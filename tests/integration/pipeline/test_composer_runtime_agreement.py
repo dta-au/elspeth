@@ -223,15 +223,36 @@ where the architectural fix landed:
       of those 5 — the two that go through the public entry point — confirming
       the other three exercise the validator directly.
     - Deleting the ``mode == RoutingMode.DIVERT`` skip in ``_live_predecessors``
-      failed NOTHING (86/86 green). That gap was real: every DIVERT edge
-      ``build_execution_graph`` creates targets a SINK, and a transform's
-      ``on_error`` is rejected unless it names a sink (builder.py:1139), so a
-      TRANSFORM cannot be a divert target on the production path and the guard
-      is defence-in-depth for the public ``add_edge`` surface. Two negative
-      controls were added for it (``test_divert_only_predecessor_is_not_checked``
-      and ``test_divert_mode_stored_as_plain_string_is_still_skipped``, the
-      latter pinning ``==`` over ``is`` because ``add_edge`` does not coerce
-      ``mode``).
+      failed ``test_divert_only_predecessor_is_not_rejected`` and
+      ``test_divert_mode_stored_as_plain_string_is_still_skipped``. The skip is
+      pinned.
+
+      METHOD NOTE, because a first pass got this wrong and the wrong answer is
+      the seductive one: the identical string
+      ``if edge_data["mode"] == RoutingMode.DIVERT:`` appears THREE times in
+      this module (``validate_edge_compatibility``'s edge loop,
+      ``get_effective_producer_schema_config``, and ``_live_predecessors``). A
+      naive first-occurrence substitution patches the edge loop and reports
+      "nothing failed", which reads as a coverage hole in ``_live_predecessors``
+      and is not one — the skip IS pinned. When mutating a line for this
+      protocol, assert the match is unique before editing and fail closed if it
+      is not; a mutation applied to the wrong site produces a confident,
+      completely wrong coverage claim.
+
+    - Flipping that same comparison from ``==`` to ``is`` failed exactly one
+      test, ``test_divert_mode_stored_as_plain_string_is_still_skipped``.
+      ``RoutingMode`` is a ``StrEnum`` and ``add_edge`` stores ``mode``
+      uncoerced, so an edge carrying the plain string ``"divert"`` compares
+      equal but is not identical; identity would treat it as live and reject a
+      runnable pipeline.
+
+      Reachability, stated so the guard is not over-read: every DIVERT edge
+      ``build_execution_graph`` creates targets a SINK (source quarantine,
+      transform/gate ``on_error``, sink failsink), and a transform's
+      ``on_error`` is rejected unless it names a sink (builder.py:1139). A
+      TRANSFORM therefore cannot be a divert target on today's production path,
+      so this filter is defence-in-depth for the public ``add_edge`` surface
+      rather than a guard on a live route.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval

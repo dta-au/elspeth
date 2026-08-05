@@ -3647,9 +3647,14 @@ def _check_schema_contracts(
     #   means a guaranteed row-1 failure, never a maybe.
     #
     # Scoped to ``node_type == "transform"`` and NOT to aggregations, which Rule C
-    # does include: the collision preflight exists only in TransformExecutor, so
-    # extending this to the aggregation executor would reject pipelines the
-    # runtime accepts.
+    # does include. NOT because aggregations cannot collide — ``batch_replicate``
+    # and ``batch_outlier_annotator`` hand-roll the identical check in their own
+    # bodies and raise the same message — but because aggregations are reductive:
+    # a producer's definite arrivals describe the rows entering the batch, not the
+    # row leaving it, so intersecting them with the aggregation's declared outputs
+    # is unsound. Widening needs its own argument; see
+    # ``validate_transform_output_field_collisions`` in core/dag/schema_validation.py
+    # for the runtime-side twin of this decision (elspeth-cfcd333f83).
     for node in nodes:
         if node.node_type != "transform" or node.plugin is None:
             continue

@@ -726,45 +726,6 @@ class TestTransformOutputFieldCollisions:
         with pytest.raises(GraphValidationError, match="headline"):
             schema_validation.validate_transform_output_field_collisions(graph)
 
-    def test_divert_only_predecessor_is_not_checked(self) -> None:
-        """A predecessor reachable ONLY over a DIVERT edge contributes no guarantee.
-
-        The negative twin of the test above, and the one that actually pins the
-        DIVERT skip: deleting the ``mode == RoutingMode.DIVERT`` guard in
-        ``_live_predecessors`` leaves every other test in this file green, because
-        they all reach their predecessor over a live edge as well.
-
-        Rows do not traverse a DIVERT edge — they arrive by exception handling
-        carrying an error envelope, not the producer's declared output — so
-        inheriting a guarantee across one and rejecting on it would refuse a
-        pipeline the engine runs.
-
-        Built through the direct graph API on purpose: ``build_execution_graph``
-        cannot express this shape, because every DIVERT edge it creates targets a
-        SINK (source quarantine, transform/gate ``on_error``, sink failsink), and
-        a transform's ``on_error`` is explicitly rejected unless it names a sink
-        (core/dag/builder.py:1139). The guard is therefore defence-in-depth for the
-        public ``add_edge`` surface and for any future topology that routes error
-        rows into a transform — not a live production path today.
-        """
-        graph = ExecutionGraph()
-        graph.add_node(
-            "src",
-            node_type=NodeType.SOURCE,
-            plugin_name="text",
-            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
-        )
-        graph.add_node(
-            "t1",
-            node_type=NodeType.TRANSFORM,
-            plugin_name="llm",
-            config={"schema": {"mode": "observed"}},
-            declared_output_fields=frozenset({"headline"}),
-        )
-        graph.add_edge("src", "t1", label="on_error", mode=RoutingMode.DIVERT)
-
-        schema_validation.validate_transform_output_field_collisions(graph)
-
     def test_divert_mode_stored_as_plain_string_is_still_skipped(self) -> None:
         """``add_edge`` does not coerce ``mode``, so the string form must skip too.
 

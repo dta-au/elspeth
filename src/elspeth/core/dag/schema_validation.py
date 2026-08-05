@@ -721,11 +721,25 @@ def _live_predecessors(graph: ExecutionGraph, node_id: str) -> list[str]:
     pair, so a predecessor counts as live when ANY of its edges is non-DIVERT;
     filtering edge-wise without regrouping would drop a live predecessor.
 
+    REACHABILITY, stated honestly: ``build_execution_graph`` cannot currently
+    produce a DIVERT edge INTO a transform. Error routing in ELSPETH is
+    terminal — every DIVERT edge the builder creates lands on a SINK (source
+    quarantine :1126, transform ``on_error`` :1146, gate ``on_error`` :1169,
+    sink failsink :1189), and a transform's ``on_error`` is rejected outright
+    unless it names a sink (builder.py:1139, mirroring
+    ``TransformSettings.validate_on_error``). So on today's production path
+    this filter is equivalent to bare ``.predecessors()``. It is kept as
+    defence-in-depth for the public ``add_edge`` surface — which tests and any
+    future "route errors into a repair transform" topology use — and pinned by
+    ``test_divert_only_predecessor_is_not_checked``. Do not read it as
+    guarding a live production path.
+
     Deliberately NOT shared with ``validate_sink_required_fields``, which uses
-    bare ``.predecessors()``: there, DIVERT-blindness only widens the set of
-    graphs it rejects for missing guarantees, whereas here a spurious
-    guarantee would reject a runnable pipeline. Do not "harmonize" these by
-    giving this check the looser walk (elspeth-cfcd333f83).
+    bare ``.predecessors()`` and IS DIVERT-reachable (sink → failsink sink):
+    there, DIVERT-blindness only widens the set of graphs it rejects for
+    missing guarantees, whereas here a spurious guarantee would reject a
+    runnable pipeline. Do not "harmonize" these by giving this check the
+    looser walk (elspeth-cfcd333f83).
     """
     live: dict[str, None] = {}
     for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
@@ -752,10 +766,27 @@ def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
     ``POST /validate`` reach, not after execution has started
     (elspeth-cfcd333f83).
 
-    Scope is TRANSFORM nodes only. ``AggregationExecutor.execute_flush``
-    performs no equivalent collision check, so an aggregation has no runtime
-    failure to pre-empt and rejecting one here would refuse pipelines the
-    engine runs today. ``NodeInfo`` enforces the same boundary by guarding
+    Scope is TRANSFORM nodes only, and the honest reason is narrower than
+    "aggregations cannot hit this". ``AggregationExecutor.execute_flush``
+    indeed runs no centralized collision check — but two aggregation-eligible
+    plugins HAND-ROLL the identical one in their own bodies and raise the same
+    message: ``batch_replicate`` (batch_replicate.py:273-279, and it ships
+    wired under ``aggregations:`` in examples/deaggregation/settings.yaml) and
+    ``batch_outlier_annotator`` (batch_outlier_annotator.py:278-286). So an
+    aggregation-wired instance of those DOES have a runtime failure, and this
+    check does not pre-empt it.
+
+    Widening is deliberately left out of elspeth-cfcd333f83 because it needs a
+    soundness argument this one does not have, not because the failure is
+    absent: aggregations are reductive, so a predecessor's guarantees describe
+    the rows going IN to the batch, not the row coming OUT. For a
+    ``batch_stats`` emitting count/sum/mean that relationship simply does not
+    hold, and intersecting upstream guarantees with declared outputs there
+    would reject pipelines the engine runs. Only pass-through-shaped
+    aggregations (``output_mode: transform``) carry the input row forward, and
+    separating those is its own piece of work.
+
+    ``NodeInfo`` enforces the same boundary by guarding
     ``declared_output_fields`` to TRANSFORM nodes.
 
     Soundness: reject only where the collision is certain. A predecessor is

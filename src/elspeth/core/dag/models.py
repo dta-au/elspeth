@@ -247,13 +247,21 @@ class NodeInfo:
             )
         # Offensive programming: declared_output_fields mirrors the
         # declared_required_fields guard above. It is TRANSFORM-only rather
-        # than TRANSFORM+AGGREGATION (as passes_through_input is) because the
-        # only consumer — validate_transform_output_field_collisions — pre-empts
-        # a runtime check that exists solely in TransformExecutor._run_preflight.
-        # AggregationExecutor.execute_flush performs no collision check, so
-        # carrying the declaration on an aggregation node would be data with no
-        # reader, and validating it would reject pipelines the engine runs today
-        # (elspeth-cfcd333f83).
+        # than TRANSFORM+AGGREGATION (as passes_through_input is) because its
+        # only consumer — validate_transform_output_field_collisions — is
+        # scoped to TRANSFORM nodes, so an aggregation node would carry data
+        # with no reader.
+        #
+        # This boundary is a SCOPE decision, not a claim that aggregations
+        # cannot collide. BatchReplicate — which the passes_through_input
+        # comment below correctly notes is wired under `aggregations:` in YAML
+        # — hand-rolls the identical collision check in its own body
+        # (batch_replicate.py:273-279), as does batch_outlier_annotator. The
+        # reason for not widening is that aggregations are reductive: an
+        # upstream node's guarantees describe the rows entering the batch, not
+        # the row leaving it, so the intersection this check relies on is not
+        # sound there. See validate_transform_output_field_collisions'
+        # docstring for the full argument (elspeth-cfcd333f83).
         if self.declared_output_fields and self.node_type != NodeType.TRANSFORM:
             raise GraphValidationError(
                 f"NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; "
