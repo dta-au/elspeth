@@ -60,11 +60,15 @@ def _created_fields(transform: BaseTransform) -> frozenset[str]:
 
     Exactly the two sources that state what the PLUGIN creates, because they
     diverge deliberately: ``value_transform`` keeps ``declared_output_fields``
-    EMPTY so the executor's collision check stays off, while overriding
-    ``self_created_input_fields`` — read either alone and it vanishes from its
-    own invariant. Measured: dropping ``declared_output_fields`` loses
-    value_transform; dropping ``self_created_input_fields`` loses none today but
-    is the surface the framework's own demotion reads, so both stay.
+    EMPTY so the executor's collision check stays off, and overrides
+    ``self_created_input_fields`` instead — so that property is its ONLY source.
+
+    Measured by substitution over the live roster, because the direction is easy
+    to state backwards: dropping ``self_created_input_fields`` loses
+    value_transform (24 -> 23); dropping ``declared_output_fields`` loses no
+    plugin today (24 -> 24). Both stay anyway — the second is the surface the
+    executor's collision check reads, so a plugin declaring only there must not
+    become invisible here the moment one appears.
 
     The union is also load-bearing against a fix already queued elsewhere.
     elspeth-dea96e0830 proposes narrowing batch-aware reductive transforms'
