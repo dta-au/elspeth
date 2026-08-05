@@ -15,7 +15,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import text
 
-from elspeth.contracts import NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
@@ -604,6 +604,170 @@ def test_diagnostics_surfaces_latest_failed_operation_as_failure_detail(tmp_path
         assert "HTTP 400" in diagnostics.failure_detail.error_message
         assert "provider error body redacted" in diagnostics.failure_detail.error_message
         assert "max_output_tokens below minimum" not in diagnostics.failure_detail.error_message
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_prefers_failed_node_state_over_operation_owner(tmp_path) -> None:
+    """failure_detail must name the node that raised, not the operation scope owner.
+
+    Regression test for elspeth-8e5cc5ced0 (run ed3b37c9, 2026-08-05): a
+    transform input-validation PluginContractViolation propagated up through
+    the streaming source_load operation. The failed operation row carries the
+    SOURCE node (the operation's scope owner), so a projection reading only
+    operations attributes the failure to the wrong node — while the failed
+    node_state in the same payload names the transform correctly. The
+    projection must prefer the failed node_state for attribution, keeping the
+    operation fields as "the operation in flight".
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+
+        row = factory.data_flow.create_row(
+            web_run_id, "source", 0, {"item": {"product": "mouse"}}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        )
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        state = factory.execution.begin_node_state(
+            token.token_id,
+            "hoist_items",
+            web_run_id,
+            1,
+            {"item": {"product": "mouse"}},
+            state_id="state-token-0",
+        )
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(
+                exception="Transform 'value_transform' input validation failed: 2 validation errors",
+                exception_type="PluginContractViolation",
+            ),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error="Transform 'value_transform' input validation failed: 2 validation errors",
+            duration_ms=50.0,
+        )
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+        assert diagnostics.failure_detail.operation_id == source_op.operation_id
+        assert diagnostics.failure_detail.operation_type == "source_load"
+        assert "input validation failed" in diagnostics.failure_detail.error_message
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_keeps_operation_owner_when_no_failed_node_state(tmp_path) -> None:
+    """Genuine source failures (no failed node_state) keep operation attribution."""
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error="Source 'json' failed to read input file: malformed JSON at line 3",
+            duration_ms=5.0,
+        )
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "source"
+        assert diagnostics.failure_detail.operation_type == "source_load"
+        assert "malformed JSON" in diagnostics.failure_detail.error_message
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_node_state_lookup_ignores_token_preview_limit(tmp_path) -> None:
+    """The failed-state attribution must not be scoped by the preview-limited token query.
+
+    A run whose failing token sorts outside the preview window (limit=1 with
+    an earlier successful row) must still attribute failure_detail to the
+    failing node — otherwise the burial problem failure_detail exists to
+    solve is reintroduced through the back door.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+
+        first_row = factory.data_flow.create_row(
+            web_run_id, "source", 0, {"ok": True}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        )
+        factory.data_flow.create_token(first_row.row_id, token_id="token-0")
+        second_row = factory.data_flow.create_row(
+            web_run_id, "source", 1, {"item": {}}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        )
+        failing_token = factory.data_flow.create_token(second_row.row_id, token_id="token-1")
+
+        state = factory.execution.begin_node_state(
+            failing_token.token_id,
+            "hoist_items",
+            web_run_id,
+            1,
+            {"item": {}},
+            state_id="state-token-1",
+        )
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(
+                exception="Transform 'value_transform' input validation failed",
+                exception_type="PluginContractViolation",
+            ),
+        )
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error="Transform 'value_transform' input validation failed",
+            duration_ms=50.0,
+        )
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=1,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
     finally:
         db.close()
 

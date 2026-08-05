@@ -419,9 +419,43 @@ def load_run_diagnostics_from_db(
         failure_detail: RunDiagnosticFailureDetail | None = None
         if failure_row is not None:
             failed_at = failure_row.completed_at or failure_row.started_at
+            failure_node_id = failure_row.node_id
+
+            # Attribution: operations.node_id names the node OWNING the
+            # operation scope, not the node that raised. A source_load scope
+            # spans the whole row loop, so a transform crash propagating up
+            # through it lands on an operation row carrying the SOURCE node
+            # (elspeth-8e5cc5ced0). The failed node_state written by
+            # NodeStateGuard carries the true raising node, so prefer it.
+            # Queried independently of the preview-limited token query above:
+            # the failing token may sort outside the preview window.
+            failed_state_stmt = (
+                select(
+                    node_states_table.c.node_id,
+                    node_states_table.c.completed_at,
+                )
+                .where(
+                    and_(
+                        node_states_table.c.run_id == landscape_run_id,
+                        node_states_table.c.status == "failed",
+                    )
+                )
+                .order_by(
+                    node_states_table.c.completed_at.desc().nulls_last(),
+                    node_states_table.c.started_at.desc(),
+                    node_states_table.c.state_id.asc(),
+                )
+                .limit(1)
+            )
+            failed_state_row = conn.execute(failed_state_stmt).first()
+            if failed_state_row is not None:
+                failure_node_id = failed_state_row.node_id
+                if failed_state_row.completed_at is not None:
+                    failed_at = failed_state_row.completed_at
+
             failure_detail = RunDiagnosticFailureDetail(
                 operation_id=failure_row.operation_id,
-                node_id=failure_row.node_id,
+                node_id=failure_node_id,
                 operation_type=failure_row.operation_type,
                 error_message=failure_row.error_message,
                 failed_at=failed_at,

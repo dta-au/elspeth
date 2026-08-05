@@ -947,12 +947,20 @@ class RunDiagnosticSummary(_StrictResponse):
 
 
 class RunDiagnosticFailureDetail(_StrictResponse):
-    """Focused pointer to the operation that caused a run to fail.
+    """Focused pointer to what caused a run to fail.
 
     A run with hundreds of successful operations and one failure can hide the
     cause in the (paged, limited) operations list. This model surfaces the
-    *latest* failed operation directly so the UI can render "what went wrong"
-    without scanning. None on the response when no failed operation exists.
+    failure directly so the UI can render "what went wrong" without scanning.
+    None on the response when no failed operation exists.
+
+    ``node_id`` names the node that raised — taken from the latest FAILED
+    node_state when one exists, falling back to the failed operation's owner
+    (elspeth-8e5cc5ced0). ``operation_id``/``operation_type`` describe the
+    latest failed *operation*, i.e. the operation in flight when the failure
+    surfaced; its scope may span other nodes' work (a ``source_load`` scope
+    covers the whole streaming row loop), so it can legitimately differ from
+    ``node_id``.
 
     ``error_message`` is the chain text persisted to ``operations.error_message``
     in Landscape — it carries the wrapper error plus its cause(s) including any
