@@ -301,12 +301,17 @@ def _llm_prompt_template_planner(
         del recorder, correction_target
         source = guided.reviewed_sources[guided.source_order[0]]
         output = guided.reviewed_outputs[guided.output_order[0]]
+        # Each chained node needs its OWN response_field. A downstream llm node
+        # reusing its upstream's field would declare an output the row already
+        # carries, which the engine rejects as a pipeline configuration error
+        # (elspeth-cfcd333f83) — the fixture would then be unrunnable and would
+        # fail authoring before reaching the surfacing behaviour under test.
         if extra_node_id is None:
-            _chain = [("summarize_rows", "llm_rows", output.name)]
+            _chain = [("summarize_rows", "llm_rows", output.name, "summary")]
         else:
             _chain = [
-                ("summarize_rows", "llm_rows", f"{extra_node_id}_rows"),
-                (extra_node_id, f"{extra_node_id}_rows", output.name),
+                ("summarize_rows", "llm_rows", f"{extra_node_id}_rows", "summary"),
+                (extra_node_id, f"{extra_node_id}_rows", output.name, f"{extra_node_id}_summary"),
             ]
         pipeline = {
             "sources": {
@@ -329,7 +334,7 @@ def _llm_prompt_template_planner(
                         "schema": {"mode": "observed"},
                         "profile": "task-role",
                         "prompt_template": prompt,
-                        "response_field": "summary",
+                        "response_field": node_response_field,
                         "interpretation_requirements": [
                             {
                                 "id": f"llm_prompt_template:{node_id}:{node_id}",
@@ -341,7 +346,7 @@ def _llm_prompt_template_planner(
                         ],
                     },
                 }
-                for node_id, node_input, node_on_success in _chain
+                for node_id, node_input, node_on_success, node_response_field in _chain
             ],
             "edges": [],
             "outputs": [

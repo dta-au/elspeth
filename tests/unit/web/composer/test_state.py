@@ -6085,6 +6085,205 @@ class TestSchemaContractValidation:
         assert "select_only: true" in msg
         assert "Declared required output fields not produced by this transform: [batch_size]" in msg
 
+    # ── Rule D: declared output collides with a definitely-arriving input field ──
+    # elspeth-cfcd333f83. The runtime surface is TransformExecutor._run_preflight's
+    # detect_field_collisions call, which raises PluginContractViolation on row 1.
+
+    def _llm_options(self, response_field: str) -> dict[str, Any]:
+        """Minimal constructible llm transform config for the collision probe."""
+        return {
+            "provider": "gateway",
+            "model": "anthropic/claude-sonnet-4.6",
+            "endpoint": "https://gateway.example.invalid/v1",
+            "api_key": "${LLM_API_KEY}",
+            "prompt_template": "Title-case this: {headline}",
+            "response_field": response_field,
+            "schema": {"mode": "observed"},
+        }
+
+    def _llm_rewrite_state(
+        self,
+        *,
+        response_field: str,
+        source_plugin: str = "text",
+        source_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        """source -> llm -> sink, with the llm writing ``response_field``."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rewrite",
+                plugin=source_plugin,
+                options=source_options if source_options is not None else {"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rewrite",
+                "rewrite",
+                "main",
+                plugin="llm",
+                options=self._llm_options(response_field),
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_rule_d_llm_rewrite_in_place_collides_with_source_field(self) -> None:
+        """Rule D: an llm rewriting its own input field in place is rejected.
+
+        The reported defect: a text source emits ``headline`` and an llm
+        transform sets ``response_field: headline`` to title-case it. Compose
+        succeeded and /validate returned is_valid=true, then the run died on
+        row 1 because TransformExecutor's collision preflight rejects a
+        transform whose declared_output_fields overlap the arriving row.
+        """
+        result = self._llm_rewrite_state(response_field="headline").validate()
+
+        assert not result.is_valid, "Composer must reject an llm that overwrites a field already on the row."
+        rule_d_errors = [e for e in result.errors if e.component == "node:rewrite" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected a Rule D rejection naming headline, got: {[e.message for e in result.errors]}"
+        msg = rule_d_errors[0].message
+        assert "[headline] already arrive(s) on its input row" in msg
+        # Actionable in both repair directions, so the planner can fix it.
+        assert "response_field" in msg
+        assert "field_mapper" in msg
+        # Only the colliding field is reported — the llm's other declared
+        # outputs (headline_model / headline_usage) do not arrive on the row.
+        contract = rule_d_errors[0].contract
+        assert contract is not None
+        assert contract.extra_fields == ("headline",)
+        assert contract.producer == "rewrite"
+        assert contract.consumer == "rewrite"
+
+    def test_rule_d_negative_control_non_colliding_output_authors_cleanly(self) -> None:
+        """Rule D stays silent when the declared output is a fresh field name.
+
+        Same topology as the rejection above with only ``response_field``
+        changed, so a failure here means Rule D fires on shape rather than on
+        the collision itself.
+        """
+        result = self._llm_rewrite_state(response_field="headline_titlecased").validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_abstains_when_arrival_is_not_definite(self) -> None:
+        """Rule D abstains when the field is not PROVEN to arrive.
+
+        A csv source with an observed schema declares no guaranteed fields, so
+        ``_connection_definite_emits`` contributes nothing and the composer
+        cannot prove ``headline`` reaches the node. These predicates are lower
+        bounds: erroring on a merely-possible collision would be a false
+        rejection, so the runtime preflight owns this case per-row.
+        """
+        result = self._llm_rewrite_state(
+            response_field="headline",
+            source_plugin="csv",
+            source_options={"schema": {"mode": "observed"}},
+        ).validate()
+
+        assert result.is_valid, result.errors
+
+    def test_rule_d_fires_when_only_one_row_union_arm_delivers_the_field(self) -> None:
+        """Rule D rejects a collision carried by a SINGLE fan-in arm.
+
+        ``_connection_definite_emits`` deliberately UNIONS row_union arm emit
+        sets where the presence walk would intersect them, because the two
+        directions have opposite safety polarities. A row_union republishes
+        each arm's rows unchanged, so a field guaranteed by one arm really is
+        present on that arm's rows; the executor's collision preflight runs
+        per row and dies on them. Requiring the field on EVERY arm would miss
+        this genuine failure, so union — not intersection — is correct here.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="gate_in",
+                plugin="text",
+                options={"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("arm_a_in", "arm_b_in"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        # Only arm A mints `tag`; arm B carries the bare source row.
+        state = state.with_node(self._make_transform("tagger", "arm_a_in", "arm_a_out", plugin="llm", options=self._llm_options("tag")))
+        state = state.with_node(
+            NodeSpec(
+                id="union",
+                node_type="row_union",
+                plugin=None,
+                input="arm_a_out",
+                on_success="union_out",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                # Barrier branches are keyed by FORK BRANCH NAME; arm B reaches
+                # the barrier untransformed, so its key and connection coincide.
+                branches={"arm_a_in": "arm_a_out", "arm_b_in": "arm_b_in"},
+                policy=None,
+                merge=None,
+            )
+        )
+        state = state.with_node(self._make_transform("retag", "union_out", "main", plugin="llm", options=self._llm_options("tag")))
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        rule_d_errors = [e for e in result.errors if e.component == "node:retag" and e.error_code == "transform_contract_violation"]
+        assert rule_d_errors, f"Expected Rule D to reject the single-arm collision, got: {[e.message for e in result.errors]}"
+        assert rule_d_errors[0].contract is not None
+        assert "tag" in rule_d_errors[0].contract.extra_fields
+        # The collision must be the ONLY reason this pipeline is rejected —
+        # otherwise a structural complaint could carry the test and the fan-in
+        # semantics would go unverified.
+        assert [e.error_code for e in result.errors] == ["transform_contract_violation"], [e.message for e in result.errors]
+
+    def test_rule_d_ignores_transforms_declaring_no_output_fields(self) -> None:
+        """A transform that declares no output fields is never a Rule D subject.
+
+        ``value_transform`` deliberately keeps ``declared_output_fields`` empty
+        because its targets may legitimately be overwrites — the same opt-out
+        the executor's collision check honours. Rule D must inherit that
+        abstention rather than re-deriving emission from the schema.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="rewrite",
+                plugin="text",
+                options={"column": "headline", "schema": {"mode": "observed"}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "rewrite",
+                "rewrite",
+                "main",
+                options={"operations": [{"target": "headline", "expression": "row['headline'].title()"}]},
+            )
+        )
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
     def test_v3_field_mapper_locked_input_rejects_upstream_batch_size_extra(self) -> None:
         """Rule A: locked-mode field_mapper input rejects upstream batch_stats extra.
 
