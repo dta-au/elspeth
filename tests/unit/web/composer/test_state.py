@@ -3890,7 +3890,7 @@ class TestSchemaContractValidation:
         output field absent from the mapping) → sink. The field_mapper's
         upstream is the source sentinel (no producer-probe call), and the
         sink uses ``mode: observed`` with no required_fields (so neither
-        sink-Rule-A nor sink-Rule-B reaches ``_producer_emit_set``). Rule C
+        sink-Rule-A nor sink-Rule-B reaches ``_producer_emit_profile``). Rule C
         is therefore the only probe site that calls ``create_transform``
         for the broken plugin.
         """
@@ -8251,3 +8251,302 @@ class TestCompositionStateRowUnion:
         assert detail.producer == "variant_union"
         assert detail.consumer == "output:output"
         assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_resolvable_pass_through_node_between_union_and_locked_consumer_still_errors(self) -> None:
+        """elspeth-902fc354b2 gap 1: a resolvable intermediate node must not bypass Rule A.
+
+        With a pass-through relay between the row_union and the locked
+        consumer, the presence walk RESOLVES (to the relay), so the row_union
+        boundary path never runs. The relay declares
+        ``passes_through_input=True`` — a runtime-verified ADR-008 contract —
+        so every arm emit definitely survives it and must still reach the
+        Rule A comparison at the locked consumer.
+        """
+        relay = self._transform("relay", "union_out", "relay_done")
+        locked_tail = self._transform(
+            "after_union",
+            "relay_done",
+            "output",
+            options=self._locked_tail_options(["verdict: str"]),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), relay, locked_tail),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_union"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "relay"
+        assert detail.consumer == "after_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_row_union_arm_pass_through_carries_source_guarantees_to_locked_consumer(self) -> None:
+        """elspeth-902fc354b2 gap 2 through a union: arms pass through source fields.
+
+        g08's live rejection included ``complaint_text`` — an ordinary
+        pass-through field, not an llm side-field. An llm arm declares
+        ``passes_through_input=True``, so a source-guaranteed field definitely
+        arrives on every union row and a locked consumer forbidding it is a
+        definite runtime PluginContractViolation.
+        """
+        state = self._state(
+            arms=self._llm_arms(),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_model: str", "verdict_usage: any"]),
+        )
+        state = replace(
+            state,
+            sources={
+                "source": self._source(
+                    schema={
+                        "mode": "fixed",
+                        "fields": ["complaint_text: str"],
+                        "guaranteed_fields": ["complaint_text"],
+                    }
+                )
+            },
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.extra_fields == ("complaint_text",)
+
+
+class TestPassThroughArrivalExtras:
+    """Rule A/B must compare DEFINITE ARRIVALS, not the nearest producer's own emits.
+
+    elspeth-902fc354b2 (battery round 3, g08): the runtime predicate these
+    rules mirror — the consumer's generated input model with
+    ``extra='forbid'`` — validates the ENTIRE arriving row, which includes
+    every field passed through ``passes_through_input=True`` transforms
+    (a runtime-verified ADR-008 declaration) from arbitrarily far upstream.
+    A producer's own predicted emit set is therefore only a fragment of what
+    arrives; the walker must union in upstream definite arrivals wherever the
+    pass-through declaration proves they survive.
+    """
+
+    def _source(self) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={
+                "schema": {
+                    "mode": "fixed",
+                    "fields": ["complaint_id: str", "complaint_text: str"],
+                    "guaranteed_fields": ["complaint_id", "complaint_text"],
+                }
+            },
+            on_validation_failure="discard",
+        )
+
+    def _llm(self, *, on_success: str = "summarized") -> NodeSpec:
+        return NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Summarize this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": "one_sentence_summary",
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _passthrough(self, node_id: str, input_connection: str, on_success: str, *, options: dict[str, Any] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _output(self, *, options: dict[str, Any] | None = None) -> OutputSpec:
+        return OutputSpec(
+            name="output",
+            plugin="json",
+            options=options or {"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def test_pass_through_source_fields_reach_a_locked_consumer(self) -> None:
+        """The g08 linear shape: source fields survive the llm and hit the locked tail."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(),
+                self._passthrough(
+                    "final_cleanup",
+                    "summarized",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["one_sentence_summary: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:final_cleanup"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == (
+            "complaint_id",
+            "complaint_text",
+            "one_sentence_summary_model",
+            "one_sentence_summary_usage",
+        )
+
+    def test_pass_through_source_fields_reach_a_locked_sink(self) -> None:
+        """Rule B shares the arrival math: pass-through fields hit a locked sink too."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._llm(on_success="output"),),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["one_sentence_summary: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == (
+            "complaint_id",
+            "complaint_text",
+            "one_sentence_summary_model",
+            "one_sentence_summary_usage",
+        )
+
+    def test_non_pass_through_intermediate_stops_upstream_arrivals(self) -> None:
+        """A select_only field_mapper is NOT pass-through: arrivals stop at its emit set.
+
+        ``passes_through_input=False`` means pass-through of any given
+        upstream field is not definite, so contributing only the mapper's own
+        computed emit set is the correct lower bound — no invented extras at
+        the tail.
+        """
+        mapper = NodeSpec(
+            id="select",
+            node_type="transform",
+            plugin="field_mapper",
+            input="summarized",
+            on_success="selected",
+            on_error="discard",
+            options={
+                "schema": {"mode": "flexible", "fields": ["summary_out: str"]},
+                "mapping": {"one_sentence_summary": "summary_out"},
+                "select_only": True,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(),
+                mapper,
+                self._passthrough(
+                    "final_cleanup",
+                    "selected",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["summary_out: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
+
+    def test_fixed_output_pass_through_transform_stops_upstream_arrivals(self) -> None:
+        """A ``mode: fixed`` output contract is an extras firewall at that transform.
+
+        Runtime enforces the relay's own fixed output with extra='forbid':
+        rows either match the declared set exactly or the run fails AT THE
+        RELAY — extras can never travel past it. The defect is reported at
+        the relay's own locked input, not invented at the downstream tail.
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._passthrough(
+                    "relay",
+                    "rows",
+                    "relayed",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str"]}},
+                ),
+                self._passthrough(
+                    "final_cleanup",
+                    "relayed",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
+        relay_entry = next(
+            error for error in result.errors if error.error_code == "locked_input_extras" and error.component == "node:relay"
+        )
+        detail = relay_entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("complaint_text",)
