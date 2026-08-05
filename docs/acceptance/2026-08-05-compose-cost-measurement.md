@@ -128,6 +128,30 @@ demands). The residual g04-class failures are the freeform-loop
 scaffolding defect, tracked on elspeth-7da4e52344.
 elspeth-930a163c85 closed. Rollback candidate for web:14 is web:13.
 
+## Addendum 2: g04 planner-route experiment (same day)
+
+Following the elspeth-7da4e52344 leg-by-leg investigation (comments
+2352–2354), the g04 topology was recomposed with a grammar-satisfying
+rephrasing (`ops-local/acceptance/intents/g04p.json`; verified locally
+that it classifies EXPLICIT_MUTATION → planner, while original g04
+classifies AMBIGUOUS → compose loop).
+
+**Result: the planner fails on this topology too** — two runs, both
+HTTP 500 `composer_planner_failure` / `planner_repair_exhausted` at
+127s/113s. Combined with the loop's n=2 wall-clock exhaustion, the g04
+family defeats BOTH authoring surfaces deterministically; routing is not
+the lever for this graph family.
+
+The topology is nonetheless expressible: `examples/json_explode/
+settings.yaml` (corpus green) authors it in 3 nodes with `items: any` +
+`mode: observed` — no list declaration, no `guaranteed_fields`. The
+schema DSL has no list field type (`contracts/schema.py:119`), so the
+"prove `line_items` is a list" direction both surfaces pursued is a dead
+end by construction. Classified as an authoring-guidance defect on
+elspeth-7da4e52344 (comment 2356), sibling in shape to
+elspeth-fcef029996, distinct from the elspeth-38dffd9bec expressibility
+gap.
+
 ## Success criteria disposition
 
 1. ✅ (as `web:13`, wider than briefed, on operator instruction)
