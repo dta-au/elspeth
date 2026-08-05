@@ -426,64 +426,97 @@ class TestValueTransformConfig:
         assert cfg.operations[0].target == "x"
 
 
-class TestValueTransformConfigRejectsSelfContradictoryInputs:
-    """A required schema field created by the operations is unsatisfiable (elspeth-5955a9c421).
+class TestValueTransformDemotesSelfCreatedInputs:
+    """An operation target created before any read is optional on INPUT (elspeth-d6eeb3a71d).
 
-    Declaring an operation target in schema.fields makes it required ON INPUT,
-    while the operation exists to CREATE it — every row then fails input
-    validation at runtime. The config must be rejected at construction so both
-    authoring surfaces (YAML and Composer) fail closed instead of crashing the
-    run.
+    The ``schema`` block names both what value_transform consumes and what it
+    emits. A target assigned before any operation reads it is CREATED here, so
+    it cannot be required on input — but it IS guaranteed on output. The
+    derived input pydantic model demotes it to optional while the output
+    ``SchemaConfig`` keeps it required, which is what makes
+    ``guaranteed_fields`` legal at contracts/schema.py.
+
+    Supersedes the construction-time rejection landed as 7a5d72d34: that guard
+    used this same predicate to REJECT, and its error message ("no upstream row
+    can ever satisfy the input contract") was false for the overwrite case.
     """
 
-    def test_rejects_required_schema_field_assigned_before_read(self) -> None:
+    def test_target_assigned_before_read_is_optional_on_input(self) -> None:
         """The live g04 shape: targets hoisted from a nested field, declared required."""
-        from elspeth.plugins.infrastructure.config_base import PluginConfigError
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
-        with pytest.raises(PluginConfigError, match="assigned before any operation reads"):
-            ValueTransform(
-                {
-                    "schema": {
-                        "mode": "flexible",
-                        "fields": [
-                            {"name": "product", "field_type": "str"},
-                            {"name": "quantity", "field_type": "int"},
-                        ],
-                    },
-                    "required_input_fields": ["item"],
-                    "operations": [
-                        {"target": "product", "expression": "row['item']['product']"},
-                        {"target": "quantity", "expression": "row['item']['quantity']"},
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": [
+                        {"name": "product", "field_type": "str"},
+                        {"name": "quantity", "field_type": "int"},
                     ],
-                }
-            )
+                },
+                "required_input_fields": ["item"],
+                "operations": [
+                    {"target": "product", "expression": "row['item']['product']"},
+                    {"target": "quantity", "expression": "row['item']['quantity']"},
+                ],
+            }
+        )
 
-    def test_rejects_required_field_read_only_after_creation(self) -> None:
-        """A later read does not make the field an input: it reads the created value."""
-        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        required = {n for n, f in transform.input_schema.model_fields.items() if f.is_required()}
+        assert required.isdisjoint({"product", "quantity"})
+        transform.input_schema.model_validate(
+            {"order_id": "ORD-001", "item": {"product": "Wireless Mouse", "quantity": 2}},
+            strict=True,
+        )
+
+    def test_recompute_of_an_existing_column_builds_and_accepts_the_upstream_row(self) -> None:
+        """Recomputing a column the source already carries is canonical data cleaning."""
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
-        with pytest.raises(PluginConfigError, match="subtotal"):
-            ValueTransform(
-                {
-                    "schema": {
-                        "mode": "flexible",
-                        "fields": [
-                            {"name": "price", "field_type": "int"},
-                            {"name": "quantity", "field_type": "int"},
-                            {"name": "subtotal", "field_type": "int"},
-                        ],
-                    },
-                    "operations": [
-                        {"target": "subtotal", "expression": "row['price'] * row['quantity']"},
-                        {"target": "total", "expression": "row['subtotal'] + 5"},
-                    ],
-                }
-            )
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["price: float", "qty: int", "total: float"],
+                },
+                "operations": [{"target": "total", "expression": "row['price'] * row['qty']"}],
+            }
+        )
 
-    def test_allows_overwrite_that_reads_its_own_target(self) -> None:
-        """Read-then-assign overwrites are satisfiable and stay legal."""
+        transform.input_schema.model_validate({"price": 2.5, "qty": 4, "total": 0.0}, strict=True)
+        transform.input_schema.model_validate({"price": 2.5, "qty": 4}, strict=True)
+
+    def test_fixed_mode_overwrite_with_downstream_guarantee_now_runs(self) -> None:
+        """mode:fixed + overwrite + guaranteed_fields had NO working config before this fix.
+
+        Scope of the claim, precisely: the FRAMEWORK now derives input-optional +
+        output-guaranteed, so this config runs. An AUTHOR still cannot DECLARE
+        that combination — contracts/schema.py:574-582 is untouched and still
+        rejects ``required: false`` alongside ``guaranteed_fields``, so the
+        author must write ``required: true`` and rely on the framework demoting
+        it underneath. Comment 2377's option C' is NARROWED, not closed.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "fixed",
+                    "fields": ["price: float", "qty: int", "total: float"],
+                    "guaranteed_fields": ["total"],
+                },
+                "operations": [{"target": "total", "expression": "row['price'] * row['qty']"}],
+            }
+        )
+
+        # Input: satisfiable with or without the overwritten column.
+        transform.input_schema.model_validate({"price": 2.5, "qty": 4, "total": 0.0}, strict=True)
+        transform.input_schema.model_validate({"price": 2.5, "qty": 4}, strict=True)
+        # Output: the guarantee survives.
+        assert "total" in (transform._output_schema_config.guaranteed_fields or ())
+
+    def test_target_read_before_assignment_stays_required(self) -> None:
+        """An operation that reads its own target is a genuine input consumer."""
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
         transform = ValueTransform(
@@ -492,7 +525,32 @@ class TestValueTransformConfigRejectsSelfContradictoryInputs:
                 "operations": [{"target": "price", "expression": "row['price'] * 1.1"}],
             }
         )
-        assert "price" in transform.input_schema.model_fields
+
+        assert transform.input_schema.model_fields["price"].is_required()
+
+    def test_field_read_only_after_creation_is_demoted(self) -> None:
+        """A later read does not make the field an input: it reads the created value."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": [
+                        {"name": "price", "field_type": "int"},
+                        {"name": "quantity", "field_type": "int"},
+                        {"name": "subtotal", "field_type": "int"},
+                    ],
+                },
+                "operations": [
+                    {"target": "subtotal", "expression": "row['price'] * row['quantity']"},
+                    {"target": "total", "expression": "row['subtotal'] + 5"},
+                ],
+            }
+        )
+
+        assert not transform.input_schema.model_fields["subtotal"].is_required()
+        assert transform.input_schema.model_fields["price"].is_required()
 
     def test_allows_optional_declared_target(self) -> None:
         """required: false declares the target's type without demanding it on input."""
@@ -509,17 +567,97 @@ class TestValueTransformConfigRejectsSelfContradictoryInputs:
         )
         assert not transform.input_schema.model_fields["product"].is_required()
 
-    def test_dynamic_key_read_disables_the_guard(self) -> None:
-        """A dynamic subscript key means reads cannot be proven; the config passes."""
+    def test_dynamic_key_read_is_rejected_at_construction_not_at_every_row(self) -> None:
+        """When the read analysis abstains, fail closed where the author can act.
+
+        A dynamic subscript means we cannot prove whether the target is read, so
+        we cannot safely demote it — but leaving it required rejected EVERY row
+        at runtime with a generic "field required", and nothing told the author
+        the analysis had abstained. Reject at construction with the dynamic
+        expression named instead.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        with pytest.raises(PluginConfigError, match="read/create status cannot be determined"):
+            ValueTransform(
+                {
+                    "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
+                    "operations": [{"target": "product", "expression": "row[row['key']]"}],
+                }
+            )
+
+    def test_dynamic_read_on_one_target_does_not_poison_a_provable_sibling(self) -> None:
+        """Abstention is per-TARGET, never per-config.
+
+        Operation 1's subscript is unresolvable, but operation 2 is a provable
+        self-overwrite of ``price`` — the same operation that resolves fine on
+        its own. Rejecting the pair would repeat the exact error the 7a5d72d34
+        guard was retracted for: asserting an unsatisfiability that is not true.
+        ``price`` is read before it is assigned, so an upstream row supplying it
+        satisfies the contract.
+        """
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
         transform = ValueTransform(
             {
-                "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
+                "schema": {"mode": "flexible", "fields": [{"name": "price", "field_type": "float"}]},
+                "operations": [
+                    {"target": "junk", "expression": "row[row['k']]"},
+                    {"target": "price", "expression": "row['price'] * 1.1"},
+                ],
+            }
+        )
+
+        assert transform.input_schema.model_fields["price"].is_required()
+
+    def test_dynamic_read_alongside_an_explicit_read_of_the_same_target_builds(self) -> None:
+        """An explicit read settles the target's status even beside a dynamic one.
+
+        ``row['price']`` is literally present, so ``price`` is provably read
+        before assignment — a genuine input, satisfiable by any upstream row
+        that supplies it. The unresolvable sibling subscript cannot make a
+        proven read unproven.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "price", "field_type": "float"}]},
+                "operations": [{"target": "price", "expression": "row[row['k']] + row['price']"}],
+            }
+        )
+
+        assert transform.input_schema.model_fields["price"].is_required()
+
+    def test_dynamic_read_before_an_unread_required_target_is_rejected(self) -> None:
+        """The genuinely undecidable shape still fails closed at construction."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        with pytest.raises(PluginConfigError, match="read/create status cannot be determined"):
+            ValueTransform(
+                {
+                    "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
+                    "operations": [
+                        {"target": "other", "expression": "row[row['k']]"},
+                        {"target": "product", "expression": "'x'"},
+                    ],
+                }
+            )
+
+    def test_dynamic_key_read_is_legal_when_no_target_is_declared_required(self) -> None:
+        """The abstention only matters when a declared required field is at stake."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "other", "field_type": "str"}]},
                 "operations": [{"target": "product", "expression": "row[row['key']]"}],
             }
         )
-        assert transform is not None
+
+        assert transform.input_schema.model_fields["other"].is_required()
 
     def test_observed_mode_targets_stay_legal(self) -> None:
         """Observed mode declares no required inputs, so targets never contradict it."""

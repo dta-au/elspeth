@@ -239,10 +239,23 @@ def _build_blob_fetch_output_schema_config(schema_config: SchemaConfig, cfg: Blo
 class BlobFetch(BaseTransform):
     """Fetch an HTTP(S) URL into the run payload store and emit a blob reference."""
 
+    # url_field is the INPUT column (the URL to fetch); every option below is
+    # "Output field receiving ..." per its own config description.
+    output_naming_config_keys = frozenset(
+        {
+            "blob_ref_field",
+            "content_type_field",
+            "size_bytes_field",
+            "sha256_field",
+            "fetch_status_field",
+            "fetch_url_final_field",
+            "fetch_url_final_ip_field",
+        }
+    )
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:39777de60c1c1869"
+    source_file_hash: str | None = "sha256:19956cd74a8a5110"
     config_model = BlobFetchConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "blob")

@@ -125,7 +125,7 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aceb2827507cab8a"
+    source_file_hash: str | None = "sha256:4e9ba10cc63f48a7"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
@@ -246,6 +246,24 @@ class BatchStats(BaseTransform):
             adds_fields=True,
         )
         self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: the demotion set is every key the aggregate may WRITE.
+
+        WIDER than ``declared_output_fields`` (elspeth-d6eeb3a71d): the
+        conditional ``skipped_missing`` / ``skipped_non_finite`` diagnostics are
+        written but not guaranteed, so the base default would leave them
+        demanded on input.
+
+        It also includes ``group_by``, which IS read from the input rows — that
+        is deliberate here, because ``consumed_input_fields`` subtracts every
+        column named by a config option (``group_by`` and ``value_field``
+        included) before anything is demoted. Creation and consumption are
+        tracked separately on purpose; this property answers only "what may this
+        transform write".
+        """
+        return self._all_possible_output_keys
 
     def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
         """Override (elspeth-f5f798f797): aggregation output is independent of input shape.

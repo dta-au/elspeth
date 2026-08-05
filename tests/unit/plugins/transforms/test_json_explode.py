@@ -401,6 +401,41 @@ class TestJSONExplodeTypeViolations:
 class TestJSONExplodeConfiguration:
     """Tests for configuration validation."""
 
+    def test_rejects_array_field_named_item_index_when_include_index(self) -> None:
+        """The auto-generated index would overwrite the column being read.
+
+        ``output_field`` is already guarded against colliding with both
+        ``array_field`` and the generated ``item_index``; ``array_field`` itself
+        was not. The plugin reads ``row[array_field]`` directly, so the collision
+        also let the read column be treated as self-created and demoted off the
+        input contract (elspeth-d6eeb3a71d).
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        with pytest.raises(PluginConfigError, match="item_index"):
+            JSONExplode(
+                {
+                    "schema": DYNAMIC_SCHEMA,
+                    "array_field": "item_index",
+                    "include_index": True,
+                }
+            )
+
+    def test_allows_array_field_named_item_index_without_the_index(self) -> None:
+        """With include_index=False there is no generated column to collide with."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DYNAMIC_SCHEMA,
+                "array_field": "item_index",
+                "include_index": False,
+            }
+        )
+
+        assert transform is not None
+
     def test_no_on_error_attribute(self) -> None:
         """JSONExplode has no on_error - on_error should be None."""
         from elspeth.plugins.transforms.json_explode import JSONExplode

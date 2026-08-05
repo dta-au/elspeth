@@ -170,6 +170,12 @@ class JSONExplodeConfig(DataPluginConfig):
     def _reject_field_collision(self) -> JSONExplodeConfig:
         if self.output_field == self.array_field:
             raise ValueError(f"output_field and array_field must differ, both are '{self.output_field}'")
+        if self.include_index and self.array_field == "item_index":
+            raise ValueError(
+                "array_field='item_index' conflicts with the auto-generated index field "
+                "when include_index=True — the generated index would overwrite the very "
+                "column being exploded. Rename the source column or set include_index=False."
+            )
         if self.include_index and self.output_field == "item_index":
             raise ValueError(
                 "output_field='item_index' conflicts with the auto-generated index field "
@@ -231,10 +237,12 @@ class JSONExplode(BaseTransform):
         to surface the upstream bug. This is intentional - see module docstring.
     """
 
+    # array_field is the INPUT column being exploded; output_field is emitted.
+    output_naming_config_keys = frozenset({"output_field"})
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1102736a9a6b54f1"
+    source_file_hash: str | None = "sha256:28c5145404eee89e"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "

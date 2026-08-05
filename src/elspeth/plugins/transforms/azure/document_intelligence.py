@@ -283,11 +283,14 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     multiple rows are in flight concurrently with FIFO output ordering.
     """
 
+    # source_field is the INPUT column (holds the document URL/base64); these
+    # three name the row fields the analysis result is WRITTEN to.
+    output_naming_config_keys = frozenset({"content_field", "page_count_field", "result_field"})
     name = "azure_document_intelligence"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:0774b4a6f8d0f40f"
+    source_file_hash: str | None = "sha256:ba6c5e9717f41af7"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     creates_tokens = False

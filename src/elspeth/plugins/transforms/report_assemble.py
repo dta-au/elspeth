@@ -99,10 +99,12 @@ class ReportAssembleConfig(TransformDataConfig):
 class ReportAssemble(BaseTransform):
     """Assemble a paginated report from a flushed batch of text rows."""
 
+    # text_field is the INPUT column being collated; output_field is written.
+    output_naming_config_keys = frozenset({"output_field"})
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:54e8b0dc7490247f"
+    source_file_hash: str | None = "sha256:4d2b810b340578ae"
     config_model = ReportAssembleConfig
     usage_when_to_use: str = (
         "Use in an aggregations node to assemble each flushed batch into a page or section of a "

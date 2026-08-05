@@ -877,10 +877,23 @@ class ExpressionParser:
         string-literal keys are resolvable; any other key shape (a computed
         key, a non-string constant) marks the enumeration incomplete.
 
-        Used for config-time contradiction diagnosis — e.g. value_transform
-        rejecting a required input its own operations create — and NEVER as a
-        security control: an incomplete enumeration means callers must not
-        draw conclusions from the absence of a field.
+        NEVER a security control. Beyond that, note what this result now feeds:
+        it is no longer diagnosis-only. ``ValueTransform`` uses it to decide
+        which operation targets are CREATED rather than read, and that set is
+        subtracted from the derived input model — the one
+        ``TransformExecutor`` and ``AggregationExecutor`` ``model_validate(...,
+        strict=True)`` every row against. So this is a VALIDATION-RELAXING
+        consumer, and the hazard has changed direction with it.
+
+        The old hazard was concluding something from a field's ABSENCE. The
+        live hazard is the opposite: a wrongly enumerated PRESENCE. If a field
+        is reported read when it is not, nothing breaks; if a target is treated
+        as created when the transform actually reads it, a genuine input
+        requirement is silently dropped and a contract violation stops being
+        caught at the transform boundary. Hence ``complete=False`` must make
+        callers ABSTAIN from demoting rather than guess — and ValueTransform
+        rejects such a config at construction rather than shipping a contract
+        it cannot justify (elspeth-d6eeb3a71d).
         """
         fields: set[str] = set()
         complete = True

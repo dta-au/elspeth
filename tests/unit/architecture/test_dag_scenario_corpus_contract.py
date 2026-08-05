@@ -443,7 +443,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
 # (elspeth-7a2c9a24c3): the manifest's expected node record carries that hash.
-EXPECTED_CASE_REGISTRY_SHA256 = "754ae92d124c1012fe0b0d61fee7bbc1f4930e6ec386cde8a8312b7335626251"
+# Rotated again 2026-08-05 for the value_transform PH3 refresh
+# (elspeth-d6eeb3a71d). Verified mechanical each time: the manifest diff is a
+# two lines swapping only hash tokens on the value_transform and json_explode
+# node records — schema_fields, schema_hash and schema_mode are unchanged (all
+# observed/null), and the csv/json source_file_hashes on the same line are
+# byte-identical, so no audit projection material moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "1069a5695c945ff85e4ba00459f3fe330638229f63f529a60a72e97f7edf4f19"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -5157,6 +5163,12 @@ def test_corpus_plugin_manager_exposes_builtins_and_custom_through_public_instan
 
 
 def test_corpus_transform_declares_exact_schema_and_runtime_contract() -> None:
+    # `input_schema` is a property on BaseTransform; a class-body assignment is
+    # redirected to `_declared_input_schema` by __init_subclass__ so that reads
+    # route through self-created-field demotion (elspeth-d6eeb3a71d). Asserting
+    # the backing store is what "declares CorpusInputSchema" now means —
+    # asserting `.input_schema` at CLASS level would only prove the property was
+    # shadowed, which is the bug that redirect exists to prevent.
     assert issubclass(CorpusInputSchema, PluginSchema)
     assert CorpusInputSchema.model_fields["id"].annotation is int
     assert CorpusInputSchema.model_fields["value"].annotation is int
@@ -5165,18 +5177,18 @@ def test_corpus_transform_declares_exact_schema_and_runtime_contract() -> None:
     assert CorpusOutputSchema.model_fields["count"].annotation is int
     assert CorpusFailOnceEOFBatchTransform.name == "dag_corpus_fail_once_eof_batch"
     assert CorpusFailOnceEOFBatchTransform.determinism is Determinism.DETERMINISTIC
-    assert CorpusFailOnceEOFBatchTransform.input_schema is CorpusInputSchema
+    assert CorpusFailOnceEOFBatchTransform._declared_input_schema is CorpusInputSchema
     assert CorpusFailOnceEOFBatchTransform.output_schema is CorpusOutputSchema
     assert CorpusFailOnceEOFBatchTransform.is_batch_aware is True
     assert CorpusFailOnceEOFBatchTransform.on_error == "discard"
     assert CorpusAlwaysErrorTransform.name == "dag_corpus_always_error"
     assert CorpusAlwaysErrorTransform.determinism is Determinism.DETERMINISTIC
-    assert CorpusAlwaysErrorTransform.input_schema is CorpusInputSchema
+    assert CorpusAlwaysErrorTransform._declared_input_schema is CorpusInputSchema
     assert CorpusAlwaysErrorTransform.output_schema is CorpusInputSchema
     assert CorpusAlwaysErrorTransform.on_error == "discard"
     assert CorpusBranchLossTransform.name == "dag_corpus_branch_loss"
     assert CorpusBranchLossTransform.determinism is Determinism.DETERMINISTIC
-    assert CorpusBranchLossTransform.input_schema is CorpusInputSchema
+    assert CorpusBranchLossTransform._declared_input_schema is CorpusInputSchema
     assert CorpusBranchLossTransform.output_schema is None
     assert CorpusBranchLossTransform.on_error == "discard"
 

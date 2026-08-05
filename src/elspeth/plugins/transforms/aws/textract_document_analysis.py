@@ -368,10 +368,13 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
 class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     """Enrich S3 document references through asynchronous Amazon Textract analysis."""
 
+    # bucket_field/key_field/version_field are INPUT columns; these four are
+    # "Optional output field for ..." per their own config descriptions.
+    output_naming_config_keys = frozenset({"text_field", "page_count_field", "metadata_field", "result_field"})
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:692ad007183fbb41"
+    source_file_hash: str | None = "sha256:4dc903fb793e84f4"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False

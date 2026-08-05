@@ -450,10 +450,13 @@ class WebScrapeTransform(BaseTransform):
                 scraping_reason: Regulatory monitoring
     """
 
+    # url_field is an INPUT column (the row field holding the URL to fetch);
+    # these two choose where the fetched content is WRITTEN.
+    output_naming_config_keys = frozenset({"content_field", "fingerprint_field"})
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:239f2cab39ce5c91"
+    source_file_hash: str | None = "sha256:fdfca5c43a2ae397"
     config_model = WebScrapeConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")

@@ -205,10 +205,12 @@ def _splitlines_bounded(source_value: str, *, max_lines: int) -> tuple[list[str]
 class LineExplode(BaseTransform):
     """Explode a string field into one output row per line."""
 
+    # source_field is the INPUT column being split; the other two are emitted.
+    output_naming_config_keys = frozenset({"output_field", "index_field"})
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d40053696353f520"
+    source_file_hash: str | None = "sha256:b7ee4ee216ec1a00"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "

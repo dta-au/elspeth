@@ -115,21 +115,118 @@ class ValueTransformConfig(TransformDataConfig):
             raise ValueError("operations must contain at least one operation")
         return self
 
+    def created_before_read_targets(self) -> frozenset[str]:
+        """Targets this transform CREATES: assigned before any operation reads them.
+
+        The 'schema' block is this transform's INPUT contract, but authors also
+        use it to name the emitted shape. A target assigned before any
+        operation reads it is created here, so it must not be required on
+        input — ``BaseTransform.input_schema`` demotes these to optional
+        (elspeth-d6eeb3a71d).
+
+        An operation that reads its own target (``row['price'] * 1.1``) — or
+        any target read before its first assignment — is a genuine input
+        consumer and is NOT reported, so its input requirement survives.
+
+        Conservative, and scoped PER TARGET: a read that cannot be statically
+        resolved to a literal key (``row[row['k']]``) leaves undecidable only
+        those targets not already proven to be read — never the whole operation
+        list. See ``_analyse_operation_reads`` for why, and for the residual
+        that scoping accepts. An undecidable target that is also declared
+        required is rejected at construction by
+        ``_reject_unanalysable_reads_over_required_targets``.
+
+        Supersedes the construction-time rejection landed as 7a5d72d34. That
+        guard applied this same predicate to REJECT the config, but the
+        rejection was wrong: for an overwrite that does not read its target
+        (``total = row['price'] * row['qty']`` over a source that already
+        carries ``total``) an upstream row DOES satisfy the contract, so the
+        guard's "no upstream row can ever satisfy" claim was false and it
+        rejected canonical data cleaning. Demotion is correct on both arms:
+        absent -> created, present -> overwritten.
+        """
+        created, _undecidable = self._analyse_operation_reads()
+        return created
+
+    def _analyse_operation_reads(self) -> tuple[frozenset[str], dict[str, str]]:
+        """Classify every target as read, created, or undecidable.
+
+        Returns ``(created_before_read, {undecidable_target: blocking_expression})``.
+
+        Abstention is scoped to the TARGET, never to the whole operation list.
+        An unresolvable subscript makes it impossible to know which fields THAT
+        expression reads, so it can only cast doubt on targets not yet proven to
+        be read; a target with a literal read of its own name is settled, and a
+        sibling operation's dynamic key cannot unsettle it. Abandoning the whole
+        analysis on the first unresolvable read (as this did originally) rejected
+        provably-fine configs — the same false-unsatisfiability claim the
+        7a5d72d34 guard was retracted for.
+
+        KNOWN RESIDUAL, ACCEPTED DELIBERATELY — DO NOT ADD A GUARD FOR IT.
+        Per-target scoping means a dynamic read is no longer treated as reading
+        everything, and a dynamic key can name ANY field at runtime, including
+        one that was demoted. Concretely::
+
+            [{total: "row['price']*2"}, {x: "row[row['k']]"}]   # total demoted, BUILDS
+
+        Two properties keep that safe, and they are why no guard is warranted:
+
+        * Operations apply SEQUENTIALLY to a mutating working copy (``process``
+          deep-copies the row, then writes each target back before the next
+          expression is evaluated). In the ordering above ``total`` already
+          exists when the dynamic read runs, so that read sees the COMPUTED
+          value, never the input — demotion cannot affect it.
+        * The genuinely unsafe shape is a dynamic read ordered BEFORE a demoted
+          target's assignment, and that shape is ALREADY REJECTED here: such a
+          read leaves the later target undecidable, so a declared-required
+          target trips the validator below. Swapping the two operations above
+          turns the config from BUILDS into a construction error.
+
+        What is left is a dynamic key that resolves to a demoted field never
+        assigned earlier — which fails as a KeyError from the dynamic key
+        itself, a hazard inherent to non-literal subscripts rather than one
+        demotion introduces. No shipped config uses a dynamic key at all
+        (``row[row[`` appears nowhere in examples/, tests/fixtures/ or docs/).
+        The conservative alternative is whole-list abstention, which is exactly
+        the behaviour removed above for rejecting configs that work today: a
+        live false-reject is not worth trading for a theoretical one.
+        """
+        assigned: set[str] = set()
+        read_before_assign: set[str] = set()
+        undecidable: dict[str, str] = {}
+        blocking_expression: str | None = None
+
+        for op in self.operations:
+            reads = op.get_parser().static_field_reads()
+            # Literal reads resolve even in an expression that is incomplete
+            # overall, and they count before this operation's own assignment.
+            read_before_assign |= reads.fields - assigned
+            if not reads.complete and blocking_expression is None:
+                blocking_expression = op.expression
+            if op.target not in read_before_assign and blocking_expression is not None:
+                # Some earlier-or-current expression could have read this target
+                # before it was assigned; we cannot prove it is created here.
+                undecidable[op.target] = blocking_expression
+            assigned.add(op.target)
+
+        created = frozenset(assigned - read_before_assign - set(undecidable))
+        return created, undecidable
+
     @model_validator(mode="after")
-    def _reject_required_inputs_created_by_operations(self) -> ValueTransformConfig:
-        """Reject a config whose required schema fields are created, not consumed.
+    def _reject_unanalysable_reads_over_required_targets(self) -> ValueTransformConfig:
+        """Fail at construction when abstention would strand a required target.
 
-        The 'schema' block is this transform's INPUT contract: every required
-        field in it must arrive on the row. An operation target assigned
-        before any operation reads it is CREATED by this transform, so
-        declaring it required on input is self-contradictory — every row
-        would fail input validation at runtime (elspeth-5955a9c421). Reject
-        at construction so both authoring surfaces fail closed.
+        A dynamic subscript (``row[row['k']]``) makes it impossible to prove
+        whether a target is read or created, so the target cannot safely be
+        demoted and stays required on input. Left alone that rejects EVERY row
+        at runtime with a generic "field required" and no hint that the analysis
+        abstained. Reject here instead, naming the expression and the fixes.
 
-        Overwrites stay legal: an operation that reads its own target (or any
-        target read before its first assignment) is a genuine input consumer.
-        The analysis is conservative — a read that cannot be statically
-        resolved to a literal key disables the guard rather than guessing.
+        Deliberately much narrower than the guard removed from 7a5d72d34: that
+        one fired when the analysis SUCCEEDED and proved the field was created,
+        which is exactly the case demotion now handles. This one fires only for a
+        target whose OWN status is undecidable — a provable read or a provable
+        creation is never rejected, whatever a sibling operation does.
         """
         declared_fields = self.schema_config.fields
         if not declared_fields:
@@ -138,26 +235,22 @@ class ValueTransformConfig(TransformDataConfig):
         if not required_on_input:
             return self
 
-        assigned: set[str] = set()
-        read_before_assign: set[str] = set()
-        for op in self.operations:
-            reads = op.get_parser().static_field_reads()
-            if not reads.complete:
-                return self
-            read_before_assign |= reads.fields - assigned
-            assigned.add(op.target)
+        _created, undecidable = self._analyse_operation_reads()
+        stranded = sorted(required_on_input & set(undecidable))
+        if not stranded:
+            return self
 
-        contradicted = sorted((required_on_input & assigned) - read_before_assign)
-        if contradicted:
-            raise ValueError(
-                f"schema.fields declares {contradicted} as required input, but the "
-                f"operations create these fields: each is assigned before any operation reads "
-                f"it, so no upstream row can ever satisfy the input contract and every row "
-                f"would fail input validation at runtime. Remove these fields from "
-                f"'schema.fields' (operation targets are automatically guaranteed on output), "
-                f"or declare them with 'required': false to type an optional input."
-            )
-        return self
+        blocking = undecidable[stranded[0]]
+        raise ValueError(
+            f"schema.fields declares {stranded} as required input, and these are also "
+            f"operation targets whose read/create status cannot be determined: the "
+            f"expression {blocking!r} has a non-literal subscript key, so it is "
+            f"impossible to prove whether these fields arrive on the row or are created "
+            f"here. They are therefore left required, and if they are in fact created "
+            f"every row will fail input validation at runtime. Either use a literal key "
+            f"so the reads can be resolved, or declare these fields with "
+            f"'required': false."
+        )
 
 
 # =============================================================================
@@ -182,7 +275,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8c24181221a99546"
+    source_file_hash: str | None = "sha256:69c86168099b080d"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -220,6 +313,10 @@ class ValueTransform(BaseTransform):
         # The executor's field collision check only runs when this is non-empty.
         self.declared_output_fields: frozenset[str] = frozenset()
 
+        # ...so the input-demotion set is computed separately: the targets this
+        # transform creates rather than consumes (elspeth-d6eeb3a71d).
+        self._self_created_input_fields = cfg.created_before_read_targets()
+
         self._output_schema_config = self._build_value_transform_output_schema_config(cfg)
 
         self.input_schema, self.output_schema = self._create_schemas(
@@ -227,6 +324,15 @@ class ValueTransform(BaseTransform):
             "ValueTransform",
             adds_fields=True,
         )
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: value_transform keeps declared_output_fields empty by design.
+
+        The demotion set is the operation targets created rather than consumed,
+        which the base class default (``declared_output_fields``) cannot see.
+        """
+        return self._self_created_input_fields
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

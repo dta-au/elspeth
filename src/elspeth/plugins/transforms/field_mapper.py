@@ -117,7 +117,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:801d37e5d5962e5c"
+    source_file_hash: str | None = "sha256:ba441ecf2df78bc7"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -162,6 +162,12 @@ class FieldMapper(BaseTransform):
 
         self.declared_output_fields = self._derive_declared_output_fields(cfg)
 
+        # Wider than declared_output_fields: every rename target is CREATED here
+        # whenever its source arrives, even when it is not GUARANTEED (non-strict
+        # mode, or a source that only resolves at runtime). Requiring any of them
+        # on input is the elspeth-d6eeb3a71d trap, so all of them demote.
+        self._self_created_input_fields = frozenset(target for source, target in cfg.mapping.items() if source != target)
+
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,
             "FieldMapper",
@@ -192,6 +198,11 @@ class FieldMapper(BaseTransform):
         if cfg.strict:
             return True
         return cls._is_static_normalized_source(source) and source in base_guaranteed
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: every rename target may be created, not just the guaranteed ones."""
+        return self._self_created_input_fields
 
     @classmethod
     def _derive_declared_output_fields(cls, cfg: FieldMapperConfig) -> frozenset[str]:

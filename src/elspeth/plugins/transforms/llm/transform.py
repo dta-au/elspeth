@@ -1150,12 +1150,15 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         queries is None     → SingleQueryStrategy
     """
 
+    # response_field names the row field the LLM response is WRITTEN to
+    # ("Field name for LLM response in output"), not a column that is read.
+    output_naming_config_keys = frozenset({"response_field"})
     name = "llm"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:61627311cc1fc02d"
+    source_file_hash: str | None = "sha256:f263d3532dc7894a"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

@@ -108,7 +108,7 @@ class BatchDistributionProfile(BaseTransform):
     name = "batch_distribution_profile"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7c94c90a777de0b3"
+    source_file_hash: str | None = "sha256:3515c098fc194ed5"
     config_model = BatchDistributionProfileConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -178,6 +178,23 @@ class BatchDistributionProfile(BaseTransform):
             adds_fields=True,
         )
         self._output_schema_config = self._build_output_schema_config(schema_config)
+
+    @property
+    def self_created_input_fields(self) -> frozenset[str]:
+        """Override: every key the profile may WRITE, guaranteed or not.
+
+        ``_PROFILE_OUTPUT_KEYS`` is already the guaranteed set plus the
+        conditional ``missing_indices`` / ``non_finite_indices`` diagnostics —
+        the same union the group_by collision check uses. Without the
+        conditional half, declaring one of those in ``schema.fields`` still
+        demanded it on input (elspeth-d6eeb3a71d); this mirrors
+        ``BatchStats._all_possible_output_keys``.
+
+        It excludes ``group_by`` by construction, which is correct here and
+        belt-and-braces anyway: ``consumed_input_fields`` subtracts every
+        config-named column before demotion.
+        """
+        return _PROFILE_OUTPUT_KEYS
 
     def _build_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
         """Describe the profile output shape without propagating input fields."""

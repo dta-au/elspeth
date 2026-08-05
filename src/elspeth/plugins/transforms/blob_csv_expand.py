@@ -154,10 +154,13 @@ def _build_blob_csv_output_schema_config(schema_config: SchemaConfig, cfg: BlobC
 class BlobCSVExpand(BaseTransform):
     """Parse a CSV blob and emit one output row per CSV data row."""
 
+    # blob_ref_field is the INPUT column ("Input field containing a payload-store
+    # content hash"); row_index_field names an emitted field.
+    output_naming_config_keys = frozenset({"row_index_field"})
     name = "blob_csv_expand"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e50a0a00fc42e7b4"
+    source_file_hash: str | None = "sha256:d0d39d8c19a8d988"
     config_model = BlobCSVExpandConfig
     usage_when_to_use: str = (
         "Use when each input row carries a payload-store reference to a CSV blob and you need to "
