@@ -603,6 +603,65 @@ def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDec
     return PipelineMutationIntentDecision.AMBIGUOUS
 
 
+def carries_build_action(message: str) -> bool:
+    """Return whether a message asks for pipeline construction at all.
+
+    This is a DISCLOSURE decision, not an authority decision, and it is
+    deliberately not expressed in terms of
+    :class:`PipelineMutationIntentDecision` (issue elspeth-a6a2ed6b1d).
+    That enum reaches ``AMBIGUOUS`` through two early returns that never
+    test content — the input-size ceiling and the unbalanced-quote guard
+    — so gating disclosure on ``is not CONVERSATIONAL`` let an oversize
+    or unbalanced-quote greeting fail open into a build-failure notice.
+    Here the content test always runs.
+
+    Three deliberate calls, none of them inherited:
+
+    * **No size ceiling.** ``classify_pipeline_mutation_intent`` caps
+      input because granting *mutation authority* over unbounded text is
+      unsafe. Disclosure grants nothing, and failing closed on length
+      would re-create the withholding defect for the realistic "here is
+      my 6KB CSV, build me a pipeline that ..." shape. The search is a
+      single linear alternation.
+    * **Unbalanced quotes fall back to the raw message.** A balanced
+      strip is worth keeping: it stops quoted material being read as a
+      command, so ``What does "build a pipeline" mean?`` carries no
+      build action. When the strip is unreliable it would instead
+      swallow the tail of the message, hiding a real request, so the raw
+      text is searched — erring toward disclosure, the direction this
+      issue exists to correct.
+    * **Request revocation is NOT consulted**, though it was tried.
+      ``_REQUEST_REVOCATION_PATTERN`` looks like free reuse, but the
+      intent grammar only ever applies it inside
+      ``_matches_complete_multi_clause_pipeline_request``, where a
+      fullmatch production has already constrained the message shape.
+      As a bare search over free prose it misfires on ordinary English:
+      it suppressed disclosure for acceptance intents g07/g07r, whose
+      "Build me a pipeline that runs Amazon Textract ..." request also
+      contains "... rather than have the whole run stop." Suppressing a
+      real build request re-creates the exact defect this predicate
+      exists to fix, so the revocation false-positives below are the
+      lesser harm.
+
+    Known imprecision, deliberately not hand-tuned: the underlying verb
+    alternation has no object requirement, so revocations ("Do not build
+    anything"), non-imperative uses ("I make heavy use of CSV files"),
+    and capability questions ("Are you able to run pipelines yourself?")
+    all report True and will draw an empty-state notice they should not.
+    Narrowing by excluding interrogatives is ruled out by evidence
+    rather than taste — "Can you build a pipeline that ...?" is a
+    genuine build request this predicate must keep admitting. Narrowing
+    the verb list by intuition is how this grammar became fragile in the
+    first place; it wants a sampled corpus of conversational traffic,
+    which does not exist yet.
+    """
+    unquoted_text, quotes_balanced, _quoted_material_seen = _strip_quoted_text(message)
+    candidate = " ".join((unquoted_text if quotes_balanced else message).split())
+    if not candidate:
+        return False
+    return _ANY_MUTATION_ACTION_PATTERN.search(candidate) is not None
+
+
 def is_referential_pipeline_mutation_intent(message: str) -> bool:
     """Return whether an admitted mutation request depends on prior prose.
 

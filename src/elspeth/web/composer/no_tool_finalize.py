@@ -17,13 +17,10 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.web.composer.discovery_cache import RuntimePreflightCache as _RuntimePreflightCache
 from elspeth.web.composer.no_tool_policy import (
-    PipelineMutationIntentDecision as _PipelineMutationIntentDecision,
-)
-from elspeth.web.composer.no_tool_policy import (
     blocking_result_from_tool_invocations as _blocking_result_from_tool_invocations,
 )
 from elspeth.web.composer.no_tool_policy import (
-    classify_pipeline_mutation_intent as _classify_pipeline_mutation_intent,
+    carries_build_action as _carries_build_action,
 )
 from elspeth.web.composer.no_tool_policy import (
     compose_empty_state_message as _compose_empty_state_message,
@@ -82,8 +79,9 @@ async def finalize_no_tool_response(
     ``routes._composer_history_content`` discriminator depends on the
     ``content`` / ``raw_assistant_content`` relationship below):
 
-    1. **No-mutation empty-state augmentation** — user asked for a
-       build-style action, no successful mutation has been seen this
+    1. **No-mutation empty-state augmentation** — the user's message
+       carried a build action (``carries_build_action``), no successful
+       mutation has been seen this
        turn, and the state is structurally empty. The model's prose
        is passed through verbatim with an operator-facing suffix
        appended (concrete blocker if a tool failed). ``content``
@@ -144,7 +142,8 @@ async def finalize_no_tool_response(
         session_scope: Scope identifier for cache + telemetry.
         user_message: The user's message that triggered this turn.
             Used to detect "build-style" requests for the
-            no-mutation empty-state augmentation path.
+            no-mutation empty-state augmentation path; a purely
+            conversational message suppresses that path.
         mutation_success_seen: Whether any mutating tool call
             succeeded this turn. Suppresses the no-mutation
             augmentation path.
@@ -160,7 +159,7 @@ async def finalize_no_tool_response(
     path — they are not caught here.
     """
     if (
-        _classify_pipeline_mutation_intent(user_message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
+        _carries_build_action(user_message)
         and not mutation_success_seen
         and _state_is_structurally_empty(state)
         and not _last_mutation_was_pending_proposal(tool_invocations)
@@ -174,6 +173,41 @@ async def finalize_no_tool_response(
         # output from both the user and (via routes._composer_history_content)
         # from the model itself on subsequent turns
         # (cf. elspeth-861b0c58f5).
+        #
+        # Disclosure is gated on _carries_build_action, NOT on the
+        # mutation-intent enum (issue elspeth-a6a2ed6b1d). This branch
+        # previously required EXPLICIT_MUTATION, which is a packaging
+        # verdict — the grammar fullmatches the whole normalised message
+        # from character 0 and treats a single "?" anywhere as a hard
+        # disqualifier. Over the acceptance corpus that split
+        # otherwise-identical requests: 14 of 18 phrasings classified
+        # AMBIGUOUS and silently lost the explanation of why nothing got
+        # built. Whether a user is owed that explanation cannot turn on
+        # the article after the verb.
+        #
+        # Gating on "is not CONVERSATIONAL" instead was tried and
+        # rejected on review: AMBIGUOUS is also reached by two early
+        # returns that never test content (the input-size ceiling and
+        # the unbalanced-quote guard), so an oversize or
+        # unbalanced-quote greeting failed OPEN into a build-failure
+        # notice. The named predicate always runs the content test, so
+        # neither short-circuit decides disclosure. Routing is
+        # unaffected: the surface-selection call sites read
+        # classify_pipeline_mutation_intent, which this path no longer
+        # consults.
+        #
+        # Known consequence: taking this branch pre-empts
+        # check_state_claim_grounding below. For prose that falsely
+        # claims work was done, the operator gets this notice (empty
+        # state plus the concrete blocker) instead of the sharper
+        # grounding correction naming the contradiction. Both contradict
+        # the false claim, so this is not a safety regression, and the
+        # blocker cause is the more actionable half. Composing the two
+        # was considered and deferred: _canonical_trusted_suffix_segments
+        # recognises a CLOSED set of suffix shapes, so a naively
+        # concatenated suffix would fail closed to a single untrusted
+        # text segment and lose the trusted chrome entirely. Composing
+        # therefore needs a new canonical shape, not a bigger f-string.
         #
         # Exception: APPROVAL_REQUIRED proposals are not failures. Under
         # explicit_approve trust mode the build SUCCEEDED — the work is
