@@ -4611,7 +4611,7 @@ class CompositionState:
         # Generic semantic-contract check.
         from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 
-        semantic_errors, semantic_contracts = validate_semantic_contracts(self)
+        semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(self)
         errors.extend(semantic_errors)
 
         numeric_contract_errors, numeric_contract_warnings = _batch_distribution_profile_value_field_entries(self.sources, self.nodes)
@@ -4621,6 +4621,7 @@ class CompositionState:
         warnings: list[ValidationEntry] = []
         _warn = ValidationEntry
         warnings.extend(numeric_contract_warnings)
+        warnings.extend(semantic_warnings)
         from elspeth.web.interpretation_state import prompt_shield_recommendation_warning_pairs
 
         for component, message in prompt_shield_recommendation_warning_pairs(self):

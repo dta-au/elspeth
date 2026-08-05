@@ -789,7 +789,12 @@ def validate_semantic_evidence(
     secret: SecretValidatedState,
 ) -> PhaseReport[AuthoredValidatedState] | PhaseFailure:
     """Validate and serialize authored semantic edge contracts."""
-    semantic_errors, semantic_contracts = validate_semantic_contracts(secret.policy.state)
+    # Advisory (UNKNOWN + WARN) findings do not block execution: they mark a
+    # dimension no producer in the registry can declare, and the runtime's
+    # ``on_error`` route already handles a value that turns out wrong. Blocking
+    # would make the consumer plugin unwireable while the YAML path — which has
+    # no semantic gate at all — runs the same pipeline clean.
+    semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(secret.policy.state)
     responses = tuple(serialize_semantic_contracts(semantic_contracts))
     if semantic_errors:
         return PhaseFailure(
@@ -814,7 +819,12 @@ def validate_semantic_evidence(
             readiness=_blocked_readiness(code="semantic_contracts", detail="Semantic contract check failed."),
             semantic_contracts=responses,
         )
-    detail = f"All {len(semantic_contracts)} semantic contract(s) satisfied" if semantic_contracts else "No semantic contracts to check"
+    if not semantic_contracts:
+        detail = "No semantic contracts to check"
+    elif semantic_warnings:
+        detail = f"{len(semantic_contracts)} semantic contract(s) checked, {len(semantic_warnings)} advisory"
+    else:
+        detail = f"All {len(semantic_contracts)} semantic contract(s) satisfied"
     return PhaseReport(
         artifact=AuthoredValidatedState.from_secret_evidence(secret, semantic_contracts=responses),
         checks=(ValidationCheck(name=CHECK_SEMANTIC_CONTRACTS, passed=True, detail=detail, affected_nodes=(), outcome_code=None),),

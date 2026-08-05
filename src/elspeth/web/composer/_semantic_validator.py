@@ -7,6 +7,15 @@ requirements per field. Emits structured SemanticEdgeContract records
 and high-severity ValidationEntry errors on CONFLICT or on UNKNOWN +
 FAIL policy.
 
+UNKNOWN + WARN emits an advisory ValidationEntry instead of an error.
+WARN is for a requirement whose dimension no producer in the registry
+can currently declare: blocking on it would make the consumer plugin
+unwireable rather than fail-closed, while dropping it silently would
+hide a real contract gap. The warning discloses the gap and leaves the
+runtime's ``on_error`` route to handle a value that turns out wrong.
+Reserve it for that case — a requirement with a real declarer (see
+``line_explode``, satisfied by ``web_scrape``) must keep FAIL.
+
 This module reuses ProducerResolver — there must be exactly ONE
 walk-back implementation across composer state.
 
@@ -188,14 +197,17 @@ def _targeted_conflict_repair_hint(
 
 def validate_semantic_contracts(
     state: CompositionState,
-) -> tuple[tuple[ValidationEntry, ...], tuple[SemanticEdgeContract, ...]]:
+) -> tuple[tuple[ValidationEntry, ...], tuple[ValidationEntry, ...], tuple[SemanticEdgeContract, ...]]:
     """Validate semantic contracts across the composition.
 
-    Returns (errors, contracts):
+    Returns (errors, warnings, contracts):
     - errors: ValidationEntry records suitable for ValidationSummary.errors
+    - warnings: advisory records for ValidationSummary.warnings, raised on
+      UNKNOWN + WARN policy — disclosed but non-blocking
     - contracts: SemanticEdgeContract records for ValidationSummary.semantic_contracts
     """
     errors: list[ValidationEntry] = []
+    warnings: list[ValidationEntry] = []
     contracts: list[SemanticEdgeContract] = []
     seen_edges: set[tuple[str, str, str, str]] = set()
 
@@ -248,20 +260,22 @@ def validate_semantic_contracts(
                     outcome=SemanticOutcome.UNKNOWN,
                 )
                 contracts.append(contract)
-                if req.unknown_policy is UnknownSemanticPolicy.FAIL:
-                    errors.append(
-                        ValidationEntry(
-                            f"node:{node.id}",
-                            (
-                                f"Semantic contract: '{node.plugin}' node '{node.id}' "
-                                f"requires field '{req.field_name}' "
-                                f"({req.requirement_code}) but the upstream producer is "
-                                f"undeclared (coalesce, ambiguous, or unreachable)."
-                            ),
-                            cast(Severity, req.severity),
-                            "semantic_contract_violation",
-                        )
+                if req.unknown_policy is not UnknownSemanticPolicy.ALLOW:
+                    entry = ValidationEntry(
+                        f"node:{node.id}",
+                        (
+                            f"Semantic contract: '{node.plugin}' node '{node.id}' "
+                            f"requires field '{req.field_name}' "
+                            f"({req.requirement_code}) but the upstream producer is "
+                            f"undeclared (coalesce, ambiguous, or unreachable)."
+                        ),
+                        cast(Severity, req.severity),
+                        "semantic_contract_violation",
                     )
+                    if req.unknown_policy is UnknownSemanticPolicy.FAIL:
+                        errors.append(entry)
+                    else:
+                        warnings.append(entry)
             continue
 
         producer_decl = _safe_output_semantics(upstream_producer)
@@ -331,7 +345,7 @@ def validate_semantic_contracts(
                         ),
                     )
                 )
-            elif outcome is SemanticOutcome.UNKNOWN and req.unknown_policy is UnknownSemanticPolicy.FAIL:
+            elif outcome is SemanticOutcome.UNKNOWN and req.unknown_policy is not UnknownSemanticPolicy.ALLOW:
                 producer_label = upstream_producer.plugin_name if upstream_producer.plugin_name is not None else "(unknown plugin)"
                 if facts is None:
                     semantic_detail = (
@@ -347,23 +361,25 @@ def validate_semantic_contracts(
                         f"text_framing={facts.text_framing.value}, "
                         f"value_type={facts.value_type.value}."
                     )
-                errors.append(
-                    ValidationEntry(
-                        f"node:{node.id}",
-                        (
-                            f"Semantic contract: '{node.plugin}' node '{node.id}' "
-                            f"requires field '{req.field_name}' "
-                            f"({req.requirement_code}) but upstream producer "
-                            f"'{upstream_producer.producer_id}' ({producer_label}) "
-                            f"{semantic_detail}"
-                        ),
-                        cast(Severity, req.severity),
-                        "semantic_contract_violation",
-                        contract=SchemaContractDetail(
-                            producer=upstream_producer.producer_id,
-                            consumer=node.id,
-                        ),
-                    )
+                entry = ValidationEntry(
+                    f"node:{node.id}",
+                    (
+                        f"Semantic contract: '{node.plugin}' node '{node.id}' "
+                        f"requires field '{req.field_name}' "
+                        f"({req.requirement_code}) but upstream producer "
+                        f"'{upstream_producer.producer_id}' ({producer_label}) "
+                        f"{semantic_detail}"
+                    ),
+                    cast(Severity, req.severity),
+                    "semantic_contract_violation",
+                    contract=SchemaContractDetail(
+                        producer=upstream_producer.producer_id,
+                        consumer=node.id,
+                    ),
                 )
+                if req.unknown_policy is UnknownSemanticPolicy.FAIL:
+                    errors.append(entry)
+                else:
+                    warnings.append(entry)
 
-    return tuple(errors), tuple(contracts)
+    return tuple(errors), tuple(warnings), tuple(contracts)

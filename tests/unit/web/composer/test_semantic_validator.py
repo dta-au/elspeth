@@ -184,7 +184,8 @@ class TestValidateSemanticContracts:
 
     def test_compact_text_produces_conflict(self):
         state = _wardline_state(text_separator=" ", scrape_format="text")
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
 
         assert len(errors) == 1
         error = errors[0]
@@ -214,7 +215,8 @@ class TestValidateSemanticContracts:
 
     def test_newline_text_passes(self):
         state = _wardline_state(text_separator="\n", scrape_format="text")
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert errors == ()
         assert len(contracts) == 1
         assert contracts[0].outcome is SemanticOutcome.SATISFIED
@@ -222,7 +224,8 @@ class TestValidateSemanticContracts:
 
     def test_markdown_passes(self):
         state = _wardline_state(scrape_format="markdown")
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert errors == ()
         assert contracts[0].outcome is SemanticOutcome.SATISFIED
         assert contracts[0].producer_facts.content_kind is ContentKind.MARKDOWN
@@ -278,7 +281,8 @@ class TestValidateSemanticContracts:
                 ),
             ),
         )
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert len(errors) == 1
         assert errors[0].component == "node:explode"
         assert "source" in errors[0].message
@@ -346,7 +350,8 @@ class TestValidateSemanticContracts:
                 ),
             ),
         )
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert len(errors) == 1
         assert errors[0].component == "node:explode"
         assert "source:orders" in errors[0].message
@@ -430,7 +435,8 @@ class TestValidateSemanticContracts:
                 ),
             ),
         )
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
 
         assert len(contracts) == 1
         assert contracts[0].outcome is SemanticOutcome.UNKNOWN
@@ -537,7 +543,8 @@ class TestValidateSemanticContracts:
                 ),
             ),
         )
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert errors == ()  # markdown is line-compatible
         assert len(contracts) == 1
         assert contracts[0].outcome is SemanticOutcome.SATISFIED
@@ -629,7 +636,8 @@ class TestLLMJsonExplodeRegression:
         """Pin p2_t4_stress: LLM response_field is a string, not a list."""
         state = self._llm_to_json_explode_state()
 
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
 
         assert len(errors) == 1
         assert errors[0].component == "node:parse_classification"
@@ -793,7 +801,8 @@ class TestWardlineRegressionPin:
 
     def test_wardline_broken_yaml_blocked_by_semantic_validator(self) -> None:
         state = self._wardline_broken_yaml_state()
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
 
         assert len(errors) == 1
         assert errors[0].component == "node:split_lines"
@@ -825,7 +834,8 @@ class TestWardlineRegressionPin:
         — not just one that makes it too loose.
         """
         state = self._wardline_fixed_yaml_state()
-        errors, contracts = validate_semantic_contracts(state)
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
         assert errors == ()
         assert len(contracts) == 1
         assert contracts[0].outcome is SemanticOutcome.SATISFIED
@@ -923,9 +933,11 @@ class TestSemanticValidatorSecretLeakage:
             ),
         )
 
-        errors, contracts = validate_semantic_contracts(state)
-        for entry in errors:
-            assert self.SENTINEL not in entry.message, f"Sentinel leaked in error message: {entry.message!r}"
+        errors, warnings, contracts = validate_semantic_contracts(state)
+        # No warnings == () pin here: it would make the sweep below vacuous.
+        # This test guards the sentinel across EVERY validator output channel.
+        for entry in (*errors, *warnings):
+            assert self.SENTINEL not in entry.message, f"Sentinel leaked in validator output: {entry.message!r}"
             assert self.SENTINEL not in entry.component
         for contract in contracts:
             assert self.SENTINEL not in repr(contract)

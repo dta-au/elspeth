@@ -1191,7 +1191,10 @@ class ExecutionServiceImpl:
             ) from exc
         composition_state = authored_state
 
-        semantic_errors, semantic_contracts = validate_semantic_contracts(composition_state)
+        # Advisory (UNKNOWN + WARN) findings are deliberately not raised here —
+        # see validate_semantic_evidence for the rationale. Only FAIL-policy
+        # violations block a run.
+        semantic_errors, _semantic_warnings, semantic_contracts = validate_semantic_contracts(composition_state)
         if semantic_errors:
             raise SemanticContractViolationError(
                 entries=semantic_errors,

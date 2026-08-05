@@ -60,7 +60,48 @@ def _build_json_explode_input_requirements(
                 requirement_code="json_explode.array_field.list",
                 accepted_value_types=frozenset({SemanticValueType.LIST}),
                 severity="high",
-                unknown_policy=UnknownSemanticPolicy.FAIL,
+                # WARN, not FAIL. No plugin declares SemanticValueType.LIST as
+                # a fact — it appears only here, as a requirement — so FAIL made
+                # json_explode unwireable from EVERY producer, web_scrape
+                # included (it declares content_kind/text_framing, never
+                # value_type).
+                #
+                # That gap follows from the row model and no declaration can
+                # close it. ELSPETH's atomic unit is one row and a row field
+                # holds a DISCRETE value; the schema DSL offers
+                # str/int/float/bool by design, not omission. A list is never a
+                # resting field value — it rides in an ``any`` field only for as
+                # long as it takes deaggregation to explode it into rows. So
+                # LIST is coherent as a REQUIREMENT (this transform really does
+                # need a real list at the instant it explodes) yet structurally
+                # undeclarable as a FACT. Declaring LIST for an ``any`` field to
+                # satisfy it would trade a fail-closed false-reject for a
+                # false-accept and misstate the row contract.
+                #
+                # ADR-008 §Alternative 3 and ADR-014 §Tier classification draw
+                # the line this sits on: a DECLARATION LIE is Tier 1 and must
+                # crash, but a wrong VALUE is not that. A non-list here is one
+                # row's value with no plugin having lied — nothing can declare
+                # the property in the first place. ADR-003 §Validation Semantics
+                # already skips static validation when a schema is dynamic; WARN
+                # keeps that posture but discloses the gap rather than staying
+                # silent.
+                #
+                # Note the module docstring's trust model: this transform
+                # deliberately does not soften a wrong type, because the SOURCE
+                # is supposed to have validated it. For a list-shaped field the
+                # source cannot — the DSL types it ``any``, which validates
+                # nothing. So all three candidate checkpoints (source schema,
+                # this static gate, plugin-level on_error) are blind to it by
+                # construction, and the only real one is process(), which
+                # detects a non-list at the row boundary and raises with an
+                # explicit diagnostic. Holding the static gate at FAIL rejected
+                # every valid pipeline to pre-empt a case that surfaces loudly
+                # and legibly when it does occur.
+                #
+                # A CONFLICT — e.g. llm declaring STR — remains a hard error.
+                # Restore FAIL if a producer ever declares LIST honestly.
+                unknown_policy=UnknownSemanticPolicy.WARN,
                 configured_by=("array_field",),
             ),
         ),
@@ -177,7 +218,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7ab4c0d936735f9d"
+    source_file_hash: str | None = "sha256:8522aea8229dac1d"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -261,8 +302,10 @@ class JSONExplode(BaseTransform):
                 issue_code=None,
                 summary="Deaggregate a list-valued field — emits one row per array element, preserving sibling fields and optionally adding an item_index.",
                 composer_hints=(
-                    "array_field MUST hold a real list (value_type=list). A JSON-looking string does NOT count — insert a parser first.",
-                    "Single-query LLM responses are strings. Do not wire response_field directly to json_explode; explode after parsing.",
+                    "Feed array_field from a source that natively parses structured data — a json source reading nested arrays puts a real list in the row.",
+                    "Type that field 'any' in the source schema and give json_explode schema {mode: observed}. ELSPETH rows hold discrete values, so the schema DSL has no list type; 'any' is how a list rides to the explode. See examples/json_explode.",
+                    "A JSON-looking STRING is not an array_field, and there is no transform that parses one into a list — the value must arrive list-shaped from the source.",
+                    "Single-query LLM responses are strings, so do not wire response_field directly to json_explode.",
                     "Sibling fields are duplicated onto every emitted row — that's by design for fan-out lineage.",
                 ),
             )
@@ -277,8 +320,8 @@ class JSONExplode(BaseTransform):
                 "contains JSON-looking text."
             ),
             suggested_fixes=(
-                "Point array_field at a source or transform output that declares value_type=list.",
-                "If the upstream value is JSON text, insert an explicit parser/validator transform that emits a real list before json_explode.",
+                "Read the data with a source that parses structure natively — a json source over nested arrays delivers a real list. Type the field 'any' in the source schema and give json_explode schema {mode: observed}; examples/json_explode is the working shape.",
+                "Do not look for a parser transform to convert JSON text into a list — none exists, and type_coerce only targets int/float/bool/str. Change where the data enters the pipeline instead.",
                 "For single-query llm output, do not wire response_field directly to json_explode; the response_field is a string.",
             ),
         )
