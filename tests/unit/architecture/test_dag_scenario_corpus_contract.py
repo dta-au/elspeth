@@ -439,7 +439,11 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for index, locator in enumerate(locators, start=1)
 )
 EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb84c65a0b5100f4354830f9"
-EXPECTED_CASE_REGISTRY_SHA256 = "072e01d26838718275d7112d647c65c8b36b6bfa6959f981e235d3dce177678e"
+# Digests the FULL case content, so it moves whenever a pinned expected
+# projection does — including a plugin ``source_file_hash`` refresh reaching the
+# corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
+# (elspeth-7a2c9a24c3): the manifest's expected node record carries that hash.
+EXPECTED_CASE_REGISTRY_SHA256 = "17b7b1420473619af2eb5f07bfb12869aaba3b4a3e497d2a3ba88e94a4f836d2"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

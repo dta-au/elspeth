@@ -139,6 +139,33 @@ def _allow_raw_secrets_in_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "true")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_planner_authoring_aids_memo() -> Iterator[None]:
+    """Clear the process-global authoring-aids memo between tests.
+
+    ``build_planner_authoring_aids`` memoizes on ``snapshot_hash`` alone
+    (``planner_authoring_aids._AIDS_MEMO``). That key is sound in production —
+    one plugin registry per process, so equal availability implies equal
+    catalog CONTENT — but tests violate the premise. ``StubCatalog`` in
+    ``test_prompts.py`` and ``_mock_catalog`` in
+    ``tests/unit/web/composer/conftest.py`` expose the identical plugin id set
+    (csv / passthrough / csv) and therefore hash identically, while carrying
+    different ``composer_hints``. Whichever built first won, and the other
+    silently received its aids.
+
+    That surfaced as ``test_context_includes_discovery_time_composer_hints``
+    failing only under the full suite, at whatever xdist distribution put both
+    on one worker — invisible to any scoped run. Isolate the memo rather than
+    weaken the production key, which is a measured cost optimisation
+    (elspeth-a79f1b2e6b).
+    """
+    from elspeth.web.composer.planner_authoring_aids import _AIDS_MEMO
+
+    _AIDS_MEMO.clear()
+    yield
+    _AIDS_MEMO.clear()
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _sink_effect_spool_outside_repo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
     """Keep the default sink-effect spool out of the repository tree.

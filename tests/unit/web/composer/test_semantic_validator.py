@@ -553,6 +553,88 @@ class TestValidateSemanticContracts:
         assert contracts[0].producer_plugin == "web_scrape"
 
 
+class TestUnknownWarnPolicyIsDisclosedNotBlocking:
+    """Positive coverage for the UNKNOWN + WARN branch (elspeth-7a2c9a24c3).
+
+    Every other case in this file pins ``warnings == ()``. Without these, both
+    ``else: warnings.append(entry)`` arms could be deleted and the suite would
+    stay green — the feature would be dead code from the suite's perspective.
+    """
+
+    def _json_source_to_json_explode_state(self) -> CompositionState:
+        """The examples/json_explode topology, verbatim.
+
+        This exact pipeline runs green under ``elspeth run`` and was rejected
+        by the composer before the WARN change.
+        """
+        return CompositionState(
+            metadata=PipelineMetadata(name="json-explode-green-example"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="json",
+                on_success="source_out",
+                options={
+                    "path": "orders.json",
+                    "schema": {"mode": "fixed", "fields": ["order_id: int", "items: any"]},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="explode",
+                    node_type="transform",
+                    plugin="json_explode",
+                    input="source_out",
+                    on_success="output",
+                    on_error="discard",
+                    options={
+                        "array_field": "items",
+                        "output_field": "item",
+                        "include_index": True,
+                        "schema": {"mode": "observed"},
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="output",
+                    plugin="json",
+                    options={"path": "order_items.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_unknown_producer_under_warn_policy_is_disclosed_not_blocking(self) -> None:
+        state = self._json_source_to_json_explode_state()
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == (), "A WARN-policy requirement must never block authoring"
+        assert len(warnings) == 1, "The gap must still be DISCLOSED, not silently dropped"
+        assert warnings[0].error_code == "semantic_contract_violation"
+        assert warnings[0].component == "node:explode"
+        assert "json_explode.array_field.list" in warnings[0].message
+        assert len(contracts) == 1
+        assert contracts[0].outcome is SemanticOutcome.UNKNOWN
+
+    def test_warn_advisory_reaches_the_validation_summary_warnings_channel(self) -> None:
+        """The advisory is worthless if it dies inside the validator."""
+        state = self._json_source_to_json_explode_state()
+        summary = state.validate()
+
+        assert summary.is_valid, "A WARN-policy requirement must not invalidate the composition"
+        assert any(entry.error_code == "semantic_contract_violation" for entry in summary.warnings), (
+            "The semantic advisory must surface in ValidationSummary.warnings, not be discarded between the validator and the summary."
+        )
+
+
 class TestLLMJsonExplodeRegression:
     def _llm_to_json_explode_state(self) -> CompositionState:
         return CompositionState(

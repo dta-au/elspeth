@@ -20,8 +20,25 @@ and simply removes the consumer from the product. WARN is the honest policy for
 a property only knowable per row — see ADR-008 §Alternative 3 and ADR-014 §Tier
 classification on declaration-lie vs row-level data error.
 
-Both rosters are discovered from a live ``PluginManager`` so a newly registered
-plugin cannot silently escape the check.
+Both rosters are discovered from a live ``PluginManager``, and a plugin that
+declares semantics but cannot be probed is a hard failure rather than a silent
+skip — that would be the same hole in miniature.
+
+KNOWN LIMITS, so nobody reads more assurance into this than it carries:
+
+* Facts are collected under each producer's ``probe_config()``, one arbitrary
+  configuration. ``web_scrape`` declares different ``content_kind`` /
+  ``text_framing`` per ``format``, so a requirement satisfiable only under a
+  non-probe config reads as unsatisfiable here, and one satisfiable only under
+  the probe config reads as satisfiable while being unwireable in practice.
+* Satisfiability ignores TOPOLOGY. It asks "does any registered plugin declare
+  a satisfying fact", not "can this consumer actually be wired downstream of
+  that producer". A requirement satisfied only by a producer that can never
+  legally precede the consumer would still pass.
+
+Both are strictly weaker than the defect this catches — a requirement no
+configuration of any plugin can satisfy — so the gate is worth having as-is.
+Tighten it if either limit ever hides a real defect.
 """
 
 from __future__ import annotations
@@ -46,8 +63,9 @@ def _registered_plugin_classes() -> tuple[type, ...]:
 def _probe_instance(plugin_cls: type) -> Any | None:
     """Instantiate via ``probe_config()``; None when the plugin cannot be probed.
 
-    A plugin that declares neither semantics nor a probe config contributes
-    nothing to either roster, so skipping it cannot mask a defect.
+    Callers MUST treat None as an error for a plugin that declares semantics —
+    see ``_semantics_instance``. Most sources and sinks have no ``probe_config``
+    and declare no semantics, so they legitimately contribute to neither roster.
     """
     probe_config = getattr(plugin_cls, "probe_config", None)
     if probe_config is None:
@@ -56,6 +74,28 @@ def _probe_instance(plugin_cls: type) -> Any | None:
         return plugin_cls(probe_config())
     except (NotImplementedError, TypeError):
         return None
+
+
+def _semantics_instance(plugin_cls: type, method_name: str) -> Any:
+    """Instance of a plugin that DECLARES semantics, or a loud failure.
+
+    Silently skipping an unprobeable declarer is the hole this whole file
+    exists to close. Most sources and sinks currently have no ``probe_config``
+    — including ``JSONSource``, which is exactly the producer that would
+    declare LIST if anyone ever made that declaration honest. If such a plugin
+    gained ``output_semantics()`` while being unprobeable, a silent skip would
+    leave the satisfiability check reporting the requirement as unsatisfiable
+    even though the fix had landed: the documented remediation would be
+    unreachable through its own gate. Fail instead, so the next author is told
+    to give the plugin a ``probe_config()``.
+    """
+    instance = _probe_instance(plugin_cls)
+    assert instance is not None, (
+        f"{plugin_cls.__name__} declares {method_name}() but cannot be probed — "
+        f"it has no usable probe_config(), so its semantics are invisible to this "
+        f"gate. Add probe_config() to the plugin; do not let a declarer be skipped."
+    )
+    return instance
 
 
 def _declares_own(plugin_cls: type, method_name: str) -> bool:
@@ -73,9 +113,7 @@ def _declared_facts() -> list[Any]:
     for plugin_cls in _registered_plugin_classes():
         if not _declares_own(plugin_cls, "output_semantics"):
             continue
-        instance = _probe_instance(plugin_cls)
-        if instance is None:
-            continue
+        instance = _semantics_instance(plugin_cls, "output_semantics")
         facts.extend(instance.output_semantics().fields)
     return facts
 
@@ -86,9 +124,7 @@ def _declared_requirements() -> list[tuple[type, Any]]:
     for plugin_cls in _registered_plugin_classes():
         if not _declares_own(plugin_cls, "input_semantic_requirements"):
             continue
-        instance = _probe_instance(plugin_cls)
-        if instance is None:
-            continue
+        instance = _semantics_instance(plugin_cls, "input_semantic_requirements")
         requirements.extend((plugin_cls, req) for req in instance.input_semantic_requirements().fields)
     return requirements
 

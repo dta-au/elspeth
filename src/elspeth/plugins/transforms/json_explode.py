@@ -108,6 +108,15 @@ def _build_json_explode_input_requirements(
                 #
                 # A CONFLICT — e.g. llm declaring STR — remains a hard error.
                 # Restore FAIL if a producer ever declares LIST honestly.
+                #
+                # SCOPE WARNING: unknown_policy applies to the whole
+                # requirement, not per dimension. This one constrains ONLY
+                # accepted_value_types (content_kinds and text_framings are
+                # empty above), so WARN covers exactly the undeclarable case
+                # argued here. If you add a content-kind or text-framing
+                # constraint to this requirement it silently inherits WARN and
+                # none of the reasoning above applies to it — split it into a
+                # second FieldSemanticRequirement with its own policy instead.
                 unknown_policy=UnknownSemanticPolicy.WARN,
                 configured_by=("array_field",),
             ),
@@ -225,7 +234,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cf4fe18251fa716e"
+    source_file_hash: str | None = "sha256:1102736a9a6b54f1"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "

@@ -2722,10 +2722,16 @@ class ComposerServiceImpl:
             # only: the message itself is Tier-3 authored text and must not be
             # logged.
             state_is_empty = _state_is_structurally_empty(state)
-            intent_is_explicit_mutation = _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
+            # Short-circuit on state_is_empty exactly as the original inline
+            # condition did, so the classifier stays a first-turn-only cost
+            # rather than running on every compose request. None in the log
+            # means "not evaluated" — a non-empty state already decided this.
+            intent_is_explicit_mutation = (
+                _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION if state_is_empty else None
+            )
             planner_eligible = (
                 state_is_empty
-                and intent_is_explicit_mutation
+                and intent_is_explicit_mutation is True
                 and guided_terminal is None
                 and self._sessions_service is not None
                 and session_id is not None
@@ -2745,7 +2751,7 @@ class ComposerServiceImpl:
             # cached boolean or a None check — the classifier does not re-run.
             if (
                 state_is_empty
-                and intent_is_explicit_mutation
+                and intent_is_explicit_mutation is True
                 and guided_terminal is None
                 and self._sessions_service is not None
                 and session_id is not None

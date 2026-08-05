@@ -41,6 +41,7 @@ from elspeth.contracts.enums import NodeStateStatus, RunStatus
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
+from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.blobs_inline import (
@@ -1193,8 +1194,24 @@ class ExecutionServiceImpl:
 
         # Advisory (UNKNOWN + WARN) findings are deliberately not raised here —
         # see validate_semantic_evidence for the rationale. Only FAIL-policy
-        # violations block a run.
-        semantic_errors, _semantic_warnings, semantic_contracts = validate_semantic_contracts(composition_state)
+        # violations block a run. They are still recorded: a run that proceeded
+        # with an unproven contract must not look identical to one where every
+        # contract was satisfied.
+        semantic_errors, semantic_warnings, semantic_contracts = validate_semantic_contracts(composition_state)
+        if semantic_warnings:
+            slog.info(
+                "semantic_contract_advisory_at_execute",
+                advisory_count=len(semantic_warnings),
+                affected_nodes=sorted({entry.component.removeprefix("node:") for entry in semantic_warnings}),
+                requirement_codes=sorted(
+                    {
+                        contract.requirement.requirement_code
+                        for contract in semantic_contracts
+                        if contract.outcome is SemanticOutcome.UNKNOWN
+                        and contract.requirement.unknown_policy is not UnknownSemanticPolicy.FAIL
+                    }
+                ),
+            )
         if semantic_errors:
             raise SemanticContractViolationError(
                 entries=semantic_errors,

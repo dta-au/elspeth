@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.secrets import (
@@ -819,15 +820,34 @@ def validate_semantic_evidence(
             readiness=_blocked_readiness(code="semantic_contracts", detail="Semantic contract check failed."),
             semantic_contracts=responses,
         )
+    # An advisory that survives only as an integer in prose is not
+    # reconstructable evidence. Name the requirements in the detail and carry
+    # the nodes in the structured `affected_nodes` field, so a completed run
+    # records WHICH contract went unproven rather than merely how many.
+    advisory_nodes = tuple(dict.fromkeys(entry.component.removeprefix("node:") for entry in semantic_warnings))
     if not semantic_contracts:
         detail = "No semantic contracts to check"
     elif semantic_warnings:
-        detail = f"{len(semantic_contracts)} semantic contract(s) checked, {len(semantic_warnings)} advisory"
+        advisory_codes = ", ".join(
+            sorted(
+                {
+                    contract.requirement.requirement_code
+                    for contract in semantic_contracts
+                    if contract.outcome is SemanticOutcome.UNKNOWN and contract.requirement.unknown_policy is not UnknownSemanticPolicy.FAIL
+                }
+            )
+        )
+        detail = (
+            f"{len(semantic_contracts)} semantic contract(s) checked; "
+            f"{len(semantic_warnings)} unproven (advisory): {advisory_codes or 'unspecified'}"
+        )
     else:
         detail = f"All {len(semantic_contracts)} semantic contract(s) satisfied"
     return PhaseReport(
         artifact=AuthoredValidatedState.from_secret_evidence(secret, semantic_contracts=responses),
-        checks=(ValidationCheck(name=CHECK_SEMANTIC_CONTRACTS, passed=True, detail=detail, affected_nodes=(), outcome_code=None),),
+        checks=(
+            ValidationCheck(name=CHECK_SEMANTIC_CONTRACTS, passed=True, detail=detail, affected_nodes=advisory_nodes, outcome_code=None),
+        ),
     )
 
 

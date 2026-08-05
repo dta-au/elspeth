@@ -2103,7 +2103,7 @@ class TestAuthoritativeProofDiagnostics:
                 "elspeth.web.execution.validation.validate_pipeline",
                 return_value=_successful_core_validation_result(),
             ),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(PipelineValidationError) as exc_info,
         ):
             await service.execute(session_id=session_id, user_id="alice")
@@ -2557,7 +2557,7 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
             await service.execute(session_id=session_id)
@@ -2623,7 +2623,7 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
             await service.execute(session_id=session_id)
@@ -2634,7 +2634,7 @@ class TestExecutionFanoutGuard:
         # line_explode now correctly fails the independent UNKNOWN semantic
         # contract gate, so keep that sibling gate stubbed on the accepted
         # retry just as it is on the initial guard-producing call above.
-        with patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())):
+        with patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())):
             await service.execute(
                 session_id=session_id,
                 fanout_ack_token=raised.value.guard.ack_token,
@@ -2688,7 +2688,7 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
             run_id = await service.execute(session_id=session_id)
 
@@ -2755,7 +2755,7 @@ class TestExecutionFanoutGuard:
 
         with (
             patch.object(service, "_run_pipeline"),
-            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
             pytest.raises(ExecutionFanoutGuardRequired) as raised,
         ):
             await service.execute(session_id=session_id)
