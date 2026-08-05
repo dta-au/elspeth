@@ -160,6 +160,79 @@ where the architectural fix landed:
   ``tests/unit/web/composer/test_runtime_preflight_pending_review_verification.py``,
   per the Shape 4 precedent that this suite carries no LLM-loop scaffolding.
 
+* Shape 17 — transform output-field collision with an already-present row field
+  (battery-2026-08-05 round 3, graph g05, run
+  ``adf0b6c6-bdcb-4e29-ba23-b953bae5366c``, ``elspeth-cfcd333f83``). A text
+  source emitting ``headline`` fed an llm node authored with
+  ``response_field: headline`` — the obvious authoring for a rewrite-in-place
+  transform. Compose succeeded, ``POST /validate`` returned ``is_valid=true``,
+  and the run died on row 1 with ``PluginContractViolation`` "would overwrite
+  existing input fields ['headline']" from
+  ``TransformExecutor._run_preflight`` — an error the engine's own message
+  calls a *pipeline configuration error*.
+
+  Root cause was an information gap, not a missing predicate: ``NodeInfo``
+  carried ``declared_required_fields`` (sinks) but nothing for transform
+  outputs, and ``core/dag/builder.py`` read ``transform.declared_output_fields``
+  for a self-consistency check and then discarded it, so the build-time surface
+  structurally could not see what the executor enforced per row. Closed on both
+  surfaces: ``core/dag/schema_validation.py::validate_transform_output_field_collisions``
+  (runtime graph, the output-side twin of ``validate_sink_required_fields``,
+  reached by both ``elspeth run`` and ``POST /validate`` because
+  ``build_execution_graph`` ends by calling ``validate_edge_compatibility``),
+  and Rule D in ``web/composer/state.py::_check_schema_contracts`` (authoring).
+
+  The fork the ticket posed — legalise the overwrite, or reject at compose — is
+  answered by rejection: ``contracts/field_collision.py`` states the no-silent-
+  overwrite policy ("silent overwrites are data loss") for a lineage system, and
+  rewrite-in-place is doubly blocked because the transform must also READ the
+  field it rewrites (see ``elspeth-39118dd24f``). Rewrite-in-place is simply not
+  an expressible shape today; first-class support would be an explicit opt-in
+  feature, not this fix.
+
+  Two coverage boundaries are DELIBERATELY left open and are part of this shape
+  rather than separate defects, because closing either means changing fan-in
+  guarantee/emit semantics:
+    - ROW_UNION upstream: composer Rule D rejects, the graph check abstains
+      (``walk_effective_guarantee_vote`` has no ROW_UNION branch). Runtime
+      under-rejects, so it is sound; the composer is the stronger surface.
+    - QUEUE upstream: the graph check rejects (correctly — the walk propagates
+      through QUEUE as the intersection of arm votes, Shape 14), composer Rule D
+      abstains. The authoring loop therefore gets no repair signal and the
+      failure lands at deploy/preflight rather than in the compose turn.
+
+  Pinned at the unit layer per the Shape 6 / Shape 15 precedent that this suite
+  carries no LLM-loop scaffolding: ``tests/unit/core/dag/test_graph_validation.py``
+  (``TestTransformOutputFieldCollisions``, incl. the DIVERT-only and
+  string-mode negative controls), ``tests/unit/core/dag/test_builder_validation.py``
+  (``TestTransformOutputFieldCollisionRejectedAtBuild`` — the ticket's literal
+  g05 topology through the real ``text`` source and real ``llm`` plugin), and
+  ``tests/unit/web/composer/test_state.py`` for Rule D.
+
+  Bug verification protocol, performed 2026-08-05 and recorded verbatim as this
+  file requires:
+    - Neutering the body of ``validate_transform_output_field_collisions``
+      (inserting ``return`` before its node loop) failed 5 tests:
+      ``test_reached_through_validate_edge_compatibility``,
+      ``test_multi_hop_guarantee_through_pass_through_transform_is_rejected``,
+      ``test_live_edge_alongside_divert_edge_is_still_rejected``,
+      ``test_upstream_guaranteed_field_is_rejected``, and
+      ``test_response_field_reusing_source_column_is_rejected``, each with
+      ``Failed: DID NOT RAISE <class 'elspeth.core.dag.models.GraphValidationError'>``.
+    - Neutering only the CALL SITE in ``validate_edge_compatibility`` failed 2
+      of those 5 — the two that go through the public entry point — confirming
+      the other three exercise the validator directly.
+    - Deleting the ``mode == RoutingMode.DIVERT`` skip in ``_live_predecessors``
+      failed NOTHING (86/86 green). That gap was real: every DIVERT edge
+      ``build_execution_graph`` creates targets a SINK, and a transform's
+      ``on_error`` is rejected unless it names a sink (builder.py:1139), so a
+      TRANSFORM cannot be a divert target on the production path and the guard
+      is defence-in-depth for the public ``add_edge`` surface. Two negative
+      controls were added for it (``test_divert_only_predecessor_is_not_checked``
+      and ``test_divert_mode_stored_as_plain_string_is_still_skipped``, the
+      latter pinning ``==`` over ``is`` because ``add_edge`` does not coerce
+      ``mode``).
+
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
