@@ -817,7 +817,7 @@ def _producer_declared_field_type(
             prepare_validation_probe_options(producer_node.options),
         )
     except Exception as exc:
-        if _is_static_contract_probe_exception(exc):
+        if _is_config_probe_exception(exc):
             return None
         raise
 
@@ -833,8 +833,25 @@ def _producer_declared_field_type(
         transform.close()
 
 
-def _is_static_contract_probe_exception(exc: Exception) -> bool:
-    """Return True for expected draft/config failures from static probes."""
+# ``PluginManager._raise_if_invalid`` reports a failed transform config as a
+# bare ``ValueError`` whose message it builds as
+# ``f"Invalid configuration for {label} '{name}':\n..."``. There is no type to
+# match on, so this prefix is the only signal separating an expected draft
+# config from a genuine engine defect. Coupled to that raise site: changing the
+# message there must change this constant.
+_TRANSFORM_CONFIG_ERROR_PREFIX = "Invalid configuration for transform "
+
+
+def _is_config_probe_exception(exc: Exception) -> bool:
+    """Return True only for expected draft/config failures from probe construction.
+
+    The single probe-tolerance taxonomy for this module and for every other
+    composer consumer (``guided.emitters``, ``_semantic_validator``), which
+    reuse it rather than restating it. Composer probes construct plugins from in-progress composer/
+    LLM/user-authored config, so a config, lookup, or template failure is
+    ordinary external input and the caller abstains. Anything else is a
+    genuine engine defect and must crash through.
+    """
     from elspeth.plugins.infrastructure.config_base import PluginConfigError
     from elspeth.plugins.infrastructure.manager import PluginNotFoundError
     from elspeth.plugins.infrastructure.templates import TemplateError
@@ -842,7 +859,7 @@ def _is_static_contract_probe_exception(exc: Exception) -> bool:
 
     if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
         return True
-    return type(exc) is ValueError and str(exc).startswith("Invalid configuration for transform ")
+    return type(exc) is ValueError and str(exc).startswith(_TRANSFORM_CONFIG_ERROR_PREFIX)
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -2328,17 +2345,6 @@ def _check_schema_contracts(
         transforms = get_shared_plugin_manager().get_transforms()
         return frozenset(cls.name for cls in transforms if cls.passes_through_input)
 
-    def _is_config_probe_exception(exc: Exception) -> bool:
-        """Return True only for expected draft/config failures from probe construction."""
-        from elspeth.plugins.infrastructure.config_base import PluginConfigError
-        from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-        from elspeth.plugins.infrastructure.templates import TemplateError
-        from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
-
-        if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
-            return True
-        return type(exc) is ValueError and str(exc).startswith("Invalid configuration for transform ")
-
     def _probe_transform_output_schema(plugin: str, options: Mapping[str, Any]) -> tuple[bool, SchemaConfig | None]:
         """Read ``plugin``'s output schema, closing the validation-only instance.
 
@@ -2392,6 +2398,42 @@ def _check_schema_contracts(
             return frozenset()
         try:
             return transform.declared_output_fields
+        finally:
+            transform.close()
+
+    def _probe_transform_declared_input_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
+        """Read ``plugin``'s ``declared_input_fields``, closing the probe instance.
+
+        Input-side twin of ``_probe_transform_declared_output_fields``. Six
+        transform configs compute this as a property over their own options
+        (web_scrape's ``url_field``, blob_fetch's ``url_field``,
+        blob_csv_expand's ``blob_ref_field`` — which DEFAULTS to ``blob_ref``,
+        so the set is non-empty even when the author wrote no option at all —
+        textract's ``key_field`` plus optionally ``bucket_field``/
+        ``version_field``, azure document_intelligence's ``source_field``, and
+        rag's ``query_field``). None of those names reach the raw
+        ``required_input_fields`` option or the ``schema:`` block, so reading
+        the config surfaces alone misses every one of them; only a constructed
+        instance knows (elspeth-ada5a60249).
+
+        A construction failure abstains with the empty set, for the same reason
+        the output probe does: a draft node whose options do not yet build is
+        owned by the existing config-validation paths, and this rule must not
+        turn an incomplete draft into a hard error.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        try:
+            transform = get_shared_plugin_manager().create_transform(
+                plugin,
+                prepare_validation_probe_options(options),
+            )
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return frozenset()
+        try:
+            return transform.declared_input_fields
         finally:
             transform.close()
 
@@ -2806,13 +2848,20 @@ def _check_schema_contracts(
         (``get_effective_guaranteed_fields``, which unions ``guaranteed_fields``
         with declared-required ``fields``). Field-set membership rules need the
         *actual* emission — the set the runtime will see — which equals
-        ``_output_schema_config.guaranteed_fields`` for transforms whose
-        plugins compute their own emit set (``field_mapper``, ``batch_stats``,
-        etc.). When the two sets diverge, the transform itself is internally
-        inconsistent (caught by the per-node self-consistency loop below);
-        using the declared set for downstream Rule A/B checks would cascade
-        Rule C breakage into spurious extras attribution at downstream
-        consumers/sinks.
+        ``_output_schema_config.guaranteed_fields`` for a REDUCTIVE transform
+        whose plugin computes its own emit set (``field_mapper`` renaming a
+        field away, ``batch_stats``): there the declared-required fields are
+        exactly the ones dropped, so using the declared set for downstream
+        Rule A/B checks would invent extras the runtime never emits.
+
+        The two sets diverging is NOT by itself an inconsistency to report.
+        Rule C below is deliberately gated to ``field_mapper`` with
+        ``select_only: true`` for that reason (see its comment): for an
+        ADDITIVE plugin ``guaranteed_fields`` is only a LOWER BOUND on
+        emission — the fields the transform itself adds, never the ones it
+        forwards — so a generic divergence check would mis-attribute every
+        passed-through field as missing. Which regime applies is answered by
+        ``passes_through_input``, below.
 
         For sources (no instance) and probe-failed transforms, falls back to
         the declared set — those are the cases where we don't have a separate
@@ -2828,16 +2877,27 @@ def _check_schema_contracts(
         is enforced with ``extra='forbid'`` at the transform's own input
         preflight: rows either match the declared set exactly or die AT this
         node, never downstream of it — so propagation always stops here, and
-        Rule A at this node's own locked input owns reporting the extras. The
-        firewall governs only the PROPAGATION answer, never the emit set: a
-        plugin-computed ``guaranteed_fields`` stays authoritative (the
-        declared effective set unions declared-required input fields — for a
-        reductive transform, exactly the fields it drops — and substituting
-        it would invent extras the runtime never emits). Only when no
-        computed set exists does the firewall pin the emit prediction to the
-        declared effective set, which also stops the declared-set fallback
-        composing upstream fields through it and re-reporting the same
-        defect one consumer downstream.
+        Rule A at this node's own locked input owns reporting the extras.
+
+        Behind that firewall the EMIT set splits on the same declaration
+        (elspeth-9a8367078f). ``passes_through_input=True`` is defined on
+        ``BaseTransform`` as "unconditionally emits every field present on the
+        input row, plus ``declared_output_fields``", so declaring it IS the
+        statement that the transform is additive; one that may drop, rename or
+        filter cannot declare it. For an additive producer the firewall pins
+        the arriving row exactly — every declared-required field must be
+        present or the row dies here, and the runtime pass-through cross-check
+        guarantees it survives — so ``get_effective_guaranteed_fields()``
+        (computed guarantees UNION declared-required) is a sound lower bound
+        on emission, and predicting the computed set alone instead let a
+        locked downstream consumer/sink pass a pipeline the runtime kills on
+        row 1. For a reductive producer the plugin-computed
+        ``guaranteed_fields`` stays authoritative, because there the
+        declared-required fields are the dropped ones. Only when no computed
+        set exists does the firewall pin the emit prediction to the declared
+        effective set, which also stops the declared-set fallback composing
+        upstream fields through it and re-reporting the same defect one
+        consumer downstream.
         """
         if is_source_producer_id(producer.producer_id):
             return _effective_producer_guarantees(producer), False
@@ -2873,6 +2933,11 @@ def _check_schema_contracts(
             extras_firewall = not output_config.allows_extra_fields
             propagates = passes_through and not extras_firewall
             if output_config.guaranteed_fields is not None:
+                if extras_firewall and passes_through:
+                    # ADDITIVE behind the firewall: the computed set names only
+                    # what this plugin ADDS, so it must be unioned with the
+                    # declared-required fields the transform forwards.
+                    return output_config.get_effective_guaranteed_fields(), False
                 # The plugin computed its own emit set — authoritative, and the
                 # only set that stays correct for REDUCTIVE transforms.
                 return frozenset(output_config.guaranteed_fields), propagates
@@ -3248,12 +3313,29 @@ def _check_schema_contracts(
             continue
         assert consumer_effective_required is not None  # No error => resolved.
 
+        # Projected input declarations (elspeth-ada5a60249). Read off the
+        # constructed plugin because neither surface above carries them: the
+        # six property-computing configs derive the field name from an ordinary
+        # option, so ``required_input_fields`` is empty and the ``schema:``
+        # block never names it. Probed only for transforms — sinks declare
+        # their input requirements through ``get_raw_sink_required_fields``,
+        # checked in the outputs loop below.
+        declared_input = (
+            _probe_transform_declared_input_fields(node.plugin, node.options)
+            if node.node_type == "transform" and node.plugin is not None
+            else frozenset()
+        )
+
         # ``consumer_effective_required`` folds in a fixed/flexible consumer's
         # *implicitly* required declared fields (which the explicit-only
         # ``consumer_required`` misses), so a flexible consumer — whose input is
         # NOT locked (``consumer_locked_input is None``) and whose explicit
         # ``required_fields`` is empty — still reaches producer resolution.
-        if not consumer_required and consumer_locked_input is None and not consumer_effective_required:
+        # ``declared_input`` joins the same disjunction: a web_scrape with no
+        # explicit contract and an unlocked input carries its requirement
+        # ONLY there, and omitting it here would leave the rule permanently
+        # inert.
+        if not consumer_required and consumer_locked_input is None and not consumer_effective_required and not declared_input:
             continue
 
         actual_producer = _walk_to_real_producer(
@@ -3364,6 +3446,69 @@ def _check_schema_contracts(
                         ),
                     )
                 )
+
+        # Projected declared-input enforcement (elspeth-ada5a60249). The
+        # runtime surface is DeclaredRequiredFieldsContract.pre_emission_check,
+        # which subtracts the transform's declared_input_fields from the row's
+        # effective fields and raises before process() runs — so a declaration
+        # the upstream cannot satisfy fails 100% of rows. Authoring previously
+        # accepted it: a web_scrape whose `url_field` named a column no producer
+        # emits composed clean, passed /validate, and died on row 1.
+        #
+        # PARTICIPATION-GATED, unlike the explicit ``consumer_required`` check
+        # above, which fails closed against any producer. That asymmetry is the
+        # point: an author who writes ``required_input_fields`` has made a
+        # promise by hand, whereas this set is DERIVED from ordinary options
+        # (blob_csv_expand's ``blob_ref_field`` defaults to ``blob_ref``, so it
+        # is non-empty even when the author wrote nothing). Enforcing a derived
+        # declaration against an abstaining producer would reject every
+        # observed-source pipeline that names an input column — pipelines the
+        # engine runs today. Those stay enforced per-row at runtime. This
+        # mirrors the sink required-fields gate below and the runtime twin
+        # ``validate_transform_declared_input_fields``.
+        #
+        # Report only the increment beyond the explicit set already handled
+        # above, so a field is never double-reported — same discipline as the
+        # implicit-required parity block that follows.
+        if declared_input:
+            # _effective_producer_guarantees(actual_producer) already succeeded
+            # above (else we continued via parse_failed_producers), so this
+            # producer's contract config parsed cleanly and the vote walks the
+            # same paths on the same options deterministically. A ValueError
+            # here would be a non-determinism bug in our own code, not a fresh
+            # Tier-3 parse fault — same judgment as the Rule A site below.
+            producer_participates, _producer_vote_fields = _effective_producer_vote(actual_producer)
+            if producer_participates or producer_guaranteed:
+                declared_missing = declared_input - consumer_required - producer_guaranteed
+                if declared_missing:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Schema contract violation: '{actual_producer.producer_id}' -> '{node.id}'. "
+                            f"Consumer ({node.plugin or node.node_type}) requires input fields: "
+                            f"[{_format_fields(declared_input)}] (declared by its own options, not by "
+                            f"`required_input_fields`). "
+                            f"Producer ({_producer_label(actual_producer)}) guarantees: [{_format_fields(producer_guaranteed)}]. "
+                            f"Missing fields: [{_format_fields(declared_missing)}]. "
+                            f"The engine rejects every row missing one of these before the transform runs, "
+                            f"so this pipeline fails on the first row. "
+                            f"Fix by pointing the option that names the column (for web_scrape 'url_field', "
+                            f"for blob_csv_expand 'blob_ref_field') at a field the upstream emits, OR by "
+                            f"adding the field to the upstream's schema.",
+                            "high",
+                            # Same family and same closed repair-feedback code as
+                            # the explicit-required site above: a consumer needs a
+                            # field its producer does not deliver.
+                            "schema_contract_violation",
+                            # Identifiers + field names only, same redaction
+                            # judgment as the sibling contract sites.
+                            contract=SchemaContractDetail(
+                                producer=actual_producer.producer_id,
+                                consumer=node.id,
+                                missing_fields=tuple(sorted(declared_missing)),
+                            ),
+                        )
+                    )
 
         # Rule A: producer emits a field that consumer's locked input forbids.
         # The runtime check is the auto-generated input Pydantic model with

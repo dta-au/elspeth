@@ -1865,7 +1865,7 @@ class TestStructuredQueryProbeClassification:
     def test_malformed_query_draft_is_classified_as_config_probe(self) -> None:
         """The relocated failure is matched by the composer probe classifier."""
         from elspeth.plugins.infrastructure.config_base import PluginConfigError
-        from elspeth.web.composer._semantic_validator import _is_config_probe_exception
+        from elspeth.web.composer.state import _is_config_probe_exception
 
         bad = self._base_config(
             queries=[

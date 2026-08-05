@@ -6477,6 +6477,142 @@ class TestSchemaContractValidation:
             f"Flexible consumer must not trigger locked-input rejection, got errors: {[e.message for e in result.errors]}"
         )
 
+    # ── Projected declared_input_fields: a transform's own options name a
+    # required input column (elspeth-ada5a60249). The runtime surface is
+    # DeclaredRequiredFieldsContract.pre_emission_check, which raises before
+    # process() runs, so every row fails.
+
+    def _web_scrape_options(self, url_field: str) -> dict[str, Any]:
+        """Minimal constructible web_scrape config for the declared-input probe."""
+        return {
+            "url_field": url_field,
+            "content_field": "page_content",
+            "fingerprint_field": "page_fingerprint",
+            "http": {
+                # A non-reserved domain, so the composer's abuse_contact rule
+                # stays silent and these tests observe only the contract check.
+                "abuse_contact": "ops@somecompany.gov.au",
+                "scraping_reason": "contract validation test",
+                "allowed_hosts": ["127.0.0.0/8"],
+            },
+            "schema": {"mode": "observed"},
+        }
+
+    def _web_scrape_state(self, *, url_field: str, source_mode: str) -> CompositionState:
+        """source -> web_scrape -> sink, with the scraper's url_field under test."""
+        source_schema: dict[str, Any] = (
+            {"mode": "fixed", "fields": ["id: int", "url: str", "label: str"]} if source_mode == "fixed" else {"mode": "observed"}
+        )
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success="urls", plugin="csv", options={"schema": source_schema}))
+        state = state.with_node(
+            self._make_transform(
+                "scraper",
+                "urls",
+                "main",
+                plugin="web_scrape",
+                options=self._web_scrape_options(url_field),
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_declared_input_field_missing_from_typed_producer_is_rejected(self) -> None:
+        """The reported defect: a misnamed url_field composed clean and died on row 1.
+
+        ``url_field`` never reaches ``required_input_fields`` or the ``schema:``
+        block, so both raw config surfaces were blind; only the constructed
+        plugin knows the column name.
+        """
+        result = self._web_scrape_state(url_field="page_url", source_mode="fixed").validate()
+
+        assert not result.is_valid, "Composer must reject a url_field naming a column no producer emits."
+        declared_errors = [
+            e
+            for e in result.errors
+            if e.component == "node:scraper" and e.error_code == "schema_contract_violation" and "page_url" in e.message
+        ]
+        assert declared_errors, f"Expected a declared-input rejection naming page_url, got: {[e.message for e in result.errors]}"
+        msg = declared_errors[0].message
+        assert "Missing fields: [page_url]" in msg
+        # The message must say WHERE the requirement came from, since the author
+        # never wrote `required_input_fields`.
+        assert "declared by its own options" in msg
+        assert "url_field" in msg
+
+    def test_declared_input_field_satisfied_by_producer_is_clean(self) -> None:
+        """Negative control: the correctly wired chaosweb shape must stay valid."""
+        result = self._web_scrape_state(url_field="url", source_mode="fixed").validate()
+
+        assert result.is_valid, f"Correctly wired url_field must not be rejected, got: {[e.message for e in result.errors]}"
+
+    def test_declared_input_field_against_observed_producer_abstains(self) -> None:
+        """ABSTENTION: an observed producer proves nothing, so enforcement stays per-row.
+
+        This is the case that separates the projected declaration from the raw
+        ``required_input_fields`` surface, which fails closed here.
+        """
+        result = self._web_scrape_state(url_field="page_url", source_mode="observed").validate()
+
+        assert result.is_valid, f"Observed producer must abstain, got: {[e.message for e in result.errors]}"
+
+    def _blob_csv_expand_state(self, *, source_fields: list[str]) -> CompositionState:
+        """blob_ref_field OMITTED — its default names 'blob_ref', so nothing in the options says so."""
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="manifest",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": source_fields}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "expand",
+                "manifest",
+                "main",
+                plugin="blob_csv_expand",
+                options={"columns": ["id", "text"], "schema": {"mode": "observed"}},
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_declared_input_field_from_option_default_is_rejected(self) -> None:
+        """Omission shape: the author wrote no option at all, so only the probe can know.
+
+        Pins that ``prepare_validation_probe_options`` preserves a
+        default-derived declaration — nothing in the raw options names
+        ``blob_ref``, so a probe that lost the default would leave this rule
+        silently inert for every omission-shaped defect.
+        """
+        result = self._blob_csv_expand_state(source_fields=["manifest_index: int", "source_name: str"]).validate()
+
+        assert not result.is_valid, "Composer must reject a default blob_ref_field no producer emits."
+        declared_errors = [e for e in result.errors if e.component == "node:expand" and "blob_ref" in e.message]
+        assert declared_errors, f"Expected a declared-input rejection naming blob_ref, got: {[e.message for e in result.errors]}"
+        assert "declared by its own options" in declared_errors[0].message
+
+    def test_declared_input_field_from_option_default_satisfied_is_clean(self) -> None:
+        """Negative control: the canonical manifest shape guarantees blob_ref."""
+        result = self._blob_csv_expand_state(source_fields=["manifest_index: int", "blob_ref: str"]).validate()
+
+        assert result.is_valid, f"Canonical blob manifest must stay valid, got: {[e.message for e in result.errors]}"
+
+    def test_declared_input_probe_closes_every_constructed_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The declared-input probe owns the validation-only transform it constructs."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+
+        self._web_scrape_state(url_field="page_url", source_mode="fixed").validate()
+
+        assert tracking.instances, "fixture did not exercise the declared-input probe site"
+        assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
+
 
 class TestPassThroughComposerParity:
     """ADR-007 composer parity tests for known-pass-through plugins.
@@ -8549,7 +8685,7 @@ class TestPassThroughArrivalExtras:
             on_validation_failure="discard",
         )
 
-    def _llm(self, *, on_success: str = "summarized") -> NodeSpec:
+    def _llm(self, *, on_success: str = "summarized", schema: dict[str, Any] | None = None) -> NodeSpec:
         return NodeSpec(
             id="summarize",
             node_type="transform",
@@ -8558,7 +8694,7 @@ class TestPassThroughArrivalExtras:
             on_success=on_success,
             on_error="discard",
             options={
-                "schema": {"mode": "observed"},
+                "schema": schema or {"mode": "observed"},
                 "provider": "openrouter",
                 "model": "anthropic/claude-sonnet-4.6",
                 "prompt_template": "Summarize this row.",
@@ -8829,3 +8965,187 @@ class TestPassThroughArrivalExtras:
         assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
             result.errors
         )
+
+    def _fixed_llm_schema(self) -> dict[str, Any]:
+        """The llm's own arriving fields, declared fixed — an ADDITIVE firewall.
+
+        Mirror image of ``_rename_mapper``: the same ``mode: fixed`` contract,
+        but on a producer that declares ``passes_through_input=True``, so the
+        declared fields are ones it FORWARDS rather than ones it drops.
+        """
+        return {"mode": "fixed", "fields": ["complaint_id: str", "complaint_text: str"]}
+
+    def _locked_summary_trio(self) -> dict[str, Any]:
+        return {
+            "schema": {
+                "mode": "fixed",
+                "fields": [
+                    "one_sentence_summary: str",
+                    "one_sentence_summary_model: str",
+                    "one_sentence_summary_usage: any",
+                ],
+            }
+        }
+
+    def test_additive_fixed_pass_through_predicts_forwarded_fields_at_a_locked_sink(self) -> None:
+        """An ADDITIVE fixed-output producer still emits the fields it forwards.
+
+        elspeth-9a8367078f, the mirror of the reductive pair above. ``llm``
+        declares ``passes_through_input=True`` — runtime-enforced by the
+        executor's pass-through cross-check (ADR-008), which fails the run if
+        an input field is dropped — so ``complaint_id``/``complaint_text``
+        reach every emitted row. Its computed ``guaranteed_fields`` names only
+        the summary trio it ADDS, so predicting that alone let this pipeline
+        compose valid and die on row 1 against the locked sink's
+        ``extra='forbid'`` model: the compose-valid/run-dies direction.
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._llm(on_success="output", schema=self._fixed_llm_schema()),),
+            edges=(),
+            outputs=(self._output(options=self._locked_summary_trio()),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == ("complaint_id", "complaint_text")
+
+    def test_additive_fixed_pass_through_predicts_forwarded_fields_at_a_locked_consumer(self) -> None:
+        """Rule A shares the emit-profile math, so it shares the additive blind spot."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._llm(schema=self._fixed_llm_schema()),
+                self._passthrough("final_cleanup", "summarized", "output", options=self._locked_summary_trio()),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(
+            error for error in result.errors if error.error_code == "locked_input_extras" and error.component == "node:final_cleanup"
+        )
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "summarize"
+        assert detail.extra_fields == ("complaint_id", "complaint_text")
+
+
+class TestExtrasFirewallDirection:
+    """The composer rejects the shape the DAG's un-gated walk accepts — via Rule A, not the twin.
+
+    ``walk_effective_guarantee_vote`` unions guarantees through a
+    ``passes_through_input`` node without consulting its extras firewall, so a
+    ``mode: fixed`` llm still carries ``a`` downstream and
+    ``validate_transform_declared_input_fields`` accepts a web_scrape that needs
+    it (pinned in
+    ``tests/unit/core/dag/test_transform_declared_input_fields.py::TestExtrasFirewallDirection``).
+
+    The composer's own declared-input block shares that un-gated union and
+    likewise raises nothing here. What rejects is Rule A at the llm's locked
+    input, whose emit profile stops propagation at a non-extras-allowing
+    contract. Both assertions below are load-bearing: the positive one pins that
+    the divergence stays DAG-accept/composer-reject, and the negative one pins
+    WHICH check owns the rejection, so gating the declared-input block registers
+    here as a change rather than passing silently (elspeth-9c5ff8fa7d).
+    """
+
+    def _state(self) -> CompositionState:
+        """source {a,url} -> llm (locked to [url], pass-through) -> web_scrape needing 'a'."""
+        source = SourceSpec(
+            plugin="csv",
+            on_success="rows",
+            options={"schema": {"mode": "fixed", "fields": ["a: str", "url: str"], "guaranteed_fields": ["a", "url"]}},
+            on_validation_failure="discard",
+        )
+        llm = NodeSpec(
+            id="summarize",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="scraped",
+            on_error="discard",
+            options={
+                "schema": {"mode": "fixed", "fields": ["url: str"]},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Summarize this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": "summary",
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        scraper = NodeSpec(
+            id="scraper",
+            node_type="transform",
+            plugin="web_scrape",
+            input="scraped",
+            on_success="output",
+            on_error="discard",
+            options={
+                "url_field": "a",
+                "content_field": "page_content",
+                "fingerprint_field": "page_fingerprint",
+                "http": {
+                    "abuse_contact": "ops@dta.gov.au",
+                    "scraping_reason": "contract validation test",
+                    "allowed_hosts": ["127.0.0.0/8"],
+                },
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=source,
+            nodes=(llm, scraper),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="output",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_rule_a_rejects_at_the_firewall_node(self) -> None:
+        """The safe-direction pin: the row carrying 'a' dies at the llm, and composing says so."""
+        result = self._state().validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:summarize"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "source"
+        assert detail.extra_fields == ("a",)
+
+    def test_declared_input_block_does_not_report_the_downstream_consumer(self) -> None:
+        """Discriminator: the composer's declared-input twin shares the walk's un-gated union."""
+        result = self._state().validate()
+
+        assert [error.component for error in result.errors if error.error_code == "schema_contract_violation"] == []

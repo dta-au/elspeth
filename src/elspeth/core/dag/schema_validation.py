@@ -80,6 +80,13 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # (elspeth-cfcd333f83).
     validate_transform_output_field_collisions(graph)
 
+    # Validate that every field a transform declares as REQUIRED input is
+    # guaranteed by a participating upstream. Input-side twin of the two checks
+    # above; runs last for the same reason they each cite — a graph tripping
+    # several checks keeps reporting the pre-existing error
+    # (elspeth-ada5a60249).
+    validate_transform_declared_input_fields(graph)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -846,6 +853,121 @@ def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
                 f"Fix: give the transform a different output field name (for the llm "
                 f"transform, change 'response_field'), or drop/rename the existing "
                 f"field upstream of this node before it arrives.",
+                component_id=str(node_id),
+                component_type="transform",
+            )
+
+
+def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
+    """Reject transforms whose declared input fields no upstream guarantees.
+
+    Input-side twin of ``validate_transform_output_field_collisions``. A
+    transform's ``declared_input_fields`` are fields it REQUIRES on every
+    arriving row; ``DeclaredRequiredFieldsContract.pre_emission_check``
+    (engine/executors/declared_required_fields.py) subtracts them from the
+    row's effective fields and raises ``DeclaredRequiredInputFieldsViolation``
+    before ``process()`` runs. A declaration the upstream cannot satisfy
+    therefore fails 100% of rows, first row onward — a pipeline
+    *configuration* error, so it belongs on the build-time surface both
+    ``elspeth run`` and the web ``POST /validate`` reach (elspeth-ada5a60249).
+
+    Why a dedicated validator rather than folding the set into the Phase-1
+    ``consumer_required`` computation in ``validate_single_edge``: PARTICIPATION.
+    Phase 1 fails closed — it compares an explicit, author-written
+    ``required_input_fields`` against the producer's guarantees and rejects
+    when they are missing, including against an observed producer that
+    guarantees nothing. That is right for a promise the author made by hand.
+    It is wrong for the six declarations projected here, which are DERIVED
+    from ordinary options (web_scrape's ``url_field``, blob_csv_expand's
+    ``blob_ref_field`` — which defaults to ``blob_ref``, so the set is
+    non-empty even when the author wrote nothing at all). Enforcing those
+    against an abstaining upstream would reject every observed-source pipeline
+    that names an input column, which the engine runs successfully today.
+
+    Soundness: reject only where the miss is certain. A predecessor is checked
+    only when its effective-guarantee vote actually PARTICIPATED. Here that
+    flag is load-bearing rather than implied — unlike the output-side twin,
+    whose set INTERSECTION is empty for an abstainer anyway, this check uses
+    set DIFFERENCE, which cannot distinguish "abstained" from "participated
+    and guarantees nothing" without it (the distinction ``EffectiveGuaranteeVote``
+    exists to carry, and the one ``validate_sink_required_fields`` rests on).
+    An abstaining upstream stays enforced per-row by the executor contract.
+
+    ``_live_predecessors`` filters DIVERT edges for the same never-reject-a-
+    runnable-pipeline reason the output twin cites, reached by the opposite
+    route: a DIVERT payload is an error envelope rather than the producer's
+    declared row, so subtracting its fields would report a miss that the rows
+    actually traversing the graph never see.
+
+    The vote this rests on is not firewall-aware, and the resulting divergence
+    from the composer runs in ONE direction only (elspeth-9c5ff8fa7d).
+    ``walk_effective_guarantee_vote`` unions a predecessor's guarantees through
+    every ``passes_through_input`` node without consulting that node's own
+    extras firewall, so a ``mode: fixed`` transform mid-pipeline contributes
+    upstream fields its ``extra='forbid'`` input model would never admit. The
+    walk therefore OVER-promises; against set DIFFERENCE that can only shrink
+    ``missing``, so this validator may under-reject through a firewall and can
+    never over-reject through one. The composer's declared-input block shares
+    the same un-gated union — what rejects there is the neighbouring Rule A
+    (``locked_input_extras``, web/composer/state.py), whose emit profile stops
+    propagation at a non-extras-allowing contract and reports the extras
+    against the firewall node itself.
+
+    Scope that before gating the walk. The union exceeds the firewall node's
+    own effective guarantees only by fields its fixed schema does not declare,
+    and a row carrying one of those dies AT that node — so wherever rows still
+    flow the walk's answer is already correct, and the over-promise names a
+    field at a point no row reaches. Firewall-gating this walk is therefore
+    defensive; the substantive gap is that no build-time DAG check mirrors
+    Rule A at all, so the locked-input death itself builds green. Until
+    elspeth-9c5ff8fa7d settles both, treat DAG-accept with composer-reject as
+    the expected asymmetry and the reverse as a defect.
+
+    Per-predecessor rejection is the correct granularity: if ONE live
+    participating predecessor definitely omits a declared field, every row
+    arriving from it fails the executor's pre-emission check, whatever the
+    other inbound paths carry.
+
+    ``NodeInfo`` enforces the same boundary by guarding
+    ``declared_input_fields`` to TRANSFORM nodes.
+
+    Raises:
+        GraphValidationError: if a transform declares an input field that a
+            live, participating predecessor does not guarantee.
+    """
+    # Shared cache across all transforms' predecessor walks — same pattern as
+    # validate_sink_required_fields and validate_transform_output_field_collisions.
+    effective_fields_cache: dict[str, EffectiveGuaranteeVote] = {}
+
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        if info.node_type != NodeType.TRANSFORM:
+            continue
+
+        declared_input = info.declared_input_fields
+        if not declared_input:
+            continue
+
+        for predecessor_id in _live_predecessors(graph, node_id):
+            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
+            if not vote.participated:
+                continue
+
+            missing = sorted(declared_input - vote.fields)
+            if not missing:
+                continue
+
+            raise GraphValidationError(
+                f"Transform '{info.plugin_name}' (node '{node_id}') requires input "
+                f"fields {missing} that its upstream '{predecessor_id}' does not "
+                f"guarantee on the rows reaching it. The transform declares these "
+                f"from its own options, and the engine rejects every row missing "
+                f"one before the transform runs, so this pipeline fails on the "
+                f"first row. "
+                f"Fix: point the option that names the column at a field the "
+                f"upstream actually emits (for web_scrape that is 'url_field', "
+                f"for blob_csv_expand 'blob_ref_field'), or add the field to the "
+                f"upstream's schema or guaranteed_fields.",
                 component_id=str(node_id),
                 component_type="transform",
             )

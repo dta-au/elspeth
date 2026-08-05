@@ -46,6 +46,7 @@ class _BuilderValidationTransform:
     on_error: str | None = None
     on_success: str | None = "output"
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
 
     def __init__(self, *, name: str, output_schema_config: SchemaConfig) -> None:

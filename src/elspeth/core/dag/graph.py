@@ -136,6 +136,7 @@ class ExecutionGraph:
         output_schema_config: SchemaConfig | None = None,
         declared_required_fields: frozenset[str] = _EMPTY_DECLARED_REQUIRED_FIELDS,
         declared_output_fields: frozenset[str] = frozenset(),
+        declared_input_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
     ) -> None:
         """Add a node to the execution graph.
@@ -165,6 +166,14 @@ class ExecutionGraph:
                 forwards, so a derived value would report every pass-through
                 transform as colliding with its own upstream
                 (elspeth-cfcd333f83). Empty frozenset otherwise.
+            declared_input_fields: For TRANSFORM nodes only — the set of fields
+                the transform REQUIRES on each arriving row. Populated by the
+                builder from TransformProtocol.declared_input_fields. As with
+                declared_output_fields there is deliberately no derivation from
+                the node's schema config when omitted: six transform configs
+                compute this as a property over their own options and the
+                `schema:` block never carries those field names
+                (elspeth-ada5a60249). Empty frozenset otherwise.
             passes_through_input: For TRANSFORM nodes only — True iff the transform
                 unconditionally emits rows containing every input field
                 (ADR-007). Validator walk propagates predecessor guarantees
@@ -204,6 +213,7 @@ class ExecutionGraph:
             output_schema_config=output_schema_config,
             declared_required_fields=declared_required_fields,
             declared_output_fields=declared_output_fields,
+            declared_input_fields=declared_input_fields,
             passes_through_input=passes_through_input,
         )
         self._graph.add_node(node_id, info=info)

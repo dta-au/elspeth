@@ -53,22 +53,11 @@ from elspeth.web.composer.state import (
     SchemaContractDetail,
     Severity,
     ValidationEntry,
+    _is_config_probe_exception,
 )
 
 if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.base import BaseTransform
-
-
-def _is_config_probe_exception(exc: Exception) -> bool:
-    """Same expected-error set used by _check_schema_contracts for probes."""
-    from elspeth.plugins.infrastructure.config_base import PluginConfigError
-    from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-    from elspeth.plugins.infrastructure.templates import TemplateError
-    from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
-
-    if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
-        return True
-    return type(exc) is ValueError and str(exc).startswith("Invalid configuration for transform ")
 
 
 def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:

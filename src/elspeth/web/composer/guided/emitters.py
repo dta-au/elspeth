@@ -595,26 +595,6 @@ def _structured_output_fields(options: Mapping[str, Any]) -> list[_WireStructure
     return projected
 
 
-def _is_cardinality_probe_config_failure(exc: Exception) -> bool:
-    """Return True only for expected draft/config failures from probe construction.
-
-    Mirrors the ``_is_config_probe_exception`` taxonomy nested inside
-    ``elspeth.web.composer.state`` (not importable from there): plugin
-    config/lookup/template failures are expected when the wire review renders
-    an authored-only fallback state — e.g. operator-profile options that were
-    never lowered because authored validation already errs. Anything else is a
-    genuine engine defect and must crash through.
-    """
-    from elspeth.plugins.infrastructure.config_base import PluginConfigError
-    from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-    from elspeth.plugins.infrastructure.templates import TemplateError
-    from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
-
-    if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
-        return True
-    return type(exc) is ValueError and str(exc).startswith("Invalid configuration for transform ")
-
-
 def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
     if node.node_type == "aggregation":
         if node.expected_output_count is not None:
@@ -633,13 +613,20 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 
+    # Function-local like its neighbours above: ``state`` imports this package
+    # (``guided.state_machine``) at module level, so the reverse edge stays
+    # deferred. One taxonomy — the wire review tolerates exactly the draft
+    # configs /validate does, e.g. operator-profile options never lowered
+    # because authored validation already errs.
+    from elspeth.web.composer.state import _is_config_probe_exception
+
     try:
         transform = get_shared_plugin_manager().create_transform(
             executable_node.plugin,
             prepare_validation_probe_options(executable_node.options),
         )
     except Exception as exc:
-        if not _is_cardinality_probe_config_failure(exc):
+        if not _is_config_probe_exception(exc):
             raise
         # Conservative fallback: render the weakest honest row-cardinality
         # claim instead of crashing the whole wire review over a config the

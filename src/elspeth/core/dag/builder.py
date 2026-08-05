@@ -387,6 +387,12 @@ def build_execution_graph(
                 component_type="transform",
             )
 
+        # This is the only site that projects declared_input_fields; the
+        # aggregation loop below deliberately does not. Aggregation wiring
+        # rejects any transform with is_batch_aware=False (runtime_factory), and
+        # _initialize_declared_input_fields raises FrameworkBugError when a
+        # batch-aware transform declares input fields, so the excluded space is
+        # empty by construction rather than an unhandled case.
         graph.add_node(
             tid,
             node_type=node_type,
@@ -396,6 +402,7 @@ def build_execution_graph(
             output_schema=transform.output_schema,  # TransformProtocol requires this
             output_schema_config=output_schema_config,
             declared_output_fields=transform.declared_output_fields,
+            declared_input_fields=transform.declared_input_fields,
             passes_through_input=transform.passes_through_input,
         )
 

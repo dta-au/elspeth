@@ -208,6 +208,29 @@ class NodeInfo:
     # as colliding with its own upstream. Declaration only.
     declared_output_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_input_fields — the fields the transform
+    # REQUIRES on each arriving row. Used for build-time detection of the
+    # violation DeclaredRequiredFieldsContract.pre_emission_check otherwise
+    # raises per-row, before process() ever runs (elspeth-ada5a60249). Empty
+    # frozenset for all non-transform nodes.
+    #
+    # Input-side sibling of declared_output_fields above, and NOT derivable
+    # from input_schema/input_schema_config for the same class of reason: six
+    # transform configs compute this as a property over their own options
+    # (web_scrape's url_field, blob_csv_expand's blob_ref_field, textract's
+    # key_field plus optionally bucket_field/version_field, ...), and the
+    # generated input model is built from the `schema:` block, which never
+    # folds those in. Declaration only.
+    #
+    # Deliberately a SEPARATE field rather than a widening of
+    # declared_required_fields: that one is SINK-only and fails closed at
+    # construction for every other node type (guard below), because sinks
+    # derive it from output_schema_config while transforms have no such
+    # derivation. Projecting transform input declarations onto it would trip
+    # that invariant at graph construction.
+    declared_input_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
     # by the builder from TransformProtocol.passes_through_input. When True,
     # the validator walk propagates predecessor guarantees through this node
@@ -267,6 +290,27 @@ class NodeInfo:
                 f"NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_output_fields={sorted(self.declared_output_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_input_fields mirrors the
+        # declared_output_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer, validate_transform_declared_input_fields,
+        # is scoped to TRANSFORM nodes, so any other node type would carry data
+        # with no reader.
+        #
+        # Sinks are not merely out of scope here, they are served by a
+        # different field: SINK input requirements live on
+        # declared_required_fields and are checked by
+        # validate_sink_required_fields. Aggregations are excluded because they
+        # are reductive — the executor's per-row declared-input contract does
+        # not apply to a batch flush the same way — so admitting them would
+        # need its own soundness argument (elspeth-ada5a60249).
+        if self.declared_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_input_fields={sorted(self.declared_input_fields)!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )
