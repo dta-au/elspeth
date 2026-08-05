@@ -13,6 +13,7 @@ PRODUCTION_PATH_AUDIT_TESTS = frozenset(
         "test_artifact_idempotency_contention.py",
         "test_audit_field_separation.py",
         "test_can_drop_rows_roundtrip.py",
+        "test_contract_violation_token_outcomes.py",
         "test_export.py",
         "test_exporter_batch_queries.py",
         "test_recorder_explain.py",
