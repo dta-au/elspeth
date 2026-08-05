@@ -20,6 +20,25 @@ The landed read-time guard in ``BaseTransform.input_schema`` catches the aliasin
 case only when the demote set is non-empty, and demote is intersected with the
 declared model's own fields — an ``observed``-mode schema declares none, so that
 guard is silent for exactly the probe shape every plugin ships.
+
+WHAT THIS DOES AND DOES NOT CATCH — measured, so the next author inherits the
+boundary rather than rediscovering it:
+
+    aliased output + creates fields (fixed)      CAUGHT (both codes)
+    aliased output + creates fields (observed)   CAUGHT (aliasing only)
+    separate closed output omitting created      CAUGHT
+    separate closed output naming created        clean, correctly
+    aliased output but creates nothing           clean, correctly — shape-preserving
+    separate OBSERVED output omitting created    clean, DELIBERATELY: extra='allow'
+                                                 admits the field anyway, so nothing
+                                                 is wrong to report
+
+Known limits, none of them defects of this file:
+  * Fields a transform creates only at RUNTIME, never declared statically, are
+    invisible here — ``value_transform``'s dynamic-key case is the example.
+  * Each plugin is exercised through ONE ``probe_config``. For plugins whose
+    created set is config-dependent this is a sample, not an exhaustive sweep;
+    it is still roster-complete over plugins.
 """
 
 from __future__ import annotations
