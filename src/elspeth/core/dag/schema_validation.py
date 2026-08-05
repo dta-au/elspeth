@@ -74,6 +74,12 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # and any future multi-hop shape.
     validate_sink_required_fields(graph)
 
+    # Validate that no transform declares an output field its input already
+    # carries. Output-side twin of the sink check above; runs last so a graph
+    # tripping both keeps reporting the pre-existing sink error
+    # (elspeth-cfcd333f83).
+    validate_transform_output_field_collisions(graph)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -698,4 +704,117 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
                 f"or remove them from the sink's declared_required_fields.",
                 component_id=str(node_id),
                 component_type="sink",
+            )
+
+
+def _live_predecessors(graph: ExecutionGraph, node_id: str) -> list[str]:
+    """Predecessors reachable by a routing edge rows actually traverse.
+
+    DIVERT edges are structural markers: rows reach their destination through
+    exception handling, not by traversing the edge, and the payload is an
+    error envelope rather than the producer's declared output. A guarantee
+    inherited across a DIVERT edge is therefore not a guarantee about what
+    arrives — the same reason ``validate_edge_compatibility`` and
+    ``get_effective_producer_schema_config`` already skip them.
+
+    A MultiDiGraph can carry both a MOVE and a DIVERT edge between the same
+    pair, so a predecessor counts as live when ANY of its edges is non-DIVERT;
+    filtering edge-wise without regrouping would drop a live predecessor.
+
+    Deliberately NOT shared with ``validate_sink_required_fields``, which uses
+    bare ``.predecessors()``: there, DIVERT-blindness only widens the set of
+    graphs it rejects for missing guarantees, whereas here a spurious
+    guarantee would reject a runnable pipeline. Do not "harmonize" these by
+    giving this check the looser walk (elspeth-cfcd333f83).
+    """
+    live: dict[str, None] = {}
+    for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
+        # `==` not `is`: RoutingMode is a StrEnum and add_edge() stores whatever
+        # it is handed without coercing, so an edge carrying the plain string
+        # "divert" must still be recognised. Identity comparison would treat it
+        # as live and reject a runnable pipeline. Matches the comparisons in
+        # validate_edge_compatibility and get_effective_producer_schema_config.
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        live[str(from_id)] = None
+    return list(live)
+
+
+def validate_transform_output_field_collisions(graph: ExecutionGraph) -> None:
+    """Reject transforms that declare an output field their input already carries.
+
+    Output-side twin of ``validate_sink_required_fields``. A transform's
+    ``declared_output_fields`` are fields it ADDS to the row;
+    ``TransformExecutor._run_preflight`` raises ``PluginContractViolation``
+    ("would overwrite existing input fields") on the first row whose keys
+    intersect that set. That is a pipeline *configuration* error, so it
+    belongs on the build-time surface both ``elspeth run`` and the web
+    ``POST /validate`` reach, not after execution has started
+    (elspeth-cfcd333f83).
+
+    Scope is TRANSFORM nodes only. ``AggregationExecutor.execute_flush``
+    performs no equivalent collision check, so an aggregation has no runtime
+    failure to pre-empt and rejecting one here would refuse pipelines the
+    engine runs today. ``NodeInfo`` enforces the same boundary by guarding
+    ``declared_output_fields`` to TRANSFORM nodes.
+
+    Soundness: reject only where the collision is certain. A predecessor is
+    checked only when its effective-guarantee vote actually participated —
+    an abstaining (dynamic/observed) upstream may or may not carry the field,
+    and speculating would refuse runnable pipelines. Those stay enforced
+    per-row by the executor preflight, mirroring the abstention discipline
+    ``validate_sink_required_fields`` documents.
+
+    Per-predecessor rejection is the correct granularity: if ONE live
+    predecessor definitely guarantees a colliding field, then every row
+    arriving from that predecessor crashes the preflight, whatever the other
+    inbound paths carry.
+
+    Raises:
+        GraphValidationError: if a transform declares an output field that a
+            live predecessor definitely guarantees on the arriving row.
+    """
+    # Shared cache across all transforms' predecessor walks — same pattern as
+    # validate_sink_required_fields and the schema_cache in
+    # validate_edge_compatibility.
+    effective_fields_cache: dict[str, EffectiveGuaranteeVote] = {}
+
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        if info.node_type != NodeType.TRANSFORM:
+            continue
+
+        declared_output = info.declared_output_fields
+        if not declared_output:
+            continue
+
+        for predecessor_id in _live_predecessors(graph, node_id):
+            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
+            # Abstention skip. Today every walk branch that reports
+            # participated=False also reports an empty field set, so this is
+            # implied by the intersection below rather than load-bearing —
+            # unlike validate_sink_required_fields, where set DIFFERENCE makes
+            # abstention indistinguishable from "guarantees nothing" without
+            # the flag. Stated explicitly anyway: it is the soundness rule this
+            # check rests on, so a future vote shape that reported
+            # possibly-present (rather than guaranteed) fields cannot silently
+            # turn a build-time rejection into a guess (elspeth-cfcd333f83).
+            if not vote.participated:
+                continue
+
+            collisions = sorted(declared_output & vote.fields)
+            if not collisions:
+                continue
+
+            raise GraphValidationError(
+                f"Transform '{info.plugin_name}' (node '{node_id}') declares output "
+                f"fields {collisions} that its upstream '{predecessor_id}' already "
+                f"guarantees on every row reaching it. The transform would overwrite "
+                f"existing row data, which the engine rejects at run time as a "
+                f"pipeline configuration error. "
+                f"Fix: give the transform a different output field name (for the llm "
+                f"transform, change 'response_field'), or drop/rename the existing "
+                f"field upstream of this node before it arrives.",
+                component_id=str(node_id),
+                component_type="transform",
             )

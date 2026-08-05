@@ -569,3 +569,96 @@ class TestCoalesceOnSuccessRejectsConnection:
                 gates=list(settings.gates),
                 coalesce_settings=settings.coalesce,
             )
+
+
+class TestTransformOutputFieldCollisionRejectedAtBuild:
+    """The ticket's g05 shape must not build (elspeth-cfcd333f83).
+
+    A composer-authored "title-case the headline" pipeline reused the existing
+    field name as the llm transform's ``response_field``. That passed
+    validation and then crashed on the first row in
+    ``TransformExecutor._run_preflight`` with "would overwrite existing input
+    fields ... This is a pipeline configuration error". Configuration errors
+    belong on the build-time surface: ``build_execution_graph`` runs
+    ``validate_edge_compatibility()``, which both ``elspeth run`` and the web
+    ``POST /validate`` reach, so the rejection surfaces from
+    ``from_plugin_instances`` itself.
+    """
+
+    @staticmethod
+    def _build(tmp_path: Any, *, response_field: str) -> ExecutionGraph:
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import ElspethSettings, SinkSettings
+
+        text_path = tmp_path / "in.txt"
+        text_path.write_text("hello world\n", encoding="utf-8")
+
+        settings = ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="text",
+                    on_success="title_case",
+                    options={
+                        "path": str(text_path),
+                        "column": "headline",
+                        "schema": {"mode": "observed"},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="title_case",
+                    plugin="llm",
+                    input="title_case",
+                    on_success="main",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4.1-nano",
+                        "api_key": "env:OPENROUTER_API_KEY",
+                        "prompt_template": "Title-case: {{ row.headline }}",
+                        "response_field": response_field,
+                        "schema": {"mode": "observed"},
+                        "required_input_fields": ["headline"],
+                    },
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="text",
+                    on_write_failure="discard",
+                    options={
+                        "path": str(tmp_path / "out.txt"),
+                        "field": "headline",
+                        "schema": {"mode": "observed"},
+                    },
+                )
+            },
+        )
+        plugins = instantiate_plugins_from_config(settings)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=None,
+        )
+
+    def test_response_field_reusing_source_column_is_rejected(self, tmp_path: Any) -> None:
+        """The `text` source guarantees `headline` from its `column:` option."""
+        with pytest.raises(GraphValidationError, match="headline") as exc_info:
+            self._build(tmp_path, response_field="headline")
+
+        message = str(exc_info.value)
+        assert exc_info.value.component_type == "transform"
+        # Actionable for an LLM author: names the fix, not just the fault.
+        assert "response_field" in message
+
+    def test_fresh_response_field_still_builds(self, tmp_path: Any) -> None:
+        """Negative control: renaming the output field makes the pipeline valid."""
+        graph = self._build(tmp_path, response_field="title_cased")
+
+        graph.validate_edge_compatibility()

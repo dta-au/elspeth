@@ -16,7 +16,9 @@ from elspeth.contracts import EdgeInfo, PluginSchema
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.types import NodeID, SinkName
+from elspeth.core.dag import schema_validation
 from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.core.dag.guarantees import walk_effective_guarantee_vote
 from elspeth.core.dag.models import GraphValidationError, NodeInfo
 
 # ---------------------------------------------------------------------------
@@ -532,3 +534,267 @@ class TestGetSourceErrorPaths:
         assert graph.get_sources() == []
         with pytest.raises(GraphValidationError, match="Graph must have at least one source"):
             graph.validate()
+
+
+# ---------------------------------------------------------------------------
+# validate_transform_output_field_collisions — build-time detection of the
+# in-place rewrite the TransformExecutor preflight otherwise raises per-row
+# (elspeth-cfcd333f83)
+# ---------------------------------------------------------------------------
+
+
+def _collision_graph(
+    *,
+    source_schema: dict[str, object],
+    declared_output_fields: frozenset[str],
+) -> ExecutionGraph:
+    """source -> transform -> sink, with the transform's declaration under test."""
+    graph = ExecutionGraph()
+    graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="text", config={"schema": source_schema})
+    graph.add_node(
+        "t1",
+        node_type=NodeType.TRANSFORM,
+        plugin_name="llm",
+        config={"schema": {"mode": "observed"}},
+        declared_output_fields=declared_output_fields,
+    )
+    graph.add_node("sink", node_type=NodeType.SINK, plugin_name="text", config={"schema": {"mode": "observed"}})
+    graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("t1", "sink", label="out", mode=RoutingMode.MOVE)
+    return graph
+
+
+class TestTransformOutputFieldCollisions:
+    """A transform must not declare an output field its input already carries.
+
+    The runtime equivalent is TransformExecutor._run_preflight raising
+    PluginContractViolation ("would overwrite existing input fields") on the
+    first row. That is a pipeline CONFIGURATION error, so it belongs on the
+    build-time surface `elspeth run` and the web POST /validate both reach.
+    """
+
+    def test_upstream_guaranteed_field_is_rejected(self) -> None:
+        """Ticket shape: the transform's output field is guaranteed upstream."""
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset({"headline", "headline_model"}),
+        )
+
+        with pytest.raises(GraphValidationError, match="headline") as exc_info:
+            schema_validation.validate_transform_output_field_collisions(graph)
+
+        assert exc_info.value.component_id == "t1"
+        assert exc_info.value.component_type == "transform"
+        # Only the colliding field is named — the transform's other declared
+        # outputs are legitimate additions.
+        assert "headline_model" not in str(exc_info.value)
+
+    def test_reached_through_validate_edge_compatibility(self) -> None:
+        """The check is wired into the surface /validate and `elspeth run` reach."""
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset({"headline"}),
+        )
+
+        with pytest.raises(GraphValidationError, match="headline"):
+            graph.validate_edge_compatibility()
+
+    def test_non_colliding_output_field_builds(self) -> None:
+        """Negative control: a fresh output field must remain buildable."""
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset({"title_cased"}),
+        )
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_abstaining_upstream_is_not_rejected(self) -> None:
+        """Abstention control: never reject on a guess.
+
+        The declared output field is the SAME name the rejection test uses, so
+        the only difference is that this upstream makes no guarantee at all.
+        An observed source may or may not carry 'headline'; that stays enforced
+        per-row by the executor preflight.
+        """
+        graph = _collision_graph(
+            source_schema={"mode": "observed"},
+            declared_output_fields=frozenset({"headline"}),
+        )
+
+        # Pin the precondition: a change to participates_in_propagation that
+        # made this upstream vote must break this test loudly rather than
+        # silently voiding what it controls for.
+        vote = walk_effective_guarantee_vote(graph, "src", {})
+        assert vote.participated is False
+        assert vote.fields == frozenset()
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_multi_hop_guarantee_through_pass_through_transform_is_rejected(self) -> None:
+        """source -> pass-through transform -> transform.
+
+        The colliding field is guaranteed by the SOURCE, not by the transform's
+        direct predecessor's own declaration — it only reaches the second
+        transform because ADR-007 propagation carries it through the
+        pass-through node. Rejecting here proves the check consults the
+        effective-guarantee walk, not the predecessor's raw schema.
+        """
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="text",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
+        )
+        graph.add_node(
+            "passthru",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="enrich",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["extra"]}},
+            declared_output_fields=frozenset({"extra"}),
+            passes_through_input=True,
+        )
+        graph.add_node(
+            "rewriter",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="llm",
+            config={"schema": {"mode": "observed"}},
+            declared_output_fields=frozenset({"headline"}),
+        )
+        graph.add_edge("src", "passthru", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("passthru", "rewriter", label="continue", mode=RoutingMode.MOVE)
+
+        # The direct predecessor's OWN declaration does not name 'headline';
+        # only the propagated vote does.
+        assert graph.get_guaranteed_fields("passthru") == frozenset({"extra"})
+        assert walk_effective_guarantee_vote(graph, "passthru", {}).fields == frozenset({"extra", "headline"})
+
+        with pytest.raises(GraphValidationError, match="headline") as exc_info:
+            schema_validation.validate_transform_output_field_collisions(graph)
+        assert exc_info.value.component_id == "rewriter"
+
+    def test_divert_only_predecessor_is_not_rejected(self) -> None:
+        """DIVERT edges are structural markers, not live inbound paths.
+
+        Rows reach a DIVERT destination through exception handling carrying an
+        error envelope, not by traversing the edge with the producer's declared
+        output. Inheriting a guarantee across one would reject a runnable
+        pipeline.
+        """
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="text",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
+        )
+        graph.add_node(
+            "quarantine",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="llm",
+            config={"schema": {"mode": "observed"}},
+            declared_output_fields=frozenset({"headline"}),
+        )
+        graph.add_edge("src", "quarantine", label="on_error", mode=RoutingMode.DIVERT)
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_live_edge_alongside_divert_edge_is_still_rejected(self) -> None:
+        """A predecessor with BOTH a MOVE and a DIVERT edge stays live.
+
+        Guards the regrouping in _live_predecessors: filtering edge-wise
+        without collapsing by predecessor would let the DIVERT edge mask a
+        real MOVE path from the same producer.
+        """
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="text",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
+        )
+        graph.add_node(
+            "t1",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="llm",
+            config={"schema": {"mode": "observed"}},
+            declared_output_fields=frozenset({"headline"}),
+        )
+        graph.add_edge("src", "t1", label="on_error", mode=RoutingMode.DIVERT)
+        graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)
+
+        with pytest.raises(GraphValidationError, match="headline"):
+            schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_divert_only_predecessor_is_not_checked(self) -> None:
+        """A predecessor reachable ONLY over a DIVERT edge contributes no guarantee.
+
+        The negative twin of the test above, and the one that actually pins the
+        DIVERT skip: deleting the ``mode == RoutingMode.DIVERT`` guard in
+        ``_live_predecessors`` leaves every other test in this file green, because
+        they all reach their predecessor over a live edge as well.
+
+        Rows do not traverse a DIVERT edge — they arrive by exception handling
+        carrying an error envelope, not the producer's declared output — so
+        inheriting a guarantee across one and rejecting on it would refuse a
+        pipeline the engine runs.
+
+        Built through the direct graph API on purpose: ``build_execution_graph``
+        cannot express this shape, because every DIVERT edge it creates targets a
+        SINK (source quarantine, transform/gate ``on_error``, sink failsink), and
+        a transform's ``on_error`` is explicitly rejected unless it names a sink
+        (core/dag/builder.py:1139). The guard is therefore defence-in-depth for the
+        public ``add_edge`` surface and for any future topology that routes error
+        rows into a transform — not a live production path today.
+        """
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="text",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
+        )
+        graph.add_node(
+            "t1",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="llm",
+            config={"schema": {"mode": "observed"}},
+            declared_output_fields=frozenset({"headline"}),
+        )
+        graph.add_edge("src", "t1", label="on_error", mode=RoutingMode.DIVERT)
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_divert_mode_stored_as_plain_string_is_still_skipped(self) -> None:
+        """``add_edge`` does not coerce ``mode``, so the string form must skip too.
+
+        Pins the ``==`` comparison in ``_live_predecessors``: switching it to an
+        identity check (``is``) would treat a plain ``"divert"`` edge as live and
+        reject a runnable pipeline.
+        """
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="text",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["headline"]}},
+        )
+        graph.add_node(
+            "t1",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="llm",
+            config={"schema": {"mode": "observed"}},
+            declared_output_fields=frozenset({"headline"}),
+        )
+        graph.add_edge("src", "t1", label="on_error", mode="divert")
+
+        schema_validation.validate_transform_output_field_collisions(graph)
+
+    def test_transform_declaring_nothing_is_skipped(self) -> None:
+        """No declaration means no fields added, so no collision is possible."""
+        graph = _collision_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["headline"]},
+            declared_output_fields=frozenset(),
+        )
+
+        schema_validation.validate_transform_output_field_collisions(graph)

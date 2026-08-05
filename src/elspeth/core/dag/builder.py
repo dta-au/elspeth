@@ -395,6 +395,7 @@ def build_execution_graph(
             input_schema=transform.input_schema,  # TransformProtocol requires this
             output_schema=transform.output_schema,  # TransformProtocol requires this
             output_schema_config=output_schema_config,
+            declared_output_fields=transform.declared_output_fields,
             passes_through_input=transform.passes_through_input,
         )
 

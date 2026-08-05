@@ -196,6 +196,18 @@ class NodeInfo:
     # fields a sink requires. Empty frozenset for all non-sink nodes.
     declared_required_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_output_fields — the fields the transform ADDS
+    # to each row. Used for build-time detection of the field collision the
+    # TransformExecutor preflight otherwise raises per-row
+    # (elspeth-cfcd333f83). Empty frozenset for all non-transform nodes.
+    #
+    # NOT derivable from output_schema_config: a pass-through transform's
+    # effective guaranteed fields include the input fields it forwards, so
+    # deriving this from guarantees would report every pass-through transform
+    # as colliding with its own upstream. Declaration only.
+    declared_output_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
     # by the builder from TransformProtocol.passes_through_input. When True,
     # the validator walk propagates predecessor guarantees through this node
@@ -230,6 +242,23 @@ class NodeInfo:
                 f"NodeInfo.declared_required_fields is only meaningful for SINK nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_required_fields={sorted(self.declared_required_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_output_fields mirrors the
+        # declared_required_fields guard above. It is TRANSFORM-only rather
+        # than TRANSFORM+AGGREGATION (as passes_through_input is) because the
+        # only consumer — validate_transform_output_field_collisions — pre-empts
+        # a runtime check that exists solely in TransformExecutor._run_preflight.
+        # AggregationExecutor.execute_flush performs no collision check, so
+        # carrying the declaration on an aggregation node would be data with no
+        # reader, and validating it would reject pipelines the engine runs today
+        # (elspeth-cfcd333f83).
+        if self.declared_output_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_output_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_output_fields={sorted(self.declared_output_fields)!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )
