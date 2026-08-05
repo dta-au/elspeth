@@ -2712,9 +2712,40 @@ class ComposerServiceImpl:
         recorder = BufferingRecorder()
         plugin_snapshot, policy_catalog = self._plugin_policy_context(user_id)
         try:
+            # Which authoring surface a request gets is decided here, and the
+            # two are not equivalent: the planner is one bounded call, the
+            # compose loop is an iterative turn/wall-clock budget. Nothing else
+            # records the choice — the `surface` dimension on Composer
+            # telemetry is the SESSION surface (freeform/guided), not this one —
+            # so without this line a session's posture cannot be reconstructed
+            # after the fact (elspeth-7da4e52344). Booleans and closed vocab
+            # only: the message itself is Tier-3 authored text and must not be
+            # logged.
+            state_is_empty = _state_is_structurally_empty(state)
+            intent_is_explicit_mutation = _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
+            planner_eligible = (
+                state_is_empty
+                and intent_is_explicit_mutation
+                and guided_terminal is None
+                and self._sessions_service is not None
+                and session_id is not None
+                and user_message_id is not None
+            )
+            slog.info(
+                "composer_authoring_surface_selected",
+                authoring_surface="planner" if planner_eligible else "compose_loop",
+                state_is_structurally_empty=state_is_empty,
+                intent_is_explicit_mutation=intent_is_explicit_mutation,
+                is_guided_terminal=guided_terminal is not None,
+                session_id=session_id,
+            )
+            # Repeated rather than branching on ``planner_eligible`` so the
+            # ``is not None`` conjuncts narrow ``session_id`` /
+            # ``user_message_id`` for the call below. Every conjunct here is a
+            # cached boolean or a None check — the classifier does not re-run.
             if (
-                _state_is_structurally_empty(state)
-                and _classify_pipeline_mutation_intent(message) is _PipelineMutationIntentDecision.EXPLICIT_MUTATION
+                state_is_empty
+                and intent_is_explicit_mutation
                 and guided_terminal is None
                 and self._sessions_service is not None
                 and session_id is not None
