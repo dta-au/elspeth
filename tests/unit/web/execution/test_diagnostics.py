@@ -772,6 +772,136 @@ def test_diagnostics_failure_detail_node_state_lookup_ignores_token_preview_limi
         db.close()
 
 
+def test_diagnostics_failure_detail_ignores_a_failed_node_state_that_did_not_fail_the_run(tmp_path) -> None:
+    """An uncorrelated failed node_state must not steal attribution from the operation.
+
+    Regression test for the cross-wire found while verifying elspeth-8e5cc5ced0
+    live. Preferring the *latest* failed node_state is a positional guess, not a
+    causal link: a run can hold a failed state that never failed the run — a row
+    diverted by on_error — while the operation aborted for an unrelated reason.
+    Here the SOURCE raises mid-stream, and the only failed node_state belongs to
+    a transform whose failure was discarded. Sources write no failed node_state,
+    so there is nothing to lose the tie against.
+
+    Correct attribution is the source. Naming the discarded row's transform is
+    the original defect in the opposite direction, and strictly worse: it names
+    a node with no causal relationship to the failure at all.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "explode_items", NodeType.TRANSFORM, "json_explode")
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        state = factory.execution.begin_node_state(
+            token.token_id,
+            "explode_items",
+            web_run_id,
+            1,
+            {"value": 1},
+            state_id="state-token-0",
+        )
+        # Row-level failure, routed away by on_error — the run carried on.
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(
+                exception="row 1 could not be exploded",
+                exception_type="TypeError",
+            ),
+        )
+
+        # The source then dies mid-stream. Its error is what failed the run.
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(
+            source_op.operation_id,
+            "failed",
+            error="SOURCE BLEW UP mid-stream on row 3",
+            duration_ms=50.0,
+        )
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.error_message == "SOURCE BLEW UP mid-stream on row 3"
+        assert diagnostics.failure_detail.node_id == "source"
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_correlates_past_an_uncorrelated_later_failure(tmp_path) -> None:
+    """The raising node is still found when a newer, unrelated failed state sits in front of it.
+
+    Guards the scan rather than the tie-break: the correlated state is not
+    necessarily the most recent failed one, so a lookup that inspects only the
+    latest row would fall back to scope attribution and silently re-open
+    elspeth-8e5cc5ced0 for any run carrying a later diverted-row failure.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+        _register_node(factory, web_run_id, "tidy_values", NodeType.TRANSFORM, "value_transform")
+
+        fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        raising_state = factory.execution.begin_node_state(
+            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            raising_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+        )
+
+        later_row = factory.data_flow.create_row(
+            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        )
+        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+        later_state = factory.execution.begin_node_state(
+            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+        )
+        factory.execution.complete_node_state(
+            later_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception="unrelated diverted row", exception_type="TypeError"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+    finally:
+        db.close()
+
+
 def test_diagnostics_failure_detail_none_when_no_failed_operations(tmp_path) -> None:
     """failure_detail must be None for runs without failed operations."""
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")

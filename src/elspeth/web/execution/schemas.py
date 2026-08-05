@@ -954,13 +954,17 @@ class RunDiagnosticFailureDetail(_StrictResponse):
     failure directly so the UI can render "what went wrong" without scanning.
     None on the response when no failed operation exists.
 
-    ``node_id`` names the node that raised — taken from the latest FAILED
-    node_state when one exists, falling back to the failed operation's owner
-    (elspeth-8e5cc5ced0). ``operation_id``/``operation_type`` describe the
-    latest failed *operation*, i.e. the operation in flight when the failure
-    surfaced; its scope may span other nodes' work (a ``source_load`` scope
-    covers the whole streaming row loop), so it can legitimately differ from
-    ``node_id``.
+    ``node_id`` names the node that raised — taken from the most recent FAILED
+    node_state whose recorded error is the one that failed the operation,
+    falling back to the failed operation's owner when no such state correlates
+    (elspeth-8e5cc5ced0). The correlation matters: a run can hold failed
+    node_states that never failed the run (rows diverted by ``on_error``), and
+    attributing an operation's crash to one of those names a node with no
+    causal relationship to the failure. ``operation_id``/``operation_type``
+    describe the latest failed *operation*, i.e. the operation in flight when
+    the failure surfaced; its scope may span other nodes' work (a
+    ``source_load`` scope covers the whole streaming row loop), so it can
+    legitimately differ from ``node_id``.
 
     ``error_message`` is the chain text persisted to ``operations.error_message``
     in Landscape — it carries the wrapper error plus its cause(s) including any

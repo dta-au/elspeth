@@ -43,6 +43,12 @@ _MAX_DIAGNOSTIC_LIMIT = 100
 _OPERATION_PREVIEW_LIMIT = 20
 _ARTIFACT_PREVIEW_LIMIT = 20
 
+# How many of the most recent failed node_states to consider when correlating a
+# failed operation to the node that raised it. A run can accumulate many failed
+# states that never failed the run (rows diverted by on_error), so the scan is
+# bounded rather than unbounded, and finding no match is a normal outcome.
+_FAILED_STATE_CORRELATION_SCAN_LIMIT = 50
+
 _SafeFailureClassification = Literal[
     "authentication_failed",
     "authorization_denied",
@@ -176,6 +182,49 @@ def _decode_json(value: str | None) -> Any | None:
     if value is None:
         return None
     return json.loads(value)
+
+
+def _node_state_error_explains_operation(error_json: str | None, operation_error_message: str | None) -> bool:
+    """Whether this failed node_state records the exception that failed the operation.
+
+    There is no persisted linkage from an operation to the node_state that
+    aborted it, so correlate on the recorded error instead. Both sides render
+    the same exception through the same scrubber: ``operations.error_message``
+    is ``scrub_text_for_audit(str(exc))`` (``core/operations.py``
+    ``_render_exception``) and ``ExecutionError.exception`` is the same scrub of
+    the same string (``contracts/errors.py`` ``__post_init__``). So when the
+    state is the operation's cause, its ``exception`` appears verbatim inside
+    the operation's message. Substring rather than equality: the operation
+    message may carry wrapper/cause chain text around it.
+
+    ``exception`` is the field to key on — ``ExecutionError`` requires it
+    non-empty, whereas ``context`` is an optional structured payload only
+    populated for exceptions exposing ``to_audit_dict()``. It is read as a
+    fallback for envelopes predating that guarantee.
+
+    Returns False for anything it cannot positively correlate — an absent,
+    malformed, or unrecognised envelope, or an empty message that would match
+    indiscriminately. A false negative costs scope-owner attribution (the prior
+    behaviour); a false positive names an unrelated node, which is the defect
+    this exists to prevent.
+    """
+    if not operation_error_message:
+        return False
+    try:
+        payload = _decode_json(error_json)
+    except (TypeError, ValueError):
+        # error_json is a Text column: a malformed value must degrade this
+        # projection to scope attribution, never fail the diagnostics read.
+        return False
+    if not isinstance(payload, dict):
+        return False
+    candidate = payload.get("exception")
+    if not isinstance(candidate, str) or not candidate.strip():
+        context = payload.get("context")
+        candidate = context.get("message") if isinstance(context, dict) else None
+    if not isinstance(candidate, str) or not candidate.strip():
+        return False
+    return candidate in operation_error_message
 
 
 def _max_datetime(values: list[datetime | None]) -> datetime | None:
@@ -429,10 +478,24 @@ def load_run_diagnostics_from_db(
             # NodeStateGuard carries the true raising node, so prefer it.
             # Queried independently of the preview-limited token query above:
             # the failing token may sort outside the preview window.
+            #
+            # But ONLY when that state is the operation's own cause. "Latest
+            # failed node_state" is a positional guess, not a causal link, and
+            # a run can hold a failed state that never failed the run at all —
+            # a row diverted by on_error, say — while the operation aborted for
+            # an unrelated reason. Attributing the source's own crash to a
+            # discarded row's transform is the original defect in the opposite
+            # direction. There is no persisted operation->state linkage to join
+            # on, so correlate on the recorded error: both sides render the
+            # SAME exception through the audit scrubber, so the state's message
+            # appears verbatim in operations.error_message when it is the cause.
+            # No correlated state => keep the operation's owner, which is at
+            # least the scope that aborted.
             failed_state_stmt = (
                 select(
                     node_states_table.c.node_id,
                     node_states_table.c.completed_at,
+                    node_states_table.c.error_json,
                 )
                 .where(
                     and_(
@@ -445,13 +508,15 @@ def load_run_diagnostics_from_db(
                     node_states_table.c.started_at.desc(),
                     node_states_table.c.state_id.asc(),
                 )
-                .limit(1)
+                .limit(_FAILED_STATE_CORRELATION_SCAN_LIMIT)
             )
-            failed_state_row = conn.execute(failed_state_stmt).first()
-            if failed_state_row is not None:
+            for failed_state_row in conn.execute(failed_state_stmt):
+                if not _node_state_error_explains_operation(failed_state_row.error_json, failure_row.error_message):
+                    continue
                 failure_node_id = failed_state_row.node_id
                 if failed_state_row.completed_at is not None:
                     failed_at = failed_state_row.completed_at
+                break
 
             failure_detail = RunDiagnosticFailureDetail(
                 operation_id=failure_row.operation_id,
