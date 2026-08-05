@@ -1300,7 +1300,7 @@ class TestTransformExecutor:
             declared_output_fields=frozenset({"llm_response", "llm_response_model"}),
         )
         # Input row already has "llm_response" — collision!
-        token = _make_token(data={"value": "test", "llm_response": "pre-existing"})
+        token = _make_token(data={"value": "test", "llm_response": "pre-existing"}, token_id="tok_collision")
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
@@ -1308,6 +1308,10 @@ class TestTransformExecutor:
 
         factory.data_flow.record_token_outcome.assert_called_once()
         kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        # The outcome must be attributed to the token that actually failed: an
+        # outcome recorded against the wrong token reports a phantom failure
+        # AND leaves the real one pending, which outcome/path alone cannot catch.
+        assert kwargs["ref"].token_id == "tok_collision"
         assert kwargs["outcome"] == TerminalOutcome.FAILURE
         assert kwargs["path"] == TerminalPath.UNROUTED
 
@@ -1632,7 +1636,7 @@ class TestTransformExecutor:
         executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
         transform = _make_transform()
         transform._on_start_called = False  # Simulate missing lifecycle call
-        token = _make_token()
+        token = _make_token(token_id="tok_lifecycle")
         ctx = make_context()
 
         with pytest.raises(PluginContractViolation, match="before on_start"):
@@ -1640,6 +1644,9 @@ class TestTransformExecutor:
 
         factory.data_flow.record_token_outcome.assert_called_once()
         kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        # See the collision test above: outcome/path alone cannot detect an
+        # outcome recorded against the wrong token.
+        assert kwargs["ref"].token_id == "tok_lifecycle"
         assert kwargs["outcome"] == TerminalOutcome.FAILURE
         assert kwargs["path"] == TerminalPath.UNROUTED
 
