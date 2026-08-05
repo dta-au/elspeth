@@ -109,6 +109,25 @@ operator decisions, surfaced here and not self-served.
    g04 did not. This is turn-count pressure, ticket material distinct
    from the latency knob.
 
+## Addendum: effort-knob trial (web:14, same day)
+
+Operator selected lever 1. `web:14` deployed (env-only:
+`ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT=medium` added — the key
+was previously absent, code default `high`; telemetry rev 14; doctor
+green; 1/1/0; health/ready 200). Serial retrials:
+
+| Graph | At `high` (web:13) | At `medium` (web:14) |
+|---|---|---|
+| g08 (LLM-shaped) | 422 at 270s (123s thinking tail) | **completed ~200s**, 5 reviews resolved; full-shape valid graph — both branches `prompt_shield → llm → content_safety`, input-side shield present, `value_transform` style tags |
+| g04 (nested-JSON flatten) | 422 ×2 | still 422 at 271s — worst call 123s → 72s, but 7 turns of `json_explode` `guaranteed_fields`/list-typed-contract churn consumed the budget; binding constraint is turn count (elspeth-7da4e52344) |
+| g01 (regression check) | 192s | 184s — no regression |
+
+Verdict update: the effort knob resolves the latency half of the timeout
+problem; the compose timeout stays untouched (as the brief's rule
+demands). The residual g04-class failures are the freeform-loop
+scaffolding defect, tracked on elspeth-7da4e52344.
+elspeth-930a163c85 closed. Rollback candidate for web:14 is web:13.
+
 ## Success criteria disposition
 
 1. ✅ (as `web:13`, wider than briefed, on operator instruction)
