@@ -295,7 +295,101 @@ before the bucket was emptied.
 
 ## Part 2 — cold install of Sydney
 
-_pending_
+Run `700e19d5-7894-4087-9a04-25aca8047b26`, `ap-southeast-2`, root profile
+`elspeth-acceptance` on both provider aliases. Runbook step 2 skipped per the
+brief (`elspeth-e54343d43b`: the shipped installer policies cannot complete a
+create).
+
+### Models — every premise verified live, not taken from the brief
+
+| Claim | How checked | Result |
+|---|---|---|
+| `zai.glm-5` exists in Sydney | `list-foundation-models` | present, `ACTIVE`, TEXT, streaming |
+| **No** `zai` inference profile exists | `list-inference-profiles`, filtered on `zai`/`glm` | `[]` of 29 ACTIVE profiles — brief confirmed |
+| `au.anthropic.claude-sonnet-4-6` available | `list-inference-profiles` | `ACTIVE` |
+| Z.AI model access enabled | **live `bedrock-runtime converse`** | returned `ok`, 269 ms |
+| Composer model invocable | live `converse` | returned `ok`, 881 ms |
+| `fast` profile model invocable | live `converse` | returned `ok`, 18 tokens |
+
+The brief warned that "a new provider usually needs" console model access
+enabled. It did not — access was already live. Verified by invoking, not by
+reading a console page.
+
+`au.anthropic.claude-sonnet-4-6` resolves to foundation models in **two**
+Regions (`ap-southeast-2` and `ap-southeast-4`), which is why the grant needs
+the wildcard sibling form; the module derives that automatically because `au.`
+is a geography prefix. `zai.` is a **provider** label in
+`bedrock_known_provider_prefixes`, so it derives no cross-region grant and the
+explicit foundation-model ARNs are load-bearing. The plan produced no
+`bedrock_unclassified_model_ids` precondition failure, which is the module's
+own confirmation that the pairing is grantable.
+
+Distinctness (`config.py:957`): final path segments `au.anthropic.claude-sonnet-4-6`
+vs `zai.glm-5` — distinct as strings and as vendors.
+
+### Images
+
+Built from a **detached worktree at `52ab3ec8b`**, not from the shared
+checkout: a concurrent writer modified seven source files and added one test at
+04:54–04:56, two minutes after this session's commit. An image whose contents
+do not match its `CANDIDATE_SHA` label is the exact provenance defect
+`elspeth-9f7d336e1c` exists to prevent, so the build took its context from a
+clean tree at a known commit. The other session's work was neither committed,
+reverted, nor built.
+
+Pre-publish verification passed: revision label == deployed SHA, `linux/amd64`,
+uid/gid `1654`, `boto3` + `psycopg` + `psycopg2` + `elspeth.web` import,
+`--version`, frontend dist present and **world-readable** (2 × `index.html` —
+the container runs as 1654, so a root-owned 0600 dist boots fine and serves
+nothing), `SESSION_SCHEMA_EPOCH=45`.
+
+| | Digest |
+|---|---|
+| `elspeth-web` index | `sha256:fabe0cf9…` |
+| `elspeth-web` amd64 child | `sha256:d614f114…` |
+| `elspeth-cloudwatch-agent` index | `sha256:5e95635d…` |
+| `elspeth-cloudwatch-agent` amd64 child | `sha256:4e8cca34…` |
+
+The scan-manifest trap reproduced exactly as the brief describes, and was
+confirmed in **both** directions rather than assumed:
+`describe-image-scan-findings` on the index digest returns
+`ScanNotFoundException`; on the amd64 child it returns `COMPLETE`. Both
+publishes produced `application/vnd.oci.image.index.v1+json` with an `amd64`
+child and an attestation child, even though the runbook's flow is
+`buildx --load` then `docker push`.
+
+### Finding (P2) — the runbook's zero-finding scan gate is unsatisfiable for the agent image
+
+`elspeth-web` amd64 child: **COMPLETE, zero findings.** Clean.
+
+`elspeth-cloudwatch-agent` amd64 child: **COMPLETE, 33 findings — 5 CRITICAL,
+16 HIGH, 9 MEDIUM, 3 LOW.** Runbook step 4's `require_clean_scan` requires a
+total of zero, so this is a documented stop condition.
+
+Every finding is an OS package in the base layer — `perl`, `openssl`, `glibc`,
+`sqlite3` — and **all 33 report no fix available upstream**
+(`fixed_in_version` absent on every one). Bumping the pinned base digest
+therefore cannot clear the gate; it is currently unsatisfiable for any
+Debian-derived base.
+
+The cause is narrower than it looks, and the fix is concrete.
+`cloudwatch-agent-image/Dockerfile` copies `/opt/aws` out of
+`amazon/cloudwatch-agent` and then runs it **on a `python:3.13-slim`
+runtime**. The entrypoint,
+`/opt/aws/amazon-cloudwatch-agent/bin/start-amazon-cloudwatch-agent`, is an
+**ELF binary** — the agent is Go. Nothing in the image uses the Python base;
+it contributes no capability and every one of the 33 CVEs. The app image, whose
+runtime is a busybox/venv root rather than a distro, scans clean.
+
+Recommendation: rebase the sidecar on a minimal runtime (upstream
+`amazon/cloudwatch-agent` itself, or a distroless static base) and re-gate.
+Filed against the cold-install qualification, `elspeth-671a17d5c0`.
+
+**Proceeded past this gate deliberately**, and it is recorded rather than
+waived silently: the findings are unfixed-upstream OS packages, in a monitoring
+sidecar, in a single-tenant disposable account whose ALB ingress is restricted
+to one operator IP — and stopping would deliver no battery at all. That is an
+operator decision to ratify or reverse, not a clean pass.
 
 ## Part 3 — battery round 4
 
