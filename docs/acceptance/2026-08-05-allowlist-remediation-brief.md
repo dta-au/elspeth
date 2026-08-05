@@ -1,7 +1,30 @@
 # Brief: unblock the compose cost measurement by fixing the acceptance allowlist
 
 Date: 2026-08-05. Author: `claude-cache-deploy`. Audience: the agent that
-executes it. Prerequisite reading:
+executes it.
+
+> **Executed 2026-08-05, with two deliberate divergences.** The operator
+> widened Task 1 beyond the three named transforms: `web:13` deployed the
+> full plugin share (allowlist 15 → 40 entries; Azure ×5 / Dataverse ×2
+> excluded for missing credentials), after a local dry-run of
+> `compile_web_plugin_policy` against the real registry — the policy
+> compiler is fail-closed at boot, so pre-flighting the compile is the
+> safety step any future re-run must keep. `web:12` (the three-transform
+> variant) was registered but never deployed. Task 2 outcome:
+> g01 composed deterministically in 192s (was a 270s timeout), g02 in 84s,
+> no llm/guardrail nodes; **USD 1.3394 → 0.4246 per session (−68%), cache
+> hit 37% → 85.4%**, flattening curve confirmed; elspeth-a79f1b2e6b CLOSED.
+> Task 3 verdict: budget untouched for g01/g02-class graphs; g04/g08-class
+> churn timeouts remain (operator ticket elspeth-930a163c85), and `web:14`
+> later set candidate effort "medium" (123s tails → 72s). The predicted
+> sample-data trap was observed exactly: the composer pre-normalised its
+> invented rows because it cannot express "lowercase" — now P1
+> elspeth-38dffd9bec. One measurement correction: the audit row's `content`
+> column is only the summary projection; the C6 cache fields live in
+> `tool_calls -> 0 -> 'call'`, and key-presence is NOT a cohort
+> discriminator — split cohorts by session set.
+
+Prerequisite reading:
 `docs/acceptance/2026-08-05-compose-token-cost-addendum.md` (the fix being
 measured) and `ops-local/README.md` (environment of record, operator
 utilities). Status at handoff: the cache fix (`6bcd69037`,
