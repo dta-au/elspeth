@@ -510,13 +510,32 @@ def load_run_diagnostics_from_db(
                 )
                 .limit(_FAILED_STATE_CORRELATION_SCAN_LIMIT)
             )
+            # Tie-break among correlated states: prefer one recorded against the
+            # operation's OWN node. One exception can terminalize several nodes'
+            # states with the same message — a failsink boundary failure
+            # terminalizes the failsink states that raised AND the primary divert
+            # anchors that did not (executors/sink.py, elspeth-2a75af7f8f) — so
+            # correlation alone can leave several equally-matching candidates and
+            # recency picks whichever was written last, which is not the raiser.
+            # An operation whose node_id is itself the raiser (a sink_write) then
+            # names a bystander. Matching the operation's node is positive
+            # evidence when it is present; its ABSENCE is not evidence, because
+            # for a scope-owning operation (source_load) no failed state carries
+            # the source's node at all — so fall through to recency, which is the
+            # case this correlation was built for.
+            correlated_state = None
             for failed_state_row in conn.execute(failed_state_stmt):
                 if not _node_state_error_explains_operation(failed_state_row.error_json, failure_row.error_message):
                     continue
-                failure_node_id = failed_state_row.node_id
-                if failed_state_row.completed_at is not None:
-                    failed_at = failed_state_row.completed_at
-                break
+                if correlated_state is None:
+                    correlated_state = failed_state_row
+                if failed_state_row.node_id == failure_row.node_id:
+                    correlated_state = failed_state_row
+                    break
+            if correlated_state is not None:
+                failure_node_id = correlated_state.node_id
+                if correlated_state.completed_at is not None:
+                    failed_at = correlated_state.completed_at
 
             failure_detail = RunDiagnosticFailureDetail(
                 operation_id=failure_row.operation_id,
