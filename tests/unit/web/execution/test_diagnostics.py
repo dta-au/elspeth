@@ -902,6 +902,236 @@ def test_diagnostics_failure_detail_correlates_past_an_uncorrelated_later_failur
         db.close()
 
 
+def test_diagnostics_failure_detail_prefers_an_exact_match_over_a_newer_substring_decoy(tmp_path) -> None:
+    """A newer state whose exception is a fragment of the message must not outrank the true cause.
+
+    The scan is ordered by recency, and a scope-owning operation (source_load)
+    records the SOURCE node, so no failed state carries the operation's own
+    node: any candidate that sorts first and merely substring-matches would win
+    unopposed. Here the decoy's exception is ``"2"``, which occurs inside the
+    fatal message's ``"2 validation errors"`` by coincidence.
+
+    Both halves of the projection are pinned. Attributing the decoy also takes
+    its ``failed_at``, so the drawer pairs a node with a timestamp and a message
+    that node never emitted.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+        _register_node(factory, web_run_id, "tidy_values", NodeType.TRANSFORM, "value_transform")
+
+        fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        raising_state = factory.execution.begin_node_state(
+            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            raising_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+        )
+
+        later_row = factory.data_flow.create_row(
+            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        )
+        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+        later_state = factory.execution.begin_node_state(
+            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+        )
+        factory.execution.complete_node_state(
+            later_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception="2", exception_type="TypeError"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+        completed_at = {state.node_id: state.completed_at for token in diagnostics.tokens for state in token.states}
+        assert diagnostics.failure_detail.failed_at == completed_at["hoist_items"]
+        assert diagnostics.failure_detail.failed_at != completed_at["tidy_values"]
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_prefers_the_whole_message_over_a_newer_prefix_match(tmp_path) -> None:
+    """Two nodes on one plugin: a diverted row's prefix must not outrank the fatal message.
+
+    The generic head of a plugin's error text is shared by every row it fails,
+    so a row diverted by on_error records a strict prefix of the message that
+    later killed the run. No unusual exception text is involved — this is the
+    ordinary shape of a pipeline running the same transform at two nodes, and
+    it is why a length floor alone cannot decide correlation: both candidates
+    are ordinary messages, and only the more specific match is the cause.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+        _register_node(factory, web_run_id, "tidy_values", NodeType.TRANSFORM, "value_transform")
+
+        fatal_message = "Transform 'value_transform' input validation failed: 2 validation errors"
+        diverted_message = "Transform 'value_transform' input validation failed"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        raising_state = factory.execution.begin_node_state(
+            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            raising_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=fatal_message, exception_type="PluginContractViolation"),
+        )
+
+        later_row = factory.data_flow.create_row(
+            web_run_id, "source", 1, {"value": 2}, row_id="row-1", source_row_index=1, ingest_sequence=1
+        )
+        later_token = factory.data_flow.create_token(later_row.row_id, token_id="token-1")
+        later_state = factory.execution.begin_node_state(
+            later_token.token_id, "tidy_values", web_run_id, 1, {"value": 2}, state_id="state-token-1"
+        )
+        factory.execution.complete_node_state(
+            later_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=diverted_message, exception_type="PluginContractViolation"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_ignores_a_degenerate_substring_candidate(tmp_path) -> None:
+    """A token too short to identify anything must not correlate at all.
+
+    ``"None"`` occurs inside ``"'NoneType' object has no attribute 'get'"`` for
+    no causal reason whatsoever, and the diverted row that recorded it is the
+    only failed state in the run. With nothing to outrank it, correlation must
+    refuse rather than rank: the operation keeps its own scope-owning node,
+    which is the documented degradation.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "tidy_values", NodeType.TRANSFORM, "value_transform")
+
+        fatal_message = "AttributeError: 'NoneType' object has no attribute 'get'"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        diverted_state = factory.execution.begin_node_state(
+            token.token_id, "tidy_values", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            diverted_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception="None", exception_type="TypeError"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "source"
+    finally:
+        db.close()
+
+
+def test_diagnostics_failure_detail_correlates_a_short_exception_matching_the_message_exactly(tmp_path) -> None:
+    """A short exception still correlates when it IS the message, not a fragment of one.
+
+    Guards the minimum-specificity rule against over-correction: the rule
+    withholds correlation from short *fragments*, and an exact match is not a
+    fragment. Plugins do raise terse errors, and refusing them would re-open
+    elspeth-8e5cc5ced0 for every run whose fatal exception is a short one.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "hoist_items", NodeType.TRANSFORM, "value_transform")
+
+        fatal_message = "bad row"
+
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"value": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        raising_state = factory.execution.begin_node_state(
+            token.token_id, "hoist_items", web_run_id, 1, {"value": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            raising_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=2.0,
+            error=ExecutionError(exception=fatal_message, exception_type="ValueError"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=fatal_message, duration_ms=50.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "hoist_items"
+    finally:
+        db.close()
+
+
 def test_diagnostics_failure_detail_none_when_no_failed_operations(tmp_path) -> None:
     """failure_detail must be None for runs without failed operations."""
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")

@@ -47,7 +47,20 @@ _ARTIFACT_PREVIEW_LIMIT = 20
 # failed operation to the node that raised it. A run can accumulate many failed
 # states that never failed the run (rows diverted by on_error), so the scan is
 # bounded rather than unbounded, and finding no match is a normal outcome.
+# A residual neither bound closes: with the true-cause state evicted from this
+# window while a coincidental candidate clearing the substring floor below stays
+# inside it, ranking still names the bystander — narrowing either limit only
+# shrinks the odds, and a schema-level operation -> state linkage is what would
+# remove the failure mode.
 _FAILED_STATE_CORRELATION_SCAN_LIMIT = 50
+
+# A correlating exception shorter than the operation's whole message must be at
+# least this long. A rendered exception message identifies the failure it came
+# from; a bare token ("2", "None", "Error", "Timeout") turns up inside unrelated
+# error text by coincidence, and one coincidence is enough to name a bystander.
+# Exact matches are exempt at any length: a candidate equal to the whole message
+# is positive identification, not a fragment that happens to appear in one.
+_MINIMUM_SUBSTRING_CORRELATION_LENGTH = 12
 
 _SafeFailureClassification = Literal[
     "authentication_failed",
@@ -184,8 +197,8 @@ def _decode_json(value: str | None) -> Any | None:
     return json.loads(value)
 
 
-def _node_state_error_explains_operation(error_json: str | None, operation_error_message: str | None) -> bool:
-    """Whether this failed node_state records the exception that failed the operation.
+def _node_state_error_correlating_exception(error_json: str | None, operation_error_message: str | None) -> str | None:
+    """The exception this failed node_state records, when it explains the operation.
 
     There is no persisted linkage from an operation to the node_state that
     aborted it, so correlate on the recorded error instead. Both sides render
@@ -195,36 +208,46 @@ def _node_state_error_explains_operation(error_json: str | None, operation_error
     the same string (``contracts/errors.py`` ``__post_init__``). So when the
     state is the operation's cause, its ``exception`` appears verbatim inside
     the operation's message. Substring rather than equality: the operation
-    message may carry wrapper/cause chain text around it.
+    message may carry wrapper/cause chain text around it. A substring that is
+    not the whole message must clear ``_MINIMUM_SUBSTRING_CORRELATION_LENGTH``.
+
+    The matched text is returned rather than a verdict because correlation does
+    not decide attribution on its own: several states can correlate to one
+    operation, and the caller ranks them by how specifically each matches.
 
     ``exception`` is the field to key on — ``ExecutionError`` requires it
     non-empty, whereas ``context`` is an optional structured payload only
     populated for exceptions exposing ``to_audit_dict()``. It is read as a
     fallback for envelopes predating that guarantee.
 
-    Returns False for anything it cannot positively correlate — an absent,
-    malformed, or unrecognised envelope, or an empty message that would match
-    indiscriminately. A false negative costs scope-owner attribution (the prior
-    behaviour); a false positive names an unrelated node, which is the defect
-    this exists to prevent.
+    Returns None for anything it cannot positively correlate — an absent,
+    malformed, or unrecognised envelope, an empty message that would match
+    indiscriminately, or a fragment too short to identify a failure. A false
+    negative costs scope-owner attribution (the prior behaviour); a false
+    positive names an unrelated node, which is the defect this exists to
+    prevent.
     """
     if not operation_error_message:
-        return False
+        return None
     try:
         payload = _decode_json(error_json)
     except (TypeError, ValueError):
         # error_json is a Text column: a malformed value must degrade this
         # projection to scope attribution, never fail the diagnostics read.
-        return False
+        return None
     if not isinstance(payload, dict):
-        return False
+        return None
     candidate = payload.get("exception")
     if not isinstance(candidate, str) or not candidate.strip():
         context = payload.get("context")
         candidate = context.get("message") if isinstance(context, dict) else None
     if not isinstance(candidate, str) or not candidate.strip():
-        return False
-    return candidate in operation_error_message
+        return None
+    if candidate == operation_error_message:
+        return candidate
+    if len(candidate) < _MINIMUM_SUBSTRING_CORRELATION_LENGTH:
+        return None
+    return candidate if candidate in operation_error_message else None
 
 
 def _max_datetime(values: list[datetime | None]) -> datetime | None:
@@ -510,28 +533,41 @@ def load_run_diagnostics_from_db(
                 )
                 .limit(_FAILED_STATE_CORRELATION_SCAN_LIMIT)
             )
-            # Tie-break among correlated states: prefer one recorded against the
-            # operation's OWN node. One exception can terminalize several nodes'
-            # states with the same message — a failsink boundary failure
-            # terminalizes the failsink states that raised AND the primary divert
-            # anchors that did not (executors/sink.py, elspeth-2a75af7f8f) — so
-            # correlation alone can leave several equally-matching candidates and
-            # recency picks whichever was written last, which is not the raiser.
-            # An operation whose node_id is itself the raiser (a sink_write) then
-            # names a bystander. Matching the operation's node is positive
-            # evidence when it is present; its ABSENCE is not evidence, because
-            # for a scope-owning operation (source_load) no failed state carries
-            # the source's node at all — so fall through to recency, which is the
-            # case this correlation was built for.
+            # Rank the correlated states; do not take the first one found. One
+            # exception can terminalize several nodes' states with the same
+            # message — a failsink boundary failure terminalizes the failsink
+            # states that raised AND the primary divert anchors that did not
+            # (executors/sink.py, elspeth-2a75af7f8f) — and a substring match
+            # can correlate a state that shares no exception at all, so the
+            # scan's recency order alone picks whichever was written last,
+            # which need not be the raiser.
+            #
+            # Ordering, strongest term first: the operation's OWN node recorded
+            # a correlating failure; the candidate is the operation's whole
+            # message rather than a fragment of it; the candidate is longer,
+            # so the more specific match; then scan order, which leaves
+            # equally-specific candidates resolved by recency as before.
+            #
+            # Matching the operation's node is positive evidence when present;
+            # its ABSENCE is not evidence, because for a scope-owning operation
+            # (source_load) no failed state carries the source's node at all —
+            # the case this correlation was built for. So no term can be
+            # settled early and the scan runs to completion: a node match found
+            # first is not evidence that no better candidate follows it.
             correlated_state = None
+            correlated_rank: tuple[bool, bool, int] | None = None
             for failed_state_row in conn.execute(failed_state_stmt):
-                if not _node_state_error_explains_operation(failed_state_row.error_json, failure_row.error_message):
+                candidate = _node_state_error_correlating_exception(failed_state_row.error_json, failure_row.error_message)
+                if candidate is None:
                     continue
-                if correlated_state is None:
+                rank = (
+                    failed_state_row.node_id == failure_row.node_id,
+                    candidate == failure_row.error_message,
+                    len(candidate),
+                )
+                if correlated_rank is None or rank > correlated_rank:
                     correlated_state = failed_state_row
-                if failed_state_row.node_id == failure_row.node_id:
-                    correlated_state = failed_state_row
-                    break
+                    correlated_rank = rank
             if correlated_state is not None:
                 failure_node_id = correlated_state.node_id
                 if correlated_state.completed_at is not None:
