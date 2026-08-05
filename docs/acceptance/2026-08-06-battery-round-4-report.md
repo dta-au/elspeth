@@ -539,6 +539,49 @@ the hash to `6e3cdb85…`, so that hypothesis is **refuted**. The source content
 and the declared schema are both correct; the rejection is in the
 source-validation path.
 
+#### Follow-up: intermittent, and the discriminator is an inversion
+
+The intent was re-run twice more on the same live stack:
+
+| Attempt | Session | Run | Outcome |
+|---|---|---|---|
+| 1 | `e41b2ec2` | `ad27eb80` | `empty` — 4/4 discarded |
+| 2 | `6055267c` | `da5cc692` | `empty` — 4/4 discarded |
+| 3 | `36082993` | `217e40d8` | **`completed`** — 4 processed, 4 succeeded, 0 failed |
+
+So it is **composition-dependent, not a hard failure** — which also means
+"regression against round 3" stays unproven, since a stochastic composer choice
+could have gone the other way then. Comparing the source schema across the
+three gives the discriminator, and it is an inversion:
+
+```
+FAILING (×2)   mode: flexible
+               fields: [{name: TicketID, field_type: str}, {name: CustomerName, …},
+                        {name: Priority, …}, {name: Summary, …}]
+               guaranteed_fields: [TicketID, CustomerName, Priority, Summary]
+
+PASSING (×1)   mode: flexible
+               fields: ["id: str", "name: str", "priority_level: str", "issue_summary: str"]
+               guaranteed_fields: [id, name, priority_level, issue_summary]
+```
+
+**The failing schema is the correct one.** Structured `{name, field_type}`
+entries whose names match the CSV header exactly — and every row is rejected.
+The passing schema is degenerate: `fields` is a list of bare **strings** in a
+`"name: type"` text form rather than structured entries, and its
+`guaranteed_fields` are the *renamed downstream* names, which appear nowhere in
+the CSV header. It validates 4/4.
+
+A correctly declared schema rejects data that conforms to it; a schema
+describing entirely the wrong fields passes. The likely mechanism is
+`core/dag/schema_validation.py:178-183`, where a schema with zero
+`model_fields` and `extra="allow"` is treated as *observed* and **bypasses**
+validation — so the string form probably fails to parse into fields at all and
+is waved through, while the honest declaration is enforced and wrongly fails.
+If so this shares a root with the `type_coerce` defect below: **typed
+declarations are validated, untyped ones are not, and only the honest author is
+punished.**
+
 Two reporting defects compound it:
 
 1. **`routing.discarded: 0` contradicts `discard_summary.total: 4`** in the
@@ -569,6 +612,49 @@ validator rejects the edge because the producer has not already done the
 conversion the consumer performs — so the transform can never be wired to the
 only kind of producer that needs it. Composed pipelines using `type_coerce`
 downstream of a CSV source are unbuildable.
+
+**Deterministic, 3 of 3.** Re-run twice more, identical failure with fresh node
+ids each time (so the composer re-authors the shape rather than replaying a
+cached graph). Contrast g01, which is intermittent.
+
+**Localised to one function — do not bisect the 35 commits.** A
+composer-independent probe against the deployed commit settles it. The tracked
+`examples/transform_pipeline/settings.yaml` is exactly CSV → `type_coerce`
+(`price` str→float) and reports `Pipeline configuration valid.`; it still
+passes when the source is changed to declare all four fields as
+`field_type: str`. So the YAML/DAG path does **not** reject a declared-`str` →
+`type_coerce`-`float` edge.
+
+The reason is `core/dag/schema_validation.py:178-183`: a producer or consumer
+schema with zero `model_fields` and `extra="allow"` counts as *observed* and
+**bypasses type validation entirely**. Only typed contract classes reach
+`check_compatibility`. The composer emits exactly those — the failing edge
+names `CSVRowSchema` and `TypeCoerceInput` — so the check at
+`schema_validation.py:186-205` runs and raises `EdgeContractError`.
+
+Root issue: `check_compatibility` (`contracts/data.py`) treats a consumer's
+declared input type as a **precondition the producer must already satisfy**. A
+coercing transform's input contract describes what it *accepts and converts*,
+not what it requires pre-converted. There is no notion of a converting
+consumer.
+
+**Attribution caveat.** Round 4 changed two variables against round 3 — the
+image (35 commits) **and** the advisor model, which participates in the compose
+loop as an END gate and so does not hold the composer's authoring choices
+constant. Round-3 composition states were not captured before teardown (a gap
+in the Part 0 capture worth noting), so whether round 3 ever authored
+`type_coerce` downstream of a CSV source is unknown. The validator may always
+have been wrong here and simply gone unexercised. That question affects the
+blame, not the fix site.
+
+**A concurrent session is editing this exact area** (uncommitted at time of
+writing): `core/dag/schema_validation.py`, `core/dag/builder.py`,
+`core/dag/graph.py`, `core/dag/models.py`,
+`web/composer/_semantic_validator.py`, plus new
+`tests/invariants/test_transform_input_contract_is_satisfiable.py` and
+`tests/unit/core/dag/test_transform_declared_input_fields.py`. "Transform input
+contract is satisfiable" is this defect restated — it may already be fixed in
+flight. Check that work before starting.
 
 ## Part 4 — cost
 
