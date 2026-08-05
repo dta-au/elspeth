@@ -210,12 +210,20 @@ class TransformExecutor:
             | AggregateDeclarationContractViolation
             | PassThroughContractViolation
             | ZeroEmissionSuccessContractViolation
+            | PluginContractViolation
         ),
     ) -> None:
-        """Persist the matching FAILED token_outcome for declaration-path failures."""
+        """Persist the matching FAILED token_outcome for contract-violation failures.
+
+        Covers both the declaration-contract hierarchy and the bare
+        ``PluginContractViolation`` raised by schema validation and the
+        lifecycle/collision guards (elspeth-82d4c5146c): the run still
+        crashes, but the token's fate must be described in token_outcomes or
+        run accounting reports a pending token on a finished run.
+        """
         if self._data_flow is None:
             raise OrchestrationInvariantError(
-                f"TransformExecutor.data_flow is None but declaration-path failures for "
+                f"TransformExecutor.data_flow is None but contract-violation failures for "
                 f"transform '{transform.name}' must record terminal token_outcomes."
             )
 
@@ -307,11 +315,18 @@ class TransformExecutor:
         # All transforms are system-owned and must inherit BaseTransform.
         # AttributeError here means a transform violates the interface contract.
         if not transform._on_start_called:
-            raise PluginContractViolation(
+            lifecycle_violation = PluginContractViolation(
                 f"Transform '{transform.name}' was called before on_start(). "
                 f"This is an engine lifecycle bug — on_start() must be called "
                 f"before any process() invocation."
             )
+            self._record_terminal_contract_failure(
+                transform=transform,
+                token=token,
+                run_id=run_id,
+                violation=lifecycle_violation,
+            )
+            raise lifecycle_violation
 
         # --- FIELD COLLISION ENFORCEMENT (pre-execution) ---
         # Centralized check: if this transform declares output fields,
@@ -326,11 +341,18 @@ class TransformExecutor:
                 transform.declared_output_fields,
             )
             if collisions is not None:
-                raise PluginContractViolation(
+                collision_violation = PluginContractViolation(
                     f"Transform '{transform.name}' would overwrite existing input fields "
                     f"{collisions}. This is a pipeline configuration error — the transform's "
                     f"output fields collide with fields already present in the row."
                 )
+                self._record_terminal_contract_failure(
+                    transform=transform,
+                    token=token,
+                    run_id=run_id,
+                    violation=collision_violation,
+                )
+                raise collision_violation
 
         # --- PRE-EMISSION DECLARATION-CONTRACT DISPATCH (ADR-010 §Decision 3 + F2) ---
         # Fires BEFORE generic input_schema validation so the current
@@ -372,9 +394,16 @@ class TransformExecutor:
         try:
             transform.input_schema.model_validate(input_dict, strict=True)
         except ValidationError as e:
-            raise PluginContractViolation(
+            input_violation = PluginContractViolation(
                 f"Transform '{transform.name}' input validation failed: {e}. This indicates an upstream transform/source schema bug."
-            ) from e
+            )
+            self._record_terminal_contract_failure(
+                transform=transform,
+                token=token,
+                run_id=run_id,
+                violation=input_violation,
+            )
+            raise input_violation from e
 
         return effective_input_fields, static_contract
 
@@ -498,10 +527,17 @@ class TransformExecutor:
             try:
                 transform.output_schema.model_validate(emitted_row.to_dict(), strict=True)
             except ValidationError as e:
-                raise PluginContractViolation(
+                output_violation = PluginContractViolation(
                     f"Transform '{transform.name}' output validation failed for emitted row {idx}: {e}. "
                     "This indicates a transform schema bug."
-                ) from e
+                )
+                self._record_terminal_contract_failure(
+                    transform=transform,
+                    token=token,
+                    run_id=run_id,
+                    violation=output_violation,
+                )
+                raise output_violation from e
 
     def _populate_result_audit_fields(
         self,

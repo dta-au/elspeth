@@ -664,6 +664,37 @@ class TestTransformExecutor:
 
         transform.process.assert_not_called()
 
+    def test_input_validation_contract_violation_records_terminal_token_outcome(self) -> None:
+        """Input-validation crashes must leave a FAILED terminal outcome (elspeth-82d4c5146c).
+
+        The run still crashes — PluginContractViolation propagates — but the
+        audit trail must describe the token's fate. Without this recording the
+        run accounting reports failed=0, pending=1, closure='open' for a token
+        that provably failed.
+        """
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, _make_span_factory(), _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+
+        from elspeth.contracts import PluginSchema
+
+        class StrictSchema(PluginSchema):
+            count: int
+
+        transform.input_schema = StrictSchema
+        token = _make_token(data={"count": "not_an_int"}, token_id="tok_input_violation")
+        ctx = make_context()
+
+        with pytest.raises(PluginContractViolation, match="input validation failed"):
+            executor.execute_transform(transform, token, ctx)
+
+        factory.data_flow.record_token_outcome.assert_called_once()
+        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert kwargs["ref"].token_id == "tok_input_violation"
+        assert kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert kwargs["path"] == TerminalPath.UNROUTED
+        assert kwargs["context"]["exception_type"] == "PluginContractViolation"
+
     def test_declared_input_fields_violation_precedes_generic_input_validation(self) -> None:
         """Missing declared fields surface as ADR-013 violations before schema validation."""
         factory = _make_factory()
@@ -910,6 +941,11 @@ class TestTransformExecutor:
         assert kwargs["status"] == NodeStateStatus.FAILED
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "PluginContractViolation"
+
+        factory.data_flow.record_token_outcome.assert_called_once()
+        outcome_kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert outcome_kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert outcome_kwargs["path"] == TerminalPath.UNROUTED
 
     def test_output_schema_validation_rejects_coercible_wrong_runtime_type_before_completed(self) -> None:
         """Transform output validation must reject coercible schema-wrong values before audit completion."""
@@ -1270,6 +1306,11 @@ class TestTransformExecutor:
         with pytest.raises(PluginContractViolation, match="would overwrite existing input fields"):
             executor.execute_transform(transform, token, ctx)
 
+        factory.data_flow.record_token_outcome.assert_called_once()
+        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert kwargs["path"] == TerminalPath.UNROUTED
+
     def test_empty_declared_output_fields_skips_collision_check(self) -> None:
         """Transform with empty declared_output_fields passes through without collision check.
 
@@ -1596,6 +1637,11 @@ class TestTransformExecutor:
 
         with pytest.raises(PluginContractViolation, match="before on_start"):
             executor.execute_transform(transform, token, ctx)
+
+        factory.data_flow.record_token_outcome.assert_called_once()
+        kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert kwargs["path"] == TerminalPath.UNROUTED
 
     def test_on_error_none_raises_orchestration_invariant_error(self) -> None:
         """on_error=None invariant: last-line defense if config layer regresses."""

@@ -340,9 +340,15 @@ class SinkExecutor:
         tokens: Sequence[TokenInfo],
         sink_name: str,
         phase: str,
-        violation: (DeclarationContractViolation | AggregateDeclarationContractViolation | SinkTransactionalInvariantError),
+        violation: (DeclarationContractViolation | AggregateDeclarationContractViolation | PluginContractViolation),
     ) -> None:
-        """Record FAILED token_outcomes for sink boundary failures before write."""
+        """Record FAILED token_outcomes for sink boundary failures before write.
+
+        ``PluginContractViolation`` covers both ``SinkTransactionalInvariantError``
+        (its subclass) and the bare violation raised by sink input-schema
+        validation (elspeth-82d4c5146c): the run still crashes, but every
+        token at the boundary must carry a terminal outcome first.
+        """
         base_context = dict(violation.to_audit_dict())
         failing_token_id = base_context["token_id"] if "token_id" in base_context else None
         failing_row_id = base_context["row_id"] if "row_id" in base_context else None
@@ -584,7 +590,7 @@ class SinkExecutor:
                 row_contracts=row_contracts,
             )
             self._validate_sink_input(sink, rows, contracts=row_contracts)
-        except (DeclarationContractViolation, AggregateDeclarationContractViolation, SinkTransactionalInvariantError) as violation:
+        except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             self._complete_states_failed(
                 states=[(token, state) for token, state in all_states if isinstance(state, NodeStateOpen)],
                 duration_ms=0.0,
@@ -861,7 +867,7 @@ class SinkExecutor:
                 row_contracts=None,
             )
             self._validate_sink_input(failsink, enriched_rows, skip_schema=True)
-        except (DeclarationContractViolation, AggregateDeclarationContractViolation, SinkTransactionalInvariantError) as violation:
+        except (DeclarationContractViolation, AggregateDeclarationContractViolation, PluginContractViolation) as violation:
             # Mirror the primary path's boundary-failure terminalization
             # (elspeth-2a75af7f8f): the enriched row never reached the
             # failsink, so terminalize both the quarantine states just opened
