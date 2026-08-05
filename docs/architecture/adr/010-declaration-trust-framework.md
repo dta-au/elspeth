@@ -6,7 +6,7 @@
 **Supersedes:** (partial, clause-level) — see "Supersession map" below
 **Tags:** framework, declaration-contract, audit-evidence, tier-1, registry, audit-integrity
 **Review date:** 2026-10-19 (six months from acceptance; ADR-010 §Consequences must be re-evaluated against observed 2B/2C experience by that date)
-**Filigree epic:** `elspeth-a3ac5d88c6` (Track 2 — Declaration-trust framework Phase 2B/2C; hard SLA 2026-07-18)
+**Filigree epic:** `elspeth-300abf520d` (Track 2 — Declaration-trust framework Phase 2B/2C). Re-filed 2026-08-06 from the pre-Jun-30 archived store, where it is `elspeth-a3ac5d88c6`; the "hard SLA 2026-07-18" carried by the original has lapsed and is not a live commitment.
 
 ---
 

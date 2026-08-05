@@ -27,8 +27,13 @@
 - **Composer assurance parity** — composer correctness, LLM-evaluation
   remediation (validator parity / runtime dry-run / operator visibility), and
   deterministic advisor checkpoints. The "authoring without weakening assurance"
-  bet made falsifiable. · tracker: elspeth-e1ab67e55a, elspeth-528bde62bb,
-  elspeth-dac6602a2b · metric: composer authoring success (activation).
+  bet made falsifiable. Deterministic advisor checkpoints have SHIPPED (see
+  `web/composer/advisor_checkpoint_telemetry.py` and the `advisor_checkpoint_*`
+  option set); what remains under this bet is composer correctness and
+  LLM-evaluation remediation. · tracker: elspeth-e1ab67e55a,
+  elspeth-528bde62bb, elspeth-dac6602a2b — **all three are readable only in the
+  pre-Jun-30 archived store** (`.weft/filigree/filigree.db`) and need re-filing
+  against HEAD before use · metric: composer authoring success (activation).
 
 - **Fork/coalesce audit integrity** — schema reconciliation, field provenance,
   merge safety. · tracker: elspeth-e20903300c.

@@ -526,7 +526,9 @@ bumps for D2 anyway; adding one nullable column is negligible cost.
 - **elspeth-e1dd5e1303** — `rows_buffered` live-vs-derive discrepancy,
   forced by D3/I.4 item 3.
 - **elspeth-1396d3f790** — cross-process worker coordination (option c),
-  unblocked by F1 (D7 scope exclusion).
+  unblocked by F1 (D7 scope exclusion). Readable only in the pre-Jun-30
+  archived store (`.weft/filigree/filigree.db`); live successors are
+  `elspeth-b5d7aa5655` and `elspeth-4d6c0dd0f5`. See ADR-030 §Tickets.
 
 ## Amendment detail (2026-06-13): ADR-030 slice 3 — journal-first barrier acceptance
 

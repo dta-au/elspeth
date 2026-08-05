@@ -262,9 +262,14 @@ follower auto-promotion.
 ### Tickets
 
 - **elspeth-1396d3f790** — cross-process multi-worker run coordination
-  (option c), the feature this ADR shapes.
+  (option c), the feature this ADR shapes. Readable only in the pre-Jun-30
+  archived store (`.weft/filigree/filigree.db`); it was not carried across the
+  2026-06-30 tracker cutover. Not re-filed, because this ADR reached Accepted
+  at its slice 5 and live successors now carry the work: `elspeth-b5d7aa5655`
+  (make web runtime multi-replica safe) and `elspeth-4d6c0dd0f5` (remediate
+  deferred-platform review failures before multi-replica integration).
 - **elspeth-2f23292372** — resume() entry guard (option b), landed; gains
-  seat-liveness precision under this ADR.
+  seat-liveness precision under this ADR. Archived store only (closed there).
 - **elspeth-6116873e3b / elspeth-7bb7124e8f** — G25b isolation and G25h chaos
   campaigns (slice 5).
 - **elspeth-3977d8ab60** — batches-row-COMPLETED-before-complete_barrier

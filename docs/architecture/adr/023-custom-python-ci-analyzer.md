@@ -18,7 +18,7 @@ ELSPETH's CI originally enforced a growing set of project-specific invariants th
 | **Composer** | `composer.catch_order`, `composer.exception_channel` | Except-handler ordering, composer exception-routing invariant |
 | **Manifest** | `manifest.contract_manifest`, `manifest.symbol_inventory`, `manifest.test_to_source_mapping` | Recompute a manifest from source, compare to checked-in declaration; symbol-inventory and test-to-source-mapping invariants |
 
-The enforcement scripts have grown organically. A structural review on 2026-05-19 (filigree epic `elspeth-8843308cfe`) identified that the 14 scripts should consolidate into a single `elspeth-lints` package with a rule registry, a shared CLI, SARIF output, and a findings-parity contract. That consolidation work proceeds under that epic.
+The enforcement scripts have grown organically. A structural review on 2026-05-19 (filigree epic `elspeth-8843308cfe`) identified that the 14 scripts should consolidate into a single `elspeth-lints` package with a rule registry, a shared CLI, SARIF output, and a findings-parity contract. **That consolidation has since landed** — `elspeth-lints/` ships the registry, CLI, rule tree, MCP surface, and SARIF output. As at 2026-08-06 one script remains outside the package (`scripts/cicd/enforce_adapter_budget.py`, invoked directly at `.github/workflows/ci.yaml:270`); that residual is tracked at `elspeth-3575a7f15d`. The original epic and its children live only in the pre-Jun-30 archived store (`.weft/filigree/filigree.db`).
 
 This ADR records the prior, more fundamental question: **should ELSPETH be writing this enforcement in custom Python at all, or porting the rules to an off-the-shelf static analyzer?**
 
@@ -106,17 +106,17 @@ Re-open this ADR if one of these conditions becomes true:
 
 ### What this defers
 
-This ADR does not defer items into a "follow-up" pile. The consolidation work (rule registry, SARIF emission, parity harness, per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split, CI-graph collapse, GitHub Code Scanning upload, rule-taxonomy rationale doc, epic-close verification) is tracked in epic `elspeth-8843308cfe` and its 17 child tasks. The taint-analysis future direction (D4) has no committed timeline by operator decision; when it begins, a new ADR will record the chosen toolchain for those specific rules.
+This ADR does not defer items into a "follow-up" pile. The consolidation work (rule registry, SARIF emission, parity harness, per-category ports, meta-CI gate, ADR-name rename, pre-commit incremental split, CI-graph collapse, GitHub Code Scanning upload, rule-taxonomy rationale doc, epic-close verification) was tracked in epic `elspeth-8843308cfe` and its 17 child tasks, which now live only in the pre-Jun-30 archived store; the work has substantially landed and only the residual at `elspeth-3575a7f15d` remains. The taint-analysis future direction (D4) has no committed timeline by operator decision; when it begins, a new ADR will record the chosen toolchain for those specific rules.
 
 ### Operator actions
 
-None at ADR-acceptance time. The consolidation work proceeds under epic `elspeth-8843308cfe`.
+None at ADR-acceptance time. The consolidation work has since landed; the one remaining port is tracked at `elspeth-3575a7f15d`.
 
 ## References
 
-* **Consolidation epic:** filigree `elspeth-8843308cfe` (Consolidate CI/CD enforcement scripts into elspeth-lints package)
-* **Rule-taxonomy rationale doc** (broader companion to this ADR, scoped to the catalog of rules rather than the toolchain decision): filigree `elspeth-797cac825e`
-* **SARIF upload to GitHub Code Scanning:** filigree `elspeth-b79958739e`
+* **Consolidation residual:** filigree `elspeth-3575a7f15d` (migrate the last CI enforcement script into elspeth-lints). The original epic `elspeth-8843308cfe` and its children were not carried across the 2026-06-30 tracker cutover and are readable only in `.weft/filigree/filigree.db`.
+* **Rule-taxonomy rationale doc** (broader companion to this ADR, scoped to the catalog of rules rather than the toolchain decision): filigree `elspeth-797cac825e` — archived store only.
+* **SARIF upload to GitHub Code Scanning:** filigree `elspeth-b79958739e` — archived store only.
 * **CodeQL workflow:** [.github/workflows/codeql.yaml](../../../.github/workflows/codeql.yaml)
 * **Existing enforcement scripts:** [scripts/cicd/](../../../scripts/cicd/)
 * **CICD allowlist lifecycle telemetry:** project memory `project_cicd_allowlist_audit_2026-05-19`; skill `cicd-allowlist-audit`

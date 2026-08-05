@@ -347,13 +347,17 @@ From the agent reports, produce:
 
 1. **Audit summary doc** at `docs/audit/YYYY-MM-DD-cicd-allowlist-audit.md`
    with the inventory, growth rate, and per-category verdict.
-2. **Filigree subtickets** under parent `elspeth-297b8f5c5d` ("CI allowlist
+2. **Filigree subtickets** under parent `elspeth-0e60f3effc` ("CI allowlist
    revalidation") — one per confirmed-fixable category, citing the specific
    allowlist keys and the SME verdict.
-   - Don't duplicate the existing 41 children — those are about *enforcer-script
-     bugs* (false negatives, missing checks). This audit produces tickets
-     about *exemption-corpus debt* (entries the enforcer correctly flagged
-     but were exempted on weak grounds).
+   - This audit produces tickets about *exemption-corpus debt* (entries the
+     enforcer correctly flagged but were exempted on weak grounds), not about
+     *enforcer-script bugs* (false negatives, missing checks).
+   - The parent's 41 pre-2026-06-30 children about enforcer-script bugs live
+     only in the archived store (`.weft/filigree/filigree.db`, under
+     `elspeth-297b8f5c5d`) and were not recovered. Check there before filing
+     what may be a duplicate, and verify any archived finding against HEAD —
+     some are already fixed in the tree.
 3. **Process tickets** for structural findings:
    - If growth rate > 25% in the audit window: ticket for a ratchet
      (per-PR allowlist-delta budget, or required burn-down lane).
@@ -367,7 +371,7 @@ The audit produces exactly these artifacts:
 
 - `docs/audit/YYYY-MM-DD-cicd-allowlist-audit.md` (the summary)
 - `docs/audit/findings/<agent-role>.md` per dispatched SME agent
-- Filigree subtickets under `elspeth-297b8f5c5d` (only for *new* fixable findings)
+- Filigree subtickets under `elspeth-0e60f3effc` (only for *new* fixable findings)
 - Updated baseline note on the parent epic
 
 ## What this skill does NOT do
@@ -409,7 +413,7 @@ The audit produces exactly these artifacts:
   CLI in `elspeth-lints/src/elspeth_lints/core/cli.py`; CI in
   `.github/workflows/enforce-allowlist-judge-gates.yaml`; design notes in
   `notes/cicd-judge-cli-prototype-plan.md`.
-- Parent filigree epic `elspeth-297b8f5c5d` — for the standing
+- Parent filigree epic `elspeth-0e60f3effc` — for the standing
   "CI allowlist revalidation" track.
 - Prior audit: `docs/audit/2026-05-19-cicd-allowlist-audit.md` (the first
   application of this skill).

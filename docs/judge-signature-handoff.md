@@ -11,8 +11,11 @@ The judge-metadata signature is an **HMAC** — a symmetric MAC. Any holder of
 `ELSPETH_JUDGE_METADATA_HMAC_KEY` can forge a signature: hand-write
 `judge_verdict: ACCEPTED` with a fabricated rationale over a publicly-computable
 fingerprint, sign it, and pass every gate. The whole design follows from that
-single fact (invariant elspeth-b3a3335c9f, *[O1] operator-only HMAC custody*;
-the CI-exposure corollary is elspeth-2b351cd004):
+single fact (invariant elspeth-fa00de6ec1, *[O1] operator-only HMAC custody*).
+The CI-exposure corollary is mitigated in `.github/workflows/ci.yaml`: every
+step that injects `ELSPETH_JUDGE_METADATA_HMAC_KEY` gates it on
+`github.event_name != 'pull_request'`, so PR-controlled code never runs with the
+secret present.
 
 - **An agent never holds the key.** Agents may *propose* work — survey the tree,
   stage a bundle, run a non-authoritative preview judge — but the authoritative
