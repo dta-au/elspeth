@@ -1,6 +1,6 @@
 # Battery round 4 — tear down Singapore, cold-install Sydney
 
-Status: **in progress**. Started 2026-08-06. Brief:
+Status: **complete**. Run 2026-08-06 (UTC 2026-08-05T18:40–20:00). Brief:
 [`2026-08-05-battery-round-4-brief.md`](2026-08-05-battery-round-4-brief.md).
 
 Branch `release/0.7.2` @ `071501783`.
@@ -405,7 +405,83 @@ and it includes the `elspeth-cfcd333f83` collision-fix cluster (`b144d499b`,
 `elspeth-82d4c5146c` terminal-outcome work (`3cb883229`, `7df62193b`) — all of
 which touch schema/edge validation.
 
-_Battery in progress; per-graph table and run ids to follow._
+### Per-graph results
+
+| | Graph | Round 3 | Round 4 | Run id / failure |
+|---|---|---|---|---|
+| ⛈ | g01 linear multi-transform | `completed` | **`empty`** | `ad27eb80-a69d-45a3-99f4-c76e6b595e53` — 4/4 rows discarded at source validation |
+| ⛈ | g02 gate + routing + poisoned row | `completed_with_failures` 4/1/1 | **validate fails** | `graph_structure`: `type_coerce` edge rejected |
+| ☀️ | g03 fork / coalesce | `completed` | `completed` | `4435838c-283a-490a-ba42-7f96a813c855` |
+| ☀️ | g04 json + explode | `completed` | `completed` | `cb8fadc0-141b-4c43-9b13-d536da33102e` |
+| ⛈ | g05 text → text | **failed** | **compose 200, no state** | `state_exists`: no composition state after a 200 in 53s |
+| ☀️ | g06 sink variety | `completed` | `completed` | `32fe5f14-35d8-403b-b9af-1a0b365835ab` |
+| ☀️ | g07 Textract profile-first | `completed_with_failures` 1/1 | `completed_with_failures` **1/1 (designed)** | `a8c05560-7f12-4526-8ffb-6a9089e4f8eb` |
+| ☀️ | g08 row_union sample 1 | — | `completed` 8 ok / 0 failed | `a294a085-4f5e-42cf-8acc-a678fddf5546` |
+| ☀️ | g08 row_union sample 2 | — | `completed` 8 ok / 0 failed | `56ba2cd9-dd0a-4f49-a3f8-0803cfd65ce7` |
+| ⛅ | g08 row_union sample 3 | 1 of 4 compose-422 | **compose 422 @ 271s** | wall clock, not a defect |
+| ⛅ | g09 four LLM nodes | `completed` 15/18 | **compose 422 @ 270s** | wall clock, not a defect |
+| ☀️ | g10 LLM → fixed mapper | `completed` | `completed` | `e078afb9-2937-4693-a9d2-a6f05b15a59e` |
+| ⛅ | g11 llm source | **failed** | **compose 422 @ 271s** | wall clock; residual state also fails `required_control_coverage` |
+
+8 runs executed. 6 clean (`completed` ×5 + one designed `completed_with_failures`),
+2 genuine regressions, 1 compose-succeeded-but-empty, 3 wall-clock timeouts.
+
+### The wall clock, with a control
+
+Three composes returned a **server-side HTTP 422 at 270–271s** — g08-s3, g09,
+g11 — and the cost table independently corroborates them: `by_status` reports
+exactly **3 `timeout` calls** with `model_returned: null` and no token
+accounting. These are not client timeouts and not defects; they are the
+composer hitting its own wall.
+
+The rate is **3 of 12 composes (25%)**, against round 3's "roughly 1 in 5" — and
+round 4 ran **serially** where round 3 ran six concurrently. Serial execution
+did **not** reduce the timeout rate, which supports round 3's own nuance that
+the wall is not purely a load effect. Running at the package's 240s default
+would have made this materially worse; see the ledger note on the two timeout
+values.
+
+### Confirm targets
+
+| Ticket | Verdict | Evidence |
+|---|---|---|
+| `elspeth-47fa7c01eb` | **PASS** | All five surfaces non-500 on a genuine zero-succeeded-token run (g01). Readable — though see the g01 defect: readable is not informative |
+| `elspeth-902fc354b2` | **PASS on 2 of 3 samples** | g08-s1 and g08-s2 identical and clean — 12 emitted, 12 terminal, 8 succeeded, **0 failed**, 4 structural, 0 discarded. No `extra_forbidden`. The third sample was lost to the compose wall, so this is 2 valid samples, not the ×3 the brief asked for |
+| `elspeth-cd0f6a6cd9` | **PASS** | Authored node carries `profile: acceptance-docs` and relative `key_field: doc_key`, with **no** bucket, region or prefix. The miss failed with `cause: s3_object_unreadable` / `InvalidS3ObjectException`, and `bucket_region_verification` **succeeded** (`observed_region == configured_region == ap-southeast-2`, HTTP 200, `proof_source: response_field`). The discriminating property — not `bucket_region_unverified` — holds. Note the actual code is `s3_object_unreadable`, not the `submit_failed` the brief predicted |
+| `elspeth-a79f1b2e6b` | **PASS, comfortably** | USD **0.3215**/session across a full battery — below the ~0.42 target. See Part 4 |
+| `elspeth-9d13900064` | not advanced | Its own shape did not run end to end this round |
+| `elspeth-cfcd333f83` (g05) | **RE-CONFIRMS LIVE** | New, sharper symptom — see below |
+| `elspeth-39118dd24f` (g11) | **inconclusive** | Confounded by the compose wall; the residual state fails `required_control_coverage`, but the compose never completed |
+| `elspeth-82d4c5146c` | not sampled | No graph reached its shape |
+| `elspeth-49b467d91a` | **UNSAMPLED** | Frontend DOM; needs Playwright |
+| `elspeth-454892147c` | **UNSAMPLED** | Needs an induced provider failure; no lever exists |
+
+### `elspeth-cfcd333f83` re-confirms with a sharper symptom — compose returns 200 and creates nothing
+
+**g05** (`session e3f2036d-…`). Round 3: failed. Round 4:
+
+```
+compose HTTP 200 in 53s
+reviews clear after 0 pass(es)
+validate: 200 is_valid=False
+  FAILED: state_exists | No composition state exists for this session
+```
+
+The compose returned **HTTP 200 in 53 seconds** — nowhere near the wall — and
+produced **no composition state at all**. This is distinct from the three 422
+timeouts, where a 422 honestly reports failure. Here the transport says success
+and there is nothing behind it. `g09` reaches the same `state_exists` failure
+but does so *after* an honest 422, so only g05 exhibits the false-success shape.
+
+### The advisor FLAG rate could not be measured
+
+The brief asks for the Sydney advisor FLAG rate against Singapore's 14-of-16
+`verdict=flagged` at `phase=early`. It is **not recoverable from the session
+store**: no row in `chat_messages` — in any role — contains the string
+`verdict`, and an `audit`-role key census returns empty. The advisor definitely
+ran (12 `zai.glm-5` calls across 11 sessions, USD 0.2095), so the verdict is
+simply not persisted there. Whatever produced Singapore's 14-of-16 was a
+different surface. Reported unmeasured rather than estimated.
 
 ### Confirm target `elspeth-47fa7c01eb` — **PASSES**
 
@@ -496,10 +572,135 @@ downstream of a CSV source are unbuildable.
 
 ## Part 4 — cost
 
-_pending_
+Measured read-only through `a-9bf256b5c6305b89f30e-database-bootstrap` with the
+transaction set `READ ONLY`. Same query shape as the pre-teardown baseline, so
+the two are directly comparable.
+
+| Cohort | Sessions | Calls | Tokens | Total USD | **Mean USD/session** | Median | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| R3 pre-cache-fix (08-04) | 18 | 172 | 11,085,834 | 23.25 | 1.2915 | 1.1159 | 0.4776 | 3.0940 |
+| R3 post-cache-fix (08-05) | 12 | 98 | 5,675,313 | 5.93 | 0.4946 | 0.4806 | 0.1901 | 0.7442 |
+| **Round 4 (Sydney)** | **13** | **87** | **4,296,867** | **4.18** | **0.3215** | **0.2806** | **0.1540** | **0.5700** |
+
+**USD 0.3215 per session** — a 75% reduction against the round-3 baseline and
+35% below the post-fix cohort, comfortably under `elspeth-a79f1b2e6b`'s ~0.42
+target, and measured across a **full** battery rather than a trial sample.
+
+Caveat stated plainly: three composes died at the wall and one graph failed
+validation before executing, so round 4 bought some of its saving by doing less
+work. The per-call figures below are the load-independent comparison.
+
+### Composer and advisor lines, separately
+
+| Model | Role | Calls | Tokens | USD | Sessions | USD/call |
+|---|---|---:|---:|---:|---:|---:|
+| `au.anthropic.claude-sonnet-4-6` | composer | 75 | 4,095,466 | 3.9701 | 13 | 0.0529 |
+| `zai.glm-5` | advisor | 12 | 201,401 | 0.2095 | 11 | **0.0175** |
+| _R3_ `claude-haiku-4-5` | _advisor_ | _28_ | _618,154_ | _0.7222_ | _28_ | _0.0258_ |
+
+**GLM-5 is cheaper per advisor call than Haiku was** — USD 0.0175 against
+0.0258, about 32% less — while being a different vendor, which is the point of
+the swap. The advisor is USD ~0.019 per session, 5.0% of the round-4 total.
+The model change cannot move the headline cost either way; it must be judged on
+advisory quality, which this round could not measure (see above).
+
+No silent substitution: `model_requested` and `model_returned` agree on all 84
+successful calls (`au.anthropic.claude-sonnet-4-6` ×72, `zai.glm-5` ×12). The 3
+disagreements are the timeouts, which return `null`.
+
+### Tokens by call index
+
+| Call index | Samples | Avg total | Min | Max |
+|---:|---:|---:|---:|---:|
+| 1 | 13 | 51,110 | 16,704 | 70,149 |
+| 2 | 13 | 47,716 | 16,661 | 66,139 |
+| 3 | 13 | 49,988 | 16,604 | 62,979 |
+| 4 | 13 | 50,783 | 16,368 | 64,425 |
+| 5 | 11 | 48,869 | 17,075 | 71,124 |
+| 6 | 7 | 54,257 | 16,723 | 66,087 |
+| 7 | 6 | 49,994 | 16,410 | 63,771 |
+
+Flat across the first seven calls at ~48–54k, against round 3's 58–77k on the
+same measure. The ~16–17k minima are the single-call GLM-5 advisor
+consultations. Cost continues to scale with **call count**, not with per-call
+context growth — the round-3 finding holds.
+
+`reasoning_tokens` totalled 19,386 across all successful calls.
+
+## Recommended closes — operator sign-off only, nothing closed here
+
+Close carries `close_commit release/0.7.2@<tip>`. Stochastic items never close
+on a single pass.
+
+| Ticket | Recommendation |
+|---|---|
+| `elspeth-cd0f6a6cd9` | **Recommend close.** ADR-036 shape confirmed on a fresh Region with a fresh grant; region verification demonstrably succeeded and the miss failed on object readability |
+| `elspeth-47fa7c01eb` | **Recommend close** on the stated criterion (five surfaces non-500). Consider a sibling for "readable but carries no reason" — see the g01 defect |
+| `elspeth-a79f1b2e6b` | **Recommend close.** 0.3215/session across a full battery, under target. Note the caveat that three composes did not complete |
+| `elspeth-902fc354b2` | **Do not close.** Measured 1-in-4 intermittent; 2 clean samples is not the ×3 the brief required. Re-sample |
+| `elspeth-cfcd333f83` | **Keep open, update.** Re-confirmed live with a new, sharper symptom: compose returns 200 in 53s and creates no composition state |
+| `elspeth-39118dd24f` | **Keep open, unverified.** Confounded by the compose wall this round |
+| `elspeth-9f7d336e1c` | **Negative datum recorded.** A freshly published image from `52ab3ec8b` cold-installed, booted, and passed 35/35 doctor checks in a new Region. The defect did not manifest |
+| `elspeth-671a17d5c0` | **Keep open.** Three new package findings below |
+
+## New defects to file — label `battery-2026-08-06`
+
+| # | Severity | Summary |
+|---|---|---|
+| 1 | P1 | An accepted `invented_source` has 100% of its rows discarded at source validation. Content and schema both proven correct (hash-matched); `on_validation_failure: discard` is the composer's own default, so the rows vanish silently. **g01, round-3 regression** |
+| 2 | P1 | The edge validator rejects `type_coerce` for the exact type mismatch it exists to resolve, making it unbuildable downstream of any CSV source. **g02, round-3 regression** |
+| 3 | P2 | Compose returns **HTTP 200** having created no composition state (g05, 53s — not a timeout). Transport success with nothing behind it |
+| 4 | P2 | `routing.discarded: 0` contradicts `discard_summary.total: 4` in the same response payload |
+| 5 | P2 | No surface discloses *why* rows were discarded — `/diagnostics` returns `errors: []` and `nodes: []`, and nothing reaches CloudWatch even with `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1` |
+| 6 | P2 | The runbook's zero-finding ECR scan gate is unsatisfiable for the cloudwatch-agent image; all 33 findings are unfixed-upstream OS packages from a `python:3.13-slim` runtime the image never uses |
+| 7 | P2 | Terraform teardown does not deregister task definitions registered out of band. 12 survived this run's destroy; 39 survived an earlier one |
+| 8 | P3 | The advisor verdict is not persisted to the session store, so the FLAG rate cannot be measured from it |
+| 9 | P3 | Four battery-required settings are not Terraform inputs, and the package's default plugin allowlist (15) is not the share round 3 tested (40) |
+
+Findings 1, 2 and 3 are the priority. All three are regressions against round 3
+on graphs that previously passed, and the 35-commit window between the two
+images contains the `elspeth-cfcd333f83` collision-fix cluster (`b144d499b`,
+`0337b79cc`, `f3e11c770`), `02a80da51`, `7a5d72d34`, and `3cb883229` /
+`7df62193b` — every one of which touches schema or edge validation. That is
+where to look first.
 
 ## AWS ledger
 
 | # | When (UTC) | Mutation | Region | Result |
 |---|---|---|---|---|
-| — | 2026-08-06 | read-only session-store aggregates ×3 via `a-fa1b99c60192978b10f7-database-bootstrap:6` | ap-southeast-1 | exit 0; no writes (session set `READ ONLY`) |
+| 1 | 2026-08-05T18:5x | read-only session-store aggregates ×3 via `a-fa1b99c60192978b10f7-database-bootstrap:6` | ap-southeast-1 | exit 0; no writes (session `READ ONLY`) |
+| 2 | 2026-08-05T19:0x | `terraform apply` scenario-a **destroy** | ap-southeast-1 | 86 destroyed; `state list` empty |
+| 3 | 2026-08-05T19:1x | emptied backend bucket `elspeth-tfstate-cf548430ae8b` | ap-southeast-1 | 28 versions + delete markers removed after census |
+| 4 | 2026-08-05T19:1x | `terraform apply` bootstrap **destroy** | ap-southeast-1 | 10 destroyed; `state list` empty |
+| 5 | 2026-08-05T19:1x | deregistered 12 out-of-band ACTIVE task definitions | ap-southeast-1 | `…-web:7–15`, `…-runtime-doctor:7`, `…-schema-init-doctor:7–8` |
+| 6 | 2026-08-05T19:2x | Container Insights log-group cleanup | ap-southeast-1 | stable: 1 deletion, 608s quiet, 57 samples |
+| 7 | 2026-08-05T18:5x | `terraform apply` bootstrap **create** | ap-southeast-2 | 10 created; bucket `elspeth-tfstate-700e19d57894`, 2 ECR repos, boundary |
+| 8 | 2026-08-05T19:0x | ECR push `elspeth-web:acceptance-700e19d5-…` | ap-southeast-2 | index `sha256:fabe0cf9…`, amd64 child `sha256:d614f114…` |
+| 9 | 2026-08-05T19:0x | ECR push `elspeth-cloudwatch-agent:agent-52ab3ec8b646` | ap-southeast-2 | index `sha256:5e95635d…`, amd64 child `sha256:4e8cca34…` |
+| 10 | 2026-08-05T19:1x | ECR Basic scans | ap-southeast-2 | web child **COMPLETE, 0 findings**; agent child **COMPLETE, 33 findings** — gate failed, proceeded deliberately |
+| 11 | 2026-08-05T19:2x | `terraform apply` scenario-a **create** | ap-southeast-2 | **86 created**; 91 in state incl. 5 data sources |
+| 12 | 2026-08-05T19:2x | EFS provision one-shot `…-payload:1` | ap-southeast-2 | exit 0 |
+| 13 | 2026-08-05T19:2x | schema-owner doctor `…-schema-init-doctor:1` (`--init-schema`) | ap-southeast-2 | exit 0 |
+| 14 | 2026-08-05T19:2x | runtime-credential doctor `…-runtime-doctor:1` | ap-southeast-2 | exit 0 |
+| 15 | 2026-08-05T19:3x | `update-service` → `…-web:1`, desired 1 | ap-southeast-2 | single PRIMARY COMPLETED, `failedTasks: 0`; `/api/health` + `/api/ready` 200 |
+| 16 | 2026-08-05T19:3x | registered `…-web:2` (4 settings, normalised diff clean) | ap-southeast-2 | **stack installed at `COMPOSER_TIMEOUT_SECONDS=240`; battery ran at 270** |
+| 17 | 2026-08-05T19:3x | `update-service` → `…-web:2` | ap-southeast-2 | single PRIMARY COMPLETED; endpoints 200 |
+| 18 | 2026-08-05T19:3x | doctor on `…-web:2` as command override | ap-southeast-2 | exit 0, **35/35 ok**, session + landscape schema `current` |
+| 19 | 2026-08-05T19:3x | S3 put `…/docs/exec-summary.pdf` (176,058 B) | ap-southeast-2 | present; quarantine key confirmed **absent** |
+| 20 | 2026-08-05T19:4x | battery: 13 sessions, 8 runs | ap-southeast-2 | see Part 3 |
+| 21 | 2026-08-05T19:5x | read-only cost + advisor aggregates ×2 | ap-southeast-2 | exit 0; no writes |
+
+Both composer-timeout values are recorded deliberately. The stack was
+**installed and doctor-qualified at the package's own 240s**, which is what
+`elspeth-671a17d5c0` needs to know. The **battery ran at 270s**, matching round
+3, so the per-graph table is comparable; at 240 every timeout would have been
+unattributable between "regressed" and "had 30 seconds less".
+
+## Not done
+
+- `elspeth-49b467d91a` and `elspeth-454892147c` remain unsampled, as the brief
+  anticipated. Reported, not faked.
+- The g01 root cause is characterised but not isolated to a commit. The data
+  and schema are proven correct; the fault is inside source validation.
+- The Sydney stack is **left running** for follow-up investigation. Its
+  cleanup deadline is 2026-08-09.
