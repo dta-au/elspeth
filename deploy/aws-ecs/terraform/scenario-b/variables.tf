@@ -79,7 +79,8 @@ variable "aws_account_id" {
 }
 
 variable "aws_region" {
-  type = string
+  type    = string
+  default = "ap-southeast-2"
 }
 
 variable "aws_profile" {
