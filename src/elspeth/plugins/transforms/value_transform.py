@@ -115,6 +115,50 @@ class ValueTransformConfig(TransformDataConfig):
             raise ValueError("operations must contain at least one operation")
         return self
 
+    @model_validator(mode="after")
+    def _reject_required_inputs_created_by_operations(self) -> ValueTransformConfig:
+        """Reject a config whose required schema fields are created, not consumed.
+
+        The 'schema' block is this transform's INPUT contract: every required
+        field in it must arrive on the row. An operation target assigned
+        before any operation reads it is CREATED by this transform, so
+        declaring it required on input is self-contradictory — every row
+        would fail input validation at runtime (elspeth-5955a9c421). Reject
+        at construction so both authoring surfaces fail closed.
+
+        Overwrites stay legal: an operation that reads its own target (or any
+        target read before its first assignment) is a genuine input consumer.
+        The analysis is conservative — a read that cannot be statically
+        resolved to a literal key disables the guard rather than guessing.
+        """
+        declared_fields = self.schema_config.fields
+        if not declared_fields:
+            return self
+        required_on_input = {field.name for field in declared_fields if field.required}
+        if not required_on_input:
+            return self
+
+        assigned: set[str] = set()
+        read_before_assign: set[str] = set()
+        for op in self.operations:
+            reads = op.get_parser().static_field_reads()
+            if not reads.complete:
+                return self
+            read_before_assign |= reads.fields - assigned
+            assigned.add(op.target)
+
+        contradicted = sorted((required_on_input & assigned) - read_before_assign)
+        if contradicted:
+            raise ValueError(
+                f"schema.fields declares {contradicted} as required input, but the "
+                f"operations create these fields: each is assigned before any operation reads "
+                f"it, so no upstream row can ever satisfy the input contract and every row "
+                f"would fail input validation at runtime. Remove these fields from "
+                f"'schema.fields' (operation targets are automatically guaranteed on output), "
+                f"or declare them with 'required': false to type an optional input."
+            )
+        return self
+
 
 # =============================================================================
 # ValueTransform Plugin Class
@@ -138,7 +182,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:698d5b9fe188c8fe"
+    source_file_hash: str | None = "sha256:8c24181221a99546"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (

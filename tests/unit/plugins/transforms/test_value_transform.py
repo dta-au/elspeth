@@ -422,4 +422,113 @@ class TestValueTransformConfig:
                 "operations": [{"target": "x", "expression": "row['a'] + row['b']"}],
             }
         )
+        assert len(cfg.operations) == 1
         assert cfg.operations[0].target == "x"
+
+
+class TestValueTransformConfigRejectsSelfContradictoryInputs:
+    """A required schema field created by the operations is unsatisfiable (elspeth-5955a9c421).
+
+    Declaring an operation target in schema.fields makes it required ON INPUT,
+    while the operation exists to CREATE it — every row then fails input
+    validation at runtime. The config must be rejected at construction so both
+    authoring surfaces (YAML and Composer) fail closed instead of crashing the
+    run.
+    """
+
+    def test_rejects_required_schema_field_assigned_before_read(self) -> None:
+        """The live g04 shape: targets hoisted from a nested field, declared required."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        with pytest.raises(PluginConfigError, match="assigned before any operation reads"):
+            ValueTransform(
+                {
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": [
+                            {"name": "product", "field_type": "str"},
+                            {"name": "quantity", "field_type": "int"},
+                        ],
+                    },
+                    "required_input_fields": ["item"],
+                    "operations": [
+                        {"target": "product", "expression": "row['item']['product']"},
+                        {"target": "quantity", "expression": "row['item']['quantity']"},
+                    ],
+                }
+            )
+
+    def test_rejects_required_field_read_only_after_creation(self) -> None:
+        """A later read does not make the field an input: it reads the created value."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        with pytest.raises(PluginConfigError, match="subtotal"):
+            ValueTransform(
+                {
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": [
+                            {"name": "price", "field_type": "int"},
+                            {"name": "quantity", "field_type": "int"},
+                            {"name": "subtotal", "field_type": "int"},
+                        ],
+                    },
+                    "operations": [
+                        {"target": "subtotal", "expression": "row['price'] * row['quantity']"},
+                        {"target": "total", "expression": "row['subtotal'] + 5"},
+                    ],
+                }
+            )
+
+    def test_allows_overwrite_that_reads_its_own_target(self) -> None:
+        """Read-then-assign overwrites are satisfiable and stay legal."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "price", "field_type": "float"}]},
+                "operations": [{"target": "price", "expression": "row['price'] * 1.1"}],
+            }
+        )
+        assert "price" in transform.input_schema.model_fields
+
+    def test_allows_optional_declared_target(self) -> None:
+        """required: false declares the target's type without demanding it on input."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": [{"name": "product", "field_type": "str", "required": False, "nullable": False}],
+                },
+                "operations": [{"target": "product", "expression": "row['item']['product']"}],
+            }
+        )
+        assert not transform.input_schema.model_fields["product"].is_required()
+
+    def test_dynamic_key_read_disables_the_guard(self) -> None:
+        """A dynamic subscript key means reads cannot be proven; the config passes."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
+                "operations": [{"target": "product", "expression": "row[row['key']]"}],
+            }
+        )
+        assert transform is not None
+
+    def test_observed_mode_targets_stay_legal(self) -> None:
+        """Observed mode declares no required inputs, so targets never contradict it."""
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "observed"},
+                "operations": [{"target": "product", "expression": "row['item']['product']"}],
+            }
+        )
+        assert transform is not None

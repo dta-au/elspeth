@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import math
 import operator
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -655,6 +656,18 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         return self.visit(node.orelse)
 
 
+@dataclass(frozen=True)
+class StaticFieldReads:
+    """Statically resolvable top-level field reads of one allowed name.
+
+    ``complete`` is False when the expression reads the name with a key that
+    is not a string literal, so ``fields`` understates the true read set.
+    """
+
+    fields: frozenset[str]
+    complete: bool
+
+
 class ExpressionParser:
     """Safe expression parser for gate conditions.
 
@@ -855,6 +868,41 @@ class ExpressionParser:
 
         # Field access, ambiguous ops, ternaries, str-returning calls: routable.
         return False
+
+    def static_field_reads(self, name: str = "row") -> StaticFieldReads:
+        """Statically enumerate the top-level fields the expression reads from ``name``.
+
+        Walks the validated AST for direct reads of ``name``: subscripts
+        (``name['field']``) and presence probes (``name.get('field')``). Only
+        string-literal keys are resolvable; any other key shape (a computed
+        key, a non-string constant) marks the enumeration incomplete.
+
+        Used for config-time contradiction diagnosis — e.g. value_transform
+        rejecting a required input its own operations create — and NEVER as a
+        security control: an incomplete enumeration means callers must not
+        draw conclusions from the absence of a field.
+        """
+        fields: set[str] = set()
+        complete = True
+        for node in ast.walk(self._ast):
+            if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name) and node.value.id == name:
+                key = node.slice
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    fields.add(key.value)
+                else:
+                    complete = False
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == name
+            ):
+                if len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                    fields.add(node.args[0].value)
+                else:
+                    complete = False
+        return StaticFieldReads(fields=frozenset(fields), complete=complete)
 
     def evaluate(self, context: dict[str, Any] | PipelineRow) -> Any:
         """Evaluate expression against context data.

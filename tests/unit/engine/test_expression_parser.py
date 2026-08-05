@@ -1681,3 +1681,54 @@ class TestExpressionParserBoundaryGuards:
         parser = ExpressionParser("1e308 * 10")
         with pytest.raises(ExpressionEvaluationError, match="non-finite float"):
             parser.evaluate({})
+
+
+class TestStaticFieldReads:
+    """Static enumeration of top-level fields an expression reads."""
+
+    def test_literal_subscript_reads(self) -> None:
+        reads = ExpressionParser("row['a'] + row['b']['c']").static_field_reads()
+        assert reads.fields == frozenset({"a", "b"})
+        assert reads.complete is True
+
+    def test_get_call_reads(self) -> None:
+        reads = ExpressionParser("row.get('x') is not None").static_field_reads()
+        assert reads.fields == frozenset({"x"})
+        assert reads.complete is True
+
+    def test_no_row_reference_is_empty_and_complete(self) -> None:
+        reads = ExpressionParser("1 + 1").static_field_reads()
+        assert reads.fields == frozenset()
+        assert reads.complete is True
+
+    def test_dynamic_subscript_key_marks_incomplete(self) -> None:
+        reads = ExpressionParser("row[row['k']]").static_field_reads()
+        assert "k" in reads.fields
+        assert reads.complete is False
+
+    def test_non_string_constant_key_marks_incomplete(self) -> None:
+        reads = ExpressionParser("row[0]").static_field_reads()
+        assert reads.complete is False
+
+    def test_nested_subscript_counts_only_top_level_field(self) -> None:
+        reads = ExpressionParser("row['item']['product']").static_field_reads()
+        assert reads.fields == frozenset({"item"})
+        assert reads.complete is True
+
+    def test_namespace_mode_reads_named_root(self) -> None:
+        parser = ExpressionParser(
+            "collections['facts']['count'] > 0",
+            allowed_names=["collections"],
+        )
+        reads = parser.static_field_reads("collections")
+        assert reads.fields == frozenset({"facts"})
+        assert reads.complete is True
+
+    def test_namespace_mode_other_root_reads_nothing(self) -> None:
+        parser = ExpressionParser(
+            "collections['facts']['count'] > 0",
+            allowed_names=["collections"],
+        )
+        reads = parser.static_field_reads("row")
+        assert reads.fields == frozenset()
+        assert reads.complete is True
