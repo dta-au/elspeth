@@ -47,6 +47,14 @@ def _created_fields(transform: BaseTransform) -> frozenset[str]:
     value_transform; dropping ``self_created_input_fields`` loses none today but
     is the surface the framework's own demotion reads, so both stay.
 
+    The union is also load-bearing against a fix already queued elsewhere.
+    elspeth-dea96e0830 proposes narrowing batch-aware reductive transforms'
+    ``self_created_input_fields`` to the empty set. All 13 batch-aware
+    transforms carry a non-empty ``declared_output_fields``, so reading the
+    union keeps every one of them in this sweep when that lands; reading
+    ``self_created_input_fields`` alone would silently drop 13 transforms and
+    trip the liveness floor for a reason unrelated to this invariant.
+
     ``_output_schema_config.guaranteed_fields`` is deliberately NOT a third
     source. It is built as ``schema_config.guaranteed_fields |
     declared_output_fields`` (base.py ``_build_output_schema_config``), so it
@@ -177,6 +185,8 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         omission becomes row-rejecting rather than merely undeclared.
         """
         omitting: dict[str, str] = {}
+        unbuildable: dict[str, str] = {}
+        rebuild_rejected: set[str] = set()
         forbid_checked = 0
         for cls in _roster():
             probe_config = getattr(cls, "probe_config", None)
@@ -185,7 +195,9 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             try:
                 base = probe_config()
                 instance = cls(base)
-            except Exception:  # unusable probe config is not this invariant's concern
+            except Exception as exc:
+                # Recorded, never swallowed — same discipline as the arm above.
+                unbuildable[_label(cls)] = type(exc).__name__
                 continue
             created = _created_fields(instance)
             if not created:
@@ -200,12 +212,14 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
                 built = cls(candidate)
             except Exception:
                 # A plugin-local guard rejecting this shape is a SEPARATE contract
-                # and an acceptable answer. Four transforms land here today —
-                # batch_outlier_annotator and batch_replicate refuse a schema that
-                # collides with the fields they overwrite, and json_explode /
-                # line_explode refuse a non-normalized field name once the schema
-                # declares an output contract. All four are deliberate fail-closed
-                # guards, not artifacts of the re-declaration above.
+                # and an acceptable answer — batch_outlier_annotator and
+                # batch_replicate refuse a schema that collides with the fields
+                # they overwrite, and json_explode / line_explode refuse a
+                # non-normalized field name once the schema declares an output
+                # contract. Recorded and pinned below, because "four transforms
+                # land here" stated only in prose is exactly how an arm loses
+                # coverage without anyone noticing.
+                rebuild_rejected.add(_label(cls))
                 continue
             if not _output_forbids_extras(built):
                 continue
@@ -215,10 +229,24 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             if violation is not None:
                 omitting[_label(cls)] = violation
 
-        assert forbid_checked > 0, (
-            "no transform produced a closed (extra='forbid') output contract — this arm is "
-            "vacuous. Either the fixed-mode re-declaration above stopped reaching the "
-            "plugins that build a fixed output schema, or they all moved to observed output."
+        assert unbuildable == {}, (
+            f"transforms that could not be built from their own probe_config: {unbuildable}. "
+            f"An unbuildable transform is invisible to this arm."
+        )
+        # The deliberate fail-closed rejections are PINNED, not counted. A count
+        # would let one plugin stop guarding while another started, silently
+        # swapping coverage; naming the set makes either change fail loudly.
+        assert rebuild_rejected == {"batch_outlier_annotator", "batch_replicate", "json_explode", "line_explode"}, (
+            f"the set of transforms rejecting the fixed-mode re-declaration changed: "
+            f"{sorted(rebuild_rejected)}. Each is a deliberate plugin-local guard; if one "
+            f"stopped rejecting it now needs to satisfy this arm instead."
+        )
+        # A FLOOR, not "> 0" — this arm reaches exactly four transforms today, and
+        # "> 0" would let three of them silently drop out while staying green.
+        assert forbid_checked >= 4, (
+            f"only {forbid_checked} transforms produced a closed (extra='forbid') output "
+            f"contract, expected at least 4 — either the fixed-mode re-declaration stopped "
+            f"reaching the plugins that build a fixed output schema, or they moved to observed."
         )
         assert omitting == {}, (
             f"transforms whose closed output contract omits fields they create: {omitting}. "
