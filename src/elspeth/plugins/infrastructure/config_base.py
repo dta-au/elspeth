@@ -614,6 +614,36 @@ class TransformDataConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "transform"
 
+    # Redeclared from DataPluginConfig to state DIRECTION. The inherited wording
+    # ("Schema configuration for data validation") is direction-neutral, and a
+    # transform sits between two contracts, so an author — including the LLM
+    # composer, which reads this exact string — reasonably reads it as "describe
+    # this node's data" and enumerates the node's own OUTPUTS here. That is the
+    # authoring mistake behind elspeth-d6eeb3a71d / elspeth-5955a9c421.
+    #
+    # Deliberately NOT saying "do not list fields this transform creates":
+    # declaring a created field is legal and automatically demoted to optional on
+    # input (BaseTransform.input_schema), and it is the ONLY route to a typed
+    # downstream guarantee — SchemaConfig requires every guaranteed_fields entry
+    # to be declared in `fields` AND marked required. Telling authors to omit
+    # them would forbid the supported path.
+    #
+    # Sources and sinks keep the inherited wording: each has one data contract,
+    # so there is no direction to disambiguate.
+    schema_config: SchemaConfig = Field(
+        ...,
+        alias="schema",
+        description=(
+            "This transform's INPUT contract: the schema of rows arriving from upstream. "
+            "Use 'schema: {mode: observed}' to infer types from data, or "
+            "provide explicit field definitions with mode (fixed/flexible)."
+        ),
+        json_schema_extra={
+            "composer_description": COMPOSER_SCHEMA_DESCRIPTION,
+            "composer_placeholder": COMPOSER_SCHEMA_PLACEHOLDER,
+        },
+    )
+
     required_input_fields: list[str] | None = Field(
         default=None,
         description=(
