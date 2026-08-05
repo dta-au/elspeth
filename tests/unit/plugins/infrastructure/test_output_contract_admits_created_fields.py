@@ -37,18 +37,29 @@ _OMITS = "output_contract_omits_created_fields"
 
 
 def _created_fields(transform: BaseTransform) -> frozenset[str]:
-    """Every column the transform may write into a row.
+    """Every column the transform itself writes into a row.
 
-    Three sources, unioned, because they diverge deliberately and no single one
-    is the whole answer: ``value_transform`` keeps ``declared_output_fields``
-    EMPTY so the executor's collision check stays off while overriding
-    ``self_created_input_fields``, and ``_output_schema_config`` is derived
-    independently — so it still names the created fields when the other two are
-    wrong. Reading any one alone makes some plugin vanish from its own invariant.
+    Exactly the two sources that state what the PLUGIN creates, because they
+    diverge deliberately: ``value_transform`` keeps ``declared_output_fields``
+    EMPTY so the executor's collision check stays off, while overriding
+    ``self_created_input_fields`` — read either alone and it vanishes from its
+    own invariant. Measured: dropping ``declared_output_fields`` loses
+    value_transform; dropping ``self_created_input_fields`` loses none today but
+    is the surface the framework's own demotion reads, so both stay.
+
+    ``_output_schema_config.guaranteed_fields`` is deliberately NOT a third
+    source. It is built as ``schema_config.guaranteed_fields |
+    declared_output_fields`` (base.py ``_build_output_schema_config``), so it
+    folds in the AUTHOR's pass-through guarantees — fields that arrive on the
+    row and are merely promised onward, not manufactured. Including it made
+    this predicate disagree with the framework's own guard: a shape-preserving
+    ``passthrough`` declaring ``guaranteed_fields: [foo]`` creates nothing, yet
+    was reported as aliasing while creating ``foo``, and the advice attached to
+    that report would have pushed a correct closed contract into observed mode.
+    It also bought nothing: across all field-creating transforms in the roster
+    it adds zero fields and drops zero plugins from the sweep.
     """
-    contract = transform._output_schema_config
-    guaranteed = set(contract.guaranteed_fields or ()) if contract is not None else set()
-    return frozenset(set(transform.self_created_input_fields) | set(transform.declared_output_fields) | guaranteed)
+    return frozenset(set(transform.self_created_input_fields) | set(transform.declared_output_fields))
 
 
 def _output_forbids_extras(transform: BaseTransform) -> bool:
@@ -127,7 +138,16 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             if violation is not None:
                 aliased[_label(cls)] = violation
 
-        assert checked > 0, "no field-creating transform was exercised — the probe shape changed"
+        # A FLOOR, not "> 0". Construction failures are swallowed above, so a
+        # refactor that broke most probe_configs would leave this arm green
+        # while reaching almost nothing. 24 of the 32 registered transforms
+        # create fields today; the 8 that do not are the four guardrail
+        # transforms plus keyword_filter, passthrough, truncate and type_coerce,
+        # which write in place. Raise this floor when transforms are added.
+        assert checked >= 24, (
+            f"only {checked} field-creating transforms were exercised, expected at least 24 — "
+            f"either probe_config construction started failing silently or the roster shrank"
+        )
         assert aliased == {}, (
             f"transforms sharing one schema object between input and output while creating "
             f"fields: {aliased}. Build the output schema separately — "
@@ -283,3 +303,32 @@ class TestTheSweepPredicateActuallyFires:
                 )
 
         assert _output_contract_violations(_Compliant({"schema": {"mode": "fixed", "fields": ["kept: str"]}})) == {}
+
+    def test_a_shape_preserving_transform_that_creates_nothing_is_reported_clean(self) -> None:
+        """The control this file was missing, and the one that matters most.
+
+        A shape-preserving transform legitimately shares ONE schema object
+        between input and output — that aliasing is correct, not a defect, and
+        the predicate must stay silent for it even when the author declares
+        ``guaranteed_fields``. An earlier revision of ``_created_fields`` read
+        ``_output_schema_config.guaranteed_fields`` as a third source; because
+        the framework builds that as ``schema_config.guaranteed_fields |
+        declared_output_fields``, the author's pass-through promise came back as
+        a "created" field and ``passthrough`` was reported as aliasing while
+        creating a field it never writes. The attached advice would have pushed
+        a correct closed contract into observed mode.
+
+        This asserts against the SHIPPED plugin rather than a local stub, so the
+        control cannot drift from the shape a real author writes.
+        """
+        from elspeth.plugins.transforms.passthrough import PassThrough
+
+        transform = PassThrough({"schema": {"mode": "fixed", "fields": ["foo: str"], "guaranteed_fields": ["foo"]}})
+
+        assert transform.declared_output_fields == frozenset()
+        assert transform.self_created_input_fields == frozenset()
+        assert _created_fields(transform) == frozenset(), (
+            "an author's pass-through guarantee is not a created field — see the "
+            "_created_fields docstring for why guaranteed_fields is not a source"
+        )
+        assert _output_contract_violations(transform) == {}
