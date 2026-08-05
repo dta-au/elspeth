@@ -68,15 +68,22 @@ def _build_json_explode_input_requirements(
                 #
                 # That gap follows from the row model and no declaration can
                 # close it. ELSPETH's atomic unit is one row and a row field
-                # holds a DISCRETE value; the schema DSL offers
-                # str/int/float/bool by design, not omission. A list is never a
-                # resting field value — it rides in an ``any`` field only for as
-                # long as it takes deaggregation to explode it into rows. So
-                # LIST is coherent as a REQUIREMENT (this transform really does
-                # need a real list at the instant it explodes) yet structurally
-                # undeclarable as a FACT. Declaring LIST for an ``any`` field to
-                # satisfy it would trade a fail-closed false-reject for a
-                # false-accept and misstate the row contract.
+                # holds a DISCRETE value. Neither type vocabulary has a list:
+                # the schema DSL is str/int/float/bool/any (schema.py:39) and
+                # the runtime contract is int/str/float/bool/NoneType/datetime/
+                # object (type_normalization.py:25), closed because a field type
+                # must be checkpoint-serializable. A list is never a resting
+                # field value — it rides in an ``any`` field only for as long as
+                # it takes deaggregation to explode it into rows, and an
+                # ``any``/``object`` field SKIPS type validation outright
+                # (schema_contract.py:270-272).
+                #
+                # So LIST is coherent as a REQUIREMENT (this transform really
+                # does need a real list at the instant it explodes) yet
+                # structurally undeclarable as a FACT: nothing in the type
+                # system can assert it. Declaring LIST for an ``any`` field to
+                # satisfy the requirement would trade a fail-closed
+                # false-reject for a false-accept and misstate the row contract.
                 #
                 # ADR-008 §Alternative 3 and ADR-014 §Tier classification draw
                 # the line this sits on: a DECLARATION LIE is Tier 1 and must
@@ -218,7 +225,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8522aea8229dac1d"
+    source_file_hash: str | None = "sha256:cf4fe18251fa716e"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
