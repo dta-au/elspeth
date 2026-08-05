@@ -393,7 +393,106 @@ operator decision to ratify or reverse, not a clean pass.
 
 ## Part 3 — battery round 4
 
-_pending_
+Instance `https://a-9bf256b5c6305b89f30e-alb-209940822.ap-southeast-2.elb.amazonaws.com`,
+task definition `a-9bf256b5c6305b89f30e-web:2`, composer
+`au.anthropic.claude-sonnet-4-6`, advisor `zai.glm-5`, composer timeout 270s,
+composes run **serially**.
+
+Image under test is `52ab3ec8b`; round 3 ran `f65af925806a`, **35 source
+commits earlier**. That gap is the most likely home for any regression below,
+and it includes the `elspeth-cfcd333f83` collision-fix cluster (`b144d499b`,
+`0337b79cc`, `f3e11c770`), `02a80da51`, `7a5d72d34`, and the
+`elspeth-82d4c5146c` terminal-outcome work (`3cb883229`, `7df62193b`) — all of
+which touch schema/edge validation.
+
+_Battery in progress; per-graph table and run ids to follow._
+
+### Confirm target `elspeth-47fa7c01eb` — **PASSES**
+
+A run with zero succeeded tokens must be readable. Round 4 produced one
+naturally (g01, below) rather than by construction, which is stronger evidence
+than a synthetic case. All five named surfaces return non-500:
+
+| Endpoint | Status |
+|---|---|
+| `/api/runs/{id}` | 200 |
+| `/api/runs/{id}/diagnostics` | 200 |
+| `/api/runs/{id}/outputs` | 200 |
+| `/api/runs/{id}/results` | 200 |
+| `/api/sessions/{id}/runs` | 200 |
+
+Readable, but see the next finding: readable is not the same as informative.
+
+### New defect — an accepted invented source has every row discarded at source validation, silently
+
+**g01** (`session e41b2ec2-…`, `run ad27eb80-a69d-45a3-99f4-c76e6b595e53`).
+Round 3: `completed`. Round 4: **`empty`**.
+
+The intent asks the composer to invent four sample tickets. It did, correctly:
+an `invented_source` interpretation was staged, the driver resolved it
+`accepted_as_drafted` (HTTP 200), and the state shows it `resolved` with the
+CSV materialised to a blob:
+
+```
+source: plugin csv, on_validation_failure: discard
+  schema: 4 str fields, guaranteed_fields all 4, mode flexible
+  blob_ref: a6e1693d-f72e-4817-aae9-58167a26e81a
+  source_authoring: modality llm_generated, resolved_kind invented_source,
+                    content_hash a1f08cbf…
+```
+
+The run then reports:
+
+```
+status "empty"          accounting.source.rows_processed 0
+tokens.emitted 0        routing.discarded 0
+integrity.closure "closed"   missing_terminal_outcomes 0
+discard_summary: total 4, validation_errors 4,
+                 stage source_validation, node source_source_109e31cdd1b1
+```
+
+So the blob **was** read and four rows **were** parsed — then all four failed
+source validation and were discarded.
+
+The data is not the problem, and this was proved rather than assumed. The
+recorded `content_hash` is `a1f08cbffe8d06b47a92b1dc9a1cf757202674d2363bbe75f3f9e51f6a0ca319`;
+a local file reconstructed from the accepted draft is **524 bytes and hashes
+identically**, matching the state's own `accepted_len: 524`. A UTF-8 BOM — the
+obvious mechanism for "every row fails on a guaranteed field" — would change
+the hash to `6e3cdb85…`, so that hypothesis is **refuted**. The source content
+and the declared schema are both correct; the rejection is in the
+source-validation path.
+
+Two reporting defects compound it:
+
+1. **`routing.discarded: 0` contradicts `discard_summary.total: 4`** in the
+   same payload. Two views of one run disagree about whether anything was
+   discarded.
+2. **No surface states why.** `/diagnostics` returns `errors: []` and
+   `nodes: []`; `/outputs` returns `artifacts: []`; the web log group carries no
+   application-level rejection record even with
+   `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1`. An operator sees a pipeline that
+   "did nothing" with no route to the reason. `on_validation_failure: discard`
+   is the composer's own default here, so this is the default path.
+
+### New defect — the edge validator rejects `type_coerce` for the mismatch it exists to fix
+
+**g02** (`session 481cca93-…`). Round 3: `completed_with_failures` 4/1/1, by
+design. Round 4: **fails validation, never runs.**
+
+```
+validate: 200 is_valid=False
+  graph_structure | Edge from 'source_source_80d272629b7f' to
+  'transform_coerce_score_87e360afb307' invalid: producer schema 'CSVRowSchema'
+  incompatible with consumer schema 'TypeCoerceInput':
+  Type mismatches: score (expected float, got str)
+```
+
+A CSV source yields `str`. `type_coerce` converts `str` to `float`. The
+validator rejects the edge because the producer has not already done the
+conversion the consumer performs — so the transform can never be wired to the
+only kind of producer that needs it. Composed pipelines using `type_coerce`
+downstream of a CSV source are unbuildable.
 
 ## Part 4 — cost
 
