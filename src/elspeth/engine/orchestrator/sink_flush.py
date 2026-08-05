@@ -328,7 +328,9 @@ class SinkFlushCoordinator:
         the track_operation(source_load) context to preserve audit attribution.
 
         Handles:
-        1. Write pending tokens to sinks (each sink has its own track_operation)
+        1. Write pending tokens to sinks (each sink write has its own
+           sink_write operation, owned by the sink-effect reservation rather
+           than by a track_operation call in SinkExecutor)
         2. Raise GracefulShutdownError if interrupted
         """
         counters = loop_ctx.counters

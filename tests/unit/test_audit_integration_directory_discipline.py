@@ -18,6 +18,7 @@ PRODUCTION_PATH_AUDIT_TESTS = frozenset(
         "test_exporter_batch_queries.py",
         "test_recorder_explain.py",
         "test_recorder_routing_events.py",
+        "test_sink_boundary_orchestrator.py",
         "test_source_boundary_orchestrator.py",
     }
 )

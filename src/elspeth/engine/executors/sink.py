@@ -43,6 +43,7 @@ from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
 from elspeth.contracts.sink_effects import (
     SinkEffectAttemptAction,
     SinkEffectAttemptState,
@@ -334,6 +335,102 @@ class SinkExecutor:
             context=exc.to_audit_dict(),
         )
 
+    def _record_boundary_failure_operation(
+        self,
+        *,
+        sink_node_id: str,
+        sink_name: str,
+        violation: BaseException,
+    ) -> None:
+        """Record the failed ``sink_write`` operation for a pre-reservation boundary failure.
+
+        A sink write normally gets its operation from the sink-effect
+        reservation (``SinkEffectReservation._insert_or_compare_operation``),
+        which inserts one ``sink_write`` row keyed on the effect identity and
+        flips it to ``completed`` at finalization. A boundary violation raises
+        *before* any effect is reserved, so that row is never created and the
+        run would otherwise finish carrying no failed operation naming the sink
+        that raised (elspeth-207c9fbb0b). Sources do not have this gap: the
+        ``source_load`` operation wraps the whole source lifecycle, so a source
+        boundary failure fails an operation that already exists.
+
+        Within a single attempt this never duplicates the reservation's row:
+        reaching the reservation means that attempt's validation passed.
+
+        It is NOT unique per node across attempts, and callers must not read it
+        that way. A redrive whose batch composition changed is a supported
+        shape (``test_retry_with_mixed_interrupted_and_fresh_members_progresses``):
+        an earlier attempt can reserve an effect and then be interrupted,
+        leaving an ``open`` row, while the redrive's wider batch fails the
+        boundary before reservation and writes this ``failed`` row — two
+        ``sink_write`` rows at one node for what an operator would call one
+        write. ``uq_operations_sink_effect_id`` cannot collapse them because
+        this row's effect id is NULL. The stranded ``open`` row is the known
+        residual tracked as elspeth-800d00c03e.
+
+        THIS ROW SHAPE IS A STOPGAP, not settled design — read it that way
+        before building on it. The three caveats above (not unique per node
+        across attempts, a NULL effect id the unique index cannot use, and a
+        stranded ``open`` sibling) are not independent: they share one root.
+        ``sink_write`` operations are owned by the effect RESERVATION, so their
+        identity is the EFFECT, and nothing covers the ATTEMPT. This method
+        inserts an effect-less row into an effect-keyed table and then explains
+        why that is tolerable. The shape that dissolves all three is to open the
+        ``sink_write`` operation at the START of the write attempt, before
+        boundary validation, and let the reservation ATTACH the effect id to the
+        row that already exists: one operation per attempt, uniqueness intact,
+        no NULL-effect special case, and elspeth-800d00c03e's stranded ``open``
+        row becomes the same row rather than a second one. That is the right fix
+        and it is deliberately not attempted here — it reshapes an audit record
+        the reservation and finalization paths both depend on.
+
+        A run can also legitimately carry several sink_write rows at *different*
+        nodes: a batch whose primary effect finalized and whose failsink then
+        failed its boundary has a completed primary row alongside this failed
+        failsink row, because they record two writes to two nodes.
+
+        The row carries no ``sink_effect_id``: there is no durable effect to
+        point at. ``ck_operations_sink_effect_type`` constrains only the
+        reverse direction (an effect id implies ``sink_write``), so a
+        ``sink_write`` with no effect id is the schema's own encoding of "a
+        write attempt that died before acquiring an effect identity".
+
+        Tier-1: this is an audit record. A failure to write it propagates and
+        fails the run rather than being swallowed alongside the violation —
+        audit corruption is categorically worse than the boundary error.
+
+        What that costs, stated precisely because it is easy to over-promise:
+        at THIS level the boundary error survives as the raised error's
+        ``__context__``. It does not survive the run. ``Orchestrator.run``
+        re-raises ``from None``, so on this path no ``PluginContractViolation``
+        appears anywhere in the final chain, the persisted run error is empty,
+        and the exception *type* a caller sees changes — anything catching
+        ``PluginContractViolation`` around the sink write behaves differently
+        when the audit write is the thing that failed. This exposure is not
+        introduced here: ``_complete_states_failed`` and
+        ``_record_boundary_failure_outcomes`` already write to the audit DB in
+        this same ``except`` branch. This call is a third such write.
+        """
+        operation = self._execution.begin_operation(
+            run_id=self._run_id,
+            node_id=sink_node_id,
+            operation_type="sink_write",
+            input_data=scrub_payload_for_audit({"sink_plugin": sink_name}),
+        )
+        # Mirrors track_operation's _render_exception: the violation text can
+        # interpolate row values, so it is scrubbed before it reaches the audit
+        # trail, and an unrenderable message degrades to the (secret-free) type.
+        try:
+            error_message = scrub_text_for_audit(str(violation))
+        except BaseException:
+            error_message = type(violation).__name__
+        self._execution.complete_operation(
+            operation_id=operation.operation_id,
+            status="failed",
+            error=error_message or type(violation).__name__,
+            duration_ms=0.0,
+        )
+
     def _record_boundary_failure_outcomes(
         self,
         *,
@@ -600,6 +697,11 @@ class SinkExecutor:
                 tokens=tokens,
                 sink_name=sink_name,
                 phase="sink_write",
+                violation=violation,
+            )
+            self._record_boundary_failure_operation(
+                sink_node_id=sink_node_id,
+                sink_name=sink_name,
                 violation=violation,
             )
             raise
@@ -888,6 +990,14 @@ class SinkExecutor:
                 tokens=diverted_tokens,
                 sink_name=failsink_name,
                 phase="failsink_write",
+                violation=violation,
+            )
+            # The failsink effect was never reserved either, and the primary
+            # effect has already finalized its own operation as 'completed', so
+            # without this the run carries no failed operation at all.
+            self._record_boundary_failure_operation(
+                sink_node_id=failsink_node_id,
+                sink_name=failsink_name,
                 violation=violation,
             )
             raise

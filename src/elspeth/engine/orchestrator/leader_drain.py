@@ -284,8 +284,13 @@ class LeaderDrainCoordinator:
                     f"Active scheduler work: {active_work}."
                 )
 
-            # 4. Sink writes — outside source_load track_operation context.
-            # Each sink write has its own track_operation (sink_write) in SinkExecutor.
+            # 4. Sink writes — outside the source_load track_operation context.
+            # Each sink write still gets its own sink_write operation, but it is
+            # owned by the sink-effect reservation (SinkEffectReservation
+            # ._insert_or_compare_operation), keyed on the effect identity — not
+            # by a track_operation call in SinkExecutor. A boundary violation
+            # that raises before the effect is reserved records its own failed
+            # sink_write operation instead (elspeth-207c9fbb0b).
             self._sink_flush.flush_and_write_sinks(
                 factory,
                 run_id,
