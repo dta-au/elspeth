@@ -8550,3 +8550,83 @@ class TestPassThroughArrivalExtras:
         detail = relay_entry.contract
         assert detail is not None
         assert detail.extra_fields == ("complaint_text",)
+
+    def _rename_mapper(self, input_connection: str, on_success: str) -> NodeSpec:
+        """A reductive fixed-output mapper: renames complaint_text -> body.
+
+        The declared fixed schema lists the ARRIVING fields (with guarantees,
+        so the plugin can compute); the mapping drops ``complaint_text`` by
+        renaming it. The plugin computes its own emit set (``complaint_id``,
+        ``body``) — the declared-required union must never override that
+        computation.
+        """
+        return NodeSpec(
+            id="rename",
+            node_type="transform",
+            plugin="field_mapper",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {
+                    "mode": "fixed",
+                    "fields": ["complaint_id: str", "complaint_text: str"],
+                    "guaranteed_fields": ["complaint_id", "complaint_text"],
+                },
+                "mapping": {"complaint_text": "body"},
+                "select_only": False,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_reductive_fixed_mapper_does_not_predict_dropped_fields_at_locked_sink(self) -> None:
+        """A fixed-mode reductive producer's PLUGIN-COMPUTED emit set is authoritative.
+
+        Regression for the mode:fixed pin introduced with elspeth-902fc354b2:
+        pinning to ``get_effective_guaranteed_fields()`` unions the declared
+        required fields — for a reductive transform, exactly the fields it
+        drops — into the Rule B prediction, rejecting a pipeline the runtime
+        executes clean (field_mapper deletes the renamed source key).
+        """
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._rename_mapper("rows", "output"),),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["complaint_id: str", "body: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "sink_locked_extras" for error in result.errors), result.errors
+
+    def test_reductive_fixed_mapper_does_not_predict_dropped_fields_at_locked_consumer(self) -> None:
+        """Rule A shares the emit-profile math: no invented extras at a locked node input."""
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._rename_mapper("rows", "renamed"),
+                self._passthrough(
+                    "final_cleanup",
+                    "renamed",
+                    "output",
+                    options={"schema": {"mode": "fixed", "fields": ["complaint_id: str", "body: str"]}},
+                ),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" and error.component == "node:final_cleanup" for error in result.errors), (
+            result.errors
+        )
