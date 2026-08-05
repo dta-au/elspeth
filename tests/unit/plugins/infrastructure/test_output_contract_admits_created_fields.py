@@ -122,6 +122,7 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
     def test_no_registered_transform_aliases_its_output_schema_onto_its_input(self) -> None:
         """Whole-roster arm: creating fields and staying shape-preserving is a bug."""
         aliased: dict[str, str] = {}
+        unbuildable: dict[str, str] = {}
         checked = 0
         for cls in _roster():
             probe_config = getattr(cls, "probe_config", None)
@@ -129,7 +130,9 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
                 continue
             try:
                 instance = cls(probe_config())
-            except Exception:  # unusable probe config is not this invariant's concern
+            except Exception as exc:
+                # Recorded, never swallowed — see the assertion below.
+                unbuildable[_label(cls)] = type(exc).__name__
                 continue
             if not _created_fields(instance):
                 continue
@@ -138,16 +141,26 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             if violation is not None:
                 aliased[_label(cls)] = violation
 
-        # A FLOOR, not "> 0". Construction failures are swallowed above, so a
-        # refactor that broke most probe_configs would leave this arm green
-        # while reaching almost nothing. 24 of the 32 registered transforms
-        # create fields today; the 8 that do not are the four guardrail
-        # transforms plus keyword_filter, passthrough, truncate and type_coerce,
-        # which write in place. Raise this floor when transforms are added.
-        assert checked >= 24, (
-            f"only {checked} field-creating transforms were exercised, expected at least 24 — "
-            f"either probe_config construction started failing silently or the roster shrank"
+        # LIVENESS, asserted two ways because a count alone is only a proxy.
+        #
+        # First, exactly: every registered transform must BUILD from its own
+        # probe_config. Silently skipping an unbuildable plugin is how this
+        # whole arm goes quietly blind — a genuinely defective transform whose
+        # probe_config happens to raise would otherwise be excused by the very
+        # sweep meant to catch it. Zero fail today, so this needs no allowlist;
+        # if a legitimate exemption ever appears, name it here rather than
+        # widening the except.
+        assert unbuildable == {}, (
+            f"transforms that could not be built from their own probe_config: {unbuildable}. "
+            f"Fix the probe_config or exempt it explicitly — an unbuildable transform is "
+            f"invisible to this invariant."
         )
+        # Second, as a floor: the above cannot see a transform that was
+        # deregistered rather than broken. 24 of 32 registered transforms create
+        # fields; the 8 that do not are the four guardrail transforms plus
+        # keyword_filter, passthrough, truncate and type_coerce, which write in
+        # place.
+        assert checked >= 24, f"only {checked} field-creating transforms were exercised, expected at least 24 — the roster shrank"
         assert aliased == {}, (
             f"transforms sharing one schema object between input and output while creating "
             f"fields: {aliased}. Build the output schema separately — "
