@@ -392,3 +392,39 @@ class TestTheSweepPredicateActuallyFires:
             "_created_fields docstring for why guaranteed_fields is not a source"
         )
         assert _output_contract_violations(transform) == {}
+
+    def test_a_separate_observed_output_omitting_a_created_field_is_reported_clean(self) -> None:
+        """The last documented behaviour that was prose rather than a gate.
+
+        An OPEN output contract (``extra='allow'``) that does not name a created
+        field is CORRECT: the emitted row carrying that field validates anyway,
+        so there is nothing to report. Only a CLOSED contract makes the omission
+        row-rejecting, which is the sibling control above.
+
+        Pinned because this row looks like an oversight and is the one a future
+        author is most likely to "fix" — tightening the predicate to flag it
+        would break no other test and would convert a correct open contract into
+        a reported defect, the same class of false positive as the ``passthrough``
+        one, arriving by a different door.
+        """
+
+        class _SeparateButOpen(BaseTransform):
+            name = "output_contract_control_separate_open"
+            determinism = Determinism.DETERMINISTIC
+            declared_output_fields = frozenset({"added"})
+
+            def __init__(self, config: dict[str, Any]) -> None:
+                super().__init__(config)
+                from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+                declared = SchemaConfig.from_dict({"mode": "observed"})
+                self.input_schema = create_schema_from_config(declared, "OpenControlIn", allow_coercion=False)
+                self.output_schema = create_schema_from_config(declared, "OpenControlOut", allow_coercion=False)
+
+        transform = _SeparateButOpen({"schema": {"mode": "observed"}})
+
+        # Genuinely separate models, and the output tolerates extras — so the
+        # predicate must decline BOTH codes, for two independent reasons.
+        assert transform.output_schema is not transform._declared_input_schema
+        assert not _output_forbids_extras(transform)
+        assert _output_contract_violations(transform) == {}
