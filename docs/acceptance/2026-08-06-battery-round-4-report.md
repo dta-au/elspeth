@@ -583,12 +583,16 @@ the two are directly comparable.
 | **Round 4 (Sydney)** | **13** | **87** | **4,296,867** | **4.18** | **0.3215** | **0.2806** | **0.1540** | **0.5700** |
 
 **USD 0.3215 per session** — a 75% reduction against the round-3 baseline and
-35% below the post-fix cohort, comfortably under `elspeth-a79f1b2e6b`'s ~0.42
-target, and measured across a **full** battery rather than a trial sample.
+35% below the post-fix cohort, under `elspeth-a79f1b2e6b`'s ~0.42 target.
 
-Caveat stated plainly: three composes died at the wall and one graph failed
-validation before executing, so round 4 bought some of its saving by doing less
-work. The per-call figures below are the load-independent comparison.
+**This is a floor, not a full-battery figure.** Three composes died at the wall
+and one graph failed validation before executing, so only 8 of 13 sessions
+produced runs: round 4 bought part of its saving by doing less work. The
+ticket's criterion is explicitly a *full* battery, so this does not satisfy it
+and the ticket should not close on it — treating 0.3215 as the answer would
+repeat exactly the small-sample error this report identifies in the brief's own
+0.4246 figure. The per-call figures below are the load-independent comparison
+and are the sounder basis for judging the cache fix.
 
 ### Composer and advisor lines, separately
 
@@ -636,7 +640,7 @@ on a single pass.
 |---|---|
 | `elspeth-cd0f6a6cd9` | **Recommend close.** ADR-036 shape confirmed on a fresh Region with a fresh grant; region verification demonstrably succeeded and the miss failed on object readability |
 | `elspeth-47fa7c01eb` | **Recommend close** on the stated criterion (five surfaces non-500). Consider a sibling for "readable but carries no reason" — see the g01 defect |
-| `elspeth-a79f1b2e6b` | **Recommend close.** 0.3215/session across a full battery, under target. Note the caveat that three composes did not complete |
+| `elspeth-a79f1b2e6b` | **Do not close — re-measure.** 0.3215/session is under target, but the ticket's criterion says a **full** battery and this one was not: 3 composes died at the wall and 1 graph failed validation, so only 8 of 13 sessions produced runs. 0.3215 is a **floor from a partial battery**. Closing on it would repeat the small-sample error this report criticises in the brief's own 0.4246 figure |
 | `elspeth-902fc354b2` | **Do not close.** Measured 1-in-4 intermittent; 2 clean samples is not the ×3 the brief required. Re-sample |
 | `elspeth-cfcd333f83` | **Keep open, update.** Re-confirmed live with a new, sharper symptom: compose returns 200 in 53s and creates no composition state |
 | `elspeth-39118dd24f` | **Keep open, unverified.** Confounded by the compose wall this round |
