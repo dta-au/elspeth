@@ -27,6 +27,7 @@ from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import planner_authoring_aids
 from elspeth.web.composer.planner_authoring_aids import (
     PLACEHOLDER_BLOB_ID,
@@ -1121,6 +1122,79 @@ class TestDiscoveryDigest:
         json_sink = next(entry for entry in digest["sinks"] if entry["name"] == "json")
         assert json_sink["composer_hints"] == list(next(plugin.composer_hints for plugin in view.list_sinks() if plugin.name == "json"))
         assert any("collision_policy" in hint for hint in json_sink["composer_hints"])
+
+    def test_every_declared_prohibition_and_tag_set_reaches_the_digest_verbatim(self) -> None:
+        """The always-present tier states what a plugin must NOT be used for.
+
+        g11 (elspeth-afdf55a17c): a planner authored multiline LLM text into
+        the ``text`` sink, which diverts any value bearing CR or LF. The sink
+        had said so all along in ``usage_when_not_to_use`` — but only in a
+        ``list_sinks`` result the digest guidance tells the planner it rarely
+        needs. A selection rule carried solely by a tool the planner is
+        steered away from is a rule it will usually not read.
+        """
+        view, _snapshot = _trained_view()
+
+        digest = discovery_digest(view)
+
+        for kind, plugins in (("sources", view.list_sources()), ("transforms", view.list_transforms()), ("sinks", view.list_sinks())):
+            entries = {entry["name"]: entry for entry in digest[kind]}
+            for plugin in plugins:
+                entry = entries[plugin.name]
+                if plugin.usage_when_not_to_use is None:
+                    assert "not_for" not in entry
+                else:
+                    # Verbatim, never summarized: a shortened prohibition
+                    # reads as a narrower rule than the one declared.
+                    assert entry["not_for"] == plugin.usage_when_not_to_use
+                assert entry.get("capability_tags", []) == list(plugin.capability_tags)
+
+    def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
+        """The exact g11 regression anchor, held on the stable token only.
+
+        Phase 1 of the fix plan extends this sentence with a ``line_explode``
+        remedy, so pinning the whole string would pin prose that is expected
+        to change. What must not regress is that the digest — not only a
+        ``list_sinks`` result — tells the planner the sink refuses multiline.
+        """
+        view, _snapshot = _trained_view()
+
+        text_sink = next(entry for entry in discovery_digest(view)["sinks"] if entry["name"] == "text")
+
+        assert "multiline" in text_sink["not_for"]
+
+    def test_digest_carries_no_worked_example_and_says_so(self) -> None:
+        """``example_use`` is YAML and unvalidated; the omission is disclosed.
+
+        Every worked shape this module renders is run through the real
+        candidate builder by these tests, so a drifting exemplar fails CI.
+        ``example_use`` has no such gate and is written in YAML, while this
+        surface authors through ``set_pipeline``. Carrying it in the
+        always-present tier would teach an unverified shape in the wrong
+        language — so it is omitted, and the guidance states the omission
+        instead of leaving the planner to infer the digest is complete.
+        """
+        view, _snapshot = _trained_view()
+
+        digest = discovery_digest(view)
+
+        assert all("example_use" not in entry for kind in ("sources", "transforms", "sinks") for entry in digest[kind])
+        assert "carry no worked example" in planner_authoring_aids._DISCOVERY_DIGEST_GUIDANCE
+
+    def test_prohibition_is_absent_rather_than_null_when_a_plugin_declares_none(self) -> None:
+        """A third-party plugin may omit reference content; nulls are not carried."""
+        summary = PluginSummary(
+            name="third_party",
+            description="External plugin with no reference content.",
+            plugin_type="sink",
+            config_fields=[],
+        )
+
+        entry = planner_authoring_aids._digest_entries([summary])[0]
+
+        assert "not_for" not in entry
+        assert "capability_tags" not in entry
+        assert entry["name"] == "third_party"
 
     def test_capability_core_discovery_order_speaks_with_the_digest_voice(self) -> None:
         """The static core and the live digest guidance must agree, zero daylight.
