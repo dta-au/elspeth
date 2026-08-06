@@ -1105,7 +1105,7 @@ class SinkExecutor:
         self,
         *,
         primary_divert_states: list[tuple[TokenInfo, int, NodeState]],
-        diversion_by_index: dict[int, RowDiversion],
+        diversion_by_index: Mapping[int, RowDiversion],
         diversion_error_hashes: Mapping[int, str],
         diversion_reason_hashes: Mapping[int, str],
         on_token_written: Callable[[TokenInfo], None] | None,
@@ -1135,10 +1135,10 @@ class SinkExecutor:
         # Discard mode: complete primary states and record DIVERTED outcomes.
         # No routing_event (no DAG edge for discard), no failsink write.
         for token, idx, primary_state in primary_divert_states:
-            durable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
+            recovery_stable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
             # The sink's own words. _write_primary_effect proved this string
             # hashes to the durable attribution before building the RowDiversion,
-            # and already substitutes `durable_reason` when a recovered batch has
+            # and already substitutes `recovery_stable_reason` when a recovered batch has
             # no live diversion log — so this degrades to the old text rather
             # than inventing one. ExecutionError scrubs it (reasons quoting a
             # driver error can carry row values, e.g. database_sink constraint
@@ -1158,7 +1158,7 @@ class SinkExecutor:
                 self._execution.complete_node_state(
                     state_id=current.state_id,
                     status=NodeStateStatus.FAILED,
-                    output_data={"discarded": True, "reason": durable_reason},
+                    output_data={"discarded": True, "reason": recovery_stable_reason},
                     duration_ms=0.0,
                     error=discard_error,
                 )
