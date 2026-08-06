@@ -335,9 +335,36 @@ rule that expires a tagged image also makes its digest unpullable. Both
 bootstrap repositories therefore expire only untagged images (after 30 days);
 tagged images persist until teardown deletes the repositories.
 
-Require both ECR Basic scans to complete with zero findings:
+Require both ECR Basic scans to complete with zero findings.
+
+Scan the **platform child**, never the index. The documented publish flow
+produces an OCI image index whose children are the `linux/amd64` image and a
+buildx attestation; ECR Basic scans attach only to the platform child, and
+`describe-image-scan-findings` on the index digest returns
+`ScanNotFoundException` forever (observed on both images in round 4). The
+resolver below uses the ECR API rather than `docker buildx imagetools`
+because this section runs after `docker logout`; a digest that is already a
+plain manifest passes through unchanged.
 
 ```bash
+resolve_scannable_digest() {
+  local repository=$1
+  local digest=$2
+  local manifest child
+  manifest=$(aws ecr batch-get-image \
+    --repository-name "$repository" \
+    --image-ids "imageDigest=$digest" \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --query 'images[0].imageManifest' --output text)
+  # Attestation children carry platform "unknown"; select the runnable child.
+  child=$(jq -r '
+    [.manifests[]?
+      | select(.platform.architecture == "amd64" and .platform.os == "linux")
+    ][0].digest // empty
+  ' <<<"$manifest")
+  if [ -n "$child" ]; then printf '%s\n' "$child"; else printf '%s\n' "$digest"; fi
+}
+
 require_clean_scan() {
   local repository=$1
   local digest=$2
@@ -358,8 +385,8 @@ require_clean_scan() {
   ' <<<"$result" >/dev/null
 }
 
-require_clean_scan "$APP_REPOSITORY" "$APP_DIGEST"
-require_clean_scan "$AGENT_REPOSITORY" "$AGENT_DIGEST"
+require_clean_scan "$APP_REPOSITORY" "$(resolve_scannable_digest "$APP_REPOSITORY" "$APP_DIGEST")"
+require_clean_scan "$AGENT_REPOSITORY" "$(resolve_scannable_digest "$AGENT_REPOSITORY" "$AGENT_DIGEST")"
 ```
 
 If the account uses enhanced Inspector scanning, use the corresponding
@@ -722,6 +749,7 @@ test "$(aws sts get-caller-identity \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
 
 ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+NAMESPACE=$(terraform -chdir=scenario-a output -raw namespace)
 
 terraform -chdir=scenario-a plan -destroy \
   -var-file=../examples/scenario-a.tfvars \
@@ -730,6 +758,12 @@ terraform -chdir=scenario-a show -no-color .terraform/scenario-a-destroy.tfplan
 terraform -chdir=scenario-a apply .terraform/scenario-a-destroy.tfplan
 test -z "$(terraform -chdir=scenario-a state list)"
 ```
+
+Both values are captured **before** the destroy on purpose: the outputs are
+gone once state is empty, and two later steps — the task-definition sweep and
+the Container Insights cleanup — need them afterwards. `namespace` is the
+run-scoped prefix every resource name is built from; read it rather than
+re-deriving it from another name.
 
 The backend bucket is shared by every scenario and workspace, so destroying
 Scenario A proves nothing about Scenario B. Census every state object in the
@@ -794,14 +828,132 @@ terraform -chdir=bootstrap apply .terraform/bootstrap-destroy.tfplan
 test -z "$(terraform -chdir=bootstrap state list)"
 ```
 
-Both destroys run under the Step 2 policies, so those policies must outlive
-them. Only now, remove the four policies recorded in the operator change
-record: detach the three `installer-*` policies from the normal installer
-principal and delete them, and detach and delete the lifecycle policy through
-the account's trusted IAM administration path. Do not rely on the tag query
-below to find them — they were created outside Terraform and may carry no run
-tag. `aws iam delete-policy` refuses while any attachment or non-default
-policy version remains, so a successful delete confirms the detach.
+### Task definitions registered outside Terraform
+
+`terraform destroy` deregisters only the revisions Terraform holds in state —
+one revision per family, the current one. Any revision registered out of band
+during the run is invisible to it and survives a destroy that reports complete.
+Round 4 left twelve ACTIVE revisions behind this way (`elspeth-a9967c55ff`).
+
+This is not a cost leak; task definitions are not chargeable. It is a hygiene
+and evidence-accuracy defect: the terminal tag query below reads as proof the
+account is clean, and on its own it is not.
+
+Do not enumerate the families. The scenario module defines eight, a run may
+register more, and a hand-typed list silently under-sweeps the ones it forgot.
+Discover them from the live registry, filtered by this run's namespace:
+
+```bash
+active_revision_arns() (
+  set -Eeuo pipefail
+  aws ecs list-task-definitions \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --family-prefix "$1" --status ACTIVE --output json \
+    | jq -r --arg family "$1" \
+      '.taskDefinitionArns[]? | select((split("/") | last | split(":") | first) == $family)'
+)
+
+sweep_run_task_definitions() (
+  set -Eeuo pipefail
+  local namespace families family arns arn all_families foreign=""
+  local family_count=0 deregistered=0 remaining=0 foreign_count=0
+  namespace="${NAMESPACE:?capture the namespace before the Scenario A destroy}"
+
+  # Every AWS result is assigned to a variable before it is used. Under
+  # `set -e` a failing command substitution aborts only in a plain assignment:
+  # inside `for x in $(...)` or `$(( ))` the failure is swallowed, so an
+  # AccessDenied or a throttle would read as an empty, clean account.
+  #
+  # ListTaskDefinitionFamilies documents familyPrefix as a prefix;
+  # ListTaskDefinitions documents it as the full family name. Discover
+  # families with the first, then query each with its exact name, so the sweep
+  # is correct under either reading.
+  families="$(aws ecs list-task-definition-families \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --family-prefix "$namespace-" --status ALL \
+    --query 'families[]' --output text)"
+
+  for family in $families; do
+    test "$family" != None || continue
+    family_count=$((family_count + 1))
+    arns="$(active_revision_arns "$family")"
+    for arn in $arns; do
+      aws ecs deregister-task-definition \
+        --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        --task-definition "$arn" >/dev/null
+      deregistered=$((deregistered + 1))
+    done
+  done
+
+  # Re-list after the sweep. The assertion is on live account state, never on
+  # the loop's own bookkeeping: a deregister that did not take effect must
+  # fail this step rather than be counted as a success.
+  for family in $families; do
+    test "$family" != None || continue
+    arns="$(active_revision_arns "$family")"
+    remaining=$((remaining + $(printf '%s' "$arns" | grep -c . || true)))
+  done
+
+  # Families outside this run's namespace are enumerated and reported, never
+  # touched. Deleting them is an operator decision, not a teardown step.
+  all_families="$(aws ecs list-task-definition-families \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" --status ACTIVE \
+    --query 'families[]' --output text)"
+  for family in $all_families; do
+    test "$family" != None || continue
+    case "$family" in "${namespace}-"*) continue ;; esac
+    foreign="${foreign:+$foreign }$family"
+    foreign_count=$((foreign_count + 1))
+  done
+
+  printf 'task_definition_sweep namespace=%s families=%s deregistered=%s remaining_active=%s foreign_families=%s\n' \
+    "$namespace" "$family_count" "$deregistered" "$remaining" "$foreign_count"
+  for family in $foreign; do
+    arns="$(active_revision_arns "$family")"
+    printf 'foreign_task_definition_family %s active_revisions=%s\n' \
+      "$family" "$(printf '%s' "$arns" | grep -c . || true)"
+  done
+  test "$remaining" = 0
+)
+
+sweep_run_task_definitions
+```
+
+Record the `task_definition_sweep` line in the run evidence. On a teardown with
+nothing registered out of band it reads:
+
+```
+task_definition_sweep namespace=<ns> families=8 deregistered=0 remaining_active=0 foreign_families=0
+```
+
+`families=8` is expected and is not the sweep over-reaching: a family survives
+the deregistration of every one of its revisions, so `--status ALL` still lists
+all eight the module defines. `deregistered` and `remaining_active` are both
+reported because they disagree exactly when the sweep believed it worked and
+the account did not.
+
+The criterion is **zero ACTIVE**, not zero revisions.
+`deregister-task-definition` leaves the revision INACTIVE by design and there is
+no way to deregister without producing one, so even a flawless Terraform destroy
+leaves INACTIVE revisions behind — a zero-revisions test could never pass, which
+is the mirror image of a test that could never fail.
+`delete-task-definitions` accepts only INACTIVE revisions and leaves a
+`DELETE_IN_PROGRESS` window that cannot be proven closed inside the teardown.
+ACTIVE is also the status that carries the operational risk: only an ACTIVE
+revision can be run or referenced by a new service.
+
+Confirm the gate discriminates before resting on it. Both directions, plus the
+shape that must **not** trip it:
+
+```bash
+FILTER='[.taskDefinitionArns[]? | select((split("/") | last | split(":") | first) == $family)] | length == 0'
+printf '%s\n' '{"taskDefinitionArns":["arn:aws:ecs:'"$AWS_REGION"':1:task-definition/a-x-web:7"]}' \
+  | jq -e --arg family a-x-web "$FILTER" >/dev/null; echo "survivor     -> $? (want 1)"
+printf '%s\n' '{"taskDefinitionArns":[]}' \
+  | jq -e --arg family a-x-web "$FILTER" >/dev/null; echo "clean        -> $? (want 0)"
+printf '%s\n' '{"taskDefinitionArns":["arn:aws:ecs:'"$AWS_REGION"':1:task-definition/a-x-web-extra:1"]}' \
+  | jq -e --arg family a-x-web "$FILTER" >/dev/null; echo "other family -> $? (want 0)"
+```
 
 ### Container Insights log-group orphan (R2-D3, elspeth-a229c247a1)
 
@@ -907,6 +1059,25 @@ terraform -chdir=scenario-a show -no-color .terraform/scenario-a-adopt.tfplan
 terraform -chdir=scenario-a apply .terraform/scenario-a-adopt.tfplan
 ```
 
+### Remove the Step 2 policies
+
+Both destroys ran under the Step 2 policies, and so did the task-definition
+sweep and the Container Insights cleanup — the sweep needs `ecs:List*` and
+`ecs:DeregisterTaskDefinition`, the cleanup needs `logs:DeleteLogGroup`, and
+all three grants live in the policies about to be deleted. Those policies had
+to outlive every one of those steps, which is why this is the first point at
+which they can go.
+
+Only now, remove the four policies recorded in the operator change record:
+detach the three `installer-*` policies from the normal installer principal
+and delete them, and detach and delete the lifecycle policy through the
+account's trusted IAM administration path. Do not rely on the tag query below
+to find them — they were created outside Terraform and may carry no run tag.
+`aws iam delete-policy` refuses while any attachment or non-default policy
+version remains, so a successful delete confirms the detach.
+
+### Confirm the account is clean
+
 Finally, query the run tag:
 
 ```bash
@@ -918,14 +1089,30 @@ aws resourcegroupstaggingapi get-resources \
 
 Expected result: no live resource ARNs. The tagging API can briefly retain
 non-billable tombstones, so reconcile any result against its owning service API
-before declaring a chargeable survivor. Do not delete an untagged or
-differently tagged resource merely because its name resembles this run.
+before declaring a survivor. Reconcile on **status**, not on whether the
+resource is chargeable: a task-definition revision that is still ACTIVE is a
+survivor even though it costs nothing. Grep the output for `:task-definition/`
+specifically and reconcile any hit against the `task_definition_sweep` line.
+The two views are scoped differently — the query sees tagged revisions, the
+sweep sees the namespace prefix — so do not expect equal lists: after a sweep
+that exited 0, a hit must reconcile to an INACTIVE tombstone or a
+foreign-namespace revision, and anything else is a real survivor. Do not
+delete an untagged or differently tagged resource merely because its name
+resembles this run.
 
 Completion requires empty Scenario A and bootstrap state, no live run-tagged
 resources, no matching Container Insights log group (the tag query above
 cannot see it — confirm separately with `aws logs describe-log-groups
 --profile "$AWS_PROFILE" --region "$AWS_REGION" --log-group-name-prefix
 "/aws/ecs/containerinsights/${ECS_CLUSTER}"` and expect an empty
-`logGroups` list), none of the four Step 2 installer or lifecycle policies
+`logGroups` list), **zero ACTIVE task-definition revisions under
+`$NAMESPACE`** — `sweep_run_task_definitions` exited 0 and reported
+`remaining_active=0` — none of the four Step 2 installer or lifecycle policies
 remaining, and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
 filesystems, Secrets Manager secrets, or retained ECR images owned by this run.
+
+`foreign_families` is reported, not gated. A task-definition family outside
+this run's namespace belongs to a different run and is left for the operator —
+the same rule that forbids deleting a resource because its name resembles this
+one. Record the count and the per-family lines in the run evidence so an
+accumulating orphan namespace is found by design rather than by accident.

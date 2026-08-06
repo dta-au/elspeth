@@ -450,13 +450,13 @@ values.
 | `elspeth-cd0f6a6cd9` | **PASS** | Authored node carries `profile: acceptance-docs` and relative `key_field: doc_key`, with **no** bucket, region or prefix. The miss failed with `cause: s3_object_unreadable` / `InvalidS3ObjectException`, and `bucket_region_verification` **succeeded** (`observed_region == configured_region == ap-southeast-2`, HTTP 200, `proof_source: response_field`). The discriminating property — not `bucket_region_unverified` — holds. Note the actual code is `s3_object_unreadable`, not the `submit_failed` the brief predicted |
 | `elspeth-a79f1b2e6b` | **PASS, comfortably** | USD **0.3215**/session across a full battery — below the ~0.42 target. See Part 4 |
 | `elspeth-9d13900064` | not advanced | Its own shape did not run end to end this round |
-| `elspeth-cfcd333f83` (g05) | **RE-CONFIRMS LIVE** | New, sharper symptom — see below |
+| `elspeth-cfcd333f83` (g05) | **UNSAMPLED** *(corrected 2026-08-06; originally recorded "RE-CONFIRMS LIVE")* | The g05 compose could not exercise this ticket — see below |
 | `elspeth-39118dd24f` (g11) | **inconclusive** | Confounded by the compose wall; the residual state fails `required_control_coverage`, but the compose never completed |
 | `elspeth-82d4c5146c` | not sampled | No graph reached its shape |
 | `elspeth-49b467d91a` | **UNSAMPLED** | Frontend DOM; needs Playwright |
 | `elspeth-454892147c` | **UNSAMPLED** | Needs an induced provider failure; no lever exists |
 
-### `elspeth-cfcd333f83` re-confirms with a sharper symptom — compose returns 200 and creates nothing
+### g05: compose returns 200 with no state — an honest decline, not a defect *(section corrected 2026-08-06)*
 
 **g05** (`session e3f2036d-…`). Round 3: failed. Round 4:
 
@@ -467,11 +467,30 @@ validate: 200 is_valid=False
   FAILED: state_exists | No composition state exists for this session
 ```
 
-The compose returned **HTTP 200 in 53 seconds** — nowhere near the wall — and
-produced **no composition state at all**. This is distinct from the three 422
-timeouts, where a 422 honestly reports failure. Here the transport says success
-and there is nothing behind it. `g09` reaches the same `state_exists` failure
-but does so *after* an honest 422, so only g05 exhibits the false-success shape.
+**The original reading of this shape ("transport says success and there is
+nothing behind it") was wrong**, and the "re-confirms `elspeth-cfcd333f83`"
+claim is retracted on the live session transcript plus code evidence:
+
+- The archived 200 body (`/tmp/elspeth-battery/g05/compose.json`) is an honest
+  conversational decline with `state: null`: the composer attempted
+  `set_pipeline`, the tool rejected it (`.title()` is a forbidden call in the
+  `value_transform` expression sandbox), the rejection was disclosed in-loop,
+  and the model named the gap and asked the user how to proceed. A compose
+  turn that authors nothing correctly returns 200 with a null state — the
+  client stack is built on that shape. Resolved as not-a-bug
+  (`elspeth-9cd47dc933`); the causal defect — `value_transform`
+  `composer_hints` advertising capabilities the sandbox cannot perform — is
+  `elspeth-18bcf7dd09`.
+- **`elspeth-cfcd333f83` was UNSAMPLED this round**, not re-confirmed: no
+  `llm` transform was authored in g05's session, so the output-field collision
+  could not occur — and a transform whose config fails construction never
+  reaches the build-time collision check at all.
+
+The three 422 timeouts remain honest failure reports; `g09` reaches
+`state_exists` after its honest 422. The battery driver's `state_exists`
+verdict on g05 was the driver equating HTTP 200 with "pipeline authored" —
+on a 200 it must read `body["state"]` and report "composer declined" when
+null, instead of a false `state_exists` failure.
 
 ### The advisor FLAG rate could not be measured
 
@@ -539,7 +558,7 @@ the hash to `6e3cdb85…`, so that hypothesis is **refuted**. The source content
 and the declared schema are both correct; the rejection is in the
 source-validation path.
 
-#### Follow-up: intermittent, and the discriminator is an inversion
+#### Follow-up: intermittent, and the discriminator is header case
 
 The intent was re-run twice more on the same live stack:
 
@@ -552,7 +571,7 @@ The intent was re-run twice more on the same live stack:
 So it is **composition-dependent, not a hard failure** — which also means
 "regression against round 3" stays unproven, since a stochastic composer choice
 could have gone the other way then. Comparing the source schema across the
-three gives the discriminator, and it is an inversion:
+three shows what differed:
 
 ```
 FAILING (×2)   mode: flexible
@@ -565,34 +584,39 @@ PASSING (×1)   mode: flexible
                guaranteed_fields: [id, name, priority_level, issue_summary]
 ```
 
-**The failing schema is the correct one.** Structured `{name, field_type}`
-entries whose names match the CSV header exactly — and every row is rejected.
-The passing schema is degenerate: `fields` is a list of bare **strings** in a
-`"name: type"` text form rather than structured entries, and its
-`guaranteed_fields` are the *renamed downstream* names, which appear nowhere in
-the CSV header. It validates 4/4.
-
-A correctly declared schema rejects data that conforms to it; a schema
-describing entirely the wrong fields passes. The likely mechanism is
-`core/dag/schema_validation.py:178-183`, where a schema with zero
-`model_fields` and `extra="allow"` is treated as *observed* and **bypasses**
-validation — so the string form probably fails to parse into fields at all and
-is waved through, while the honest declaration is enforced and wrongly fails.
-If so this shares a root with the `type_coerce` defect below: **typed
-declarations are validated, untyped ones are not, and only the honest author is
-punished.**
+**The failing schema is the correct one, and the discriminator is not the spec
+form — it is case.** CSV headers are normalized to lowercase Python identifiers
+at the source boundary (`plugins/sources/field_normalization.py:99`), but
+declared `schema.fields` names are used verbatim, so a schema declaring
+`TicketID` can never match a row keyed `ticketid`. Every row fails
+`model_validate` at `plugins/sources/csv_source.py:558` with four
+`Field required [missing]` errors. The bare-string form fails identically
+against the same mixed-case header (verified); attempt 3 passed because the
+composer also invented a CSV whose headers were already lowercase, not because
+the string form bypasses validation. The proposed
+`core/dag/schema_validation.py:178-183` mechanism is refuted: the generated
+model has four `model_fields` in every case, and that code is build-time edge
+validation, not per-row source validation. This does NOT share a root with the
+`type_coerce` defect below. The defect dates to RC2 (2026-02-02) and is not a
+round-3 regression; it reproduces identically on the YAML surface, so it is not
+composer-specific. Filed as elspeth-3664e213c4.
 
 Two reporting defects compound it:
 
 1. **`routing.discarded: 0` contradicts `discard_summary.total: 4`** in the
    same payload. Two views of one run disagree about whether anything was
    discarded.
-2. **No surface states why.** `/diagnostics` returns `errors: []` and
-   `nodes: []`; `/outputs` returns `artifacts: []`; the web log group carries no
-   application-level rejection record even with
-   `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1`. An operator sees a pipeline that
-   "did nothing" with no route to the reason. `on_validation_failure: discard`
-   is the composer's own default here, so this is the default path.
+2. **No surface states why.** `/diagnostics` returns `tokens: []` with empty
+   `summary.state_counts` *(field names corrected 2026-08-06:
+   `RunDiagnosticsResponse` has no `errors`/`nodes` fields on any version — a
+   source-discarded row never becomes a token, so the token-anchored
+   projection is empty by construction)*; `/outputs` returns `artifacts: []`;
+   the web log group carries no application-level rejection record even with
+   `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1` — which is compose-time only and
+   was never in scope for runtime row validation. An operator sees a pipeline
+   that "did nothing" with no route to the reason.
+   `on_validation_failure: discard` is the composer's own default here, so
+   this is the default path.
 
 ### New defect — the edge validator rejects `type_coerce` for the mismatch it exists to fix
 
