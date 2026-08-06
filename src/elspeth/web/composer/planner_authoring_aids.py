@@ -1172,8 +1172,9 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     """Render one entry per plugin, reference content carried verbatim.
 
     ``not_for`` is the plugin's ``usage_when_not_to_use`` — its own stated
-    prohibition, profile-projected when an operator profile rewrites it, the
-    same live projection ``required_options`` already gets below. It carried
+    prohibition, already profile-projected when it reaches this function,
+    because an operator-profiled summary rewrites the field in the catalog view
+    itself (``plugin_policy.profiles``). It carried
     the ``text`` sink's "not for multiline values" rule that a planner authored
     straight past (elspeth-afdf55a17c), because until now the only tier that
     stated it was a ``list_sinks`` result the planner is told it rarely needs.
