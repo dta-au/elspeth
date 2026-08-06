@@ -233,7 +233,7 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
         "parameters": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["affected_node_id", "kind", "user_term", "llm_draft"],
+            "required": ["affected_node_id", "kind", "user_term"],
             "properties": {
                 "affected_node_id": {
                     "type": "string",
@@ -254,7 +254,13 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 },
                 "llm_draft": {
                     "type": "string",
-                    "description": "LLM-authored interpretation, source data, or prompt template text.",
+                    "description": (
+                        "OMIT this when the review site already carries a staged "
+                        "interpretation_requirements draft (the normal case): the server resolves "
+                        "the staged draft verbatim, which is more reliable than re-transmitting "
+                        "multi-line text. Provide it only for a site with no staged draft, or to "
+                        "assert an exact match; if provided it must byte-match the staged draft."
+                    ),
                 },
             },
         },

@@ -1506,12 +1506,16 @@ class _RequestInterpretationReviewRedactionModel(BaseModel):
     marked :class:`Sensitive`. ``extra="forbid"`` ensures a misrouted
     argument shape fails fast at the persistence boundary rather than
     silently accepting an unknown key.
+
+    ``llm_draft`` is optional, mirroring the live handler's argument model
+    (elspeth-9d59c33480): an omitted draft resolves server-side from the
+    staged requirement, so the tool-call row legitimately carries no draft.
     """
 
     affected_node_id: str
     kind: InterpretationKind
     user_term: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
-    llm_draft: Annotated[str, Sensitive(summarizer=_summarize_interpretation_term)]
+    llm_draft: Annotated[str | None, Sensitive(summarizer=_summarize_interpretation_term)] = None
 
     model_config = ConfigDict(extra="forbid")
 

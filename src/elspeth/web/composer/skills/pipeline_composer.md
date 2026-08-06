@@ -226,16 +226,12 @@ result.
   `user_term` is server-derived and already staged on the pending requirement —
   `inline_source_url_list` for a single-column `url` CSV, `inline_source_data`
   for every other artifact. Copy the staged requirement's `user_term` exactly;
-  never invent or derive your own. The review
-  `llm_draft` must be the exact staged source artifact text, including its
-  framing and whitespace. Never summarize, reformat, or describe it as
-  user-supplied. If the exact source artifact text is not in your immediate
-  context after binding a blob-backed source, read the current source state or
-  blob content and use the staged requirement's exact `draft`; do not stop in
-  prose because you no longer remember the generated rows. A draft-mismatch
-  error from `request_interpretation_review(kind="invented_source")` is
-  repairable: retrieve the authoritative pending source requirement and retry
-  with that exact draft. Do not report a source-review handoff mismatch merely
+  never invent or derive your own. Omit `llm_draft` in the review call: the
+  server resolves the staged requirement's `draft` verbatim, which is exactly
+  the staged source artifact text. Never re-type the artifact into the tool
+  call — escape-sequence round-trips make byte-identical re-emission
+  unreliable — and never summarize, reformat, or describe it as
+  user-supplied. Do not report a source-review handoff mismatch merely
   because there is no transform node named `source`; inspect the actual source
   options first. This permission does not allow you to invent non-source
   configuration, credentials, wire-visible identity values, audit facts, plugin
@@ -519,8 +515,10 @@ specific phrase.
 Do not use the whole phrase `how <adjective> ...` as `user_term` when the
 adjective itself is the named criterion; strip the framing and keep the
 adjective itself.
-The `llm_draft` must be the exact score, rubric, cutoff, ranking, or category
-semantics you authored, not the whole prompt template.
+The staged requirement `draft` must be the exact score, rubric, cutoff,
+ranking, or category semantics you authored, not the whole prompt template.
+In the review call, omit `llm_draft`: the server resolves the staged draft
+itself.
 
 Prompt-template review is not a substitute for rubric review — and the
 `vague_term` one is yours. When the LLM node has a prompt you wrote AND authored
@@ -756,11 +754,11 @@ on records you READ back but are owned by the backend.
 
 | Kind | When to call | Required shape |
 | --- | --- | --- |
-| `kind="vague_term"` | You author operational semantics for a user criterion: scoring scale, rubric, category meaning, threshold, cutoff, ranking rule, or subjective definition. | `affected_node_id`, stable `user_term`, exact drafted definition in `llm_draft`. |
-| `kind="invented_source"` | You create source rows, URLs, or inline source content the user did not provide verbatim. | Bind the source first; use the exact generated content as `llm_draft`. |
+| `kind="vague_term"` | You author operational semantics for a user criterion: scoring scale, rubric, category meaning, threshold, cutoff, ranking rule, or subjective definition. | `affected_node_id`, stable `user_term`; stage the drafted definition as the requirement `draft` and omit `llm_draft` (server-resolved). |
+| `kind="invented_source"` | You create source rows, URLs, or inline source content the user did not provide verbatim. | Bind the source first; the staged requirement `draft` carries the generated content — omit `llm_draft` (server-resolved). |
 | `kind="llm_prompt_template"` | Backend auto-stages and surfaces this row. Do not call the review tool for it. | Backend-owned; no caller-authored shape. |
 | `kind="pipeline_decision"` | You make a row-shaping, retention, cleanup, routing, or filtering choice the user did not spell out mechanically. | Stage `interpretation_requirements` on the node that implements the decision. |
-| `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; `llm_draft` is the exact `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |
+| `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; omit `llm_draft` — the server resolves the current `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |
 
 Data-minimization cleanup is a pipeline decision. The review belongs on the
 policy-visible transform that implements the cleanup, not on its upstream

@@ -1290,7 +1290,10 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     params = tool["parameters"]
     assert params["type"] == "object"
     assert params["additionalProperties"] is False
-    assert set(params["required"]) == {"affected_node_id", "kind", "user_term", "llm_draft"}
+    # llm_draft is deliberately NOT required (elspeth-9d59c33480): omitting it
+    # resolves the staged requirement draft server-side instead of forcing the
+    # LLM to re-emit staged bytes through tool-call JSON.
+    assert set(params["required"]) == {"affected_node_id", "kind", "user_term"}
     assert set(params["properties"]) == {"affected_node_id", "kind", "user_term", "llm_draft"}
     assert all(params["properties"][k]["type"] == "string" for k in params["properties"])
     assert params["properties"]["kind"]["enum"] == [
@@ -3468,3 +3471,232 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
     assert event.composer_skill_hash == "a" * 64
     # Resolved at creation time.
     assert event.resolved_at == event.created_at
+
+
+# --------------------------------------------------------------------------- #
+# elspeth-9d59c33480 — omitted llm_draft resolves the staged requirement
+# draft server-side. The LLM must never need to re-emit staged draft bytes
+# through tool-call JSON (real-newline vs escape-sequence round-trips made
+# byte-identical re-emission deterministically fail in battery r5 g04).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_invented_source_draft(
+    service: SessionServiceImpl,
+) -> None:
+    """Omitting llm_draft surfaces the staged multiline source artifact verbatim."""
+    session_id = uuid4()
+    draft = 'url,label\nhttps://example.gov.au/a,"first, quoted"\nhttps://example.gov.au/b,plain\n'
+    source = _llm_generated_source(draft=draft)
+    state_id = await _seed_source_session(service, session_id, source=source)
+    state = _state_with_source(source)
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": SOURCE_COMPONENT_ID,
+            "kind": "invented_source",
+            "user_term": "inline_source_url_list",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_source_review_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == draft
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_pipeline_decision_draft(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    state_id = await _seed_node_session(service, session_id, node=_pipeline_decision_review_node())
+    state = _state_with(_pipeline_decision_review_node())
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": "drop_raw_html",
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_html_fields",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_pipeline_decision_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == ("Drop the scraped raw HTML and fingerprint fields before saving the JSON output.")
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_staged_structured_vague_term_draft(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    node = _structured_llm_node()
+    state_id = await _seed_node_session(service, session_id, node=node)
+    state = _state_with(node)
+
+    result = await _handle_request_interpretation_review(
+        {
+            "affected_node_id": "rate_node",
+            "kind": "vague_term",
+            "user_term": "cool",
+        },
+        state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_vague_term_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == "visually appealing"
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_resolves_current_model_for_llm_model_choice(
+    service: SessionServiceImpl,
+) -> None:
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Model-choice omitted-draft test")
+    state, node_id, user_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": node_id,
+            "kind": "llm_model_choice",
+            "user_term": user_term,
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_model_choice_omitted_draft",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=10,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+
+    assert result.success is True
+    rows = await service.list_interpretation_events(session_id, status="pending")
+    assert len(rows) == 1
+    assert rows[0].llm_draft == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_without_staged_draft_is_arg_error() -> None:
+    """Legacy placeholder vague-term sites have no staged draft; llm_draft stays required there."""
+    state = _state_with(_llm_node())
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": "rate_node",
+                "kind": "vague_term",
+                "user_term": "cool",
+            },
+            state,
+            session_id=uuid4(),
+            composition_state_id=uuid4(),
+            tool_call_id="call_legacy_omitted_draft",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=_fake_create_pending_interpretation_event,
+            list_interpretation_events=_empty_list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_omitted_draft_still_validates_resolved_content() -> None:
+    """A staged draft that fails the content validators must not ride past them
+    just because it was resolved server-side rather than submitted."""
+    source = _llm_generated_source(draft="url\n{{ jinja_metacharacters }}\n")
+    state = _state_with_source(source)
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": SOURCE_COMPONENT_ID,
+                "kind": "invented_source",
+                "user_term": "inline_source_url_list",
+            },
+            state,
+            session_id=uuid4(),
+            composition_state_id=uuid4(),
+            tool_call_id="call_source_review_bad_staged_draft",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=_fake_create_pending_interpretation_event,
+            list_interpretation_events=_empty_list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_provided_draft_must_still_match_staged_draft(
+    service: SessionServiceImpl,
+) -> None:
+    """The provided-draft path keeps the strict byte-match (back-compat guard)."""
+    session_id = uuid4()
+    source = _llm_generated_source(draft="url\nhttps://example.gov.au/a\n")
+    state_id = await _seed_source_session(service, session_id, source=source)
+    state = _state_with_source(source)
+
+    with pytest.raises(ToolArgumentError, match=r"llm_draft|source review requirement draft"):
+        await _handle_request_interpretation_review(
+            {
+                "affected_node_id": SOURCE_COMPONENT_ID,
+                "kind": "invented_source",
+                "user_term": "inline_source_url_list",
+                "llm_draft": "url\\nhttps://example.gov.au/a\\n",
+            },
+            state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id="call_source_review_escaped_bytes",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="pending") == []

@@ -173,6 +173,11 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
       schema's 8192-byte expectation (see ``interpretation_events_table``
       column definitions; the schema-level body limit also bounds these
       at the ASGI boundary).
+    * ``llm_draft`` is optional (elspeth-9d59c33480): when omitted, the
+      handler resolves the draft from the staged requirement site
+      server-side. Requiring the LLM to re-emit staged draft bytes through
+      tool-call JSON made multiline drafts deterministically unmatchable
+      (real newlines vs escape sequences).
 
     ``extra="forbid"`` rejects unknown keys structurally so a misrouted
     argument shape (e.g., the LLM passing ``id`` instead of
@@ -183,7 +188,7 @@ class _RequestInterpretationReviewArgumentsModel(BaseModel):
     affected_node_id: str = Field(min_length=1, max_length=256)
     kind: InterpretationKind
     user_term: str = Field(min_length=1, max_length=8192)
-    llm_draft: str = Field(min_length=1, max_length=8192)
+    llm_draft: str | None = Field(default=None, min_length=1, max_length=8192)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -207,6 +212,58 @@ def _validate_source_artifact_review_content(value: str) -> None:
         if len(line) > 1024:
             raise ValueError("source artifact review content has a line exceeding the 1024-character limit")
     reject_credential_shaped_content(value)
+
+
+def _validate_review_draft_content(kind: InterpretationKind, draft: str) -> None:
+    """Tier-3 content gate for a review draft, provided or staged-resolved.
+
+    One dispatch shared by both draft origins (elspeth-9d59c33480): the
+    LLM-submitted ``llm_draft`` and the staged requirement draft the handler
+    resolves server-side when ``llm_draft`` is omitted. Every draft that can
+    become a persisted review event passes this gate, so the origin cannot
+    weaken the invariant. Raises :class:`ToolArgumentError` (ARG_ERROR, not a
+    Tier-1 crash) — the LLM recovers by re-staging compliant content.
+
+    Prompt-template reviews deliberately carry real Jinja such as
+    ``{{ row.html }}``, so they keep only the credential prefilter and skip
+    the accepted-value/source-artifact validators.
+    """
+    try:
+        reject_credential_shaped_content(draft)
+    except ValueError as exc:
+        raise ToolArgumentError(
+            argument="llm_draft",
+            expected="content that does not match a known credential shape",
+            actual_type="credential-shaped content rejected at the tool boundary",
+        ) from exc
+    if kind in {
+        InterpretationKind.VAGUE_TERM,
+        InterpretationKind.PIPELINE_DECISION,
+        InterpretationKind.LLM_MODEL_CHOICE,
+    }:
+        # ``llm_model_choice`` drafts are short model identifier strings
+        # (e.g. ``anthropic/claude-sonnet-4.5``) selected from a catalog
+        # at compose time; they are treated as accepted-value content
+        # because they flow into the runtime config as-is, never as
+        # template fragments — the same content rules apply (no Jinja,
+        # no control characters, no credential shapes).
+        try:
+            _validate_accepted_value_content(draft)
+        except ValueError as exc:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected="content without template metacharacters, control characters, or credential patterns",
+                actual_type="rejected by accepted-value content validator",
+            ) from exc
+    elif kind is InterpretationKind.INVENTED_SOURCE:
+        try:
+            _validate_source_artifact_review_content(draft)
+        except ValueError as exc:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected="source artifact content without template metacharacters, credential patterns, or non-printable controls",
+                actual_type="rejected by source-artifact content validator",
+            ) from exc
 
 
 def _options_with_inline_blob_source_review(
@@ -1850,7 +1907,7 @@ def _assert_affected_component(
     kind: InterpretationKind,
     user_term: str,
     llm_draft: str | None = None,
-) -> None:
+) -> str | None:
     """Tier-3 boundary check on the LLM-supplied review component.
 
     Raises :class:`ToolArgumentError` with an actionable message when:
@@ -1866,6 +1923,13 @@ def _assert_affected_component(
     Each branch raises ARG_ERROR (not a Tier-1 crash) because the LLM can
     recover by staging the right source/node metadata and retrying the tool
     call. Term matching remains strict after stripping surrounding whitespace.
+
+    Returns the *effective* review draft: the staged requirement draft where
+    the site carries one (the server-owned source of truth,
+    elspeth-9d59c33480), else the caller-provided ``llm_draft``, else ``None``
+    (a legacy vague-term placeholder site with no staged draft and no
+    submission). When both exist they must byte-match, so the two sources
+    never diverge on the returned value.
     """
     if kind is InterpretationKind.INVENTED_SOURCE:
         source_name = source_name_from_component_id(affected_node_id)
@@ -1895,33 +1959,32 @@ def _assert_affected_component(
                 expected=f"source to contain a pending {kind.value} requirement for the requested term",
                 actual_type=f"missing pending {kind.value} review site",
             )
-        if llm_draft is not None:
-            # The presence guard above already proved the key is present on
-            # the resolved source, and ``state`` is a frozen CompositionState
-            # that cannot change in between. Direct subscript: a ``KeyError``
-            # here would mean our guard logic broke. The retrieved value's
-            # contents remain Tier-3 LLM-authored, so the shape check below
-            # stays.
-            requirements = source.options[INTERPRETATION_REQUIREMENTS_KEY]
-            draft = None
-            if isinstance(requirements, (list, tuple)):
-                for requirement in requirements:
-                    if (
-                        isinstance(requirement, Mapping)
-                        and requirement.get("kind") == kind.value
-                        and requirement.get("user_term") == user_term
-                        and requirement.get("status") == "pending"
-                    ):
-                        draft_value = requirement.get("draft")
-                        draft = draft_value if isinstance(draft_value, str) else None
-                        break
-            if draft is not None and draft != llm_draft:
-                raise ToolArgumentError(
-                    argument="llm_draft",
-                    expected="the exact source review requirement draft staged in source.options.interpretation_requirements",
-                    actual_type="invented_source event draft does not match the source review requirement draft",
-                )
-        return
+        # The presence guard above already proved the key is present on
+        # the resolved source, and ``state`` is a frozen CompositionState
+        # that cannot change in between. Direct subscript: a ``KeyError``
+        # here would mean our guard logic broke. The retrieved value's
+        # contents remain Tier-3 LLM-authored, so the shape check below
+        # stays.
+        requirements = source.options[INTERPRETATION_REQUIREMENTS_KEY]
+        draft = None
+        if isinstance(requirements, (list, tuple)):
+            for requirement in requirements:
+                if (
+                    isinstance(requirement, Mapping)
+                    and requirement.get("kind") == kind.value
+                    and requirement.get("user_term") == user_term
+                    and requirement.get("status") == "pending"
+                ):
+                    draft_value = requirement.get("draft")
+                    draft = draft_value if isinstance(draft_value, str) else None
+                    break
+        if llm_draft is not None and draft is not None and draft != llm_draft:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected="the exact source review requirement draft staged in source.options.interpretation_requirements",
+                actual_type="invented_source event draft does not match the source review requirement draft",
+            )
+        return draft if draft is not None else llm_draft
 
     if kind is InterpretationKind.PIPELINE_DECISION:
         node = _find_node_or_raise(state, affected_node_id)
@@ -1965,7 +2028,7 @@ def _assert_affected_component(
                 expected=str(exc),
                 actual_type="pipeline_decision node that failed semantic review",
             ) from exc
-        return
+        return draft if draft is not None else llm_draft
 
     node = _find_node_or_raise(state, affected_node_id)
     plugin = node.plugin
@@ -2018,7 +2081,8 @@ def _assert_affected_component(
             ),
             actual_type=("pending vague_term requirement with no resolvable prompt wiring (the operator's resolve would dead-end)"),
         )
-    if kind is InterpretationKind.VAGUE_TERM and llm_draft is not None:
+    staged_draft: str | None = None
+    if kind is InterpretationKind.VAGUE_TERM:
         requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY)
         if isinstance(requirements, (list, tuple)):
             matching = [
@@ -2032,19 +2096,22 @@ def _assert_affected_component(
             ]
             if matching:
                 current_draft = matching[0].get("draft")
-                if not isinstance(current_draft, str) or current_draft != llm_draft:
+                if llm_draft is not None and (not isinstance(current_draft, str) or current_draft != llm_draft):
                     raise ToolArgumentError(
                         argument="llm_draft",
                         expected="the exact current vague-term requirement draft",
                         actual_type="stale vague-term draft",
                     )
-    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE and llm_draft is not None and llm_draft != prompt_template:
-        raise ToolArgumentError(
-            argument="llm_draft",
-            expected=f"current options.prompt_template for node {affected_node_id!r}",
-            actual_type="stale prompt-template draft",
-        )
-    if kind is InterpretationKind.LLM_MODEL_CHOICE and llm_draft is not None:
+                staged_draft = current_draft if isinstance(current_draft, str) else None
+    if kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+        if llm_draft is not None and llm_draft != prompt_template:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected=f"current options.prompt_template for node {affected_node_id!r}",
+                actual_type="stale prompt-template draft",
+            )
+        staged_draft = prompt_template
+    if kind is InterpretationKind.LLM_MODEL_CHOICE:
         current_model = options.get("model")
         if not isinstance(current_model, str) or not current_model:
             raise ToolArgumentError(
@@ -2052,12 +2119,14 @@ def _assert_affected_component(
                 expected=f"node {affected_node_id!r} to declare non-empty options.model",
                 actual_type=f"options.model is {type(current_model).__name__}",
             )
-        if llm_draft != current_model:
+        if llm_draft is not None and llm_draft != current_model:
             raise ToolArgumentError(
                 argument="llm_draft",
                 expected=f"current options.model for node {affected_node_id!r}",
                 actual_type="stale model-choice draft",
             )
+        staged_draft = current_model
+    return staged_draft if staged_draft is not None else llm_draft
 
 
 def _assert_affected_llm_node(
@@ -2389,54 +2458,43 @@ async def _handle_request_interpretation_review(
     # as ToolArgumentError so the compose loop's ARG_ERROR routing catches
     # it (a bare ValueError would land in the plugin-crash catch-all and
     # mis-classify the failure as a Tier-1 plugin bug).
-    for field_name, field_value in (("user_term", parsed.user_term), ("llm_draft", parsed.llm_draft)):
-        try:
-            reject_credential_shaped_content(field_value)
-        except ValueError as exc:
-            raise ToolArgumentError(
-                argument=field_name,
-                expected="content that does not match a known credential shape",
-                actual_type="credential-shaped content rejected at the tool boundary",
-            ) from exc
-    # F-2 prompt-injection guard on llm_draft. Vague-term and invented-source
-    # drafts become accepted values/artifacts; reject template metacharacters
-    # before any DB write. Prompt-template reviews deliberately carry real
-    # Jinja such as ``{{ row.html }}``, so they keep the credential prefilter
-    # above but skip the accepted-value validator.
-    if parsed.kind in {
-        InterpretationKind.VAGUE_TERM,
-        InterpretationKind.PIPELINE_DECISION,
-        InterpretationKind.LLM_MODEL_CHOICE,
-    }:
-        # ``llm_model_choice`` drafts are short model identifier strings
-        # (e.g. ``anthropic/claude-sonnet-4.5``) selected from a catalog
-        # at compose time; they are treated as accepted-value content
-        # because they flow into the runtime config as-is, never as
-        # template fragments — the same content rules apply (no Jinja,
-        # no control characters, no credential shapes).
-        try:
-            _validate_accepted_value_content(parsed.llm_draft)
-        except ValueError as exc:
-            raise ToolArgumentError(
-                argument="llm_draft",
-                expected="content without template metacharacters, control characters, or credential patterns",
-                actual_type="rejected by accepted-value content validator",
-            ) from exc
-    elif parsed.kind is InterpretationKind.INVENTED_SOURCE:
-        try:
-            _validate_source_artifact_review_content(parsed.llm_draft)
-        except ValueError as exc:
-            raise ToolArgumentError(
-                argument="llm_draft",
-                expected="source artifact content without template metacharacters, credential patterns, or non-printable controls",
-                actual_type="rejected by source-artifact content validator",
-            ) from exc
+    try:
+        reject_credential_shaped_content(parsed.user_term)
+    except ValueError as exc:
+        raise ToolArgumentError(
+            argument="user_term",
+            expected="content that does not match a known credential shape",
+            actual_type="credential-shaped content rejected at the tool boundary",
+        ) from exc
+    # F-2 prompt-injection + credential gate on a caller-provided draft,
+    # before any state inspection (kept ahead of the component check so a
+    # bad submitted draft reports as a content error, not a site error).
+    if parsed.llm_draft is not None:
+        _validate_review_draft_content(parsed.kind, parsed.llm_draft)
     # Tier-3 boundary check on the LLM-supplied component/kind pair. Missing
     # component, wrong component kind, and absent review metadata all raise
     # ARG_ERROR so the LLM can retry after fixing composition state. This must
     # happen before rate limiting so cap-exceeded audit rows are emitted only
-    # for valid pending review sites.
-    _assert_affected_component(state, parsed.affected_node_id, parsed.kind, parsed.user_term, parsed.llm_draft)
+    # for valid pending review sites. Returns the effective draft: the staged
+    # requirement draft where the site carries one (server-owned source of
+    # truth), else the caller-provided ``llm_draft`` (elspeth-9d59c33480 —
+    # the LLM must never need to re-emit staged draft bytes through
+    # tool-call JSON, where escape-sequence round-trips made byte-identical
+    # re-emission deterministically fail).
+    resolved_draft = _assert_affected_component(state, parsed.affected_node_id, parsed.kind, parsed.user_term, parsed.llm_draft)
+    if resolved_draft is None:
+        raise ToolArgumentError(
+            argument="llm_draft",
+            expected=(
+                "a review draft: this site has no staged requirement draft to resolve, so llm_draft is required — "
+                "either stage a structured interpretation_requirements entry with a draft or provide llm_draft"
+            ),
+            actual_type="omitted llm_draft with no staged requirement draft",
+        )
+    # A staged-resolved draft passes the same content gate as a submitted
+    # one — the origin must not weaken the persisted-event invariant.
+    if parsed.llm_draft is None:
+        _validate_review_draft_content(parsed.kind, resolved_draft)
     # Dedup gate. Runs BEFORE the rate-limit check on purpose: a duplicate
     # re-stage is zero logical progress and must not consume the per-term
     # budget, which is reserved for legitimate user-resolved churn (accept,
@@ -2499,7 +2557,7 @@ async def _handle_request_interpretation_review(
             tool_call_id=tool_call_id,
             user_term=parsed.user_term,
             kind=parsed.kind,
-            llm_draft=parsed.llm_draft,
+            llm_draft=resolved_draft,
             model_identifier=model_identifier,
             model_version=model_version,
             provider=provider,

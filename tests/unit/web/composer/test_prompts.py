@@ -613,12 +613,13 @@ class TestBuildSystemPrompt:
         assert "`user_term` is server-derived and already staged on the pending requirement" in flattened
         assert "`inline_source_url_list` for a single-column `url` CSV" in flattened
         assert "Copy the staged requirement's `user_term` exactly; never invent or derive your own" in flattened
-        assert "llm_draft` must be the exact staged source artifact text" in flattened
-        assert "If the exact source artifact text is not in your immediate context" in flattened
-        assert "use the staged requirement's exact `draft`" in flattened
-        assert 'A draft-mismatch error from `request_interpretation_review(kind="invented_source")` is repairable' in flattened
+        # elspeth-9d59c33480: the skill instructs omitting llm_draft so the
+        # server resolves the staged draft — never byte re-emission.
+        assert "Omit `llm_draft` in the review call" in flattened
+        assert "the server resolves the staged requirement's `draft` verbatim" in flattened
+        assert "Never re-type the artifact into the tool call" in flattened
         assert "Do not report a source-review handoff mismatch merely because there is no transform node named `source`" in flattened
-        assert "Never summarize, reformat, or describe it as" in flattened
+        assert "never summarize, reformat, or describe it as" in flattened
         assert "Do not treat a missing or mismatched review handoff as a product blocker" in flattened
         assert "Before stopping, enumerate pending `interpretation_requirements` from the source and from every node" in flattened
         assert 'Use `affected_node_id="source"` for requirements stored on `source.options.interpretation_requirements`' in flattened
