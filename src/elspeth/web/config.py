@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
+import structlog
 from pydantic import BaseModel, ConfigDict, Field, SecretBytes, SecretStr, ValidationError, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts.auth import AuthProviderType
@@ -44,6 +45,14 @@ _LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _MIN_NON_LOCAL_JWT_SECRET_KEY_BYTES = 32
 _DEFAULT_COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS = 300.0
 _DEFAULT_COMPOSER_TRANSPORT_HEADROOM_SECONDS = 30.0
+# Conservative planning floor for one authoring turn (LLM call + tool work).
+# Measured ~20s/turn mean on the 2026-08-02 acceptance burst (11 provider
+# calls / 99.4s); 15s sits below that mean so the underfunded-budget warning
+# (elspeth-f159d2394b) fires only when the configured turn budget is not
+# realistically reachable, not on ordinary variance.
+_COMPOSER_PLANNING_SECONDS_PER_TURN = 15.0
+
+_slog = structlog.get_logger(__name__)
 # Mechanical link to core retention default: if
 # core/config.py:PayloadStoreSettings.retention_days changes, this value
 # tracks it automatically. Prevents the silent divergence called out in
@@ -937,6 +946,31 @@ class WebSettings(BaseModel):
                 f"got {self.composer_timeout_seconds}s, maximum {max_backend_timeout_seconds}s "
                 f"(transport idle ceiling {self.composer_transport_idle_ceiling_seconds}s - "
                 f"headroom {self.composer_transport_headroom_seconds}s)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _warn_composer_turn_budget_underfunded(self) -> WebSettings:
+        """Disclose a turn budget the wall clock cannot fund (elspeth-f159d2394b).
+
+        The 2026-08-02 acceptance run authorised 12+8 turns on a 120s clock
+        that funded ~6 at the measured per-turn cost — the configured budget
+        was never reachable, presenting a capability that did not exist.
+        Disclosure rather than rejection: per-turn cost is workload- and
+        model-dependent (measured ~20s/turn on the acceptance burst;
+        thinking-heavy single calls have exceeded 120s), so a hard gate here
+        would couple config validity to a drifting measurement. The planning
+        floor below is deliberately below the measured mean.
+        """
+        configured_turns = self.composer_max_composition_turns + self.composer_max_discovery_turns
+        fundable_turns = int(self.composer_timeout_seconds // _COMPOSER_PLANNING_SECONDS_PER_TURN)
+        if fundable_turns < configured_turns:
+            _slog.warning(
+                "composer_turn_budget_underfunded",
+                composer_timeout_seconds=self.composer_timeout_seconds,
+                configured_turns=configured_turns,
+                fundable_turns_estimate=fundable_turns,
+                planning_seconds_per_turn=_COMPOSER_PLANNING_SECONDS_PER_TURN,
             )
         return self
 

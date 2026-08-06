@@ -381,14 +381,14 @@ locals {
     { name = "ELSPETH_WEB__PAYLOAD_STORE_PATH", value = local.payload_store_path },
     { name = "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", value = "12" },
     { name = "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", value = "8" },
-    # 240s, not the former 120s: at the measured ~20s per authoring turn a
-    # 120s clock funded ~6 turns, so the 12+8 turn budget above was
-    # unreachable at any observed turn cost. 240 is the ceiling this
-    # deployment can honestly offer — it leaves the app's 30s transport
-    # headroom inside the ALB's 300s idle timeout (network.tf), and stays
-    # under the 270s WebSettings guard. Raising it further requires raising
-    # the ALB idle timeout first; see the terraform README.
-    { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = "240" },
+    # Operator-tunable (var.composer_timeout_seconds; was a hardcoded 120,
+    # then a hardcoded 240 — elspeth-f159d2394b). Default 240: at the
+    # measured ~20s per authoring turn a 120s clock funded ~6 turns, so the
+    # 12+8 turn budget above was unreachable at any observed turn cost. The
+    # variable's plan-time validation enforces the 270s WebSettings guard;
+    # raising past that requires raising the ALB idle timeout (network.tf)
+    # first — see the terraform README.
+    { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = tostring(var.composer_timeout_seconds) },
     # "medium", not the code default "high": the candidate role is the other
     # half of the wall-clock budget above, and the value is measured rather
     # than preferred. At "high" the g08 acceptance graph returned a 422 at the
