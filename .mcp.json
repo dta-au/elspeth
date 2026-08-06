@@ -62,7 +62,10 @@
         "--root",
         ".",
         "--loomweave-url",
-        "http://127.0.0.1:10251"
+        "http://127.0.0.1:10251",
+        "--trust-pack",
+        "scripts.wardline_pack",
+        "--allow-custom-packs"
       ],
       "command": "/home/john/.local/bin/wardline",
       "type": "stdio"
