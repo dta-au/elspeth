@@ -1,20 +1,24 @@
 # Canonical Pipeline Capabilities
 
 This is ELSPETH's static, public pipeline-language contract. It describes what
-the shared planner can author; live discovery remains the authority for which
-plugins and models are installed and authorized in the current deployment.
-Every planning surface receives these exact bytes before its interaction rules.
+every authoring surface can author; live discovery remains the authority for
+which plugins and models are installed and authorized in the current
+deployment. Every authoring surface receives these exact bytes before its
+interaction rules.
 
 ## Canonical proposal and discovery
 
 [capability:discovery-order]
 
-Author exactly one complete canonical pipeline proposal through
-`emit_pipeline_proposal`. Use the read-only discovery tools before proposing:
+Author pipelines as one complete canonical pipeline document — the
+`set_pipeline` object shape. Each authoring surface accepts that document
+through its own terminal authoring tool; your interaction rules and
+per-request instructions name yours. Use the read-only discovery tools before
+authoring:
 
 1. Read current pipeline and validation state with `get_pipeline_state`,
    `diff_pipeline`, or `preview_pipeline` as relevant.
-2. Consult the authoring_aids discovery digest delivered in the planning
+2. Consult the authoring_aids discovery digest delivered in the request
    context first: it is rendered from the live policy-visible catalog at
    prompt build and is current for this deployment — plan directly from it.
    Call `list_sources`, `list_transforms`, `list_sinks`, or `list_recipes`
@@ -25,9 +29,9 @@ Author exactly one complete canonical pipeline proposal through
    repair when a proposal is rejected, rather than guessing.
 4. Use `get_expression_grammar` before authoring conditions. Use blob and
    secret-reference discovery when the request needs them; secret values are
-   never part of planner discovery.
-5. Call `emit_pipeline_proposal` once with the complete `set_pipeline` argument
-   object. Preserve the requested topology during every repair.
+   never part of authoring discovery.
+5. Author through your surface's terminal authoring tool with the complete
+   canonical document. Preserve the requested topology during every repair.
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live

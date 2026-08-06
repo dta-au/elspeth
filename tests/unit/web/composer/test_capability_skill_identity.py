@@ -63,6 +63,32 @@ def test_freeform_and_every_guided_planner_prepend_identical_core_bytes() -> Non
         assert rendered.count(core) == 1
 
 
+def test_capability_core_names_no_surface_exclusive_terminal_tool() -> None:
+    # The core's exact bytes are prepended to the freeform tool-loop surface
+    # (whose roster has NO emit_pipeline_proposal) and to every planner
+    # surface (discovery + terminal). A tool that exists on only one side
+    # must never be instructed from the shared bytes: the planner terminal
+    # contract is delivered per-request by plan_pipeline instead
+    # (elspeth-3348db88f9). The canonical document shape (`set_pipeline`)
+    # remains the shared referent both surfaces author.
+    core = load_pipeline_capability_core()
+
+    assert "emit_pipeline_proposal" not in core
+    assert "emit_pipeline_proposal" not in build_system_prompt(None)
+    assert "`set_pipeline`" in core
+
+
+def test_planner_request_instruction_carries_the_terminal_contract() -> None:
+    # Split-the-core counterpart: with the shared bytes surface-neutral, the
+    # planner's exactly-once terminal contract must ride the per-request
+    # instruction channel every plan_pipeline call sends.
+    from elspeth.web.composer.pipeline_planner import PLANNER_TERMINAL_INSTRUCTION
+
+    assert "emit_pipeline_proposal" in PLANNER_TERMINAL_INSTRUCTION
+    assert "exactly once" in PLANNER_TERMINAL_INSTRUCTION
+    assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
+
+
 def test_guided_chat_prompts_are_interaction_only_and_advertise_no_planner_terminal() -> None:
     core = load_pipeline_capability_core()
 

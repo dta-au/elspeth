@@ -925,6 +925,16 @@ _PROSE_NUDGE_BUDGET = 2
 # reaching the finalizer describes server-side authority and stays terminal.
 _CANDIDATE_SHAPE_INTEGRITY_PREFIX: Final[str] = "guided planner candidate"
 
+# The planner-surface terminal contract. The shared capability core is
+# surface-neutral about terminal tools — its exact bytes also front the
+# freeform tool loop, whose roster has no emit_pipeline_proposal
+# (elspeth-3348db88f9) — so the exactly-once terminal instruction rides
+# every planner request instead.
+PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
+    "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
+    "with one complete canonical set_pipeline argument object."
+)
+
 
 def _prose_reply_notice() -> str:
     return "Your previous reply called no tool. You must respond with a declared tool call — continue from where you were."
@@ -2400,10 +2410,7 @@ async def _plan_pipeline_inner(
         "current_state": provider_current_state,
         "reviewed_facts": reviewed_planner_context,
         "authoring_aids": authoring_aids,
-        "instruction": (
-            "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
-            "with one complete canonical set_pipeline argument object."
-        ),
+        "instruction": PLANNER_TERMINAL_INSTRUCTION,
     }
     if conversation_context is not None:
         provider_request["conversation_context"] = conversation_context.to_dict()
