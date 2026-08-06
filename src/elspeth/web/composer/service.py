@@ -4074,29 +4074,21 @@ class ComposerServiceImpl:
                     mutation_success_seen=mutation_success_seen,
                     plugin_snapshot=plugin_snapshot,
                 )
-                outstanding_findings: ValidationResult | None = None
-                if result.runtime_preflight is not None and _is_pending_interpretation_handoff(result.runtime_preflight):
-                    outstanding_findings = await self._pending_handoff_outstanding_findings(
-                        result.state,
-                        user_id=user_id,
-                        session_id=session_id,
-                        cache=runtime_preflight_cache,
-                        initial_version=initial_version,
-                        session_scope=session_scope,
-                        llm_calls=recorder.llm_calls,
-                        plugin_snapshot=plugin_snapshot,
-                    )
+                # ``_surface_and_finalize_no_tools`` now owns the announcement
+                # (with its outstanding-findings qualification) for the
+                # pending-handoff preflight shape on EVERY caller
+                # (elspeth-c5350d93fd). What is left here is the residue the
+                # shared tail cannot see: this branch's trigger is the TOOL
+                # BATCH — ``request_interpretation_review`` succeeded and
+                # terminated the batch — which is ground truth that a review was
+                # staged even when the preflight was not computed this turn
+                # (None) or came back green. Re-appending on the pending-handoff
+                # shape would emit the suffix TWICE and pass
+                # ``_enforce_augmentation_prefix_invariant`` silently, since a
+                # doubled suffix still keeps the prose as a strict prefix.
                 handoff_result = (
-                    _append_interpretation_review_handoff_message(
-                        result,
-                        dispatch.raw_assistant_content,
-                        outstanding_findings=outstanding_findings,
-                    )
-                    if (
-                        result.runtime_preflight is None
-                        or result.runtime_preflight.is_valid
-                        or _is_pending_interpretation_handoff(result.runtime_preflight)
-                    )
+                    _append_interpretation_review_handoff_message(result, dispatch.raw_assistant_content)
+                    if (result.runtime_preflight is None or result.runtime_preflight.is_valid)
                     else result
                 )
                 threaded = replace(
@@ -4654,11 +4646,12 @@ class ComposerServiceImpl:
     ) -> ComposerResult:
         """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
 
-        Shared tail of BOTH no-tool finalize paths (Task 7 HIGH-1):
-        ``_try_terminate_no_tools`` and the B-4D-3 budget-exhaustion last-chance
-        finalize in ``_classify_and_budget_turn``. Returns either the fail-closed
-        blocked ``ComposerResult`` (an orphaned interpretation site survived) or
-        the finalized ``ComposerResult``. The caller threads ``repair_turns_used``
+        Shared tail of ALL THREE no-tool finalize paths (Task 7 HIGH-1):
+        ``_try_terminate_no_tools``, the B-4D-3 budget-exhaustion last-chance
+        finalize in ``_classify_and_budget_turn``, and the staged-handoff branch
+        that precedes it. Returns either the fail-closed blocked
+        ``ComposerResult`` (an orphaned interpretation site survived) or the
+        finalized ``ComposerResult``. The caller threads ``repair_turns_used``
         (only ``_try_terminate_no_tools`` tracks it) and the persisted ids.
 
         See the orphan-gate / backend-surfacing doctrine in the caller's docstring
@@ -4686,8 +4679,9 @@ class ComposerServiceImpl:
                 reason="composer_complete",
             ),
         )
-        return await self._finalize_no_tool_response(
-            content=assistant_message.content or "",
+        raw_content = assistant_message.content or ""
+        result = await self._finalize_no_tool_response(
+            content=raw_content,
             state=state,
             initial_version=initial_version,
             user_id=user_id,
@@ -4701,6 +4695,43 @@ class ComposerServiceImpl:
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
         )
+
+        runtime_result = result.runtime_preflight
+        if runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
+            # Shape-16 handoff qualification, applied HERE and not at the call
+            # sites (elspeth-c5350d93fd). It previously lived on the
+            # staged-handoff branch alone, so the two OTHER callers — the
+            # B-4D-3 budget-exhaustion finalize and the CLEAN no-tool tail,
+            # which is the single most common way a compose turn ends —
+            # published a pending-review result with NOTHING backend-authored
+            # appended: for a handoff result with no grounding violations
+            # ``finalize_no_tool_response`` returns the model's raw prose
+            # verbatim, so an operator whose model happened not to mention the
+            # review got no indication one existed. Owning it in the shared
+            # tail covers every present and future caller by construction.
+            #
+            # Keying on the preflight SHAPE rather than on the tool batch is
+            # sound here because ``_surface_pt_and_gate_orphans_or_none`` has
+            # already run above: PT reviews are surfaced and orphaned sites
+            # returned fail-closed, so a surviving INTERPRETATION_REVIEW_PENDING
+            # blocker means a resolvable card genuinely exists to announce.
+            outstanding_findings = await self._pending_handoff_outstanding_findings(
+                result.state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+            return _append_interpretation_review_handoff_message(
+                result,
+                raw_content,
+                outstanding_findings=outstanding_findings,
+            )
+
+        return result
 
     async def _evaluate_terminal_no_tool_advisor_gate(
         self,
