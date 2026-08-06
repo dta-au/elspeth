@@ -27,6 +27,7 @@ from elspeth.contracts import (
     NodeType,
     PipelineRow,
     PluginSchema,
+    ResumePoint,
     RoutingMode,
     RunStatus,
     SourceRow,
@@ -469,8 +470,13 @@ def _start_interrupted_multi_source_run(tmp_path: Path) -> _MultiSourceResumeCon
     run_id = exc_info.value.run_id
     assert run_id is not None
     assert checkpoint_mgr.get_latest_checkpoint(run_id) is not None
+    # elspeth-1f5b83cd28: the refunds source was interrupted mid-load, so the
+    # advisory gate refuses — matching the IncompleteSourceResumeError the
+    # enforcing guard raises in every test below.
     check = recovery_mgr.can_resume(run_id, graph)
-    assert check.can_resume, f"Expected interrupted multi-source run to be resumable: {check.reason}"
+    assert not check.can_resume
+    assert check.reason is not None
+    assert "refunds=interrupted" in check.reason
     with db.engine.connect() as conn:
         refunds_source_node_id = conn.execute(
             select(run_sources_table.c.source_node_id).where(
@@ -508,8 +514,13 @@ def _append_crashed_refund_row(ctx: _MultiSourceResumeContext) -> str:
 
 def _resume_multi_source_run(ctx: _MultiSourceResumeContext) -> Any:
     resume_config, resume_graph = _build_multi_source_resume_pipeline(output_path=ctx.output_path)
-    resume_point = ctx.recovery_mgr.get_resume_point(ctx.run_id, resume_graph)
-    assert resume_point is not None
+    # elspeth-1f5b83cd28: the advisory gate refuses interrupted sources, so
+    # get_resume_point returns None. Hand-build the resume point — these tests
+    # prove the enforcing guard refuses (and stays side-effect-free) on its
+    # own authority.
+    checkpoint = ctx.checkpoint_mgr.get_latest_checkpoint(ctx.run_id)
+    assert checkpoint is not None
+    resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
     return Orchestrator(
         ctx.db,
         checkpoint_manager=ctx.checkpoint_mgr,

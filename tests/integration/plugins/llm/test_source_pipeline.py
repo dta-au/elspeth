@@ -18,7 +18,7 @@ import respx
 from litellm.types.utils import ModelResponse, Usage
 from sqlalchemy import func, select
 
-from elspeth.contracts import CallStatus, CallType, Determinism, PipelineRow, RunStatus, SourceProtocol
+from elspeth.contracts import CallStatus, CallType, Determinism, PipelineRow, ResumePoint, RunStatus, SourceProtocol
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.sink_effects import SinkEffectState
@@ -744,9 +744,18 @@ def test_interrupted_llm_source_refuses_resume_before_exhaustion(
         members_before_resume = factory.execution.sink_effects.get_members_for_run(run_id)
         output_before_resume = output_path.read_bytes()
 
+        # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
+        # source, so get_resume_point returns None. Hand-build the resume
+        # point — the enforcing guard must refuse on its own authority.
         recovery = RecoveryManager(db, checkpoint_manager)
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
+        check = recovery.can_resume(run_id, graph)
+        assert not check.can_resume
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
+        resume_point = ResumePoint(
+            checkpoint=checkpoint_before_resume,
+            sequence_number=checkpoint_before_resume.sequence_number,
+        )
         with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
             orchestrator.resume(
                 resume_point=resume_point,

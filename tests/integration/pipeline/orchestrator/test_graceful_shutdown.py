@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus
+from elspeth.contracts import Determinism, PipelineRow, ResumePoint, RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.results import SourceRow
@@ -543,8 +543,17 @@ class TestShutdownBreaksLoop:
 class TestInterruptAndResume:
     """Tests for interrupt → resume pipeline lifecycle."""
 
-    def test_interrupted_run_is_resumable(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Interrupt after N of M rows, verify checkpoint and resumability."""
+    def test_interrupted_mid_source_run_refuses_resume_honestly(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """Interrupt after N of M rows: checkpoint persists, gate refuses honestly.
+
+        The interrupt lands mid-source, so the source lifecycle is
+        ``interrupted`` and no current resume path can recover the unread
+        rows — ``resume()`` has always refused this run with
+        ``IncompleteSourceResumeError``. Pre-elspeth-1f5b83cd28 this test
+        asserted ``can_resume=True``, certifying resumability with the
+        advisory gate's false green; the honest contract is a clean refuse
+        naming the incomplete source.
+        """
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
@@ -594,10 +603,14 @@ class TestInterruptAndResume:
         assert run is not None
         assert run.status == RunStatus.INTERRUPTED
 
-        # Verify the run IS resumable
+        # The checkpoint baseline exists, but the advisory gate refuses —
+        # matching the enforcing guard's IncompleteSourceResumeError verdict.
+        assert checkpoint_mgr.get_latest_checkpoint(run_id) is not None
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         check = recovery.can_resume(run_id, graph)
-        assert check.can_resume, f"Expected resumable, got: {check.reason}"
+        assert not check.can_resume
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
 
     def test_shutdown_creates_checkpoint(self, landscape_db: LandscapeDB, payload_store) -> None:
         """Checkpoint exists after graceful shutdown."""
@@ -638,8 +651,15 @@ class TestInterruptAndResume:
         checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
         assert checkpoint is not None
 
-    def test_buffered_aggregation_shutdown_remains_resumable(self, landscape_db: LandscapeDB, payload_store) -> None:
-        """Buffered aggregation shutdown must persist a recovery checkpoint."""
+    def test_buffered_aggregation_shutdown_persists_recovery_state(self, landscape_db: LandscapeDB, payload_store) -> None:
+        """Buffered aggregation shutdown persists checkpoint + journal rows.
+
+        The durable recovery evidence (checkpoint baseline, BLOCKED journal
+        rows) must survive the shutdown. The run itself is NOT resumable —
+        the source was interrupted mid-load, and elspeth-1f5b83cd28 made the
+        advisory gate report that honestly instead of green-lighting a
+        resume the enforcing guard always refused.
+        """
         from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
         from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
         from elspeth.core.config import CheckpointSettings
@@ -687,9 +707,13 @@ class TestInterruptAndResume:
             )
         assert blocked_barrier_rows, "Expected buffered aggregation tokens as BLOCKED journal rows"
 
+        # elspeth-1f5b83cd28: the buffered work is durably persisted, but the
+        # interrupted source makes the run non-resumable — the gate says so.
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         check = recovery.can_resume(run_id, graph)
-        assert check.can_resume, f"Expected resumable buffered shutdown, got: {check.reason}"
+        assert not check.can_resume
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
 
     def test_buffered_coalesce_shutdown_refuses_completion_without_source_exhaustion(
         self,
@@ -771,8 +795,11 @@ class TestInterruptAndResume:
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         assert recovery.get_unprocessed_rows(run_id) == []
 
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
+        # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
+        # source, so get_resume_point returns None. Hand-build the resume
+        # point — resume() must refuse on its own authority.
+        assert not recovery.can_resume(run_id, graph).can_resume
+        resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
 
         with pytest.raises(IncompleteSourceResumeError, match=r"source.*primary.*interrupted"):
             orchestrator.resume(
@@ -837,8 +864,13 @@ class TestInterruptAndResume:
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
         assert recovery.get_unprocessed_rows(run_id) == []
 
-        first_resume_point = recovery.get_resume_point(run_id, graph)
-        assert first_resume_point is not None
+        # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
+        # source; hand-build the resume point to prove the enforcing guard
+        # refuses independently.
+        assert not recovery.can_resume(run_id, graph).can_resume
+        first_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert first_checkpoint is not None
+        first_resume_point = ResumePoint(checkpoint=first_checkpoint, sequence_number=first_checkpoint.sequence_number)
         # F1: pending coalesce state lives in BLOCKED journal rows, not on the
         # resume point — assert the durable pending-coalesce evidence directly.
         from sqlalchemy import select
@@ -873,9 +905,12 @@ class TestInterruptAndResume:
 
         assert output_sink.results == []
 
-        second_resume_point = recovery.get_resume_point(run_id, graph)
-        assert second_resume_point is not None
-        assert second_resume_point.sequence_number == first_resume_point.sequence_number
+        # The refused resume advanced nothing: same latest checkpoint, and
+        # the gate's verdict is unchanged.
+        second_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert second_checkpoint is not None
+        assert second_checkpoint.sequence_number == first_resume_point.sequence_number
+        assert not recovery.can_resume(run_id, graph).can_resume
         # F1: the pending coalesce branches must still be BLOCKED journal rows
         # after the refused resume (nothing consumed them).
         with landscape_db.connection() as conn:

@@ -24,7 +24,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts import Determinism, PluginSchema, RunStatus
+from elspeth.contracts import Determinism, PluginSchema, ResumePoint, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import IncompleteSourceResumeError, PluginContractViolation
@@ -257,9 +257,9 @@ def test_aggregation_count_flush_violation_abandons_tokens_at_finalization(tmp_p
 
     The honest counterpart to the END_OF_SOURCE case: a count trigger fires on
     the third row's INTAKE, while the source is still ``loading``. The run is
-    therefore NOT resumable in practice — the resume gate says yes, then the
-    resume itself refuses with ``IncompleteSourceResumeError`` because the
-    source never reached a complete lifecycle state.
+    therefore NOT resumable — the advisory gate refuses (elspeth-1f5b83cd28)
+    and the resume itself refuses with ``IncompleteSourceResumeError``,
+    because the source never reached a complete lifecycle state.
 
     This was elspeth-82d4c5146c's original symptom (``closure='open'``,
     ``missing_terminal_outcomes == batch size`` on a finished run) and the
@@ -280,9 +280,16 @@ def test_aggregation_count_flush_violation_abandons_tokens_at_finalization(tmp_p
     _assert_all_tokens_abandoned(db, run_id)
 
     # Mid-load flush: the source never completed, so nothing can pick these up.
+    # elspeth-1f5b83cd28: the advisory gate, the enforcing guard, and the
+    # ADR-038 abandonment sweep now all agree on that fact.
     assert _source_lifecycle_states(db, run_id) == {"primary": "loading"}
-    resume_point = recovery.get_resume_point(run_id, graph)
-    assert resume_point is not None
+    check = recovery.can_resume(run_id, graph)
+    assert not check.can_resume
+    assert check.reason is not None
+    assert "primary=loading" in check.reason
+    latest_checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+    assert latest_checkpoint is not None
+    resume_point = ResumePoint(checkpoint=latest_checkpoint, sequence_number=latest_checkpoint.sequence_number)
     with pytest.raises(IncompleteSourceResumeError):
         Orchestrator(db, checkpoint_manager=checkpoint_mgr).resume(
             resume_point=resume_point,
