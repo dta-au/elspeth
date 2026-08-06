@@ -5018,6 +5018,134 @@ class TestSchemaContractValidation:
         entries = [error for error in result.errors if error.error_code == "coalesce_schema_mode_mixed"]
         assert len(entries) == 1, result.errors
 
+    def test_union_coalesce_rejects_incompatible_shared_field_types(self) -> None:
+        """Stage 1 mirrors the runtime's union type-compatibility rule.
+
+        Battery round-6 g03 (elspeth-85f3cc3022): the composer declared the
+        same field with different types on two branches it authored in one
+        ``set_pipeline`` call. Stage 1 reported ``is_valid=True``, so the
+        mutation envelope told the compose loop the pipeline was clean and it
+        stopped; only the DAG build rejected it. The type rule is now checked
+        where the authoring surface can act on it.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].severity == "high"
+        assert "value" in entries[0].message
+        assert "'int'" in entries[0].message
+        assert "'str'" in entries[0].message
+
+    def test_union_coalesce_type_entry_carries_structured_repair_facts(self) -> None:
+        """The planner's feedback strips messages, so the facts must be structured.
+
+        Without these the closed code names the failing NODE but never the
+        FIELD, and the repair is unreachable for a field a plugin contributed
+        rather than the author declaring it.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "coalesce_union_type_incompatible")
+        assert entry.coalesce_union_type is not None
+        detail = entry.coalesce_union_type
+        assert detail.field == "value"
+        assert {detail.branch_a, detail.branch_b} == {"path_a", "path_b"}
+        assert {detail.type_a, detail.type_b} == {"int", "str"}
+        assert entry.to_dict()["coalesce_union_type"] == {
+            "field": "value",
+            "branch_a": detail.branch_a,
+            "type_a": detail.type_a,
+            "branch_b": detail.branch_b,
+            "type_b": detail.type_b,
+        }
+
+    def test_union_coalesce_type_conflict_is_policy_independent(self) -> None:
+        """The verdict must not depend on the coalesce policy.
+
+        Composer derives ``require_all`` from the policy alone while the
+        runtime uses ``has_all_branch_semantics``. The two cannot disagree on
+        a composer-authored pipeline (no ``quorum_count`` field exists), but
+        this pins the stronger property the mirror actually relies on: the type
+        conflict is raised before ``require_all`` is read at all, so no policy
+        can turn the rejection on or off.
+        """
+        for policy in ("require_all", "quorum", "best_effort", "first"):
+            state = self._make_coalesce_schema_mode_state(
+                source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+                transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            )
+            coalesce = next(node for node in state.nodes if node.id == "merge_results")
+            state = state.with_node(replace(coalesce, policy=policy))
+
+            result = state.validate()
+
+            assert any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors), (
+                f"policy={policy} did not reject",
+            )
+
+    def test_union_coalesce_accepts_compatible_shared_field_types(self) -> None:
+        """Identical declared types across branches stay valid."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_union_coalesce_type_check_abstains_on_unresolved_branch(self) -> None:
+        """One resolvable branch is not enough to prove a conflict."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            branch_plugin="not_registered",
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_union_coalesce_mode_mixed_suppresses_the_type_entry(self) -> None:
+        """The runtime raises the mode conflict first, so only it is reported.
+
+        Emitting both would hand the repair loop a second, phantom target on a
+        node whose real defect is the mode mismatch.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_nested_coalesce_ignores_incompatible_shared_field_types(self) -> None:
+        """Only union merge merges typed branch fields; nested keys by branch."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            merge="nested",
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
     def test_fork_gate_direct_sink_contract_checked(self) -> None:
         """Fork branches that terminate at sinks stay statically checkable."""
         state = self._empty_state()

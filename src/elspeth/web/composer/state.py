@@ -10,7 +10,7 @@ Layer: L3 (application).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
@@ -39,6 +39,7 @@ from elspeth.contracts.sink import (
     LOCAL_RECOVERY_SINK_PLUGINS,
 )
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.union_merge import UnionTypeConflictError, merge_union_field_flags
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.config import (
     _MAX_NODE_NAME_LENGTH,
@@ -574,6 +575,47 @@ class RowUnionSchemaDetail:
         )
 
 
+class CoalesceUnionTypeDetailDict(TypedDict):
+    """Structured facts for a union-coalesce shared-field type conflict."""
+
+    field: str
+    branch_a: str
+    type_a: str
+    branch_b: str
+    type_b: str
+
+
+@dataclass(frozen=True, slots=True)
+class CoalesceUnionTypeDetail:
+    """The exact conflicting declaration a union coalesce cannot merge.
+
+    Same custody class as :class:`RowUnionSchemaDetail`: a field name and two
+    branch names plus their declared types, all read from validated schema
+    config — pipeline identifiers and schema field names, never user row
+    content. The planner's feedback projection withholds raw validation
+    messages, so without these facts the closed code names the failing NODE but
+    not which FIELD conflicts. That gap is not hypothetical here: a branch can
+    conflict on a field it never declared, because a plugin contributes its own
+    computed output fields (``value_transform`` adds an operation target as
+    ``any``), and no amount of re-reading the authored candidate reveals it.
+    """
+
+    field: str
+    branch_a: str
+    type_a: str
+    branch_b: str
+    type_b: str
+
+    def to_dict(self) -> CoalesceUnionTypeDetailDict:
+        return CoalesceUnionTypeDetailDict(
+            field=self.field,
+            branch_a=self.branch_a,
+            type_a=self.type_a,
+            branch_b=self.branch_b,
+            type_b=self.type_b,
+        )
+
+
 class ValidationEntryDict(TypedDict):
     """JSON representation of :class:`ValidationEntry`."""
 
@@ -583,6 +625,7 @@ class ValidationEntryDict(TypedDict):
     error_code: NotRequired[str]
     contract: NotRequired[SchemaContractDetailDict]
     row_union_schema: NotRequired[RowUnionSchemaDetailDict]
+    coalesce_union_type: NotRequired[CoalesceUnionTypeDetailDict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -599,6 +642,7 @@ class ValidationEntry:
     error_code: str | None = None
     contract: SchemaContractDetail | None = None
     row_union_schema: RowUnionSchemaDetail | None = None
+    coalesce_union_type: CoalesceUnionTypeDetail | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
@@ -609,6 +653,8 @@ class ValidationEntry:
             result["contract"] = self.contract.to_dict()
         if self.row_union_schema is not None:
             result["row_union_schema"] = self.row_union_schema.to_dict()
+        if self.coalesce_union_type is not None:
+            result["coalesce_union_type"] = self.coalesce_union_type.to_dict()
         return result
 
 
@@ -2652,47 +2698,27 @@ def _check_schema_contracts(
             return None
         return schema_config
 
-    def _known_producer_schema_mode(producer: ProducerEntry) -> Literal["observed", "explicit"] | None:
-        """Return the runtime branch-schema mode when Composer can prove it."""
-        schema_config = _known_producer_schema_config(producer)
-        if schema_config is None:
-            return None
-        if schema_config.is_observed:
-            return "observed"
-        return "explicit" if schema_config.fields is not None else None
-
     def _known_connection_schema_mode(
         connection_name: str,
         *,
         visited: frozenset[str] = frozenset(),
     ) -> Literal["observed", "explicit"] | None:
-        """Resolve a branch connection's mode through structural producers."""
-        if connection_name in visited:
-            return None
-        producer = resolver.find_producer_for(connection_name)
-        if producer is None:
-            return None
-        if is_source_producer_id(producer.producer_id):
-            return _known_producer_schema_mode(producer)
+        """Resolve a branch connection's mode through structural producers.
 
-        producer_node = node_by_id[producer.producer_id]
-        if producer_node.node_type == "gate":
-            return _known_connection_schema_mode(
-                producer_node.input,
-                visited=visited | {connection_name},
-            )
-        if producer_node.node_type == "queue":
-            # Runtime assigns every structural queue an observed output schema.
-            return "observed"
-        if producer_node.node_type == "row_union":
-            # Runtime assigns every row_union an observed output schema.
-            return "observed"
-        if producer_node.node_type == "coalesce":
-            # A nested coalesce's strategy-specific output schema is not
-            # reconstructed by Composer preview. Preserve the existing
-            # conservative abstention at that boundary.
+        Derived from :func:`_known_connection_schema_config` rather than
+        walking the producer graph a second time. The union-coalesce checks
+        rely on the two answers describing the same branch set: the mode-mixed
+        entry short-circuits the type check, which is only sound while
+        "resolves to an explicit mode" and "resolves to a typed schema config"
+        cannot disagree. Deriving makes that structural instead of a convention
+        two hand-maintained traversals would have to keep in lockstep.
+        """
+        schema_config = _known_connection_schema_config(connection_name, visited=visited)
+        if schema_config is None:
             return None
-        return _known_producer_schema_mode(producer)
+        if schema_config.is_observed:
+            return "observed"
+        return "explicit" if schema_config.fields is not None else None
 
     def _known_connection_schema_config(
         connection_name: str,
@@ -2750,6 +2776,74 @@ def _check_schema_contracts(
                     "Ensure every branch uses an explicit schema with compatible fields, or every branch uses an observed schema.",
                     "high",
                     "coalesce_schema_mode_mixed",
+                )
+            )
+            # Report the mode conflict alone, mirroring the runtime's ordering
+            # (``merge_union_fields`` raises on mode before it builds any typed
+            # field set). The tradeoff is deliberate rather than free: a node
+            # carrying both defects now costs two repair round-trips. It is
+            # taken because a type entry here is only conditionally real —
+            # under the "make every branch observed" repair the observed
+            # branches stop contributing typed fields and the conflict
+            # disappears, so reporting it would send the loop after a target
+            # that one of the two valid repairs deletes.
+            continue
+
+        # Runtime merges the typed branch fields through the canonical union
+        # algorithm and rejects a shared field whose branches declare different
+        # types. Composer resolves the same computed producer schemas, so it
+        # mirrors that rule here rather than leaving the whole class to the DAG
+        # build: a mutation that reports is_valid=true gives the compose loop no
+        # reason to repair, which is how battery round-6 g03 handed back a
+        # type-incompatible union merge believing it was done
+        # (elspeth-85f3cc3022). Non-contributing branches are excluded exactly
+        # as ``merge_union_fields`` excludes them.
+        branch_typed_fields: dict[str, list[tuple[str, Hashable, bool, bool]]] = {}
+        for branch_name, branch_connection in zip(
+            _coalesce_branch_names(coalesce_node.branches),
+            _coalesce_branch_connections(coalesce_node.branches),
+            strict=True,
+        ):
+            schema_config = _known_connection_schema_config(branch_connection)
+            if schema_config is None or schema_config.is_observed or schema_config.fields is None:
+                continue
+            branch_typed_fields[branch_name] = [
+                (field.name, field.field_type, field.required, field.nullable) for field in schema_config.fields
+            ]
+        if len(branch_typed_fields) < 2:
+            continue
+        # ``require_all`` is derived from the policy alone, where the runtime
+        # uses ``CoalesceSettings.has_all_branch_semantics`` — which is ALSO
+        # true for a quorum whose count equals the branch count. The two cannot
+        # disagree here: a composer NodeSpec has no ``quorum_count`` field
+        # (``yaml_importer`` lists it unsupported) while the runtime makes it
+        # mandatory for quorum, so the diverging case is unreachable from this
+        # surface. Independently, the conflict raises before either this flag or
+        # ``collision_policy`` is read, and the merged flags are discarded here.
+        # Both hold today; the first is the one that would still hold if a
+        # future caller consumed the returned flags.
+        try:
+            merge_union_field_flags(
+                branch_typed_fields,
+                require_all=coalesce_node.policy == "require_all",
+                branch_order=_coalesce_branch_names(coalesce_node.branches),
+            )
+        except UnionTypeConflictError as conflict:
+            errors.append(
+                _err(
+                    f"node:{coalesce_node.id}",
+                    f"Coalesce '{coalesce_node.id}' receives incompatible types for field '{conflict.field}' in union merge: "
+                    f"branch '{conflict.branch_a}' has {conflict.type_a!r}, branch '{conflict.branch_b}' has {conflict.type_b!r}. "
+                    "Union merge requires every branch declaring a shared field to declare the same type for it.",
+                    "high",
+                    "coalesce_union_type_incompatible",
+                    coalesce_union_type=CoalesceUnionTypeDetail(
+                        field=conflict.field,
+                        branch_a=conflict.branch_a,
+                        type_a=str(conflict.type_a),
+                        branch_b=conflict.branch_b,
+                        type_b=str(conflict.type_b),
+                    ),
                 )
             )
 

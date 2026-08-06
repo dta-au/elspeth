@@ -74,6 +74,7 @@ from elspeth.web.composer.pipeline_proposal import (
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.state import (
+    CoalesceUnionTypeDetail,
     CompositionState,
     EdgeSpec,
     NodeSpec,
@@ -3019,6 +3020,57 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
         "source",
     ]
     assert open_feedback["repeat_notice"] == _REPEAT_NOTICE
+
+
+def test_allowlisted_candidate_feedback_projects_coalesce_union_type_facts() -> None:
+    """The coalesce type conflict reaches the planner as structured facts.
+
+    The projection strips raw validation messages, so without this payload the
+    closed code names the failing NODE but never the FIELD — and the static
+    guidance is unreachable for a field a plugin contributed as a computed
+    output rather than the author declaring it (elspeth-85f3cc3022). Custody
+    follows ``row_union_schema``: branch types are read from upstream
+    connections the detail does not name, so any config ownership suppresses
+    them.
+    """
+    entry = ValidationEntry(
+        component="node:merge_results",
+        message="Coalesce 'merge_results' receives incompatible types for field 'PRIVATE-UPSTREAM-FIELD'.",
+        severity="high",
+        error_code="coalesce_union_type_incompatible",
+        coalesce_union_type=CoalesceUnionTypeDetail(
+            field="PRIVATE-UPSTREAM-FIELD",
+            branch_a="a",
+            type_a="int",
+            branch_b="b",
+            type_b="str",
+        ),
+    )
+    summary = ValidationSummary(is_valid=False, errors=(entry,))
+
+    disclosed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+    )
+    projected = disclosed["validation"]["errors"][0]
+    assert projected["error_code"] == "coalesce_union_type_incompatible"
+    assert projected["coalesce_union_type"] == {
+        "field": "PRIVATE-UPSTREAM-FIELD",
+        "branch_a": "a",
+        "type_a": "int",
+        "branch_b": "b",
+        "type_b": "str",
+    }
+    # The static guidance rides along, since the raw message never does.
+    assert "suggested_fix" in projected
+    # The message itself is still withheld.
+    assert "detail" not in projected
+
+    withheld = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"upstream_source"})),
+    )
+    assert "coalesce_union_type" not in withheld["validation"]["errors"][0]
+    assert "PRIVATE-UPSTREAM-FIELD" not in canonical_json(withheld)
 
 
 def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads() -> None:

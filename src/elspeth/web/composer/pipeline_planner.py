@@ -1449,11 +1449,12 @@ class _EntryWithholding:
     connectivity: bool
     contract: bool
     row_union: bool
+    coalesce_union_type: bool
     withheld: bool
 
 
 _ENTRY_DISCLOSED: Final[_EntryWithholding] = _EntryWithholding(
-    config=False, connectivity=False, contract=False, row_union=False, withheld=False
+    config=False, connectivity=False, contract=False, row_union=False, coalesce_union_type=False, withheld=False
 )
 
 
@@ -1501,14 +1502,27 @@ def _entry_withholding(entry: Any, finalizer_owned: _FinalizerOwnedRefs) -> _Ent
         and any(participant in finalizer_owned.config for participant in _contract_participant_refs(entry.contract))
     )
     row_union = config or (entry.row_union_schema is not None and bool(finalizer_owned.config))
+    # Same payload provenance as ``row_union``: a coalesce's branch types are
+    # read from upstream connections' declarations the detail does not name, so
+    # entry-own attribution cannot prove the types did not come from a bound
+    # private source. Suppress whenever any config ownership exists.
+    coalesce_union_type = config or (entry.coalesce_union_type is not None and bool(finalizer_owned.config))
     code = entry.error_code or "validation_error"
     withheld = (
         config
         or (connectivity and code in _CONNECTIVITY_FACT_CODES)
         or (contract and entry.contract is not None)
         or (row_union and entry.row_union_schema is not None)
+        or (coalesce_union_type and entry.coalesce_union_type is not None)
     )
-    return _EntryWithholding(config=config, connectivity=connectivity, contract=contract, row_union=row_union, withheld=withheld)
+    return _EntryWithholding(
+        config=config,
+        connectivity=connectivity,
+        contract=contract,
+        row_union=row_union,
+        coalesce_union_type=coalesce_union_type,
+        withheld=withheld,
+    )
 
 
 def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwnedRefs) -> bool:
@@ -1652,6 +1666,15 @@ def _allowlisted_candidate_feedback(
             # (``withholding.row_union``, elspeth-5904b1683a; precise branch
             # attribution is tracked as follow-up work).
             projected["row_union_schema"] = entry.row_union_schema.to_dict()
+        if entry.coalesce_union_type is not None and not withholding.coalesce_union_type:
+            # The conflicting field, the two branch names, and their declared
+            # types — the coalesce equivalent of the row_union facts above.
+            # Without them the closed code names the failing NODE but never the
+            # FIELD, and the static guidance ("declare the same type on every
+            # branch that declares it") is unsatisfiable in the case where a
+            # branch conflicts on a field it never declared, because a plugin
+            # contributed the field as a computed output (elspeth-85f3cc3022).
+            projected["coalesce_union_type"] = entry.coalesce_union_type.to_dict()
         errors.append(projected)
     feedback: dict[str, Any] = {
         "success": False,

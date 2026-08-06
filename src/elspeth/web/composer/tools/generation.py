@@ -622,6 +622,20 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "compatible fields, or set every branch schema to observed.",
     ),
     (
+        r"coalesce_union_type_incompatible|[Ii]ncompatible types for field",
+        "A union coalesce merges its branches into one row, so a field carried by more than one branch must have the same "
+        "type on each. Two branches carry the same field with different types, and there is no merged row shape that "
+        "satisfies both. Two things surprise authors here. 'any' is a distinct type, NOT a wildcard: 'any' against 'int' "
+        "conflicts. And a branch can carry a field it never declared, because a transform contributes its own output fields "
+        "to that branch's schema — a field_mapper or value_transform writing a target adds it as 'any' when the branch "
+        "schema does not declare it. So the named field may appear in neither branch's authored schema.",
+        "Read the conflicting field and both branch names off the rejection rather than searching your authored schemas — "
+        "the field may not appear in either. Then pick the one type the merged field should have and declare it explicitly "
+        "on every branch that carries it, which also pins any type a transform would otherwise contribute as 'any'. If the "
+        "branches genuinely carry different kinds of value, give them different field names instead, or convert the "
+        "diverging branch to the shared type in its transform before the coalesce.",
+    ),
+    (
         r"sink_contract_violation|Schema contract violation: '.*' -> 'output:[^']+'",
         "A sink schema requires fields that its upstream producer does not guarantee. "
         "The rejection's contract facts name the producer, the sink, and the missing field names.",
@@ -1017,6 +1031,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "semantic_contract_violation",
     "contract_config_invalid",
     "coalesce_schema_mode_mixed",
+    "coalesce_union_type_incompatible",
     # ── Structural rejections (same closure sweep) ──────────────────────────
     "no_source_configured",
     "no_sinks_configured",

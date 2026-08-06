@@ -257,6 +257,72 @@ where the architectural fix landed:
       so this filter is defence-in-depth for the public ``add_edge`` surface
       rather than a guard on a live route.
 
+* Shape 18 — union-coalesce shared-field type compatibility (battery-2026-08-07
+  round 6, graph g03, session ``5190564b-abcc-450a-9a65-225411b3ce66``, pin
+  ``69c6ad4b5``, ``elspeth-85f3cc3022``). The composer authored a fork/coalesce
+  whose two branches declared ``price`` as ``int`` and ``str`` and merged them
+  with ``merge: union``. Stage 1 returned ``is_valid=True``, so ``set_pipeline``
+  reported the mutation clean; the DAG build rejected it with
+  ``GraphValidationError`` "receives incompatible types for field 'price' in
+  union merge". Validate green / runtime red, and the compose loop had no
+  signal to repair from: it stopped in the skill's pending-review terminal
+  state believing it was done. The ticket's proposed fix ("preview before
+  declaring done") treated the symptom — nothing in the mutation envelope gave
+  the model a reason to preview.
+
+  This was a missing member of an existing mirror family, not a new class:
+  ``state.py`` already mirrored the coalesce observed/explicit MODE rule
+  (``coalesce_schema_mode_mixed``) and the row_union TYPE rule
+  (``row_union_schema_incompatible``); union coalesce had the mode mirror but
+  never got the type mirror. Closed in
+  ``web/composer/state.py::validate`` by reusing the canonical shared algorithm
+  ``contracts/union_merge.py::merge_union_field_flags`` — the same function the
+  runtime reaches through ``merge_coalesce_schema`` — rather than
+  re-implementing type comparison, so the two surfaces cannot drift on the
+  rule. Emits ``coalesce_union_type_incompatible``. The mode entry short-
+  circuits the type check because the runtime raises the mode conflict first.
+
+  Parity is exact for every coalesce that REACHES the check, verified across a
+  9-case matrix (fixed/flexible/observed against conflicting/identical/``any``/
+  disjoint): Stage 1 and the runtime graph build agree on all nine. Two known
+  boundaries keep that from being a claim about the whole rule, and both are
+  permissive (they miss a rejection; neither blocks a runnable pipeline):
+    - ``merge=None``. Both union mirrors gate on ``merge != "union"``
+      (``state.py``), but ``CoalesceSettings.merge`` DEFAULTS to ``"union"``
+      (``core/config.py``), so a composer coalesce that leaves merge unset is
+      skipped here while the runtime would enforce the rule. Reaching it
+      through the tool surface looks blocked — ``yaml_generator`` always emits
+      the key, so ``None`` becomes ``merge: null`` and pydantic rejects — but
+      the gap is real in ``validate()`` and is not closed by this shape.
+    - ALL-OBSERVED branches. ``merge_union_fields`` early-returns observed mode
+      without a type check, and Stage 1 abstains by the same rule, so two
+      observed branches whose INFERRED types diverge reach the coalesce
+      executor and fail there with ``ContractMergeError`` ("Cannot merge
+      contracts"). That is data-dependent, so no static surface can close it;
+      it is deliberately NOT routed to this shape's error code, because the
+      repair ("your rows carry mixed types") is not this code's repair
+      ("declare the same type on every branch").
+
+  Two results are counterintuitive and are pinned deliberately:
+    - ``any`` is NOT a wildcard here. ``price: any`` against ``price: int``
+      conflicts, because ``merge_union_field_flags`` compares type keys with
+      ``!=`` on opaque hashables. This differs from
+      ``row_union_schema_configs_compatible``, which DOES treat ``any`` as a
+      wildcard for flexible row_union branches — the two node kinds genuinely
+      have different rules and the mirrors must not be cross-copied.
+    - A branch that never declares the shared field can still conflict, because
+      a plugin adds its own output fields to the computed schema (e.g.
+      ``value_transform`` adds an operation target as ``any``). Stage 1 sees
+      this because ``_known_producer_schema_config`` probes the plugin for its
+      COMPUTED output schema, exactly as the DAG builder does — which is why
+      the mirror can be exact instead of authored-schema-only.
+
+  Pinned by ``TestComposerRuntimeCoalesceUnionTypeAgreement`` here, with
+  composer-level coverage in ``tests/unit/web/composer/test_state.py``
+  (``TestSchemaContractValidation``: rejection, compatible-types negative
+  control, unresolved-branch abstention, mode-mixed precedence, and nested-merge
+  exemption).
+
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
@@ -4791,6 +4857,330 @@ class TestComposerRuntimeRowUnionAgreement:
 
         with pytest.raises(ValidationError):
             load_settings_from_yaml_string(invalid_yaml)
+
+
+class TestComposerRuntimeCoalesceUnionTypeAgreement:
+    """Shape 18 — a union coalesce's shared-field types agree on both surfaces.
+
+    Battery round-6 g03 (``elspeth-85f3cc3022``) in plugin-neutral form: a fork
+    gate feeds a transform on each branch, each declaring its own explicit
+    schema, and both branches merge at ``merge: union``. When the two branches
+    declare the same field with different types the runtime graph build rejects
+    it; before this shape closed, composer Stage 1 accepted it, so the mutation
+    envelope told the compose loop the pipeline was clean.
+
+    The positive control (identical declared types) must stay green on both
+    surfaces — the risk of mirroring a runtime rule into authoring is a mirror
+    that is STRICTER than the runtime, which would block runnable pipelines, a
+    strictly worse failure than the permissiveness it replaces.
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the ``UnionTypeConflictError`` handler around the
+    ``merge_union_field_flags`` call in ``web/composer/state.py::validate``'s
+    union-coalesce loop. Neutering that handler (swallowing the exception so no
+    entry is appended) restores the pre-fix behaviour and fails exactly two of
+    these three tests, both at their COMPOSER assertion while their runtime half
+    still raises — which is precisely the validate-green/runtime-red divergence
+    this shape records:
+      - ``test_both_reject_incompatible_shared_field_types`` fails with
+        ``assert not True`` where the summary is
+        ``ValidationSummary(is_valid=True, errors=(), …)``;
+      - ``test_both_reject_any_against_a_concrete_type`` fails with
+        ``assert False`` on the ``coalesce_union_type_incompatible`` search.
+    ``test_both_accept_compatible_shared_field_types`` still passes under the
+    mutation, as a positive control must. Verified by manual revert on
+    2026-08-07; restored. Per this file's METHOD NOTE the marker was asserted
+    unique before editing.
+    """
+
+    def _empty_state(self) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _composer_state(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        label_schema: dict[str, Any],
+        price_schema: dict[str, Any],
+    ) -> CompositionState:
+        state = self._empty_state()
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="gate_in",
+                options={
+                    "path": str(csv_path),
+                    "schema": {"mode": "fixed", "fields": ["id: int", "price: int"]},
+                },
+                on_validation_failure="discard",
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_label", "branch_price"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        for node_id, branch_connection, done_connection, schema in (
+            ("t_label", "branch_label", "label_done", label_schema),
+            ("t_price", "branch_price", "price_done", price_schema),
+        ):
+            state = state.with_node(
+                NodeSpec(
+                    id=node_id,
+                    node_type="transform",
+                    plugin="value_transform",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={
+                        "schema": schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="label_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_label": "label_done", "branch_price": "price_done"},
+                policy="require_all",
+                merge="union",
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": str(output_path), "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+        )
+        for edge_id, from_node, to_node, edge_type, label in (
+            ("e1", "source", "fork_gate", "on_success", None),
+            ("e2", "fork_gate", "t_label", "fork", "branch_label"),
+            ("e3", "fork_gate", "t_price", "fork", "branch_price"),
+            ("e4", "t_label", "merge_results", "on_success", None),
+            ("e5", "t_price", "merge_results", "on_success", None),
+        ):
+            state = state.with_edge(
+                EdgeSpec(
+                    id=edge_id,
+                    from_node=from_node,
+                    to_node=to_node,
+                    edge_type=edge_type,
+                    label=label,
+                )
+            )
+        return state
+
+    def _runtime_settings(
+        self,
+        *,
+        csv_path: Path,
+        output_path: Path,
+        label_schema: dict[str, Any],
+        price_schema: dict[str, Any],
+    ) -> ElspethSettings:
+        return ElspethSettings(
+            sources={
+                "primary": SourceSettings(
+                    plugin="csv",
+                    on_success="gate_in",
+                    options={
+                        "path": str(csv_path),
+                        "schema": {"mode": "fixed", "fields": ["id: int", "price: int"]},
+                        "on_validation_failure": "discard",
+                    },
+                )
+            },
+            transforms=[
+                TransformSettings(
+                    name="t_label",
+                    plugin="value_transform",
+                    input="branch_label",
+                    on_success="label_done",
+                    on_error="discard",
+                    options={
+                        "schema": label_schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                ),
+                TransformSettings(
+                    name="t_price",
+                    plugin="value_transform",
+                    input="branch_price",
+                    on_success="price_done",
+                    on_error="discard",
+                    options={
+                        "schema": price_schema,
+                        "operations": [{"target": "price", "expression": "row['price']"}],
+                    },
+                ),
+            ],
+            gates=[
+                GateSettings(
+                    name="fork_gate",
+                    input="gate_in",
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=["branch_label", "branch_price"],
+                )
+            ],
+            coalesce=[
+                CoalesceSettings(
+                    name="merge_results",
+                    branches={"branch_label": "label_done", "branch_price": "price_done"},
+                    policy="require_all",
+                    merge="union",
+                    on_success="main",
+                )
+            ],
+            sinks={
+                "main": SinkSettings(
+                    plugin="csv",
+                    on_write_failure="discard",
+                    options={"path": str(output_path), "schema": {"mode": "observed"}},
+                )
+            },
+        )
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("id,price\n1,2\n", encoding="utf-8")
+        return csv_path, tmp_path / "out.csv"
+
+    def _build_runtime_graph_from_settings(self, config: ElspethSettings) -> ExecutionGraph:
+        plugins = instantiate_plugins_from_config(config)
+        return ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=list(config.gates),
+            coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        )
+
+    def test_both_reject_incompatible_shared_field_types(self, tmp_path: Path) -> None:
+        """The g03 shape: ``price`` declared ``int`` on one branch, ``str`` on the other."""
+        csv_path, output_path = self._paths(tmp_path)
+        label_schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        price_schema = {"mode": "fixed", "fields": ["id: int", "price: str"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=label_schema,
+            price_schema=price_schema,
+        ).validate()
+
+        assert not composer_result.is_valid
+        entries = [error for error in composer_result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, composer_result.errors
+        assert entries[0].component == "node:merge_results"
+        assert "price" in entries[0].message
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    label_schema=label_schema,
+                    price_schema=price_schema,
+                )
+            )
+            graph.validate_edge_compatibility()
+        message = str(exc_info.value).lower()
+        assert "incompatible" in message
+        assert "price" in message
+
+    def test_both_accept_compatible_shared_field_types(self, tmp_path: Path) -> None:
+        """Positive control: the mirror must not be stricter than the runtime."""
+        csv_path, output_path = self._paths(tmp_path)
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=schema,
+            price_schema=schema,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                label_schema=schema,
+                price_schema=schema,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_both_reject_any_against_a_concrete_type(self, tmp_path: Path) -> None:
+        """``any`` is a declared type here, not a wildcard — unlike row_union.
+
+        ``row_union_schema_configs_compatible`` skips ``any`` on flexible
+        branches; ``merge_union_field_flags`` compares type keys with ``!=``.
+        The two node kinds have genuinely different rules, so this pins that
+        the coalesce mirror follows the coalesce rule.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+        label_schema = {"mode": "fixed", "fields": ["id: int", "price: any"]}
+        price_schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            label_schema=label_schema,
+            price_schema=price_schema,
+        ).validate()
+        assert any(error.error_code == "coalesce_union_type_incompatible" for error in composer_result.errors)
+
+        with pytest.raises(GraphValidationError):
+            graph = self._build_runtime_graph_from_settings(
+                self._runtime_settings(
+                    csv_path=csv_path,
+                    output_path=output_path,
+                    label_schema=label_schema,
+                    price_schema=price_schema,
+                )
+            )
+            graph.validate_edge_compatibility()
 
 
 class TestComposerRuntimeQueueGuaranteeAgreement:
