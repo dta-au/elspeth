@@ -83,6 +83,7 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
+from elspeth.web.execution._semantic_helpers import semantic_affected_component_id
 from elspeth.web.execution.accounting import load_run_accounting_from_db
 from elspeth.web.execution.completion_gates import (
     CompletionGateFacts,
@@ -1203,7 +1204,10 @@ class ExecutionServiceImpl:
             slog.info(
                 "semantic_contract_advisory_at_execute",
                 advisory_count=len(semantic_warnings),
-                affected_nodes=sorted({entry.component.removeprefix("node:") for entry in semantic_warnings}),
+                # Shared helper, not a bare removeprefix: a semantic advisory
+                # can name a transform node OR a sink output, and the helper
+                # carries the rule for keeping a sink's ``output:`` qualifier.
+                affected_nodes=sorted({semantic_affected_component_id(entry.component) for entry in semantic_warnings}),
                 requirement_codes=sorted(
                     {
                         contract.requirement.requirement_code

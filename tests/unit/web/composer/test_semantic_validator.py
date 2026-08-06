@@ -1319,7 +1319,11 @@ def _sink_state(
                 options={
                     "path": "outputs/out.txt",
                     "field": sink_field,
-                    "schema": {"mode": "fixed", "fields": [f"{sink_field}: str"]},
+                    # flexible, not fixed: a locked sink schema rejects the
+                    # llm's own emitted model/usage fields as "extras", and a
+                    # SCHEMA-contract error would mask the SEMANTIC verdict
+                    # these tests exist to assert.
+                    "schema": {"mode": "flexible", "fields": [f"{sink_field}: str"]},
                 },
                 on_write_failure="discard",
             ),
@@ -1357,7 +1361,7 @@ def _llm_node(**overrides: object) -> NodeSpec:
     return _transform_node(
         plugin="llm",
         options={
-            "schema": {"mode": "fixed", "fields": ["topic: str"]},
+            "schema": {"mode": "flexible", "fields": ["topic: str"]},
             "required_input_fields": ["topic"],
             "provider": "openrouter",
             "model": "anthropic/claude-3.7-sonnet",
@@ -1801,3 +1805,130 @@ class TestSinkProbeToleratesDraftConfig:
         assert _sink_edges(contracts) == []
         assert errors == ()
         assert warnings == ()
+
+
+class TestSinkConflictReachesTheWiredStageOneSurface:
+    """The validator in isolation is not the surface the Composer authors on.
+
+    ``CompositionState.validate()`` is what the composer calls, and an error
+    existing is not the same claim as validate() refusing — Stage 1 has
+    rendered an abstention as ``is_valid: true`` before (elspeth-2ed41f0a4a).
+    Assert the refusal itself.
+    """
+
+    def test_llm_to_text_is_refused_by_full_validate(self) -> None:
+        state = _sink_state(producer=_llm_node(), sink_plugin="text", sink_field="announcement")
+        result = state.validate()
+
+        assert result.is_valid is False, "a sink CONFLICT must make the whole composition invalid, not merely emit an entry"
+        sink_errors = [
+            entry for entry in result.errors if entry.component == "output:sink" and entry.error_code == "semantic_contract_violation"
+        ]
+        assert len(sink_errors) == 1, "the sink violation must reach the wired surface attributed to the sink"
+        assert "text.field.single_line_text" in sink_errors[0].message
+
+    def test_llm_to_document_is_accepted_by_full_validate(self) -> None:
+        """The repair must be authorable on the same surface that refuses the defect.
+
+        Order is load-bearing: blocking llm -> text while the alternative is
+        unauthorable would refuse the user's goal outright rather than redirect
+        it. This asserts the alternative actually validates.
+        """
+        state = _sink_state(producer=_llm_node(), sink_plugin="document", sink_field="announcement")
+        result = state.validate()
+
+        assert result.is_valid is True, f"llm -> document must author clean; errors={[e.message for e in result.errors]}"
+        assert not [entry for entry in result.errors if entry.error_code == "semantic_contract_violation"]
+
+    def test_the_document_sink_is_authorized_on_the_composer_surface(self) -> None:
+        """A remedy naming an unavailable plugin is not a remedy.
+
+        TextSink's conflict assistance tells the operator to use the document
+        sink, so document must be authorized wherever text is — otherwise this
+        work would convert "no correct answer" into "a correct answer you are
+        not allowed to author".
+        """
+        from elspeth.web.plugin_policy.compiler import REQUIRED_WEB_PLUGIN_IDS
+
+        authorized = {(plugin.kind, plugin.name) for plugin in REQUIRED_WEB_PLUGIN_IDS}
+        assert ("sink", "text") in authorized
+        assert ("sink", "document") in authorized, (
+            "the text sink's remedy names the document sink; authorizing text without document leaves "
+            "generated multiline text with no authorable destination (elspeth-afdf55a17c)"
+        )
+
+
+class TestWebScrapeValueTypeDeclarationSideEffect:
+    """Declaring value_type=STR on web_scrape hardens a second edge. Pin it.
+
+    web_scrape abstained on value_type, so ``web_scrape -> json_explode``
+    compared UNKNOWN and graded as an advisory. With the honest STR
+    declaration it compares STR against {LIST} and CONFLICTs — a NEW hard
+    refusal outside the sink acceptance criteria, so it is pinned deliberately
+    rather than discovered later.
+
+    The refusal is correct: json_explode expands a real list-shaped value and
+    does not parse JSON text, so this composition fails at runtime. And it
+    arrives with a remedy — json_explode owns producer-agnostic assistance for
+    its requirement_code — so it is not a prohibition with no alternative.
+    """
+
+    def _scrape_to_json_explode_state(self) -> CompositionState:
+        return CompositionState(
+            metadata=PipelineMetadata(name="scrape-to-json-explode"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="csv",
+                on_success="producer_in",
+                options={"path": "data/urls.csv", "schema": {"mode": "fixed", "fields": ["url: str"]}},
+                on_validation_failure="quarantine",
+            ),
+            nodes=(
+                _web_scrape_node(scrape_format="markdown", text_separator=" ", on_success="explode_in"),
+                _transform_node(
+                    id="expand",
+                    plugin="json_explode",
+                    input="explode_in",
+                    options={
+                        "schema": {"mode": "flexible", "fields": ["content: str"]},
+                        "array_field": "content",
+                    },
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin="json",
+                    options={"path": "out.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="errors",
+                    plugin="json",
+                    options={"path": "err.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_a_string_producer_now_conflicts_with_json_explode(self) -> None:
+        errors, _warnings, contracts = validate_semantic_contracts(self._scrape_to_json_explode_state())
+
+        edge = next(contract for contract in contracts if contract.to_id == "expand")
+        assert edge.producer_facts is not None
+        assert edge.producer_facts.value_type.value == "str", "web_scrape must declare the type it provably emits"
+        assert edge.outcome is SemanticOutcome.CONFLICT
+        assert len(errors) == 1
+        assert errors[0].component == "node:expand"
+
+    def test_that_conflict_carries_a_named_remedy(self) -> None:
+        """json_explode owns the prose, addressed by requirement_code, so the
+        remedy does not depend on which producer tripped it."""
+        from elspeth.web.execution._semantic_helpers import assistance_suggestion_for
+
+        errors, _warnings, contracts = validate_semantic_contracts(self._scrape_to_json_explode_state())
+
+        suggestion = assistance_suggestion_for(errors[0], contracts)
+        assert suggestion is not None, "a new refusal class must not ship without an alternative"
+        assert "list" in suggestion.lower()
