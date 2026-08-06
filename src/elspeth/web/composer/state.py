@@ -1535,7 +1535,8 @@ def _validate_gate_route_parity(condition: str, routes: Mapping[str, str] | None
     This is a deliberate second copy of the runtime predicate built on the same
     shared ``ExpressionParser`` substrate that ``_validate_gate_expression``
     already uses (durable unification is deferred to follow-up
-    elspeth-f584eb820c). It must mirror ``validate_boolean_routes`` faithfully:
+    elspeth-2f93076878, which moves the route-label predicates out of
+    ``ExpressionParser``). It must mirror ``validate_boolean_routes`` faithfully:
     same predicates, same ``boolean … elif non_routable`` precedence.
 
     Returns an error message when the route labels are inconsistent with the
