@@ -111,6 +111,14 @@ locals {
     "source:text",
     "sink:aws_s3",
     "sink:csv",
+    # sink:document is paired with sink:text and must be authorized wherever
+    # text is. text refuses any value carrying CR or LF to hold its
+    # one-row-one-record invariant, so document is the only sink that can
+    # publish generated multiline text. Authorizing text alone reproduces the
+    # state that produced elspeth-afdf55a17c: a composer asked to write a
+    # generated announcement to a file has no correct sink to choose and
+    # authors the refusing one, which discards the row and publishes nothing.
+    "sink:document",
     "sink:json",
     "sink:text",
     "transform:aws_bedrock_content_safety",
@@ -138,6 +146,7 @@ locals {
     "source:llm",
     "source:text",
     "sink:csv",
+    "sink:document",
     "sink:json",
     "sink:text",
     "transform:field_mapper",

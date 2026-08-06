@@ -2321,6 +2321,38 @@ def test_scenario_allowlist_authorizes_the_llm_source_like_every_other_llm_plugi
     assert {"source:llm", "transform:llm"} <= _quoted_plugin_ids(core_match.group("body"))
 
 
+def test_scenario_allowlist_authorizes_the_document_sink_alongside_the_text_sink() -> None:
+    """``sink:document`` carries the same posture as ``sink:text``.
+
+    ``text`` refuses any value carrying CR or LF to hold its one-row-one-record
+    invariant, so ``document`` is the only sink that can publish generated
+    multiline text. Authorizing ``text`` alone leaves a composer asked to write
+    a generated announcement to a file with no correct sink to choose — it
+    authors the refusing one, which discards the row and publishes a zero-byte
+    artifact (elspeth-afdf55a17c).
+
+    Pinned as a pair for the same reason ``source:llm``/``transform:llm`` is:
+    dropping one and keeping the other silently restores the gap.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\n  \]",
+        locals_text,
+        re.DOTALL,
+    )
+    assert allowlist_match is not None
+    assert {"sink:document", "sink:text"} <= _quoted_plugin_ids(allowlist_match.group("body"))
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert {"sink:document", "sink:text"} <= _quoted_plugin_ids(core_match.group("body"))
+
+
 def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
     """variables.tf restates the web core because HCL validation cannot read a local.
 

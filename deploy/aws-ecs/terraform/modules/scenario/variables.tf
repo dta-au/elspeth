@@ -387,6 +387,7 @@ variable "plugin_preferences" {
               "source:llm",
               "source:text",
               "sink:csv",
+              "sink:document",
               "sink:json",
               "sink:text",
               "transform:field_mapper",
