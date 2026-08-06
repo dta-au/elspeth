@@ -131,6 +131,15 @@ class TestValidateSemanticContracts:
         # too. A `>=` bound would be met by the transform probes alone and
         # would therefore HIDE a leaked, never-closed sink probe — the precise
         # defect this test exists to catch.
+        #
+        # There is deliberately NO source class in this list, and adding one
+        # would break the test rather than strengthen it. This fixture's source
+        # feeds `web_scrape`, which declares no input requirements, so the
+        # `if not requirements.fields: continue` fires before its producer is
+        # ever probed — the source probe is unreachable from this shape, not
+        # merely absent from it. Source-probe lifecycle needs a source-fed
+        # CONSUMER and is covered by
+        # TestSourceProducerFactsAreRead::test_source_producer_probe_is_closed.
         assert sorted(type(instance._delegate).__name__ for instance in tracking.instances) == [
             "JSONSink",
             "JSONSink",
@@ -1827,6 +1836,49 @@ class TestSourceProducerFactsAreRead:
         assert edge.outcome is SemanticOutcome.SATISFIED
         assert errors == ()
         assert warnings == ()
+
+    def test_source_producer_probe_is_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The source probe is validation-only and must not outlive its answer.
+
+        ``_safe_output_semantics`` constructs a real source to read its facts
+        and owns the instance, so the close belongs in a ``finally``. That
+        close was UNVERIFIED: the source probe is the fourth probe class and
+        arrived with this branch, while the existing lifecycle coverage
+        (``TestValidateSemanticContracts``) runs on a fixture whose source is
+        never probed at all — see the note on its membership assertion. A
+        mutation removing this close therefore survived the whole suite.
+
+        A source-fed SINK is the shape that reaches it: the sink loop resolves
+        the source as the producer and asks it for facts, so exactly one
+        ``LLMSource`` and one ``TextSink`` are constructed.
+
+        The membership assertion alone cannot catch a leak — a leaked instance
+        is still recorded. ``close_count`` is the assertion that bites, and
+        membership is what stops it going vacuous by keeping the leak visible
+        as a named class rather than an empty list.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+
+        validate_semantic_contracts(self._llm_source_state(sink_plugin="text"))
+
+        assert sorted(type(instance._delegate).__name__ for instance in tracking.instances) == [
+            "LLMSource",
+            "TextSink",
+        ], "the fixture must construct a SOURCE probe — without one this test cannot observe the source close at all"
+
+        source_probes = [instance for instance in tracking.instances if type(instance._delegate).__name__ == "LLMSource"]
+        assert len(source_probes) == 1
+        assert source_probes[0].close_count == 1, (
+            "the source probe leaked: _safe_output_semantics owns the instance and must close it in a finally"
+        )
+        assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
 
 
 class TestSinkProbeToleratesDraftConfig:
