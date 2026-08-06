@@ -479,7 +479,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # frozen expectation showed every other field equal — schema_fields,
 # schema_hash and schema_mode are unchanged, so no audit projection material
 # moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "ba24c15ab67967c84568e9ede5e4a4b2678d175bf3fb7b39ab43472739b47959"
+EXPECTED_CASE_REGISTRY_SHA256 = "5dd6fd06de1a5d96eae0d5c2a3a59d53c6d32fd388b5ae804efa016f40d5409c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
