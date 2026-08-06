@@ -93,6 +93,13 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # last for the same pre-existing-error reason (elspeth-b19dfe41fb).
     validate_transform_string_typed_input_fields(graph)
 
+    # Validate that a locked (mode: fixed) consumer admits every field a
+    # type-bypassing producer GUARANTEES. Newest check, so it runs last for the
+    # same pre-existing-error reason its three siblings above each cite
+    # (elspeth-9615d6c75a). Driving it from validate_single_edge instead put it
+    # in the FIRST loop, where it pre-empted all four.
+    validate_locked_consumer_guaranteed_extras(graph, _schema_cache=schema_cache)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -202,33 +209,19 @@ def validate_single_edge(
     producer_schema = get_effective_producer_schema(graph, from_node_id, _cache=_schema_cache)
     consumer_schema = to_info.input_schema
 
-    # Rule 1: Dynamic schemas (None) bypass type validation — but a dynamic
-    # producer can still make PROMISES (guaranteed_fields travels outside the
-    # schema), so mirror composer Rule A before abandoning the edge.
+    # Rule 1: an unknowable schema on either side bypasses type validation. A
+    # bypassing producer can still make PROMISES — guaranteed_fields travels
+    # outside the schema — so these edges are swept by
+    # validate_locked_consumer_guaranteed_extras, which runs as the LAST
+    # whole-graph pass rather than here (see its docstring for why).
+    # Kept inline rather than behind _phase2_bypasses_type_validation so the
+    # narrowing survives for the concrete-schema code below.
     if producer_schema is None or consumer_schema is None:
-        _validate_locked_consumer_guaranteed_extras(
-            graph,
-            from_node_id,
-            to_node_id,
-            producer_schema=producer_schema,
-            consumer_schema=consumer_schema,
-        )
         return  # Types unknowable on one side - compatible with anything
 
-    # Handle observed schemas (no explicit fields + extra='allow')
-    # These are created by _create_dynamic_schema and accept anything
-    # NOTE: We control all schemas via PluginSchema base class which sets model_config["extra"].
-    # Direct access is correct per Tier 1 trust model - missing key would be our bug.
-    producer_is_observed = len(producer_schema.model_fields) == 0 and producer_schema.model_config["extra"] == "allow"
-    consumer_is_observed = len(consumer_schema.model_fields) == 0 and consumer_schema.model_config["extra"] == "allow"
-    if producer_is_observed or consumer_is_observed:
-        _validate_locked_consumer_guaranteed_extras(
-            graph,
-            from_node_id,
-            to_node_id,
-            producer_schema=producer_schema,
-            consumer_schema=consumer_schema,
-        )
+    # Observed schemas accept anything, so they bypass for the same reason and
+    # are swept by the same pass.
+    if _is_observed_schema(producer_schema) or _is_observed_schema(consumer_schema):
         return  # Observed schemas bypass static type validation
 
     # Rule 2: Full compatibility check (missing fields, type mismatches, extra fields)
@@ -254,6 +247,81 @@ def validate_single_edge(
         )
 
 
+def _is_observed_schema(schema: type[PluginSchema]) -> bool:
+    """True for a schema that declares no fields and accepts anything.
+
+    ``_create_dynamic_schema`` builds these.
+
+    NOTE: We control all schemas via the PluginSchema base class, which sets
+    ``model_config["extra"]``. Direct access is correct per the Tier 1 trust
+    model — a missing key would be our bug.
+    """
+    return len(schema.model_fields) == 0 and schema.model_config["extra"] == "allow"
+
+
+def _phase2_bypasses_type_validation(
+    producer_schema: type[PluginSchema] | None,
+    consumer_schema: type[PluginSchema] | None,
+) -> bool:
+    """True when Phase 2 abandons an edge before ``check_compatibility`` runs.
+
+    Two arms bypass: an unknowable (dynamic, ``None``) schema on either side,
+    and an observed schema on either side. These are exactly the edges whose
+    extras no other check covers; everywhere else ``check_compatibility`` owns
+    extras, so sweeping them again would double-report.
+
+    ``validate_single_edge`` spells both arms out inline rather than calling
+    this, because routing them through a predicate costs the type narrowing its
+    concrete-schema tail depends on. The observed arm is shared via
+    ``_is_observed_schema``; the ``None`` arm is a single identical comparison.
+    """
+    if producer_schema is None or consumer_schema is None:
+        return True
+    return _is_observed_schema(producer_schema) or _is_observed_schema(consumer_schema)
+
+
+def validate_locked_consumer_guaranteed_extras(
+    graph: ExecutionGraph,
+    *,
+    _schema_cache: dict[str, type[PluginSchema] | None] | None = None,
+) -> None:
+    """Reject guaranteed extras against locked inputs, across the whole graph.
+
+    Whole-graph pass for the per-edge rule ``_validate_locked_consumer_guaranteed_extras``
+    states. It runs LAST for the reason its three siblings each cite — a graph
+    tripping several checks keeps reporting the pre-existing error.
+
+    That placement is load-bearing, not cosmetic. The rule originally ran inline
+    inside ``validate_single_edge``, which the FIRST loop of
+    ``validate_edge_compatibility`` drives, so it pre-empted every whole-graph
+    check below it. A sink that both missed its required fields AND refused the
+    producer's extras then reported only the extras — and the extras remedies
+    ("add the extra fields", "relax to flexible", "drop the extras") cannot
+    supply a field the producer never guaranteed, so the author was handed three
+    fixes that all leave the graph invalid.
+
+    Only edges Phase 2 abandons are swept (``_phase2_bypasses_type_validation``).
+    DIVERT edges carry quarantine/error payloads that never conformed to the
+    producer schema, so they are skipped here exactly as the Phase 1/2 loop
+    skips them.
+    """
+    cache: dict[str, type[PluginSchema] | None] = {} if _schema_cache is None else _schema_cache
+    for from_id, to_id, edge_data in graph._graph.edges(data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        producer_schema = get_effective_producer_schema(graph, from_id, _cache=cache)
+        consumer_schema = graph.get_node_info(to_id).input_schema
+        if not _phase2_bypasses_type_validation(producer_schema, consumer_schema):
+            continue
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_id,
+            to_id,
+            producer_schema=producer_schema,
+            consumer_schema=consumer_schema,
+        )
+
+
 def _validate_locked_consumer_guaranteed_extras(
     graph: ExecutionGraph,
     from_node_id: str,
@@ -264,10 +332,11 @@ def _validate_locked_consumer_guaranteed_extras(
 ) -> None:
     """Build-time mirror of composer Rule A: guaranteed extras vs a locked input.
 
-    ``check_compatibility``'s extras arm compares schema against schema, so
-    both bypass paths above it (dynamic producer, observed producer) used to
-    leave a locked (``extra='forbid'``) consumer unchecked against a producer
-    whose promises travel in the OTHER channel — ``guaranteed_fields``. A
+    ``check_compatibility``'s extras arm compares schema against schema, so the
+    two edges it never sees (``_phase2_bypasses_type_validation``: dynamic
+    producer, observed producer) used to leave a locked (``extra='forbid'``)
+    consumer unchecked against a producer whose promises travel in the OTHER
+    channel — ``guaranteed_fields``. A
     guarantee means every row WILL carry the field; a locked consumer that
     does not admit it kills every such row at the executor input preflight
     (``engine/executors/transform.py`` ``model_validate``; ``sink.py`` /
