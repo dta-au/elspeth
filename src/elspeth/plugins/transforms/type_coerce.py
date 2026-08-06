@@ -280,7 +280,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fc4abff53bf3f35c"
+    source_file_hash: str | None = "sha256:bac871c04b15ecb6"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -509,7 +509,9 @@ class TypeCoerce(BaseTransform):
                 composer_hints=(
                     "Sources already validate/coerce; use type_coerce only when an upstream transform's output is the wrong type.",
                     "Set on_error to a quarantine sink to capture un-coercible rows for audit, instead of crashing the run.",
-                    "Numeric coercion accepts 'int', 'float', 'bool', 'str' — see the config schema for the full list.",
+                    "conversions is a LIST of {field, to} entries, e.g. conversions: [{field: price, to: float}, "
+                    "{field: quantity, to: int}] — a field-to-type mapping is rejected; to accepts 'int', 'float', "
+                    "'bool', 'str'.",
                     "A type_coerce node's schema: block declares the types that ARRIVE at the node (the pre-coercion input, "
                     "e.g. score: str from a string-typed source); the coerced type belongs to the node's OUTPUT contract and "
                     "is derived automatically from its conversions.",

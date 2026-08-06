@@ -335,7 +335,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:371633ee910e5a1d"
+    source_file_hash: str | None = "sha256:4ed72ea4f0d4fe69"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (

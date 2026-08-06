@@ -467,12 +467,19 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # once more within the same slice when the new hints were shortened to the
 # 280-char assistance cap (same three tokens, same byte-identical
 # normalization check).
+# Rotated again 2026-08-06 for the type_coerce conversions-shape composer-hint
+# fix (elspeth-697f455a1d), which co-landed the PH3 refreshes the
+# elspeth-97487736ca commit (6394b11b0) had left stale on field_mapper and
+# value_transform: only the three value_transform ``source_file_hash`` tokens
+# on the union-collision-fail node records changed (token-normalized old/new
+# manifests diff empty; type_coerce and field_mapper are not pinned in the
+# manifest).
 # Verified mechanical
 # each time: a field-by-field diff of the live durable projection against the
 # frozen expectation showed every other field equal — schema_fields,
 # schema_hash and schema_mode are unchanged, so no audit projection material
 # moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "9bcbdde184af28f5723739ef8e5bfd85c00bf5676add0e41e408a4be34814d08"
+EXPECTED_CASE_REGISTRY_SHA256 = "ba24c15ab67967c84568e9ede5e4a4b2678d175bf3fb7b39ab43472739b47959"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
