@@ -937,7 +937,15 @@ PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
 
 
 def _prose_reply_notice() -> str:
-    return "Your previous reply called no tool. You must respond with a declared tool call — continue from where you were."
+    # Names the terminal tool: the generic "call a declared tool" wording was
+    # satisfiable by any cheap discovery call — the live repro showed the
+    # model answering each nudge with a discovery call and prosing again,
+    # never reaching the terminal tool before the nudge budget spent.
+    return (
+        "Your previous reply called no tool. You must respond with a declared tool call — "
+        "if your design is settled, call emit_pipeline_proposal with the complete proposal now; "
+        "otherwise continue discovery from where you were."
+    )
 
 
 def _escape_hatch_notice() -> str:
@@ -2783,7 +2791,20 @@ async def _plan_pipeline_inner(
             else:
                 message, calls, audited_call = await call_model(
                     reasoning_effort=(
-                        model_config.candidate_reasoning_effort if repair_count > 0 else model_config.discovery_reasoning_effort
+                        # A prose reply is the model announcing it is at
+                        # emission stage: at discovery effort "low" sonnet-5
+                        # emitted zero reasoning on exactly the turns where
+                        # the terminal proposal was due and narrated the plan
+                        # as prose instead, and this branch could never give
+                        # the first emission turn candidate-level effort —
+                        # candidate effort only engaged after a REJECTED
+                        # candidate (elspeth-b1e85829e9, 2/2 live repro;
+                        # effort=medium produced a real candidate on the same
+                        # repro). Sticky past the first nudge by design: once
+                        # the model has prose-planned, emission is imminent.
+                        model_config.candidate_reasoning_effort
+                        if repair_count > 0 or prose_nudges > 0
+                        else model_config.discovery_reasoning_effort
                     ),
                 )
         except PipelinePlannerError as exc:
