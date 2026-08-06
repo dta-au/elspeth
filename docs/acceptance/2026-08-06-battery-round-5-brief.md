@@ -108,8 +108,13 @@ Pin the candidate SHA and record it in the report the way round 4 pinned
 ```bash
 pytest tests/ -n 12          # plain default selection IS the CI-equivalent run
 elspeth-lints check
-.venv/bin/python scripts/wardline_gate.py
+wardline scan . --fail-on ERROR --fail-on-inert \
+  --trust-pack scripts.wardline_pack --allow-custom-packs --local-only
 ```
+
+*Corrected 2026-08-06: `scripts/wardline_gate.py` was removed in `cdfcee61b`
+after this brief was written; the wardline scan above is the gate of record
+(exit 0 = clean and non-inert). Do not skip the gate because the script 404s.*
 
 Scoped runs will not do. The PH3 `source_file_hash` gate, the DAG corpus
 manifest contract and the whole-tree AST gates are cross-cutting and only fire
@@ -327,6 +332,11 @@ compose.
 authored" and reported a false `state_exists` failure on g05's honest decline.
 On a 200 it must read `body["state"]` and report *composer declined* when null.
 Fix before running, or g05 will be misreported again.
+
+*Corrected 2026-08-06: the null-state half is landed — `drive_graph.py` now
+reads `body["state"]` and exits 3 on a designed decline. Verify, don't re-fix.
+The `/state` + `/state/yaml` capture reads (§Framing) are still absent and
+remain pre-stack work.*
 
 ### Carried confirm targets
 
