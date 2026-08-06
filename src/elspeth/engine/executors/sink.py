@@ -1105,6 +1105,7 @@ class SinkExecutor:
         self,
         *,
         primary_divert_states: list[tuple[TokenInfo, int, NodeState]],
+        diversion_by_index: dict[int, RowDiversion],
         diversion_error_hashes: Mapping[int, str],
         diversion_reason_hashes: Mapping[int, str],
         on_token_written: Callable[[TokenInfo], None] | None,
@@ -1114,18 +1115,43 @@ class SinkExecutor:
         No routing_event (no DAG edge for discard) and no failsink write — the
         row does not reach its destination. Records SINK_DISCARDED outcomes and
         checkpoints. Returns the number of discarded tokens.
+
+        The FAILED state's error is this token's ONLY disclosure of why the sink
+        refused the row: discard-mode leaves no operation failed (the batch
+        effect really did publish, so ``sink_write`` completes and
+        ``failure_detail`` is correctly empty) and no ``validation_errors`` row.
+        ``RunDiagnosticDiscard`` states that contract — sink discard "leaves a
+        token whose failed node state already discloses the reason" — so a state
+        carrying only the durable hash makes a discarded row undiagnosable on
+        every surface at once (elspeth-9595abb7b0).
+
+        ``output_data`` deliberately keeps the hash form while ``error`` carries
+        the reason. Only the former is hashed into ``output_hash``, and the live
+        reason is unavailable to a recovered batch, so disclosing it there would
+        make one logical state hash differently depending on whether it was
+        recovered.
         """
         discard_count = 0
         # Discard mode: complete primary states and record DIVERTED outcomes.
         # No routing_event (no DAG edge for discard), no failsink write.
         for token, idx, primary_state in primary_divert_states:
             durable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
+            # The sink's own words. _write_primary_effect proved this string
+            # hashes to the durable attribution before building the RowDiversion,
+            # and already substitutes `durable_reason` when a recovered batch has
+            # no live diversion log — so this degrades to the old text rather
+            # than inventing one. ExecutionError scrubs it (reasons quoting a
+            # driver error can carry row values, e.g. database_sink constraint
+            # violations), and the reason hash rides along in `context` so the
+            # disclosed text stays checkable against the durable evidence.
+            disclosed_reason = diversion_by_index[idx].reason
 
             # FAILED — the row didn't reach its destination (discarded).
             discard_error = ExecutionError(
-                exception=durable_reason,
+                exception=disclosed_reason,
                 exception_type="SinkDiscard",
                 phase="write",
+                context={"diversion_reason_hash": diversion_reason_hashes[idx]},
             )
             current = self._execution.get_node_state(primary_state.state_id)
             if isinstance(current, NodeStateOpen):
@@ -1348,6 +1374,7 @@ class SinkExecutor:
             else:
                 discard_count = self._handle_discard_diversions(
                     primary_divert_states=primary_divert_states,
+                    diversion_by_index=diversion_by_index,
                     diversion_error_hashes=effect_write.diversion_error_hashes,
                     diversion_reason_hashes=effect_write.diversion_reason_hashes,
                     on_token_written=on_token_written,

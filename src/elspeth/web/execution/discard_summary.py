@@ -158,23 +158,69 @@ def load_discard_summaries_from_db(
                 )
             )
 
-        sink_query = (
-            select(token_outcomes_table.c.run_id, func.count().label("count"))
+        # Attribute each sink discard to the sink that refused the row, as every
+        # other stage above does (elspeth-9595abb7b0: the only stage entry named
+        # no node, so the summary could not even say which sink discarded).
+        #
+        # A correlated scalar subquery, not a join: the discard sentinel lives on
+        # token_outcomes while the node lives on the token's FAILED sink state,
+        # and a token fanned out to several sinks has more than one such state.
+        # Joining would emit one row per state and inflate the count against the
+        # category totals DiscardSummary cross-checks. Reducing to one node per
+        # token keeps the total exactly what the unattributed query returned.
+        #
+        # LEFT-join semantics (a NULL node_id when no failed sink state exists)
+        # are deliberate for the same reason: a discard whose primary anchor is
+        # missing must still be counted, unattributed, rather than dropped.
+        discard_node_id = (
+            select(node_states_table.c.node_id)
+            .select_from(
+                node_states_table.join(
+                    nodes_table,
+                    and_(
+                        node_states_table.c.run_id == nodes_table.c.run_id,
+                        node_states_table.c.node_id == nodes_table.c.node_id,
+                    ),
+                )
+            )
+            .where(node_states_table.c.run_id == token_outcomes_table.c.run_id)
+            .where(node_states_table.c.token_id == token_outcomes_table.c.token_id)
+            .where(node_states_table.c.status == NodeStateStatus.FAILED)
+            .where(nodes_table.c.node_type == NodeType.SINK)
+            .order_by(node_states_table.c.step_index.desc(), node_states_table.c.node_id.asc())
+            .limit(1)
+            .scalar_subquery()
+            .label("node_id")
+        )
+        attributed_discards = (
+            select(token_outcomes_table.c.run_id.label("run_id"), discard_node_id)
             .where(token_outcomes_table.c.run_id.in_(run_ids))
             .where(token_outcomes_table.c.sink_name == DISCARD_SINK_NAME)
             .where(token_outcomes_table.c.completed == 1)
-            .group_by(token_outcomes_table.c.run_id)
+            .subquery()
         )
-        for run_id, count in conn.execute(sink_query):
+        sink_query = select(
+            attributed_discards.c.run_id,
+            attributed_discards.c.node_id,
+            func.count().label("count"),
+        ).group_by(attributed_discards.c.run_id, attributed_discards.c.node_id)
+        sink_stages: dict[str, list[DiscardStageSummary]] = {run_id: [] for run_id in run_ids}
+        for run_id, node_id, count in conn.execute(sink_query):
             count_value = int(count)
-            counts[run_id]["sink_discards"] = count_value
-            stages[run_id].append(
+            counts[run_id]["sink_discards"] += count_value
+            sink_stages[run_id].append(
                 DiscardStageSummary(
                     stage="sink_discard",
-                    node_id=None,
+                    node_id=node_id,
                     count=count_value,
                 )
             )
+        # Ordered here rather than in SQL: node_id is now nullable, and backends
+        # disagree on where NULL sorts, so an ORDER BY would make the projection
+        # differ between SQLite and PostgreSQL.
+        for run_id, run_sink_stages in sink_stages.items():
+            run_sink_stages.sort(key=lambda stage: (stage.node_id is None, stage.node_id or ""))
+            stages[run_id].extend(run_sink_stages)
 
     summaries: dict[str, DiscardSummary] = {}
     for run_id, run_counts in counts.items():
