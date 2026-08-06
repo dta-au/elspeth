@@ -131,6 +131,7 @@ class _UncalledBatchTransform:
         self.can_drop_rows = False
         self.declared_output_fields = frozenset()
         self.declared_input_fields = frozenset()
+        self.declared_string_input_fields = frozenset()
         self.requires_runtime_preflight = False
         self._output_schema_config = None
         self.on_error = "discard"
