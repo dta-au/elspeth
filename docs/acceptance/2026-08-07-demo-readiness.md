@@ -36,7 +36,7 @@ measurement. Where they differ on anything else, it is **stochastic variation**
 | ⛈ | g05 text → text | **`failed`** | not sampled | **Regression, untriaged** |
 | ☀️ | g06 sink variety | `completed` | not sampled | Stable |
 | ☀️ | g07 Textract profile-first | `completed_with_failures` 1/1 — designed | not sampled | Stable |
-| ☀️ | g08 row_union A/B | 1 failed, 1 cwf, 1 completed, 1 compose-422 | **3/3 `completed`** | A supersedes B — B predates the fix/envelope |
+| ⚠️ | g08 row_union A/B | 1 failed, 1 cwf, 1 completed, 1 compose-422 | **3/3 `completed`** — all three via REPAIR | A supersedes B, but green is reached by self-correction — see below |
 | ☀️ | g09 four LLM nodes | `completed` 15/18 | not sampled | See row-count note |
 | ☀️ | g10 LLM → fixed mapper | `completed` | not sampled | Stable |
 | ⛈ | g11 llm source | **`failed`** | **`failed`** — sink write, 0-byte artifact | **Reproducible. Mechanism known** |
@@ -46,8 +46,15 @@ Two footnotes that are not weather but matter:
 - **g09 `completed` 15/18** — the run is green but three rows did not make it.
   A demo that shows a row count will show 15 of 18. Worth knowing which before
   you stand in front of anyone; it may be designed, but nothing on record says so.
-- **g08 in Source A is 3/3 at the new render.** Round 5 was 1 completed /
-  2 validate-failed. That graph moved from the worst column to clean.
+- **g08 in Source A is 3/3 at the new render** (round 5: 1 completed, 2
+  validate-failed) — but every one of the three reached green by **repairing
+  itself**, not by authoring correctly first time: s1 corrected once, s2 and s3
+  four times each, including a `set_pipeline[failed]` and a
+  `patch_node_options[rejected]`. That is the same behaviour class flagged as
+  ⚠️ for g03; the difference is only that g08 recovered and g03 did not, and at
+  n=3 "always recovers" is indistinguishable from "recovered three times".
+  It is amber, not sunny. **If the demo shows the compose transcript, an
+  audience watches four corrections scroll past.**
 
 ## The three that decide the demo
 
@@ -82,21 +89,25 @@ it composes in 191s and the *authoring quality* is what is exposed.
 
 ### 3. g05 — a regression nobody has triaged ⛈
 
-Round 5: ☀️ `completed` 6/6. Source B: **`failed`**. No ticket exists. I did not
-sample it, so I cannot say whether it is stochastic or hard. **This is the
-biggest unknown in the corpus** and the cheapest thing to resolve — one drive.
+Round 5: ☀️ `completed` 6/6. Source B: **`failed`**. Filed as
+`elspeth-d1602e4b90`, undiagnosed. I did not sample it, so I cannot say whether
+it is stochastic, hard, or simply an envelope death on Source B's smaller wall.
+**This is the biggest unknown in the corpus** and the cheapest thing to
+resolve — one drive.
 
 ## Pin list before the demo
 
-Ordered by what actually threatens a demo.
+Ordered by what actually threatens a demo. All four must-fix items are filed
+and carry the **`demo-blocker`** label, so `filigree list-issues --label
+demo-blocker` is the live version of this table.
 
 ### Must fix
 
 | # | Ticket | Why it blocks |
 |---|---|---|
-| 1 | *(none yet — file from `adf0b6c6`)* | **g05 regression.** Untriaged, no ticket, was green in round 5. Diagnose first, then decide — it may be trivial |
+| 1 | `elspeth-d1602e4b90` | **g05 regression.** Was green 6/6 in round 5, `failed` in the swarm run, unsampled at the round-6 pin. Diagnose first — one drive answers it, and it may be an envelope death rather than a graph defect |
 | 2 | `elspeth-9595abb7b0` | **g11 sink failure is undiagnosable.** Two surfaces contradict each other; if anything fails on stage you cannot explain it. Fix the diagnosability even if the root cause turns out trivial |
-| 3 | *(root cause of the g11 sink write)* | The only reproducible red in the corpus, on the newest capability |
+| 3 | `elspeth-afdf55a17c` (P1) | **g11 sink write fails** — 0-byte artifact, run failed. The only reproducible red in the corpus, on the newest capability, with one sample. Reproduced independently by the swarm run on a different envelope, so it is not envelope-dependent |
 | 4 | `elspeth-85f3cc3022` | **g03 authors invalid pipelines sometimes.** Stochastic failure in a demo graph. The narrow fix is cheap: make the composer `preview_pipeline` before declaring done — it already does this on g11 and g08 |
 
 ### Fix if the demo touches it
