@@ -912,6 +912,34 @@ class ExpressionParser:
         # Field access, ambiguous ops, ternaries, str-returning calls: routable.
         return False
 
+    def has_string_amplification_risk(self) -> bool:
+        """Check if the expression contains a Mult/Mod whose operand can be a string.
+
+        THREAT-001 counterpart to is_provably_non_routable(): str repetition
+        (``s * n``) and printf-style formatting (``fmt % x``) allocate output
+        linear in their inputs, and the same property that keeps Mult/Mod
+        routable exempts them from the non-routable guard. Callers that
+        evaluate expressions against untrusted-size data (preview sampling)
+        use this to refuse evaluation up front.
+
+        CONSERVATIVE by polarity, not node shape: an operand "can be a
+        string" unless ``_is_non_routable_node`` proves it numeric, so
+        str-returning Call operands fire the moment such builtins exist in
+        ``_SAFE_BUILTINS``.
+        """
+        return self._node_has_string_amplification(self._ast.body)
+
+    def _node_has_string_amplification(self, node: ast.expr) -> bool:
+        """True if any Mult/Mod BinOp under ``node`` has a can-be-string operand."""
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.BinOp)
+                and isinstance(child.op, (ast.Mult, ast.Mod))
+                and (not self._is_non_routable_node(child.left) or not self._is_non_routable_node(child.right))
+            ):
+                return True
+        return False
+
     def static_field_reads(self, name: str = "row") -> StaticFieldReads:
         """Statically enumerate the top-level fields the expression reads from ``name``.
 

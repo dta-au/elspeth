@@ -15408,6 +15408,109 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["field"] == "price"
         assert result.data["is_valid"] is False
 
+    def test_observed_csv_string_amplification_gate_blocks_without_evaluating(self, monkeypatch) -> None:
+        """A Mult over an observed (string-typed) field must be diagnosed
+        BEFORE evaluation, never evaluated at preview (THREAT-001).
+
+        ``row['price'] * 100000`` on observed CSV is str-repetition: sampling
+        would allocate the amplified string per sampled row inside the web
+        process. The amplification diagnostic replaces evaluation entirely.
+        """
+        from elspeth.core.expression_parser import ExpressionParser
+
+        state = self._state_with_csv_source(schema_mode="observed")
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "amp_gate",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "row['price'] * 100000",
+                "routes": {"true": "out", "false": "out"},
+                "options": {},
+            },
+            state,
+            _mock_catalog(),
+        )
+        assert result.success, result.data
+
+        evaluated_expressions: list[str] = []
+        original_evaluate = ExpressionParser.evaluate
+
+        def counting_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
+            evaluated_expressions.append(repr(self))
+            return original_evaluate(self, context)
+
+        monkeypatch.setattr(ExpressionParser, "evaluate", counting_evaluate)
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            result.updated_state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        amplification = [d for d in diagnostics if d["code"] == "gate_expression_unbounded_string_amplification"]
+        assert amplification, diagnostics
+        assert amplification[0]["severity"] == "blocking"
+        assert amplification[0]["evidence_locator"]["node_id"] == "amp_gate"
+        assert result.data["is_valid"] is False
+        # The mechanism, not just the symptom: the amplifying condition was
+        # never evaluated against sampled rows.
+        assert not any("100000" in expr for expr in evaluated_expressions), evaluated_expressions
+        # And the new branch did not misfile the finding as a type mismatch.
+        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+        assert not mismatch, mismatch
+
+    def test_observed_csv_memory_error_yields_resource_code(self, monkeypatch) -> None:
+        """MemoryError during sampled-row evaluation gets its own resource
+        diagnostic, not the schema-typing repair (belt-and-braces arm)."""
+        from elspeth.core.expression_parser import ExpressionParser
+
+        state = self._state_with_csv_source(schema_mode="observed")
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "oom_gate",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "row['price'] >= 100",
+                "routes": {"true": "out", "false": "out"},
+                "options": {},
+            },
+            state,
+            _mock_catalog(),
+        )
+        assert result.success, result.data
+
+        def exploding_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
+            raise MemoryError("simulated allocation failure")
+
+        monkeypatch.setattr(ExpressionParser, "evaluate", exploding_evaluate)
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            result.updated_state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        resource = [d for d in diagnostics if d["code"] == "gate_expression_preview_memory_exhaustion"]
+        assert resource, diagnostics
+        assert resource[0]["severity"] == "blocking"
+        assert resource[0]["evidence_locator"]["node_id"] == "oom_gate"
+        # A resource event must not receive the schema-typing repair.
+        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+        assert not mismatch, mismatch
+
     def test_observed_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Observed CSV strings must not reach numeric batch_stats at runtime.
 

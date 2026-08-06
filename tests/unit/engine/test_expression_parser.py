@@ -1659,6 +1659,63 @@ class TestVisitorCouplingAssertion:
         assert arm_names(_ExpressionEvaluator) == {t.__name__ for t in _ALLOWED_EXPR_TYPES} | {"Expression"}
 
 
+class TestStringAmplificationRisk:
+    """has_string_amplification_risk(): Mult/Mod with a can-be-string operand.
+
+    THREAT-001: str repetition (s * n) and printf-style formatting (fmt % x)
+    allocate output linear in their inputs, and is_provably_non_routable()
+    deliberately leaves Mult/Mod routable — so the property that makes them
+    dangerous exempts them from that guard. The predicate classifies by
+    POLARITY (operand not provably numeric under _is_non_routable_node), not
+    node shape, so str-returning Call operands fire the moment such builtins
+    exist in _SAFE_BUILTINS.
+    """
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "row['name'] * 1000",  # Subscript operand — the staging repro
+            "1000 * row['name']",  # commuted
+            "row['fmt'] % row['x']",  # printf-style formatting
+            "row['x'] * row['y']",  # both operands unknown
+            "(row['x'] * 1000) == 'aaa'",  # amplifying BinOp below the root
+            "row.get('name') * 50",  # .get() form is row-derived too
+        ],
+    )
+    def test_fires_when_an_operand_can_be_string(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_amplification_risk() is True
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "len(row['x']) * 1000",  # numeric Call operand — polarity, not shape
+            "abs(row['x']) % 3",
+            "2 * 3",
+            "row['x'] + 1",  # Add is not an amplifying operator
+            "row['x'] > 5",  # no Mult/Mod at all
+            "-row['x'] * 4",  # unary minus proves the operand numeric
+        ],
+    )
+    def test_quiet_when_no_string_polarity(self, expression: str) -> None:
+        assert ExpressionParser(expression).has_string_amplification_risk() is False
+
+    def test_polarity_not_shape_for_call_operands(self) -> None:
+        """A str-capable Call operand fires; a numeric one does not.
+
+        Pinned on a raw (unvalidated) AST because no str-returning builtin
+        exists before A3 — ``lower`` is validator-rejected today. A
+        Subscript-shape probe would pass every other test in this class and
+        silently reopen the hole the moment A3's builtins land.
+        """
+        import ast as _ast
+
+        parser = ExpressionParser("row['x'] == 1")
+        amplifying = _ast.parse("lower(row['x']) * 1000", mode="eval").body
+        numeric = _ast.parse("len(row['x']) * 1000", mode="eval").body
+        assert parser._node_has_string_amplification(amplifying) is True
+        assert parser._node_has_string_amplification(numeric) is False
+
+
 class TestExpressionParserDictContext:
     """Tests for evaluating expressions against plain dict contexts.
 
