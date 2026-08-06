@@ -224,6 +224,22 @@ class NodeSpec:
         # and Stage 1 must not be stricter than the runtime.
         if self.node_type == "coalesce" and self.merge is None:
             object.__setattr__(self, "merge", "union")
+        # Do NOT extend this normalisation to ``on_error`` by analogy. The shapes
+        # look identical and the remedies are inverted. ``merge`` has a runtime
+        # DEFAULT to mirror (``CoalesceSettings.merge = "union"``), so defaulting
+        # it here RECORDS a decision the runtime has already made. A transform's
+        # ``on_error`` has NO runtime default — ``TransformSettings.on_error`` is
+        # a required ``str`` (core/config.py) — so defaulting it here would
+        # INVENT a routing decision the author never made, and "discard" silently
+        # drops failed rows in a system whose purpose is lineage. Compare the
+        # gate, whose ``on_error`` IS optional and whose documented posture for
+        # omission is fail-FAST, not discard. Stage 1 already does the right
+        # thing by REJECTING an unset transform ``on_error``
+        # (``transform_missing_on_error``); a default here would suppress that
+        # error, not complement it. Note ``from_dict`` reads
+        # ``on_error=d["on_error"]`` unnormalised, so a session persisted with
+        # ``on_error: null`` deserialises to None — contained, because Stage 1
+        # rejects it.
         if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
             branch_tuple = tuple(self.branches)
             normalized_branches: CoalesceBranches = (
