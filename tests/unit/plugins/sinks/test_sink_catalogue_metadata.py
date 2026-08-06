@@ -28,6 +28,7 @@ EXPECTED_SINK_TAGS = {
     "csv": ("csv", "file", "batch", "tabular"),
     "database": ("database", "sql", "tabular", "exactly-once"),
     "dataverse": ("dataverse", "odata", "crm", "upsert"),
+    "document": ("document", "file", "multiline", "single-value"),
     "json": ("json", "jsonl", "file", "structured"),
     "text": ("text", "file", "line-oriented", "single-field"),
 }
@@ -111,6 +112,16 @@ def _assert_plugin_specific_example_contract(reference: BuiltinReference) -> Non
         }
         with pytest.raises(PluginConfigError, match="ASCII identifier"):
             reference.plugin_cls.config_model.from_dict(unsafe_options, plugin_name="dataverse")
+    elif name == "document":
+        assert options["field"] == "announcement_text"
+        assert options["collision_policy"] == "auto_increment"
+        schema = cast(Mapping[str, Any], options["schema"])
+        assert schema["mode"] == "fixed"
+        assert schema["fields"] == ["announcement_text: str"]
+        # The example must not advertise an append/resume knob this sink
+        # deliberately does not offer.
+        assert "mode" not in options
+        _assert_relative_output_path(options["path"])
     elif name == "json":
         assert options["format"] == "jsonl"
         assert options["mode"] == "write"

@@ -1047,6 +1047,8 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/transforms.py:_handle_splice_transform:arguments"
   - "src/elspeth/plugins/sinks/text_sink.py:TextSink.__init__:config"
   - "src/elspeth/plugins/sinks/text_sink.py:TextSink.write:rows (list)"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.__init__:config"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.write:rows (list)"
   - "src/elspeth/plugins/sinks/aws_s3_sink.py:AWSS3Sink.__init__:config"
   - "src/elspeth/plugins/sinks/aws_s3_sink.py:AWSS3Sink.write:rows (list)"
   - "src/elspeth/plugins/sources/aws_s3_source.py:_new_json_object:return"

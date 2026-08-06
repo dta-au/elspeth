@@ -1,0 +1,321 @@
+"""Verbatim single-value local document sink.
+
+``text`` writes one LF-delimited record per row and therefore diverts any value
+carrying CR or LF. That invariant is correct for line-oriented records and is
+exactly what makes ``text`` unable to publish a generated document: an
+announcement, report, or summary is one value whose line breaks are content,
+not record separators.
+
+This sink is the other half of that pair. It writes one value to one file
+byte-for-byte — no framing, no escaping, no trailing newline — and it publishes
+only when the run delivers exactly one value to the target. Joining several
+rows into one document is the ``report_assemble`` aggregation's job, so this
+sink deliberately offers no separator knob: two joiners for one concern would
+drift apart, and a silent concatenation would invent a frame the sink exists to
+avoid.
+"""
+
+from __future__ import annotations
+
+import codecs
+import keyword
+from collections.abc import Iterator, Mapping
+from typing import Any, Literal
+
+from pydantic import Field, field_validator, model_validator
+
+from elspeth.contracts import CallType, Determinism, PluginSchema
+from elspeth.contracts.contexts import SinkContext
+from elspeth.contracts.diversion import SinkWriteResult
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.sink_effects import (
+    SINK_EFFECT_PROTOCOL_VERSION,
+    ResolvedSinkEffectMode,
+    RestrictedSinkEffectContext,
+    SinkEffectCommitResult,
+    SinkEffectExecutionPurpose,
+    SinkEffectInputKind,
+    SinkEffectInspection,
+    SinkEffectInspectionRequest,
+    SinkEffectPipelineMembersInput,
+    SinkEffectPlan,
+    SinkEffectPrepareRequest,
+    SinkEffectReconcileResult,
+)
+from elspeth.plugins.infrastructure.base import BaseSink
+from elspeth.plugins.infrastructure.config_base import LocalFileSinkConfig, OutputCollisionPolicy
+from elspeth.plugins.infrastructure.output_paths import resolve_output_collision_path, validate_output_collision_policy_mode
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+from elspeth.plugins.sinks._diversion_attribution import DiversionAttribution, build_diversion_attribution
+from elspeth.plugins.sinks._local_file_effects import (
+    commit_local_effect,
+    inspect_local_effect,
+    predecessor_local_path,
+    prepare_local_effect,
+    reconcile_local_effect,
+)
+
+# The remedy is part of the reason on purpose: a prohibition that names no
+# alternative is what left "generate an announcement and write it to a file"
+# with no correct answer in the first place.
+_ONE_VALUE_REMEDY = (
+    "Combine rows into one value with the report_assemble aggregation first, or use the text sink to write one line per row."
+)
+
+
+class DocumentSinkConfig(LocalFileSinkConfig):
+    """Configuration for verbatim single-value document output."""
+
+    field: str = Field(description="String field whose whole value becomes the file contents.")
+    encoding: Literal["utf-8", "ascii", "latin-1", "cp1252"] = Field(
+        default="utf-8",
+        description="Character encoding used for the emitted document.",
+    )
+    mode: Literal["write"] = Field(
+        default="write",
+        description="Write a new output. Appending is not offered: concatenating unframed documents would invent a record separator.",
+    )
+
+    @field_validator("field")
+    @classmethod
+    def _validate_field(cls, value: str) -> str:
+        if not value.isidentifier() or keyword.iskeyword(value):
+            raise ValueError(f"field {value!r} must be a non-keyword Python identifier")
+        return value
+
+    @field_validator("encoding")
+    @classmethod
+    def _validate_encoding(cls, value: str) -> str:
+        try:
+            canonical = codecs.lookup(value).name
+        except LookupError as exc:
+            raise ValueError(f"unknown encoding: {value!r}") from exc
+        if canonical not in {"utf-8", "ascii", "iso8859-1", "cp1252"}:
+            raise ValueError("encoding must be one of utf-8, ascii, latin-1, or cp1252")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_collision_mode(self) -> DocumentSinkConfig:
+        validate_output_collision_policy_mode(
+            plugin_name="DocumentSink",
+            mode=self.mode,
+            collision_policy=self.collision_policy,
+        )
+        return self
+
+
+class DocumentSink(BaseSink):
+    """Write one configured field's whole value to a file, byte-for-byte."""
+
+    name = "document"
+    determinism = Determinism.IO_WRITE
+    plugin_version = "1.0.0"
+    source_file_hash: str | None = "sha256:87cdeba8da12c5b9"
+    config_model = DocumentSinkConfig
+    supports_resume = False
+    effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
+    effect_call_type = CallType.FILESYSTEM
+    supported_effect_modes = frozenset({"write"})
+    supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+
+    usage_when_to_use: str = (
+        "Use when one row carries a whole generated document — an announcement, report, summary, or assembled markdown — "
+        "that must reach the file exactly as produced, with its own line breaks preserved and no trailing newline added."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for one record per row — that is the text sink, which writes each value as its own LF-delimited line. "
+        "Do not use to concatenate several rows into one file: this sink publishes nothing and diverts every row unless the "
+        "run delivers exactly one value, so join rows with the report_assemble aggregation first."
+    )
+    example_use: str = """sinks:
+  announcement:
+    plugin: document
+    options:
+      path: outputs/announcement.txt
+      field: announcement_text
+      collision_policy: auto_increment
+      schema:
+        mode: fixed
+        fields:
+          - "announcement_text: str"
+"""
+    capability_tags: tuple[str, ...] = ("document", "file", "multiline", "single-value")
+
+    @classmethod
+    def _resolve_sink_effect_mode(
+        cls,
+        config: Mapping[str, object],
+        *,
+        purpose: SinkEffectExecutionPurpose,
+    ) -> ResolvedSinkEffectMode | None:
+        # Unlike text and json, no purpose switches this sink to append:
+        # supports_resume is False, so configure_for_resume() never runs and
+        # the executed mode is "write" for every purpose.
+        cfg = DocumentSinkConfig.from_dict(dict(config), plugin_name=cls.name)
+        del purpose
+        return ResolvedSinkEffectMode(cfg.mode)
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        super().__init__(config)
+        cfg = DocumentSinkConfig.from_dict(config, plugin_name=self.name)
+        self._path = cfg.resolved_path()
+        self._requested_path = self._path
+        self._field = cfg.field
+        self._encoding = cfg.encoding
+        self._mode = cfg.mode
+        self._collision_policy: OutputCollisionPolicy | None = cfg.collision_policy
+        self._schema_config = cfg.schema_config
+        self._schema_class: type[PluginSchema] = create_schema_from_config(
+            self._schema_config,
+            "DocumentSinkRowSchema",
+            allow_coercion=False,
+        )
+        self.input_schema = self._schema_class
+        self.declared_required_fields = self._schema_config.get_effective_required_fields() | {self._field}
+
+    def inspect_effect(
+        self,
+        request: SinkEffectInspectionRequest,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectInspection:
+        del ctx
+        predecessor_path = predecessor_local_path(request)
+        if predecessor_path is not None:
+            self._path = predecessor_path
+        else:
+            self._path = resolve_output_collision_path(self._requested_path, self._collision_policy)
+        return inspect_local_effect(target_path=self._path, request=request)
+
+    def prepare_effect(
+        self,
+        request: SinkEffectPrepareRequest,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectPlan:
+        del ctx
+        if type(request.effect_input) is not SinkEffectPipelineMembersInput:
+            raise TypeError("DocumentSink effects require pipeline member input")
+        members = request.effect_input.members
+        current_by_effect_id = {member.member_effect_id: member for member in members}
+        predecessor_declared = bool(request.inspection.evidence["predecessor_declared"])
+        # A replace-mode rebuild serializes the full cumulative snapshot for the
+        # target and never includes baseline file bytes (see continuation_emission).
+        # So the one-value rule is a question about the whole run's delivery to
+        # this output, not about this effect alone: two single-row effects put
+        # two members in the snapshot and must not publish either.
+        emitted_members = tuple(request.effect_input.target_snapshot_members)
+
+        accepted: list[int] = []
+        payload: bytes | None = None
+        # (row, ordinal, reason) in ascending ordinal order. Collected first and
+        # applied in one place below so every diversion side effect — the
+        # failsink write, the ordinal partition, and the audit attribution —
+        # happens together and cannot drift apart.
+        pending_diversions: list[tuple[dict[str, Any], int, str]] = []
+
+        if len(emitted_members) == 1:
+            snapshot_member = emitted_members[0]
+            current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
+            row = deep_thaw(snapshot_member.row)
+            missing = object()
+            value = row.get(self._field, missing)
+            reason: str | None = None
+            if type(value) is not str:
+                reason = f"Document field {self._field!r} must be a string"
+            else:
+                try:
+                    # Verbatim: CR and LF are content here, and no record
+                    # separator is appended — the file is the value.
+                    payload = value.encode(self._encoding)
+                except UnicodeEncodeError:
+                    reason = f"Document value is not representable in configured codec {self._encoding}"
+            if reason is not None:
+                if current_member is None:
+                    raise ValueError(f"Predecessor document snapshot is incompatible: {reason}")
+                pending_diversions.append((row, current_member.ordinal, reason))
+                payload = None
+            elif current_member is not None:
+                accepted.append(current_member.ordinal)
+        else:
+            # The decision is global, not per-row, so it is settled before any
+            # byte is staged. Rows an earlier effect already published are not
+            # in this effect's members and are left alone: a committed row
+            # cannot honestly be reported as diverted.
+            reason = (
+                f"Document sinks publish exactly one value per file; this output received {len(emitted_members)} rows. {_ONE_VALUE_REMEDY}"
+            )
+            for member in sorted(members, key=lambda candidate: candidate.ordinal):
+                pending_diversions.append((deep_thaw(member.row), member.ordinal, reason))
+
+        diverted: list[int] = []
+        diversion_attribution: list[DiversionAttribution] = []
+        for diverted_row, ordinal, diverted_reason in pending_diversions:
+            self._divert_row(diverted_row, row_index=ordinal, reason=diverted_reason)
+            diverted.append(ordinal)
+            diversion_attribution.append(build_diversion_attribution(ordinal=ordinal, reason=diverted_reason))
+
+        def chunks() -> Iterator[bytes]:
+            if payload is not None:
+                yield payload
+
+        return prepare_local_effect(
+            effect_id=request.effect_id,
+            input_kind=request.input_kind,
+            inspection=request.inspection,
+            chunks=chunks(),
+            row_count=len(members),
+            accepted_ordinals=accepted,
+            diverted_ordinals=diverted,
+            encoding=self._encoding,
+            format_name="document",
+            stream_sequence=1 if predecessor_declared else 0,
+            diversion_attribution=diversion_attribution,
+        )
+
+    def commit_effect(self, plan: SinkEffectPlan, ctx: RestrictedSinkEffectContext) -> SinkEffectCommitResult:
+        del ctx
+        return commit_local_effect(plan)
+
+    def reconcile_effect(self, plan: SinkEffectPlan, ctx: RestrictedSinkEffectContext) -> SinkEffectReconcileResult:
+        del ctx
+        return reconcile_local_effect(plan)
+
+    def write(self, rows: list[dict[str, Any]], ctx: SinkContext) -> SinkWriteResult:
+        del rows, ctx
+        raise RuntimeError("DocumentSink publication requires the recoverable sink effect coordinator") from None
+
+    def flush(self) -> None:
+        """No-op: ``commit_effect`` performs synchronous publication.
+
+        Direct ``write`` publication is forbidden. The recoverable sink-effect
+        coordinator owns inspection, intent recording, synchronous commit, and
+        reconciliation, so there is no independent buffered state to flush.
+        """
+        pass
+
+    def close(self) -> None:
+        """No-op: file handles are opened and closed inside the effect commit path."""
+
+    @classmethod
+    def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code is None:
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=None,
+                summary="Write one row's whole string value to a file byte-for-byte, line breaks and all.",
+                composer_hints=(
+                    "This is the sink for generated or multiline text — an LLM announcement, a report, an assembled "
+                    "markdown document. The value is written exactly as produced, with no quoting, no \\n escaping, and "
+                    "no trailing newline added.",
+                    "Set field to the field holding the whole document; its value must be a string.",
+                    "It publishes exactly one value per file. If the run delivers more than one row to this output, every "
+                    "row is diverted and no file is written — put report_assemble upstream to combine rows into one value first.",
+                    "Use the text sink instead when each row is its own record and should become its own line; text "
+                    "rejects any value containing CR or LF, which is why it cannot carry a generated document.",
+                    "Choose only utf-8, ascii, latin-1, or cp1252; a value not representable in the configured encoding is "
+                    "diverted without leaking its content.",
+                    "There is no append mode and no resume: concatenating unframed documents would invent a record "
+                    "separator this sink exists to avoid.",
+                ),
+            )
+        return None

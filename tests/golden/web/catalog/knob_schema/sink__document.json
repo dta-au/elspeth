@@ -1,0 +1,78 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true
+      },
+      {
+        "description": "On the web surface this field takes one of exactly two values: the sentinel \"blob:<uuid>\" naming a file uploaded to this session \u2014 normally prefilled for you, so leave it as it is \u2014 or a plain path that resolves inside this session's own subtree (a source reads from <data_dir>/blobs/<session_id>/; an output writes to <data_dir>/outputs/<session_id>/ or <data_dir>/blobs/<session_id>/). Every other path is rejected, including another session's subtree, a shared or deployment-level directory, and any absolute path outside those trees. Hand-authored YAML runs are not confined this way.",
+        "kind": "text",
+        "label": "Path",
+        "name": "path",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": null,
+        "description": "Required when mode is 'write'. 'auto_increment' is the safe default \u2014 it picks a free sibling path. 'fail_if_exists' refuses an existing write target. 'append_or_create' only with mode='append'.",
+        "enum": [
+          "fail_if_exists",
+          "auto_increment",
+          "append_or_create"
+        ],
+        "kind": "enum",
+        "label": "Collision Policy",
+        "name": "collision_policy",
+        "nullable": true,
+        "required": false,
+        "required_when": {
+          "equals": "write",
+          "field": "mode"
+        }
+      },
+      {
+        "description": "String field whose whole value becomes the file contents.",
+        "kind": "text",
+        "label": "Field",
+        "name": "field",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "default": "utf-8",
+        "description": "Character encoding used for the emitted document.",
+        "enum": [
+          "utf-8",
+          "ascii",
+          "latin-1",
+          "cp1252"
+        ],
+        "kind": "enum",
+        "label": "Encoding",
+        "name": "encoding",
+        "nullable": false,
+        "required": false
+      },
+      {
+        "default": "write",
+        "description": "Write a new output. Appending is not offered: concatenating unframed documents would invent a record separator.",
+        "enum": [
+          "write"
+        ],
+        "kind": "enum",
+        "label": "Mode",
+        "name": "mode",
+        "nullable": false,
+        "required": false
+      }
+    ]
+  },
+  "plugin_kind": "sink",
+  "plugin_name": "document"
+}

@@ -257,7 +257,7 @@ class TestDiscoverAllPlugins:
         # Expected counts verified during migration from hookimpl files
         EXPECTED_SOURCE_COUNT = 8  # Existing seven sources plus llm
         EXPECTED_TRANSFORM_COUNT = 32  # Existing 29 plus two AWS Bedrock Guardrails and Amazon Textract
-        EXPECTED_SINK_COUNT = 8  # csv, json, text, database, aws_s3, azure_blob, dataverse, chroma_sink
+        EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
 
         discovered = discover_all_plugins()
 
