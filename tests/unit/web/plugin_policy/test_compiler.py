@@ -25,7 +25,10 @@ def _settings(**overrides: object) -> WebSettings:
     values: dict[str, object] = {
         "composer_max_composition_turns": 4,
         "composer_max_discovery_turns": 4,
-        "composer_timeout_seconds": 60,
+        # 8 configured turns need >= 120s at the 15s/turn planning floor, or the
+        # composer_turn_budget_underfunded disclosure fires and breaks this
+        # module's strict no-warning assertions.
+        "composer_timeout_seconds": 120,
         "composer_rate_limit_per_minute": 20,
         "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
     }

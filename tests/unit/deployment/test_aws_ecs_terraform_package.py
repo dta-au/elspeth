@@ -2091,12 +2091,30 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
     ceiling = WebSettings.model_fields["composer_transport_idle_ceiling_seconds"].default
     headroom = WebSettings.model_fields["composer_transport_headroom_seconds"].default
 
-    timeout_match = re.search(
-        r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",\s*value\s*=\s*"(?P<seconds>[\d.]+)"\s*\}',
+    assert re.search(
+        r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",\s*value\s*=\s*tostring\(var\.composer_timeout_seconds\)\s*\}',
         _text("modules/scenario/locals.tf"),
+    ), "the scenario module no longer wires ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS to var.composer_timeout_seconds"
+
+    variables_text = _text("modules/scenario/variables.tf")
+    var_match = re.search(
+        r'variable\s+"composer_timeout_seconds"\s*\{.*?default\s*=\s*(?P<seconds>[\d.]+)',
+        variables_text,
+        re.DOTALL,
     )
-    assert timeout_match is not None, "the scenario module no longer pins ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"
-    timeout_seconds = float(timeout_match.group("seconds"))
+    assert var_match is not None, "var.composer_timeout_seconds no longer declares a default; a stock install would prompt for it"
+    timeout_seconds = float(var_match.group("seconds"))
+
+    cap_match = re.search(
+        r'variable\s+"composer_timeout_seconds"\s*\{.*?condition\s*=[^\n]*<=\s*(?P<cap>[\d.]+)',
+        variables_text,
+        re.DOTALL,
+    )
+    assert cap_match is not None, "var.composer_timeout_seconds lost its plan-time validation cap"
+    assert float(cap_match.group("cap")) == ceiling - headroom, (
+        f"the plan-time validation cap {cap_match.group('cap')}s no longer mirrors the WebSettings "
+        f"guard ({ceiling}s ceiling - {headroom}s headroom); a plan-clean value could still refuse to boot"
+    )
 
     idle_match = re.search(
         r"idle_timeout\s*=\s*(?P<seconds>\d+)",

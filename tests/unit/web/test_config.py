@@ -244,9 +244,11 @@ class TestWebSettingsValidation:
         """
         from unittest.mock import MagicMock
 
+        import structlog
+
         from elspeth.web import config as config_module
 
-        logger = MagicMock()
+        logger = MagicMock(spec=structlog.stdlib.BoundLogger)
         monkeypatch.setattr(config_module, "_slog", logger)
         settings = WebSettings(
             composer_max_composition_turns=12,
@@ -266,9 +268,11 @@ class TestWebSettingsValidation:
     def test_fundable_turn_budget_does_not_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from unittest.mock import MagicMock
 
+        import structlog
+
         from elspeth.web import config as config_module
 
-        logger = MagicMock()
+        logger = MagicMock(spec=structlog.stdlib.BoundLogger)
         monkeypatch.setattr(config_module, "_slog", logger)
         WebSettings(
             composer_max_composition_turns=3,

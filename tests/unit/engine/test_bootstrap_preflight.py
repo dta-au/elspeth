@@ -95,8 +95,8 @@ class TestResolvePreflightDirect:
         assert result.gate_results[0].name == "corpus_ready"
         assert result.gate_results[0].result is True
 
-    def test_commencement_gate_context_uses_empty_env_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Host process environment is not exposed unless the caller supplies gate env."""
+    def test_commencement_gate_context_has_no_env_namespace(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The env gate namespace was deleted end to end (D2); it must not reappear."""
         from elspeth.engine.bootstrap import resolve_preflight
 
         monkeypatch.setenv("ELSPETH_SECRET_ORACLE", "sk-hidden")
@@ -113,7 +113,7 @@ class TestResolvePreflightDirect:
         with patch("elspeth.engine.commencement.evaluate_commencement_gates", side_effect=capture_gate_context):
             resolve_preflight(mock_config, Path("/fake/pipeline.yaml"), probes=[])
 
-        assert captured_context["env"] == {}
+        assert "env" not in captured_context
 
     def test_dependency_results_flow_into_gate_context(self) -> None:
         """When both depends_on and gates are configured, dep results are in gate context."""
