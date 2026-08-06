@@ -1299,3 +1299,94 @@ class TestUnionCoalesceGuaranteedExtras:
 
         mapper = next(n for n in graph.get_nodes() if n.node_id.startswith("transform_drop_extras"))
         assert schema_validation.get_effective_guaranteed_fields(graph, mapper.node_id) == frozenset({"description"})
+
+
+_LINEAR_PASS_THROUGH_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'description: str'
+      on_validation_failure: discard
+
+transforms:
+- name: shorten
+  plugin: truncate
+  input: raw
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: {sink_mode}
+{sink_fields}"""
+
+
+def _build_linear_pass_through_graph(*, sink_mode: str = "fixed", sink_fields: str = _SINK_ADMITS_DESCRIPTION) -> ExecutionGraph:
+    """Build source -> under-declaring pass-through transform -> sink. No coalesce."""
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    settings = load_settings_from_yaml_string(_LINEAR_PASS_THROUGH_PIPELINE.format(sink_mode=sink_mode, sink_fields=sink_fields))
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+    )
+
+
+class TestTypedPassThroughGuaranteedExtras:
+    """The defect is NOT specific to union coalesce — pin its real scope.
+
+    elspeth-1451ff385f was reported, diagnosed and fixed as a coalesce bug,
+    because that is where the builder decouples the two channels
+    STRUCTURALLY (typed fields from each branch's construction-time schema,
+    guarantees from a separate graph walk). But the failing ingredient is
+    only "a producer whose guarantees exceed its own declared fields, feeding
+    a locked consumer", and any `passes_through_input=True` transform that
+    declares a NARROWER schema than it forwards has exactly that shape with
+    no coalesce anywhere.
+
+    Verified by A/B against this same pipeline: with
+    ``validate_typed_producer_guaranteed_extras`` disabled the build is
+    GREEN, so this was a live silent defect on linear pipelines too and is
+    not merely a coalesce symptom reached by another route.
+    """
+
+    def test_under_declaring_pass_through_against_locked_sink_is_rejected(self) -> None:
+        """No fork, no coalesce — same phantom guarantees, same certain row death."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_linear_pass_through_graph()
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("id", "product")
+
+    def test_under_declaring_pass_through_into_admitting_sink_still_builds(self) -> None:
+        """False-reject guard: the same producer is fine when nothing is locked."""
+        _build_linear_pass_through_graph(sink_mode="observed", sink_fields="")
