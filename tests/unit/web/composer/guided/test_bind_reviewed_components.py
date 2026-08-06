@@ -3,9 +3,10 @@
 The planner authors topology against the redacted reviewed context. When it
 invents its own output name anyway, ``bind_guided_reviewed_components`` must
 restore the reviewed name AND rewrite every reference to the invented name —
-source/node ``on_success``/``on_error`` routing and the ``edges`` array — or
-the candidate dies at set_pipeline validation with "unknown node" and the
-repair loop burns to REPAIR_EXHAUSTED (elspeth-859e2702dd).
+source/node ``on_success``/``on_error`` routing, gate ``routes``/``fork_to``
+targets, and the ``edges`` array — or the candidate dies at set_pipeline
+validation with "unknown node" and the repair loop burns to REPAIR_EXHAUSTED
+(elspeth-859e2702dd, elspeth-2e8a711248).
 """
 
 from __future__ import annotations
@@ -112,6 +113,87 @@ def test_bind_rewrites_invented_output_name_in_edges_and_routing() -> None:
     ]
 
 
+def test_bind_rewrites_invented_output_name_in_gate_routes() -> None:
+    # Gate routes target sinks BY NAME: the DAG builder resolves each route
+    # value against sink_ids before deferring to connection names, so an
+    # invented output name in routes{} is a live sink reference that must be
+    # remapped exactly like on_success/on_error (elspeth-2e8a711248).
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "hex_gate",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "hex_gate",
+                "node_type": "gate",
+                "input": "hex_gate",
+                "condition": "row['hex'] != ''",
+                "routes": {"true": "colours_json", "false": "discard"},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "colours_json", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    bound = bind_guided_reviewed_components(pipeline, _guided())
+
+    assert bound["nodes"][0]["routes"] == {"true": "output", "false": "discard"}
+
+
+def test_bind_rewrites_invented_output_name_in_fork_to() -> None:
+    # fork_to entries are also resolved against sink names first ("Explicit
+    # sink destination") — a fork branch aimed at the invented output name
+    # must be renamed; sibling branch names and the "fork" route sentinel
+    # must pass through untouched.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "fan_out",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "fan_out",
+                "node_type": "gate",
+                "input": "fan_out",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["colours_json", "audit_branch"],
+            },
+            {
+                "id": "audit",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "audit_branch",
+                "on_success": "colours_json",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "colours_json", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    bound = bind_guided_reviewed_components(pipeline, _guided())
+
+    nodes_by_id = {node["id"]: node for node in bound["nodes"]}
+    assert nodes_by_id["fan_out"]["fork_to"] == ["output", "audit_branch"]
+    assert nodes_by_id["fan_out"]["routes"] == {"true": "fork", "false": "fork"}
+    assert nodes_by_id["audit"]["on_success"] == "output"
+
+
 def test_candidate_state_defaults_missing_edge_label() -> None:
     # set_pipeline's tool schema makes edges[*].label optional and the handler
     # reads it with .get(); the proposal round-trip must apply the same
@@ -173,6 +255,89 @@ def test_bind_resolves_dangling_sink_reference_to_single_reviewed_output() -> No
     bound = bind_guided_reviewed_components(pipeline, _guided())
 
     assert bound["sources"]["source"]["on_success"] == "output"
+
+
+def test_bind_leaves_unknown_gate_route_targets_for_validation() -> None:
+    # Counterpart boundary to the rename tests: when the rename map is EMPTY
+    # (outputs already use the reviewed name) an unknown route target is NOT
+    # resolved to the single output the way on_success is. A route value
+    # outside the known set is ambiguous — stale sink name vs. a connection
+    # whose consumer is not in this candidate (predecessor routes in the
+    # amend/correction flows are exactly that) — and a binder rewrite there
+    # reads as a planner contract violation in the amend diff (the 1f7241de
+    # failure class). Ambiguity belongs to validation.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "hex_gate",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "hex_gate",
+                "node_type": "gate",
+                "input": "hex_gate",
+                "condition": "row['hex'] != ''",
+                "routes": {"true": "csv_rows", "false": "discard"},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    bound = bind_guided_reviewed_components(pipeline, _guided())
+
+    assert bound["nodes"][0]["routes"] == {"true": "csv_rows", "false": "discard"}
+
+
+def test_bind_leaves_unknown_fork_to_targets_for_validation() -> None:
+    # fork_to twin of the route-target boundary above: an unknown branch name
+    # stays for validation rather than being inferred to the reviewed sink.
+    # Live branch names (consumed by a transform input) are untouched too.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "fan_out",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "fan_out",
+                "node_type": "gate",
+                "input": "fan_out",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["csv_rows", "audit_branch"],
+            },
+            {
+                "id": "audit",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "audit_branch",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    bound = bind_guided_reviewed_components(pipeline, _guided())
+
+    nodes_by_id = {node["id"]: node for node in bound["nodes"]}
+    assert nodes_by_id["fan_out"]["fork_to"] == ["csv_rows", "audit_branch"]
+    assert nodes_by_id["fan_out"]["routes"] == {"true": "fork", "false": "fork"}
 
 
 def _fork_coalesce_pipeline() -> dict[str, object]:

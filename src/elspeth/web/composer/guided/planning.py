@@ -899,6 +899,20 @@ def bind_guided_reviewed_components(
                 for edge_key in ("on_success", "on_error"):
                     if topology_node.get(edge_key) in output_rename:
                         topology_node[edge_key] = output_rename[topology_node[edge_key]]
+                # Gate routes{} values and fork_to[] entries are sink-reference
+                # positions too: the DAG builder resolves both against sink
+                # names before deferring to connection names, so an invented
+                # output name here is as live a reference as on_success.
+                gate_routes = topology_node.get("routes")
+                if isinstance(gate_routes, dict):
+                    for route_label, route_target in gate_routes.items():
+                        if type(route_target) is str and route_target in output_rename:
+                            gate_routes[route_label] = output_rename[route_target]
+                gate_fork_to = topology_node.get("fork_to")
+                if isinstance(gate_fork_to, list):
+                    topology_node["fork_to"] = [
+                        output_rename[branch] if type(branch) is str and branch in output_rename else branch for branch in gate_fork_to
+                    ]
         topology_edges = bound.get("edges")
         if isinstance(topology_edges, list):
             for topology_edge in topology_edges:
@@ -958,6 +972,15 @@ def bind_guided_reviewed_components(
                     for key in ("on_success", "on_error"):
                         if topology_node.get(key) is not None:
                             _resolve_dangling(topology_node, key)
+                    # Gate routes{}/fork_to[] deliberately stay out of this
+                    # inference: a value outside known_targets is ambiguous
+                    # there (stale sink name vs. not-yet-consumed connection,
+                    # e.g. a predecessor route whose consumer the candidate
+                    # does not carry), and the amend/correction flows restore
+                    # predecessor authority by diff — a binder rewrite would
+                    # read as a planner contract violation (the 1f7241de
+                    # failure class). The RENAME map above still retargets
+                    # them exactly; residual ambiguity belongs to validation.
         topology_edges = bound.get("edges")
         if isinstance(topology_edges, list):
             for topology_edge in topology_edges:
