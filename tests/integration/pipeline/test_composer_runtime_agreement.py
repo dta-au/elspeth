@@ -287,13 +287,34 @@ where the architectural fix landed:
   disjoint): Stage 1 and the runtime graph build agree on all nine. Two known
   boundaries keep that from being a claim about the whole rule, and both are
   permissive (they miss a rejection; neither blocks a runnable pipeline):
-    - ``merge=None``. Both union mirrors gate on ``merge != "union"``
-      (``state.py``), but ``CoalesceSettings.merge`` DEFAULTS to ``"union"``
-      (``core/config.py``), so a composer coalesce that leaves merge unset is
-      skipped here while the runtime would enforce the rule. Reaching it
-      through the tool surface looks blocked — ``yaml_generator`` always emits
-      the key, so ``None`` becomes ``merge: null`` and pydantic rejects — but
-      the gap is real in ``validate()`` and is not closed by this shape.
+    - ``merge=None``. CLOSED FOR NODESPEC-CONSTRUCTED STATE by ``aa963bafe``
+      (``elspeth-11334b382c``); the injected-``state_dict`` route remains open
+      (``elspeth-5581fcb76f``). Both union mirrors gate on ``merge != "union"``
+      (``state.py``) while ``CoalesceSettings.merge`` DEFAULTS to ``"union"``
+      (``core/config.py``), so a coalesce that left merge unset was skipped by
+      BOTH the mode mirror and the type mirror while the runtime enforced each
+      as a union. ``NodeSpec.__post_init__`` now normalises it at the one
+      construction boundary ``from_dict``, ``upsert_node``, ``set_pipeline``
+      and ``replace`` all route through, so a third union rule cannot inherit
+      the hole. It DEFAULTS the field rather than requiring it: the runtime
+      accepts an unset merge, so rejecting here would be the opposite
+      divergence.
+
+      THE REACHABILITY ARGUMENT THIS ENTRY ORIGINALLY CARRIED WAS FALSE, and
+      naming that is the point of amending rather than deleting it. The claim
+      — "``yaml_generator`` always emits the key, so ``None`` becomes
+      ``merge: null`` and pydantic rejects" — was disproved by execution:
+      ``to_dict`` writes ``merge`` CONDITIONALLY (``state.py:4374``) so the key
+      is ABSENT, and ``yaml_generator.py:290`` reads ``c["merge"]``
+      unconditionally, raising ``KeyError`` — an internal crash on the
+      ``preview_pipeline -> runtime_preflight -> validate_pipeline ->
+      generate_yaml`` path, never a pydantic error and never a repair signal a
+      model could act on. That wrong argument is why ``af62478df`` shipped with
+      the gap ``aa963bafe`` had to close. A PERMISSIVE finding that is ALSO
+      load-bearing for an unreachability argument gets neither half
+      scrutinised: one half removes the incentive to test it, the other
+      supplies a reason not to. Retiring a finding on reachability therefore
+      requires an EXECUTED check, not a code reading.
     - ALL-OBSERVED branches. ``merge_union_fields`` early-returns observed mode
       without a type check, and Stage 1 abstains by the same rule, so two
       observed branches whose INFERRED types diverge reach the coalesce
