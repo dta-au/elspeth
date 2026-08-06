@@ -171,6 +171,12 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
   - "src/elspeth/plugins/sources/llm/source.py:LLMSource.probe_config:return"
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
+  # Sink probe_config, same contract as the transform hook above: a sink that
+  # declares input_semantic_requirements() must be instantiable in isolation
+  # so tests/invariants/test_semantic_requirements_are_satisfiable can read it.
+  - "src/elspeth/plugins/infrastructure/base.py:BaseSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/text_sink.py:TextSink.probe_config:return"
+  - "src/elspeth/plugins/sinks/document_sink.py:DocumentSink.probe_config:return"
 
   # Plugin implementations - config input
   - "src/elspeth/plugins/sinks/chroma_sink.py:ChromaSink.__init__:config"

@@ -879,16 +879,23 @@ def _producer_declared_field_type(
         transform.close()
 
 
-# ``PluginManager._raise_if_invalid`` reports a failed transform config as a
-# bare ``ValueError`` whose message it builds as
+# ``PluginManager._raise_if_invalid`` reports a failed plugin config as a bare
+# ``ValueError`` whose message it builds as
 # ``f"Invalid configuration for {label} '{name}':\n..."``. There is no type to
 # match on, so this prefix is the only signal separating an expected draft
 # config from a genuine engine defect. Coupled to that raise site: changing the
-# message there must change this constant.
+# message there must change these constants.
+#
+# The label is part of the prefix on purpose. Each probe knows which factory it
+# called, so it tolerates only that factory's draft-config failure: a transform
+# probe that swallowed "Invalid configuration for sink" would be swallowing an
+# error it could not have produced, which is the shape of a masked defect.
 _TRANSFORM_CONFIG_ERROR_PREFIX = "Invalid configuration for transform "
+_SINK_CONFIG_ERROR_PREFIX = "Invalid configuration for sink "
+_SOURCE_CONFIG_ERROR_PREFIX = "Invalid configuration for source "
 
 
-def _is_config_probe_exception(exc: Exception) -> bool:
+def _is_plugin_config_probe_exception(exc: Exception, *, config_error_prefix: str) -> bool:
     """Return True only for expected draft/config failures from probe construction.
 
     The single probe-tolerance taxonomy for this module and for every other
@@ -897,6 +904,10 @@ def _is_config_probe_exception(exc: Exception) -> bool:
     LLM/user-authored config, so a config, lookup, or template failure is
     ordinary external input and the caller abstains. Anything else is a
     genuine engine defect and must crash through.
+
+    The typed exceptions are shared across plugin kinds — a missing plugin or a
+    bad template is the same draft-config event whichever factory raised it.
+    Only the untyped ``ValueError`` needs the per-kind prefix.
     """
     from elspeth.plugins.infrastructure.config_base import PluginConfigError
     from elspeth.plugins.infrastructure.manager import PluginNotFoundError
@@ -905,7 +916,29 @@ def _is_config_probe_exception(exc: Exception) -> bool:
 
     if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
         return True
-    return type(exc) is ValueError and str(exc).startswith(_TRANSFORM_CONFIG_ERROR_PREFIX)
+    return type(exc) is ValueError and str(exc).startswith(config_error_prefix)
+
+
+def _is_config_probe_exception(exc: Exception) -> bool:
+    """Transform-probe tolerance — the established name, unchanged in behaviour."""
+    return _is_plugin_config_probe_exception(exc, config_error_prefix=_TRANSFORM_CONFIG_ERROR_PREFIX)
+
+
+def _is_sink_config_probe_exception(exc: Exception) -> bool:
+    """Sink-probe tolerance.
+
+    Verified against the live registry rather than assumed to match the
+    transform set: a partial ``text`` config (missing ``schema``, a ``field``
+    that is not an identifier, an unsupported ``encoding``) all surface as the
+    prefixed ``ValueError``, and an unregistered sink name as
+    ``UnknownPluginTypeError``.
+    """
+    return _is_plugin_config_probe_exception(exc, config_error_prefix=_SINK_CONFIG_ERROR_PREFIX)
+
+
+def _is_source_config_probe_exception(exc: Exception) -> bool:
+    """Source-probe tolerance."""
+    return _is_plugin_config_probe_exception(exc, config_error_prefix=_SOURCE_CONFIG_ERROR_PREFIX)
 
 
 def _batch_distribution_profile_value_field_entries(
@@ -2063,7 +2096,7 @@ def _check_schema_contracts(
     tuple[EdgeContract, ...],
 ]:
     """Validate producer/consumer schema contracts across declarative routing."""
-    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
+    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
 
     errors: list[ValidationEntry] = []
     contract_warnings: list[ValidationEntry] = []
@@ -2107,14 +2140,18 @@ def _check_schema_contracts(
     node_by_id = {node.id: node for node in nodes}
 
     # Schema-specific bookkeeping: track per-connection producer
-    # description (for richer duplicate-error messages) and the separate
-    # direct-to-sink producers map (sink-targeted edges that the
-    # resolver intentionally excludes from walk-back). Mirror the
+    # description, for richer duplicate-error messages. Mirror the
     # resolver's registration order so first-seen descriptions match
     # the resolver's first-seen producer.
+    #
+    # Direct-to-sink producers are NOT tracked here: the resolver records
+    # them during the same registration walk and exposes them through
+    # ``sink_producers()``. Sink-targeted connections are skipped below for
+    # description purposes only, because a sink is never a duplicate-producer
+    # participant — several nodes writing to one output is fan-in, not
+    # contention.
     producer_desc: dict[str, str] = {}
     duplicate_descs: dict[str, list[str]] = {}
-    direct_sink_producers: dict[str, list[ProducerEntry]] = {}
 
     def _record_description(connection_name: str, description: str) -> None:
         if connection_name in producer_desc:
@@ -2126,42 +2163,18 @@ def _check_schema_contracts(
         if connection_name not in sink_names:
             internal_connection_names.add(connection_name)
 
-    def _record_direct_sink(
-        sink_name: str,
-        producer_id: str,
-        plugin_name: str | None,
-        options: Mapping[str, Any],
-    ) -> None:
-        if sink_name not in direct_sink_producers:
-            direct_sink_producers[sink_name] = []
-        direct_sink_producers[sink_name].append(ProducerEntry(producer_id=producer_id, plugin_name=plugin_name, options=options))
-
     for source_name, source in source_map.items():
-        producer_id = source_producer_id(source_name)
-        if source.on_success in sink_names:
-            _record_direct_sink(
-                source.on_success,
-                producer_id,
-                source.plugin,
-                source.options,
-            )
-        else:
+        if source.on_success not in sink_names:
             source_desc = f"source '{source.plugin}'" if source_name == "source" else f"source '{source_name}' ({source.plugin})"
             _record_description(source.on_success, source_desc)
 
     for node in nodes:
         if node.node_type == "coalesce" and node.on_success is None:
             _record_description(node.id, f"coalesce '{node.id}'")
-        elif node.on_success is not None:
-            if node.on_success in sink_names:
-                _record_direct_sink(node.on_success, node.id, node.plugin, node.options)
-            else:
-                _record_description(node.on_success, f"node '{node.id}' on_success")
-        if node.on_error is not None and node.on_error != "discard":
-            if node.on_error in sink_names:
-                _record_direct_sink(node.on_error, node.id, node.plugin, node.options)
-            else:
-                _record_description(node.on_error, f"node '{node.id}' on_error")
+        elif node.on_success is not None and node.on_success not in sink_names:
+            _record_description(node.on_success, f"node '{node.id}' on_success")
+        if node.on_error is not None and node.on_error != "discard" and node.on_error not in sink_names:
+            _record_description(node.on_error, f"node '{node.id}' on_error")
         if node.routes is not None:
             for route_label, target in node.routes.items():
                 if target == _DISCARD_ROUTE_TARGET:
@@ -2173,7 +2186,6 @@ def _check_schema_contracts(
                     # below).
                     continue
                 if target in sink_names:
-                    _record_direct_sink(target, node.id, node.plugin, node.options)
                     continue
                 # Same-node carve-out: a gate with multiple route labels
                 # mapping to the same target is idempotent, not a
@@ -2192,10 +2204,9 @@ def _check_schema_contracts(
                     # contract walks from the sink back through the gate
                     # to the gate's upstream producer (matched in
                     # _walk_producer_entry_to_real_producer's fork-vs-sink
-                    # branch). Record both the direct-sink producer entry
-                    # and the description so duplicate-error formatting
-                    # remains identical to pre-resolver behaviour.
-                    _record_direct_sink(branch_name, node.id, node.plugin, node.options)
+                    # branch). The resolver records the producer entry; no
+                    # description is kept, because a sink is not a
+                    # duplicate-producer participant.
                     continue
                 _record_description(branch_name, f"gate '{node.id}' fork '{branch_name}'")
 
@@ -3254,8 +3265,8 @@ def _check_schema_contracts(
                 return None
             # ``resolver.get_node`` rather than indexing ``node_by_id``: like
             # ``_walk_producer_entry_to_real_producer`` — the walker this
-            # mirrors — this one is also handed ``direct_sink_producers``
-            # entries, which are minted separately from the producer map and so
+            # mirrors — this one is also handed ``resolver.sink_producers``
+            # entries, which are registered outside the producer map and so
             # are not guaranteed to name a registered NodeSpec.
             producer_node = resolver.get_node(current_producer.producer_id)
             if producer_node is None:
@@ -3760,9 +3771,8 @@ def _check_schema_contracts(
         if not sink_required and sink_locked_input is None:
             continue
 
-        if output.name in direct_sink_producers:
-            sink_producers = tuple(direct_sink_producers[output.name])
-        else:
+        sink_producers = resolver.sink_producers(output.name)
+        if not sink_producers:
             actual_producer = _walk_to_real_producer(
                 output.name,
                 warnings=contract_warnings,

@@ -29,6 +29,7 @@ from elspeth.contracts.contexts import SinkContext
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_semantics import InputSemanticRequirements
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
     ResolvedSinkEffectMode,
@@ -141,6 +142,19 @@ class DocumentSink(BaseSink):
           - "announcement_text: str"
 """
     capability_tags: tuple[str, ...] = ("document", "file", "multiline", "single-value")
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the semantic-satisfiability invariant.
+
+        Touches nothing on disk: ``resolved_path`` only resolves a Path and the
+        schema factory builds a model in memory.
+        """
+        return {
+            "path": "document_sink_probe.txt",
+            "field": "document_sink_probe_body",
+            "schema": {"mode": "fixed", "fields": ["document_sink_probe_body: str"]},
+        }
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -296,8 +310,72 @@ class DocumentSink(BaseSink):
     def close(self) -> None:
         """No-op: file handles are opened and closed inside the effect commit path."""
 
+    def input_semantic_requirements(self) -> InputSemanticRequirements:
+        """Accept every text framing, including UNCONSTRAINED — that is the point.
+
+        This sink writes the value verbatim, so a line break is content and no
+        framing can be wrong for it. ``TextFraming.UNCONSTRAINED`` is listed
+        explicitly rather than by leaving the dimension unconstrained, because
+        accepting the generative claim is precisely what this sink exists to
+        do: ``llm -> document`` must be SATISFIED at authoring time, in the
+        same breath as ``llm -> text`` becomes a CONFLICT (ADR-039).
+
+        NOT_TEXT is excluded: this sink encodes a ``str``, so a producer that
+        positively claims a non-text value is a real contradiction, and
+        ``accepted_value_types={STR}`` says the same thing on the other axis.
+
+        ``accepted_content_kinds`` is DELIBERATELY empty — "dimension
+        unconstrained" as a decision, not as an omission. A verbatim writer has
+        no opinion on whether the document is prose, markdown, or HTML; that is
+        the user's choice of file. Constraining it would also be actively
+        wrong here: a generative producer declares ``content_kind=UNKNOWN``
+        because prose-versus-markdown is not statically decidable, and any
+        non-empty set downgrades that edge to UNKNOWN — turning the one
+        composition this sink exists to bless into a mere advisory.
+
+        ``unknown_policy=WARN``: an undeclared producer must not be blocked.
+        """
+        from elspeth.contracts.plugin_semantics import (
+            FieldSemanticRequirement,
+            InputSemanticRequirements,
+            SemanticValueType,
+            TextFraming,
+            UnknownSemanticPolicy,
+        )
+
+        return InputSemanticRequirements(
+            fields=(
+                FieldSemanticRequirement(
+                    field_name=self._field,
+                    accepted_content_kinds=frozenset(),
+                    accepted_text_framings=frozenset(
+                        {
+                            TextFraming.UNCONSTRAINED,
+                            TextFraming.COMPACT,
+                            TextFraming.NEWLINE_FRAMED,
+                            TextFraming.LINE_COMPATIBLE,
+                        }
+                    ),
+                    accepted_value_types=frozenset({SemanticValueType.STR}),
+                    requirement_code="document.field.verbatim_text",
+                    unknown_policy=UnknownSemanticPolicy.WARN,
+                    configured_by=("field",),
+                ),
+            )
+        )
+
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code == "document.field.verbatim_text":
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=issue_code,
+                summary=(
+                    "This sink writes one row's whole string value to the file, so the configured field must hold text. "
+                    "A producer that emits a non-string value into it has nothing this sink can encode."
+                ),
+                suggested_fixes=("Point field at a string-valued field, or convert the value to a string upstream before this sink.",),
+            )
         if issue_code is None:
             return PluginAssistance(
                 plugin_name=cls.name,

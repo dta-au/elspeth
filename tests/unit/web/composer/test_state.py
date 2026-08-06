@@ -23,6 +23,7 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
     route_destination_facts,
 )
+from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
 class TestSourceSpec:
@@ -3782,7 +3783,7 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "map_body"))
         state = state.with_edge(self._make_edge("e2", "map_body", "main"))
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise TemplateError("invalid template syntax")
 
@@ -3846,7 +3847,7 @@ class TestSchemaContractValidation:
         state = state.with_edge(self._make_edge("e1", "source", "map_body"))
         state = state.with_edge(self._make_edge("e2", "map_body", "main"))
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise RuntimeError("framework bug inside transform __init__")
 
@@ -3927,7 +3928,7 @@ class TestSchemaContractValidation:
             on_write_failure="discard",
         )
 
-        class _BrokenManager:
+        class _BrokenManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise RuntimeError("framework bug inside field_mapper __init__")
 
@@ -3997,7 +3998,7 @@ class TestSchemaContractValidation:
             "CONSTRUCTION_PROBE_SECRET_SENTINEL",
         )
 
-        class _LeakyManager:
+        class _LeakyManager(DelegatingPluginManagerDouble):
             def create_transform(self, plugin_name: str, options: dict[str, Any]) -> object:
                 raise TemplateError(f"plugin '{plugin_name}' failed to initialize: " + " | ".join(leaked_substrings))
 
@@ -7070,7 +7071,7 @@ class TestPassThroughComposerParity:
             passes_through_input = True
             is_batch_aware = False  # Required by _known_batch_aware_transform_plugins()
 
-        class _StubPluginManager:
+        class _StubPluginManager(DelegatingPluginManagerDouble):
             def get_transforms(self) -> list[type]:
                 return [_StubPassThrough]
 

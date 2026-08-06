@@ -1,12 +1,20 @@
 """Shared producer-map and walk-back primitive.
 
 Both the schema-contract validator and the semantic-contract validator
-need to: (1) build a map from connection name to producer node, (2) walk
-back through structural gates to find the real producer of a connection.
-This module provides the single implementation. Pass-through propagation
-is intentionally NOT included — that remains schema-specific in
-state.py because semantic validation does not propagate through
-pass-through transforms in Phase 1.
+need to: (1) build a map from connection name to producer node, (2) record
+which producers write DIRECTLY to each sink, and (3) walk back through
+structural gates to find the real producer. This module provides the single
+implementation of all three. Pass-through propagation is intentionally NOT
+included — that remains schema-specific in state.py because semantic
+validation does not propagate through pass-through transforms in Phase 1.
+
+Sink-targeted edges are kept out of ``_producer_map`` on purpose: a sink is
+a terminal, so nothing downstream may walk back "through" it, and a sink
+name colliding with a connection name is a separate validation error. They
+are not DISCARDED, though — they land in ``_sink_producers``, keyed by sink
+name and holding a LIST because a sink legitimately has fan-in (several
+nodes routing to one output). ``sink_producers()`` is how a sink-side
+validator reaches them.
 
 Layer: L3 (web composer application code). Imports state types from
 the same layer.
@@ -61,6 +69,7 @@ class ProducerResolver:
         "_node_by_id",
         "_producer_map",
         "_queue_predecessors",
+        "_sink_producers",
         "duplicate_connections",
     )
 
@@ -70,6 +79,7 @@ class ProducerResolver:
         node_by_id: dict[str, NodeSpec],
         duplicate_connections: frozenset[str],
         queue_predecessors: Mapping[str, tuple[ProducerEntry, ...]] | None = None,
+        sink_producers: Mapping[str, tuple[ProducerEntry, ...]] | None = None,
     ) -> None:
         self._producer_map = producer_map
         self._node_by_id = node_by_id
@@ -78,6 +88,12 @@ class ProducerResolver:
         # producer_id (elspeth-a5b86149d4). Absent for queue-free compositions;
         # every ordinary connection resolves through _producer_map as before.
         self._queue_predecessors: Mapping[str, tuple[ProducerEntry, ...]] = queue_predecessors or {}
+        # Direct-to-sink producers, keyed by sink name, in registration order.
+        # NOT deduplicated: two route labels from one gate onto one sink are
+        # two entries, exactly as the schema-contract layer recorded them
+        # before this map moved here. Both consumers dedupe on the resolved
+        # producer, so preserving the raw order keeps that behaviour identical.
+        self._sink_producers: Mapping[str, tuple[ProducerEntry, ...]] = sink_producers or {}
 
     @classmethod
     def build(
@@ -90,6 +106,7 @@ class ProducerResolver:
     ) -> ProducerResolver:
         producer_map: dict[str, ProducerEntry] = {}
         duplicates: set[str] = set()
+        sink_producers: dict[str, list[ProducerEntry]] = {}
         node_by_id = {node.id: node for node in nodes}
 
         # Declared queue fan-in (elspeth-a5b86149d4): a queue's id names the
@@ -103,8 +120,11 @@ class ProducerResolver:
             if connection_name is None or connection_name == "discard":
                 return
             if connection_name in sink_names:
-                # Direct-to-sink edges aren't producers for downstream
-                # walk-back; schema-contract code handles them separately.
+                # A sink is terminal: nothing downstream walks back THROUGH
+                # it, so the edge never enters producer_map. It is still a
+                # real producer->consumer edge, so record it here — this is
+                # the map every sink-side validator reads.
+                sink_producers.setdefault(connection_name, []).append(entry)
                 return
             if connection_name in queue_nodes and entry.producer_id != connection_name:
                 # A producer publishing to a declared queue is a queue
@@ -181,7 +201,13 @@ class ProducerResolver:
             for queue_id, entries in queue_predecessors.items()
         }
 
-        return cls(producer_map, node_by_id, frozenset(duplicates), frozen_predecessors)
+        return cls(
+            producer_map,
+            node_by_id,
+            frozenset(duplicates),
+            frozen_predecessors,
+            {sink_name: tuple(entries) for sink_name, entries in sink_producers.items()},
+        )
 
     def find_producer_for(self, connection_name: str) -> ProducerEntry | None:
         """Return the immediate producer for a connection, or None.
@@ -207,39 +233,72 @@ class ProducerResolver:
         """
         return self._queue_predecessors.get(queue_id, ())
 
-    def walk_to_real_producer(self, connection_name: str) -> ProducerEntry | None:
-        """Walk back through structural gates to the true producer.
+    def sink_producers(self, sink_name: str) -> tuple[ProducerEntry, ...]:
+        """Return the producers writing DIRECTLY to a sink, in registration order.
 
-        Returns None on: unknown connection, duplicate connection,
-        routing loop, or any structural node that semantic walk-back
-        does not traverse (currently: coalesce — its branch semantics
-        are handled by callers that need them).
+        Empty tuple for an unknown or unfed sink name. These are the IMMEDIATE
+        producers — a gate routing to the sink is returned as the gate. Feed
+        each through ``walk_entry_to_real_producer`` to reach the real upstream.
 
-        Source producers (producer_id == "source" or "source:<name>") return immediately
-        WITHOUT a node-table lookup. The source is registered in
-        _producer_map but is intentionally absent from _node_by_id
-        (it is not a NodeSpec). Any code path that called
-        _node_by_id[producer.producer_id] for a source would raise
-        KeyError — short-circuit here is load-bearing.
+        A sink can have several producers (fan-in), which is why this returns a
+        tuple rather than a single entry. Any consumer-side rule must be
+        conservative across all of them.
         """
-        current = connection_name
-        visited: set[str] = set()
+        return self._sink_producers.get(sink_name, ())
+
+    def walk_to_real_producer(self, connection_name: str) -> ProducerEntry | None:
+        """Walk back through structural gates to the true producer of a connection.
+
+        Returns None on: unknown connection, duplicate connection, or a
+        routing loop. Structural producers that are not gates (coalesce,
+        queue, row_union) are RETURNED as themselves — their branch semantics
+        belong to callers that need them, and their ``plugin_name`` is None,
+        so a plugin probe reads them as "no declared producer".
+
+        Sink-targeted connections are absent from the connection map by
+        construction; reach those through ``sink_producers``.
+        """
+        if connection_name in self.duplicate_connections:
+            return None
+        if connection_name not in self._producer_map:
+            return None
+        # Seed the loop guard with the starting connection so a route that
+        # cycles back to it is detected on the first repeat.
+        return self._walk_back(self._producer_map[connection_name], visited={connection_name})
+
+    def walk_entry_to_real_producer(self, producer: ProducerEntry) -> ProducerEntry | None:
+        """Walk back through structural gates from an already-resolved producer.
+
+        The entry form of ``walk_to_real_producer``, for producers that were
+        never reached through the connection map — direct-to-sink edges, which
+        are deliberately kept out of it. Same traversal, same stopping rules.
+        """
+        return self._walk_back(producer, visited=set())
+
+    def _walk_back(self, producer: ProducerEntry, *, visited: set[str]) -> ProducerEntry | None:
+        """Shared gate traversal for both walk entry points.
+
+        Source producers (producer_id == "source" or "source:<name>") return
+        immediately WITHOUT a node-table lookup. The source is registered in
+        _producer_map but is intentionally absent from _node_by_id (it is not
+        a NodeSpec). Any code path that called _node_by_id[producer.producer_id]
+        for a source would raise KeyError — the short-circuit is load-bearing.
+        """
+        current = producer
         while True:
-            if current in visited:
+            if is_source_producer_id(current.producer_id):
+                return current
+            producer_node = self._node_by_id[current.producer_id]
+            if producer_node.node_type != "gate":
+                return current
+            connection_name = producer_node.input
+            if connection_name in visited:
                 return None
-            visited.add(current)
-            if current in self.duplicate_connections:
+            visited.add(connection_name)
+            next_producer = self.find_producer_for(connection_name)
+            if next_producer is None:
                 return None
-            if current not in self._producer_map:
-                return None
-            producer = self._producer_map[current]
-            if is_source_producer_id(producer.producer_id):
-                return producer
-            producer_node = self._node_by_id[producer.producer_id]
-            if producer_node.node_type == "gate":
-                current = producer_node.input
-                continue
-            return producer
+            current = next_producer
 
     def get_node(self, node_id: str) -> NodeSpec | None:
         """Return the registered NodeSpec for a producer id, or None.

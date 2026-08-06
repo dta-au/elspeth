@@ -15,6 +15,7 @@ from elspeth.contracts.contexts import SinkContext
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_semantics import InputSemanticRequirements
 from elspeth.contracts.sink import OutputValidationResult
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
@@ -120,6 +121,19 @@ class TextSink(BaseSink):
           - "line_text: str"
 """
     capability_tags: tuple[str, ...] = ("text", "file", "line-oriented", "single-field")
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Minimal config for the semantic-satisfiability invariant.
+
+        Constructs nothing on disk: ``resolved_path`` only resolves a Path and
+        the schema factory builds a model in memory.
+        """
+        return {
+            "path": "text_sink_probe.txt",
+            "field": "text_sink_probe_line",
+            "schema": {"mode": "fixed", "fields": ["text_sink_probe_line: str"]},
+        }
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -287,8 +301,74 @@ class TextSink(BaseSink):
     def close(self) -> None:
         """No-op: file handles are opened and closed inside the effect commit path."""
 
+    def input_semantic_requirements(self) -> InputSemanticRequirements:
+        """Require the configured field to be single-line, compact text.
+
+        ``accepted_text_framings={COMPACT}`` — COMPACT ONLY. This is the
+        authoring-time statement of the runtime invariant in ``prepare_effect``:
+        a value carrying CR or LF is diverted, so a pipeline that routes
+        newline-bearing text here publishes nothing. ``LINE_COMPATIBLE`` is
+        deliberately EXCLUDED: it is the newline-BEARING side of the vocabulary
+        (``line_explode`` accepts it as line-splittable, and ``web_scrape``
+        declares it for markdown). Accepting it would bless
+        ``web_scrape(markdown) -> text``, which is the exact zero-byte failure
+        this requirement exists to prevent (ADR-039, elspeth-afdf55a17c).
+
+        ``accepted_content_kinds`` is DELIBERATELY empty, which
+        ``compare_semantic`` reads as "dimension unconstrained". Stated as a
+        decision, not left blank by omission: this sink cares about FRAMING and
+        about the value being a string, never about whether the line is prose,
+        markdown, or a JSON fragment — one compact line of JSON is JSONL, and
+        writing it is correct. Enumerating the acceptable kinds would block
+        nothing extra (every kind this sink cannot write — raw HTML, binary —
+        already conflicts on framing or value_type) while downgrading to
+        UNKNOWN every producer that declares framing but honestly abstains on
+        kind. ``line_explode`` reached the same conclusion for the same reason.
+
+        ``unknown_policy=WARN`` because a producer that declares nothing must
+        not be blocked: only a positive conflicting claim blocks. That is what
+        keeps ``csv -> text`` — the ordinary single-field extract — authorable.
+        """
+        from elspeth.contracts.plugin_semantics import (
+            FieldSemanticRequirement,
+            InputSemanticRequirements,
+            SemanticValueType,
+            TextFraming,
+            UnknownSemanticPolicy,
+        )
+
+        return InputSemanticRequirements(
+            fields=(
+                FieldSemanticRequirement(
+                    field_name=self._field,
+                    accepted_content_kinds=frozenset(),
+                    accepted_text_framings=frozenset({TextFraming.COMPACT}),
+                    accepted_value_types=frozenset({SemanticValueType.STR}),
+                    requirement_code="text.field.single_line_text",
+                    unknown_policy=UnknownSemanticPolicy.WARN,
+                    configured_by=("field",),
+                ),
+            )
+        )
+
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
+        if issue_code == "text.field.single_line_text":
+            return PluginAssistance(
+                plugin_name=cls.name,
+                issue_code=issue_code,
+                summary=(
+                    "The text sink writes one LF-delimited record per row, so a value whose line breaks are content "
+                    "cannot go straight into it — every such row is diverted and the file ends up empty. Two remedies: "
+                    "put line_explode between the producer and this sink and set field to line_explode's output_field, "
+                    "which writes one line per line; or send the value to the document sink instead, which writes one "
+                    "row's whole value to the file byte-for-byte with its line breaks preserved."
+                ),
+                suggested_fixes=(
+                    "Insert a line_explode transform before this sink and point the sink's field at its output_field.",
+                    "Replace this sink with the document sink when the value is one whole document, not one record per row.",
+                ),
+            )
         if issue_code is None:
             return PluginAssistance(
                 plugin_name=cls.name,

@@ -344,9 +344,18 @@ def _build_web_scrape_output_semantics(
         ContentKind,
         FieldSemanticFacts,
         OutputSemanticDeclaration,
+        SemanticValueType,
         TextFraming,
     )
 
+    # ``value_type`` is STR for every recognized format, and that is a fact this
+    # transform genuinely knows: ``process`` calls ``content.encode()`` before
+    # assigning ``output[content_field]``, so a non-str value could not reach
+    # the row. Leaving it UNKNOWN was an under-declaration, and an abstaining
+    # dimension downgrades an otherwise-SATISFIED edge to advisory UNKNOWN for
+    # any consumer that constrains it (ADR-039: abstention cannot be graded by
+    # the facts).
+    value_type = SemanticValueType.STR
     if format == "markdown":
         kind = ContentKind.MARKDOWN
         framing = TextFraming.LINE_COMPATIBLE
@@ -365,9 +374,12 @@ def _build_web_scrape_output_semantics(
             fact_code = "web_scrape.content.compact_text"
     else:
         # Unknown format value — let the schema layer handle it.
-        # Returning UNKNOWN here is honest: we don't know.
+        # Returning UNKNOWN here is honest: we don't know. ``format`` is a
+        # Literal, so this branch is defensive; abstaining on every dimension
+        # keeps it from asserting anything about a shape it did not produce.
         kind = ContentKind.UNKNOWN
         framing = TextFraming.UNKNOWN
+        value_type = SemanticValueType.UNKNOWN
         fact_code = "web_scrape.content.unknown_format"
 
     return OutputSemanticDeclaration(
@@ -376,6 +388,7 @@ def _build_web_scrape_output_semantics(
                 field_name=content_field,
                 content_kind=kind,
                 text_framing=framing,
+                value_type=value_type,
                 fact_code=fact_code,
                 configured_by=("format", "text_separator"),
             ),

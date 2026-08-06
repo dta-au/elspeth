@@ -13,7 +13,7 @@ from pathlib import Path
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.plugin_semantics import SemanticOutcome, UnknownSemanticPolicy
+from elspeth.contracts.plugin_semantics import SemanticEdgeContract, SemanticOutcome, UnknownSemanticPolicy
 from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.secrets import (
@@ -26,11 +26,17 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import (
     CompositionState,
+    ValidationEntry,
     _batch_aware_placement_error,
     _batch_aware_required_input_fields_error,
     _batch_distribution_profile_value_field_entries,
 )
-from elspeth.web.execution._semantic_helpers import assistance_suggestion_for, serialize_semantic_contracts
+from elspeth.web.execution._semantic_helpers import (
+    assistance_suggestion_for,
+    semantic_affected_component_id,
+    semantic_component_attribution,
+    serialize_semantic_contracts,
+)
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     InterpretationValidatedState,
@@ -786,6 +792,21 @@ def validate_secret_evidence(
     )
 
 
+def _semantic_validation_error(
+    entry: ValidationEntry,
+    semantic_contracts: tuple[SemanticEdgeContract, ...],
+) -> ValidationError:
+    """Convert one semantic finding into a ledger error with honest attribution."""
+    component_id, component_type = semantic_component_attribution(entry.component)
+    return ValidationError(
+        component_id=component_id,
+        component_type=component_type,
+        message=entry.message,
+        suggestion=assistance_suggestion_for(entry, semantic_contracts),
+        error_code=None,
+    )
+
+
 def validate_semantic_evidence(
     secret: SecretValidatedState,
 ) -> PhaseReport[AuthoredValidatedState] | PhaseFailure:
@@ -807,16 +828,11 @@ def validate_semantic_evidence(
                 affected_nodes=(),
                 outcome_code=None,
             ),
-            errors=tuple(
-                ValidationError(
-                    component_id=entry.component.removeprefix("node:"),
-                    component_type="transform",
-                    message=entry.message,
-                    suggestion=assistance_suggestion_for(entry, semantic_contracts),
-                    error_code=None,
-                )
-                for entry in semantic_errors
-            ),
+            # Attribution is derived from the component prefix, never assumed:
+            # a semantic consumer is a transform node OR a sink output, and
+            # hardcoding "transform" reported every sink violation against a
+            # node id that does not exist.
+            errors=tuple(_semantic_validation_error(entry, semantic_contracts) for entry in semantic_errors),
             readiness=_blocked_readiness(code="semantic_contracts", detail="Semantic contract check failed."),
             semantic_contracts=responses,
         )
@@ -824,7 +840,7 @@ def validate_semantic_evidence(
     # reconstructable evidence. Name the requirements in the detail and carry
     # the nodes in the structured `affected_nodes` field, so a completed run
     # records WHICH contract went unproven rather than merely how many.
-    advisory_nodes = tuple(dict.fromkeys(entry.component.removeprefix("node:") for entry in semantic_warnings))
+    advisory_nodes = tuple(dict.fromkeys(semantic_affected_component_id(entry.component) for entry in semantic_warnings))
     if not semantic_contracts:
         detail = "No semantic contracts to check"
     elif semantic_warnings:
