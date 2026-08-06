@@ -379,6 +379,7 @@ from elspeth.core.config import (
     TriggerConfig,
 )
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
+from elspeth.core.dag.models import EdgeContractError
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
@@ -948,6 +949,55 @@ class TestComposerRuntimeAgreement:
             )
             graph.validate_edge_compatibility()
         assert "requires" in str(exc_info.value).lower()
+
+    def test_runtime_states_both_sink_verdicts_when_one_edge_violates_both_rules(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A doubly-violating sink edge must state BOTH verdicts, not whichever raises first.
+
+        The authored defect below is simultaneously a missing-required-field
+        AND an extra-undeclared-field violation, and the composer reports both.
+        The runtime raises from inside the per-edge loop, which aborts before
+        ``validate_sink_required_fields`` — called strictly after that loop —
+        ever runs. Reporting the extras half alone proposed dropping the extras
+        as the repair, which would leave the sink still requiring ``text`` that
+        nothing guarantees: a false repair signal to an LLM authoring loop
+        (elspeth-9615d6c75a).
+
+        This pins the MECHANISM — both verdicts present, and both field sets
+        populated on the structured error the composer preflight formatter
+        reads — deliberately NOT an ordering between the two checks. Ordering
+        is what accumulating the verdicts makes irrelevant.
+        """
+        text_path = tmp_path / "input.txt"
+        text_path.write_text("hello\n", encoding="utf-8")
+        output_path = tmp_path / "out.csv"
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            graph = self._build_runtime_graph(
+                source_plugin="text",
+                source_options={
+                    "path": str(text_path),
+                    "column": "line",
+                    "schema": {"mode": "observed"},
+                },
+                transform_plugin=None,
+                sink_options={
+                    "path": str(output_path),
+                    "schema": {"mode": "fixed", "fields": ["text: str"]},
+                },
+            )
+            graph.validate_edge_compatibility()
+
+        message = str(exc_info.value)
+        assert "requires fields ['text']" in message, "The missing-required-field verdict must survive the extras rejection."
+        assert "Extra fields rejected by consumer input contract: ['line']" in message, "The extras verdict must survive too."
+
+        error = exc_info.value
+        assert isinstance(error, EdgeContractError), "The combined verdict keeps the structured subclass the formatter reads."
+        assert error.compatibility_result.missing_fields == ("text",)
+        assert error.compatibility_result.extra_fields == ("line",)
 
     def test_both_reject_aggregation_nested_required_input_fields_without_upstream_guarantee(
         self,

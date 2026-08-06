@@ -358,6 +358,10 @@ def _validate_locked_consumer_guaranteed_extras(
     Admitted = every declared model field, required or optional — an optional
     declared field is legitimate input, not an extra (the boundary
     ``TestExtrasFirewallDirection`` pins).
+
+    For a SINK consumer the rejection ACCUMULATES the sink required-fields
+    verdict rather than pre-empting it — see the raise site for why ordering
+    alone is not a fix.
     """
     if consumer_schema is None:
         return
@@ -371,7 +375,22 @@ def _validate_locked_consumer_guaranteed_extras(
 
     from_info = graph.get_node_info(from_node_id)
     to_info = graph.get_node_info(to_node_id)
-    raise EdgeContractError(
+
+    # A SINK consumer can violate BOTH rules on the same edge: the producer
+    # guarantees a field the locked sink forbids AND fails to guarantee one
+    # the sink requires. The dedicated sweep that reports the second half
+    # (validate_sink_required_fields) runs strictly AFTER this edge loop and
+    # is unreachable once this raises, so reporting extras alone left the
+    # runtime proposing "insert a field_mapper with select_only: true to drop
+    # the extras" — a repair that leaves the sink still requiring a field
+    # nothing provides. That is a FALSE repair signal to an LLM authoring
+    # loop, so the verdict is assembled here rather than ordered
+    # (elspeth-9615d6c75a). Phase 1 already defers sink required-fields to the
+    # sweep for the abstention reason documented above; consulting the rule's
+    # single owner keeps this raise site honest without duplicating it.
+    sink_missing = _sink_required_missing_fields(graph, to_node_id, from_node_id, {}) if to_info.node_type == NodeType.SINK else frozenset()
+
+    extras_report = (
         f"Schema contract violation: edge '{from_node_id}' → '{to_node_id}'\n"
         f"  Consumer ({to_info.plugin_name}) input is locked (mode: fixed) and accepts: "
         f"{sorted(consumer_schema.model_fields)}\n"
@@ -385,13 +404,30 @@ def _validate_locked_consumer_guaranteed_extras(
         f"with 'Missing fields', or\n"
         f"  2. Relax the consumer schema to mode: flexible WITHOUT declaring the extra fields, "
         f"so it admits them as undeclared, or\n"
-        f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer",
+        f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer"
+    )
+
+    if sink_missing:
+        message = (
+            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing)}\n"
+            f"\n"
+            f"The same edge ALSO violates the consumer's locked input contract. "
+            f"BOTH must be repaired — dropping the extras alone leaves the sink "
+            f"requiring {sorted(sink_missing)} that nothing guarantees:\n"
+            f"{extras_report}"
+        )
+    else:
+        message = extras_report
+
+    raise EdgeContractError(
+        message,
         from_node_id=str(from_node_id),
         to_node_id=str(to_node_id),
         producer_schema_name=producer_schema.__name__ if producer_schema is not None else "(dynamic)",
         consumer_schema_name=consumer_schema.__name__,
         compatibility_result=CompatibilityResult(
             compatible=False,
+            missing_fields=tuple(sorted(sink_missing)),
             extra_fields=tuple(sorted(extras)),
         ),
         component_type=to_info.node_type.value,
@@ -828,6 +864,54 @@ def row_union_schema_configs_compatible(
     return False, conflicting_fields, f"Conflicting shared field types: {conflict_details}"
 
 
+def _sink_required_missing_fields(
+    graph: ExecutionGraph,
+    sink_node_id: str,
+    predecessor_id: str,
+    cache: dict[str, EffectiveGuaranteeVote],
+) -> frozenset[str]:
+    """Evaluate the sink required-fields rule for ONE (sink, predecessor) pair.
+
+    Single owner of the rule. ``validate_sink_required_fields`` sweeps every
+    sink through it, and ``_validate_locked_consumer_guaranteed_extras``
+    consults it for the one edge it is about to reject, so the two sites
+    cannot drift into disagreeing about the same graph — the failure mode
+    that produced elspeth-3283f2eaec and elspeth-cfcd333f83.
+
+    ABSTENTION belongs to the rule, not to the caller: a predecessor that
+    neither guarantees anything nor participated in the vote defers to
+    SinkExecutor's per-row ``declared_required_fields`` enforcement and
+    yields no build-time violation.
+    """
+    sink_required = graph.get_node_info(sink_node_id).declared_required_fields
+    if not sink_required:
+        return frozenset()
+
+    vote = walk_effective_guarantee_vote(graph, predecessor_id, cache)
+    if not vote.fields and not vote.participated:
+        return frozenset()
+
+    return sink_required - vote.fields
+
+
+def _sink_required_violation_message(sink_plugin_name: str, predecessor_id: str, missing: frozenset[str]) -> str:
+    """The one wording of the sink required-fields verdict.
+
+    Shared by the dedicated sweep and the per-edge combined report so a graph
+    tripping BOTH rules states the sink half in exactly the words a graph
+    tripping only the sink rule would use.
+    """
+    return (
+        f"Sink '{sink_plugin_name}' requires fields {sorted(missing)} "
+        f"but its upstream '{predecessor_id}' does not guarantee them. "
+        f"Likely causes: a coalesce union marked these fields optional "
+        f"(branch-exclusive or AND-downgraded), or an upstream transform "
+        f"did not declare them as guaranteed output. "
+        f"Fix: ensure the upstream node guarantees these fields, "
+        f"or remove them from the sink's declared_required_fields."
+    )
+
+
 def validate_sink_required_fields(graph: ExecutionGraph) -> None:
     """Validate each sink's declared_required_fields against upstream guarantees.
 
@@ -873,28 +957,16 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
         if info.node_type != NodeType.SINK:
             continue
 
-        sink_required = info.declared_required_fields
-        if not sink_required:
+        if not info.declared_required_fields:
             continue
 
         for predecessor_id in graph._graph.predecessors(node_id):
-            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
-            guaranteed = vote.fields
-            if not guaranteed and not vote.participated:
-                continue
-
-            missing = sink_required - guaranteed
+            missing = _sink_required_missing_fields(graph, node_id, predecessor_id, effective_fields_cache)
             if not missing:
                 continue
 
             raise GraphValidationError(
-                f"Sink '{info.plugin_name}' requires fields {sorted(missing)} "
-                f"but its upstream '{predecessor_id}' does not guarantee them. "
-                f"Likely causes: a coalesce union marked these fields optional "
-                f"(branch-exclusive or AND-downgraded), or an upstream transform "
-                f"did not declare them as guaranteed output. "
-                f"Fix: ensure the upstream node guarantees these fields, "
-                f"or remove them from the sink's declared_required_fields.",
+                _sink_required_violation_message(info.plugin_name, predecessor_id, missing),
                 component_id=str(node_id),
                 component_type="sink",
             )

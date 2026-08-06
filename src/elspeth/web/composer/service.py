@@ -470,11 +470,53 @@ def _request_interpretation_review_kind_from_arguments(arguments: Mapping[str, A
 
 
 # Module-level OTel counter for runtime preflight outcomes.
-# Attributes: outcome (success | failure), exception_class (bounded closed-list | other)
+#
+# Two orthogonal dimensions, deliberately NOT collapsed into one (elspeth-ca0bd5d4ef):
+#   outcome:  how the call ENDED — "returned" (a ValidationResult came back) or
+#             "failure" (the preflight raised and was cached as
+#             RuntimePreflightFailure). Only the failure arm carries
+#             exception_class (bounded closed-list | other).
+#   verdict:  what a returned preflight SAID — see ``_preflight_verdict``.
+#             Absent on the failure arm: a call that threw has no verdict.
+# Before the split, ``outcome="success"`` covered every non-raising call, so a
+# red verdict — the validator running normally and saying no — was recorded as
+# a success and had no correct observability surface anywhere.
 _RUNTIME_PREFLIGHT_COUNTER = metrics.get_meter(__name__).create_counter(
     "composer.runtime_preflight.total",
     description="Total runtime-equivalent preflight invocations in the composer service",
 )
+
+# Module-level OTel counter for no-tool finalizes published over a RED preflight.
+# Attributes: budget_exhausted (bool), repair_turns_used (int, capped at
+# _MAX_REPAIR_TURNS by the loop, so cardinality is bounded at 3).
+#
+# Answers a question the preflight counter alone cannot: when a compose turn
+# ends with the validator objecting, had the shared repair budget ALREADY been
+# spent? If it usually had, the model never received the actionable objection —
+# the repair turns were consumed by earlier emitters and the operator gets the
+# suffix instead of a fixed pipeline. Emitted from the shared no-tool finalize
+# tail so it cannot drift onto one caller; ``_attempt_preflight_repair`` stays
+# counter-free by its own contract.
+_PREFLIGHT_INVALID_FINALIZE_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.preflight_invalid_finalize.total",
+    description="No-tool finalizes published with a red runtime-preflight verdict, by shared repair-budget state",
+)
+
+
+def _preflight_verdict(result: ValidationResult) -> str:
+    """Return the closed-vocab telemetry verdict for a RETURNED preflight.
+
+    Three-valued, not two. The pending-interpretation handoff shape is
+    ``is_valid=False`` yet authoring-valid and completion-ready — it is a
+    user-action boundary, not a validator objection. Folding it into
+    ``"invalid"`` would re-commit the same non-success-collapsed-into-one-bucket
+    defect this split exists to fix, one level down.
+    """
+    if result.is_valid:
+        return "valid"
+    if _is_pending_interpretation_handoff(result):
+        return "pending_review"
+    return "invalid"
 
 
 class _MalformedLLMResponseError(ComposerServiceError):
@@ -2237,7 +2279,7 @@ class ComposerServiceImpl:
                 initial_version=initial_version,
                 llm_calls=llm_calls,
             )
-        _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "success"})
+        _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "returned", "verdict": _preflight_verdict(entry)})
         return entry
 
     async def _pending_handoff_outstanding_findings(
@@ -4072,6 +4114,7 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     message=message,
                     mutation_success_seen=mutation_success_seen,
+                    repair_turns_used=repair_turns_used,
                     plugin_snapshot=plugin_snapshot,
                 )
                 # ``_surface_and_finalize_no_tools`` now owns the announcement
@@ -4205,6 +4248,7 @@ class ComposerServiceImpl:
                         session_scope=session_scope,
                         message=message,
                         mutation_success_seen=mutation_success_seen,
+                        repair_turns_used=repair_turns_used,
                         plugin_snapshot=plugin_snapshot,
                     )
                     threaded = replace(
@@ -4508,6 +4552,7 @@ class ComposerServiceImpl:
             session_scope=session_scope,
             message=message,
             mutation_success_seen=mutation_success_seen,
+            repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
         )
         # Thread repair_turns_used through to the result so the route handler can
@@ -4642,6 +4687,7 @@ class ComposerServiceImpl:
         session_scope: str,
         message: str,
         mutation_success_seen: bool,
+        repair_turns_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
@@ -4651,8 +4697,9 @@ class ComposerServiceImpl:
         finalize in ``_classify_and_budget_turn``, and the staged-handoff branch
         that precedes it. Returns either the fail-closed blocked
         ``ComposerResult`` (an orphaned interpretation site survived) or the
-        finalized ``ComposerResult``. The caller threads ``repair_turns_used``
-        (only ``_try_terminate_no_tools`` tracks it) and the persisted ids.
+        finalized ``ComposerResult``. The caller still threads the persisted ids
+        and stamps ``repair_turns_used`` onto the returned result; the value is
+        passed in here so the red-verdict finalize telemetry below can record it.
 
         See the orphan-gate / backend-surfacing doctrine in the caller's docstring
         and in the comments around ``_missing_pending_interpretation_review_sites``.
@@ -4731,6 +4778,18 @@ class ComposerServiceImpl:
                 outstanding_findings=outstanding_findings,
             )
 
+        if runtime_result is not None and not runtime_result.is_valid:
+            # Red verdict published to the operator (elspeth-ca0bd5d4ef). The
+            # pending-handoff shape returned above is excluded on purpose: it is
+            # a user-action boundary, not a validator objection, and counting it
+            # here would answer a different question than the one asked.
+            _PREFLIGHT_INVALID_FINALIZE_COUNTER.add(
+                1,
+                {
+                    "budget_exhausted": repair_turns_used >= _MAX_REPAIR_TURNS,
+                    "repair_turns_used": repair_turns_used,
+                },
+            )
         return result
 
     async def _evaluate_terminal_no_tool_advisor_gate(
