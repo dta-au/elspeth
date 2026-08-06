@@ -239,7 +239,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7ee4ee216ec1a00"
+    source_file_hash: str | None = "sha256:a66f96fff9fa421d"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "

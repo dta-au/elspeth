@@ -83,6 +83,8 @@ tests/unit/engine/test_work_items.py::not hasattr(DAGNavigator, 'create_continua
 tests/unit/engine/test_work_items.py::not hasattr(DAGNavigator, 'create_work_item')
 tests/unit/mcp/test_mcp_init.py::hasattr(elspeth.mcp, 'create_server')
 tests/unit/mcp/test_mcp_init.py::hasattr(elspeth.mcp, 'main')
+tests/unit/plugins/infrastructure/test_base_semantics.py::not hasattr(BaseSink, 'output_semantics')
+tests/unit/plugins/infrastructure/test_base_semantics.py::not hasattr(BaseSource, 'input_semantic_requirements')
 tests/unit/plugins/llm/test_pool_config.py::not hasattr(throttle_config, 'max_capacity_retry_seconds')
 tests/unit/plugins/llm/test_pool_config.py::not hasattr(throttle_config, 'pool_size')
 tests/unit/plugins/llm/test_pooled_executor.py::hasattr(entry, 'buffer_wait_ms')

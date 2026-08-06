@@ -94,7 +94,7 @@ class TextSink(BaseSink):
     name = "text"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6d72e7fd4eb21cc9"
+    source_file_hash: str | None = "sha256:62b478f33fc425f8"
     config_model = TextSinkConfig
     supports_resume = True
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
