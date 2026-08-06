@@ -5995,6 +5995,71 @@ async def test_prose_replies_exhaust_nudge_budget_then_terminate_malformed(
 
 
 @pytest.mark.asyncio
+async def test_prose_nudged_retry_runs_at_candidate_effort(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A prose reply is the model announcing it is at emission stage — the
+    nudged retry must run at candidate effort, not discovery effort.
+
+    elspeth-b1e85829e9 (live, 2/2 repro): at discovery effort "low",
+    sonnet-5 emitted zero reasoning tokens on exactly the turns where the
+    terminal proposal was due, narrated the plan as prose instead, and the
+    effort wiring (candidate effort only after a REJECTED candidate) could
+    never give the first emission turn candidate-level effort — terminal
+    MALFORMED_RESPONSE with the whole repair budget unspent. Raising effort
+    to medium produced a real candidate on the same repro, so effort
+    causally gates the emission.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("I think a csv source feeding one passthrough is right; let me lay that out."),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "discovery_reasoning_effort": "low",
+            "candidate_reasoning_effort": "high",
+        },
+    )
+
+    assert completion.requests[0].get("reasoning_effort") == "low"
+    # The retry after the prose nudge is the emission turn: candidate effort.
+    assert completion.requests[1].get("reasoning_effort") == "high"
+
+
+@pytest.mark.asyncio
+async def test_prose_nudge_names_the_terminal_tool(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The nudge must route a settled design to emit_pipeline_proposal.
+
+    The generic "call a declared tool" wording was satisfiable by any cheap
+    discovery call — the live repro showed the model answering each nudge
+    with a discovery call and then prosing again, never reaching the
+    terminal tool before the nudge budget spent.
+    """
+    completion = _ScriptedCompletion(
+        _text_response("Prose plan instead of a tool call."),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    notices = [
+        message
+        for message in completion.requests[1]["messages"]
+        if message["role"] == "user" and "called no tool" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    assert "emit_pipeline_proposal" in str(notices[0]["content"])
+
+
+@pytest.mark.asyncio
 async def test_malformed_tool_call_arguments_stay_fatal(
     tmp_path: Path,
     tool_context: ToolContext,
