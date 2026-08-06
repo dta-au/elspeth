@@ -1122,7 +1122,7 @@ sinks:
       path: out.jsonl
       format: jsonl
       schema:
-        mode: fixed
+        mode: {sink_mode}
 {sink_fields}"""
 
 # A pass-through branch that declares only the field it rewrites. The fields it
@@ -1176,6 +1176,7 @@ def _build_coalesce_graph(
     *,
     branch_schema: str = _BRANCH_UNDERDECLARED,
     sink_fields: str = _SINK_ADMITS_DESCRIPTION,
+    sink_mode: str = "fixed",
     extra_transforms: str = "",
     coalesce_out: str = "\n  on_success: output",
 ) -> ExecutionGraph:
@@ -1186,6 +1187,7 @@ def _build_coalesce_graph(
     settings = load_settings_from_yaml_string(
         _COALESCE_PIPELINE.format(
             branch_schema=branch_schema,
+            sink_mode=sink_mode,
             extra_transforms=extra_transforms,
             sink_fields=sink_fields,
             coalesce_out=coalesce_out,
@@ -1245,9 +1247,45 @@ class TestUnionCoalesceGuaranteedExtras:
         with pytest.raises(EdgeContractError, match="Extra fields forbidden"):
             _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED)
 
-    def test_sink_admitting_every_guaranteed_field_still_builds(self) -> None:
-        """False-reject guard: a locked sink that admits all five must stay green."""
+    def test_fully_declared_branches_against_admitting_sink_still_build(self) -> None:
+        """A locked sink admitting every field must stay green.
+
+        Names what this actually covers: with fully-declared branches the
+        guarantees are a SUBSET of the declared fields, so the merged schema
+        has no phantoms and ``check_compatibility`` alone decides this edge —
+        the new pass is not the discriminating arm. Keep it as the guard on
+        the declared channel; the guard on the NEW check is the flexible-
+        consumer test below, which is the case where guarantees exceed the
+        declared fields and the check must still decline to fire.
+        """
         _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED, sink_fields=_SINK_ADMITS_ALL)
+
+    def test_flexible_consumer_admits_the_guaranteed_extras(self) -> None:
+        """False-reject guard for the NEW check: phantoms + a consumer that admits extras.
+
+        Same under-declared branches as the defect test, so the coalesce
+        guarantees four fields it never declares and the new pass DOES
+        evaluate this edge. A `mode: flexible` consumer is `extra='allow'`,
+        so no row can die at its preflight and the check must decline. This
+        is the shape that would break if the check ever stopped consulting
+        the consumer's extras policy.
+        """
+        _build_coalesce_graph(sink_mode="flexible")
+
+    @pytest.mark.xfail(
+        reason=(
+            "Inverse defect, deliberately out of scope for elspeth-1451ff385f: "
+            "check_compatibility's MISSING-fields arm reads the declared channel only, "
+            "the mirror of the extras-arm defect this class fixes. The coalesce declares "
+            "['description'], so a sink admitting every GUARANTEED field is rejected with "
+            "'Missing fields' even though the rows carry them and the pipeline runs. "
+            "Pinned so the asymmetry is visible in the suite, not only in the ticket."
+        ),
+        strict=True,
+    )
+    def test_sink_admitting_every_guaranteed_field_is_wrongly_rejected(self) -> None:
+        """The remedy the rejection message used to propose first — a false reject."""
+        _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
 
     def test_select_only_field_mapper_clears_the_rejection(self) -> None:
         """The rejection message's remedy 3 must actually clear the rejection.

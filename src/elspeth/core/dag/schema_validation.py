@@ -291,7 +291,19 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
     ``validate_transform_output_field_collisions`` (elspeth-cfcd333f83) and
     its two siblings each cite. The bypass-path calls stay where they are:
     moving them here would relocate errors that shape is already reported at.
+
+    Re-checking the bypass edges here is verdict-neutral by CONSTRUCTION, not
+    by convention: their call site runs earlier in program order, so if the
+    condition holds on such an edge that call has already raised and this one
+    is unreachable as the raiser. The visible consequence is that error
+    PRIORITY for this check varies with whether the producer is typed — the
+    rejected SET does not. Do not "tidy" the two sites into one: collapsing
+    them relocates the bypass errors elspeth-9615d6c75a pins.
     """
+    # Same memoized resolution the edge loop uses — this pass walks every edge
+    # again, and get_effective_producer_schema recurses through gate chains
+    # (the O(N^2) → O(N) note on the loop above applies identically here).
+    schema_cache: dict[str, type[PluginSchema] | None] = {}
     for from_id, to_id, edge_data in graph._graph.edges(data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
@@ -300,12 +312,19 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
         # own validators — same exclusion validate_single_edge applies.
         if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
             continue
+        consumer_schema = to_info.input_schema
+        # Cheap guard first: the helper declines unless the consumer forbids
+        # extras, and resolving the producer schema is the expensive half —
+        # on a passing edge its only product is a name in an error never
+        # raised.
+        if consumer_schema is None or consumer_schema.model_config["extra"] != "forbid":
+            continue
         _validate_locked_consumer_guaranteed_extras(
             graph,
             from_id,
             to_id,
-            producer_schema=get_effective_producer_schema(graph, from_id),
-            consumer_schema=to_info.input_schema,
+            producer_schema=get_effective_producer_schema(graph, from_id, _cache=schema_cache),
+            consumer_schema=consumer_schema,
         )
 
 
@@ -360,8 +379,12 @@ def _validate_locked_consumer_guaranteed_extras(
         f"  Extra fields rejected by consumer input contract: {sorted(extras)}\n"
         f"\n"
         f"Fix: Either:\n"
-        f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them, or\n"
-        f"  2. Relax the consumer schema (mode: flexible) to admit undeclared fields, or\n"
+        f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them "
+        f"— and when the producer TYPES its own fields (a union coalesce merges its branches' "
+        f"declared schemas), declare them on those branches too, or this edge fails instead "
+        f"with 'Missing fields', or\n"
+        f"  2. Relax the consumer schema to mode: flexible WITHOUT declaring the extra fields, "
+        f"so it admits them as undeclared, or\n"
         f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer",
         from_node_id=str(from_node_id),
         to_node_id=str(to_node_id),
