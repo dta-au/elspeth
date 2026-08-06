@@ -618,7 +618,7 @@ Two reporting defects compound it:
    `on_validation_failure: discard` is the composer's own default here, so
    this is the default path.
 
-### New defect — the edge validator rejects `type_coerce` for the mismatch it exists to fix
+### New defect — a `type_coerce` edge is rejected with no repair suggestion *(mechanism corrected 2026-08-06; original heading claimed the validator was wrong)*
 
 **g02** (`session 481cca93-…`). Round 3: `completed_with_failures` 4/1/1, by
 design. Round 4: **fails validation, never runs.**
@@ -631,54 +631,45 @@ validate: 200 is_valid=False
   Type mismatches: score (expected float, got str)
 ```
 
-A CSV source yields `str`. `type_coerce` converts `str` to `float`. The
-validator rejects the edge because the producer has not already done the
-conversion the consumer performs — so the transform can never be wired to the
-only kind of producer that needs it. Composed pipelines using `type_coerce`
-downstream of a CSV source are unbuildable.
-
 **Deterministic, 3 of 3.** Re-run twice more, identical failure with fresh node
-ids each time (so the composer re-authors the shape rather than replaying a
-cached graph). Contrast g01, which is intermittent.
+ids each time, so the composer re-authors the shape rather than replaying a
+cached graph. Contrast g01, which is intermittent.
 
-**Localised to one function — do not bisect the 35 commits.** A
-composer-independent probe against the deployed commit settles it. The tracked
-`examples/transform_pipeline/settings.yaml` is exactly CSV → `type_coerce`
-(`price` str→float) and reports `Pipeline configuration valid.`; it still
-passes when the source is changed to declare all four fields as
-`field_type: str`. So the YAML/DAG path does **not** reject a declared-`str` →
-`type_coerce`-`float` edge.
+**The mechanism recorded here on first writing was wrong, and this section
+retracts it.** The original reading — "a CSV source yields `str`, `type_coerce`
+converts it, so the validator rejects the edge for the mismatch the transform
+exists to resolve; `check_compatibility` has no notion of a converting
+consumer; localised to `schema_validation.py:178-205`; look in the 35-commit
+window" — does not survive the fix work (`e64fa38f2`, `elspeth-aed3b69cf0`):
 
-The reason is `core/dag/schema_validation.py:178-183`: a producer or consumer
-schema with zero `model_fields` and `extra="allow"` counts as *observed* and
-**bypasses type validation entirely**. Only typed contract classes reach
-`check_compatibility`. The composer emits exactly those — the failing edge
-names `CSVRowSchema` and `TypeCoerceInput` — so the check at
-`schema_validation.py:186-205` runs and raises `EdgeContractError`.
+- **`type_coerce` already models a converting consumer.** Its input schema is
+  the declared block verbatim and its *output* overwrites those types with the
+  conversion targets. A node's `schema:` block declares what **arrives**, never
+  the transformed result.
+- **The composer authored a contradictory declaration** — `score: float` on the
+  input side of the node that produces the float. That input contract is
+  genuinely unsatisfiable, and the build-time rejection is **correct and
+  load-bearing**: the strict runtime gate would otherwise have failed 100% of
+  rows.
+- **Not a regression, and the bisect is retired.** The shape is reachable from
+  plain YAML at HEAD, so the 35-commit window is not implicated.
+- My composer-independent probe was misread. `examples/transform_pipeline`
+  passes because it declares `price: str` — what arrives. It was evidence of
+  *correct* behaviour on both sides, not of a bypass that spares untyped
+  schemas.
 
-Root issue: `check_compatibility` (`contracts/data.py`) treats a consumer's
-declared input type as a **precondition the producer must already satisfy**. A
-coercing transform's input contract describes what it *accepts and converts*,
-not what it requires pre-converted. There is no notion of a converting
-consumer.
+**The real defect is disclosure, not validation.** `EdgeContractError` raised
+during graph *build* was caught by phase-1 `validate_graph_structure` as its
+superclass `GraphValidationError` with `suggestion=None`. Phase 3's rich
+handler needs a built graph and is dead for build-raised errors. So the
+composer was told the edge was invalid and never received the
+`patch_node_options` repair that would have let it self-correct — which is why
+it failed identically on all three samples instead of converging.
 
-**Attribution caveat.** Round 4 changed two variables against round 3 — the
-image (35 commits) **and** the advisor model, which participates in the compose
-loop as an END gate and so does not hold the composer's authoring choices
-constant. Round-3 composition states were not captured before teardown (a gap
-in the Part 0 capture worth noting), so whether round 3 ever authored
-`type_coerce` downstream of a CSV source is unknown. The validator may always
-have been wrong here and simply gone unexercised. That question affects the
-blame, not the fix site.
-
-**A concurrent session is editing this exact area** (uncommitted at time of
-writing): `core/dag/schema_validation.py`, `core/dag/builder.py`,
-`core/dag/graph.py`, `core/dag/models.py`,
-`web/composer/_semantic_validator.py`, plus new
-`tests/invariants/test_transform_input_contract_is_satisfiable.py` and
-`tests/unit/core/dag/test_transform_declared_input_fields.py`. "Transform input
-contract is satisfiable" is this defect restated — it may already be fixed in
-flight. Check that work before starting.
+Consequence for verification: the fix makes the failure **repairable**, not
+absent. A round-5 g02 sample can still fail on the first authoring attempt; the
+discriminating property is that the suggestion is now present and the composer
+can act on it.
 
 ## Part 4 — cost
 
@@ -771,12 +762,15 @@ on a single pass.
 | 8 | P3 | The advisor verdict is not persisted to the session store, so the FLAG rate cannot be measured from it |
 | 9 | P3 | Four battery-required settings are not Terraform inputs, and the package's default plugin allowlist (15) is not the share round 3 tested (40) |
 
-Findings 1, 2 and 3 are the priority. All three are regressions against round 3
-on graphs that previously passed, and the 35-commit window between the two
-images contains the `elspeth-cfcd333f83` collision-fix cluster (`b144d499b`,
-`0337b79cc`, `f3e11c770`), `02a80da51`, `7a5d72d34`, and `3cb883229` /
-`7df62193b` — every one of which touches schema or edge validation. That is
-where to look first.
+Findings 1, 2 and 3 are the priority. *(Corrected 2026-08-06: the original text
+called all three regressions against round 3 and sent the reader to the
+35-commit window between the two images. **None of the three is a regression,
+and the bisect is retired.** Finding 1 is header-case normalization, dating to
+RC2 and reachable from plain YAML; finding 2 is a missing repair suggestion on
+a correct build-time rejection; finding 3 was resolved not-a-bug — a compose
+that authors nothing correctly returns 200 with a null state, and its causal
+defect is `elspeth-18bcf7dd09`. Round 3's green on g01 and g02 was composition
+luck, not a working code path.)*
 
 ## AWS ledger
 
