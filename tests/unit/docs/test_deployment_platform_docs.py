@@ -309,16 +309,27 @@ def test_navigation_and_repository_structure_are_honest() -> None:
         assert absent_path not in structure
 
 
-def test_unreleased_changelog_does_not_claim_multi_replica_support() -> None:
-    text = _read(CHANGELOG)
-    unreleased = text.split("## 0.7.2", maxsplit=1)[0]
+def test_release_changelog_states_cross_platform_contract_without_multi_replica_claim() -> None:
+    """The notes for the release that ships these platforms must not oversell them.
 
-    assert "## Unreleased" in unreleased
-    assert "cross-platform deployment contract" in unreleased.lower()
-    assert "Docker Compose" in unreleased
-    assert "AWS ECS" in unreleased
-    assert "native Linux" in unreleased
-    assert "Azure Ubuntu VM" in unreleased
-    assert "Kubernetes" in unreleased
-    assert "multi-replica" not in unreleased.lower()
-    assert "deploy/platforms" not in unreleased
+    The entry was authored under ``## Unreleased`` and promoted into ``## 0.7.2``
+    when that release was cut, so the gate follows the text rather than the
+    heading it was first written under. ``## Unreleased`` above it is asserted
+    to exist but is deliberately not asserted to be non-empty — that is release
+    bookkeeping, not a deployment-contract claim.
+    """
+    text = _read(CHANGELOG)
+    assert "## Unreleased" in text
+    # Whitespace-normalised: the changelog hard-wraps prose, so "one Azure\n
+    # Ubuntu VM" would defeat a raw substring match. Normalising also tightens
+    # the multi-replica prohibition, which a wrapped occurrence could evade.
+    release = " ".join(_section(text, "## 0.7.2", "## 0.7.1").split())
+
+    assert "cross-platform deployment contract" in release.lower()
+    assert "Docker Compose" in release
+    assert "AWS ECS" in release
+    assert "native Linux" in release
+    assert "Azure Ubuntu VM" in release
+    assert "Kubernetes" in release
+    assert "multi-replica" not in release.lower()
+    assert "deploy/platforms" not in release
