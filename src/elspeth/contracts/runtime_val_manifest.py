@@ -1407,6 +1407,29 @@ def _assert_runtime_val_registries_frozen() -> None:
         )
 
 
+RuntimeValRegistryFingerprint = tuple[
+    tuple[tuple[type[DeclarationContract], str], ...],
+    tuple[tuple[type[BaseException], str], ...],
+]
+
+
+def runtime_val_registry_fingerprint() -> RuntimeValRegistryFingerprint:
+    """Hashable identity of the manifest's mutable inputs at call time.
+
+    Within a process every field of a manifest entry is a pure function of
+    the registered contract's class object plus its ``name`` (dispatch
+    sites and implementation hashes derive from the class, and imported
+    code objects do not change), and of each Tier-1 class plus its
+    registered reason; ``EXPECTED_CONTRACT_SITES`` is an immutable module
+    constant. The fingerprint therefore changes exactly when a rebuilt
+    manifest could differ, no matter how the registries were mutated —
+    including direct test-harness restores that bypass the registry API.
+    """
+    declarations = tuple((type(contract), contract.name) for contract in registered_declaration_contracts())
+    tier_1 = tuple((cls, tier_1_reason(cls)) for cls in _TIER_1_ERRORS_VIEW)
+    return (declarations, tier_1)
+
+
 def build_runtime_val_manifest() -> dict[str, Any]:
     """Return a dict describing the runtime-VAL registries at call time."""
     _assert_runtime_val_registries_frozen()

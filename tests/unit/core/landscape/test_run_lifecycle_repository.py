@@ -13,6 +13,7 @@ Covers 3 untested branch clusters identified in review:
 from __future__ import annotations
 
 import json
+from typing import Any, TypedDict
 
 import pytest
 from sqlalchemy import select, update
@@ -26,6 +27,12 @@ from elspeth.contracts import (
     SecretResolutionInput,
 )
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.declaration_contracts import (
+    DeclarationContract,
+    DeclarationContractViolation,
+    ExampleBundle,
+    implements_dispatch_site,
+)
 from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
 from elspeth.contracts.preflight import CommencementGateResult, DependencyRunResult, PreflightResult
@@ -369,6 +376,41 @@ class TestBeginRunDirect:
             )
 
 
+class _StaleHeaderProbePayload(TypedDict):
+    marker: str
+
+
+class _StaleHeaderProbeViolation(DeclarationContractViolation):
+    payload_schema = _StaleHeaderProbePayload
+
+
+class _StaleHeaderProbeContract(DeclarationContract):
+    """Synthetic contract registered mid-process by the stale-header test.
+
+    Registration-shape only: no pipeline ever dispatches it, so the site
+    method is inert and the example classmethods are never invoked.
+    """
+
+    name = "stale_header_probe"
+    payload_schema: type = _StaleHeaderProbePayload
+    violation_class: type[_StaleHeaderProbeViolation] = _StaleHeaderProbeViolation
+
+    def applies_to(self, plugin: Any) -> bool:
+        return False
+
+    @implements_dispatch_site("post_emission_check")
+    def post_emission_check(self, inputs: Any, outputs: Any) -> None:
+        return None
+
+    @classmethod
+    def negative_example(cls) -> ExampleBundle:
+        raise NotImplementedError("stale-header probe contract is never dispatched")
+
+    @classmethod
+    def positive_example_does_not_apply(cls) -> ExampleBundle:
+        raise NotImplementedError("stale-header probe contract is never dispatched")
+
+
 class TestBeginRunRuntimeValManifest:
     """ADR-010 M3 (issue elspeth-1c8185dfec): runtime VAL manifest recorded at begin_run.
 
@@ -486,6 +528,47 @@ class TestBeginRunRuntimeValManifest:
 
             with pytest.raises(FrameworkBugError, match="requires frozen runtime-VAL registries"):
                 repo.begin_run(config={}, canonical_version="v1", run_id="m3-unfrozen")
+        finally:
+            dc._restore_registry_snapshot_for_tests(snapshot)
+
+    def test_manifest_reflects_registry_changes_between_runs(self) -> None:
+        """A run header must record the contract set in force at THAT run.
+
+        Regression test for elspeth-68bc1e3d3a: the manifest JSON was
+        ``@cache``'d process-wide at the first ``begin_run()`` and never
+        invalidated, so a process whose registries legitimately changed
+        afterwards wrote the FIRST run's contract set into every later run
+        header. The resume drift check then refused honest resumes — but
+        the defect was the header lying about the registry the run
+        actually executed under.
+        """
+        import elspeth.contracts.declaration_contracts as dc
+        from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
+        from elspeth.engine.executors import pass_through  # noqa: F401  (import side-effect)
+
+        snapshot = dc._snapshot_registry_for_tests()
+        try:
+            db = make_landscape_db()
+            ops = DatabaseOps(db)
+            repo = RunLifecycleRepository(db, ops, RunLoader())
+
+            repo.begin_run(config={}, canonical_version="v1", run_id="m3-before-registry-change")
+            before = self._fetch_manifest(db, "m3-before-registry-change")
+            before_names = {entry["name"] for entry in before["declaration_contracts"]}
+            assert _StaleHeaderProbeContract.name not in before_names
+
+            dc._FROZEN = False  # type: ignore[attr-defined]  # test-only patch under pytest gate
+            dc.register_declaration_contract(_StaleHeaderProbeContract())
+
+            # The autouse begin_run wrapper re-freezes the registries, so
+            # this run executes under the extended contract set.
+            repo.begin_run(config={}, canonical_version="v1", run_id="m3-after-registry-change")
+            stored = self._fetch_manifest(db, "m3-after-registry-change")
+            stored_names = {entry["name"] for entry in stored["declaration_contracts"]}
+            assert _StaleHeaderProbeContract.name in stored_names
+            # The audit property itself: the stored header equals a fresh
+            # uncached rebuild against the registries the run ran under.
+            assert stored == build_runtime_val_manifest()
         finally:
             dc._restore_registry_snapshot_for_tests(snapshot)
 
