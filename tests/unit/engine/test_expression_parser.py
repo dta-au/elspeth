@@ -1516,6 +1516,110 @@ class TestExpressionValidatorFailClosed:
         assert parser.evaluate({"a": 1, "b": 3}) is True
 
 
+class TestEvaluatorFailClosed:
+    """Verify the evaluator raises for AST node types it has no arm for.
+
+    _ExpressionEvaluator.visit() must reject any node type outside
+    _ALLOWED_EXPR_TYPES (plus the ast.Expression root wrapper). Without the
+    guard, a validator-allowed-but-evaluator-uncovered node falls through to
+    generic_visit and silently returns None, so a gate routes on the falsy
+    branch instead of failing loudly.
+    """
+
+    def test_uncovered_expr_node_raises_security_error(self) -> None:
+        """A node type with no evaluator arm raises ExpressionSecurityError.
+
+        Uses a synthetic ast.expr subclass rather than a real forbidden type
+        (e.g. JoinedStr): forbidden types are validator-rejected, so a test
+        keyed on one would silently invert its meaning if the type ever
+        moved between the allowed and forbidden sets.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        class FakeExpr(_ast.expr):
+            _fields = ()
+
+        fake_node = FakeExpr()
+        fake_node.lineno = 1
+        fake_node.col_offset = 0
+        fake_node.end_lineno = 1
+        fake_node.end_col_offset = 1
+
+        evaluator = _ExpressionEvaluator({"x": 42})
+        with pytest.raises(ExpressionSecurityError, match="FakeExpr"):
+            evaluator.visit(fake_node)
+
+    def test_compound_allowed_expression_still_evaluates(self) -> None:
+        """Over-strictness control: every allowed node type passes the guard.
+
+        Exercises Name/Subscript/Attribute/Call/Compare/BoolOp/BinOp/UnaryOp/
+        Constant/List/Dict/Tuple/Set/IfExp in executed positions.
+        """
+        parser = ExpressionParser(
+            "(len(row['tags']) + (0 if row.get('missing') is None else 1)) == 1"
+            " and row['x'] >= 2"
+            " and not (row['x'] in [10, 20])"
+            " and row['x'] in {2, 3}"
+            " and row['x'] in (2, 4)"
+            " and {'k': row['x']} == {'k': 2}"
+        )
+        assert parser.evaluate({"tags": ["t1"], "x": 2}) is True
+
+    def test_expression_root_wrapper_admitted(self) -> None:
+        """The ast.Expression root is admitted despite not being an ast.expr."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        tree = _ast.parse("row['x'] == 1", mode="eval")
+        evaluator = _ExpressionEvaluator({"x": 1})
+        assert evaluator.visit(tree) is True
+
+
+class TestVisitorCouplingAssertion:
+    """The import-time visitor/type coupling check is a testable mechanism."""
+
+    def test_missing_handler_raises_type_error(self) -> None:
+        """An expected type without a visit_* arm fails the coupling check."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class MismatchedVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="without visit_"):
+            _assert_visitor_coupling(MismatchedVisitor, {"Name", "Call"}, label="synthetic")
+
+    def test_orphan_visitor_raises_type_error(self) -> None:
+        """A visit_* arm without an expected type entry fails the coupling check."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class OrphanVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="without type entry"):
+            _assert_visitor_coupling(OrphanVisitor, set(), label="synthetic")
+
+    def test_matched_visitor_passes(self) -> None:
+        """A visitor whose arms exactly match the expected set passes."""
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _assert_visitor_coupling
+
+        class MatchedVisitor(_ast.NodeVisitor):
+            def visit_Name(self, node: _ast.Name) -> None:
+                pass
+
+        _assert_visitor_coupling(MatchedVisitor, {"Name"}, label="synthetic")
+
+
 class TestExpressionParserDictContext:
     """Tests for evaluating expressions against plain dict contexts.
 
