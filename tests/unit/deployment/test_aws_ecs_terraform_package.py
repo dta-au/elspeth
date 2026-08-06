@@ -2405,3 +2405,33 @@ def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
     assert core_match is not None
     assert mirror_match is not None
     assert _quoted_plugin_ids(core_match.group("body")) == _quoted_plugin_ids(mirror_match.group("body"))
+
+
+def test_terraform_web_core_matches_the_python_required_set() -> None:
+    """The HCL mirrors must equal REQUIRED_WEB_PLUGIN_IDS, the runtime authority.
+
+    The test above pins the two HCL copies against EACH OTHER, and nothing
+    compared either to Python. So all three could agree with one another and
+    still disagree with the set the runtime actually authorizes
+    (``compile_web_plugin_policy`` unions ``REQUIRED_WEB_PLUGIN_IDS`` in
+    regardless of what Terraform says).
+
+    Drift is not an access-control hole — Python stays authoritative — but the
+    deployment record an operator reads becomes false, and the plan-time
+    precondition in ecs.tf then rejects a plugin the deployment does authorize.
+
+    This is the FOURTH instance of one archetype on this branch alone: an
+    authorization list maintained by hand in more places than anything checks.
+    Deriving the expectation from Python is what stops a fifth
+    (elspeth-4efd6a7242).
+    """
+    from elspeth.web.plugin_policy.compiler import REQUIRED_WEB_PLUGIN_IDS
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        _text("modules/scenario/locals.tf"),
+        re.DOTALL,
+    )
+    assert core_match is not None
+
+    assert _quoted_plugin_ids(core_match.group("body")) == {str(plugin_id) for plugin_id in REQUIRED_WEB_PLUGIN_IDS}
