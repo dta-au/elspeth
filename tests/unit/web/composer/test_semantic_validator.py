@@ -132,21 +132,22 @@ class TestValidateSemanticContracts:
         # would therefore HIDE a leaked, never-closed sink probe — the precise
         # defect this test exists to catch.
         #
-        # There is deliberately NO source class in this list, and adding one
-        # would break the test rather than strengthen it. This fixture's source
-        # feeds `web_scrape`, which declares no input requirements, so the
-        # `if not requirements.fields: continue` fires before its producer is
-        # ever probed — the source probe is unreachable from this shape, not
-        # merely absent from it. Source-probe lifecycle needs a source-fed
-        # CONSUMER and is covered by
-        # TestSourceProducerFactsAreRead::test_source_producer_probe_is_closed.
+        # NO source class belongs in this list — see the failure message.
         assert sorted(type(instance._delegate).__name__ for instance in tracking.instances) == [
             "JSONSink",
             "JSONSink",
             "LineExplode",
             "WebScrapeTransform",
             "WebScrapeTransform",
-        ], "fixture must exercise both transform-consumer probes, the producer probe, and BOTH sink probes"
+        ], (
+            "fixture must exercise both transform-consumer probes, the producer probe, and BOTH sink probes. "
+            "Do NOT add a source class here: this fixture's source feeds web_scrape, and "
+            "web_scrape.input_semantic_requirements().fields == (), so `if not requirements.fields: continue` "
+            "fires before its producer is ever probed. A source probe is UNREACHABLE from this shape, not "
+            "merely absent from it, and adding one would break this test rather than strengthen it. "
+            "Source-probe lifecycle needs a source-fed CONSUMER and is covered by "
+            "TestSourceProducerFactsAreRead::test_source_producer_probe_is_closed."
+        )
         assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
 
     def test_sink_probe_is_closed_even_when_it_leaks_no_requirements(self, monkeypatch: pytest.MonkeyPatch) -> None:
