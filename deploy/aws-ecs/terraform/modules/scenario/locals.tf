@@ -98,6 +98,16 @@ locals {
     "source:aws_s3",
     "source:csv",
     "source:json",
+    # source:llm carries the same posture as transform:llm: an LLM plugin the
+    # deployment authorizes wherever it authorizes LLM use at all. It shipped
+    # and was discoverable but authorized NOWHERE until 2026-08-07
+    # (elspeth-ba6a8dff24), so no cold install could author an LLM source --
+    # acceptance battery rounds 4 and 5 both misread that as the composer
+    # "authoring around" the mechanism when it was simply unreachable. The web
+    # surface was already built for it: required_controls.py budgets
+    # shield/safety controls per llm_source_location, coverage.py derives its
+    # protected output fields, planner_authoring_aids.py carries its rules.
+    "source:llm",
     "source:text",
     "sink:aws_s3",
     "sink:csv",
@@ -125,6 +135,7 @@ locals {
   required_web_plugin_ids = toset([
     "source:csv",
     "source:json",
+    "source:llm",
     "source:text",
     "sink:csv",
     "sink:json",

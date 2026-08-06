@@ -2279,3 +2279,68 @@ def test_every_shipped_web_environment_name_is_a_real_websettings_field() -> Non
     assert f"{prefix}DEPLOYMENT_AWS_REGION" not in shipped, (
         "the module sets the reserved ELSPETH_WEB__DEPLOYMENT_AWS_REGION; settings_from_env rejects it by name and the web task would fail to boot"
     )
+
+
+def _quoted_plugin_ids(body: str) -> set[str]:
+    """Plugin ids from an HCL list body, ignoring commented-out lines."""
+    live = "\n".join(line for line in body.splitlines() if not line.strip().startswith("#"))
+    return set(re.findall(r'"((?:source|sink|transform):[a-z0-9_]+)"', live))
+
+
+def test_scenario_allowlist_authorizes_the_llm_source_like_every_other_llm_plugin() -> None:
+    """``source:llm`` carries the same posture as ``transform:llm``.
+
+    The plugin shipped and was discoverable from the first release, but was
+    authorized in neither the always-authorized web core nor the default
+    allowlist, so no cold install could author an LLM source at all. Two
+    acceptance battery rounds recorded the resulting absence as the composer
+    "authoring around" the mechanism before elspeth-ba6a8dff24 identified it
+    as a configuration gap.
+
+    Pinned as a pair with ``transform:llm``: the operator's decision was
+    parity between the two, so a future edit that drops one and keeps the
+    other is the regression this catches.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\n  \]",
+        locals_text,
+        re.DOTALL,
+    )
+    assert allowlist_match is not None
+    allowlist = _quoted_plugin_ids(allowlist_match.group("body"))
+    assert {"source:llm", "transform:llm"} <= allowlist
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert {"source:llm", "transform:llm"} <= _quoted_plugin_ids(core_match.group("body"))
+
+
+def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
+    """variables.tf restates the web core because HCL validation cannot read a local.
+
+    Two copies of one list drift silently, and the drift is invisible until an
+    operator's plugin_preferences entry is rejected for naming something the
+    deployment does authorize. Pin them equal.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    variables_text = _text("modules/scenario/variables.tf")
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    mirror_match = re.search(
+        r"Hand-mirrors locals\.tf's required_web_plugin_ids.*?toset\(\[(?P<body>.*?)\]\)",
+        variables_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert mirror_match is not None
+    assert _quoted_plugin_ids(core_match.group("body")) == _quoted_plugin_ids(mirror_match.group("body"))

@@ -377,9 +377,14 @@ variable "plugin_preferences" {
         contains(
           setunion(
             toset(var.plugin_allowlist),
+            # Hand-mirrors locals.tf's required_web_plugin_ids: a variable
+            # validation cannot reference a local, so the always-authorized web
+            # core has to be restated here. The two are pinned equal by
+            # test_always_authorized_web_core_mirror_matches_the_locals_set.
             toset([
               "source:csv",
               "source:json",
+              "source:llm",
               "source:text",
               "sink:csv",
               "sink:json",
