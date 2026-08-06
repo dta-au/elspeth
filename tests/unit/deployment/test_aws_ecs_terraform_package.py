@@ -986,7 +986,8 @@ def test_cloudwatch_agent_health_probe_checks_the_bounded_loopback_otlp_listener
 
     assert 'command     = ["CMD", "python", "-c", "' + probe + '"]' in ecs
     assert "kill -0 1" not in ecs
-    assert "FROM python:3.13-slim@" in dockerfile
+    assert "FROM gcr.io/distroless/python3-debian13:debug-nonroot@" in dockerfile
+    assert "ln -s /busybox/sh /usr/bin/sh" in dockerfile
 
     assert '"command": ["CMD", "python", "-c", "' + probe + '"]' in runbook
     assert "`127.0.0.1:4317`" in runbook
