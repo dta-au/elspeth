@@ -75,7 +75,8 @@ member it is compared by membership like every other member, so a consumer that
 does not accept it gets a hard `CONFLICT` — independent of `unknown_policy`,
 because `compare_semantic` short-circuits `CONFLICT` ahead of `UNKNOWN`.
 
-**This is what makes `llm -> text` hard-blockable.** A later phase gives
+**This is what makes `llm -> text` hard-blockable.** A later phase — landed in
+`657d12b42`, the commit after this one — gives
 `TextSink` `accepted_text_framings=frozenset({TextFraming.COMPACT})`;
 `UNCONSTRAINED` is not in `{COMPACT}`, so the composition becomes a
 policy-independent authoring error. Verified:
@@ -165,6 +166,11 @@ already works. §3 is therefore a prerequisite of the `TextSink` requirement, no
 a companion to it, and this ADR is only half-realised until that requirement
 lands.
 
+> **Update (`657d12b42`, same branch):** that requirement has since landed, in
+> the order this section requires — §3 first, the `TextSink` gate second — so
+> the ADR is now fully realised rather than half. The ordering constraint was
+> honoured, not bypassed.
+
 ### 5. Why adding a positively-claimed member is safe today
 
 At the time of this decision, exactly two consumers declare
@@ -181,6 +187,13 @@ No third consumer can be surprised by the addition because no third consumer
 exists. A future consumer that constrains `text_framing` must decide explicitly
 whether unconstrained free text is acceptable to it — which is the point.
 
+> **Update (`657d12b42`, same branch):** the enumeration above is the state on
+> the day of the decision and is retained as such; the live consumer set is now
+> four. `TextSink` arrived as the anticipated third and rejects `UNCONSTRAINED`
+> (`{COMPACT}` only), and `DocumentSink` arrived as a fourth that accepts it.
+> Both made the explicit decision this section asks a new consumer to make,
+> which is the mechanism working rather than an exception to it.
+
 ### 6. Non-goals
 
 - **No change to `compare_semantic`.** `UNCONSTRAINED` is deliberately an
@@ -190,6 +203,11 @@ whether unconstrained free text is acceptable to it — which is the point.
 - **`TextSink.input_semantic_requirements()` is not added here** (§4 ordering),
   nor the `BaseSink`/`BaseSource` hooks and sink-producer walk-back that reading
   a sink requirement would first require.
+  **Update (`657d12b42`, same branch):** all of it landed in the very next
+  commit — both hooks, the sink-producer walk-back, and the `TextSink`
+  requirement itself. This bullet scopes *this decision*; it was never a
+  standing prohibition, and §4 was scheduling that work rather than forbidding
+  it.
 - **Authoring surface only.** `validate_semantic_contracts` is reachable only
   from `web/` — a hand-authored YAML `llm -> text` pipeline gets nothing from
   this. Making the guarantee uniform means expressing it as an ADR-010
@@ -228,12 +246,26 @@ whether unconstrained free text is acceptable to it — which is the point.
 
 - No DB schema, wire-format, or runtime-behaviour change: this is authoring-time
   vocabulary. Existing pipelines are unaffected.
-- `plugins/sources/llm/source.py::output_semantics` remains **unreachable** from
-  the composer's semantic validator, which has no typed route to construct a
-  source and ask it (`BaseSource` has no hook; the probe only knows
-  `create_transform`; ADR-032 forbids bridging that with duck-typing). Its
-  declaration is correct and is what the hook will read once it lands. The llm
-  **transform** is the reachable generative producer today.
+- `plugins/sources/llm/source.py::output_semantics` was **unreachable** from the
+  composer's semantic validator **when this decision was taken**: the validator
+  had no typed route to construct a source and ask it (`BaseSource` had no hook;
+  the probe knew only `create_transform`; ADR-032 forbids bridging that with
+  duck-typing). The declaration was written correct-but-unread, against the hook
+  landing later. The llm **transform** was the only reachable generative
+  producer on that day.
+
+  **Update (`657d12b42`, same branch): it is now live, and this ADR's original
+  wording no longer describes the tree.** Adding the sink requirement of §4
+  required precisely the missing plumbing, so the same commit added
+  `BaseSource.output_semantics()` as a **declared base method** — deliberately
+  not a `hasattr` bridge, which is what ADR-032 rules out — together with
+  `_instantiate_source_producer` in `web/composer/_semantic_validator.py`, which
+  probes through `create_source` rather than `create_transform`. A source-fed
+  sink edge therefore reads the source's own declared facts, and
+  `llm source -> text` is a hard CONFLICT on the source's `UNCONSTRAINED` claim,
+  exactly as the transform edge is. `TestSourceProducerFactsAreRead` in
+  `tests/unit/web/composer/test_semantic_validator.py` pins that the probe
+  really reaches `create_source`, so the gate cannot silently go inert again.
 
 ## Alternatives Considered
 
@@ -271,8 +303,9 @@ markdown-constraining consumer, which is the more dangerous way to be wrong.
 
 - **Extends:** ADR-008 (Runtime Contract Cross-Check) — the semantic-contract
   layer's abstention grading.
-- ADR-032 (Validate by Trust Domain) — why the source-facts gap is not bridged
-  with `hasattr`/duck-typing (§6, Neutral).
+- ADR-032 (Validate by Trust Domain) — why the source-facts gap was never
+  bridged with `hasattr`/duck-typing, and was ultimately closed with a declared
+  `BaseSource` hook instead (§6, Neutral).
 - ADR-014 (Schema Config Mode Contract) — declaration-lie framing used in §2.
 - ADR-010 (Declaration Trust Framework) — the runtime `boundary_check` route
   named as the alternative for uniform, both-surface coverage (§6).
