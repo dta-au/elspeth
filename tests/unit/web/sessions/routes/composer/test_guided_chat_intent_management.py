@@ -103,6 +103,9 @@ def test_unmentioned_unavailable_model_catalog_identity_precedes_weaker_routing_
 
 
 def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
+    """A non-later target is not a future-stage instruction: the current-stage
+    flow owns it, so the action is rejected without minting clarification debt."""
+
     result = _apply(
         _action("numeric_route", target_stage="source"),
         catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
@@ -113,26 +116,94 @@ def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -
     assert result.guided.deferred_intents == ()
 
 
-def test_unmentioned_unavailable_identity_cannot_bypass_responsible_stage_rejection() -> None:
+def test_responsible_stage_rejection_keeps_its_diagnostic_and_retains_clarification_debt() -> None:
+    """The structural diagnostic still wins over the catalog-identity copy
+    (precedence), but the instruction is retained as clarification debt
+    (R2-F15) instead of vanishing."""
+
     result = _apply(
         _action("numeric_route", target_stage="output"),
         catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
     )
 
-    assert type(result) is DeferredRequestUnchanged
+    assert type(result) is DeferredRequestRetained
+    assert result.retained_intent_id == _INTENT_ID
     assert result.chat.error_class == "DeferredIntentRejected"
-    assert result.guided.deferred_intents == ()
+    assert "pending clarification" in result.chat.assistant_message
+    assert "target stage" in result.chat.assistant_message
+    assert "structure was not verified" not in result.chat.assistant_message
+    (intent,) = result.guided.deferred_intents
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
 
 
-def test_unmentioned_available_catalog_identity_still_reaches_routing_validation() -> None:
+def test_unproven_stated_routing_retains_instruction_as_clarification_debt() -> None:
+    """A stated-fact-unproven rejection keeps the instruction as constraint-free
+    clarification debt; the unproven routing facts never persist."""
+
     result = _apply(
         _action("passthrough"),
         catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
     )
 
-    assert type(result) is DeferredRequestUnchanged
+    assert type(result) is DeferredRequestRetained
+    assert result.retained_intent_id == _INTENT_ID
     assert result.chat.error_class == "DeferredIntentRejected"
-    assert result.guided.deferred_intents == ()
+    assert "pending clarification" in result.chat.assistant_message
+    (intent,) = result.guided.deferred_intents
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+
+
+def test_catalog_kind_mismatch_retains_instruction_as_clarification_debt() -> None:
+    """A user-named plugin claimed under the wrong catalog kind is retained as
+    clarification debt; the mis-kinded identity never persists."""
+
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="csv",
+        redacted_summary="Retain a mis-kinded catalog identity.",
+        constraints=(
+            ComponentCountConstraint(
+                kind="component_count",
+                component_kind="node",
+                plugin_kind="transform",
+                plugin_name="csv",
+                operator="at_least",
+                count=1,
+            ),
+        ),
+    )
+    result = apply_deferred_request(
+        action,
+        None,
+        authority=DeferredRequestAuthority(
+            guided=GuidedSession.initial(),
+            catalog=_catalog(available=frozenset({PluginId("source", "csv"), PluginId("sink", "csv")})),
+            originating_message=GuidedOriginatingUserMessageDraft(
+                message_id=_MESSAGE_ID,
+                content="Later add the csv step to the processing.",
+            ),
+            new_intent_id=_INTENT_ID,
+        ),
+        chat=StepChatResult(
+            assistant_message="model-authored response",
+            status=ComposerChatTurnStatus.SUCCESS,
+            latency_ms=7,
+            error_class=None,
+        ),
+    )
+
+    assert type(result) is DeferredRequestRetained
+    assert result.chat.error_class == "DeferredIntentRejected"
+    assert "pending clarification" in result.chat.assistant_message
+    (intent,) = result.guided.deferred_intents
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
 
 
 def _count_intent(

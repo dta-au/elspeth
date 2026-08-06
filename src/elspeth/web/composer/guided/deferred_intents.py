@@ -2198,10 +2198,11 @@ def create_deferred_clarification_intent(
 ) -> DeferredStageIntent:
     """Retain a structurally unverified future-stage instruction durably.
 
-    Last-resort retention (R2-F15 / elspeth-a96b2f1b0a): when the model cannot
-    express the user's future-stage instruction as a well-formed action even
-    after the bounded repair turn, the instruction is kept as a constraint-free
-    clarification intent instead of being discarded. The empty constraint set
+    Last-resort retention (R2-F15 / elspeth-a96b2f1b0a): when the user's
+    future-stage instruction cannot be verified — the model failed to express
+    it as a well-formed action even after the bounded repair turn, or its
+    action was rejected by settlement validation — the instruction is kept as
+    a constraint-free clarification intent instead of being discarded. The empty constraint set
     makes it permanently unclaimable by the planner
     (:func:`evaluate_deferred_intent_coverage` rejects claims on
     constraint-free intents), so it stays visibly pending until the user

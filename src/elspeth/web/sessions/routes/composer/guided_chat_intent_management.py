@@ -317,6 +317,48 @@ def _policy_visible_alternatives(
     return tuple(names[:_MAX_POLICY_VISIBLE_ALTERNATIVES])
 
 
+def _retained_unverified_chat(
+    disposition: DeferredIntentClarification | DeferredIntentRejected,
+    *,
+    latency_ms: int,
+) -> StepChatResult:
+    """Render one retained-but-unverified disposition (R2-F15).
+
+    The instruction is kept as constraint-free clarification debt, so the copy
+    must say it was kept and name the specific missing detail — never the
+    collapsed "couldn't retain" catch-all that implies the instruction is gone.
+    """
+
+    if type(disposition) is DeferredIntentClarification:
+        kinds = ", ".join(disposition.plugin_kinds)
+        detail = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}). Which category did you mean?"
+        error_class = "DeferredIntentClarification"
+    else:
+        reason = cast(DeferredIntentRejected, disposition).reason
+        if reason == "wrong_responsible_stage":
+            detail = (
+                "Its target stage does not match the stage its structural content belongs to. "
+                "Tell me the stage that should own it and I'll firm it up."
+            )
+        elif reason in {"catalog_kind_mismatch", "malformed_catalog_identity"}:
+            detail = (
+                "The plugin it names does not match the catalog under that category. "
+                "Name the exact plugin and its category and I'll firm it up."
+            )
+        else:
+            detail = (
+                "I couldn't verify its structural details against your message. "
+                "Restate the concrete structural requirement and I'll firm it up."
+            )
+        error_class = "DeferredIntentRejected"
+    return StepChatResult(
+        assistant_message=f"I kept your instruction as a pending clarification instead of applying it. {detail}",
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class=error_class,
+    )
+
+
 def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
     structural_node = next(
         (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_identifier(user_message, node_type)),
@@ -433,6 +475,19 @@ def apply_deferred_request(
             receiving_stage=_guided_stage_name(authority.guided.step),
         )
         if structural_rejection is not None:
+            if structural_rejection.reason == "wrong_responsible_stage":
+                # The action claims a later target, so it IS a future-stage
+                # instruction whose encoding the server cannot verify — the
+                # R2-F15 retention net keeps it as clarification debt. The
+                # structural diagnostic still wins over the catalog-identity
+                # copy (precedence).
+                return apply_deferred_clarification(
+                    authority=authority,
+                    chat=_retained_unverified_chat(structural_rejection, latency_ms=chat.latency_ms),
+                )
+            # target_not_later: by its own claim this is not a future-stage
+            # instruction — the current-stage flow owns the content, so
+            # retaining it would mint spurious wire-blocking debt.
             return DeferredRequestUnchanged(
                 guided=authority.guided,
                 chat=_deferred_disposition_chat(
@@ -469,8 +524,23 @@ def apply_deferred_request(
                 authority=authority,
                 chat=_contradiction_chat(disposition, latency_ms=chat.latency_ms, retained=True),
             )
+        if type(disposition) in {DeferredIntentClarification, DeferredIntentRejected}:
+            # Every remaining unverified disposition retains the instruction as
+            # clarification debt (R2-F15): the constraint-free intent carries a
+            # content hash and closed summary only, so no unproven fact, option
+            # literal, or mis-kinded identity persists.
+            return apply_deferred_clarification(
+                authority=authority,
+                chat=_retained_unverified_chat(
+                    cast(DeferredIntentClarification | DeferredIntentRejected, disposition),
+                    latency_ms=chat.latency_ms,
+                ),
+            )
         resolved_chat = _deferred_disposition_chat(disposition, catalog=authority.catalog, latency_ms=chat.latency_ms)
         if type(disposition) is not DeferredIntentAccepted:
+            # DeferredIntentUnsupported: an unavailable plugin remains a
+            # distinct catalog/availability error, never clarification debt
+            # (the user manual's explicit carve-out).
             return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)
         retained = create_deferred_stage_intent(
             disposition.action,
@@ -505,9 +575,11 @@ def apply_deferred_clarification(
     """Append the constraint-free clarification intent for one failed retain.
 
     Last-resort retention (R2-F15): the Send carried a future-stage
-    instruction the model could not express as a well-formed action even after
-    its bounded repair turn. The instruction is kept as a clarification intent
-    bound to the private originating message; the settlement command carries
+    instruction whose encoding could not be verified — the model failed to
+    express it as a well-formed action even after its bounded repair turn, or
+    the action it produced was rejected by settlement validation. The
+    instruction is kept as a clarification intent bound to the private
+    originating message; the settlement command carries
     ``retained_deferred_intent_id`` exactly like an ordinary retain, so
     ``_verify_guided_deferred_intent_append`` verifies the append and message
     binding unchanged.

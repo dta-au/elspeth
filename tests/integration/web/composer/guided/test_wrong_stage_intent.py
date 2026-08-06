@@ -2167,7 +2167,7 @@ def test_real_route_malformed_future_action_degrades_to_durable_clarification_re
 
 
 @pytest.mark.parametrize("stage", ["source", "sink"])
-def test_real_route_rejects_free_form_option_literal_without_leaking_private_prose(
+def test_real_route_unproven_option_literal_retains_clarification_debt_without_leaking_private_prose(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
@@ -2229,11 +2229,16 @@ def test_real_route_rejects_free_form_option_literal_without_leaking_private_pro
     assert response.status_code == 200, response.json()
     response_json = response.json()
     assert response_json["assistant_message"] == (
-        "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
+        "I kept your instruction as a pending clarification instead of applying it. "
+        "I couldn't verify its structural details against your message. "
+        "Restate the concrete structural requirement and I'll firm it up."
     )
     assert private_message not in _text_outside_chat_history(response_json)
     guided = _guided(client, session_id)
-    assert guided.deferred_intents == ()
+    (retained_intent,) = guided.deferred_intents
+    assert retained_intent.constraints == ()
+    assert retained_intent.catalog_kind is None
+    assert private_message not in repr(retained_intent)
     assert guided.chat_history[-2].content == private_message
     assert all("[Future-stage instruction submitted privately.]" not in turn.content for turn in guided.chat_history)
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
@@ -2293,7 +2298,7 @@ def test_exact_policy_denial_wins_over_same_name_visible_in_another_kind_at_each
 
 
 @pytest.mark.parametrize("option_schema", [True, False])
-def test_boolean_property_schema_is_repairable_and_does_not_write_a_deferred_intent(
+def test_boolean_property_schema_retains_constraint_free_clarification_debt(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     option_schema: bool,
@@ -2341,11 +2346,15 @@ def test_boolean_property_schema_is_repairable_and_does_not_write_a_deferred_int
 
     assert response.status_code == 200, response.json()
     assert response.json()["assistant_message"] == (
-        "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
+        "I kept your instruction as a pending clarification instead of applying it. "
+        "I couldn't verify its structural details against your message. "
+        "Restate the concrete structural requirement and I'll firm it up."
     )
     assert private_message not in _text_outside_chat_history(response.json())
     guided = _guided(client, session_id)
-    assert guided.deferred_intents == ()
+    (retained_intent,) = guided.deferred_intents
+    assert retained_intent.constraints == ()
+    assert private_message not in repr(retained_intent)
     assert guided.chat_history[-2].content == private_message
 
 
