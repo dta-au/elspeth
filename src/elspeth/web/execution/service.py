@@ -89,6 +89,7 @@ from elspeth.web.execution.completion_gates import (
     merge_completion_gates,
     parse_completion_gates,
 )
+from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
@@ -2380,6 +2381,24 @@ class ExecutionServiceImpl:
                 if landscape_db is None:
                     raise RuntimeError("Tier-1 invariant: completed run has no open LandscapeDB for accounting projection")
                 accounting = load_run_accounting_from_db(landscape_db, landscape_run_id=result.run_id)
+                # Operator disclosure for discarded rows (elspeth-43f52d69a4):
+                # before this line, a run that discarded rows at source
+                # validation completed with NO log signal at all — the
+                # engine ran clean, so none of the failure-path slogs fire.
+                # Aggregate counts and node attribution only; row content
+                # and validation error text stay in Landscape
+                # (validation_errors / the /diagnostics discards section),
+                # matching the count-only posture of the neighbouring
+                # run_completed_but_externally_cancelled warning.
+                discard_summary = load_discard_summaries_from_db(landscape_db, (result.run_id,)).get(result.run_id)
+                if discard_summary is not None:
+                    slog.warning(
+                        "run_completed_with_discarded_rows",
+                        run_id=run_id,
+                        landscape_run_id=result.run_id,
+                        discard_total=discard_summary.total,
+                        stages=[{"stage": stage.stage, "node_id": stage.node_id, "count": stage.count} for stage in discard_summary.stages],
+                    )
                 self._persist_and_broadcast_run_event(
                     run_id,
                     RunEvent(

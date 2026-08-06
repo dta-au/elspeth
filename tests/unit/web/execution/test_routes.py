@@ -263,6 +263,7 @@ def _create_test_app(
 def _accounting(
     *,
     source_rows: int = 1,
+    rows_rejected: int = 0,
     succeeded: int = 1,
     failed: int = 0,
     structural: int = 0,
@@ -277,7 +278,7 @@ def _accounting(
 ) -> RunAccounting:
     terminal = succeeded + failed + structural
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=source_rows),
+        source=RunAccountingSource(rows_processed=source_rows, rows_rejected=rows_rejected, rows_read=source_rows + rows_rejected),
         tokens=RunAccountingTokens(
             emitted=terminal + pending,
             terminal=terminal,
@@ -1049,6 +1050,7 @@ class TestRunDiagnosticsEndpoint:
                     token_count=9324,
                     preview_limit=50,
                     preview_truncated=True,
+                    discard_count=0,
                     state_counts={},
                     operation_counts={},
                     latest_activity_at=None,
@@ -1056,6 +1058,7 @@ class TestRunDiagnosticsEndpoint:
                 tokens=[],
                 operations=[],
                 artifacts=[],
+                discards=[],
             ),
         )
 
@@ -1148,6 +1151,7 @@ class TestRunDiagnosticsEndpoint:
                     token_count=0,
                     preview_limit=12,
                     preview_truncated=False,
+                    discard_count=0,
                     state_counts={},
                     operation_counts={},
                     latest_activity_at=None,
@@ -1155,6 +1159,7 @@ class TestRunDiagnosticsEndpoint:
                 tokens=[],
                 operations=[],
                 artifacts=[],
+                discards=[],
             )
 
         async def fake_to_thread(func, /, *args, **kwargs):
@@ -1203,6 +1208,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=1,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={"open": 1},
                 operation_counts={"source_load": 1},
                 latest_activity_at=None,
@@ -1210,6 +1216,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1280,6 +1287,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -1287,6 +1295,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1373,6 +1382,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -1380,6 +1390,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1520,6 +1531,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -1527,6 +1539,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1624,6 +1637,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -1631,6 +1645,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1752,6 +1767,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=1,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={"failed": 1},
                 operation_counts={"runtime_preflight": 1},
                 latest_activity_at=datetime.now(UTC),
@@ -1798,6 +1814,7 @@ class TestRunDiagnosticsEndpoint:
                 )
             ],
             artifacts=[],
+            discards=[],
             failure_detail=RunDiagnosticFailureDetail(
                 operation_id="op-1",
                 node_id="llm",
@@ -1872,6 +1889,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=3,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={"completed": 2, "open": 1},
                 operation_counts={},
                 latest_activity_at=datetime.now(UTC),
@@ -1879,6 +1897,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1944,6 +1963,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -1951,6 +1971,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -2024,6 +2045,7 @@ class TestRunDiagnosticsEndpoint:
                 token_count=0,
                 preview_limit=50,
                 preview_truncated=False,
+                discard_count=0,
                 state_counts={},
                 operation_counts={},
                 latest_activity_at=None,
@@ -2031,6 +2053,7 @@ class TestRunDiagnosticsEndpoint:
             tokens=[],
             operations=[],
             artifacts=[],
+            discards=[],
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -2830,7 +2853,10 @@ class TestResultsEndpoint:
                 status="completed_with_failures",
                 started_at=datetime.now(tz=UTC),
                 finished_at=datetime.now(tz=UTC),
-                accounting=_accounting(source_rows=10, succeeded=7, failed=1, routed_success=1, quarantined=1),
+                # rows_rejected must reconcile with validation_errors below —
+                # the fixture used to bake in the exact contradiction
+                # elspeth-43f52d69a4 exists to reject.
+                accounting=_accounting(source_rows=10, rows_rejected=1, succeeded=7, failed=1, routed_success=1, quarantined=1),
                 error=None,
                 landscape_run_id="lscape-1",
                 discard_summary=DiscardSummary(

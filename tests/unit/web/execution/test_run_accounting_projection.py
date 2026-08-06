@@ -14,7 +14,7 @@ from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import run_sources_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import run_sources_table, token_outcomes_table, tokens_table, transform_errors_table
 from elspeth.web.execution.accounting import (
     load_run_accounting_for_settings,
     load_run_accounting_from_db,
@@ -241,6 +241,130 @@ def test_source_accounting_projects_named_sources_and_aggregate_total() -> None:
         assert accounting.source.rows_processed == 3
         assert accounting.sources["orders"].rows_processed == 2
         assert accounting.sources["refunds"].rows_processed == 1
+    finally:
+        db.close()
+
+
+def test_rows_rejected_counts_only_discard_destination_validation_errors() -> None:
+    """A quarantined row is ADMITTED — it is already inside rows_processed.
+
+    Counting ``validation_errors`` without the ``destination='discard'`` scope
+    double-counts quarantined rows, so a run that quarantines every row would
+    report twice as many rows read as the file holds.
+    """
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-vr")
+        factory = RecorderFactory(db)
+        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "alpha"}, "amount: not an int", "fixed", "discard")
+        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "beta"}, "amount: not an int", "fixed", "discard")
+        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "gamma"}, "amount: not an int", "fixed", "rejects")
+
+        accounting = load_run_accounting_from_db(db, landscape_run_id="run-vr")
+
+        assert accounting.source.rows_processed == 1
+        assert accounting.source.rows_rejected == 2
+        assert accounting.source.rows_read == 3
+        assert accounting.sources["source"].rows_rejected == 2
+        assert accounting.sources["source"].rows_read == 3
+    finally:
+        db.close()
+
+
+def test_transform_discards_do_not_feed_source_rows_rejected() -> None:
+    """A row discarded at transform validation was admitted and has a rows row.
+
+    Feeding ``transform_errors`` into ``rows_rejected`` would double-count it
+    against ``rows_processed`` — the same bug as the unscoped count, one table
+    over.
+    """
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-te")
+        factory = RecorderFactory(db)
+        factory.data_flow.register_node(
+            run_id="run-te",
+            node_id="transform",
+            plugin_name="value_transform",
+            node_type=NodeType.TRANSFORM,
+            plugin_version="1.0",
+            config={},
+            schema_config=_OBSERVED_SCHEMA,
+        )
+        _insert_tokens(db, run_id="run-te", row_id="row-1", token_ids=["token-1"])
+        with db.write_connection() as conn:
+            conn.execute(
+                transform_errors_table.insert().values(
+                    error_id="terr-1",
+                    run_id="run-te",
+                    token_id="token-1",
+                    transform_id="transform",
+                    row_hash="hash-1",
+                    row_data_json=None,
+                    error_details_json=None,
+                    destination="discard",
+                    created_at=_NOW,
+                )
+            )
+
+        accounting = load_run_accounting_from_db(db, landscape_run_id="run-te")
+
+        assert accounting.source.rows_processed == 1
+        assert accounting.source.rows_rejected == 0
+        assert accounting.source.rows_read == 1
+    finally:
+        db.close()
+
+
+def test_all_rows_rejected_source_still_appears_in_per_source_accounting() -> None:
+    """The g01 shape at projection level: zero admitted rows must not erase the source."""
+    db = LandscapeDB.in_memory()
+    try:
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-g01")
+        factory.data_flow.register_node(
+            run_id="run-g01",
+            node_id="source-tickets",
+            plugin_name="csv",
+            node_type=NodeType.SOURCE,
+            plugin_version="1.0",
+            config={},
+            schema_config=_OBSERVED_SCHEMA,
+        )
+        with db.write_connection() as conn:
+            conn.execute(
+                run_sources_table.insert().values(
+                    run_id="run-g01",
+                    source_node_id="source-tickets",
+                    source_name="tickets",
+                    plugin_name="csv",
+                    lifecycle_state="loaded",
+                    config_hash="hash-tickets",
+                    schema_json=None,
+                    schema_contract_json=None,
+                    schema_contract_hash=None,
+                    field_resolution_json=None,
+                    recorded_at=_NOW,
+                )
+            )
+        for index in range(4):
+            factory.data_flow.record_validation_error(
+                "run-g01",
+                "source-tickets",
+                {"amount": f"value-{index}"},
+                "amount: not an int",
+                "fixed",
+                "discard",
+            )
+
+        accounting = load_run_accounting_from_db(db, landscape_run_id="run-g01")
+
+        assert accounting.source.rows_processed == 0
+        assert accounting.source.rows_rejected == 4
+        assert accounting.source.rows_read == 4
+        assert accounting.sources["tickets"].rows_processed == 0
+        assert accounting.sources["tickets"].rows_rejected == 4
+        assert accounting.sources["tickets"].rows_read == 4
     finally:
         db.close()
 

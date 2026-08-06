@@ -24,11 +24,13 @@ from elspeth.core.landscape.schema import (
     rows_table,
     token_outcomes_table,
     tokens_table,
+    validation_errors_table,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.discard_summary import _sqlite_database_file_missing
+from elspeth.web.execution.discard_summary import DISCARD_DESTINATION, _sqlite_database_file_missing
 from elspeth.web.execution.schemas import (
     RunDiagnosticArtifact,
+    RunDiagnosticDiscard,
     RunDiagnosticFailureDetail,
     RunDiagnosticNodeState,
     RunDiagnosticOperation,
@@ -280,6 +282,7 @@ def _empty_diagnostics(
             token_count=0,
             preview_limit=preview_limit,
             preview_truncated=False,
+            discard_count=0,
             state_counts={},
             operation_counts={},
             latest_activity_at=None,
@@ -287,6 +290,7 @@ def _empty_diagnostics(
         tokens=[],
         operations=[],
         artifacts=[],
+        discards=[],
     )
 
 
@@ -625,6 +629,48 @@ def load_run_diagnostics_from_db(
                 )
             )
 
+        # Source-validation discards (elspeth-43f52d69a4). A row discarded at
+        # source validation was never admitted: no rows entry, no token, no
+        # node_state, and the source_load operation COMPLETES — so every
+        # token- and operation-anchored query above is structurally blind to
+        # it, and failure_detail (which requires a FAILED operation) is the
+        # wrong carrier. validation_errors is the one table holding the
+        # reason; project it directly, scoped to the 'discard' sentinel —
+        # a quarantined row (destination = a sink name) has a token trail
+        # that already discloses its reason through `tokens`.
+        discard_count = int(
+            conn.execute(
+                select(func.count())
+                .select_from(validation_errors_table)
+                .where(validation_errors_table.c.run_id == landscape_run_id)
+                .where(validation_errors_table.c.destination == DISCARD_DESTINATION)
+            ).scalar_one()
+        )
+        discards: list[RunDiagnosticDiscard] = []
+        if discard_count:
+            discard_stmt = (
+                select(
+                    validation_errors_table.c.node_id,
+                    validation_errors_table.c.schema_mode,
+                    validation_errors_table.c.error,
+                    validation_errors_table.c.created_at,
+                )
+                .where(validation_errors_table.c.run_id == landscape_run_id)
+                .where(validation_errors_table.c.destination == DISCARD_DESTINATION)
+                .order_by(validation_errors_table.c.created_at.asc(), validation_errors_table.c.error_id.asc())
+                .limit(preview_limit)
+            )
+            discards = [
+                RunDiagnosticDiscard(
+                    stage="source_validation",
+                    node_id=row.node_id,
+                    schema_mode=row.schema_mode,
+                    error=row.error,
+                    created_at=row.created_at,
+                )
+                for row in conn.execute(discard_stmt)
+            ]
+
         latest_candidates: list[datetime | None] = [
             conn.execute(select(func.max(tokens_table.c.created_at)).where(tokens_table.c.run_id == landscape_run_id)).scalar_one_or_none(),
             conn.execute(
@@ -656,6 +702,7 @@ def load_run_diagnostics_from_db(
             token_count=token_count,
             preview_limit=preview_limit,
             preview_truncated=token_count > preview_limit,
+            discard_count=discard_count,
             state_counts=state_counts,
             operation_counts=operation_counts,
             latest_activity_at=_max_datetime(latest_candidates),
@@ -678,5 +725,6 @@ def load_run_diagnostics_from_db(
         ],
         operations=operations,
         artifacts=artifacts,
+        discards=discards,
         failure_detail=failure_detail,
     )

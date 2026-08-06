@@ -57,7 +57,7 @@ def _accounting(
     if emitted is None:
         emitted = terminal + pending
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=source_rows),
+        source=RunAccountingSource(rows_processed=source_rows, rows_rejected=0, rows_read=source_rows),
         tokens=RunAccountingTokens(
             emitted=emitted,
             terminal=terminal,
@@ -784,7 +784,7 @@ class TestStrictCoercionRejected:
                 started_at=None,
                 finished_at=None,
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed="7"),  # type: ignore[arg-type]
+                    source=RunAccountingSource(rows_processed="7", rows_rejected=0, rows_read=7),  # type: ignore[arg-type]
                     tokens=RunAccountingTokens(
                         emitted=0,
                         terminal=0,
@@ -815,7 +815,7 @@ class TestStrictCoercionRejected:
                 run_id="r1",
                 status="completed",
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed=10),
+                    source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
                     tokens=RunAccountingTokens(
                         emitted=12,
                         terminal=12,
@@ -856,7 +856,7 @@ class TestStrictCoercionRejected:
             CompletedData(
                 status="completed_with_failures",
                 accounting=RunAccounting(
-                    source=RunAccountingSource(rows_processed="100"),  # type: ignore[arg-type]
+                    source=RunAccountingSource(rows_processed="100", rows_rejected=0, rows_read=100),  # type: ignore[arg-type]
                     tokens=RunAccountingTokens(
                         emitted=98,
                         terminal=98,

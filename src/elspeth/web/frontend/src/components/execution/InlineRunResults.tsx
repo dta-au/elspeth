@@ -17,6 +17,7 @@ import {
   type DiscardStageSummary,
   type DiscardSummary,
   type Run,
+  type RunDiagnosticDiscard,
   type RunProgress,
   type RunStatus,
 } from "@/types/index";
@@ -145,23 +146,70 @@ function discardCauseText(stage: DiscardStageSummary): string {
   }
 }
 
+// A row discarded at source validation never becomes a token, so its reason
+// lives ONLY in the diagnostics `discards` section (elspeth-43f52d69a4) —
+// unlike every other stage, whose reason sits on a failed token node state.
+const MAX_RECORDED_REASONS = 3;
+
+function uniqueDiscardReasons(discards: RunDiagnosticDiscard[]): string[] {
+  const seen = new Set<string>();
+  const reasons: string[] = [];
+  for (const entry of discards) {
+    if (seen.has(entry.error)) continue;
+    seen.add(entry.error);
+    reasons.push(entry.error);
+  }
+  return reasons;
+}
+
 function DiscardSummaryWarning({ run }: { run: Run | null }): JSX.Element | null {
-  const summary = run?.discard_summary;
-  if (!run || !summary || summary.total <= 0) return null;
-  const stage = primaryDiscardStage(summary);
-  if (!stage) return null;
+  const summary = run?.discard_summary ?? null;
+  const stage = summary && summary.total > 0 ? primaryDiscardStage(summary) : null;
+  const wantRecordedReasons = run !== null && stage?.stage === "source_validation";
+  const diagnostics = useExecutionStore((s) =>
+    run ? (s.diagnosticsByRunId[run.id] ?? null) : null,
+  );
+  const diagnosticsError = useExecutionStore((s) =>
+    run ? (s.diagnosticsErrorByRunId[run.id] ?? null) : null,
+  );
+  const loadRunDiagnostics = useExecutionStore((s) => s.loadRunDiagnostics);
+
+  useEffect(() => {
+    if (!wantRecordedReasons || !run || diagnostics) return;
+    void loadRunDiagnostics(run.id);
+  }, [wantRecordedReasons, run, diagnostics, loadRunDiagnostics]);
+
+  if (!run || !summary || summary.total <= 0 || !stage) return null;
   const nodeSuffix = stage.node_id ? ` (${stage.node_id})` : "";
   const terminalNote =
     run.status === "empty"
       ? "Run terminated empty."
       : "Run completed with discarded rows.";
+  const allReasons = wantRecordedReasons ? uniqueDiscardReasons(diagnostics?.discards ?? []) : [];
+  const shownReasons = allReasons.slice(0, MAX_RECORDED_REASONS);
+  const hiddenReasonCount = allReasons.length - shownReasons.length;
   return (
     <div role="alert" className="discard-summary-warning">
       <strong>
         {plural(stage.count, "row")} discarded at {discardStageLabel(stage)}
         {nodeSuffix}. {terminalNote}
       </strong>
-      <span>{discardCauseText(stage)} View diagnostics for the first failed row's error message.</span>
+      {shownReasons.length > 0 ? (
+        <span className="discard-summary-reasons">
+          Recorded rejection {shownReasons.length === 1 ? "reason" : "reasons"}:{" "}
+          {shownReasons.join(" · ")}
+          {hiddenReasonCount > 0 ? ` (+${hiddenReasonCount} more in run diagnostics)` : ""}
+        </span>
+      ) : wantRecordedReasons ? (
+        <span>
+          {discardCauseText(stage)}{" "}
+          {diagnosticsError !== null
+            ? "See run diagnostics for the recorded rejection reasons."
+            : "Loading recorded rejection reasons…"}
+        </span>
+      ) : (
+        <span>{discardCauseText(stage)} View diagnostics for the first failed row's error message.</span>
+      )}
     </div>
   );
 }

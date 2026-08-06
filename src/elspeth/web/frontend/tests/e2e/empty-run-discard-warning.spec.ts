@@ -20,12 +20,15 @@ test.describe("empty run discard visibility", () => {
       const session = await createSession(ctx, "discard-warning-fixture");
       try {
         const runId = "run-discard-all-source-validation";
+        // rows_rejected reconciles with discard_summary.validation_errors —
+        // the backend now rejects the contradictory shape this fixture used
+        // to hard-code (rows_processed: 0 with no row-unit rejection count).
         const runFixture = {
           id: runId,
           session_id: session.id,
           status: "empty",
           accounting: {
-            source: { rows_processed: 0 },
+            source: { rows_processed: 0, rows_rejected: 2, rows_read: 2 },
             tokens: {
               emitted: 0,
               terminal: 0,
@@ -78,6 +81,50 @@ test.describe("empty run discard visibility", () => {
             },
           });
         });
+        // The banner fetches diagnostics to show the RECORDED rejection
+        // reason for source-validation discards — the one discard class with
+        // no token trail (elspeth-43f52d69a4).
+        await page.route(`**/api/runs/${runId}/diagnostics*`, async (route) => {
+          await route.fulfill({
+            json: {
+              run_id: runId,
+              landscape_run_id: "landscape-discard-fixture",
+              run_status: "empty",
+              cancel_requested: false,
+              summary: {
+                token_count: 0,
+                preview_limit: 50,
+                preview_truncated: false,
+                discard_count: 2,
+                state_counts: {},
+                operation_counts: { source_load: 1 },
+                latest_activity_at: "2026-05-24T08:00:01.000Z",
+              },
+              tokens: [],
+              operations: [],
+              artifacts: [],
+              discards: [
+                {
+                  stage: "source_validation",
+                  node_id: "source_csv_upload",
+                  schema_mode: "fixed",
+                  error:
+                    "1 validation error: amount: Input should be a valid integer, unable to parse string as an integer [int_parsing]",
+                  created_at: "2026-05-24T08:00:00.500Z",
+                },
+                {
+                  stage: "source_validation",
+                  node_id: "source_csv_upload",
+                  schema_mode: "fixed",
+                  error:
+                    "1 validation error: amount: Input should be a valid integer, unable to parse string as an integer [int_parsing]",
+                  created_at: "2026-05-24T08:00:00.600Z",
+                },
+              ],
+              failure_detail: null,
+            },
+          });
+        });
 
         const composer = new ComposerPage(page);
         await composer.goto(session.id);
@@ -89,6 +136,11 @@ test.describe("empty run discard visibility", () => {
         await expect(warning).toBeVisible();
         await expect(warning).toContainText("source_csv_upload");
         await expect(warning).toContainText("Run terminated empty");
+        // The RECORDED reason (already boundary-scrubbed server-side), not
+        // the old generic "Common causes" guess with its false "view
+        // diagnostics" pointer.
+        await expect(warning).toContainText("Recorded rejection reason");
+        await expect(warning).toContainText("int_parsing");
       } finally {
         await deleteSession(ctx, session.id);
       }

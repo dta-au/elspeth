@@ -112,7 +112,48 @@ describe("InlineRunResults", () => {
     );
   });
 
-  it("warns when an empty run discarded source-validation rows", () => {
+  it("warns when an empty run discarded source-validation rows", async () => {
+    // Source-validation discards have no token trail, so the banner fetches
+    // the recorded reasons from the diagnostics discards section
+    // (elspeth-43f52d69a4) instead of pointing at a page that used to hold
+    // nothing for this stage.
+    vi.spyOn(apiClient, "fetchRunDiagnostics").mockResolvedValue({
+      run_id: "run-empty",
+      landscape_run_id: "run-empty",
+      run_status: "empty",
+      cancel_requested: false,
+      summary: {
+        token_count: 0,
+        preview_limit: 50,
+        preview_truncated: false,
+        discard_count: 2,
+        state_counts: {},
+        operation_counts: {},
+        latest_activity_at: null,
+      },
+      tokens: [],
+      operations: [],
+      artifacts: [],
+      discards: [
+        {
+          stage: "source_validation",
+          node_id: "source_csv_upload",
+          schema_mode: "fixed",
+          error:
+            "1 validation error: amount: Input should be a valid integer [int_parsing]",
+          created_at: "2026-05-24T08:00:00.500Z",
+        },
+        {
+          stage: "source_validation",
+          node_id: "source_csv_upload",
+          schema_mode: "fixed",
+          error:
+            "1 validation error: amount: Input should be a valid integer [int_parsing]",
+          created_at: "2026-05-24T08:00:00.600Z",
+        },
+      ],
+      failure_detail: null,
+    });
     useExecutionStore.setState({
       activeRunId: null,
       progress: null,
@@ -145,6 +186,12 @@ describe("InlineRunResults", () => {
     expect(warning).toHaveTextContent(/2 rows discarded at source validation/i);
     expect(warning).toHaveTextContent(/source_csv_upload/i);
     expect(warning).toHaveTextContent(/run terminated empty/i);
+    // The recorded (already-scrubbed) reason renders once the diagnostics
+    // fetch resolves; identical reasons collapse to one entry.
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent(/recorded rejection reason:/i);
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent(/int_parsing/);
   });
 
   it("warns with the transform node when transform validation discards rows", () => {
@@ -379,8 +426,8 @@ describe("InlineRunResults", () => {
           session_id: "sess-1",
           status: "completed",
           accounting: {
-            source: { rows_processed: 3 },
-            sources: { source: { rows_processed: 3 } },
+            source: { rows_processed: 3, rows_rejected: 0, rows_read: 3 },
+            sources: { source: { rows_processed: 3, rows_rejected: 0, rows_read: 3 } },
             tokens: {
               emitted: 3,
               terminal: 3,

@@ -10,9 +10,16 @@ from sqlalchemy import and_, func, select
 from elspeth.contracts.audit import DISCARD_SINK_NAME
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.schema import rows_table, run_sources_table, runs_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import (
+    rows_table,
+    run_sources_table,
+    runs_table,
+    token_outcomes_table,
+    tokens_table,
+    validation_errors_table,
+)
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.discard_summary import _sqlite_database_file_missing, _unique_run_ids
+from elspeth.web.execution.discard_summary import DISCARD_DESTINATION, _sqlite_database_file_missing, _unique_run_ids
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -95,6 +102,45 @@ def load_run_accounting_map_from_db(
         )
         for run_id, source_name, count in conn.execute(source_stmt):
             source_rows_by_source[str(run_id)][str(source_name)] = int(count)
+
+        # Rows the source DISCARDED at validation (rows, not tokens): the
+        # destination='discard' scope is load-bearing — a QUARANTINED row
+        # writes a validation_errors entry too (destination = its sink name)
+        # but is admitted and already counted in rows_processed above, so an
+        # unscoped count would double-count it. transform_errors never feed
+        # this number for the same reason (a transform-discarded row was
+        # admitted). Mirrors DiscardSummary's validation arm and
+        # tutorial_service._count_discarded_rows.
+        rejected_rows_by_source: dict[str, dict[str, int]] = {run_id: {} for run_id in present_run_ids}
+        rejected_unattributed = _zero_counts(present_run_ids)
+        rejected_source_name = func.coalesce(run_sources_table.c.source_name, validation_errors_table.c.node_id).label("source_name")
+        rejected_stmt = (
+            select(
+                validation_errors_table.c.run_id,
+                rejected_source_name,
+                func.count().label("count"),
+            )
+            .select_from(
+                validation_errors_table.outerjoin(
+                    run_sources_table,
+                    and_(
+                        run_sources_table.c.run_id == validation_errors_table.c.run_id,
+                        run_sources_table.c.source_node_id == validation_errors_table.c.node_id,
+                    ),
+                )
+            )
+            .where(validation_errors_table.c.run_id.in_(present_run_ids))
+            .where(validation_errors_table.c.destination == DISCARD_DESTINATION)
+            .group_by(validation_errors_table.c.run_id, rejected_source_name)
+        )
+        for run_id, rejected_source, count in conn.execute(rejected_stmt):
+            # validation_errors.node_id is nullable; an unattributable
+            # rejection counts in the aggregate only (the per-source map
+            # would otherwise invent a source name).
+            if rejected_source is None:
+                rejected_unattributed[str(run_id)] += int(count)
+            else:
+                rejected_rows_by_source[str(run_id)][str(rejected_source)] = int(count)
 
         emitted_stmt = (
             select(tokens_table.c.run_id, func.count().label("count"))
@@ -190,6 +236,19 @@ def load_run_accounting_map_from_db(
         pending_tokens = missing_terminal_outcomes[run_id]
         source_rows = source_rows_by_source[run_id]
         source_row_total = sum(source_rows.values())
+        rejected_rows = rejected_rows_by_source[run_id]
+        rejected_row_total = sum(rejected_rows.values()) + rejected_unattributed[run_id]
+        # Union of both maps: a source whose every row was rejected has no
+        # rows_table entries at all, and dropping it from the per-source map
+        # would erase the source from accounting (the g01 shape).
+        per_source = {
+            name: RunAccountingSource(
+                rows_processed=source_rows.get(name, 0),
+                rows_rejected=rejected_rows.get(name, 0),
+                rows_read=source_rows.get(name, 0) + rejected_rows.get(name, 0),
+            )
+            for name in sorted(set(source_rows) | set(rejected_rows))
+        }
 
         closure: Literal["closed", "open", "unknown"] = (
             "closed"
@@ -199,8 +258,12 @@ def load_run_accounting_map_from_db(
             else "open"
         )
         accounting[run_id] = RunAccounting(
-            source=RunAccountingSource(rows_processed=source_row_total),
-            sources={source_name: RunAccountingSource(rows_processed=count) for source_name, count in sorted(source_rows.items())},
+            source=RunAccountingSource(
+                rows_processed=source_row_total,
+                rows_rejected=rejected_row_total,
+                rows_read=source_row_total + rejected_row_total,
+            ),
+            sources=per_source,
             tokens=RunAccountingTokens(
                 emitted=emitted_tokens[run_id],
                 terminal=terminal_tokens[run_id],

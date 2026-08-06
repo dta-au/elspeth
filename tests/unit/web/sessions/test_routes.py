@@ -2274,7 +2274,7 @@ def _insert_discard_audit_records(settings: WebSettings, run_id: str) -> None:
 
 def _fanout_accounting() -> RunAccounting:
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=1),
+        source=RunAccountingSource(rows_processed=1, rows_rejected=0, rows_read=1),
         tokens=RunAccountingTokens(
             emitted=9324,
             terminal=9324,
@@ -2299,7 +2299,7 @@ def _fanout_accounting() -> RunAccounting:
 
 def _open_completed_accounting() -> RunAccounting:
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=1),
+        source=RunAccountingSource(rows_processed=1, rows_rejected=0, rows_read=1),
         tokens=RunAccountingTokens(
             emitted=2,
             terminal=1,
@@ -12565,3 +12565,37 @@ class TestSendMessageTranscriptSnapshot:
             ("user", "first turn"),
             ("assistant", "Reply"),
         ]
+
+
+def test_compose_that_authors_nothing_returns_200_with_null_state(tmp_path: Path) -> None:
+    """Characterisation pin for elspeth-9cd47dc933 (battery r4 g05).
+
+    A compose turn that answers conversationally WITHOUT authoring a pipeline —
+    declining, clarifying, or reporting a rejected set_pipeline — is a
+    successful HTTP turn: 200 with ``state: null``, no composition_state_id,
+    and zero composition-state rows persisted. The client stack is built on
+    this shape (parseResponse throws on any non-2xx; the session store handles
+    null state explicitly), so "fixing" it into a 4xx would render every honest
+    question or decline as a compose failure. Failure IS disclosed: the body
+    carries the null state, and POST /validate then reports ``state_exists``
+    honestly. Do not turn this path into an error status.
+    """
+    app, service = _make_app(tmp_path)
+    app.state.composer_service = _make_composer_mock(
+        "The value_transform sandbox only permits len() and abs() — would you like the LLM-based version instead?",
+    )
+    client = TestClient(app)
+    session = client.post("/api/sessions", json={"title": "g05 characterisation"}).json()
+
+    compose = client.post(
+        f"/api/sessions/{session['id']}/messages",
+        json={"content": "Tidy each headline into title case."},
+    )
+
+    assert compose.status_code == 200
+    body = compose.json()
+    assert body["state"] is None
+    assert body["message"]["composition_state_id"] is None
+    assert body["proposals"] == []
+    current = asyncio.run(service.get_current_state(uuid.UUID(session["id"])))
+    assert current is None

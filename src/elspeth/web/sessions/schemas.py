@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.composer.guided.protocol import GUIDED_MAX_COMPONENTS_PER_KIND
-from elspeth.web.execution.schemas import DiscardSummary, RunAccounting
+from elspeth.web.execution.schemas import DiscardSummary, RunAccounting, check_discard_summary_reconciliation
 from elspeth.web.sessions.protocol import (
     ComposerDensityDefault,
     ComposerTrustMode,
@@ -440,6 +440,18 @@ class RunResponse(_StrictResponse):
     finished_at: datetime | None = None
     composition_version: int
     discard_summary: DiscardSummary | None = None
+
+    @model_validator(mode="after")
+    def _check_discard_reconciliation(self) -> RunResponse:
+        """Session-list carrier of the accounting/discard-summary pair.
+
+        This surface attaches ``discard_summary`` on its own path
+        (``sessions/routes/runs.py``), independent of the ``/api/runs/*``
+        carriers — a validator there does not protect this one
+        (elspeth-43f52d69a4).
+        """
+        check_discard_summary_reconciliation(self.accounting, self.discard_summary)
+        return self
 
 
 class TurnRecordResponse(_StrictResponse):

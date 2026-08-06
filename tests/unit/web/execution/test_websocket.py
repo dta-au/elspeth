@@ -236,7 +236,7 @@ def _accounting(
 ) -> RunAccounting:
     terminal = succeeded + failed + structural
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=source_rows),
+        source=RunAccountingSource(rows_processed=source_rows, rows_rejected=0, rows_read=source_rows),
         tokens=RunAccountingTokens(
             emitted=terminal + pending,
             terminal=terminal,

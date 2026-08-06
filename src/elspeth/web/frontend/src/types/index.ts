@@ -616,8 +616,19 @@ type _AssertTerminalSubset = TerminalRunStatus extends RunStatus ? true : never;
 const _terminalSubsetCheck: _AssertTerminalSubset = true;
 void _terminalSubsetCheck;
 
+/**
+ * Source-ingestion counts. Every field counts ROWS, not tokens
+ * (``RunAccountingSource`` at ``web/execution/schemas.py``).
+ *
+ * ``rows_processed`` — rows admitted into the pipeline (quarantined rows ARE
+ * admitted). ``rows_rejected`` — rows the source discarded at validation;
+ * always equals ``discard_summary.validation_errors`` (backend invariant).
+ * ``rows_read`` — admitted + rejected: the answer to "did it read my data?".
+ */
 export interface RunAccountingSource {
   rows_processed: number;
+  rows_rejected: number;
+  rows_read: number;
 }
 
 export interface RunAccountingTokens {
@@ -820,6 +831,9 @@ export interface RunDiagnosticSummary {
   token_count: number;
   preview_limit: number;
   preview_truncated: boolean;
+  // Total rows discarded at source validation; the (bounded) entries are in
+  // ``RunDiagnostics.discards``.
+  discard_count: number;
   state_counts: Record<string, number>;
   operation_counts: Record<string, number>;
   latest_activity_at: string | null;
@@ -839,6 +853,19 @@ export interface RunDiagnosticFailureDetail {
   failed_at: string;
 }
 
+// One source-validation discard reason, projected from the audit trail's
+// ``validation_errors`` table. A row discarded at source validation has no
+// token, so the token-anchored sections above cannot carry its reason —
+// this section is its only web surface. ``error`` is already
+// boundary-scrubbed server-side; row payload is never included.
+export interface RunDiagnosticDiscard {
+  stage: "source_validation";
+  node_id: string | null;
+  schema_mode: string;
+  error: string;
+  created_at: string;
+}
+
 export interface RunDiagnostics {
   run_id: string;
   landscape_run_id: string;
@@ -848,6 +875,7 @@ export interface RunDiagnostics {
   tokens: RunDiagnosticToken[];
   operations: RunDiagnosticOperation[];
   artifacts: RunDiagnosticArtifact[];
+  discards: RunDiagnosticDiscard[];
   failure_detail: RunDiagnosticFailureDetail | null;
 }
 

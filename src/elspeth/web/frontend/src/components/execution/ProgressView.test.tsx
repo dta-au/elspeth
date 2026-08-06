@@ -132,7 +132,7 @@ describe("ProgressView", () => {
         tokens_routed_failure: 0,
         cancel_requested: false,
         accounting: {
-          source: { rows_processed: 1 },
+          source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
           tokens: {
             emitted: 9_324,
             terminal: 9_324,

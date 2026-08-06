@@ -407,20 +407,20 @@ def _mock_pipeline_settings() -> SimpleNamespace:
 def _run_accounting_for_status(status: RunStatus) -> RunAccounting:
     if status == RunStatus.EMPTY:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=0),
+            source=RunAccountingSource(rows_processed=0, rows_rejected=0, rows_read=0),
             tokens=RunAccountingTokens(emitted=0, terminal=0, succeeded=0, failed=0, structural=0, pending=0),
             routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
             integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),
         )
     if status == RunStatus.COMPLETED_WITH_FAILURES:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=10),
+            source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
             tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=8, failed=2, structural=0, pending=0),
             routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
             integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),
         )
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=10),
+        source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
         tokens=RunAccountingTokens(emitted=10, terminal=10, succeeded=10, failed=0, structural=0, pending=0),
         routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
         integrity=RunAccountingIntegrity(closure="closed", missing_terminal_outcomes=0, duplicate_terminal_outcomes=0),

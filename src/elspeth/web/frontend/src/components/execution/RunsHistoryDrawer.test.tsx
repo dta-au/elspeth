@@ -30,6 +30,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       token_count: 1,
       preview_limit: 50,
       preview_truncated: false,
+      discard_count: 0,
       state_counts: { failed: 1 },
       operation_counts: { runtime_preflight: 1 },
       latest_activity_at: "2026-05-17T00:00:00Z",
@@ -79,6 +80,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       },
     ],
     artifacts: [],
+    discards: [],
     failure_detail: {
       operation_id: "op-1",
       node_id: "rate_colours",

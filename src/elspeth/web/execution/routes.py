@@ -80,6 +80,7 @@ from elspeth.web.execution.schemas import (
     RunStatusResponse,
     ValidationResult,
     WebSocketTicketResponse,
+    revalidated_with_discard_summary,
 )
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.middleware.rate_limit import get_rate_limiter
@@ -1155,7 +1156,13 @@ def create_execution_router() -> APIRouter:
                 (status.landscape_run_id,),
             )
             if status.landscape_run_id in discard_summaries:
-                status = status.model_copy(update={"discard_summary": discard_summaries[status.landscape_run_id]})
+                # NOT model_copy(update=...): that bypasses validators, and
+                # this attach is exactly where the accounting/discard-summary
+                # reconciliation invariant must fire (elspeth-43f52d69a4).
+                try:
+                    status = revalidated_with_discard_summary(status, discard_summaries[status.landscape_run_id])
+                except ValidationError as exc:
+                    raise _run_integrity_http(exc) from exc
         return status
 
     @router.get(
@@ -1356,7 +1363,14 @@ def create_execution_router() -> APIRouter:
                 (status.landscape_run_id,),
             )
             if status.landscape_run_id in discard_summaries:
-                status = status.model_copy(update={"discard_summary": discard_summaries[status.landscape_run_id]})
+                # Same revalidating attach as get_run_status: the terminal
+                # RunResultsResponse below re-validates too, but failing here
+                # routes the contradiction through the structured
+                # run_integrity_error envelope instead of a bare 500.
+                try:
+                    status = revalidated_with_discard_summary(status, discard_summaries[status.landscape_run_id])
+                except ValidationError as exc:
+                    raise _run_integrity_http(exc) from exc
         # mypy can't narrow a Literal through frozenset membership — the
         # cast is safe because RUN_STATUS_NON_TERMINAL_VALUES is the exact
         # complement of RunResultsResponse's Literal values, enforced by a

@@ -9,6 +9,7 @@ from ._helpers import (
     Depends,
     HTTPException,
     LandscapeDB,
+    PydanticValidationError,
     Request,
     RunAuditStoryResponse,
     RunResponse,
@@ -84,8 +85,13 @@ def register_run_routes(router: APIRouter) -> None:
             if run.landscape_run_id is not None and run.landscape_run_id in accounting_by_run_id:
                 accounting = accounting_by_run_id[run.landscape_run_id]
             _validate_run_status_accounting_for_list(run, accounting)
-            responses.append(
-                RunResponse(
+            # RunResponse construction runs the accounting/discard-summary
+            # reconciliation validator (elspeth-43f52d69a4) — the list helper
+            # above never sees discard_summary, so a contradiction fires HERE
+            # and must route through the structured run_integrity_error
+            # envelope, not a bare 500.
+            try:
+                response = RunResponse(
                     id=str(run.id),
                     session_id=str(run.session_id),
                     status=run.status,
@@ -96,7 +102,14 @@ def register_run_routes(router: APIRouter) -> None:
                     composition_version=version,
                     discard_summary=discard_summary,
                 )
-            )
+            except PydanticValidationError as exc:
+                raise _run_accounting_integrity_http(
+                    "Session run failed internal accounting validation.",
+                    run_id=run.id,
+                    landscape_run_id=run.landscape_run_id,
+                    validation_errors=exc.errors(include_url=False, include_context=False, include_input=False),
+                ) from exc
+            responses.append(response)
         return responses
 
     @router.get(

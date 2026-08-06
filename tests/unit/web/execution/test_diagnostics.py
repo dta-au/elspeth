@@ -89,6 +89,7 @@ def _diagnostic_summary(**overrides: object) -> RunDiagnosticSummary:
         "token_count": 1,
         "preview_limit": 50,
         "preview_truncated": False,
+        "discard_count": 0,
         "state_counts": {"completed": 1},
         "operation_counts": {"source_load": 1},
         "latest_activity_at": _DIAGNOSTIC_TIME,
@@ -116,6 +117,7 @@ def _diagnostics_with_state_error(
         ],
         operations=[_diagnostic_operation(status="failed", error_message=operation_error)],
         artifacts=[],
+        discards=[],
         failure_detail=(
             None
             if failure_error is None
@@ -1166,8 +1168,108 @@ def test_diagnostics_empty_when_landscape_run_has_not_started(tmp_path) -> None:
 
         assert diagnostics.summary.token_count == 0
         assert diagnostics.summary.preview_truncated is False
+        assert diagnostics.summary.discard_count == 0
         assert diagnostics.tokens == []
         assert diagnostics.operations == []
         assert diagnostics.artifacts == []
+        assert diagnostics.discards == []
+    finally:
+        db.close()
+
+
+def _seed_source_validation_discards(db: LandscapeDB, *, run_id: str, discard_count: int, quarantined_count: int = 0) -> None:
+    """Seed a run whose source rejected rows at validation with no token trail."""
+    factory = RecorderFactory(db)
+    factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    _register_node(factory, run_id, "source", NodeType.SOURCE, "csv")
+    for index in range(discard_count):
+        factory.data_flow.record_validation_error(
+            run_id,
+            "source",
+            {"amount": f"cell-value-{index}"},
+            f"1 validation error: amount: Input should be a valid integer, row {index} [int_parsing]",
+            "fixed",
+            "discard",
+        )
+    for index in range(quarantined_count):
+        factory.data_flow.record_validation_error(
+            run_id,
+            "source",
+            {"amount": f"quarantined-cell-{index}"},
+            f"1 validation error: amount: Input should be a valid integer, quarantined row {index} [int_parsing]",
+            "fixed",
+            "rejects",
+        )
+
+
+def test_diagnostics_discards_project_recorded_source_validation_reasons(tmp_path) -> None:
+    """The discards section carries the already-scrubbed reason, and ONLY for destination='discard'.
+
+    A quarantined row (destination = a sink name) is admitted and carries its
+    reason on the token trail already; projecting it here would double-report.
+    A discarded row has no token, so this section is its only web surface.
+    """
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        _seed_source_validation_discards(db, run_id=web_run_id, discard_count=2, quarantined_count=1)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="empty",
+            limit=50,
+        )
+
+        assert diagnostics.summary.discard_count == 2
+        assert len(diagnostics.discards) == 2
+        for entry in diagnostics.discards:
+            assert entry.stage == "source_validation"
+            assert entry.node_id == "source"
+            assert entry.schema_mode == "fixed"
+            assert "int_parsing" in entry.error
+        assert "quarantined row" not in diagnostics.model_dump_json()
+    finally:
+        db.close()
+
+
+def test_diagnostics_discards_never_project_row_payload(tmp_path) -> None:
+    """validation_errors.row_data_json is audit material, never web-surface material."""
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        _seed_source_validation_discards(db, run_id=web_run_id, discard_count=2)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="empty",
+            limit=50,
+        )
+
+        assert "cell-value-" not in diagnostics.model_dump_json()
+    finally:
+        db.close()
+
+
+def test_diagnostics_discards_bounded_by_preview_limit_with_honest_total(tmp_path) -> None:
+    """The list is bounded like every other diagnostics preview; the count is not."""
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-1"
+        _seed_source_validation_discards(db, run_id=web_run_id, discard_count=3)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="empty",
+            limit=2,
+        )
+
+        assert diagnostics.summary.discard_count == 3
+        assert len(diagnostics.discards) == 2
     finally:
         db.close()

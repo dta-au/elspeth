@@ -897,7 +897,7 @@ class TestAdr019LegacyCounterReadCompatibility:
     @staticmethod
     def _accounting_from_run(run: RunRecord) -> RunAccounting:
         return RunAccounting(
-            source=RunAccountingSource(rows_processed=run.rows_processed),
+            source=RunAccountingSource(rows_processed=run.rows_processed, rows_rejected=0, rows_read=run.rows_processed),
             tokens=RunAccountingTokens(
                 emitted=run.rows_succeeded + run.rows_failed,
                 terminal=run.rows_succeeded + run.rows_failed,

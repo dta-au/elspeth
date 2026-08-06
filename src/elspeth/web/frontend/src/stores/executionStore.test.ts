@@ -290,8 +290,8 @@ function makeInterpretationEvent(
 
 function makeAccounting(overrides: Partial<RunAccounting> = {}): RunAccounting {
   return {
-    source: { rows_processed: 1 },
-    sources: { source: { rows_processed: 1 } },
+    source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 },
+    sources: { source: { rows_processed: 1, rows_rejected: 0, rows_read: 1 } },
     tokens: {
       emitted: 9_324,
       terminal: 9_324,
@@ -411,6 +411,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
       token_count: 1,
       preview_limit: 50,
       preview_truncated: false,
+      discard_count: 0,
       state_counts: { completed: 1 },
       operation_counts: { source_load: 1 },
       latest_activity_at: null,
@@ -446,6 +447,7 @@ function makeDiagnostics(overrides: Partial<RunDiagnostics> = {}): RunDiagnostic
     ],
     operations: [],
     artifacts: [],
+    discards: [],
     failure_detail: null,
     ...overrides,
   };
@@ -1230,7 +1232,9 @@ describe("executionStore progress events advance live accounting", () => {
   it("refreshes the run list after terminal completion so discard summaries reach the UI", async () => {
     const close = vi.fn();
     const accounting = makeAccounting({
-      source: { rows_processed: 0 },
+      // Reconciles with the discard_summary below (validation_errors: 2) —
+      // the backend rejects the contradictory shape.
+      source: { rows_processed: 0, rows_rejected: 2, rows_read: 2 },
       tokens: {
         emitted: 0,
         terminal: 0,

@@ -36,7 +36,7 @@ _EventData = ProgressData | ErrorData | CompletedData | CancelledData | FailedDa
 
 def _accounting() -> RunAccounting:
     return RunAccounting(
-        source=RunAccountingSource(rows_processed=10),
+        source=RunAccountingSource(rows_processed=10, rows_rejected=0, rows_read=10),
         tokens=RunAccountingTokens(
             emitted=10,
             terminal=10,
