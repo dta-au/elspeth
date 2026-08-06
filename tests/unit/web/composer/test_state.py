@@ -23,6 +23,7 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
     route_destination_facts,
 )
+from elspeth.web.composer.yaml_generator import generate_yaml
 
 
 class TestSourceSpec:
@@ -3580,7 +3581,7 @@ class TestSchemaContractValidation:
         *,
         source_schema: dict[str, Any],
         transformed_branch_schema: dict[str, Any],
-        merge: str = "union",
+        merge: str | None = "union",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
         branch_plugin: str = "value_transform",
     ) -> CompositionState:
@@ -5293,6 +5294,103 @@ class TestSchemaContractValidation:
         result = state.validate()
 
         assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_unset_coalesce_merge_normalizes_to_the_runtime_default(self) -> None:
+        """An omitted ``merge`` becomes ``"union"``, because that is what the runtime runs.
+
+        ``CoalesceSettings.merge`` defaults to ``"union"`` (``core/config.py``),
+        so a coalesce authored without the optional field IS a union merge at
+        run time. Carrying ``None`` through composer state made every union
+        rule read the node as "not a union" and skip it. Normalising once at
+        construction is what keeps a THIRD union rule, added later, from
+        inheriting the same hole.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        assert coalesce.merge == "union"
+        # Non-coalesce nodes keep None: ``merge`` is forbidden on them, and
+        # row_union rejects the field outright (``row_union_field_forbidden``).
+        assert next(node for node in state.nodes if node.id == "fork_gate").merge is None
+
+    def test_unset_coalesce_merge_survives_yaml_generation(self) -> None:
+        """The unset field crashed YAML generation outright — not, as assumed, ``merge: null``.
+
+        ``to_dict()`` emits ``merge`` only when it is set, while
+        ``yaml_generator`` reads ``c["merge"]`` unconditionally, so an unset
+        merge raised ``KeyError`` before pydantic ever saw the config. That
+        made the runtime's answer an internal crash rather than a repair
+        signal. Normalising at construction closes the path that runs through
+        ``state.to_dict()``; a caller injecting its own ``state_dict`` still
+        bypasses ``NodeSpec`` entirely.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
+        assert node_dict["merge"] == "union"
+        assert "merge: union" in generate_yaml(state)
+
+    def test_union_type_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The type mirror must fire on the runtime's default merge, not only the declared one.
+
+        Shipped by the very commit that closed the previous union divergence
+        (elspeth-85f3cc3022): both union mirrors gated on ``merge == "union"``,
+        so an LLM that simply omitted the optional field got ``is_valid=True``
+        on a pipeline the runtime rejects. Omission is the CHEAPEST thing an
+        authoring model does, which made the gap the likeliest path through
+        the surface rather than an exotic one.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].coalesce_union_type is not None
+        assert entries[0].coalesce_union_type.field == "value"
+
+    def test_mode_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The mode mirror shares the gate, so it shares the repair."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_unset_coalesce_merge_stays_valid_when_branch_types_agree(self) -> None:
+        """POSITIVE CONTROL — applying the union rules must not become rejecting the node.
+
+        The runtime ACCEPTS an unset merge; it defaults it. Stage 1 must
+        therefore run the union rules over the node, never reject it for
+        having no explicit merge. Without this control a blanket rejection
+        would satisfy every other test in this group.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
 
     def test_fork_gate_direct_sink_contract_checked(self) -> None:
         """Fork branches that terminate at sinks stay statically checkable."""

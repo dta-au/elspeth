@@ -183,7 +183,9 @@ class NodeSpec:
         fork_to: Fork destinations for fork gates. None for non-fork nodes.
         branches: Branch inputs for coalesce/row_union nodes. None otherwise.
         policy: Coalesce policy. None for non-coalesce nodes.
-        merge: Coalesce merge strategy. None for non-coalesce nodes.
+        merge: Coalesce merge strategy, defaulted to "union" when a coalesce
+            omits it so composer state carries the strategy the runtime will
+            actually run. None for non-coalesce nodes.
         trigger: Aggregation batch trigger config. None for non-aggregation nodes.
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
@@ -209,6 +211,19 @@ class NodeSpec:
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        # ``CoalesceSettings.merge`` DEFAULTS to "union" (core/config.py), so a
+        # coalesce authored without the optional field is a union merge at run
+        # time. Carrying None into composer state made every union rule — which
+        # gates on ``merge == "union"`` — read the node as "not a union" and
+        # skip it, so a type-incompatible merge validated green and died at the
+        # DAG build. Normalising HERE rather than at each gate is the point: it
+        # is the one construction boundary every path routes through
+        # (``from_dict``, ``upsert_node``, ``set_pipeline``, ``replace``), so a
+        # third union rule added later cannot inherit the hole. This defaults
+        # the field, it never requires it — the runtime accepts an unset merge,
+        # and Stage 1 must not be stricter than the runtime.
+        if self.node_type == "coalesce" and self.merge is None:
+            object.__setattr__(self, "merge", "union")
         if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
             branch_tuple = tuple(self.branches)
             normalized_branches: CoalesceBranches = (

@@ -242,7 +242,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             ),
         },
         "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
-        "merge": {"type": ["string", "null"], "description": "Field merge strategy (coalesce only)."},
+        "merge": {
+            "type": ["string", "null"],
+            "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default — union's schema rules are enforced either way.",
+        },
         "trigger": {
             "type": ["object", "null"],
             "description": "Optional early batch trigger config (aggregation only). Omit, null, or {} for end-of-source-only aggregation.",
