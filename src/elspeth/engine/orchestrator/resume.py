@@ -63,7 +63,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 # immutable-success backstops retained beneath (the acquire_run_leadership
 # takeover CAS and the run_lifecycle conditional UPDATEs).
 from elspeth.core.landscape.run_lifecycle_repository import _IMMUTABLE_SUCCESS_RUN_STATUSES
-from elspeth.core.landscape.schema import RunSourceLifecycleState
+from elspeth.core.landscape.schema import SOURCE_COMPLETE_LIFECYCLE_STATES
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
 from elspeth.engine.orchestrator.aggregation import check_aggregation_timeouts
@@ -113,14 +113,6 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
     from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
     from elspeth.engine.orchestrator.types import PipelineConfig, RunResult
-
-
-_SOURCE_COMPLETE_LIFECYCLE_STATES = frozenset(
-    {
-        RunSourceLifecycleState.EXHAUSTED.value,
-        RunSourceLifecycleState.LOADED.value,
-    }
-)
 
 
 def setup_resume_context(
@@ -736,7 +728,7 @@ class ResumeCoordinator:
         incomplete_sources = {
             record.source_name: record.lifecycle_state
             for record in source_lifecycle_records.values()
-            if record.lifecycle_state not in _SOURCE_COMPLETE_LIFECYCLE_STATES
+            if record.lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES
         }
         if incomplete_sources:
             raise IncompleteSourceResumeError(run_id, incomplete_sources)
@@ -1036,7 +1028,7 @@ class ResumeCoordinator:
             incomplete_sources = {
                 state.source_names_by_source[source_node_id]: lifecycle_state
                 for source_node_id, lifecycle_state in state.source_lifecycle_by_source.items()
-                if lifecycle_state not in _SOURCE_COMPLETE_LIFECYCLE_STATES
+                if lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES
             }
             if incomplete_sources:
                 raise IncompleteSourceResumeError(run_id, incomplete_sources)

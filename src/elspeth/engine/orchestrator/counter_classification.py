@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, fields
 from types import MappingProxyType
 
-from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, _NON_TERMINAL_PATHS, TerminalOutcome, TerminalPath
 from elspeth.engine.orchestrator.types import ExecutionCounters
 
 #: Key vocabulary: every legal terminal pair plus the single non-terminal
@@ -119,6 +119,15 @@ TERMINAL_PAIR_COUNTER_EFFECTS: Mapping[TerminalPairKey, TerminalPairCounterEffec
             # terminal outcome deferred to flush time.
             increments=("rows_buffered",),
         ),
+        (None, TerminalPath.ABANDONED): TerminalPairCounterEffect(
+            # ADR-038 non-terminal: written only by run finalization for a
+            # non-resumable dead run. Counts nothing — it is not a predicate
+            # input and has no structural counter; accounting derives the
+            # abandoned tally from token_outcomes directly. Forbidden in
+            # processing results: no executor may ever emit it.
+            increments=(),
+            forbidden_in_processing_results=True,
+        ),
     }
 )
 
@@ -148,9 +157,10 @@ if _terminal_keys != _LEGAL_TERMINAL_PAIRS:
     )
 
 _non_terminal_keys = frozenset(key for key in TERMINAL_PAIR_COUNTER_EFFECTS if key[0] is None)
-if _non_terminal_keys != frozenset({(None, TerminalPath.BUFFERED)}):
+if _non_terminal_keys != frozenset({(None, path) for path in _NON_TERMINAL_PATHS}):
     raise AssertionError(
-        f"TERMINAL_PAIR_COUNTER_EFFECTS non-terminal keys must be exactly {{(None, BUFFERED)}}; got {sorted(str(k) for k in _non_terminal_keys)}."
+        f"TERMINAL_PAIR_COUNTER_EFFECTS non-terminal keys must be exactly "
+        f"{{(None, p) for p in contracts.enums._NON_TERMINAL_PATHS}}; got {sorted(str(k) for k in _non_terminal_keys)}."
     )
 
 _counter_field_names = frozenset(f.name for f in fields(ExecutionCounters) if f.name != "routed_destinations")

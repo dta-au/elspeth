@@ -65,6 +65,7 @@ def _accounting(
             failed=failed,
             structural=structural,
             pending=pending,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=routed_success,
@@ -792,6 +793,7 @@ class TestStrictCoercionRejected:
                         failed=0,
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,
@@ -823,6 +825,7 @@ class TestStrictCoercionRejected:
                         failed="2",  # type: ignore[arg-type]
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,
@@ -864,6 +867,7 @@ class TestStrictCoercionRejected:
                         failed=3,
                         structural=0,
                         pending=0,
+                        abandoned=0,
                     ),
                     routing=RunAccountingRouting(
                         routed_success=0,

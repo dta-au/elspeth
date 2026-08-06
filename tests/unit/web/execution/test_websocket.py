@@ -244,6 +244,7 @@ def _accounting(
             failed=failed,
             structural=structural,
             pending=pending,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(routed_success=0, routed_failure=0, quarantined=0, discarded=0),
         integrity=RunAccountingIntegrity(

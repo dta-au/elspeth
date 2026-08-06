@@ -213,8 +213,11 @@ class TerminalPath(StrEnum):
     sink received) or TRANSIENT (sink-write fallback for visibility).
 
     Stored alongside ``TerminalOutcome`` in the post-Stage-2 ``token_outcomes``
-    schema.  ``BUFFERED`` is the only non-terminal path — it pairs with
-    ``outcome IS NULL`` to mark a row that hasn't decided yet.
+    schema.  Two paths are non-terminal, both pairing with ``outcome IS
+    NULL``: ``BUFFERED`` marks a row that hasn't decided yet and may still
+    decide; ``ABANDONED`` (ADR-038) marks a row that never decided and never
+    will — its run terminated in a state no resume can recover, recorded by
+    run finalization, never by an executor.
     """
 
     DEFAULT_FLOW = "default_flow"
@@ -232,6 +235,7 @@ class TerminalPath(StrEnum):
     EXPAND_PARENT = "expand_parent"
     BATCH_CONSUMED = "batch_consumed"
     BUFFERED = "buffered"
+    ABANDONED = "abandoned"
 
 
 # Closed-set partition over the cross-product of TerminalOutcome and
@@ -261,6 +265,7 @@ _LEGAL_TERMINAL_PAIRS: frozenset[tuple[TerminalOutcome, TerminalPath]] = frozens
 _NON_TERMINAL_PATHS: frozenset[TerminalPath] = frozenset(
     {
         TerminalPath.BUFFERED,
+        TerminalPath.ABANDONED,
     }
 )
 

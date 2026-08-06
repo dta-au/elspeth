@@ -235,8 +235,9 @@ def accumulate_row_outcomes(
             )
         if effect.forbidden_in_processing_results:
             raise OrchestrationInvariantError(
-                f"Diversion path {pair!r} should not appear in processing results — "
-                f"diversions are counted in SinkExecutor, not the processing loop. "
+                f"Pair {pair!r} is forbidden in processing results — diversions are "
+                f"counted in SinkExecutor and ABANDONED is written only by run "
+                f"finalization (ADR-038), never by the processing loop. "
                 f"Token: {result.token}"
             )
 

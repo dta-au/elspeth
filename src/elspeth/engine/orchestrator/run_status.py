@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunCompletionStatus
 from elspeth.contracts.run_result import derive_terminal_run_status
 from elspeth.engine.orchestrator.counter_classification import TERMINAL_PAIR_COUNTER_EFFECTS, apply_counter_increments
@@ -163,6 +163,15 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     counters.rows_coalesce_failed = factory.run_status_projection.count_failed_coalesce_barrier_rows(run_id)
     for outcome_record in outcomes:
         if not outcome_record.completed:
+            if outcome_record.path is TerminalPath.ABANDONED:
+                # ADR-038: an ABANDONED record asserts its run can never be
+                # resumed, yet this derive only executes inside a resume.
+                raise AuditIntegrityError(
+                    f"Resume aggregation for run {run_id!r} read an ABANDONED record "
+                    f"for token {outcome_record.token_id!r}: the audit trail declares "
+                    "this run non-resumable, so a resume deriving its status is an "
+                    "audit contradiction — refusing to continue."
+                )
             if (outcome_record.outcome, outcome_record.path) == (None, TerminalPath.BUFFERED):
                 apply_counter_increments(counters, TERMINAL_PAIR_COUNTER_EFFECTS[(None, TerminalPath.BUFFERED)])
             continue

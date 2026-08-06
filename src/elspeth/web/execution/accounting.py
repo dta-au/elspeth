@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, case, func, or_, select
 
 from elspeth.contracts.audit import DISCARD_SINK_NAME
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
@@ -80,6 +80,7 @@ def load_run_accounting_map_from_db(
         discarded = _zero_counts(present_run_ids)
         missing_terminal_outcomes = _zero_counts(present_run_ids)
         duplicate_terminal_outcomes = _zero_counts(present_run_ids)
+        abandoned_tokens = _zero_counts(present_run_ids)
 
         source_name = func.coalesce(run_sources_table.c.source_name, rows_table.c.source_node_id).label("source_name")
         source_stmt = (
@@ -189,11 +190,16 @@ def load_run_accounting_map_from_db(
             ):
                 discarded[run_id] += value
 
-        completed_by_emitted_token = (
+        # Per-token decision census. The outer join admits completed rows AND
+        # ADR-038 (NULL, ABANDONED) rows; the conditional counts split them so
+        # one pass classifies every emitted token as decided / abandoned /
+        # unexplained.
+        outcomes_by_emitted_token = (
             select(
                 tokens_table.c.run_id.label("run_id"),
                 tokens_table.c.token_id.label("token_id"),
-                func.count(token_outcomes_table.c.outcome_id).label("completed_count"),
+                func.count(case((token_outcomes_table.c.completed == 1, 1))).label("completed_count"),
+                func.count(case((token_outcomes_table.c.path == TerminalPath.ABANDONED.value, 1))).label("abandoned_count"),
             )
             .select_from(
                 tokens_table.outerjoin(
@@ -201,7 +207,10 @@ def load_run_accounting_map_from_db(
                     and_(
                         token_outcomes_table.c.run_id == tokens_table.c.run_id,
                         token_outcomes_table.c.token_id == tokens_table.c.token_id,
-                        token_outcomes_table.c.completed == 1,
+                        or_(
+                            token_outcomes_table.c.completed == 1,
+                            token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
+                        ),
                     ),
                 )
             )
@@ -211,20 +220,45 @@ def load_run_accounting_map_from_db(
         )
 
         missing_stmt = (
-            select(completed_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(completed_by_emitted_token.c.completed_count == 0)
-            .group_by(completed_by_emitted_token.c.run_id)
+            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
+            .where(outcomes_by_emitted_token.c.completed_count == 0)
+            .where(outcomes_by_emitted_token.c.abandoned_count == 0)
+            .group_by(outcomes_by_emitted_token.c.run_id)
         )
         for run_id, count in conn.execute(missing_stmt):
             missing_terminal_outcomes[str(run_id)] = int(count)
 
+        abandoned_stmt = (
+            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
+            .where(outcomes_by_emitted_token.c.completed_count == 0)
+            .where(outcomes_by_emitted_token.c.abandoned_count > 0)
+            .group_by(outcomes_by_emitted_token.c.run_id)
+        )
+        for run_id, count in conn.execute(abandoned_stmt):
+            abandoned_tokens[str(run_id)] = int(count)
+
         duplicate_stmt = (
-            select(completed_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(completed_by_emitted_token.c.completed_count > 1)
-            .group_by(completed_by_emitted_token.c.run_id)
+            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
+            .where(outcomes_by_emitted_token.c.completed_count > 1)
+            .group_by(outcomes_by_emitted_token.c.run_id)
         )
         for run_id, count in conn.execute(duplicate_stmt):
             duplicate_terminal_outcomes[str(run_id)] = int(count)
+
+        # ADR-038 contradiction guard: a token both decided AND abandoned
+        # means the audit trail simultaneously claims a lifecycle answer
+        # exists and that nothing would ever produce one.
+        contradiction_stmt = (
+            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
+            .where(outcomes_by_emitted_token.c.completed_count > 0)
+            .where(outcomes_by_emitted_token.c.abandoned_count > 0)
+            .group_by(outcomes_by_emitted_token.c.run_id)
+        )
+        for run_id, count in conn.execute(contradiction_stmt):
+            raise ValueError(
+                f"Landscape has {int(count)} token(s) both terminally decided and "
+                f"marked ABANDONED for run {run_id!r} — audit contradiction (ADR-038)"
+            )
 
     accounting: dict[str, RunAccounting] = {}
     for run_id in present_run_ids:
@@ -250,13 +284,21 @@ def load_run_accounting_map_from_db(
             for name in sorted(set(source_rows) | set(rejected_rows))
         }
 
-        closure: Literal["closed", "open", "unknown"] = (
-            "closed"
-            if emitted_tokens[run_id] == terminal_tokens[run_id]
+        # ADR-038 closure taxonomy: 'closed' — every token decided;
+        # 'abandoned' — none unexplained, but some explicitly abandoned;
+        # 'open' — unexplained undecided tokens remain.
+        closure: Literal["closed", "open", "abandoned", "unknown"]
+        if (
+            emitted_tokens[run_id] == terminal_tokens[run_id]
             and missing_terminal_outcomes[run_id] == 0
             and duplicate_terminal_outcomes[run_id] == 0
-            else "open"
-        )
+            and abandoned_tokens[run_id] == 0
+        ):
+            closure = "closed"
+        elif missing_terminal_outcomes[run_id] == 0 and duplicate_terminal_outcomes[run_id] == 0 and abandoned_tokens[run_id] > 0:
+            closure = "abandoned"
+        else:
+            closure = "open"
         accounting[run_id] = RunAccounting(
             source=RunAccountingSource(
                 rows_processed=source_row_total,
@@ -271,6 +313,7 @@ def load_run_accounting_map_from_db(
                 failed=failed_tokens[run_id],
                 structural=structural_tokens[run_id],
                 pending=pending_tokens,
+                abandoned=abandoned_tokens[run_id],
             ),
             routing=RunAccountingRouting(
                 routed_success=routed_success[run_id],

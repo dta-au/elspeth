@@ -388,6 +388,10 @@ class RunAccountingTokens(_StrictResponse):
     failed: int = Field(ge=0)
     structural: int = Field(ge=0)
     pending: int = Field(ge=0)
+    # ADR-038: undecided tokens the audit trail explicitly marks as
+    # permanently undecidable — (NULL, ABANDONED) rows written at run
+    # finalization. Disjoint from ``pending`` (undecided, unexplained).
+    abandoned: int = Field(ge=0)
 
     @model_validator(mode="after")
     def _check_token_balance(self) -> Self:
@@ -397,10 +401,11 @@ class RunAccountingTokens(_StrictResponse):
                 f"(got terminal={self.terminal}, succeeded={self.succeeded}, "
                 f"failed={self.failed}, structural={self.structural})"
             )
-        if self.emitted != self.terminal + self.pending:
+        if self.emitted != self.terminal + self.pending + self.abandoned:
             raise ValueError(
-                "tokens.emitted must equal tokens.terminal + tokens.pending "
-                f"(got emitted={self.emitted}, terminal={self.terminal}, pending={self.pending})"
+                "tokens.emitted must equal tokens.terminal + tokens.pending + tokens.abandoned "
+                f"(got emitted={self.emitted}, terminal={self.terminal}, "
+                f"pending={self.pending}, abandoned={self.abandoned})"
             )
         return self
 
@@ -415,9 +420,16 @@ class RunAccountingRouting(_StrictResponse):
 
 
 class RunAccountingIntegrity(_StrictResponse):
-    """Closure integrity of the Landscape token ledger."""
+    """Closure integrity of the Landscape token ledger.
 
-    closure: Literal["closed", "open", "unknown"]
+    ``closure`` values: ``closed`` — every emitted token decided;
+    ``abandoned`` (ADR-038) — every emitted token decided or explicitly
+    abandoned, none unexplained; ``open`` — unexplained undecided tokens
+    remain (a resume may yet decide them, or the audit is incomplete);
+    ``unknown`` — no Landscape evidence available.
+    """
+
+    closure: Literal["closed", "open", "abandoned", "unknown"]
     missing_terminal_outcomes: int = Field(ge=0)
     duplicate_terminal_outcomes: int = Field(ge=0)
 

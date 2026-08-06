@@ -33,6 +33,7 @@ def _fanout_accounting() -> RunAccounting:
             failed=0,
             structural=1,
             pending=0,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=0,
@@ -101,6 +102,7 @@ def test_closed_accounting_requires_all_emitted_tokens_terminal() -> None:
                 failed=0,
                 structural=0,
                 pending=1,
+                abandoned=0,
             ),
             routing=RunAccountingRouting(
                 routed_success=0,
@@ -131,6 +133,7 @@ def test_completed_status_requires_closed_accounting() -> None:
                 failed=0,
                 structural=0,
                 pending=1,
+                abandoned=0,
             ),
         }
     )
@@ -163,6 +166,7 @@ def _zero_token_accounting(*, rows_processed: int, rows_rejected: int, rows_read
             failed=0,
             structural=0,
             pending=0,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=0,

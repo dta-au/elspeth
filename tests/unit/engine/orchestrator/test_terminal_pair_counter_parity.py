@@ -25,7 +25,7 @@ import pytest
 from elspeth.contracts import PendingOutcome, TokenInfo
 from elspeth.contracts.audit import TokenOutcome
 from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.results import FailureInfo
 from elspeth.engine.orchestrator.counter_classification import (
     TERMINAL_PAIR_COUNTER_EFFECTS,
@@ -165,8 +165,10 @@ class TestTableLockstep:
     def test_terminal_keys_match_legal_pairs(self) -> None:
         assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is not None) == _LEGAL_TERMINAL_PAIRS
 
-    def test_only_non_terminal_key_is_buffered(self) -> None:
-        assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is None) == frozenset({(None, TerminalPath.BUFFERED)})
+    def test_non_terminal_keys_are_buffered_and_abandoned(self) -> None:
+        assert frozenset(k for k in TERMINAL_PAIR_COUNTER_EFFECTS if k[0] is None) == frozenset(
+            {(None, TerminalPath.BUFFERED), (None, TerminalPath.ABANDONED)}
+        )
 
     def test_increments_name_real_counter_fields(self) -> None:
         counter_fields = frozenset(f.name for f in fields(ExecutionCounters))
@@ -177,7 +179,7 @@ class TestTableLockstep:
 class TestAuditDeriveMatchesTable:
     """derive_terminal_status_from_audit applies exactly the table's effects."""
 
-    @pytest.mark.parametrize("pair", [p for p in _ALL_TABLE_PAIRS if p != (None, TerminalPath.BUFFERED)], ids=str)
+    @pytest.mark.parametrize("pair", [p for p in _ALL_TABLE_PAIRS if p[0] is not None], ids=str)
     def test_terminal_pair_counters_match_table(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         effect = TERMINAL_PAIR_COUNTER_EFFECTS[pair]
         # COALESCED derive counts only the merged output (sink_name set);
@@ -196,6 +198,15 @@ class TestAuditDeriveMatchesTable:
 
         expected = _expected_counters(TERMINAL_PAIR_COUNTER_EFFECTS[(None, TerminalPath.BUFFERED)])
         _assert_governed_fields_match(counters, expected, context="derive (None, BUFFERED)")
+
+    def test_abandoned_record_crashes_the_derive(self) -> None:
+        """ADR-038: an ABANDONED record on a run being re-derived is an audit
+        contradiction — the record asserts no resume can ever run, yet the
+        derive only executes inside a resume. Fail closed, never count."""
+        factory = _fake_factory([_token_outcome(None, TerminalPath.ABANDONED, sink_name=None, completed=False)])
+
+        with pytest.raises(AuditIntegrityError, match="ABANDONED"):
+            derive_terminal_status_from_audit(factory, "run-1")  # type: ignore[arg-type]
 
     def test_coalesced_consumed_input_counts_nothing(self) -> None:
         """A consumed branch input (sink_name None) delegates to the merged token."""
@@ -221,7 +232,7 @@ class TestLiveAccumulatorMatchesTable:
     @pytest.mark.parametrize("pair", _FORBIDDEN_PAIRS, ids=str)
     def test_diversion_pairs_are_forbidden_in_processing_results(self, pair: tuple[TerminalOutcome | None, TerminalPath]) -> None:
         counters = ExecutionCounters()
-        with pytest.raises(OrchestrationInvariantError, match="Diversion path"):
+        with pytest.raises(OrchestrationInvariantError, match="forbidden in processing results"):
             accumulate_row_outcomes([_row_result(pair[0], pair[1], sink_name=_SINK)], counters, {_SINK: []})
 
 

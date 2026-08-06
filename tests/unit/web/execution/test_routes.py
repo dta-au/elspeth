@@ -286,6 +286,7 @@ def _accounting(
             failed=failed,
             structural=structural,
             pending=pending,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=routed_success,

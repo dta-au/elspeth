@@ -9,7 +9,7 @@ leaves the run resumable as *source-exhausted engine work*:
   the EOF flush runs (source_iteration.py finalize_source_iteration), so a
   flush crash is distinguishable from a mid-source interruption;
 - the resume path accepts exhausted sources (resume.py
-  ``_SOURCE_COMPLETE_LIFECYCLE_STATES``) and drains the restored EOF
+  ``SOURCE_COMPLETE_LIFECYCLE_STATES``) and drains the restored EOF
   aggregation work to the sink;
 - the source plugin is NOT re-invoked on resume (rows replay from persisted
   payloads, never from the source — load() invocation count stays 1);
@@ -206,7 +206,7 @@ class TestExhaustedSourceEOFResume:
 
         Invariants proven:
         - ``lifecycle_state='exhausted'`` sources are ACCEPTED by the public
-          resume path (resume.py ``_SOURCE_COMPLETE_LIFECYCLE_STATES``) — the
+          resume path (resume.py ``SOURCE_COMPLETE_LIFECYCLE_STATES``) — the
           run resumes instead of raising IncompleteSourceResumeError;
         - the restored EOF aggregation work drains: the count-100 trigger
           never fired in-run, so the only flush is the resume's end-of-input

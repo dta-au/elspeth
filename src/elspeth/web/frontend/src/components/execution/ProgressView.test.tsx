@@ -140,6 +140,7 @@ describe("ProgressView", () => {
             failed: 0,
             structural: 1,
             pending: 0,
+            abandoned: 0,
           },
           routing: {
             routed_success: 0,

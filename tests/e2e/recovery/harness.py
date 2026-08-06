@@ -291,7 +291,7 @@ def _run_to_interrupted_checkpoint(tmp_path: Path, clock: MockClock) -> _Crashed
     # kill instant the source HAD fully completed iteration, so flip the one
     # column to the engine's own completed-iteration value ('loaded' — the
     # same value finalize_source_iteration records, and the value resume.py's
-    # _SOURCE_COMPLETE_LIFECYCLE_STATES accepts). FAILED is what the failure
+    # SOURCE_COMPLETE_LIFECYCLE_STATES accepts). FAILED is what the failure
     # ceremony records when the process dies abnormally.
     with db.engine.begin() as conn:
         conn.execute(

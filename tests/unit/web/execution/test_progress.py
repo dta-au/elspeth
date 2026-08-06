@@ -44,6 +44,7 @@ def _accounting() -> RunAccounting:
             failed=0,
             structural=0,
             pending=0,
+            abandoned=0,
         ),
         routing=RunAccountingRouting(
             routed_success=0,

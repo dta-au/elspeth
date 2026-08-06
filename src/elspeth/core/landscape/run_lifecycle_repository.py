@@ -28,11 +28,13 @@ from elspeth.contracts import (
     SecretResolution,
     SecretResolutionInput,
 )
+from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
     mint_worker_id,
 )
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError, RunLeadershipLostError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -48,9 +50,11 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
+from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
-from elspeth.core.landscape.model_loaders import RunLoader
+from elspeth.core.landscape.model_loaders import RunLoader, TokenOutcomeLoader
 from elspeth.core.landscape.reproducibility import compute_grade
 from elspeth.core.landscape.run_coordination_repository import (
     RunCoordinationRepository,
@@ -58,7 +62,9 @@ from elspeth.core.landscape.run_coordination_repository import (
     record_coordination_event,
 )
 from elspeth.core.landscape.schema import (
+    SOURCE_COMPLETE_LIFECYCLE_STATES,
     RunSourceLifecycleState,
+    checkpoints_table,
     nodes_table,
     preflight_results_table,
     run_attributions_table,
@@ -68,7 +74,9 @@ from elspeth.core.landscape.schema import (
     run_workers_table,
     runs_table,
     secret_resolutions_table,
+    token_outcomes_table,
     token_work_items_table,
+    tokens_table,
 )
 
 if TYPE_CHECKING:
@@ -221,12 +229,28 @@ class RunLifecycleRepository:
         # read-only LandscapeDB handle (which never calls begin_run) does not
         # pay — or fail — the coordination repository's Tier-1 PRAGMA probe.
         self._run_coordination: RunCoordinationRepository | None = None
+        # Lazy (ADR-038): complete_run's abandonment sweep records
+        # (NULL, ABANDONED) token outcomes through the real outcomes recorder
+        # so its Tier-1 pair validation applies identically; constructed on
+        # first FAILED/INTERRUPTED finalize.
+        self._token_outcomes: TokenOutcomeRepository | None = None
 
     @property
     def _coordination_repo(self) -> RunCoordinationRepository:
         if self._run_coordination is None:
             self._run_coordination = RunCoordinationRepository(self._db.engine)
         return self._run_coordination
+
+    @property
+    def _outcomes_repo(self) -> TokenOutcomeRepository:
+        if self._token_outcomes is None:
+            self._token_outcomes = TokenOutcomeRepository(
+                self._db,
+                self._ops,
+                token_outcome_loader=TokenOutcomeLoader(),
+                ownership=RowTokenOwnership(self._ops),
+            )
+        return self._token_outcomes
 
     def begin_run(
         self,
@@ -626,6 +650,15 @@ class RunLifecycleRepository:
                     "cannot be stamped successful over an unquiesced journal (ADR-030 §D)."
                 )
 
+            # ADR-038 fate decision: the terminal stamp above succeeded, so
+            # the run is now immutably dead and its resumability facts are
+            # frozen. If no resume can ever decide the run's undecided
+            # tokens, record that — inside this same fenced transaction, so
+            # a deposed leader's refused stamp never leaves false
+            # abandonment records behind.
+            if status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
+                self._abandon_undecided_tokens_in(conn, run_id=run_id, status=status)
+
             # §D follower-departure hygiene (no-op at N=1, evented).
             follower_ids = (
                 conn.execute(
@@ -681,6 +714,86 @@ class RunLifecycleRepository:
                     recorded_at=timestamp,
                     context={"status": status.value},
                 )
+
+    def _abandon_undecided_tokens_in(self, conn: Connection, *, run_id: str, status: RunStatus) -> None:
+        """ADR-038: record (NULL, ABANDONED) for tokens nothing will ever decide.
+
+        Runs inside :meth:`_complete_run_in`'s fenced transaction, after the
+        FAILED/INTERRUPTED terminal UPDATE has succeeded. Fires only when the
+        run is non-resumable, tested arm for arm against the structural
+        refusals a future resume would hit (``engine/orchestrator/resume.py``):
+
+        - no checkpoint rows            → no resume point exists;
+        - no ``run_sources`` records    → ``EmptyResumeStateError``;
+        - any source lifecycle outside ``SOURCE_COMPLETE_LIFECYCLE_STATES``
+                                        → ``IncompleteSourceResumeError``.
+
+        When the run IS resumable, undecided tokens keep their BUFFERED
+        acceptances and accounting stays honestly ``closure='open'`` — a
+        resume may yet decide them. The write is idempotent: tokens already
+        bearing an ABANDONED row are excluded, so a takeover-refusal
+        re-finalize sweeps as a no-op.
+        """
+        source_states = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+        incomplete_sources = {
+            str(row.source_name): str(row.lifecycle_state)
+            for row in source_states
+            if str(row.lifecycle_state) not in SOURCE_COMPLETE_LIFECYCLE_STATES
+        }
+        checkpoint_exists = bool(
+            conn.execute(select(select(checkpoints_table.c.checkpoint_id).where(checkpoints_table.c.run_id == run_id).exists())).scalar()
+        )
+        non_resumable_arms: list[str] = []
+        if not checkpoint_exists:
+            non_resumable_arms.append("no_checkpoint")
+        if not source_states:
+            non_resumable_arms.append("no_source_records")
+        if incomplete_sources:
+            non_resumable_arms.append("incomplete_sources")
+        if not non_resumable_arms:
+            return
+
+        decided_or_abandoned = (
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id == tokens_table.c.token_id)
+            .where(
+                or_(
+                    token_outcomes_table.c.completed == 1,
+                    token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
+                )
+            )
+            .exists()
+        )
+        undecided_token_ids = (
+            conn.execute(
+                select(tokens_table.c.token_id)
+                .where(tokens_table.c.run_id == run_id)
+                .where(~decided_or_abandoned)
+                .order_by(tokens_table.c.token_id)
+            )
+            .scalars()
+            .all()
+        )
+        if not undecided_token_ids:
+            return
+
+        context = {
+            "abandoned_by": "run_finalization",
+            "run_status": status.value,
+            "non_resumable_arms": non_resumable_arms,
+            "incomplete_sources": incomplete_sources,
+        }
+        for token_id in undecided_token_ids:
+            self._outcomes_repo.record_token_outcome(
+                TokenRef(token_id=str(token_id), run_id=run_id),
+                None,
+                TerminalPath.ABANDONED,
+                context=context,
+                conn=conn,
+            )
 
     def get_run(self, run_id: str) -> Run | None:
         """Get a run by ID.

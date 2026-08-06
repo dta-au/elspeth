@@ -638,6 +638,9 @@ export interface RunAccountingTokens {
   failed: number;
   structural: number;
   pending: number;
+  /** ADR-038: undecided tokens explicitly marked permanently undecidable at
+   * run finalization — disjoint from `pending` (undecided, unexplained). */
+  abandoned: number;
 }
 
 export interface RunAccountingRouting {
@@ -648,7 +651,7 @@ export interface RunAccountingRouting {
 }
 
 export interface RunAccountingIntegrity {
-  closure: "closed" | "open" | "unknown";
+  closure: "closed" | "open" | "abandoned" | "unknown";
   missing_terminal_outcomes: number;
   duplicate_terminal_outcomes: number;
 }

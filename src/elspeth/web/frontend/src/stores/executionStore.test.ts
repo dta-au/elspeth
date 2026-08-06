@@ -299,6 +299,7 @@ function makeAccounting(overrides: Partial<RunAccounting> = {}): RunAccounting {
       failed: 0,
       structural: 1,
       pending: 0,
+      abandoned: 0,
     },
     routing: {
       routed_success: 0,
@@ -1242,6 +1243,7 @@ describe("executionStore progress events advance live accounting", () => {
         failed: 0,
         structural: 0,
         pending: 0,
+        abandoned: 0,
       },
     });
     (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close });

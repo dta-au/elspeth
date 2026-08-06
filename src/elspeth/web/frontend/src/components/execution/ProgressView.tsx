@@ -58,6 +58,7 @@ function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }
     ["Tokens Terminal", accounting.tokens.terminal],
     ["Tokens Structural", accounting.tokens.structural],
     ["Tokens Pending", accounting.tokens.pending],
+    ["Tokens Abandoned", accounting.tokens.abandoned],
     ["Rows Discarded", accounting.routing.discarded],
   ] as const;
   const integrityWarnings = [

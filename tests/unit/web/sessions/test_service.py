@@ -905,6 +905,7 @@ class TestAdr019LegacyCounterReadCompatibility:
                 failed=run.rows_failed,
                 structural=0,
                 pending=0,
+                abandoned=0,
             ),
             routing=RunAccountingRouting(
                 routed_success=run.rows_routed_success,

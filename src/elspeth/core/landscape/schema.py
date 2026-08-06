@@ -313,6 +313,20 @@ class RunSourceLifecycleState(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+# ADR-038: the source lifecycle states from which a resume can rebuild source
+# evidence. Shared by the resume gate (``IncompleteSourceResumeError``,
+# engine/orchestrator/resume.py) and the run-finalization abandonment sweep
+# (run_lifecycle_repository) — the sweep abandons exactly when the gate would
+# refuse, and drift between the two predicates is the bug class this shared
+# constant prevents.
+SOURCE_COMPLETE_LIFECYCLE_STATES: frozenset[str] = frozenset(
+    {
+        RunSourceLifecycleState.EXHAUSTED.value,
+        RunSourceLifecycleState.LOADED.value,
+    }
+)
+
+
 # === Runs and Configuration ===
 
 runs_table = Table(

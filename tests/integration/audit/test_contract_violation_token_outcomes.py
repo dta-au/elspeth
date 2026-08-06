@@ -8,8 +8,12 @@ evidence should never contain.
 
 SCOPE BOUNDARY, learned the hard way: this applies to ROW-LEVEL violations,
 whose fate is decided where they raise. It does NOT extend to the aggregation
-flush sites, which look identical but are retryable — see
-``test_aggregation_flush_violation_must_not_terminalize_resumable_tokens``.
+flush sites, which look identical but must never terminalize — see
+``test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens``.
+The aggregation half is instead decided at run finalization (ADR-038): a
+FAILED/INTERRUPTED stamp on a non-resumable run records ``(NULL, ABANDONED)``
+for every undecided token — see
+``test_aggregation_count_flush_violation_abandons_tokens_at_finalization``.
 """
 
 from __future__ import annotations
@@ -188,7 +192,29 @@ def _assert_all_tokens_undecided(db: LandscapeDB, run_id: str) -> None:
     assert accounting.tokens.emitted == 3
     assert accounting.tokens.failed == 0
     assert accounting.tokens.pending == 3
+    assert accounting.tokens.abandoned == 0
     assert accounting.integrity.closure == "open"
+
+
+def _assert_all_tokens_abandoned(db: LandscapeDB, run_id: str) -> None:
+    """ADR-038: undecided-forever tokens carry explicit abandonment records."""
+    accounting = load_run_accounting_from_db(db, landscape_run_id=run_id)
+    assert accounting.tokens.emitted == 3
+    assert accounting.tokens.failed == 0
+    assert accounting.tokens.pending == 0
+    assert accounting.tokens.abandoned == 3
+    assert accounting.integrity.missing_terminal_outcomes == 0
+    assert accounting.integrity.closure == "abandoned"
+    with db.connection() as conn:
+        abandoned_rows = conn.execute(
+            select(token_outcomes_table)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.path == TerminalPath.ABANDONED.value)
+        ).fetchall()
+    assert len(abandoned_rows) == 3
+    for row in abandoned_rows:
+        assert row.outcome is None
+        assert row.completed == 0
 
 
 def test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens(tmp_path: Path) -> None:
@@ -210,6 +236,10 @@ def test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens(tmp_p
     The trigger count is ABOVE the row count, so no count trigger fires and the
     buffer flushes at end of source — the source therefore reaches ``exhausted``
     and the run is genuinely resumable.
+
+    ADR-038's finalization abandonment sweep must NOT fire here: the sources
+    are complete and checkpoints exist, so a resume can still decide these
+    tokens. ``closure='open'`` with ``abandoned=0`` is the honest state.
     """
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     run_id, recovery, graph, _ckpt = _run_failing_aggregation(db, tmp_path, trigger_count=5)
@@ -222,36 +252,32 @@ def test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens(tmp_p
     assert recovery.can_resume(run_id, graph).can_resume
 
 
-def test_aggregation_count_flush_violation_strands_tokens_permanently(tmp_path: Path) -> None:
+def test_aggregation_count_flush_violation_abandons_tokens_at_finalization(tmp_path: Path) -> None:
     """Count-triggered flush: undecided tokens that NOTHING will ever decide.
 
-    The honest counterpart to the END_OF_SOURCE case, and the reason this pair
-    exists: a count trigger fires on the third row's INTAKE, while the source is
-    still ``loading``. The run is therefore NOT resumable in practice — the
-    resume gate says yes, then the resume itself refuses with
-    ``IncompleteSourceResumeError`` because the source never reached a complete
-    lifecycle state. These three tokens are pending FOREVER.
+    The honest counterpart to the END_OF_SOURCE case: a count trigger fires on
+    the third row's INTAKE, while the source is still ``loading``. The run is
+    therefore NOT resumable in practice — the resume gate says yes, then the
+    resume itself refuses with ``IncompleteSourceResumeError`` because the
+    source never reached a complete lifecycle state.
 
-    So this test reproduces elspeth-82d4c5146c's original symptom exactly —
-    ``closure='open'``, ``missing_terminal_outcomes == batch size`` on a
-    finished run — and it is NOT fixed here. This is the unresolved **ADR-019
-    non-terminal-path gap** (ticket comment 2375), the same class as the
-    unexecuted expand sibling.
-
-    Why not terminalize anyway, given these particular tokens are stranded?
-    Because the executor cannot tell this case from the resumable one: both are
-    "a raised flush" at the same raise sites, and the difference (source
-    lifecycle, whether anyone resumes) is decided elsewhere and later. Writing
-    ``(FAILURE, UNROUTED)`` would be right here and catastrophic for the
-    END_OF_SOURCE sibling above, where the §E.3a sweep would release its journal
-    rows. The rule is CONTRADICTION-AVOIDANCE IN THE RESUMABLE CASE, not
-    retryability in this one. The real fix is a non-terminal path that says
-    "abandoned, undecided" without claiming the token failed.
+    This was elspeth-82d4c5146c's original symptom (``closure='open'``,
+    ``missing_terminal_outcomes == batch size`` on a finished run) and the
+    **ADR-019 non-terminal-path gap** (elspeth-b4254f9a01). ADR-038 closes it
+    at the only sound seam: the raise site still records nothing (terminalizing
+    there would trip the §E.3a sweep and destroy the END_OF_SOURCE sibling's
+    resume state — see the test above), and instead the FAILED finalization —
+    inside its fenced terminal transaction, after the stamp — records
+    ``(NULL, ABANDONED)`` for every undecided token because the run's sources
+    never reached a complete lifecycle state. The tokens remain undecided
+    (``completed=0``, ``outcome IS NULL``) but the audit trail now explains
+    that nothing will ever decide them: ``closure='abandoned'``, not a
+    contradiction.
     """
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     run_id, recovery, graph, checkpoint_mgr = _run_failing_aggregation(db, tmp_path, trigger_count=3)
 
-    _assert_all_tokens_undecided(db, run_id)
+    _assert_all_tokens_abandoned(db, run_id)
 
     # Mid-load flush: the source never completed, so nothing can pick these up.
     assert _source_lifecycle_states(db, run_id) == {"primary": "loading"}
@@ -269,8 +295,9 @@ def test_aggregation_count_flush_violation_strands_tokens_permanently(tmp_path: 
             payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
         )
 
-    # Still stranded after the attempted resume — the gap is real, not latent.
-    _assert_all_tokens_undecided(db, run_id)
+    # Still abandoned after the refused resume — the abandonment sweep is
+    # idempotent and the refusal wrote no competing records.
+    _assert_all_tokens_abandoned(db, run_id)
 
 
 class _NonCanonicalEmitter(BaseTransform):

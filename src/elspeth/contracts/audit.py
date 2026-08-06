@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from elspeth.contracts.enums import (
     _LEGAL_TERMINAL_PAIRS,
+    _NON_TERMINAL_PATHS,
     BatchStatus,
     CallStatus,
     CallType,
@@ -1425,8 +1426,11 @@ class TokenOutcome:
                     f"TokenOutcome {self.outcome_id}: ({self.outcome!r}, {self.path!r}) "
                     "is not in _LEGAL_TERMINAL_PAIRS — see ADR-019 mapping table."
                 )
-        elif self.path != TerminalPath.BUFFERED:
-            raise ValueError(f"TokenOutcome {self.outcome_id}: completed=False requires path=BUFFERED (got path={self.path!r})")
+        elif self.path not in _NON_TERMINAL_PATHS:
+            raise ValueError(
+                f"TokenOutcome {self.outcome_id}: completed=False requires a non-terminal "
+                f"path (BUFFERED or ABANDONED — ADR-038), got path={self.path!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1527,6 +1531,12 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
         required=("batch_id",),
         forbidden=_forbid_except("batch_id"),
     ),
+    # ADR-038: an abandonment is not attributable to a sink, batch, or error
+    # site — the reason (run status, non-resumability arm, incomplete source
+    # states) travels in context_json, never in discriminator columns.
+    (None, TerminalPath.ABANDONED): TerminalPairFieldConstraints(
+        forbidden=_DISCRIMINATOR_FIELDS,
+    ),
 }
 
 
@@ -1554,8 +1564,11 @@ def validate_token_outcome_persisted_fields(
         assert outcome is not None
         if (outcome, path) not in _LEGAL_TERMINAL_PAIRS:
             raise ValueError(f"TokenOutcome {outcome_id}: ({outcome!r}, {path!r}) not in _LEGAL_TERMINAL_PAIRS — audit integrity violation")
-    elif path != TerminalPath.BUFFERED:
-        raise ValueError(f"TokenOutcome {outcome_id}: completed=False requires path=BUFFERED, got {path!r} — audit integrity violation")
+    elif path not in _NON_TERMINAL_PATHS:
+        raise ValueError(
+            f"TokenOutcome {outcome_id}: completed=False requires a non-terminal path "
+            f"(BUFFERED or ABANDONED — ADR-038), got {path!r} — audit integrity violation"
+        )
 
     pair: tuple[TerminalOutcome | None, TerminalPath] = (outcome, path)
     constraints = _TERMINAL_PAIR_FIELD_CONSTRAINTS[pair]

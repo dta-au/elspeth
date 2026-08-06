@@ -633,6 +633,9 @@ are insufficient when the claim references audit-table sequencing.
 
 ## Related Decisions
 
+- **Amended by:** ADR-038 (2026-08-06) — adds the second non-terminal path,
+  `(NULL, ABANDONED)`, written by run finalization for tokens on
+  non-resumable dead runs; the terminal mapping table above is unchanged.
 - **Supersedes:** ADR-018 (Producer-Site Outcome Discrimination, 2026-05-02)
 - ADR-004: Explicit Sink Routing
 - Filigree issue `elspeth-d376b8e681`: the deferred Path B question that
