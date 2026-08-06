@@ -221,6 +221,19 @@ class TestWebSettingsValidation:
 
         assert settings.composer_timeout_seconds == 300.0
 
+    def test_log_json_defaults_off_and_routes_to_configure_logging(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-cd98ea9d82 Tier 3: the JSON switch exists, defaults off
+        (local journald stays human-readable), and create_app's logging
+        helper routes it into the shared configure_logging."""
+        from elspeth.web import app as app_module
+
+        assert _settings().log_json is False
+
+        calls: dict[str, Any] = {}
+        monkeypatch.setattr(app_module, "configure_logging", lambda **kw: calls.update(kw))
+        app_module._configure_web_logging(_settings(log_json=True))
+        assert calls == {"json_output": True}
+
     def test_underfunded_turn_budget_warns_with_fundable_estimate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """elspeth-f159d2394b: a turn budget the wall clock cannot fund is
         disclosed at config time. The acceptance deploy authorised 12+8

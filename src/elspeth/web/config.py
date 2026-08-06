@@ -250,6 +250,11 @@ class WebSettings(BaseModel):
     composer_seed: int | None = None
     # Tests/offline development can disable the real provider boot probe.
     composer_boot_probe_enabled: bool = True
+    # JSON log rendering (elspeth-cd98ea9d82 Tier 3): CloudWatch Logs
+    # Insights auto-parses JSON, so `filter request_id = "..."` becomes a
+    # working field query. Off by default — local journald stays the
+    # human-readable console format.
+    log_json: bool = False
     composer_max_composition_turns: int = Field(..., ge=1)
     composer_max_discovery_turns: int = Field(..., ge=1)
     composer_max_tool_calls_per_turn: int = Field(default=16, ge=1)
