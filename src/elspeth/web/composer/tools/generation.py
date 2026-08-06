@@ -200,8 +200,9 @@ def _schema_required_fields(schema: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 _EXPRESSION_GRAMMAR = """\
-Gate Expression Syntax Reference
-=================================
+Expression Syntax Reference
+===========================
+Applies to gate conditions and value_transform expressions.
 
 Variables:
   row      - The current row as a dict. Access fields via row['field_name'].
@@ -212,9 +213,15 @@ Field access:
 
 Operators:
   ==, !=, <, >, <=, >=   Comparison
+  is, is not              Identity (None checks only, e.g. row.get('x') is not None)
   and, or, not            Boolean logic
   in, not in              Membership test
   +, -, *, /, //, %       Arithmetic
+  x if condition else y   Ternary conditional
+
+Literals:
+  Strings, numbers, and the constants True, False, None
+  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — for membership tests
 
 Built-in functions (only these are allowed):
   len()    Length of a sequence or string
@@ -234,6 +241,7 @@ Examples:
 Forbidden:
   row.get('field', default)   Default values fabricate data — use 'is not None' test
   int(row['x'])               Type coercion — coerce at source schema instead
+  row['x'] is row['y']        'is'/'is not' compare against None only
   Imports, lambdas, comprehensions, attribute access (except row.get)
 """
 

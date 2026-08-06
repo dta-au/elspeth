@@ -3710,6 +3710,61 @@ class TestDiscoveryTools:
         assert "row" in grammar
         assert isinstance(grammar, str)
 
+    def test_expression_grammar_documents_every_operator(self) -> None:
+        """Text↔parser doc-parity tripwire: every operator the parser accepts
+        has a token in the served Operators section (A4).
+
+        The operator sets map AST types to callables, so the token table here
+        is hand-maintained — the completeness assertion runs FIRST so an
+        operator added to the parser without a table entry fails loudly
+        before any text check.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import (
+            _BINARY_OPS,
+            _BOOL_OPS,
+            _COMPARISON_OPS,
+            _SAFE_CONSTANTS,
+            _UNARY_OPS,
+        )
+
+        token_table: dict[type, str] = {
+            _ast.Eq: "==",
+            _ast.NotEq: "!=",
+            _ast.Lt: "<",
+            _ast.LtE: "<=",
+            _ast.Gt: ">",
+            _ast.GtE: ">=",
+            _ast.Is: "is",
+            _ast.IsNot: "is not",
+            _ast.In: "in",
+            _ast.NotIn: "not in",
+            _ast.Add: "+",
+            _ast.Sub: "-",
+            _ast.Mult: "*",
+            _ast.Div: "/",
+            _ast.FloorDiv: "//",
+            _ast.Mod: "%",
+            _ast.Not: "not",
+            _ast.USub: "-",
+            _ast.UAdd: "+",
+            _ast.And: "and",
+            _ast.Or: "or",
+        }
+        # Completeness before text: an unmapped operator must fail here, not
+        # silently skip the documentation check.
+        assert set(token_table) == set(_COMPARISON_OPS) | set(_BINARY_OPS) | set(_UNARY_OPS) | set(_BOOL_OPS)
+
+        grammar = get_expression_grammar()
+        operators_section = grammar.split("Operators:")[1].split("Built-in functions")[0]
+        for op_type, token in token_table.items():
+            assert token in operators_section, f"{op_type.__name__} token {token!r} missing from Operators section"
+
+        # Safe constants are part of the accepted grammar too.
+        for constant in _SAFE_CONSTANTS:
+            assert constant in grammar, f"constant {constant!r} undocumented"
+
 
 class TestToolDefinitions:
     def test_all_have_json_schema(self) -> None:
