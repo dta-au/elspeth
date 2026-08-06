@@ -18,6 +18,7 @@ from __future__ import annotations
 import keyword
 import re
 import unicodedata
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -396,3 +397,114 @@ def extend_field_resolution(
         normalization_version=resolution.normalization_version,
         effective_headers=(*resolution.effective_headers, *new_effective_headers),
     )
+
+
+def check_declared_fields_reachable(
+    declared_names: Sequence[str],
+    *,
+    columns: Sequence[str] | None,
+    field_mapping: Mapping[str, str] | None,
+    header_kind: str = "headers",
+) -> None:
+    """Reject declared schema field names that resolution can never produce.
+
+    Sources that route external names through :func:`resolve_field_names` build
+    row keys as ``mapping[h] if h in mapping else h`` over ``normalize_field_name``
+    of each raw header (headered mode) or over ``columns`` verbatim (headerless
+    mode). Declared schema names are used verbatim, so a declared name outside
+    the producible set can never match a row: required fields silently discard
+    every row and optional fields crash contract inference with
+    ``Duplicate original_name`` (elspeth-3664e213c4). Both are config faults,
+    caught here at config-validation time.
+
+    Reachability per mode:
+
+    - Headerless (``columns`` provided): final names are exactly computable via
+      :func:`resolve_field_names`; a declared name must be a member.
+    - Headered (``columns is None``): a declared name ``n`` is reachable iff it
+      is a ``field_mapping`` value (mapping values bypass normalization), or it
+      is its own normalized form — ``normalize_field_name`` is idempotent, so
+      exactly the fixed points are producible by some header — AND it is not a
+      ``field_mapping`` key. A mapping key is renamed on every row where a
+      header produces it, so it never survives as a final name unless it is
+      also a mapping value.
+
+    Sparse JSON-like sources (``require_all_mapping_keys=False``) share this
+    predicate unchanged: relaxing the mapping-key presence check only allows a
+    mapped key to be absent from a given record — every path that introduces a
+    key (:func:`resolve_field_names`, :func:`extend_field_resolution`, and the
+    per-row late-key branches in the JSON-family sources) still applies
+    ``field_mapping`` after normalization, so a mapping key never appears as a
+    final name and mapping values remain reachable.
+
+    Args:
+        declared_names: Schema names the config commits to (declared fields
+            plus guaranteed_fields/required_fields entries), already validated
+            as Python identifiers.
+        columns: Explicit headerless column names, or None for headered mode.
+        field_mapping: Optional effective-name -> final-name overrides.
+        header_kind: Noun for error messages (e.g. "CSV headers",
+            "JSON object keys").
+
+    Raises:
+        ValueError: If any declared name is unreachable, listing every
+            unreachable name with the remedy that makes it reachable.
+    """
+    problems: list[str] = []
+
+    if columns is not None:
+        final_names = set(
+            resolve_field_names(
+                raw_headers=None,
+                field_mapping=dict(field_mapping) if field_mapping else None,
+                columns=list(columns),
+            ).final_headers
+        )
+        for name in declared_names:
+            if name in final_names:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+            else:
+                resolved = ", ".join(f"'{header}'" for header in sorted(final_names))
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"the resolved column names are {resolved}. "
+                    f"Declare one of the resolved names, or adjust columns/field_mapping."
+                )
+    else:
+        mapping_values = set(field_mapping.values()) if field_mapping else set()
+        for name in declared_names:
+            if name in mapping_values:
+                continue
+            if field_mapping and name in field_mapping:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"field_mapping renames '{name}' to '{field_mapping[name]}'. "
+                    f"Declare '{field_mapping[name]}', or remove the field_mapping entry."
+                )
+                continue
+            try:
+                normalized = normalize_field_name(name)
+            except ExternalHeaderError:
+                # e.g. '_' — normalization strips it to nothing, so no external
+                # header can produce it and it is not a mapping value.
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"no {header_kind[:-1] if header_kind.endswith('s') else header_kind} normalizes to it. "
+                    f"Use field_mapping to produce it."
+                )
+                continue
+            if normalized != name:
+                problems.append(
+                    f"declared field '{name}' can never appear on a row from this source: "
+                    f"{header_kind} are normalized to lowercase identifiers ('{name}' -> '{normalized}'). "
+                    f"Declare '{normalized}', or add field_mapping: {{{normalized}: {name}}} to preserve the original name."
+                )
+
+    if problems:
+        raise ValueError("\n".join(problems))

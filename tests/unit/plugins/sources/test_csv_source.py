@@ -1493,3 +1493,198 @@ class TestCSVSourceQuarantineErrorRedaction:
         assert "SECRET-abc123" not in rows[0].quarantine_error, "quarantine_error must not echo the offending input value"
         assert "id" in rows[0].quarantine_error, "field loc must survive for triage"
         assert rows[0].row == {"id": "SECRET-abc123"}
+
+
+class TestDeclaredFieldReachability:
+    """Config-time rejection of declared names no row can carry (elspeth-3664e213c4).
+
+    CSV headers are normalized to lowercase Python identifiers at the source
+    boundary, but declared schema names are used verbatim. A declared name that
+    no normalized header, ``columns`` entry, or ``field_mapping`` value can ever
+    produce used to silently discard 100% of rows (required fields) or crash
+    contract inference with ``Duplicate original_name`` (optional fields). Such
+    a declaration is now rejected when the config is built.
+    """
+
+    MIXED_CASE_CSV = "TicketID,CustomerName,Priority,Summary\nT-1,Alice,high,Broken\nT-2,Bob,low,Slow\n"
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create a plugin context with real landscape and source node records."""
+        return make_source_context(plugin_name="csv")
+
+    def _write_csv(self, tmp_path: Path) -> Path:
+        csv_file = tmp_path / "tickets.csv"
+        csv_file.write_text(self.MIXED_CASE_CSV)
+        return csv_file
+
+    @staticmethod
+    def _structured_fields(*names: str) -> list[dict[str, str]]:
+        return [{"name": name, "field_type": "str"} for name in names]
+
+    def test_mixed_case_declared_names_rejected_at_config_time(self, tmp_path: Path) -> None:
+        """Raw header names declared verbatim can never match normalized row keys -> rejected.
+
+        This replaces the former silent outcome where the config was accepted
+        and every row failed ``model_validate`` with ``Field required``.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        with pytest.raises(PluginConfigError, match="can never appear") as exc_info:
+            CSVSource(
+                {
+                    "path": str(self._write_csv(tmp_path)),
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": self._structured_fields("TicketID", "CustomerName", "Priority", "Summary"),
+                    },
+                    "on_validation_failure": "discard",
+                }
+            )
+
+        message = str(exc_info.value)
+        assert "'TicketID'" in message
+        assert "'ticketid'" in message, "rejection must name the reachable normalized form"
+        assert "field_mapping" in message, "rejection must name the preserve-original remedy"
+
+    def test_case_matched_declared_names_accepted_and_yield_rows(self, tmp_path: Path, ctx: PluginContext) -> None:
+        """Control for the rejection test: same file, same structured spec form,
+        normalized names -> accepted and every row validates.
+
+        The pair pins the discriminator as case-match against the normalized
+        header — not the field-spec form (structured vs bare string).
+        """
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        source = CSVSource(
+            {
+                "path": str(self._write_csv(tmp_path)),
+                "schema": {
+                    "mode": "flexible",
+                    "fields": self._structured_fields("ticketid", "customername", "priority", "summary"),
+                },
+                "on_validation_failure": "discard",
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 2
+        assert all(not row.is_quarantined for row in rows)
+        assert rows[0].row == {"ticketid": "T-1", "customername": "Alice", "priority": "high", "summary": "Broken"}
+
+    def test_mixed_case_declared_names_with_field_mapping_accepted(self, tmp_path: Path, ctx: PluginContext) -> None:
+        """field_mapping values bypass normalization, so mapped originals stay declarable."""
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        source = CSVSource(
+            {
+                "path": str(self._write_csv(tmp_path)),
+                "schema": {
+                    "mode": "flexible",
+                    "fields": self._structured_fields("TicketID", "CustomerName", "Priority", "Summary"),
+                },
+                "on_validation_failure": "discard",
+                "field_mapping": {
+                    "ticketid": "TicketID",
+                    "customername": "CustomerName",
+                    "priority": "Priority",
+                    "summary": "Summary",
+                },
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 2
+        assert all(not row.is_quarantined for row in rows)
+        assert rows[0].row == {"TicketID": "T-1", "CustomerName": "Alice", "Priority": "high", "Summary": "Broken"}
+
+    def test_headerless_columns_mixed_case_accepted(self, tmp_path: Path, ctx: PluginContext) -> None:
+        """Headerless ``columns`` entries are used as-is (never normalized), so a
+        declared name matching a column is reachable regardless of case."""
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        csv_file = tmp_path / "headerless.csv"
+        csv_file.write_text("T-1\nT-2\n")
+
+        source = CSVSource(
+            {
+                "path": str(csv_file),
+                "schema": {"mode": "fixed", "fields": self._structured_fields("TicketID")},
+                "on_validation_failure": "discard",
+                "columns": ["TicketID"],
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert [row.row for row in rows] == [{"TicketID": "T-1"}, {"TicketID": "T-2"}]
+
+    def test_headerless_columns_mismatched_declared_name_rejected(self, tmp_path: Path) -> None:
+        """Headerless mode has exactly computable final names — a declared name
+        absent from the resolved columns is rejected."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            CSVSource(
+                {
+                    "path": str(tmp_path / "headerless.csv"),
+                    "schema": {"mode": "fixed", "fields": self._structured_fields("TicketID")},
+                    "on_validation_failure": "discard",
+                    "columns": ["ticketid"],
+                }
+            )
+
+    def test_declared_name_renamed_away_by_field_mapping_rejected(self, tmp_path: Path) -> None:
+        """A declared name that IS a field_mapping key is renamed on every row
+        that could carry it, so it can never survive to validation."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        with pytest.raises(PluginConfigError, match="can never appear") as exc_info:
+            CSVSource(
+                {
+                    "path": str(tmp_path / "tickets.csv"),
+                    "schema": {"mode": "flexible", "fields": self._structured_fields("ticketid")},
+                    "on_validation_failure": "discard",
+                    "field_mapping": {"ticketid": "TicketID"},
+                }
+            )
+
+        message = str(exc_info.value)
+        assert "renames" in message
+        assert "'TicketID'" in message, "rejection must name the reachable mapped form"
+
+    def test_optional_mixed_case_declared_fields_rejected(self, tmp_path: Path) -> None:
+        """Optional unreachable fields used to pass pydantic (defaulted to None)
+        and then crash contract inference on the production CLI path with
+        ``ValueError: Duplicate original_name``. Config-time rejection closes
+        that path: the run never starts."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            CSVSource(
+                {
+                    "path": str(self._write_csv(tmp_path)),
+                    "schema": {"mode": "flexible", "fields": ["TicketID: str?", "CustomerName: str?"]},
+                    "on_validation_failure": "discard",
+                }
+            )
+
+    @pytest.mark.parametrize("contract_key", ["guaranteed_fields", "required_fields"])
+    def test_observed_contract_fields_mixed_case_rejected(self, tmp_path: Path, contract_key: str) -> None:
+        """Observed schemas carry contracts through guaranteed_fields/required_fields
+        without declared fields; unreachable names there are the same false
+        build-time guarantee and are rejected identically."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.csv_source import CSVSource
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            CSVSource(
+                {
+                    "path": str(self._write_csv(tmp_path)),
+                    "schema": {"mode": "observed", contract_key: ["TicketID"]},
+                    "on_validation_failure": "discard",
+                }
+            )

@@ -1372,3 +1372,51 @@ class TestAWSS3SourceAuditAndLifecycle:
             source.close()
         assert exc_info.value is failure
         assert client.closed == 1
+
+
+class TestDeclaredFieldReachability:
+    """Config-time rejection of declared names no row can carry (elspeth-3664e213c4).
+
+    S3 shares the CSV/JSON resolution seam: headered CSV and JSON object keys
+    are normalized to lowercase identifiers while declared schema names are
+    used verbatim. Headerless CSV differs — ``columns`` (or, absent columns,
+    the declared schema names themselves) become the final names as-is.
+    """
+
+    def test_headered_csv_mixed_case_declared_names_rejected(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            AWSS3SourceConfig.from_dict(_config(schema={"mode": "flexible", "fields": [{"name": "TicketID", "field_type": "str"}]}))
+
+    def test_json_mixed_case_declared_names_rejected(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            AWSS3SourceConfig.from_dict(
+                _config(
+                    key="incoming/data.json",
+                    format="json",
+                    schema={"mode": "flexible", "fields": [{"name": "TicketID", "field_type": "str"}]},
+                )
+            )
+
+    def test_headerless_csv_schema_names_are_columns_so_mixed_case_accepted(self) -> None:
+        """Headerless CSV without ``columns`` uses the declared schema names AS
+        the column names, unnormalized — declaration and final headers agree by
+        construction, so mixed case is reachable and must stay accepted."""
+        from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
+
+        cfg = AWSS3SourceConfig.from_dict(
+            _config(
+                csv_options={"has_header": False},
+                schema={"mode": "fixed", "fields": [{"name": "TicketID", "field_type": "str"}]},
+            )
+        )
+        assert cfg.schema_config.fields is not None
+
+    def test_headered_csv_normalized_declared_names_accepted(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
+
+        cfg = AWSS3SourceConfig.from_dict(_config(schema={"mode": "flexible", "fields": [{"name": "ticketid", "field_type": "str"}]}))
+        assert cfg.schema_config.fields is not None

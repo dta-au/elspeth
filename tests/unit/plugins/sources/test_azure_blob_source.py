@@ -1178,3 +1178,40 @@ class TestAzureBlobSparseFieldMapping:
         r2b = src2._normalize_row_keys({"id": 1})
         assert dict(r1b) == {"id": 2, "client_name": "Alice"}
         assert dict(r2b) == {"id": 1}
+
+
+class TestDeclaredFieldReachability:
+    """Config-time rejection of declared names no row can carry (elspeth-3664e213c4).
+
+    Azure Blob shares the CSV/JSON resolution seam with the csv/json/s3
+    sources: headered CSV and JSON object keys are normalized to lowercase
+    identifiers while declared schema names are used verbatim.
+    """
+
+    def test_headered_csv_mixed_case_declared_names_rejected(self) -> None:
+        from elspeth.plugins.sources.azure_blob_source import AzureBlobSourceConfig
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            AzureBlobSourceConfig.from_dict(
+                _base_config(schema={"mode": "flexible", "fields": [{"name": "TicketID", "field_type": "str"}]})
+            )
+
+    def test_json_mixed_case_declared_names_rejected(self) -> None:
+        from elspeth.plugins.sources.azure_blob_source import AzureBlobSourceConfig
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            AzureBlobSourceConfig.from_dict(
+                _base_config(
+                    blob_path="data/input.json",
+                    format="json",
+                    schema={"mode": "flexible", "fields": [{"name": "TicketID", "field_type": "str"}]},
+                )
+            )
+
+    def test_headered_csv_normalized_declared_names_accepted(self) -> None:
+        from elspeth.plugins.sources.azure_blob_source import AzureBlobSourceConfig
+
+        cfg = AzureBlobSourceConfig.from_dict(
+            _base_config(schema={"mode": "flexible", "fields": [{"name": "ticketid", "field_type": "str"}]})
+        )
+        assert cfg.schema_config.fields is not None

@@ -39,13 +39,14 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSource
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig
+from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldMappingCollisionError,
     FieldResolution,
+    check_declared_fields_reachable,
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
@@ -220,6 +221,30 @@ class AWSS3SourceConfig(DataPluginConfig):
             validate_field_names(self.columns, "columns")
         if self.field_mapping:
             validate_field_names(list(self.field_mapping.values()), "field_mapping values")
+
+        # Reject declared schema names the resolution can never produce
+        # (elspeth-3664e213c4). Headered CSV and JSON object keys are
+        # normalized to lowercase identifiers; headerless CSV resolves the
+        # explicit columns — or, absent columns, the declared schema names
+        # themselves (guaranteed non-empty by the check above) — verbatim.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            if self.format == "csv" and not self.csv_options.has_header:
+                schema_fields = self.schema_config.fields
+                effective_columns = self.columns if self.columns is not None else [fd.name for fd in schema_fields or ()]
+                check_declared_fields_reachable(
+                    declared,
+                    columns=effective_columns,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers",
+                )
+            else:
+                check_declared_fields_reachable(
+                    declared,
+                    columns=None,
+                    field_mapping=self.field_mapping,
+                    header_kind="CSV headers" if self.format == "csv" else "JSON object keys",
+                )
         return self
 
 
@@ -837,7 +862,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:99056bdf5f47905a"
+    source_file_hash: str | None = "sha256:974f13a9219f6298"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 

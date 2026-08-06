@@ -2424,3 +2424,29 @@ class TestFieldMappingCollisionPolarity:
 
         with pytest.raises(ValueError, match="collision"):
             list(source.load(ctx))
+
+
+class TestDeclaredFieldReachability:
+    """Config-time rejection of declared names no row can carry (elspeth-3664e213c4).
+
+    Dataverse shares the sparse JSON-object resolution seam: attribute names
+    are normalized to lowercase identifiers while declared schema names are
+    used verbatim, so a declared mixed-case name can never match a row key.
+    """
+
+    def test_mixed_case_declared_names_rejected(self) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="can never appear"):
+            DataverseSourceConfig.from_dict(
+                _base_config(schema={"mode": "flexible", "fields": [{"name": "FullName", "field_type": "str"}]})
+            )
+
+    def test_normalized_declared_names_accepted(self) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(
+            _base_config(schema={"mode": "flexible", "fields": [{"name": "fullname", "field_type": "str"}]})
+        )
+        assert cfg.schema_config.fields is not None

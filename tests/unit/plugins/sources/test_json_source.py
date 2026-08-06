@@ -1917,3 +1917,77 @@ class TestJSONSourceQuarantineErrorRedaction:
         assert "id" in rows[0].quarantine_error, "field loc must survive for triage"
         # Full raw detail still travels to the quarantine sink on the row itself.
         assert rows[0].row == {"id": "SECRET-abc123"}
+
+
+class TestDeclaredFieldReachabilityJSON:
+    """Config-time rejection of declared names no row can carry (elspeth-3664e213c4).
+
+    JSON object keys are normalized to lowercase Python identifiers at the
+    source boundary exactly like CSV headers, so a declared ``TicketID`` can
+    never match a row keyed ``ticketid``. Confirmed sibling of the CSV defect
+    (same resolve -> model_validate seam); rejected at config time.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        return make_source_context(plugin_name="json")
+
+    def _write_json(self, tmp_path: Path) -> Path:
+        json_file = tmp_path / "tickets.json"
+        json_file.write_text(
+            json.dumps(
+                [
+                    {"TicketID": "T-1", "CustomerName": "Alice"},
+                    {"TicketID": "T-2", "CustomerName": "Bob"},
+                ]
+            )
+        )
+        return json_file
+
+    def test_mixed_case_declared_names_rejected_at_config_time(self, tmp_path: Path) -> None:
+        """Raw object keys declared verbatim can never match normalized row keys -> rejected."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        with pytest.raises(PluginConfigError, match="can never appear") as exc_info:
+            JSONSource(
+                {
+                    "path": str(self._write_json(tmp_path)),
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": [
+                            {"name": "TicketID", "field_type": "str"},
+                            {"name": "CustomerName", "field_type": "str"},
+                        ],
+                    },
+                    "on_validation_failure": "discard",
+                }
+            )
+
+        message = str(exc_info.value)
+        assert "'TicketID'" in message
+        assert "'ticketid'" in message, "rejection must name the reachable normalized form"
+        assert "field_mapping" in message, "rejection must name the preserve-original remedy"
+
+    def test_case_matched_declared_names_accepted_and_yield_rows(self, tmp_path: Path, ctx: PluginContext) -> None:
+        """Control: normalized declared names against the same file validate every row."""
+        from elspeth.plugins.sources.json_source import JSONSource
+
+        source = JSONSource(
+            {
+                "path": str(self._write_json(tmp_path)),
+                "schema": {
+                    "mode": "flexible",
+                    "fields": [
+                        {"name": "ticketid", "field_type": "str"},
+                        {"name": "customername", "field_type": "str"},
+                    ],
+                },
+                "on_validation_failure": "discard",
+            }
+        )
+        rows = list(source.load(ctx))
+
+        assert len(rows) == 2
+        assert all(not row.is_quarantined for row in rows)
+        assert rows[0].row == {"ticketid": "T-1", "customername": "Alice"}

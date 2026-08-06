@@ -451,6 +451,31 @@ class SourceDataConfig(PathConfig):
         return v.strip()
 
 
+def declared_source_schema_field_names(schema_config: SchemaConfig | None) -> tuple[str, ...]:
+    """Names a source's schema config commits to producing on rows.
+
+    Declared field names (required and optional) plus guaranteed_fields and
+    required_fields entries — observed schemas carry the latter two without
+    declared fields. Deduplicated in first-declaration order so reachability
+    diagnostics report each name once, in the order the author wrote them.
+    """
+    if schema_config is None:
+        return ()
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for group in (
+        tuple(field.name for field in schema_config.fields) if schema_config.fields is not None else (),
+        schema_config.guaranteed_fields or (),
+        schema_config.required_fields or (),
+    ):
+        for name in group:
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    return tuple(names)
+
+
 class TabularSourceDataConfig(SourceDataConfig):
     """Config for sources that read tabular external data with headers.
 
@@ -484,6 +509,22 @@ class TabularSourceDataConfig(SourceDataConfig):
         # Validate field_mapping values are valid identifiers and not keywords
         if self.field_mapping is not None and self.field_mapping:
             validate_field_names(list(self.field_mapping.values()), "field_mapping values")
+
+        # Reject declared schema names the header resolution can never produce
+        # (elspeth-3664e213c4): headers are normalized to lowercase identifiers
+        # at the source boundary while declared names are used verbatim, so an
+        # unreachable declaration silently discards every row (required fields)
+        # or crashes contract inference (optional fields). Function-local import
+        # keeps the infrastructure->sources dependency contained to this check.
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            from elspeth.plugins.sources.field_normalization import check_declared_fields_reachable
+
+            check_declared_fields_reachable(
+                declared,
+                columns=self.columns,
+                field_mapping=self.field_mapping,
+            )
 
         return self
 

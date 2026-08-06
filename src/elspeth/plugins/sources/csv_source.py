@@ -86,7 +86,7 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:aee7c027b2711f86"
+    source_file_hash: str | None = "sha256:2b4b87f0eaca5602"
     config_model = CSVSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
@@ -658,7 +658,8 @@ class CSVSource(BaseSource):
                     "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode silently drops rows that don't match.",
                     "Decide whether the CSV is headered: without columns CSVSource treats the first non-skipped row as headers; for headerless data set columns=[...] so the first data row stays data. Do not copy a header row into inline source data unless it is real headered CSV.",
                     "If you have been asked to generate CSV rows yourself (the invented_source path): always emit a header row as the first non-skipped line of the generated CSV, and always leave the `columns` option unset so CSVSource treats your first row as headers.",
-                    "When generating CSV rows yourself, declare those generated column names in `schema.fields` (or `schema.guaranteed_fields`). The header row, the `columns` decision, and the schema must all agree.",
+                    "CSV headers are normalized to lowercase identifiers at the source boundary (TicketID -> ticketid, 'User ID' -> user_id). Declare the normalized form, or keep an original name via field_mapping: {normalized: Original}; other declared names are rejected at config time.",
+                    "When generating CSV rows yourself, declare the NORMALIZED form of those generated column names in `schema.fields` (or `schema.guaranteed_fields`) — or generate already-lowercase headers. The header row, the `columns` decision, and the schema must all agree.",
                     "Never generate headerless CSV — the audit trail and downstream contracts need the header to be self-describing.",
                     "columns tells CSVSource how to parse headerless rows, but downstream DAG validation still needs a schema guarantee. If transforms consume a CSV column, declare it in schema.guaranteed_fields or explicit schema fields.",
                     "CSV source options do not have url_field; if a downstream web_scrape needs URLs, keep the URL column in the CSV schema and set url_field on the web_scrape node.",

@@ -1123,9 +1123,13 @@ def derive_extra_column_risk(
     """
     if declared_fields is None or facts.observed_headers is None:
         return ()
-    declared_lower = {name.lower() for field in declared_fields if (name := _declared_field_name(field)) is not None}
-    resolved_headers = _csvsource_resolved_observed_headers(facts, field_mapping=field_mapping)
-    missing = tuple(h for h in resolved_headers if h.lower() not in declared_lower)
+    # Compare in the runtime's name space (elspeth-3664e213c4): observed
+    # headers resolved through the same normalization the source applies,
+    # against declared names verbatim. Case-folding here hid exactly the
+    # mismatch this check exists to flag — the runtime never folds case.
+    declared = {name for field in declared_fields if (name := _declared_field_name(field)) is not None}
+    resolved_headers = _runtime_resolved_observed_headers(facts, field_mapping=field_mapping)
+    missing = tuple(h for h in resolved_headers if h not in declared)
     return missing
 
 
@@ -1152,25 +1156,42 @@ def derive_required_header_mismatch_risk(
     if not required_names:
         return ()
 
-    observed_lower = {header.lower() for header in _csvsource_resolved_observed_headers(facts, field_mapping=field_mapping)}
-    required_lower = {name.lower() for name in required_names}
-    if observed_lower & required_lower:
+    # Compare in the runtime's name space (elspeth-3664e213c4): resolved
+    # observed headers against declared names verbatim, exactly as the
+    # source's model_validate will. Case-folding here reported "no risk" for
+    # a declaration that discards 100% of rows.
+    observed = set(_runtime_resolved_observed_headers(facts, field_mapping=field_mapping))
+    if observed & set(required_names):
         return ()
     return tuple(required_names)
 
 
-def _csvsource_resolved_observed_headers(
+def _runtime_resolved_observed_headers(
     facts: SourceInspectionFacts,
     *,
     field_mapping: Mapping[str, str] | None,
 ) -> tuple[str, ...]:
+    """Observed headers as the source plugin's resolution would produce them.
+
+    The risk gates above compare declared names against these, so they must be
+    in the runtime's final name space (elspeth-3664e213c4). CSV headers and
+    JSON object keys are both normalized at the source boundary; JSON-family
+    sources resolve sparsely (``require_all_mapping_keys=False``), so a mapped
+    key absent from the sample is not a config error here either. Other kinds
+    (text/unknown) have no observed headers to resolve.
+    """
     if facts.observed_headers is None:
         return ()
-    if facts.source_kind != "csv":
+    if facts.source_kind == "csv":
+        require_all_mapping_keys = True
+    elif facts.source_kind in ("json", "jsonl"):
+        require_all_mapping_keys = False
+    else:
         return facts.observed_headers
     resolution = resolve_field_names(
         raw_headers=list(facts.observed_headers),
         field_mapping=dict(field_mapping) if field_mapping is not None else None,
         columns=None,
+        require_all_mapping_keys=require_all_mapping_keys,
     )
     return resolution.final_headers

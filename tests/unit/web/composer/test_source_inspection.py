@@ -996,7 +996,11 @@ class TestDeriveExtraColumnRisk:
         declared = ("id: int", "name: str", "price: float")
         assert derive_extra_column_risk(f, declared) == ("extra",)
 
-    def test_case_insensitive_match(self) -> None:
+    def test_normalized_headers_match_declared_names_exactly(self) -> None:
+        # "ID"/"Name" resolve through source-boundary normalization to
+        # "id"/"name" and then match the declared names EXACTLY. The match
+        # comes from resolution, not case-insensitive comparison — the
+        # runtime never folds case (elspeth-3664e213c4).
         f = self._facts_with_headers(("ID", "Name"))
         declared = ("id: int", "name: str")
         assert derive_extra_column_risk(f, declared) == ()
@@ -1289,3 +1293,65 @@ class TestObservedColumnsFromPath:
 
         missing = tmp_path / "nope.csv"
         assert observed_columns_from_path(path=missing, filename="x.csv", mime_type="text/csv") == ()
+
+
+class TestRiskChecksCompareInRuntimeNameSpace:
+    """The preview hazard gates must compare in the SAME name space the runtime
+    uses (elspeth-3664e213c4): resolved observed headers against declared names,
+    exactly. The runtime never case-folds — a declared 'TicketID' can never
+    match a row keyed 'ticketid' — so a case-folding preview comparison is
+    blind to the one hazard these gates exist to flag.
+    """
+
+    def _mixed_case_facts(self) -> SourceInspectionFacts:
+        body = b"TicketID,CustomerName,Priority,Summary\nT-1,Alice,high,Broken\n"
+        return inspect_blob_content(content=body, filename="tickets.csv", mime_type="text/csv")
+
+    def test_required_mismatch_flags_mixed_case_declared_fields(self) -> None:
+        facts = self._mixed_case_facts()
+        declared = ("TicketID: str", "CustomerName: str", "Priority: str", "Summary: str")
+
+        assert derive_required_header_mismatch_risk(facts, declared) == (
+            "TicketID",
+            "CustomerName",
+            "Priority",
+            "Summary",
+        )
+
+    def test_extra_column_flags_headers_unmatched_by_mixed_case_declared_fields(self) -> None:
+        facts = self._mixed_case_facts()
+        declared = ("TicketID: str", "CustomerName: str", "Priority: str", "Summary: str")
+
+        assert derive_extra_column_risk(facts, declared) == (
+            "ticketid",
+            "customername",
+            "priority",
+            "summary",
+        )
+
+    def _mixed_case_json_facts(self) -> SourceInspectionFacts:
+        body = b'[{"TicketID": "T-1", "CustomerName": "Alice"}]'
+        return inspect_blob_content(content=body, filename="tickets.json", mime_type="application/json")
+
+    def test_json_extra_column_resolves_keys_like_the_runtime(self) -> None:
+        """JSON object keys are normalized at the source boundary exactly like
+        CSV headers, so declared normalized names must match — comparing the
+        RAW keys against declared names would falsely flag a pipeline the
+        runtime accepts (json source resolves TicketID -> ticketid)."""
+        facts = self._mixed_case_json_facts()
+        assert facts.source_kind == "json"
+        declared = ("ticketid: str", "customername: str")
+
+        assert derive_extra_column_risk(facts, declared) == ()
+
+    def test_json_extra_column_flags_undeclared_key_in_resolved_form(self) -> None:
+        facts = self._mixed_case_json_facts()
+        declared = ("ticketid: str",)
+
+        assert derive_extra_column_risk(facts, declared) == ("customername",)
+
+    def test_json_required_mismatch_resolves_keys_like_the_runtime(self) -> None:
+        facts = self._mixed_case_json_facts()
+        declared = ("ticketid: str", "customername: str")
+
+        assert derive_required_header_mismatch_risk(facts, declared) == ()

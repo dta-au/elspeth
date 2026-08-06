@@ -36,13 +36,14 @@ from elspeth.plugins.infrastructure.clients.dataverse import (
     DataversePageResponse,
     validate_additional_domain,
 )
-from elspeth.plugins.infrastructure.config_base import DataPluginConfig
+from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.sources._safe_validation_errors import safe_validation_error_text
 from elspeth.plugins.sources.field_normalization import (
     ExternalHeaderError,
     FieldResolution,
+    check_declared_fields_reachable,
     extend_field_resolution,
     normalize_field_name,
     resolve_field_names,
@@ -207,6 +208,28 @@ class DataverseSourceConfig(DataPluginConfig):
             raise ValueError("select/filter/orderby/top require entity (structured query mode)")
         return self
 
+    @model_validator(mode="after")
+    def validate_declared_field_reachability(self) -> Self:
+        """Reject declared schema names no row can ever carry (elspeth-3664e213c4).
+
+        Dataverse attribute names are normalized to lowercase identifiers at
+        the source boundary while declared names are used verbatim — the same
+        seam as the CSV/JSON sources. Sparse entities
+        (require_all_mapping_keys=False at load) do not change reachability:
+        field_mapping is applied after normalization on every path that
+        introduces an attribute, so a mapping key never survives as a final
+        name and mapping values stay reachable.
+        """
+        declared = declared_source_schema_field_names(self.schema_config)
+        if declared:
+            check_declared_fields_reachable(
+                declared,
+                columns=None,
+                field_mapping=self.field_mapping,
+                header_kind="Dataverse attribute names",
+            )
+        return self
+
     @field_validator("on_validation_failure")
     @classmethod
     def validate_on_validation_failure(cls, v: str) -> str:
@@ -251,7 +274,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f4c1784ddf970583"
+    source_file_hash: str | None = "sha256:3e3573fdf0286ccd"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
