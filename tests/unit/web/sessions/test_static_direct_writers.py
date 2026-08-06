@@ -1448,6 +1448,40 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "access log/view path, not chat-message writing"
         ),
     ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_messages_route_tool_outcomes.py",
+        enclosing_symbol="_seed_compose_turn_with_outcomes",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "tool-outcome stamping fixture (elspeth-f5e6723133) seeds one "
+            "state row so the applied-call projection can resolve a version "
+            "number without invoking the composer loop"
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_messages_route_tool_outcomes.py",
+        enclosing_symbol="_seed_compose_turn_with_outcomes",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "tool-outcome stamping fixture (elspeth-f5e6723133) seeds a "
+            "user/assistant/tool transcript with primary-writer per-call "
+            "state ids; the test target is the GET /messages outcome "
+            "projection, not chat-message writing"
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_messages_route_tool_outcomes.py",
+        enclosing_symbol="test_envelopes_without_tool_rows_are_left_unstamped",
+        table="chat_messages",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "tool-outcome stamping negative fixture (elspeth-f5e6723133): an "
+            "assistant row whose tool rows never landed must stay unstamped; "
+            "seeding that partial shape requires a direct insert"
+        ),
+    ),
     # ------ tests/unit/web/sessions/test_routes.py — OperationalError canaries ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_routes.py",

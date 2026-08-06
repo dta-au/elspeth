@@ -77,6 +77,99 @@ describe("ToolCallCard", () => {
     ).not.toBeInTheDocument();
   });
 
+  describe("server-authenticated outcome labels (elspeth-f5e6723133)", () => {
+    const call = (
+      outcome?: ToolCall["outcome"],
+      appliedStateVersion?: number | null,
+    ): ToolCall => ({
+      id: "call-x",
+      type: "function",
+      function: { name: "upsert_node", arguments: "{}" },
+      ...(outcome !== undefined ? { outcome } : {}),
+      ...(appliedStateVersion !== undefined
+        ? { applied_state_version: appliedStateVersion }
+        : {}),
+    });
+
+    it("labels an applied mutation Applied with the resulting version", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("applied", 3)}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Applied: upsert_node")).toBeInTheDocument();
+      expect(screen.getByText("v3")).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels an applied mutation without a resolvable version as Applied alone", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("applied", null)}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Applied: upsert_node")).toBeInTheDocument();
+      expect(screen.queryByText(/^v\d+$/)).not.toBeInTheDocument();
+    });
+
+    it("labels a validation-refused mutation as attempted, not applied", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("rejected")}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(
+        screen.getByText("Attempted: upsert_node (not applied)"),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels a crashed dispatch as Failed", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("failed")}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Failed: upsert_node")).toBeInTheDocument();
+    });
+
+    it("labels a cancelled dispatch as Cancelled", () => {
+      render(
+        <ToolCallCard
+          toolCall={call("cancelled")}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Cancelled: upsert_node")).toBeInTheDocument();
+    });
+
+    it("keeps the conservative Looked up default when no outcome was stamped", () => {
+      render(
+        <ToolCallCard
+          toolCall={call()}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Looked up: upsert_node")).toBeInTheDocument();
+    });
+  });
+
   it("keeps the tool-call info button at or above the 24px target-size threshold", () => {
     const css = readFileSync("src/components/chat/chat.css", "utf8");
     const rule = /\.tool-call-info-trigger\s*\{(?<body>[\s\S]*?)\n\}/.exec(css);

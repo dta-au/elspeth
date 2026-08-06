@@ -3282,6 +3282,69 @@ describe("ChatPanel mode discriminator", () => {
     ).toBeNull();
   });
 
+  it("completed stepper: the terminal step label derives from readiness, not a hardcoded 'Ready' (elspeth-bf9c296ee5)", () => {
+    const terminal: TerminalState = {
+      kind: "completed",
+      reason: null,
+      pipeline_yaml: "source:\n  plugin: csv\n",
+    };
+    const completedGuidedSession = {
+      step: "step_4_wire" as const,
+      history: [],
+      terminal,
+      chat_history: [],
+      chat_turn_seq: 0,
+      profile: null,
+    };
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: completedGuidedSession,
+      guidedTerminal: terminal,
+    });
+
+    // Composed but not yet admitted for execution → the terminal step is the
+    // validation stage, and must NOT claim "Ready".
+    const first = render(<ChatPanel />);
+    let current = screen.getByRole("listitem", { current: "step" });
+    expect(current).toHaveTextContent("Validation");
+    expect(current).not.toHaveTextContent("Ready");
+    first.unmount();
+
+    // Pending interpretation rows block the run gate → the step reads
+    // "Review" while the acknowledgement cards demand resolution.
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        "session-guided": { "evt-1": { id: "evt-1", choice: "pending" } },
+      },
+    } as never);
+    const second = render(<ChatPanel />);
+    current = screen.getByRole("listitem", { current: "step" });
+    expect(current).toHaveTextContent("Review");
+    second.unmount();
+
+    // Backend execution admission with nothing pending → "Ready" is honest.
+    resetStore(useInterpretationEventsStore);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: true,
+          blockers: [],
+        },
+      },
+    } as never);
+    render(<ChatPanel />);
+    current = screen.getByRole("listitem", { current: "step" });
+    expect(current).toHaveTextContent("Ready");
+  });
+
   it("workspace CSS: internal scroll region focus ring is inset, and the 900px collapse bounds the stream row with the rail strip first", () => {
     // jsdom runs with css:false — media queries and computed styles are
     // invisible, so the responsive contract is pinned as CSS text (same idiom

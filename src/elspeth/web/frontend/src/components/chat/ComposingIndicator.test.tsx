@@ -264,6 +264,84 @@ describe("formatElapsed", () => {
   });
 });
 
+describe("ComposingIndicator terminal badge honesty (elspeth-bf9c296ee5)", () => {
+  function completeProgress(): ComposerProgressSnapshot {
+    return {
+      session_id: "session-1",
+      request_id: "message-1",
+      phase: "complete",
+      headline: "Composer finished.",
+      evidence: ["Saved version 3."],
+      likely_next: null,
+      reason: "composer_complete",
+      updated_at: "2026-04-26T10:00:00Z",
+    };
+  }
+
+  it.each([
+    ["response_ready", "Response ready"],
+    ["pipeline_updated", "Pipeline updated"],
+    ["review_required", "Review required"],
+    ["pipeline_ready", "Pipeline ready"],
+  ] as const)(
+    "a complete phase with outcome %s renders the %s badge",
+    (outcome, label) => {
+      const { container } = render(
+        <ComposingIndicator
+          composerProgress={completeProgress()}
+          completionOutcome={outcome}
+        />,
+      );
+      expect(
+        container.querySelector(".composing-terminal-mark")?.textContent,
+      ).toBe(label);
+    },
+  );
+
+  it("falls back to the legacy 'Updated' badge when the outcome is unknown", () => {
+    // Fixture tolerance / snapshot-only reloads: with no derivable outcome the
+    // badge keeps its historical claim rather than inventing a new one.
+    const { container } = render(
+      <ComposingIndicator composerProgress={completeProgress()} />,
+    );
+    expect(
+      container.querySelector(".composing-terminal-mark")?.textContent,
+    ).toBe("Updated");
+  });
+
+  it("failed and cancelled phases keep their own labels regardless of outcome", () => {
+    const failed: ComposerProgressSnapshot = {
+      ...completeProgress(),
+      phase: "failed",
+      reason: "plugin_crash",
+    };
+    const { container, rerender } = render(
+      <ComposingIndicator
+        composerProgress={failed}
+        completionOutcome="pipeline_ready"
+      />,
+    );
+    expect(
+      container.querySelector(".composing-terminal-mark")?.textContent,
+    ).toBe("Failed");
+
+    const cancelled: ComposerProgressSnapshot = {
+      ...completeProgress(),
+      phase: "cancelled",
+      reason: "client_cancelled",
+    };
+    rerender(
+      <ComposingIndicator
+        composerProgress={cancelled}
+        completionOutcome="pipeline_ready"
+      />,
+    );
+    expect(
+      container.querySelector(".composing-terminal-mark")?.textContent,
+    ).toBe("Stopped");
+  });
+});
+
 describe("ComposingIndicator live region scope", () => {
   it("keeps role=status on a non-interactive summary subregion", () => {
     // The indicator is mounted OUTSIDE ChatPanel's role="log" container

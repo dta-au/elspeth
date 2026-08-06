@@ -3,6 +3,10 @@
 import { useEffect, useRef, useState } from "react";
 
 import type { ComposerProgressSnapshot, CompositionState } from "@/types/api";
+import {
+  COMPLETION_OUTCOME_LABELS,
+  type CompletionOutcome,
+} from "./completionOutcome";
 import { hasSources } from "@/utils/compositionState";
 import { plural } from "@/utils/plural";
 
@@ -10,6 +14,15 @@ interface ComposingIndicatorProps {
   latestRequest?: string | null;
   compositionState?: CompositionState | null;
   composerProgress?: ComposerProgressSnapshot | null;
+  /**
+   * Honest terminal-badge state for a successful completion
+   * (elspeth-bf9c296ee5), derived by the parent from the run gate's own
+   * signals (useCompletionOutcome). Only consulted when phase is
+   * "complete" — failed/cancelled keep their own labels. Omitted/null
+   * falls back to the legacy "Updated" badge (snapshot-only reloads where
+   * the per-turn mutation verdict is unknowable).
+   */
+  completionOutcome?: CompletionOutcome | null;
 }
 
 interface RequestFocus {
@@ -40,9 +53,17 @@ function isTerminalPhase(
 
 function terminalStatusLabel(
   phase: ComposerProgressSnapshot["phase"] | undefined,
+  completionOutcome: CompletionOutcome | null | undefined,
 ): string {
   if (phase === "failed") return "Failed";
   if (phase === "cancelled") return "Stopped";
+  // A successful completion must not claim more than the run gate would
+  // honour: the outcome distinguishes Response ready / Pipeline updated /
+  // Review required / Pipeline ready (elspeth-bf9c296ee5). "Updated" remains
+  // only as the no-signal fallback.
+  if (completionOutcome != null) {
+    return COMPLETION_OUTCOME_LABELS[completionOutcome];
+  }
   return "Updated";
 }
 
@@ -200,6 +221,7 @@ export function ComposingIndicator({
   latestRequest = null,
   compositionState = null,
   composerProgress = null,
+  completionOutcome = null,
 }: ComposingIndicatorProps) {
   const workingView =
     backendWorkingView(composerProgress) ??
@@ -220,7 +242,7 @@ export function ComposingIndicator({
       <div className="composing-bubble">
         {isTerminal ? (
           <div className="composing-terminal-mark" aria-hidden="true">
-            {terminalStatusLabel(composerProgress?.phase)}
+            {terminalStatusLabel(composerProgress?.phase, completionOutcome)}
           </div>
         ) : (
           <div className="composing-pulse" aria-hidden="true">

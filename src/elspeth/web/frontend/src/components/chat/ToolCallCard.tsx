@@ -82,13 +82,43 @@ export function ToolCallCard({
     );
   }, [proposal, isStale, currentState]);
   if (!proposal) {
+    // Proposal-less calls carry a server-derived outcome stamped by
+    // GET /messages from the Tier-1 tool rows (elspeth-f5e6723133). In
+    // auto_commit mode mutations execute without proposal rows, so without
+    // the stamp every applied change rendered as a read. No stamp (live
+    // stream, unclassifiable history) keeps the conservative lookup label.
+    const outcome = toolCall.outcome;
+    const label =
+      outcome === "applied"
+        ? `Applied: ${toolCall.function.name}`
+        : outcome === "rejected"
+          ? `Attempted: ${toolCall.function.name} (not applied)`
+          : outcome === "failed"
+            ? `Failed: ${toolCall.function.name}`
+            : outcome === "cancelled"
+              ? `Cancelled: ${toolCall.function.name}`
+              : `Looked up: ${toolCall.function.name}`;
+    const appliedVersion =
+      outcome === "applied" && typeof toolCall.applied_state_version === "number"
+        ? toolCall.applied_state_version
+        : null;
     return (
-      <div className="tool-call-ribbon">
+      <div
+        className={`tool-call-ribbon${outcome ? ` tool-call-ribbon--${outcome}` : ""}`}
+      >
         <ToolCallInfo
           toolName={toolCall.function.name}
           describedById={`tool-call-info-${toolCall.id}`}
         />
-        <span>Looked up: {toolCall.function.name}</span>
+        <span>{label}</span>
+        {appliedVersion !== null && (
+          <code
+            className="tool-call-ribbon-version"
+            title={`Pipeline advanced to version ${appliedVersion}`}
+          >
+            v{appliedVersion}
+          </code>
+        )}
       </div>
     );
   }

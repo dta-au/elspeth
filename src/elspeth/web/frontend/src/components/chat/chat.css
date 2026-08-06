@@ -203,7 +203,8 @@
   overflow: auto;
 }
 
-/* The completed surface is a vertical evidence stack: Pipeline ready first,
+/* The completed surface is a vertical evidence stack: the completion
+   summary first,
    then its run evidence. Keep the two cards visually adjacent while allowing
    expanded results to consume the rest of the panel instead of leaving an
    unstructured void below. The :not() preserves the collapse affordance's
@@ -687,6 +688,33 @@
 .chat-model-chip-label {
   font-weight: 600;
   color: var(--color-text-secondary);
+}
+
+/* Composer-authority chip (elspeth-f5e6723133) — names whether this session
+   auto-applies mutations or gates them behind proposals. Sibling of
+   .chat-model-chip in the header actions row; the left accent is the
+   recurring edge motif. Auto-apply carries the warning accent because it is
+   the mode where the composer acts without asking — the one fact a user
+   must be able to see at a glance. */
+.chat-authority-chip {
+  flex: 0 0 auto;
+  padding: 2px var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-left-width: 3px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.chat-authority-chip--auto_commit {
+  border-left-color: var(--color-warning);
+}
+
+.chat-authority-chip--explicit_approve {
+  border-left-color: var(--color-success);
 }
 
 .chat-panel-header-title {
@@ -1219,6 +1247,37 @@
   background: var(--color-surface);
   color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
+}
+
+/* Server-authenticated outcome accents (elspeth-f5e6723133). The label text
+   carries the meaning; the left edge only reinforces it, so an unstamped
+   ribbon (no modifier) stays neutral. */
+.tool-call-ribbon--applied,
+.tool-call-ribbon--rejected,
+.tool-call-ribbon--failed,
+.tool-call-ribbon--cancelled {
+  border-left-width: 3px;
+}
+
+.tool-call-ribbon--applied {
+  border-left-color: var(--color-success);
+}
+
+.tool-call-ribbon--rejected {
+  border-left-color: var(--color-warning);
+}
+
+.tool-call-ribbon--failed {
+  border-left-color: var(--color-error);
+}
+
+.tool-call-ribbon--cancelled {
+  border-left-color: var(--color-border);
+}
+
+.tool-call-ribbon-version {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
 }
 
 /* Tool-call info trigger + tooltip.

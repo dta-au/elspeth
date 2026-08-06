@@ -395,14 +395,130 @@ async def _pending_proposal_responses(
     return [_composition_proposal_response(proposal) for proposal in proposals]
 
 
-def _message_response(msg: ChatMessageRecord, *, include_raw_content: bool = False) -> ChatMessageResponse:
+@dataclass(frozen=True, slots=True)
+class _ToolCallOutcome:
+    """Server-derived outcome of one tool call, projected for the SPA.
+
+    ``outcome`` is a closed vocabulary:
+
+    * ``applied``   — the call durably created a composition-state version;
+    * ``rejected``  — the dispatch completed but the tool reported
+      ``success=False`` (validation refused the mutation; nothing persisted);
+    * ``failed``    — arg-error or plugin crash;
+    * ``cancelled`` — the coordinator cancelled the dispatch (Stop);
+    * ``completed`` — everything else (lookups, advisor hints).
+
+    ``applied_state_version`` accompanies ``applied`` when the version
+    number is derivable (state-id map for primary-writer rows, envelope
+    ``version_after`` for fallback-writer rows), else ``None``.
+    """
+
+    outcome: str
+    applied_state_version: int | None
+
+
+def _tool_call_outcomes_by_call_id(
+    messages: Sequence[ChatMessageRecord],
+    *,
+    state_versions_by_id: Mapping[str, int],
+) -> dict[str, _ToolCallOutcome]:
+    """Project role="tool" rows into per-call outcomes (elspeth-f5e6723133).
+
+    Two writers produce tool rows with different per-call semantics:
+
+    * ``persist_compose_turn`` (primary): ``tool_calls`` is NULL and
+      ``composition_state_id`` is set exactly when THAT call inserted a
+      composition state — per-call ground truth on the row itself.
+    * ``_persist_tool_invocations`` (fallback drains): every row of the turn
+      shares the post-compose state id, and the per-call truth lives in the
+      row's single ``_kind="audit"`` envelope
+      (``version_before``/``version_after``/``status``).
+
+    Classification never trusts tool NAMES — a mutation tool that validated
+    and was refused must not render as applied, which is exactly the
+    dishonesty class this projection exists to remove.
+    """
+    outcomes: dict[str, _ToolCallOutcome] = {}
+    for row in messages:
+        if row.role != "tool" or row.tool_call_id is None:
+            continue
+        envelope = row.tool_calls[0] if row.tool_calls else None
+        if envelope is None and row.composition_state_id is not None:
+            outcomes[row.tool_call_id] = _ToolCallOutcome(
+                outcome="applied",
+                applied_state_version=state_versions_by_id.get(str(row.composition_state_id)),
+            )
+            continue
+        if envelope is not None:
+            version_before = envelope.get("version_before")
+            version_after = envelope.get("version_after")
+            if isinstance(version_before, int) and isinstance(version_after, int) and version_after > version_before:
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome="applied",
+                    applied_state_version=version_after,
+                )
+                continue
+            status = envelope.get("status")
+            if status == ComposerToolStatus.CANCELLED.value:
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="cancelled", applied_state_version=None)
+                continue
+            if status in (ComposerToolStatus.ARG_ERROR.value, ComposerToolStatus.PLUGIN_CRASH.value):
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="failed", applied_state_version=None)
+                continue
+        try:
+            content = json.loads(row.content)
+        except (TypeError, ValueError):
+            content = None
+        if isinstance(content, dict):
+            if content.get("error_class"):
+                cancelled = content.get("_redaction_status") == ComposerToolStatus.CANCELLED.value
+                outcomes[row.tool_call_id] = _ToolCallOutcome(
+                    outcome="cancelled" if cancelled else "failed",
+                    applied_state_version=None,
+                )
+                continue
+            if content.get("success") is False:
+                outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="rejected", applied_state_version=None)
+                continue
+        outcomes[row.tool_call_id] = _ToolCallOutcome(outcome="completed", applied_state_version=None)
+    return outcomes
+
+
+def _message_response(
+    msg: ChatMessageRecord,
+    *,
+    include_raw_content: bool = False,
+    tool_outcomes: Mapping[str, _ToolCallOutcome] | None = None,
+) -> ChatMessageResponse:
     """Convert a ChatMessageRecord to a ChatMessageResponse.
 
     ``include_raw_content`` opt-in surfaces the model's pre-synthesis prose
     for assistant turns intercepted by the empty-state synthesizer. Default
     False keeps the conversation channel free of audit-only data; eval
     tooling sets True via the ``?include_raw_content=true`` query param.
+
+    ``tool_outcomes`` (elspeth-f5e6723133) stamps each assistant-row
+    ``tool_calls`` envelope whose id has a projected outcome with
+    ``outcome`` / ``applied_state_version`` so the SPA can label executed
+    mutations honestly instead of describing every call as a lookup. The
+    stamp is derived from Tier-1 tool rows server-side — never from tool
+    names. Envelopes without a projection are passed through untouched and
+    render under the client's conservative default.
     """
+    tool_calls = deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None
+    if tool_calls is not None and tool_outcomes:
+        stamped: list[Any] = []
+        for entry in tool_calls:
+            call_id = entry.get("id") if isinstance(entry, dict) else None
+            projected = tool_outcomes.get(call_id) if isinstance(call_id, str) else None
+            if projected is not None:
+                entry = {
+                    **entry,
+                    "outcome": projected.outcome,
+                    "applied_state_version": projected.applied_state_version,
+                }
+            stamped.append(entry)
+        tool_calls = stamped
     return ChatMessageResponse(
         id=str(msg.id),
         session_id=str(msg.session_id),
@@ -416,7 +532,7 @@ def _message_response(msg: ChatMessageRecord, *, include_raw_content: bool = Fal
                 raw_content=msg.raw_content if msg.role == "assistant" else None,
             )
         ],
-        tool_calls=deep_thaw(msg.tool_calls) if msg.tool_calls is not None else None,
+        tool_calls=tool_calls,
         created_at=msg.created_at,
         composition_state_id=str(msg.composition_state_id) if msg.composition_state_id else None,
         tool_call_id=msg.tool_call_id,

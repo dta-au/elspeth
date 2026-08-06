@@ -69,6 +69,16 @@ export interface ToolCall {
     name: string;
     arguments: string;
   };
+  /**
+   * Server-derived outcome of this call (elspeth-f5e6723133), stamped by
+   * GET /messages from the Tier-1 role="tool" audit rows — never from the
+   * tool name. Absent on live-streamed envelopes and historical rows the
+   * projection could not classify; the UI then falls back to the
+   * conservative "Looked up" ribbon.
+   */
+  outcome?: "applied" | "rejected" | "failed" | "cancelled" | "completed";
+  /** Composition-state version this call created; only with outcome "applied". */
+  applied_state_version?: number | null;
 }
 
 /** A visible chat segment whose kind carries its rendering authority. */

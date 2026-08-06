@@ -518,6 +518,68 @@ describe("sessionStore", () => {
       expect(asstMsg?.content).toBe("Hello back");
     });
 
+    it("records whether the turn mutated the pipeline (elspeth-bf9c296ee5)", async () => {
+      // The terminal completion badge derives "Response ready" vs "Pipeline
+      // updated" from this flag — a discarded versionChanged means the badge
+      // can only ever guess.
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+
+      // Turn 1: composer returns a NEW state version → mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-1",
+          session_id: "session-1",
+          role: "assistant",
+          content: "Added the source.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: makeCompositionState(2),
+      });
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+
+      // While the turn is in flight the flag must read null (unknown), not a
+      // stale verdict from the previous turn.
+      useSessionStore.setState({ lastComposeChangedPipeline: false });
+      const sendPromise = useSessionStore.getState().sendMessage("add a source");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBeNull();
+      await sendPromise;
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(true);
+
+      // Turn 2: answer-only response (state: null) → not mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-2",
+          session_id: "session-1",
+          role: "assistant",
+          content: "That plugin reads CSV files.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: null,
+      });
+      await useSessionStore.getState().sendMessage("what does csv do?");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(false);
+
+      // Turn 3: composer echoes the SAME version → not mutated.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+        message: {
+          id: "asst-3",
+          session_id: "session-1",
+          role: "assistant",
+          content: "No changes needed.",
+          tool_calls: null,
+          created_at: new Date().toISOString(),
+        },
+        state: makeCompositionState(2),
+      });
+      await useSessionStore.getState().sendMessage("looks fine?");
+      expect(useSessionStore.getState().lastComposeChangedPipeline).toBe(false);
+    });
+
     it("refreshes pending interpretation events after a successful freeform compose turn", async () => {
       // Regression: a freeform compose turn can create new pending
       // interpretation events (invented_source / llm_prompt_template /

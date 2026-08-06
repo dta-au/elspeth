@@ -63,6 +63,7 @@ from ._helpers import (
     _state_data_from_composer_state,
     _state_from_record,
     _state_response,
+    _tool_call_outcomes_by_call_id,
     _track_compose_inflight,
     _verify_session_ownership,
     asyncio,
@@ -1031,4 +1032,19 @@ def register_message_routes(router: APIRouter) -> None:
         else:
             conversation_messages = _composer_conversation_messages(messages)
         paged_messages = conversation_messages[offset : offset + limit]
-        return [_message_response(m, include_raw_content=include_raw_content) for m in paged_messages]
+        # Per-call outcome stamping (elspeth-f5e6723133): project the Tier-1
+        # role="tool" rows onto the assistant envelopes so the SPA can label
+        # executed mutations as applied (with the resulting state version)
+        # instead of describing every call as a lookup. Derived server-side
+        # from durable rows — never from tool names. The version map is a
+        # lean id/version projection, fetched only when tool rows exist.
+        has_tool_rows = any(m.role == "tool" and m.tool_call_id is not None for m in messages)
+        tool_outcomes = (
+            _tool_call_outcomes_by_call_id(
+                messages,
+                state_versions_by_id=await service.get_state_version_numbers(session.id),
+            )
+            if has_tool_rows
+            else None
+        )
+        return [_message_response(m, include_raw_content=include_raw_content, tool_outcomes=tool_outcomes) for m in paged_messages]

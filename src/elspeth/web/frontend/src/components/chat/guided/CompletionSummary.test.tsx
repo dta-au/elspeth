@@ -31,6 +31,7 @@ import userEvent from "@testing-library/user-event";
 import { CompletionSummary } from "./CompletionSummary";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import type { TerminalState } from "@/types/guided";
@@ -59,6 +60,7 @@ const EXITED_TERMINAL: TerminalState = {
 beforeEach(() => {
   resetStore(useSessionStore);
   resetStore(useExecutionStore);
+  resetStore(useInterpretationEventsStore);
 });
 
 // ── Contract 1: YAML text rendered in highlighted block ───────────────────────
@@ -195,6 +197,71 @@ describe("CompletionSummary -- no auto-focus on initial render", () => {
   });
 });
 
+// ── Heading honesty: derived from actual readiness state ─────────────────────
+// elspeth-bf9c296ee5: the heading must distinguish Review required /
+// Pipeline updated / Pipeline ready from the same signals that gate Run
+// (pending interpretation rows, backend execution admission) instead of
+// unconditionally claiming readiness.
+
+describe("CompletionSummary -- heading derived from mutation/readiness state", () => {
+  const READY_VALIDATION = {
+    is_valid: true,
+    checks: [],
+    errors: [],
+    warnings: [],
+    readiness: {
+      authoring_valid: true,
+      execution_ready: true,
+      completion_ready: true,
+      blockers: [],
+    },
+  };
+
+  it("defaults to 'Pipeline updated' when nothing has admitted the pipeline", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(<CompletionSummary terminal={COMPLETED_TERMINAL} />);
+    expect(
+      screen.getByRole("heading", { name: "Pipeline updated" }),
+    ).toBeInTheDocument();
+  });
+
+  it("says 'Review required' while pending interpretation rows block the run gate", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        "session-1": { "evt-1": { id: "evt-1", choice: "pending" } },
+      },
+    } as never);
+    render(<CompletionSummary terminal={COMPLETED_TERMINAL} />);
+    expect(
+      screen.getByRole("heading", { name: "Review required" }),
+    ).toBeInTheDocument();
+  });
+
+  it("says 'Pipeline ready' only once the backend admits execution", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useExecutionStore.setState({ validationResult: READY_VALIDATION } as never);
+    render(<CompletionSummary terminal={COMPLETED_TERMINAL} />);
+    expect(
+      screen.getByRole("heading", { name: "Pipeline ready" }),
+    ).toBeInTheDocument();
+  });
+
+  it("pending review outranks execution admission, mirroring the run gate", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    useExecutionStore.setState({ validationResult: READY_VALIDATION } as never);
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        "session-1": { "evt-1": { id: "evt-1", choice: "pending" } },
+      },
+    } as never);
+    render(<CompletionSummary terminal={COMPLETED_TERMINAL} />);
+    expect(
+      screen.getByRole("heading", { name: "Review required" }),
+    ).toBeInTheDocument();
+  });
+});
+
 // ── Concern B: tutorial suppression ──────────────────────────────────────────
 
 describe("CompletionSummary -- tutorial suppression (concern B)", () => {
@@ -204,8 +271,11 @@ describe("CompletionSummary -- tutorial suppression (concern B)", () => {
     // <h3>, CompletionSummary.tsx:87), matching the file's existing pattern
     // (CompletionSummary.test.tsx:95 uses getByRole("heading")) — getByText
     // would still pass if the heading were demoted to a paragraph.
+    // Default completion state (no validation verdict, no pending reviews)
+    // reads "Pipeline updated" — "Pipeline ready" is reserved for backend
+    // execution admission (elspeth-bf9c296ee5).
     expect(
-      screen.getByRole("heading", { name: "Pipeline ready" }),
+      screen.getByRole("heading", { name: "Pipeline updated" }),
     ).toBeInTheDocument();
     // ...but the freeform exit is suppressed in a tutorial.
     expect(

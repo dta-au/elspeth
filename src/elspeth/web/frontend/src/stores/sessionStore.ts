@@ -1050,6 +1050,16 @@ interface SessionState {
   messages: ChatMessage[];
   compositionState: CompositionState | null;
   /**
+   * Whether the LAST completed freeform compose turn changed the
+   * composition-state version (elspeth-bf9c296ee5). `null` means unknown: no
+   * compose turn has completed for this session view yet, or one is in
+   * flight. The terminal completion badge derives "Response ready" vs
+   * "Pipeline updated" from this — it is the persisted form of the
+   * `versionChanged` comparison the compose success branches already make
+   * (previously computed only to clear stale validation, then discarded).
+   */
+  lastComposeChangedPipeline: boolean | null;
+  /**
    * True once the active session's composition state is KNOWN — i.e. the
    * selectSession fetch settled (success, 404, or failure), or the session
    * was just created/forked (fresh state is known by construction).
@@ -1262,6 +1272,7 @@ const initialState = {
   activeSessionId: null as string | null,
   messages: [] as ChatMessage[],
   compositionState: null as CompositionState | null,
+  lastComposeChangedPipeline: null as boolean | null,
   compositionStateLoaded: false,
   compositionProposals: [] as CompositionProposal[],
   exportedYamlBlobBinding: null as ExportedYamlBlobBinding | null,
@@ -1480,6 +1491,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       activeSessionId: id,
       messages: [],
       compositionState: null,
+      lastComposeChangedPipeline: null,
       compositionStateLoaded: false,
       compositionProposals: [],
       composerPreferences: null,
@@ -1679,6 +1691,9 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isComposing: true,
       error: null,
       composerProgress: null,
+      // In flight the mutation verdict is unknown — a stale verdict from the
+      // previous turn must not label this turn's completion badge.
+      lastComposeChangedPipeline: null,
       messages: [...state.messages, optimisticMessage],
     }));
     const progressPollGeneration =
@@ -1750,6 +1765,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         return {
           messages: finalMessages,
           compositionState: newState,
+          // Persist the mutation verdict for the terminal completion badge
+          // (elspeth-bf9c296ee5): "Pipeline updated" vs "Response ready" is
+          // this comparison, not the generic terminal phase.
+          lastComposeChangedPipeline: versionChanged,
           compositionProposals: mergeCompositionProposals(
             s.compositionProposals,
             proposals,
@@ -2182,6 +2201,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       isComposing: true,
       error: null,
       composerProgress: null,
+      // Same unknown-while-in-flight contract as sendMessage.
+      lastComposeChangedPipeline: null,
       messages: state.messages.map((existing) =>
         existing.id === messageId
           ? { ...existing, local_status: "pending" }
@@ -2247,6 +2268,8 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         return {
           messages: finalMessages,
           compositionState: newState,
+          // Mirror of the sendMessage success branch (elspeth-bf9c296ee5).
+          lastComposeChangedPipeline: versionChanged,
           compositionProposals: mergeCompositionProposals(
             s.compositionProposals,
             proposals,

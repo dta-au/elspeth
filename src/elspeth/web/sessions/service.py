@@ -8761,6 +8761,24 @@ class SessionServiceImpl:
 
         return [self._row_to_state_record(row) for row in rows]
 
+    async def get_state_version_numbers(
+        self,
+        session_id: UUID,
+    ) -> dict[str, int]:
+        """Map composition-state id → version for one session (lean projection)."""
+
+        def _sync() -> Any:
+            with self._engine.connect() as conn:
+                return conn.execute(
+                    select(
+                        composition_states_table.c.id,
+                        composition_states_table.c.version,
+                    ).where(composition_states_table.c.session_id == str(session_id))
+                ).fetchall()
+
+        rows = await self._run_sync(_sync)
+        return {row.id: int(row.version) for row in rows}
+
     @staticmethod
     def _unwrap_envelope(val: Any) -> Any:
         """Unwrap _version envelope from a JSON column value.

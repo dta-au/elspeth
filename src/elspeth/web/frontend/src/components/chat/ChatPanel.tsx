@@ -25,6 +25,7 @@ import {
 import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { ComposingIndicator } from "./ComposingIndicator";
+import { AuthorityChip } from "./AuthorityChip";
 import { ModelChip } from "./ModelChip";
 import { ChatInput } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
@@ -38,6 +39,10 @@ import { GuidedPendingStrip } from "./guided/GuidedPendingStrip";
 import { GUIDED_EXPLAIN_MESSAGE } from "./guided/explainPrompt";
 import { GuidedHistory } from "./guided/GuidedHistory";
 import { GUIDED_STEP_LABELS } from "./guided/stepLabels";
+import {
+  useCompletionOutcome,
+  type CompletionOutcome,
+} from "./completionOutcome";
 import { GuidedDecisionPendingIndicator } from "./guided/GuidedDecisionPendingIndicator";
 import { GuidedTurn } from "./guided/GuidedTurn";
 import { isGuidedBuildActive } from "./guided/guidedBuildActive";
@@ -655,6 +660,23 @@ export function ChatPanel({
   const composerProgress = useSessionStore((s) => s.composerProgress);
   const clearError = useSessionStore((s) => s.clearError);
   const forkFromMessage = useSessionStore((s) => s.forkFromMessage);
+  // Honest completion labels (elspeth-bf9c296ee5), derived from the run
+  // gate's own signals rather than the generic terminal phase. Two axes of
+  // the same derivation (hoisted here per Rules of Hooks):
+  //   - freeform terminal badge: pipelineMutated is the per-turn verdict the
+  //     compose success branches persist; `?? true` keeps the legacy
+  //     "Updated"-family claim when the verdict is unknowable (e.g. a
+  //     terminal progress snapshot restored by polling after a reload);
+  //   - guided completion stepper: a completed guided terminal always
+  //     carries a composed pipeline, so its axis is fixed `true`.
+  const lastComposeChangedPipeline = useSessionStore(
+    (s) => s.lastComposeChangedPipeline,
+  );
+  const freeformCompletionOutcome = useCompletionOutcome(
+    activeSessionId,
+    lastComposeChangedPipeline ?? true,
+  );
+  const guidedCompletionOutcome = useCompletionOutcome(activeSessionId, true);
   // Guided-mode discriminator state.  Selectors are hoisted here (not inside a
   // branch) to comply with React's Rules of Hooks; the discriminator early
   // returns below decide which surface to render based on these values.
@@ -2026,7 +2048,10 @@ export function ChatPanel({
         role="region"
         aria-label="Pipeline summary"
       >
-        <GuidedWorkflowStepper activeStep="ready" />
+        <GuidedWorkflowStepper
+          activeStep="ready"
+          readyStepLabel={COMPLETED_READY_STEP_LABELS[guidedCompletionOutcome]}
+        />
         {error && (
           <GuidedErrorBanner error={error} onDismiss={clearError} />
         )}
@@ -2715,6 +2740,10 @@ export function ChatPanel({
             could override — the row stayed one line at every width and the
             ModeSwitchButton clipped to "Sw" at 390px. */}
         <div className="chat-panel-header-actions">
+          {/* Persistent composer authority (elspeth-f5e6723133): whether
+              this session auto-applies mutations or gates them behind
+              proposals — named in the chrome, beside the model identity. */}
+          <AuthorityChip />
           {/* Persistent composer-model identity (elspeth-e9f7678de8): an
               auditability product should name the model doing the composing
               in the authoring chrome, not only in run records. */}
@@ -2944,6 +2973,7 @@ export function ChatPanel({
           latestRequest={activeComposerMessage?.content ?? null}
           compositionState={compositionState}
           composerProgress={composerProgress}
+          completionOutcome={freeformCompletionOutcome}
         />
       )}
 
@@ -3056,7 +3086,28 @@ const GUIDED_WORKFLOW_STEPS: ReadonlyArray<{
   { id: "ready", label: "Ready" },
 ];
 
-function GuidedWorkflowStepper({ activeStep }: { activeStep: WorkflowStepId }) {
+// Terminal-step label on the COMPLETED surface (elspeth-bf9c296ee5): the
+// pseudo-step stays fifth and current (the wizard genuinely finished), but
+// "Ready" is only honest once the run gate would pass. While pending
+// acknowledgement cards block execution the stage is "Review"; before the
+// backend admits the pipeline it is "Validation". Mid-wizard steppers keep
+// the default "Ready" — there the step is a yet-to-be-reached goal, not a
+// claim about the present. response_ready is unreachable on a guided
+// completion (its mutation axis is fixed true); mapped for totality.
+const COMPLETED_READY_STEP_LABELS: Record<CompletionOutcome, string> = {
+  review_required: "Review",
+  pipeline_updated: "Validation",
+  pipeline_ready: "Ready",
+  response_ready: "Ready",
+};
+
+function GuidedWorkflowStepper({
+  activeStep,
+  readyStepLabel = "Ready",
+}: {
+  activeStep: WorkflowStepId;
+  readyStepLabel?: string;
+}) {
   const activeIndex = GUIDED_WORKFLOW_STEPS.findIndex((step) => step.id === activeStep);
   return (
     <nav className="guided-workflow" aria-label="Guided workflow progress">
@@ -3075,7 +3126,9 @@ function GuidedWorkflowStepper({ activeStep }: { activeStep: WorkflowStepId }) {
               aria-current={state === "current" ? "step" : undefined}
             >
               <span className="guided-workflow-index">{index + 1}</span>
-              <span className="guided-workflow-label">{step.label}</span>
+              <span className="guided-workflow-label">
+                {step.id === "ready" ? readyStepLabel : step.label}
+              </span>
             </li>
           );
         })}

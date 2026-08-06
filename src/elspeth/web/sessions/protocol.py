@@ -3088,6 +3088,19 @@ class SessionServiceProtocol(Protocol):
         offset: int = 0,
     ) -> list[CompositionStateRecord]: ...
 
+    async def get_state_version_numbers(
+        self,
+        session_id: UUID,
+    ) -> dict[str, int]:
+        """Map composition-state id → version for one session.
+
+        Lean projection (id/version columns only) for callers that need to
+        resolve state ids to version numbers without hydrating full state
+        rows — e.g. the messages route's per-tool-call outcome stamping
+        (elspeth-f5e6723133).
+        """
+        ...
+
     async def set_active_state(
         self,
         session_id: UUID,

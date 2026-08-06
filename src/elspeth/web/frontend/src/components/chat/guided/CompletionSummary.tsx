@@ -22,6 +22,10 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { requestValidate } from "@/stores/subscriptions";
 import { useTheme } from "@/hooks/useTheme";
 import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
+import {
+  COMPLETION_OUTCOME_LABELS,
+  useCompletionOutcome,
+} from "../completionOutcome";
 import type { TerminalState } from "@/types/guided";
 
 // ── Props ─────────────────────────────────────────────────────────────────────
@@ -63,6 +67,13 @@ function CompletionSummaryInner({ yaml, isTutorial }: CompletionSummaryInnerProp
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
   const isValidating = useExecutionStore((s) => s.isValidating);
+  // Heading honesty (elspeth-bf9c296ee5): a guided completion always carries
+  // a composed pipeline (pipelineMutated: true), so the heading ladders over
+  // Review required / Pipeline ready / Pipeline updated from the same
+  // signals that gate Run — it must never claim "ready" while the
+  // acknowledgement stack above still blocks execution or before the backend
+  // has admitted the pipeline.
+  const completionOutcome = useCompletionOutcome(activeSessionId, true);
   const { resolvedTheme } = useTheme();
 
   // Match the theme-awareness pattern from YamlView.tsx:164.
@@ -86,7 +97,7 @@ function CompletionSummaryInner({ yaml, isTutorial }: CompletionSummaryInnerProp
     <div className="guided-completion">
       {/* Heading per Task 7.6 M3 convention for primary entity names */}
       <h3 id={headingId} className="guided-completion-heading">
-        Pipeline ready
+        {COMPLETION_OUTCOME_LABELS[completionOutcome]}
       </h3>
 
       {/* YAML preview -- syntax-highlighted via prism-react-renderer.

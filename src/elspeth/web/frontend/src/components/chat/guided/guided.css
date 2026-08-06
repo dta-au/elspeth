@@ -1999,7 +1999,9 @@
      "Validate pipeline"    -- run validation for the active session.
 
    Visual hierarchy:
-     heading     -- "Pipeline ready", h3, muted weight to avoid competing
+     heading     -- readiness-derived ("Pipeline updated" / "Review
+                    required" / "Pipeline ready"), h3, muted weight to avoid
+                    competing
                     with surrounding chat layout.
      yaml block  -- monospace pre inside a scrollable container with an
                     inset surface to visually contain the code.
@@ -2049,7 +2051,7 @@
   min-height: 0;
 }
 
-/* Section heading -- "Pipeline ready" */
+/* Section heading -- readiness-derived completion label */
 .guided-completion-heading {
   margin: 0;
   font-size: var(--font-size-base);
