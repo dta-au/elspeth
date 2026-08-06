@@ -81,7 +81,8 @@ validation, preflight checks, and execution evidence.
 
 The substrate is therefore the product. A pipeline is made from declared
 primitives: sources, transforms, pure-config gates, aggregations, coalesce
-points, and sinks. Those primitives carry schema and semantic contracts.
+points, row-union barriers, and sinks. Those primitives carry schema and
+semantic contracts.
 Runtime assembly turns them into an execution graph; validation checks wiring,
 route targets, schema compatibility, and contracts before the executor runs the
 graph and writes the Landscape audit record.
@@ -175,6 +176,17 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   declared order for long-format processing. Audit, recovery, concurrency,
   browser-backed round-trip, and scale acceptance remains deferred and tracked
   separately.
+- **Textract document locations bind through operator profiles**
+  ([ADR-036](docs/architecture/adr/036-textract-profile-bound-bucket.md)). The
+  `aws_textract_document_analysis` transform gains a static `bucket` +
+  `key_prefix` location mode, and web deployments grant locations through
+  operator-declared `aws_textract_profiles` so bucket identity is
+  web-inexpressible and never reaches the audit trail. CLI/YAML `bucket_field`
+  pipelines are unchanged.
+- **A standalone LLM compatibility gateway ships in `gateway/`.** It presents a
+  strict OpenAI Chat Completions subset over an organisation's own custom
+  `invoke` API. It deploys separately and has no dependency on the rest of
+  ELSPETH; ELSPETH reaches it through the `gateway` LLM provider.
 - **Trust boundaries fail closed.** Deployment admission rejects unsafe state
   roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
   ECS; provider and tool data remain bounded and redacted.
@@ -196,6 +208,13 @@ a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.
+
+**Operator setting rename:** `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` is now
+`ELSPETH_WEB__DEFAULT_LLM_PROFILE`. There is no compatibility alias, so update
+the environment before upgrading. The setting names the deployment's standard
+LLM profile, which the first-run tutorial happens to use; configuring
+`ELSPETH_WEB__LLM_PROFILES` without naming that standard profile is now a
+startup error rather than an arbitrary alias silently becoming the default.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release-level summary and
 [ADR-030](docs/architecture/adr/030-multi-worker-deployment-shape.md) for the
@@ -408,15 +427,38 @@ Current plugin families include:
 
 | Family | Examples |
 | ------ | -------- |
-| Sources and sinks | CSV, JSON, text, null, Azure Blob, Dataverse, database, Chroma, local file outputs |
-| Row transforms | Field mapping, type coercion, keyword filtering, truncation, line/json expansion |
-| LLM, safety, and document ingestion | Regular `llm` transform with Azure OpenAI/OpenRouter support, multi-query and provider pooling, RAG retrieval, Azure Content Safety, Prompt Shield, Azure Document Intelligence extraction, `blob_fetch`, `blob_csv_expand` |
+| Sources and sinks | CSV, JSON, text, null, Azure Blob, AWS S3, Dataverse, database, Chroma, local file outputs |
+| Row transforms | Field mapping, type coercion, value transforms, keyword filtering, truncation, line/json expansion, report assembly |
+| LLM, safety, and document ingestion | Regular `llm` transform with Azure OpenAI, OpenRouter, AWS Bedrock, and gateway provider support, multi-query and provider pooling, RAG retrieval, Azure Content Safety, Prompt Shield, AWS Bedrock content safety and prompt shield, Azure Document Intelligence extraction, AWS Textract document analysis, `blob_fetch`, `blob_csv_expand` |
 | Batch analytics | `batch_distribution_profile`, `batch_experiment_compare`, `batch_classifier_metrics`, `batch_paired_preference`, `batch_drift_compare`, `batch_outlier_annotator`, `batch_data_quality_report`, `batch_top_k`, `batch_threshold_summary`, `batch_effect_size` |
 
 The old batch-specific LLM transforms, `azure_batch_llm` and
 `openrouter_batch_llm`, were retired. Use the regular `llm` transform with
 provider pooling or multi-query for LLM throughput, and use the statistical
 batch transforms for local, audit-attributable aggregation and evaluation.
+
+There is also an `llm` **source** plugin, distinct from the `llm` transform: it
+issues one authored prompt and emits at most one validated source row, so a
+pipeline can begin from a model response rather than a file or table.
+
+`elspeth plugins list` is the exact-count authority for the registered set; the
+families above are a reader's summary, not a manifest.
+
+### LLM Compatibility Gateway
+
+`gateway/` holds a standalone service that presents a strict OpenAI Chat
+Completions subset and translates those requests into an organisation's own
+custom `invoke` API, acquiring OAuth2 client-credentials tokens on its behalf
+and never logging message content, credentials, or raw upstream bodies. It has
+its own `pyproject.toml`, test suite, and container image, and no dependency on
+the rest of ELSPETH — deploy it separately.
+
+Because it is a plain OpenAI-compatible endpoint, any OpenAI client can point
+`base_url` at `<base>/v1` and use the gateway's inbound bearer token as its API
+key; no gateway-specific header or client library is required. ELSPETH reaches
+it over HTTP through the `gateway` LLM provider, and the Composer can target it
+like any other OpenAI-compatible endpoint. See
+[gateway/README.md](gateway/README.md).
 
 ### MCP Surfaces
 
@@ -956,6 +998,10 @@ elspeth/
 	│   ├── web/                # FastAPI app, Composer routes, auth/session storage, frontend
 	│   ├── tui/                # Terminal UI (Textual)
 	│   └── cli.py              # Typer CLI
+	├── gateway/                # Standalone LLM compatibility gateway service
+	├── deploy/                 # Compose, AWS ECS Terraform, and Linux systemd bundles
+	├── elspeth-lints/          # Project-specific static analysis (ADR-023)
+	├── examples/               # Runnable example pipelines
 	├── docs/                   # Active public documentation
 	├── website/                # Standalone static marketing site
 	└── tests/
@@ -976,7 +1022,7 @@ elspeth/
 | MCP | Landscape MCP Server | Read-only audit database analysis and debugging |
 | Canonical | RFC 8785 (JCS) | Deterministic JSON hashing |
 | DAG | NetworkX | Graph validation, topological sort, cycle detection |
-| LLM | Azure OpenAI + OpenRouter | Direct integration with pooled execution |
+| LLM | Azure OpenAI, OpenRouter, AWS Bedrock, gateway | Direct integration with pooled execution |
 | Templates | Jinja2 | Prompt templating and path generation |
 
 See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed design.

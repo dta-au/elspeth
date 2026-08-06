@@ -42,6 +42,7 @@ Current architecture and design references.
 - [Landscape Entry Points](architecture/landscape-entry-points.md) — where audit records are created
 - [Telemetry](architecture/telemetry.md) — operational visibility architecture
 - [Barrier Machinery](architecture/barrier-machinery.md) — aggregation and coalesce as structural twins; paired-surfaces table and paired-change checklist
+- [LLM Compatibility Gateway](../gateway/README.md) — the standalone `elspeth-llm-gateway` service: a strict OpenAI Chat Completions subset over an organisation's own invoke API, deployed separately from ELSPETH
 - [ADR Index](architecture/adr/README.md) — accepted architecture decisions
 
 ## Contracts

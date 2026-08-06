@@ -2,8 +2,8 @@
 
 C4 model documentation for the ELSPETH auditable pipeline framework.
 
-**Last Updated:** 2026-07-23 (synchronized with 0.7.1 release line)
-**Framework Version:** 0.7.1 (package metadata aligned at 0.7.1)
+**Last Updated:** 2026-08-07 (synchronized with 0.7.2 release line)
+**Framework Version:** 0.7.2 (package metadata aligned at 0.7.2)
 **Status:** Pre-release
 
 ---
@@ -17,8 +17,8 @@ C4 model documentation for the ELSPETH auditable pipeline framework.
 | **Data flow?** | Source → Transforms/Gates → Sinks (all recorded) |
 | **Audit storage?** | SQLite/SQLCipher (dev) / PostgreSQL (prod) |
 | **Extension model?** | pluggy-based plugin system |
-| **Production LOC** | ~310,600 Python lines across 667 files in `src/elspeth/` (frontend TSX/CSS counts not included) |
-| **Test LOC** | ~727,300 Python lines across 1,565 files (2.3:1 ratio) |
+| **Production LOC** | ~363,900 Python lines across 732 files in `src/elspeth/` (frontend TSX/CSS and the standalone `gateway/` package not included) |
+| **Test LOC** | ~891,300 Python lines across 1,749 files (2.4:1 ratio) |
 
 ---
 
@@ -71,16 +71,26 @@ C4Context
 
     System(elspeth, "ELSPETH", "Auditable Sense/Decide/Act pipeline framework with CLI and Web Composer authoring")
 
-    System_Ext(datasources, "Data Sources", "CSV, JSON, APIs, databases")
+    System_Ext(datasources, "Data Sources", "CSV, JSON, APIs, databases, S3, Azure Blob")
     System_Ext(destinations, "Data Destinations", "Files, databases, message queues")
-    System_Ext(llm, "LLM Providers", "Azure OpenAI, OpenRouter")
+    System_Ext(llm, "LLM Providers", "Azure OpenAI, OpenRouter, AWS Bedrock")
+    System_Ext(gateway, "LLM Compatibility Gateway", "Separately deployed elspeth-llm-gateway service")
 
     Rel(operator, elspeth, "Authors and executes pipelines", "CLI/YAML or authenticated Web Composer")
     Rel(auditor, elspeth, "Queries lineage", "CLI/TUI/MCP")
     Rel(elspeth, datasources, "Reads data from", "Various protocols")
     Rel(elspeth, destinations, "Writes data to", "Various protocols")
     Rel(elspeth, llm, "Calls for decisions", "HTTP/API")
+    Rel(elspeth, gateway, "Calls for decisions", "OpenAI Chat Completions subset over HTTP")
+    Rel(gateway, llm, "Translates to the organisation's own invoke API", "HTTP + OAuth2")
 ```
+
+**On the gateway.** `gateway/` is a standalone package (`elspeth-llm-gateway`)
+with its own `pyproject.toml`, test suite, and container image. It is not part
+of the `elspeth` wheel and nothing under `src/elspeth/` imports it: ELSPETH
+reaches it over HTTP like any other OpenAI-compatible endpoint, through the
+`gateway` LLM provider. It therefore appears here as an external system rather
+than inside the container boundary below.
 
 **Key relationships:**
 
@@ -173,9 +183,10 @@ C4Container
 | **Audit DB** | SQLite/SQLCipher/PostgreSQL | — | Complete audit trail and effect storage (41 tables; SQLite schema epoch 30) |
 | **Payload Store** | Filesystem | — | Content-addressable blob storage with retention |
 
-**Inventory measured from committed `HEAD` on 2026-07-23:** ~310,600 production
-Python lines across 667 files in `src/elspeth/`; ~727,300 test Python lines across 1,565 files
-(2.3:1). Frontend TypeScript and CSS are not included.
+**Inventory measured from committed `HEAD` on 2026-08-07:** ~363,900 production
+Python lines across 732 files in `src/elspeth/`; ~891,300 test Python lines across 1,749 files
+(2.4:1). Frontend TypeScript and CSS are not included, nor is the standalone
+`gateway/` package.
 
 ---
 
@@ -319,8 +330,11 @@ checkpoints, auth_events
 
 **Critical pattern:** identity and recovery are run-scoped. Composite keys bind
 nodes, edges, states, rows, tokens, ancestry, validation errors, routing, and
-sink-effect members to one run. Epoch 29 also persists canonical node output
-contract hashes, durable batch-expansion claims, and the sidecar-journal outbox.
+sink-effect members to one run. The schema also persists canonical node output
+contract hashes, durable batch-expansion claims, and the sidecar-journal outbox
+(added at epoch 29). Epoch 30 adds `token_work_items.row_union_name`, recording
+which row-union barrier group a durable work item belongs to; a store written at
+epoch 29 lacks the column and is not migrated.
 A sink or export result is not complete until its effect reaches `FINALIZED`;
 an uncertain external result remains durable and blocked rather than being
 silently replayed.
@@ -343,10 +357,12 @@ C4Component
         Component(hookspecs, "Hookspecs", "pluggy", "Hook specifications")
     }
 
-    Container_Boundary(sources, "Sources (6 registered)") {
+    Container_Boundary(sources, "Sources (8 registered)") {
         Component(csv_source, "CSVSource", "Python", "Load from CSV")
         Component(json_source, "JSONSource", "Python", "Load from JSON/JSONL")
         Component(azure_blob_source, "AzureBlobSource", "Python", "Load from Azure Blob")
+        Component(aws_s3_source, "AWSS3Source", "Python", "Load from AWS S3")
+        Component(llm_source, "LLMSource", "Python", "Emit at most one row from one authored prompt")
         Component(null_source, "NullSource", "Python", "Empty source for testing")
     }
 
@@ -362,19 +378,21 @@ C4Component
         Component(blob_fetch, "BlobFetch", "Python", "SSRF-safe remote document fetch to payload store")
         Component(blob_csv, "BlobCSVExpand", "Python", "Expand stored CSV blobs into rows")
         Component(azure_di, "AzureDocumentIntelligence", "Python", "External document layout extraction")
+        Component(textract, "AWSTextractDocumentAnalysis", "Python", "AWS Textract document analysis, profile-bound locations")
         Component(content_safety, "ContentSafety", "Python", "Azure Content Safety screening")
         Component(prompt_shield, "PromptShield", "Python", "Azure Prompt Shield detection")
     }
 
     Container_Boundary(llm, "LLM Transforms") {
-        Component(llm_transform, "LLMTransform", "Python", "Unified LLM (azure/openrouter providers, single/multi-query)")
+        Component(llm_transform, "LLMTransform", "Python", "Unified LLM (azure/openrouter/bedrock/gateway providers, single/multi-query)")
     }
 
-    Container_Boundary(sinks, "Sinks (6 registered)") {
+    Container_Boundary(sinks, "Sinks (8 registered)") {
         Component(csv_sink, "CSVSink", "Python", "Write to CSV")
         Component(json_sink, "JSONSink", "Python", "Write to JSON/JSONL")
         Component(db_sink, "DatabaseSink", "Python", "Write to database")
         Component(azure_blob_sink, "AzureBlobSink", "Python", "Write to Azure Blob")
+        Component(aws_s3_sink, "AWSS3Sink", "Python", "Write to AWS S3")
     }
 
     Container_Boundary(clients, "Audited Clients (4)") {
@@ -388,6 +406,8 @@ C4Component
     Rel(csv_source, base, "Extends BaseSource")
     Rel(json_source, base, "Extends BaseSource")
     Rel(azure_blob_source, base, "Extends BaseSource")
+    Rel(aws_s3_source, base, "Extends BaseSource")
+    Rel(llm_source, base, "Extends BaseSource")
     Rel(passthrough, base, "Extends BaseTransform")
     Rel(field_mapper, base, "Extends BaseTransform")
     Rel(batch_stats, base, "Extends BaseTransform")
@@ -396,6 +416,7 @@ C4Component
     Rel(blob_fetch, base, "Extends BaseTransform")
     Rel(blob_csv, base, "Extends BaseTransform")
     Rel(azure_di, base, "Extends BaseTransform")
+    Rel(textract, base, "Extends BaseTransform")
     Rel(content_safety, base, "Extends BaseTransform")
     Rel(prompt_shield, base, "Extends BaseTransform")
     Rel(llm_transform, base, "Extends BaseTransform")
@@ -407,6 +428,7 @@ C4Component
     Rel(json_sink, base, "Extends BaseSink")
     Rel(db_sink, base, "Extends BaseSink")
     Rel(azure_blob_sink, base, "Extends BaseSink")
+    Rel(aws_s3_sink, base, "Extends BaseSink")
 ```
 
 | Component | Count/Purpose |
@@ -416,10 +438,10 @@ C4Component
 | **Results** | Typed results (`TransformResult`, `SourceRow`) |
 | **PluginContext** | Runtime context passed to all plugin methods — phase-typed via `SourceContext`, `TransformContext`, `SinkContext`, `LifecycleContext` protocols (defined in `contracts/contexts.py`) |
 | **PluginManager** | pluggy-based discovery and registration |
-| **Sources** | Registry-discovered source plugins including azure_blob, csv, dataverse, json, null, and text |
-| **Transforms** | Registry-discovered transform plugins including LLM, RAG retrieval, web scrape, `blob_fetch`, `blob_csv_expand`, `azure_document_intelligence`, field/value/type transforms, and statistical batch transforms |
-| **LLM Transforms** | Unified LLMTransform (azure/openrouter providers, single/multi-query strategies) |
-| **Sinks** | Registry-discovered sink plugins including azure_blob, chroma_sink, csv, database, dataverse, and json |
+| **Sources** | Registry-discovered source plugins: `aws_s3`, `azure_blob`, `csv`, `dataverse`, `json`, `llm`, `null`, `text` |
+| **Transforms** | Registry-discovered transform plugins including LLM, RAG retrieval, web scrape, `blob_fetch`, `blob_csv_expand`, `azure_document_intelligence`, `aws_textract_document_analysis`, Azure and AWS Bedrock content-safety/prompt-shield screening, field/value/type transforms, `report_assemble`, and statistical batch transforms |
+| **LLM Transforms** | Unified LLMTransform (azure, openrouter, bedrock, and gateway providers; single/multi-query strategies) |
+| **Sinks** | Registry-discovered sink plugins: `aws_s3`, `azure_blob`, `chroma_sink`, `csv`, `database`, `dataverse`, `json`, `text` |
 | **Clients** | 4 audited clients (HTTP, LLM, Replayer, Verifier) |
 
 **Total Plugin Ecosystem:** registry-discovered plugins across Source,
@@ -573,6 +595,7 @@ stateDiagram-v2
 | `FAILED` | Processing error, not recoverable |
 | `EXPANDED` | Parent token for deaggregation (1→N expansion) |
 | `BUFFERED` | Temporarily held in aggregation (non-terminal, becomes COMPLETED on flush) |
+| `ABANDONED` | Non-terminal path recorded as `(outcome=NULL, path=ABANDONED, completed=False)` for a token whose fate nothing will ever decide — written only by `complete_run` inside its fenced terminal transaction, and only when the run is non-resumable ([ADR-038](docs/architecture/adr/038-non-terminal-abandoned-path.md)). Resumable runs keep buffered tokens honestly open. Accounting separates `tokens.abandoned` from `tokens.pending`, and run closure gains an `abandoned` state |
 
 ### Fork/Join Processing Flow
 
@@ -623,6 +646,18 @@ sequenceDiagram
 - **Merge Strategies**: `union`, `nested`, `select`
 - **Audit Trail**: Complete lineage from parent through children to merged output
 
+#### Row-union barriers
+
+A `row_union` is a distinct barrier from coalesce, declared in its own top-level
+`row_unions:` settings section and built as a `ROW_UNION` node. Where coalesce
+*merges* branch tokens into one, a row union is plugin-free and require-all: it
+waits for every declared branch, then releases those branch rows **unchanged**
+in declared branch order, which is what long-format processing needs. Branch
+order is bound into topology identity, cross-origin branches are rejected at
+build time, and `token_work_items.row_union_name` (Landscape epoch 30) records
+group membership so the barrier survives crash recovery. `RowUnionExecutor`
+implements the barrier and fails closed.
+
 ---
 
 ## Deployment View
@@ -670,10 +705,15 @@ C4Deployment
 | Development | SQLite | SQLite/SQLCipher | Local filesystem |
 | Supported AWS ECS profile | Aurora PostgreSQL | Aurora PostgreSQL | EFS plus task-role S3 |
 
-The 0.7.1 AWS profile supports one web task at a time. Validate-only startup,
-the deployment doctor, readiness checks, and schema-owner separation are part
-of the deployment contract; mixed-version rollout across the pre-1.0 schema
-cutover is not supported.
+The 0.7.2 AWS profile supports one web task at a time. Validate-only startup,
+the deployment doctor (`elspeth doctor`), readiness checks, and schema-owner
+separation are part of the deployment contract; mixed-version rollout across the
+pre-1.0 schema cutover is not supported.
+
+The maintained deployment set is Docker Compose, AWS ECS, native Linux systemd,
+one Azure Ubuntu VM, and Kubernetes BYO. Azure Container Apps is deferred
+pending cross-instance admission and fencing, and no bundle ships for it. See
+the [deployment platform matrix](docs/reference/deployment-platforms.md).
 
 ---
 
@@ -975,6 +1015,23 @@ ELSPETH uses ADRs to document significant architectural choices.
 | **ADR-022** | Shareable reviews | Add signed share tokens and composer completion events | Freezes reviewable composition state with auditable completion gestures |
 | **ADR-023** | Custom Python CI analyzer | Maintain `elspeth-lints` for project-specific static invariants | Captures architecture and audit rules that general linters cannot express |
 | **ADR-024** | Delivery governance for single-maintainer mode | Govern release and CI/CD delivery for single-maintainer operation | Makes delivery controls explicit where team-size assumptions do not apply |
+| **ADR-025** | Multi-source ingestion | The pipeline source surface is plural by contract and by code; the singular `source` surface is deleted, not deprecated | Removes the special case rather than carrying two ingestion shapes |
+| **ADR-026** | Durable token scheduler | Record the durable scheduler discipline and the two P0 correctness fixes found in the engine audit | Fixes the scheduler contract in the record rather than in commit archaeology |
+| **ADR-027** | Composer operator set sampling | Nullable `composer_temperature` / `composer_seed` on `WebSettings`, defaulting to `None` so the field is omitted from the provider request | Makes Composer LLM sampling explicit operator configuration instead of a hidden default |
+| **ADR-028** | QUEUE and COALESCE are not duplicates | Keep them separate; a future Barrier abstraction targets aggregation + coalesce, not queue + coalesce | The structural twins are aggregation and coalesce; unifying queue with them would merge unlike semantics |
+| **ADR-029** | Journal is barrier-buffer truth | The scheduler journal (`token_work_items` BLOCKED rows) is the single source of truth for barrier-buffer membership and payload on resume; the blob checkpoint-state families are deleted | One durable record for buffered work instead of two that can disagree |
+| **ADR-030** | Multi-worker deployment shape | A pack of cooperating OS processes on one host sharing one WAL SQLite audit database, coordinated as one epoch-fenced leader plus claim-only followers | Bounds the supported concurrency shape so audit determinism survives |
+| **ADR-031** | Tutorial is a fixed-script canary | Keep the tutorial maximally fragile and preserve backend parity permanently — no tutorial-only normalisation or shortcuts | Tutorial breakage is an early warning about the general path, so it must stay on that path |
+| **ADR-032** | Validate by trust domain | Choose boundary validation by trust domain: `isinstance` against a concrete class ELSPETH defines for internal boundaries, parse-and-construct for everything else | A structural (`runtime_checkable` Protocol) check is not a security control — an impostor passes |
+| **ADR-033** | Deferred-intent admission contract | Decide contradiction within one exact subject identity and closed count-bound arithmetic; explicitly decline existential subject resolution | Bounds the checker to decidable questions instead of open-ended witness search |
+| **ADR-034** | Audited inline blob content | Widen `blob_ref` with an explicit `mode` discriminator instead of adding a sibling `blob_content_ref` form | One reference shape with a declared mode beats two near-identical shapes |
+| **ADR-035** | Audit hash raw vs stored asymmetry | The raw/sanitized hashing asymmetry is deliberate and must not be unified: error-path hashes fingerprint the raw external input | The two hashes answer different evidentiary questions; merging them destroys one |
+| **ADR-036** | Textract profile-bound bucket | Move bucket identity to config lowering and out of the web-authorable surface; the transform gains static `bucket` / `key_prefix` options mutually exclusive with `bucket_field` | Config lowering has a custody seam; the web authoring surface does not |
+| **ADR-037** | Interpretation caps govern LLM churn only | The interpretation rate caps are an allow-list of one — they apply to `vague_term` and nothing else, counted on the population the check governs | A cap is coherent only where the user authored the term and the LLM has a bake-into-the-prompt fallback |
+| **ADR-038** | Non-terminal ABANDONED path | Add `TerminalPath.ABANDONED` — `(outcome=NULL, path=ABANDONED, completed=False)` — for a token whose fate nothing will ever decide | Amends ADR-019: a finished run must not claim its work is still in flight |
+
+ADR-034 and ADR-035 were renumbered in 0.7.2 from colliding `025-` and `026-`
+filenames; the record is now contiguously numbered 000–038.
 
 ### Implicit Architectural Decisions
 
@@ -1001,7 +1058,7 @@ ongoing CI enforcement.
 | Dimension | Evidence |
 |-----------|----------|
 | **Maintainability** | Clean module boundaries, consistent patterns across subsystems |
-| **Testability** | 2.6:1 test-to-production LOC ratio, mutation testing, property tests |
+| **Testability** | 2.4:1 test-to-production LOC ratio, mutation testing, property tests |
 | **Type Safety** | mypy strict mode, runtime-checkable protocols, NewType aliases |
 | **Documentation** | ADRs, runbooks, architecture docs, and trust-boundary guides |
 | **Error Handling** | Three-tier trust model with distinct rules per boundary |
@@ -1032,7 +1089,7 @@ ongoing CI enforcement.
 |----------|--------|----------|
 | **Audit Integrity** | ✅ Low Risk | Tier 1 crash policy, NaN/Infinity rejected |
 | **Type Safety** | ✅ Low Risk | mypy strict, runtime protocol verification |
-| **Test Coverage** | ✅ Low Risk | 2.6:1 ratio, mutation testing, property tests |
+| **Test Coverage** | ✅ Low Risk | 2.4:1 ratio, mutation testing, property tests |
 | **Resume Safety** | ✅ Low Risk | Full topology hash (BUG-COMPAT-01 fix applied) |
 
 ---
@@ -1067,12 +1124,12 @@ ongoing CI enforcement.
 
 **Key Metrics:**
 
-- Production LOC: ~236,100 (598 Python files in `src/elspeth/`; frontend TSX/CSS not included)
-- Test LOC: ~619,900 (1,391 Python files, 2.6:1 ratio)
+- Production LOC: ~363,900 (732 Python files in `src/elspeth/`; frontend TSX/CSS and the standalone `gateway/` package not included)
+- Test LOC: ~891,300 (1,749 Python files, 2.4:1 ratio)
 - Subsystems: 11 major (20+ including sub-components)
 - Plugins: registry-discovered via `discover_all_plugins()` — the same code path as `elspeth plugins list`
-- ADRs: 30+ accepted records (excluding the 000 template)
-- Status: Pre-release (0.7.1)
+- ADRs: 38 accepted records (excluding the 000 template)
+- Status: Pre-release (0.7.2)
 
 All diagrams use Mermaid syntax for version control compatibility.
 

@@ -6,15 +6,6 @@ All notable changes to ELSPETH are documented here.
 
 ## Unreleased
 
-### Deployment
-
-Release-candidate documentation now states the cross-platform deployment contract:
-Docker Compose, AWS ECS, native Linux, one Azure Ubuntu VM, and Kubernetes BYO.
-A new AWS stack comes from the tracked AWS ECS Terraform cold-install package,
-while the separate release acceptance controller and the existing-service
-redeploy path use operator-supplied task-definition ARNs; Azure Container Apps
-remains deferred pending cross-instance fencing.
-
 ## 0.7.2 - Release candidate (Release hardening and recovery correctness)
 
 0.7.2 separates the production-path hardening completed after 0.7.1. It
@@ -54,12 +45,38 @@ then install
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
 
+**Breaking operator setting rename:** `ELSPETH_WEB__TUTORIAL_LLM_PROFILE`
+becomes `ELSPETH_WEB__DEFAULT_LLM_PROFILE`, and `WebSettings.tutorial_llm_profile`
+becomes `default_llm_profile`. The setting never designated a tutorial-owned
+profile; it names the deployment's standard profile, which the first-run
+tutorial happens to use. There is no compatibility alias, so any deployment
+setting the old variable must change its environment before upgrading, and the
+protected AWS acceptance env-var contract moves with it or the scenario binding
+hash no longer matches the deployed task definition. Configuring `llm_profiles`
+without naming the standard profile is now a startup error rather than an
+arbitrary alias silently becoming the house default; zero configured profiles
+stays valid.
+
+**Breaking API rename:** `WebLLMProfileSettings` becomes `LLMProfileSettings`
+and `RuntimeWebLLMProfile` becomes `RuntimeLLMProfile`, with the alias and
+secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
+`SECRET_REF_PATTERN`. No compatibility aliases or re-exports remain.
+
 ### Major changes
 
 - **Deployment and packaging have maintained production profiles** — the
   release adds Docker Compose/PostgreSQL and native Linux systemd bundles,
   retains the AWS ECS acceptance controller, and builds a pinned non-root image
-  with its Web Composer assets and selected dependency extras.
+  with its Web Composer assets and selected dependency extras. A
+  provider-neutral `elspeth doctor` runs deployment readiness checks against a
+  target before it goes live.
+- **The cross-platform deployment contract is stated** — documentation now
+  names the supported set: Docker Compose, AWS ECS, native Linux, one Azure
+  Ubuntu VM, and Kubernetes BYO. A new AWS stack comes from the tracked AWS ECS
+  Terraform cold-install package, while the separate release acceptance
+  controller and the existing-service redeploy path use operator-supplied
+  task-definition ARNs; Azure Container Apps remains deferred pending
+  cross-instance fencing, and its bundle is not shipped.
 - **AWS and PostgreSQL paths align with their production contracts** — Composer
   can use Bedrock through the AWS default credential chain, the packaged
   PostgreSQL extra supports both locked SQLAlchemy driver paths, and acceptance
@@ -78,11 +95,20 @@ drained and repair this release forward.
 - **Textract document locations bind through operator profiles on the web
   surface** (ADR-036) — the transform gains a static `bucket` + `key_prefix`
   location mode (mutually exclusive with `bucket_field`), web deployments
-  grant document locations through a dedicated `aws_textract_profiles` table
-  with an allowlist projection that makes bucket identity web-inexpressible,
-  and profiled runs persist `{profile, relative key}` in AWS call records so
-  operator-private bucket names never reach the audit trail. CLI/YAML
-  `bucket_field` pipelines are unchanged.
+  grant document locations through a dedicated operator-declared
+  `aws_textract_profiles` settings section, and the authoring projection flips
+  from a denylist to an allowlist so `bucket`, `bucket_field`, and `key_prefix`
+  are all web-inexpressible. Profiled runs persist `{profile, relative key}` in
+  AWS call records so operator-private bucket names never reach the audit
+  trail. No database table shape changed. CLI/YAML `bucket_field` pipelines are
+  unchanged.
+- **ADR numbering collisions are repaired** — two ADRs numbered 025 and two
+  numbered 026 are renumbered to `034-audited-inline-blob-content` and
+  `035-audit-hash-raw-vs-stored-asymmetry`, leaving the record contiguously
+  numbered 000–038. Five new ADRs are accepted this release: 032 (validate by
+  trust domain), 033 (deferred-intent admission contract), 036 (Textract
+  profile-bound bucket), 037 (interpretation caps govern LLM churn only), and
+  038 (non-terminal ABANDONED path).
 
 ### Critical fixes
 
@@ -96,6 +122,16 @@ drained and repair this release forward.
   surfaces.
 - **Composer preflight cannot silently reuse stale meaning** — the runtime
   preflight cache is keyed by composition content, including unsaved state.
+- **Every token reaches a lifecycle answer when a run dies** (ADR-038) — a
+  contract violation raised mid-load previously stranded its buffered tokens
+  at `closure='open'` on a run no resume could recover. Non-resumable runs now
+  record `(outcome=NULL, path=ABANDONED)` inside the fenced terminal
+  transaction, accounting separates abandoned from pending tokens, and closure
+  gains an `abandoned` state. Resumable runs keep buffered tokens honestly
+  open.
+- **Resume advice matches the gate resume enforces** — `can_resume` evaluates
+  the same source-lifecycle gate as `resume()`, and the CLI suggests resuming
+  after an interrupt only when that gate says it can succeed.
 - **Authentication and deployment state fail closed** — local auth files,
   external identity keys, token expiry, JWT secrets, deployment roots, and ECS
   PostgreSQL transport must pass their admission checks before use.

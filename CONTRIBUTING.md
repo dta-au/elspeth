@@ -44,6 +44,11 @@ All of these must pass before submitting changes:
 .venv/bin/python -m scripts.check_contracts
 ```
 
+The root suite is scoped to `testpaths = ["tests"]`, so it does **not** cover
+`gateway/`. That package (`elspeth-llm-gateway`) is standalone, with its own
+`pyproject.toml` and test suite; if you change it, run its tests from
+`gateway/` as well.
+
 ## Code Standards
 
 - **No defensive programming** against our own code. Access typed fields directly (`obj.field`), not defensively (`getattr(obj, "field", None)`). See [Data Trust and Error Handling](docs/guides/data-trust-and-error-handling.md) for the trust-boundary rationale.
