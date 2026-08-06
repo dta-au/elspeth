@@ -164,10 +164,15 @@ def load_discard_summaries_from_db(
         #
         # A correlated scalar subquery, not a join: the discard sentinel lives on
         # token_outcomes while the node lives on the token's FAILED sink state,
-        # and a token fanned out to several sinks has more than one such state.
-        # Joining would emit one row per state and inflate the count against the
-        # category totals DiscardSummary cross-checks. Reducing to one node per
-        # token keeps the total exactly what the unattributed query returned.
+        # and nothing in the schema constrains a token to one of those. Joining
+        # would emit one row per state and inflate the stage total past the
+        # category count DiscardSummary cross-checks, turning an attribution
+        # question into a rejected response. Reducing to one node per token keeps
+        # the total exactly what the unattributed query returned, whatever the
+        # states say. To be clear about how much is claimed: this is defensive,
+        # not observed — a discarded token is terminal, so no such shape has been
+        # reproduced. The ordering picks the deepest state and is therefore a
+        # best-effort ATTRIBUTION; only the COUNT is exact.
         #
         # LEFT-join semantics (a NULL node_id when no failed sink state exists)
         # are deliberate for the same reason: a discard whose primary anchor is
