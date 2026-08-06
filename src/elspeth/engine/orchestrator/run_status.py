@@ -164,13 +164,19 @@ def derive_terminal_status_from_audit(factory: RecorderFactory, run_id: str) -> 
     for outcome_record in outcomes:
         if not outcome_record.completed:
             if outcome_record.path is TerminalPath.ABANDONED:
-                # ADR-038: an ABANDONED record asserts its run can never be
-                # resumed, yet this derive only executes inside a resume.
+                # ADR-038 fail-closed belt. This derive runs on BOTH the
+                # normal completion arm and the resume arms (ADR-030 §D —
+                # see the module docstring), but neither should ever see an
+                # ABANDONED record: the sweep writes them only AFTER the
+                # terminal stamp (normal arm derives before finalize), and a
+                # swept run trips the resume gates before either resume arm
+                # derives. Reading one here means a state those gates should
+                # already have refused — crash rather than count.
                 raise AuditIntegrityError(
-                    f"Resume aggregation for run {run_id!r} read an ABANDONED record "
+                    f"Status derive for run {run_id!r} read an ABANDONED record "
                     f"for token {outcome_record.token_id!r}: the audit trail declares "
-                    "this run non-resumable, so a resume deriving its status is an "
-                    "audit contradiction — refusing to continue."
+                    "this run non-resumable and already finalized, so a live derive "
+                    "over it is an audit contradiction — refusing to continue."
                 )
             if (outcome_record.outcome, outcome_record.path) == (None, TerminalPath.BUFFERED):
                 apply_counter_increments(counters, TERMINAL_PAIR_COUNTER_EFFECTS[(None, TerminalPath.BUFFERED)])

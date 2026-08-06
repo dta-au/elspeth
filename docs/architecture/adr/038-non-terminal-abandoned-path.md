@@ -71,7 +71,12 @@ all discriminator columns forbidden. The abandonment reason travels in
 and the incomplete source states), not in discriminator columns — an
 abandonment is not attributable to a sink, batch, or error site; tying it
 to the flush error that happened to precede it would be inference the
-producer cannot honestly declare.
+producer cannot honestly declare. Note the deliberate asymmetry with the
+`BUFFERED` sibling, which *requires* `batch_id`: an auditor asking "which
+batch was this abandoned token buffered into?" answers it by joining the
+token's own `(NULL, BUFFERED)` acceptance row on `token_id` — the
+abandonment row never restates it (and some abandoned tokens, e.g.
+mid-flight to a sink, have no batch at all).
 
 `ABANDONED` is **not** a legal `RowResult`/`PendingOutcome` value
 (`contracts/results.py`, `contracts/engine.py` keep their
@@ -98,9 +103,22 @@ the terminal conditional UPDATE succeeds, when:
 - the run is **non-resumable**, determined on the same connection,
 
 then every token of the run with no `completed=1` outcome row and no
-existing live `(NULL, ABANDONED)` row receives one `(NULL, ABANDONED)`
-record (idempotent by that WHERE clause; a takeover-refusal re-finalize
-re-runs the sweep as a no-op).
+existing `(NULL, ABANDONED)` row receives one `(NULL, ABANDONED)` record.
+Idempotency has two layers: the terminal UPDATE's already-terminal refusal
+is the single-winner gate on every ordinary path, and the WHERE exclusion
+makes the sweep a no-op on the one documented re-finalize path
+(terminal → `update_run_status(RUNNING)` → re-complete).
+
+**The sweep runs only on the FENCED finalize arm** (`token is not None`).
+Token-less `complete_run` callers — the web orphan reaper
+(`web/app.py::_finalize_orphaned_landscape_runs`), acceptance harnesses,
+direct repository callers — run on a plain write connection with no epoch
+fence, and an unfenced sweep could abandon tokens of a run a live leader
+is still driving (a reaper liveness misfire would otherwise escalate into
+a permanent decided∧abandoned accounting contradiction). Those paths
+deliberately **under-abandon**: their runs keep `closure='open'`. If the
+reaper should ever abandon, the path forward is giving it a fenced
+takeover, not unfencing the sweep.
 
 **Why inside the transaction, after the stamp:** abandonment becomes true
 at the instant the run is irrevocably dead. Written before the stamp, a
@@ -144,6 +162,20 @@ sweep does not fire and undecided tokens stay `BUFFERED` with
 that is simply never resumed keeps that state forever, and that is the
 truth.
 
+Two review-verified notes on the arms (adversarial review, 2026-08-06):
+the no-checkpoint arm is **near-vestigial in practice** — the engine
+writes a sequence-0 run-start checkpoint for every checkpointing-enabled
+run, so it fires only when checkpointing is disabled outright; the
+source-lifecycle arm is the live discriminator between the pinned count
+and END_OF_SOURCE cases (verified empirically: both crash with
+`checkpoints=1`; only the lifecycle differs). And under PostgreSQL the
+sweep's candidate SELECT takes `FOR UPDATE` row locks on the tokens rows:
+every outcome write locks its token FK row first
+(`lock_token_outcome_dependencies`), so the read-then-insert serializes
+against a concurrent terminal write under READ COMMITTED instead of
+racing into a decided∧abandoned contradiction. SQLite's single-writer
+transaction gives the same guarantee and ignores `FOR UPDATE`.
+
 ### 4. Accounting: `abandoned` tokens and `closure='abandoned'`
 
 `web/execution/accounting.py` splits the undecided set:
@@ -171,13 +203,38 @@ duplicate-terminal-outcomes raise.
   run are left intact (mirroring "FAILED/INTERRUPTED leave the journal for
   resume"); no resume can ever adopt them because the resume gates refuse
   the run first. The §E.3a reconcile is untouched — it continues to match
-  only `(FAILURE, UNROUTED)`.
+  only `completed=1` `(FAILURE, UNROUTED)` rows, which a `completed=0`
+  ABANDONED record can never satisfy. **Named invariant for future
+  auditors:** an abandoned run therefore carries a permanent, deliberate
+  cross-table tension — the journal says work is pending, the outcomes say
+  nothing will ever do it. The outcomes row is the honest record; the
+  journal rows are dead weight a non-resumable run can never replay. Do
+  not "fix" this by releasing them: release is a scheduler mutation on a
+  dead run with no consumer, and the §E.3a family's release semantics are
+  reserved for decided-terminal tokens.
 - **The seam-wide "explicit fate decision at every contract-violation
   raise site" refactor** (the architecture reviewer's wider point on
   `elspeth-b4254f9a01`) is not attempted here. This ADR closes the
   contract gap and installs the one fate decider that requires no per-site
   choreography; requiring every raise site to declare
   terminal / abandoned / resumable is a separate, larger decision.
+
+## Behavior Change Notice (operator-visible)
+
+> ⚠ **Interrupting a run mid-load (Ctrl-C / graceful shutdown while a
+> source is still `loading`) now permanently abandons its buffered
+> tokens.** The interrupted ceremony finalizes through the fenced arm, the
+> sources never reached a complete lifecycle state, so the sweep records
+> `(NULL, ABANDONED)` and accounting reports `closure='abandoned'` instead
+> of the old open-forever `pending`. This is the honest record — such a
+> run was never resumable (`IncompleteSourceResumeError`) — but operators
+> who read `closure='open'` as "maybe recoverable" should note the
+> distinction is now explicit. Runs interrupted **after** source
+> completion are untouched: still `closure='open'`, still resumable.
+>
+> Runs finalized by the **web orphan reaper** (token-less INTERRUPTED
+> stamps over RUNNING-stale runs) are NOT swept and keep `closure='open'`
+> — see §2's fenced-arm rule.
 
 ## Consequences
 
@@ -201,8 +258,14 @@ duplicate-terminal-outcomes raise.
 ### Negative
 
 - `complete_run`'s terminal transaction grows a SELECT and up to N
-  INSERTs on the FAILED/INTERRUPTED arm. Bounded by undecided-token count,
-  runs once per run death; acceptable for an audit-tier verb.
+  INSERTs on the fenced FAILED/INTERRUPTED arm — one recorder call per
+  undecided token, so N is unbounded in principle (a very large buffered
+  run holds the write lock for N round-trips, and a mid-sweep failure
+  rolls back the stamp, leaving the run RUNNING-stale). Accepted for now:
+  N is the buffered-batch scale in practice, the sweep runs once per run
+  death, and per-row recorder calls keep the Tier-1 pair validation.
+  A batched insert that preserves the validation is the escape hatch if
+  this ever bites.
 - A hard crash (kill -9) still leaves `closure='open'` with no
   abandonment records — no finalize, no sweep. That is the pre-existing
   crashed-process story (RUNNING-stale, liveness), not changed here.

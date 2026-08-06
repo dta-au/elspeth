@@ -655,8 +655,14 @@ class RunLifecycleRepository:
             # frozen. If no resume can ever decide the run's undecided
             # tokens, record that — inside this same fenced transaction, so
             # a deposed leader's refused stamp never leaves false
-            # abandonment records behind.
-            if status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
+            # abandonment records behind. The ``token is not None`` gate is
+            # load-bearing: token-less finalizes (the web orphan reaper at
+            # web/app.py::_finalize_orphaned_landscape_runs, acceptance
+            # harnesses, direct repository callers) run UNFENCED, and an
+            # unfenced sweep could abandon tokens of a run a live leader is
+            # still driving. Those paths deliberately under-abandon — their
+            # runs keep closure='open' — rather than risk a false record.
+            if token is not None and status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
                 self._abandon_undecided_tokens_in(conn, run_id=run_id, status=status)
 
             # §D follower-departure hygiene (no-op at N=1, evented).
@@ -718,7 +724,8 @@ class RunLifecycleRepository:
     def _abandon_undecided_tokens_in(self, conn: Connection, *, run_id: str, status: RunStatus) -> None:
         """ADR-038: record (NULL, ABANDONED) for tokens nothing will ever decide.
 
-        Runs inside :meth:`_complete_run_in`'s fenced transaction, after the
+        Runs inside :meth:`_complete_run_in`'s transaction — only on the
+        FENCED arm (the caller gates on ``token is not None``), after the
         FAILED/INTERRUPTED terminal UPDATE has succeeded. Fires only when the
         run is non-resumable, tested arm for arm against the structural
         refusals a future resume would hit (``engine/orchestrator/resume.py``):
@@ -730,9 +737,11 @@ class RunLifecycleRepository:
 
         When the run IS resumable, undecided tokens keep their BUFFERED
         acceptances and accounting stays honestly ``closure='open'`` — a
-        resume may yet decide them. The write is idempotent: tokens already
-        bearing an ABANDONED row are excluded, so a takeover-refusal
-        re-finalize sweeps as a no-op.
+        resume may yet decide them. The write is idempotent under the
+        documented re-finalize path (terminal → ``update_run_status(RUNNING)``
+        → re-complete): tokens already bearing an ABANDONED row are excluded.
+        On any other path the terminal UPDATE's already-terminal refusal is
+        the single-winner gate, so the sweep cannot run twice.
         """
         source_states = conn.execute(
             select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
@@ -767,12 +776,21 @@ class RunLifecycleRepository:
             )
             .exists()
         )
+        # ``with_for_update`` is the PostgreSQL race mitigation: every
+        # outcome write locks its token FK row first
+        # (``lock_token_outcome_dependencies``), so locking the candidate
+        # tokens rows here serializes the read-then-insert against a
+        # concurrent terminal write under READ COMMITTED — the competing
+        # writer either committed before our lock (the NOT EXISTS sees its
+        # row) or blocks until we commit. SQLite ignores FOR UPDATE; its
+        # single-writer transaction provides the same guarantee.
         undecided_token_ids = (
             conn.execute(
                 select(tokens_table.c.token_id)
                 .where(tokens_table.c.run_id == run_id)
                 .where(~decided_or_abandoned)
                 .order_by(tokens_table.c.token_id)
+                .with_for_update()
             )
             .scalars()
             .all()
