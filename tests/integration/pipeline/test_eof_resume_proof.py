@@ -47,6 +47,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import Determinism, PipelineRow, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
+from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -55,7 +56,7 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
-from elspeth.core.landscape.schema import run_sources_table, runs_table, token_work_items_table
+from elspeth.core.landscape.schema import run_sources_table, runs_table, token_outcomes_table, token_work_items_table
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -280,7 +281,13 @@ class TestExhaustedSourceEOFResume:
         # Reshape the interruption into the exhausted-then-crashed-EOF-flush
         # state: 'exhausted' is exactly what finalize_source_iteration records
         # before the EOF flush runs; FAILED is what the failure ceremony
-        # records when that flush crashes.
+        # records when that flush crashes. The ADR-038 abandonment rows must
+        # go too: the graceful interrupt above finalized with the source
+        # still incomplete, so its fenced ceremony correctly recorded
+        # (NULL, ABANDONED) — but the state being synthesized here (crash
+        # AFTER exhaustion) is one where the sweep does not fire (see
+        # test_aggregation_eof_flush_violation_leaves_genuinely_retryable_tokens),
+        # so a faithful reshape carries no abandonment records.
         with db.engine.begin() as conn:
             conn.execute(
                 run_sources_table.update()
@@ -288,6 +295,11 @@ class TestExhaustedSourceEOFResume:
                 .values(lifecycle_state="exhausted")
             )
             conn.execute(runs_table.update().where(runs_table.c.run_id == run_id).values(status=RunStatus.FAILED))
+            conn.execute(
+                token_outcomes_table.delete()
+                .where(token_outcomes_table.c.run_id == run_id)
+                .where(token_outcomes_table.c.path == TerminalPath.ABANDONED.value)
+            )
         assert _run_sources_states(db, run_id) == {"primary": "exhausted"}
 
         recovery = RecoveryManager(db, checkpoint_mgr)

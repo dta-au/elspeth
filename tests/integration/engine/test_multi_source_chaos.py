@@ -727,7 +727,11 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
     # No token reached a terminal outcome: the fence abandoned the in-flight
     # result without fabricating completion, and the parked PENDING_SINK
     # tokens were refused sink delivery when the run failed its invariant.
-    assert _outcomes_by_source(db, run_id) == []
+    # Under ADR-038 that abandonment is now an explicit audit record: the
+    # FAILED finalize on this non-resumable run marks every undecided token
+    # (NULL, ABANDONED) — non-terminal, no lifecycle answer fabricated.
+    outcomes = _outcomes_by_source(db, run_id)
+    assert sorted(outcomes) == sorted([("orders", None, "abandoned", None)] * 2 + [("refunds", None, "abandoned", None)] * 2)
 
 
 # ---------------------------------------------------------------------------

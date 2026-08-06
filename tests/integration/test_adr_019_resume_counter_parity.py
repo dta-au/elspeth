@@ -626,11 +626,15 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
     # finalize_source_iteration records before the EOF flushes run; 'failed' is
     # what the failure ceremony records when an EOF flush crashes. This is the
     # resumable shape on the multi-source branch — a mid-source interrupt is
-    # refused with IncompleteSourceResumeError.
+    # refused with IncompleteSourceResumeError. The mid-source interrupt's
+    # fenced ceremony correctly wrote ADR-038 (NULL, ABANDONED) rows for the
+    # then-incomplete sources; the state being synthesized (crash AFTER
+    # exhaustion) carries none, so a faithful reshape deletes them.
     with db_b.engine.connect() as conn:
         run_id = conn.execute(select(runs_table.c.run_id)).fetchone().run_id
         conn.execute(text("UPDATE runs SET status='failed' WHERE run_id=:rid"), {"rid": run_id})
         conn.execute(text("UPDATE run_sources SET lifecycle_state='exhausted' WHERE run_id=:rid"), {"rid": run_id})
+        conn.execute(text("DELETE FROM token_outcomes WHERE run_id=:rid AND path='abandoned'"), {"rid": run_id})
         conn.commit()
 
     # Non-vacuity: run-1 must have already consumed SOME (but not all) barrier
