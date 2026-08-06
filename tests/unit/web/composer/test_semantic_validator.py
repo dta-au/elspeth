@@ -876,6 +876,70 @@ class TestGenerativeProducerFeedsLineExplode:
             for entry in (*result.errors, *result.warnings)
         ), "llm -> line_explode must raise no semantic entry at all through the wired surface"
 
+    def test_intervening_transform_degrades_to_advisory_not_refusal(self) -> None:
+        """The REAL g11 topology had a transform between the llm and the sink.
+
+        g11 was `llm source -> content_safety -> text sink`, and the authorable
+        repair keeps that middle transform. Pass-through propagation is
+        deliberately not performed, so an intervening producer that declares
+        nothing breaks the fact chain and the edge is UNKNOWN — no matter what
+        the llm upstream of it claims.
+
+        This is the honest split, and it is why BOTH changes were needed:
+        UNCONSTRAINED (ADR-039 §1) makes only the DIRECT edge factual, while
+        FAIL -> WARN (§3c) is what actually unblocks the real shape. Under the
+        old FAIL policy this composition was REFUSED, which is what left the
+        user's goal with no correct spelling.
+        """
+        state = self._llm_to_line_explode_state()
+        # Splice a real registered transform that declares no output semantics
+        # between the generator and the exploder.
+        generate = NodeSpec(
+            id="generate",
+            node_type="transform",
+            plugin="llm",
+            input="raw_rows",
+            on_success="screen_in",
+            on_error="discard",
+            options=dict(state.nodes[0].options),
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        screen = NodeSpec(
+            id="screen",
+            node_type="transform",
+            plugin="passthrough",
+            input="screen_in",
+            on_success="explode_in",
+            on_error="discard",
+            options={"schema": {"mode": "flexible", "fields": ["announcement: str"]}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = state.with_node(generate).with_node(screen)
+
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == (), "The real g11 repair must be AUTHORABLE — this is what FAIL -> WARN buys"
+        assert len(warnings) == 1, "The broken fact chain must still be disclosed"
+        assert warnings[0].component == "node:split_lines"
+
+        assert len(contracts) == 1
+        assert contracts[0].producer_plugin == "passthrough"
+        assert contracts[0].outcome is SemanticOutcome.UNKNOWN, (
+            "Pass-through propagation is deliberately not performed, so the llm's UNCONSTRAINED claim "
+            "does not survive an intervening transform. If this ever becomes SATISFIED, propagation "
+            "landed and this test should be re-pointed, not deleted."
+        )
+
     def test_unconstrained_text_is_rejected_by_a_compact_only_requirement(self) -> None:
         """The gate a later phase installs on the text sink.
 

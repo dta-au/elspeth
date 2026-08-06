@@ -167,8 +167,10 @@ lands.
 
 ### 5. Why adding a positively-claimed member is safe today
 
-Exactly two consumers declare `input_semantic_requirements()` in the whole tree,
-so the blast radius is a closed enumeration rather than an estimate:
+At the time of this decision, exactly two consumers declare
+`input_semantic_requirements()` in the whole tree, so the blast radius is a
+closed enumeration rather than an estimate (the `TextSink` requirement of §4/§6
+is the expected third, and it is designed to reject the new member):
 
 | consumer | `accepted_text_framings` | effect of the new member |
 | --- | --- | --- |
