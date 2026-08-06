@@ -384,6 +384,54 @@ def test_post_emission_check_raises_on_declared_field_metadata_mismatch() -> Non
     assert mismatch["observed_present"] is True
 
 
+def test_post_emission_check_abstains_on_any_typed_declared_field_metadata() -> None:
+    """A declared 'any' field makes no metadata claim (elspeth-97487736ca).
+
+    The base ``_build_output_schema_config`` declares created fields as
+    required any-typed — an existence guarantee with the type unknown. The
+    emitted contract carries contract-propagation defaults (runtime-typed,
+    ``inferred``/optional), which must not violate a declaration that never
+    claimed otherwise. Presence stays enforced via the guarantees limb
+    (``missing_required_fields``); only the metadata comparison abstains.
+    """
+    from elspeth.contracts.schema import FieldDefinition
+
+    contract = SchemaConfigModeContract()
+    plugin = _plugin(
+        output_schema_config=SchemaConfig(
+            mode="fixed",
+            fields=(
+                FieldDefinition(name="score", field_type="int"),
+                FieldDefinition(name="copy_index", field_type="any"),
+            ),
+            guaranteed_fields=("copy_index", "score"),
+        )
+    )
+    inputs = PostEmissionInputs(
+        plugin=plugin,
+        node_id="n-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+        input_row=_row(("score",), mode="FIXED"),
+        static_contract=frozenset({"score", "copy_index"}),
+        effective_input_fields=frozenset({"score"}),
+    )
+    outputs = PostEmissionOutputs(
+        emitted_rows=(
+            _row(
+                ("score", "copy_index"),
+                mode="FIXED",
+                python_type={"score": int, "copy_index": int},
+                required={"score": True, "copy_index": False},
+                nullable={"score": False, "copy_index": True},
+            ),
+        )
+    )
+
+    assert contract.post_emission_check(inputs, outputs) is None
+
+
 def test_dispatcher_raises_single_violation_for_schema_config_mode_only(_isolated_registry) -> None:
     register_declaration_contract(SchemaConfigModeContract())
     plugin = _plugin(output_schema_config=_schema_config(mode="fixed", fields=("source",)))

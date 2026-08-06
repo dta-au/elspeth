@@ -103,6 +103,16 @@ def _collect_field_metadata_mismatches(
         if field_name not in runtime_row_fields:
             continue
 
+        if declared_field.python_type is object:
+            # FieldDefinition 'any' — an existence guarantee with no metadata
+            # claim. The base _build_output_schema_config declares created
+            # fields this way when only their names are known, and the emitted
+            # contract carries propagation defaults (runtime-typed,
+            # inferred/optional). Presence stays enforced by the guarantees
+            # limb (missing_required_fields); only this comparison abstains
+            # (elspeth-97487736ca).
+            continue
+
         observed_field = emitted_row.contract.find_field(field_name)
         if (
             observed_field is not None
