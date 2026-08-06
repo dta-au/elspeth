@@ -99,6 +99,23 @@ def _output_forbids_extras(transform: BaseTransform) -> bool:
     return output is not None and output.model_config.get("extra") == "forbid"
 
 
+def _consumed_identifier_columns(transform: BaseTransform) -> frozenset[str]:
+    """Consumed input columns a fixed-mode re-declaration must declare.
+
+    Since elspeth-d3958d90f5, construction rejects a ``mode: fixed`` schema
+    that omits an AUTHORED consumed column — the configured read could never
+    succeed — and every probe_config authors its column options. A candidate
+    omitting them would only measure that guard, not the output-contract
+    invariant these arms exist for. The validated surface read here also
+    includes option DEFAULTS (a superset of what the guard checks); declaring
+    a defaulted column is harmless for these candidates. Dotted and other
+    non-identifier spellings are exempt from the guard and cannot be schema
+    fields, so they are excluded here too.
+    """
+    consumed = set(transform.declared_input_fields) | set(transform._config_named_input_columns())
+    return frozenset(name for name in consumed if name.isidentifier())
+
+
 def _output_contract_violations(transform: BaseTransform) -> dict[str, str]:
     """Map violation code -> detail for one built transform. Empty means clean.
 
@@ -229,7 +246,12 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             candidate = copy.deepcopy(base)
             schema_block: dict[str, Any] = dict(candidate.get("schema") or {})
             schema_block["mode"] = "fixed"
-            schema_block["fields"] = sorted(set(schema_block.get("fields") or ()) | {f"{name}: any" for name in created})
+            # Consumed columns must be declared or the elspeth-d3958d90f5
+            # construction guard rejects the candidate before this arm's
+            # invariant is ever measured.
+            schema_block["fields"] = sorted(
+                set(schema_block.get("fields") or ()) | {f"{name}: any" for name in created | _consumed_identifier_columns(instance)}
+            )
             candidate["schema"] = schema_block
             try:
                 built = cls(candidate)
@@ -237,10 +259,12 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
                 # A plugin-local guard rejecting this shape is a SEPARATE contract
                 # and an acceptable answer — batch_outlier_annotator and
                 # batch_replicate refuse a schema that collides with the fields
-                # they overwrite, and json_explode / line_explode refuse a
-                # non-normalized field name once the schema declares an output
-                # contract. Recorded and pinned below, because "four transforms
-                # land here" stated only in prose is exactly how an arm loses
+                # they overwrite. json_explode / line_explode used to land here
+                # by refusing a schema that omitted their source field; once the
+                # candidates began declaring consumed columns
+                # (elspeth-d3958d90f5) that guard is satisfied and both moved
+                # INTO this arm's coverage. Recorded and pinned below, because a
+                # count stated only in prose is exactly how an arm loses
                 # coverage without anyone noticing.
                 rebuild_rejected.add(_label(cls))
                 continue
@@ -259,7 +283,7 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         # The deliberate fail-closed rejections are PINNED, not counted. A count
         # would let one plugin stop guarding while another started, silently
         # swapping coverage; naming the set makes either change fail loudly.
-        assert rebuild_rejected == {"batch_outlier_annotator", "batch_replicate", "json_explode", "line_explode"}, (
+        assert rebuild_rejected == {"batch_outlier_annotator", "batch_replicate"}, (
             f"the set of transforms rejecting the fixed-mode re-declaration changed: "
             f"{sorted(rebuild_rejected)}. Each is a deliberate plugin-local guard; if one "
             f"stopped rejecting it now needs to satisfy this arm instead."
@@ -304,6 +328,11 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             if probe_config is None:
                 continue
             base = probe_config()
+            try:
+                bare = cls(base)
+            except Exception:
+                unbuildable.add(_label(cls))
+                continue
             candidate = copy.deepcopy(base)
             schema_block: dict[str, Any] = dict(candidate.get("schema") or {})
             schema_block["mode"] = "fixed"
@@ -311,7 +340,11 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
                 # A fixed schema needs at least one authored field; two neutral
                 # columns stand in for the user's own data. Created fields are
                 # deliberately NOT added — that omission is the shape under test.
+                # Consumed columns ARE added: since elspeth-d3958d90f5 the
+                # construction guard rejects a fixed schema omitting them, and
+                # they are orthogonal to the created-field shape measured here.
                 schema_block["fields"] = ["probe_a: str", "probe_b: str"]
+            schema_block["fields"] = sorted(set(schema_block["fields"]) | {f"{name}: any" for name in _consumed_identifier_columns(bare)})
             candidate["schema"] = schema_block
             try:
                 built = cls(candidate)
@@ -337,11 +370,10 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             if violation is not None:
                 omitting[_label(cls)] = violation
 
-        # json_explode / line_explode require their source field in an explicit
-        # schema and refuse this candidate outright — the same fail-closed
-        # guards the omission arm pins, minus the collision-guard plugins,
-        # which have nothing to collide with here.
-        assert unbuildable == {"json_explode", "line_explode"}, (
+        # Every field-creating transform builds under this candidate now that
+        # consumed columns are declared — json_explode / line_explode's
+        # source-field guards were satisfied by exactly that declaration.
+        assert unbuildable == set(), (
             f"the set of transforms rejecting the fixed-mode probe changed: {sorted(unbuildable)}. "
             f"A newly-rejecting transform has left this arm's coverage; a newly-accepting one "
             f"must now satisfy it."
@@ -352,10 +384,7 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             f"only {round_tripped} output configs reached the from_dict oracle, expected at "
             f"least 20 — the roster shrank or plugins moved to observed/unset configs."
         )
-        # batch_outlier_annotator injects value_field into required_fields
-        # without declaring it (elspeth-d3958d90f5, input-side sibling); remove
-        # this pin when that issue is fixed.
-        assert set(parser_rejected) == {"batch_outlier_annotator"}, (
+        assert parser_rejected == {}, (
             f"output configs their own parser rejects: {parser_rejected}. "
             f"A guaranteed or required field is not declared in the schema — the transform "
             f"publishes a contract SchemaConfig.from_dict would refuse to build."

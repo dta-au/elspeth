@@ -615,6 +615,69 @@ class BaseTransform(ABC):
         self._validated_config = validated_config
         self.declared_input_fields = declared_input_fields
         self._schema_config = validated_config.schema_config
+        self._reject_fixed_schema_omitting_consumed_fields()
+
+    def _reject_fixed_schema_omitting_consumed_fields(self) -> None:
+        """Reject a fixed input schema that forbids an AUTHORED input column.
+
+        An input column the author explicitly configured this transform to
+        read, omitted from ``mode: fixed`` fields, is incoherent: the input
+        model is ``extra='forbid'`` over the declared fields, so any row
+        carrying the column is rejected before the transform runs — the
+        configured read can never succeed (elspeth-d3958d90f5).
+
+        Only AUTHORED option values participate, read from the raw config
+        rather than the validated model. Option DEFAULTS are deliberately
+        excluded: ``batch_replicate.copies_field`` defaults to ``"copies"``
+        with documented row-absence fallback semantics, so a user who never
+        mentioned the option must not be forced to declare its default
+        column. This is the inverse of ``_config_named_input_columns``'s
+        choice — demotion protection wants defaults visible (fail-closed
+        toward requiredness); construction rejection must not fire on intent
+        the author never expressed. ADR-013 ``declared_input_fields`` always
+        participates: it is a requiredness claim wherever it came from.
+
+        Fires only for fixed mode. Flexible schemas admit the column as an
+        extra and observed schemas declare nothing to contradict — odd
+        configs, not incoherent ones. Dotted paths and other non-identifier
+        spellings resolve at runtime only (the source boundary rejects such
+        headers as schema fields), so they are exempt.
+
+        This runs at the one seam every registered transform crosses right
+        after config validation — BEFORE the batch family injects its
+        consumed column into ``required_fields`` on a rebuilt SchemaConfig,
+        which is why the check reads the authored-option surface rather than
+        ``required_fields``: the same fact is visible earlier there.
+        """
+        schema_config = self._schema_config
+        if schema_config is None or schema_config.mode != "fixed" or schema_config.fields is None:
+            return
+
+        authored_by: dict[str, list[str]] = {}
+        for key, value in self.config.items():
+            if key in self.output_naming_config_keys or not is_column_naming_config_option(key):
+                continue
+            values = [value] if isinstance(value, str) else list(value) if isinstance(value, (list, tuple)) else []
+            for item in values:
+                if isinstance(item, str):
+                    authored_by.setdefault(item, []).append(key)
+        for name in self.declared_input_fields:
+            authored_by.setdefault(name, []).append("required_input_fields")
+
+        declared = {field.name for field in schema_config.fields}
+        missing = sorted(name for name in authored_by if name not in declared and name.isidentifier())
+        if not missing:
+            return
+
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        described = "; ".join(f"{name!r} (named by {', '.join(sorted(set(authored_by[name])))})" for name in missing)
+        raise PluginConfigError(
+            f"Transform {self.name!r} is configured to read input field(s) its fixed schema "
+            f"forbids: {described}. A 'mode: fixed' schema rejects every row carrying an "
+            f"undeclared field, so the configured read can never succeed. Declare the "
+            f"field(s) in schema.fields, or use 'mode: flexible' / 'mode: observed'."
+        )
 
     def effective_static_contract(self) -> frozenset[str]:
         """Return the transform's public static output guarantee surface.
