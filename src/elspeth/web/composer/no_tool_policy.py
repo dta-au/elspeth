@@ -107,9 +107,42 @@ ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE: Final = (
 ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE: Final = "ELSPETH completed the advisor repair turn. Pipeline readiness was not determined this turn; run validation to confirm the pipeline state."
 
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
-_MUTATION_ACTION_PATTERN: Final = (
-    r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
+
+# THREAT-002: apostrophe confusables. U+2019 was once patched as a lone
+# codepoint, not the class — any codepoint here that the grammars miss
+# suppresses revocation (fail-open to EXPLICIT_MUTATION). NFKC cannot
+# substitute (only U+FF07 folds). All members verified to survive
+# _strip_quoted_text; re-verify that if _QUOTE_TERMINATORS is ever touched.
+_APOSTROPHE_CLASS: Final = "'\u2019\u02bc\uff07\u00b4\u2032"
+_APOSTROPHE_GRAMMAR: Final = f"[{_APOSTROPHE_CLASS}]"
+
+# The canonical mutation-verb vocabulary, as data. BOTH the authority
+# pattern (_MUTATION_ACTION_PATTERN) and the revocation pattern
+# (_WHOLE_REQUEST_ACTION_GRAMMAR) are built from this tuple, so the
+# revocation vocabulary can never silently become a subset of the
+# authority vocabulary again (F4). Multi-word phrases stay ahead of their
+# prefixes so alternation matches longest-first.
+_MUTATION_ACTION_PHRASES: Final[tuple[str, ...]] = (
+    "set this up",
+    "set it up",
+    "set up",
+    "setup",
+    "build",
+    "create",
+    "make",
+    "wire",
+    "add",
+    "update",
+    "modify",
+    "change",
+    "run",
+    "execute",
+    "process",
+    "route",
+    "split",
+    "save",
 )
+_MUTATION_ACTION_PATTERN: Final = "(?:" + "|".join(r"\s+".join(map(re.escape, phrase.split())) for phrase in _MUTATION_ACTION_PHRASES) + ")"
 _CONTROLLED_OBJECT_BODY_GRAMMAR: Final = (
     r"(?:"
     r"[a-z0-9_.-]+\s+to\s+[a-z0-9_.-]+\s+pipeline|"
@@ -131,7 +164,7 @@ _CONTROLLED_COMPLEMENT_GRAMMAR: Final = (
 )
 _DIRECT_MUTATION_GRAMMAR: Final = rf"{_MUTATION_ACTION_PATTERN}\b\s+{_CONTROLLED_OBJECT_GRAMMAR}{_CONTROLLED_COMPLEMENT_GRAMMAR}"
 _POSITIVE_LEAD_GRAMMAR: Final = r"(?:(?:please[\s,]+)|(?:now|actually|just|simply)\s+|go\s+ahead\s+(?:and\s+)?)*"
-_FIRST_PERSON_REQUEST_GRAMMAR: Final = r"(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+|let(?:'|\u2019)s\s+)"
+_FIRST_PERSON_REQUEST_GRAMMAR: Final = rf"(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+|let{_APOSTROPHE_GRAMMAR}s\s+)"
 _SINGLE_CLAUSE_IMPERATIVE_PATTERN: Final = re.compile(
     rf"{_POSITIVE_LEAD_GRAMMAR}(?:{_FIRST_PERSON_REQUEST_GRAMMAR})?"
     rf"{_POSITIVE_LEAD_GRAMMAR}{_DIRECT_MUTATION_GRAMMAR}[.!]?",
@@ -214,8 +247,10 @@ _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
     rf"{_PIPELINE_OPERATION_OBJECT_GRAMMAR}",
     re.IGNORECASE,
 )
-_NEGATED_DO_GRAMMAR: Final = r"(?:do\s+not|don(?:'|\u2019)t)"
-_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|change|create|execute|make|process|run|save|update)"
+_NEGATED_DO_GRAMMAR: Final = rf"(?:do\s+not|don{_APOSTROPHE_GRAMMAR}t)"
+# Same canonical vocabulary as the authority pattern \u2014 see
+# _MUTATION_ACTION_PHRASES. A verb that can authorize can be revoked.
+_WHOLE_REQUEST_ACTION_GRAMMAR: Final = _MUTATION_ACTION_PATTERN
 _WHOLE_REQUEST_TARGET_GRAMMAR: Final = (
     r"(?:anything|any\s+changes?|it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
 )
