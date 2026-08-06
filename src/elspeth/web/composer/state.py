@@ -182,7 +182,9 @@ class NodeSpec:
         fork_to: Fork destinations for fork gates. None for non-fork nodes.
         branches: Branch inputs for coalesce/row_union nodes. None otherwise.
         policy: Coalesce policy. None for non-coalesce nodes.
-        merge: Coalesce merge strategy. None for non-coalesce nodes.
+        merge: Coalesce merge strategy, defaulted to "union" when a coalesce
+            omits it so composer state carries the strategy the runtime will
+            actually run. None for non-coalesce nodes.
         trigger: Aggregation batch trigger config. None for non-aggregation nodes.
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
@@ -208,6 +210,35 @@ class NodeSpec:
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        # ``CoalesceSettings.merge`` DEFAULTS to "union" (core/config.py), so a
+        # coalesce authored without the optional field is a union merge at run
+        # time. Carrying None into composer state made every union rule — which
+        # gates on ``merge == "union"`` — read the node as "not a union" and
+        # skip it, so a type-incompatible merge validated green and died at the
+        # DAG build. Normalising HERE rather than at each gate is the point: it
+        # is the one construction boundary every path routes through
+        # (``from_dict``, ``upsert_node``, ``set_pipeline``, ``replace``), so a
+        # third union rule added later cannot inherit the hole. This defaults
+        # the field, it never requires it — the runtime accepts an unset merge,
+        # and Stage 1 must not be stricter than the runtime.
+        if self.node_type == "coalesce" and self.merge is None:
+            object.__setattr__(self, "merge", "union")
+        # Do NOT extend this normalisation to ``on_error`` by analogy. The shapes
+        # look identical and the remedies are inverted. ``merge`` has a runtime
+        # DEFAULT to mirror (``CoalesceSettings.merge = "union"``), so defaulting
+        # it here RECORDS a decision the runtime has already made. A transform's
+        # ``on_error`` has NO runtime default — ``TransformSettings.on_error`` is
+        # a required ``str`` (core/config.py) — so defaulting it here would
+        # INVENT a routing decision the author never made, and "discard" silently
+        # drops failed rows in a system whose purpose is lineage. Compare the
+        # gate, whose ``on_error`` IS optional and whose documented posture for
+        # omission is fail-FAST, not discard. Stage 1 already does the right
+        # thing by REJECTING an unset transform ``on_error``
+        # (``transform_missing_on_error``); a default here would suppress that
+        # error, not complement it. Note ``from_dict`` reads
+        # ``on_error=d["on_error"]`` unnormalised, so a session persisted with
+        # ``on_error: null`` deserialises to None — contained, because Stage 1
+        # rejects it.
         if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
             branch_tuple = tuple(self.branches)
             normalized_branches: CoalesceBranches = (
@@ -2096,7 +2127,7 @@ def _check_schema_contracts(
     tuple[EdgeContract, ...],
 ]:
     """Validate producer/consumer schema contracts across declarative routing."""
-    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
+    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
 
     errors: list[ValidationEntry] = []
     contract_warnings: list[ValidationEntry] = []
@@ -3502,8 +3533,109 @@ def _check_schema_contracts(
             # literal "source" — else the parity check silently skips every
             # named typed source (elspeth-3332619032).
             return False
-        schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+        # ABSTAIN on a malformed declaration rather than raising. This predicate
+        # is a bool gate, not a reporter: the malformed block owns its rejection
+        # through the lazy ``contract_config_invalid`` parsers and the eager
+        # syntax sweep, both of which run in this same function. Letting the
+        # ValueError escape would leave ``validate()`` — the authoring
+        # validator — raising a 500 where its whole contract is to return a
+        # verdict, which is the defect class tracked as elspeth-bceffeba19.
+        # Safe today only by loop ordering (``_parse_producer_guarantees`` runs
+        # first on the same options and ``continue``s); that invariant is
+        # implicit, and this range made this predicate MORE load-bearing by
+        # gating ``_edge_field_type_conflict`` on it.
+        try:
+            schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+        except ValueError:
+            return False
         return schema_config is not None and not schema_config.is_observed
+
+    def _edge_field_type_conflict(producer: ProducerEntry, node: NodeSpec) -> ValidationEntry | None:
+        """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
+
+        Stage 1's edge-contract accounting compares field NAMES only, so a
+        producer declaring ``age: int`` into a consumer declaring ``age: str``
+        validated green while the DAG build raised ``EdgeContractError``
+        (elspeth-f2eb8fef9f) — a divergence needing no coalesce, no row_union
+        and no special topology.
+
+        Compares the DECLARED ``field_type`` strings directly, the way the
+        union-coalesce mirror a few hundred lines above does through
+        ``merge_union_field_flags`` and the way
+        ``row_union_schema_configs_compatible`` does on its non-fixed branch.
+
+        AN EARLIER VERSION RECONSTRUCTED BOTH SIDES AS PluginSchema MODELS VIA
+        ``build_coalesce_schema`` AND CALLED ``check_compatibility``. That was
+        wrong and produced FALSE REDS, which for a validator gating an LLM
+        authoring loop is worse than the gap it closed.
+        ``build_coalesce_schema`` widens a field to ``X | None`` when
+        ``fd.nullable or not fd.required`` (``core/dag/schema_factory.py``),
+        because a coalesce branch can lose a ``last_wins`` collision and yield
+        None. The factory that actually builds ordinary source/transform
+        schemas — ``plugins/infrastructure/schema_factory.py::_get_python_type``
+        — widens ONLY on ``not required`` and never reads ``nullable`` at all.
+        So a producer declaring ``{required: true, nullable: true}`` into a
+        consumer declaring ``{required: true, nullable: false}``, both ``int``,
+        reconstructed as ``int | None`` vs ``int`` and was REJECTED, while the
+        real schemas are both plain ``int`` and build fine. Reusing a canonical
+        function is only safe when it is canonical FOR THIS EDGE; that one is
+        built for coalesce OUTPUT.
+
+        Comparing declared type strings cannot drift that way because it
+        reconstructs nothing. It is deliberately the weaker check: it abstains
+        wherever either side declares ``any``, and it does not model coercion.
+        Under-rejecting is the correct direction here — the runtime remains
+        authoritative, and a false red misdirects the authoring loop while a
+        missed one is caught downstream.
+
+        Only the type direction is reported. Field NAMES are the surrounding
+        loop's job and extras belong to the Rule A/B walkers; reporting either
+        here would double-attribute one defect.
+
+        Callers gate on ``_producer_is_typed_source``, which is the runtime's
+        own Phase-2 bypass — observed sources and transform/gate/coalesce
+        producers resolve to a dynamic effective producer schema at runtime and
+        are skipped there, so they are skipped here too.
+        """
+        try:
+            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+            consumer_options = node.options
+            consumer_owner = f"node:{node.id}"
+            if node.node_type == "aggregation":
+                consumer_options, consumer_owner = get_aggregation_contract_options(node.options, owner=consumer_owner)
+            consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
+        except ValueError:
+            # Malformed declarations own their rejection through the
+            # ``contract_config_invalid`` parsers; do not double-report.
+            return None
+
+        if producer_schema_config is None or consumer_schema_config is None:
+            return None
+        if consumer_schema_config.is_observed:
+            return None
+        if producer_schema_config.fields is None or consumer_schema_config.fields is None:
+            return None
+
+        producer_types = {field.name: field.field_type for field in producer_schema_config.fields}
+        # ``any`` is a declared abstention on BOTH sides — the author has said
+        # the type is not pinned, so no conflict is mechanically provable.
+        mismatches = [
+            (field.name, field.field_type, producer_types[field.name])
+            for field in consumer_schema_config.fields
+            if field.name in producer_types
+            and field.field_type != "any"
+            and producer_types[field.name] != "any"
+            and producer_types[field.name] != field.field_type
+        ]
+        if not mismatches:
+            return None
+        detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
+        return _err(
+            f"node:{node.id}",
+            f"Schema contract violation: '{producer.producer_id}' -> '{node.id}'. Incompatible field types: {detail}.",
+            "high",
+            "edge_field_type_incompatible",
+        )
 
     for node in nodes:
         consumer_required, consumer_required_error = _parse_node_required_fields(node)
@@ -3585,6 +3717,9 @@ def _check_schema_contracts(
         contract_required = consumer_required
         if producer_is_typed_source:
             contract_required = consumer_required | consumer_effective_required
+            type_error = _edge_field_type_conflict(actual_producer, node)
+            if type_error is not None:
+                errors.append(type_error)
 
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed
@@ -4053,6 +4188,39 @@ def _check_schema_contracts(
                 ),
             )
         )
+
+    # Eager schema-SYNTAX sweep (elspeth-33738eedb6). Every parser above is
+    # LAZY: it resolves a declaration only when some contract comparison needs
+    # it. So a declared schema block that nothing consumes was never parsed at
+    # all, and a malformed field spec validated GREEN — `source -> sink` with a
+    # plain unschema'd sink is among the most common pipeline shapes — then
+    # died at plugin construction with PluginConfigError. A declared schema
+    # block is authored config: its SYNTAX is checkable with no topology
+    # context whatsoever, so it must not depend on who reads it.
+    #
+    # Deduped by owner against the lazy parsers above: where a contract
+    # comparison did reach the declaration, it has already reported, and one
+    # authoring defect owes exactly one error.
+    schema_config_reported = {error.component for error in errors if error.error_code == "contract_config_invalid"}
+
+    def _sweep_schema_syntax(owner: str, options: Mapping[str, Any], *, node_type: str | None = None) -> None:
+        if owner in schema_config_reported:
+            return
+        try:
+            contract_options = options
+            if node_type == "aggregation":
+                contract_options, _ = get_aggregation_contract_options(options, owner=owner)
+            get_raw_schema_config(contract_options, owner=owner)
+        except ValueError as exc:
+            schema_config_reported.add(owner)
+            errors.append(_err(owner, f"Invalid contract config: {exc}", "high", "contract_config_invalid"))
+
+    for sweep_source_name, sweep_source in sources.items():
+        _sweep_schema_syntax(source_producer_id(sweep_source_name), sweep_source.options)
+    for sweep_node in nodes:
+        _sweep_schema_syntax(f"node:{sweep_node.id}", sweep_node.options, node_type=sweep_node.node_type)
+    for sweep_output in outputs:
+        _sweep_schema_syntax(f"output:{sweep_output.name}", sweep_output.options)
 
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
 

@@ -309,27 +309,30 @@ def test_navigation_and_repository_structure_are_honest() -> None:
         assert absent_path not in structure
 
 
-def test_release_changelog_states_cross_platform_contract_without_multi_replica_claim() -> None:
-    """The notes for the release that ships these platforms must not oversell them.
+def test_deployment_changelog_states_the_contract_without_claiming_multi_replica() -> None:
+    """The notes naming the deployment contract must not overclaim it.
 
-    The entry was authored under ``## Unreleased`` and promoted into ``## 0.7.2``
-    when that release was cut, so the gate follows the text rather than the
-    heading it was first written under. ``## Unreleased`` above it is asserted
-    to exist but is deliberately not asserted to be non-empty — that is release
-    bookkeeping, not a deployment-contract claim.
+    Checked against the 0.7.2 section, not ``## Unreleased``: the contract moved
+    there when that work shipped (48cd87369), and an assertion pointed at the
+    section the text left behind stops guarding anything. The negatives are the
+    invariant — a single-VM Azure story and no ``deploy/platforms`` tree — and
+    the positives keep them anchored to the passage that makes the claim.
+
+    Whitespace is flowed first because the source is hard-wrapped: "one Azure
+    Ubuntu VM" is one phrase to a reader and two lines to ``in``.
     """
     text = _read(CHANGELOG)
-    assert "## Unreleased" in text
-    # Whitespace-normalised: the changelog hard-wraps prose, so "one Azure\n
-    # Ubuntu VM" would defeat a raw substring match. Normalising also tightens
-    # the multi-replica prohibition, which a wrapped occurrence could evade.
-    release = " ".join(_section(text, "## 0.7.2", "## 0.7.1").split())
+    before_release, release_onward = text.split("## 0.7.2", maxsplit=1)
+    assert "## Unreleased" in before_release
 
-    assert "cross-platform deployment contract" in release.lower()
-    assert "Docker Compose" in release
-    assert "AWS ECS" in release
-    assert "native Linux" in release
-    assert "Azure Ubuntu VM" in release
-    assert "Kubernetes" in release
-    assert "multi-replica" not in release.lower()
-    assert "deploy/platforms" not in release
+    release_notes = release_onward.split("\n## ", maxsplit=1)[0]
+    flowed = " ".join(release_notes.split())
+
+    assert "cross-platform deployment contract" in flowed.lower()
+    assert "Docker Compose" in flowed
+    assert "AWS ECS" in flowed
+    assert "native Linux" in flowed
+    assert "Azure Ubuntu VM" in flowed
+    assert "Kubernetes" in flowed
+    assert "multi-replica" not in flowed.lower()
+    assert "deploy/platforms" not in flowed

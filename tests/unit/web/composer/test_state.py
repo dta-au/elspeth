@@ -24,6 +24,7 @@ from elspeth.web.composer.state import (
     route_destination_facts,
 )
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
+from elspeth.web.composer.yaml_generator import generate_yaml
 
 
 class TestSourceSpec:
@@ -2417,7 +2418,13 @@ class TestStage1Validation:
         source = SourceSpec(
             plugin="csv",
             on_success="t1",
-            options={"path": "/in.csv", "schema_config": {"fields": []}},
+            # `mode` is REQUIRED by `get_raw_schema_config`, the parser BOTH
+            # surfaces share (core/dag/builder.py:161, core/dag/graph.py:199).
+            # This fixture previously omitted it and still asserted is_valid —
+            # a pipeline the runtime would reject at build time, called clean.
+            # Nothing parsed it because Stage 1's schema parse was lazy; the
+            # eager syntax sweep (elspeth-33738eedb6) now reaches it.
+            options={"path": "/in.csv", "schema_config": {"mode": "observed", "fields": []}},
             on_validation_failure="quarantine",
         )
         state = state.with_source(source)
@@ -3349,6 +3356,200 @@ class TestSchemaContractValidation:
             on_write_failure="discard",
         )
 
+    def _make_typed_edge_state(self, producer_type: str, consumer_type: str) -> CompositionState:
+        """Build csv(fixed age:<producer_type>) -> value_transform(fixed age:<consumer_type>) -> sink.
+
+        The two calls differ ONLY in the declared field type, so a test that
+        pins the mismatch against its own type-agreeing control cannot pass by
+        accident on an unrelated error (elspeth-f2eb8fef9f). See the clean-probe
+        rule in the module docstring of the agreement suite.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"age: {producer_type}"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {"mode": "fixed", "fields": [f"age: {consumer_type}"]},
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_edge_field_type_mismatch_is_rejected(self) -> None:
+        """A plain producer/consumer field-TYPE conflict must not validate green.
+
+        elspeth-f2eb8fef9f. Stage 1's edge-contract accounting compares field
+        NAMES; the runtime compares TYPES via
+        ``core/dag/schema_validation.py::validate_single_edge`` ->
+        ``contracts/data.py::check_compatibility``. Before this fix a plain
+        two-node pipeline whose producer declared ``age: int`` and whose
+        consumer declared ``age: str`` returned ``is_valid=True`` with ZERO
+        errors — byte-identical to the type-agreeing control below — while the
+        DAG build raised ``EdgeContractError`` "Type mismatches: age (expected
+        str, got int)". No coalesce, no row_union, no special topology.
+        """
+        result = self._make_typed_edge_state("int", "str").validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_edge_field_type_check_does_not_false_red_on_nullable(self) -> None:
+        """A nullable-but-required producer field must not be read as a type conflict.
+
+        Regression pin. The first implementation reconstructed both sides as
+        PluginSchema models via ``build_coalesce_schema`` and called
+        ``check_compatibility``. That factory widens a field to ``X | None``
+        when ``fd.nullable or not fd.required`` — correct for coalesce output,
+        where a branch can lose a ``last_wins`` collision — but the factory that
+        builds ordinary source/transform schemas
+        (``plugins/infrastructure/schema_factory.py::_get_python_type``) widens
+        ONLY on ``not required`` and never reads ``nullable``. So this pipeline,
+        whose real schemas are both plain ``int``, was REJECTED as ``int |
+        None`` vs ``int``.
+
+        A false red is worse than the gap it closed: it misdirects the LLM
+        authoring loop toward a defect that does not exist, and the runtime
+        would have accepted the pipeline.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": True}],
+                    }
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": False}],
+                    },
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        result = state.with_output(self._make_output("main")).validate()
+
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_edge_field_type_agreement_is_accepted(self) -> None:
+        """Positive control for :meth:`test_edge_field_type_mismatch_is_rejected`.
+
+        Identical topology and identical field NAME; only the declared type
+        agrees. This is what makes the mismatch test falsifiable — without it a
+        blanket rejection would pass the test above.
+        """
+        result = self._make_typed_edge_state("int", "int").validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors)
+
+    def _make_unreferenced_source_schema_state(self, source_fields: list[str]) -> CompositionState:
+        """Build csv(fixed, <source_fields>) -> sink, where the SINK DECLARES NO SCHEMA.
+
+        The absent sink schema is the whole point: Stage 1's
+        ``contract_config_invalid`` parse was incidental to contract checking,
+        so with nothing to compare against, the source's block was never parsed
+        (elspeth-33738eedb6). ``_make_output`` always declares one, so this
+        state builds its own sink.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": source_fields}},
+            )
+        )
+        return state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv"},
+                on_write_failure="discard",
+            )
+        )
+
+    def test_malformed_source_schema_is_rejected_without_a_consumer_schema(self) -> None:
+        """A malformed field spec must be rejected even when nothing consumes it.
+
+        elspeth-33738eedb6. ``age_no_colon_no_type`` is not a valid field spec.
+        Before this fix it validated GREEN whenever no downstream consumer
+        declared a schema — because the parse fired only when something forced
+        the schema to be resolved for a comparison — and died later at plugin
+        construction with ``PluginConfigError``. ``source -> sink`` with a
+        plain unschema'd sink is among the most common pipeline shapes.
+        """
+        result = self._make_unreferenced_source_schema_state(["age_no_colon_no_type"]).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "contract_config_invalid" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_wellformed_source_schema_is_accepted_without_a_consumer_schema(self) -> None:
+        """Positive control for the test above — identical but for the field spec."""
+        result = self._make_unreferenced_source_schema_state(["age: int"]).validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+
+    def test_malformed_source_schema_is_reported_once(self) -> None:
+        """The eager parse must not double-report against the lazy contract parsers.
+
+        With a consumer schema present, both the eager sweep and the contract
+        loop's own ``_parse_*`` helpers can observe the same broken spec. One
+        authoring defect must yield one error.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="main",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": ["age_no_colon_no_type"]}},
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "outputs/main.csv", "schema": {"mode": "fixed", "fields": ["age: int"]}},
+                on_write_failure="discard",
+            )
+        )
+
+        result = state.validate()
+
+        source_config_errors = [
+            error for error in result.errors if error.error_code == "contract_config_invalid" and "age_no_colon_no_type" in error.message
+        ]
+        assert len(source_config_errors) == 1, [(e.component, e.message) for e in result.errors]
+
     def test_schema_validation_closes_every_constructed_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every schema-inspection instance is owned and closed exactly once."""
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -3433,7 +3634,7 @@ class TestSchemaContractValidation:
         *,
         source_schema: dict[str, Any],
         transformed_branch_schema: dict[str, Any],
-        merge: str = "union",
+        merge: str | None = "union",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
         branch_plugin: str = "value_transform",
     ) -> CompositionState:
@@ -5146,6 +5347,103 @@ class TestSchemaContractValidation:
         result = state.validate()
 
         assert not any(error.error_code == "coalesce_union_type_incompatible" for error in result.errors)
+
+    def test_unset_coalesce_merge_normalizes_to_the_runtime_default(self) -> None:
+        """An omitted ``merge`` becomes ``"union"``, because that is what the runtime runs.
+
+        ``CoalesceSettings.merge`` defaults to ``"union"`` (``core/config.py``),
+        so a coalesce authored without the optional field IS a union merge at
+        run time. Carrying ``None`` through composer state made every union
+        rule read the node as "not a union" and skip it. Normalising once at
+        construction is what keeps a THIRD union rule, added later, from
+        inheriting the same hole.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        assert coalesce.merge == "union"
+        # Non-coalesce nodes keep None: ``merge`` is forbidden on them, and
+        # row_union rejects the field outright (``row_union_field_forbidden``).
+        assert next(node for node in state.nodes if node.id == "fork_gate").merge is None
+
+    def test_unset_coalesce_merge_survives_yaml_generation(self) -> None:
+        """The unset field crashed YAML generation outright — not, as assumed, ``merge: null``.
+
+        ``to_dict()`` emits ``merge`` only when it is set, while
+        ``yaml_generator`` reads ``c["merge"]`` unconditionally, so an unset
+        merge raised ``KeyError`` before pydantic ever saw the config. That
+        made the runtime's answer an internal crash rather than a repair
+        signal. Normalising at construction closes the path that runs through
+        ``state.to_dict()``; a caller injecting its own ``state_dict`` still
+        bypasses ``NodeSpec`` entirely.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
+        assert node_dict["merge"] == "union"
+        assert "merge: union" in generate_yaml(state)
+
+    def test_union_type_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The type mirror must fire on the runtime's default merge, not only the declared one.
+
+        Shipped by the very commit that closed the previous union divergence
+        (elspeth-85f3cc3022): both union mirrors gated on ``merge == "union"``,
+        so an LLM that simply omitted the optional field got ``is_valid=True``
+        on a pipeline the runtime rejects. Omission is the CHEAPEST thing an
+        authoring model does, which made the gap the likeliest path through
+        the surface rather than an exotic one.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: str"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_union_type_incompatible"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+        assert entries[0].coalesce_union_type is not None
+        assert entries[0].coalesce_union_type.field == "value"
+
+    def test_mode_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
+        """The mode mirror shares the gate, so it shares the repair."""
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "observed"},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_schema_mode_mixed" for error in result.errors)
+
+    def test_unset_coalesce_merge_stays_valid_when_branch_types_agree(self) -> None:
+        """POSITIVE CONTROL — applying the union rules must not become rejecting the node.
+
+        The runtime ACCEPTS an unset merge; it defaults it. Stage 1 must
+        therefore run the union rules over the node, never reject it for
+        having no explicit merge. Without this control a blanket rejection
+        would satisfy every other test in this group.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            merge=None,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
 
     def test_fork_gate_direct_sink_contract_checked(self) -> None:
         """Fork branches that terminate at sinks stay statically checkable."""

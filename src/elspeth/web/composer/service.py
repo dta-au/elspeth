@@ -470,11 +470,53 @@ def _request_interpretation_review_kind_from_arguments(arguments: Mapping[str, A
 
 
 # Module-level OTel counter for runtime preflight outcomes.
-# Attributes: outcome (success | failure), exception_class (bounded closed-list | other)
+#
+# Two orthogonal dimensions, deliberately NOT collapsed into one (elspeth-ca0bd5d4ef):
+#   outcome:  how the call ENDED — "returned" (a ValidationResult came back) or
+#             "failure" (the preflight raised and was cached as
+#             RuntimePreflightFailure). Only the failure arm carries
+#             exception_class (bounded closed-list | other).
+#   verdict:  what a returned preflight SAID — see ``_preflight_verdict``.
+#             Absent on the failure arm: a call that threw has no verdict.
+# Before the split, ``outcome="success"`` covered every non-raising call, so a
+# red verdict — the validator running normally and saying no — was recorded as
+# a success and had no correct observability surface anywhere.
 _RUNTIME_PREFLIGHT_COUNTER = metrics.get_meter(__name__).create_counter(
     "composer.runtime_preflight.total",
     description="Total runtime-equivalent preflight invocations in the composer service",
 )
+
+# Module-level OTel counter for no-tool finalizes published over a RED preflight.
+# Attributes: budget_exhausted (bool), repair_turns_used (int, capped at
+# _MAX_REPAIR_TURNS by the loop, so cardinality is bounded at 3).
+#
+# Answers a question the preflight counter alone cannot: when a compose turn
+# ends with the validator objecting, had the shared repair budget ALREADY been
+# spent? If it usually had, the model never received the actionable objection —
+# the repair turns were consumed by earlier emitters and the operator gets the
+# suffix instead of a fixed pipeline. Emitted from the shared no-tool finalize
+# tail so it cannot drift onto one caller; ``_attempt_preflight_repair`` stays
+# counter-free by its own contract.
+_PREFLIGHT_INVALID_FINALIZE_COUNTER = metrics.get_meter(__name__).create_counter(
+    "composer.preflight_invalid_finalize.total",
+    description="No-tool finalizes published with a red runtime-preflight verdict, by shared repair-budget state",
+)
+
+
+def _preflight_verdict(result: ValidationResult) -> str:
+    """Return the closed-vocab telemetry verdict for a RETURNED preflight.
+
+    Three-valued, not two. The pending-interpretation handoff shape is
+    ``is_valid=False`` yet authoring-valid and completion-ready — it is a
+    user-action boundary, not a validator objection. Folding it into
+    ``"invalid"`` would re-commit the same non-success-collapsed-into-one-bucket
+    defect this split exists to fix, one level down.
+    """
+    if result.is_valid:
+        return "valid"
+    if _is_pending_interpretation_handoff(result):
+        return "pending_review"
+    return "invalid"
 
 
 class _MalformedLLMResponseError(ComposerServiceError):
@@ -2237,7 +2279,7 @@ class ComposerServiceImpl:
                 initial_version=initial_version,
                 llm_calls=llm_calls,
             )
-        _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "success"})
+        _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "returned", "verdict": _preflight_verdict(entry)})
         return entry
 
     async def _pending_handoff_outstanding_findings(
@@ -4072,31 +4114,24 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     message=message,
                     mutation_success_seen=mutation_success_seen,
+                    repair_turns_used=repair_turns_used,
                     plugin_snapshot=plugin_snapshot,
                 )
-                outstanding_findings: ValidationResult | None = None
-                if result.runtime_preflight is not None and _is_pending_interpretation_handoff(result.runtime_preflight):
-                    outstanding_findings = await self._pending_handoff_outstanding_findings(
-                        result.state,
-                        user_id=user_id,
-                        session_id=session_id,
-                        cache=runtime_preflight_cache,
-                        initial_version=initial_version,
-                        session_scope=session_scope,
-                        llm_calls=recorder.llm_calls,
-                        plugin_snapshot=plugin_snapshot,
-                    )
+                # ``_surface_and_finalize_no_tools`` now owns the announcement
+                # (with its outstanding-findings qualification) for the
+                # pending-handoff preflight shape on EVERY caller
+                # (elspeth-c5350d93fd). What is left here is the residue the
+                # shared tail cannot see: this branch's trigger is the TOOL
+                # BATCH — ``request_interpretation_review`` succeeded and
+                # terminated the batch — which is ground truth that a review was
+                # staged even when the preflight was not computed this turn
+                # (None) or came back green. Re-appending on the pending-handoff
+                # shape would emit the suffix TWICE and pass
+                # ``_enforce_augmentation_prefix_invariant`` silently, since a
+                # doubled suffix still keeps the prose as a strict prefix.
                 handoff_result = (
-                    _append_interpretation_review_handoff_message(
-                        result,
-                        dispatch.raw_assistant_content,
-                        outstanding_findings=outstanding_findings,
-                    )
-                    if (
-                        result.runtime_preflight is None
-                        or result.runtime_preflight.is_valid
-                        or _is_pending_interpretation_handoff(result.runtime_preflight)
-                    )
+                    _append_interpretation_review_handoff_message(result, dispatch.raw_assistant_content)
+                    if (result.runtime_preflight is None or result.runtime_preflight.is_valid)
                     else result
                 )
                 threaded = replace(
@@ -4213,6 +4248,7 @@ class ComposerServiceImpl:
                         session_scope=session_scope,
                         message=message,
                         mutation_success_seen=mutation_success_seen,
+                        repair_turns_used=repair_turns_used,
                         plugin_snapshot=plugin_snapshot,
                     )
                     threaded = replace(
@@ -4516,6 +4552,7 @@ class ComposerServiceImpl:
             session_scope=session_scope,
             message=message,
             mutation_success_seen=mutation_success_seen,
+            repair_turns_used=repair_turns_used,
             plugin_snapshot=plugin_snapshot,
         )
         # Thread repair_turns_used through to the result so the route handler can
@@ -4650,16 +4687,19 @@ class ComposerServiceImpl:
         session_scope: str,
         message: str,
         mutation_success_seen: bool,
+        repair_turns_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Auto-surface PT reviews, run the fail-closed orphan gate, finalize.
 
-        Shared tail of BOTH no-tool finalize paths (Task 7 HIGH-1):
-        ``_try_terminate_no_tools`` and the B-4D-3 budget-exhaustion last-chance
-        finalize in ``_classify_and_budget_turn``. Returns either the fail-closed
-        blocked ``ComposerResult`` (an orphaned interpretation site survived) or
-        the finalized ``ComposerResult``. The caller threads ``repair_turns_used``
-        (only ``_try_terminate_no_tools`` tracks it) and the persisted ids.
+        Shared tail of ALL THREE no-tool finalize paths (Task 7 HIGH-1):
+        ``_try_terminate_no_tools``, the B-4D-3 budget-exhaustion last-chance
+        finalize in ``_classify_and_budget_turn``, and the staged-handoff branch
+        that precedes it. Returns either the fail-closed blocked
+        ``ComposerResult`` (an orphaned interpretation site survived) or the
+        finalized ``ComposerResult``. The caller still threads the persisted ids
+        and stamps ``repair_turns_used`` onto the returned result; the value is
+        passed in here so the red-verdict finalize telemetry below can record it.
 
         See the orphan-gate / backend-surfacing doctrine in the caller's docstring
         and in the comments around ``_missing_pending_interpretation_review_sites``.
@@ -4686,8 +4726,9 @@ class ComposerServiceImpl:
                 reason="composer_complete",
             ),
         )
-        return await self._finalize_no_tool_response(
-            content=assistant_message.content or "",
+        raw_content = assistant_message.content or ""
+        result = await self._finalize_no_tool_response(
+            content=raw_content,
             state=state,
             initial_version=initial_version,
             user_id=user_id,
@@ -4701,6 +4742,55 @@ class ComposerServiceImpl:
             llm_calls=recorder.llm_calls,
             plugin_snapshot=plugin_snapshot,
         )
+
+        runtime_result = result.runtime_preflight
+        if runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
+            # Shape-16 handoff qualification, applied HERE and not at the call
+            # sites (elspeth-c5350d93fd). It previously lived on the
+            # staged-handoff branch alone, so the two OTHER callers — the
+            # B-4D-3 budget-exhaustion finalize and the CLEAN no-tool tail,
+            # which is the single most common way a compose turn ends —
+            # published a pending-review result with NOTHING backend-authored
+            # appended: for a handoff result with no grounding violations
+            # ``finalize_no_tool_response`` returns the model's raw prose
+            # verbatim, so an operator whose model happened not to mention the
+            # review got no indication one existed. Owning it in the shared
+            # tail covers every present and future caller by construction.
+            #
+            # Keying on the preflight SHAPE rather than on the tool batch is
+            # sound here because ``_surface_pt_and_gate_orphans_or_none`` has
+            # already run above: PT reviews are surfaced and orphaned sites
+            # returned fail-closed, so a surviving INTERPRETATION_REVIEW_PENDING
+            # blocker means a resolvable card genuinely exists to announce.
+            outstanding_findings = await self._pending_handoff_outstanding_findings(
+                result.state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+            return _append_interpretation_review_handoff_message(
+                result,
+                raw_content,
+                outstanding_findings=outstanding_findings,
+            )
+
+        if runtime_result is not None and not runtime_result.is_valid:
+            # Red verdict published to the operator (elspeth-ca0bd5d4ef). The
+            # pending-handoff shape returned above is excluded on purpose: it is
+            # a user-action boundary, not a validator objection, and counting it
+            # here would answer a different question than the one asked.
+            _PREFLIGHT_INVALID_FINALIZE_COUNTER.add(
+                1,
+                {
+                    "budget_exhausted": repair_turns_used >= _MAX_REPAIR_TURNS,
+                    "repair_turns_used": repair_turns_used,
+                },
+            )
+        return result
 
     async def _evaluate_terminal_no_tool_advisor_gate(
         self,

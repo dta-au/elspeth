@@ -93,12 +93,10 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # last for the same pre-existing-error reason (elspeth-b19dfe41fb).
     validate_transform_string_typed_input_fields(graph)
 
-    # Validate that a locked (mode: fixed) consumer admits every field a
-    # type-bypassing producer GUARANTEES. Newest check, so it runs last for the
-    # same pre-existing-error reason its three siblings above each cite
-    # (elspeth-9615d6c75a). Driving it from validate_single_edge instead put it
-    # in the FIRST loop, where it pre-empted all four.
-    validate_locked_consumer_guaranteed_extras(graph, _schema_cache=schema_cache)
+    # Close the guaranteed-extras check over TYPED producers. Runs last for the
+    # same pre-existing-error reason its neighbours each cite
+    # (elspeth-1451ff385f).
+    validate_typed_producer_guaranteed_extras(graph)
 
 
 def validate_single_edge(
@@ -209,19 +207,26 @@ def validate_single_edge(
     producer_schema = get_effective_producer_schema(graph, from_node_id, _cache=_schema_cache)
     consumer_schema = to_info.input_schema
 
-    # Rule 1: an unknowable schema on either side bypasses type validation. A
-    # bypassing producer can still make PROMISES — guaranteed_fields travels
-    # outside the schema — so these edges are swept by
-    # validate_locked_consumer_guaranteed_extras, which runs as the LAST
-    # whole-graph pass rather than here (see its docstring for why).
-    # Kept inline rather than behind _phase2_bypasses_type_validation so the
-    # narrowing survives for the concrete-schema code below.
+    # Rule 1: Dynamic schemas (None) bypass type validation. A dynamic producer
+    # can still make PROMISES (guaranteed_fields travels outside the schema),
+    # but mirroring composer Rule A HERE — inside the FIRST edge loop —
+    # pre-empted every whole-graph check below it: a sink both missing its
+    # required fields and refusing the producer's extras reported only the
+    # extras, and those remedies ("add the extra fields", "relax to flexible",
+    # "drop the extras") cannot supply a field the producer never guaranteed.
+    # validate_typed_producer_guaranteed_extras sweeps these edges LAST instead
+    # — its firewall guard admits exactly the dynamic and observed producers
+    # these two arms abandon.
     if producer_schema is None or consumer_schema is None:
         return  # Types unknowable on one side - compatible with anything
 
-    # Observed schemas accept anything, so they bypass for the same reason and
-    # are swept by the same pass.
-    if _is_observed_schema(producer_schema) or _is_observed_schema(consumer_schema):
+    # Handle observed schemas (no explicit fields + extra='allow')
+    # These are created by _create_dynamic_schema and accept anything
+    # NOTE: We control all schemas via PluginSchema base class which sets model_config["extra"].
+    # Direct access is correct per Tier 1 trust model - missing key would be our bug.
+    producer_is_observed = len(producer_schema.model_fields) == 0 and producer_schema.model_config["extra"] == "allow"
+    consumer_is_observed = len(consumer_schema.model_fields) == 0 and consumer_schema.model_config["extra"] == "allow"
+    if producer_is_observed or consumer_is_observed:
         return  # Observed schemas bypass static type validation
 
     # Rule 2: Full compatibility check (missing fields, type mismatches, extra fields)
@@ -247,86 +252,85 @@ def validate_single_edge(
         )
 
 
-def _is_observed_schema(schema: type[PluginSchema]) -> bool:
-    """True for a schema that declares no fields and accepts anything.
+def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
+    """Apply the locked-consumer guarantee check to TYPED producers too.
 
-    ``_create_dynamic_schema`` builds these.
+    ``validate_single_edge`` mirrors composer Rule A only on its two bypass
+    paths (dynamic producer, observed producer). An edge whose producer has
+    real ``model_fields`` takes the ``check_compatibility`` path instead, and
+    that function compares schema against schema — it never reads
+    ``guaranteed_fields``. A producer can therefore promise fields its own
+    model does not declare and still validate clean.
 
-    NOTE: We control all schemas via the PluginSchema base class, which sets
-    ``model_config["extra"]``. Direct access is correct per the Tier 1 trust
-    model — a missing key would be our bug.
+    A union coalesce is exactly that shape: the builder merges its typed
+    ``fields`` from each branch's CONSTRUCTION-time schema but its
+    ``guaranteed_fields`` from a separately graph-walked effective guarantee
+    (elspeth-0b14977817), so a pass-through branch declaring only the field it
+    rewrites yields a merged schema guaranteeing category/id/price/product
+    while declaring description alone. Against a locked sink the build stayed
+    green and every row died at the sink's input preflight
+    (elspeth-1451ff385f).
+
+    The two channels are decoupled BY DESIGN — ``fields`` is what the node
+    typed, ``guaranteed_fields`` is what the graph proves will be present, and
+    the walk yields names without types, so forcing them to agree could only
+    declare the missing names as ``any``, which is incompatible with every
+    concrete consumer type. The fix is to check the second channel, not to
+    collapse it into the first.
+
+    Runs as a final pass rather than inline in ``validate_single_edge`` so a
+    graph tripping this AND a pre-existing check keeps reporting the
+    pre-existing error — the ordering discipline
+    ``validate_transform_output_field_collisions`` (elspeth-cfcd333f83) and
+    its two siblings each cite. The bypass-path calls stay where they are:
+    moving them here would relocate errors that shape is already reported at.
+
+    Re-checking the bypass edges here is verdict-neutral by CONSTRUCTION, not
+    by convention: their call site runs earlier in program order, so if the
+    condition holds on such an edge that call has already raised and this one
+    is unreachable as the raiser. The visible consequence is that error
+    PRIORITY for this check varies with whether the producer is typed — the
+    rejected SET does not. Do not "tidy" the two sites into one: collapsing
+    them relocates the bypass errors elspeth-9615d6c75a pins.
     """
-    return len(schema.model_fields) == 0 and schema.model_config["extra"] == "allow"
-
-
-def _phase2_bypasses_type_validation(
-    producer_schema: type[PluginSchema] | None,
-    consumer_schema: type[PluginSchema] | None,
-) -> bool:
-    """True when Phase 2 abandons an edge before ``check_compatibility`` runs.
-
-    Two arms bypass: an unknowable (dynamic, ``None``) schema on either side,
-    and an observed schema on either side. These are exactly the edges whose
-    extras no other check covers; everywhere else ``check_compatibility`` owns
-    extras, so sweeping them again would double-report.
-
-    ``validate_single_edge`` spells both arms out inline rather than calling
-    this, because routing them through a predicate costs the type narrowing its
-    concrete-schema tail depends on. The observed arm is shared via
-    ``_is_observed_schema``; the ``None`` arm is a single identical comparison.
-    """
-    if producer_schema is None or consumer_schema is None:
-        return True
-    return _is_observed_schema(producer_schema) or _is_observed_schema(consumer_schema)
-
-
-def validate_locked_consumer_guaranteed_extras(
-    graph: ExecutionGraph,
-    *,
-    _schema_cache: dict[str, type[PluginSchema] | None] | None = None,
-) -> None:
-    """Reject guaranteed extras against locked inputs, across the whole graph.
-
-    Whole-graph pass for the per-edge rule ``_validate_locked_consumer_guaranteed_extras``
-    states. It runs LAST for the reason its three siblings each cite — a graph
-    tripping several checks keeps reporting the pre-existing error.
-
-    That placement is load-bearing, not cosmetic. The rule originally ran inline
-    inside ``validate_single_edge``, which the FIRST loop of
-    ``validate_edge_compatibility`` drives, so it pre-empted every whole-graph
-    check below it. A sink that both missed its required fields AND refused the
-    producer's extras then reported only the extras — and the extras remedies
-    ("add the extra fields", "relax to flexible", "drop the extras") cannot
-    supply a field the producer never guaranteed, so the author was handed three
-    fixes that all leave the graph invalid.
-
-    Only edges Phase 2 abandons are swept (``_phase2_bypasses_type_validation``),
-    and only those whose consumer is not a correlated barrier — hoisting the rule
-    out of ``validate_single_edge`` inherited EVERY guard between that function's
-    entry and the old call site, not just the Phase-2 bypass arms.
-    DIVERT edges carry quarantine/error payloads that never conformed to the
-    producer schema, so they are skipped here exactly as the Phase 1/2 loop
-    skips them.
-    """
-    cache: dict[str, type[PluginSchema] | None] = {} if _schema_cache is None else _schema_cache
+    # Same memoized resolution the edge loop uses — this pass walks every edge
+    # again, and get_effective_producer_schema recurses through gate chains
+    # (the O(N^2) → O(N) note on the loop above applies identically here).
+    schema_cache: dict[str, type[PluginSchema] | None] = {}
     for from_id, to_id, edge_data in graph._graph.edges(data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
         to_info = graph.get_node_info(to_id)
-        # Correlated barriers are skipped for the same reason validate_single_edge
-        # skips them BEFORE Phase 2: their dedicated validators compare all
-        # incoming branches together, so consumer-style single-edge derivation
-        # does not apply. Skipping is not merely tidy — resolving a producer this
-        # pass would otherwise newly resolve is not inert, because
-        # get_effective_producer_schema itself raises on a gate with mixed
-        # observed/explicit branches. Without this, a multi-input gate feeding a
-        # nested/select coalesce was rejected despite those merge strategies
-        # having no cross-branch schema constraint at all.
+        # Correlated barriers compare all incoming branches together in their
+        # own validators — same exclusion validate_single_edge applies.
         if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
             continue
-        producer_schema = get_effective_producer_schema(graph, from_id, _cache=cache)
         consumer_schema = to_info.input_schema
-        if not _phase2_bypasses_type_validation(producer_schema, consumer_schema):
+        # Cheap guard first: the helper declines unless the consumer forbids
+        # extras, and resolving the producer schema is the expensive half —
+        # on a passing edge its only product is a name in an error never
+        # raised.
+        if consumer_schema is None or consumer_schema.model_config["extra"] != "forbid":
+            continue
+        producer_schema = get_effective_producer_schema(graph, from_id, _cache=schema_cache)
+        # The producer's own EXTRAS FIREWALL, mirroring composer
+        # `_producer_emit_profile`'s `extras_firewall`. A producer whose
+        # output contract forbids extras emits EXACTLY its declared fields —
+        # rows either match that set or die at its own preflight, never
+        # downstream of it — so a name in its guarantee channel that is not
+        # in its model provably never reaches this consumer and cannot kill
+        # a row here.
+        #
+        # Skipping is required for soundness, not just economy. A REDUCTIVE
+        # producer's guarantee channel can describe fields it consumes rather
+        # than emits (batch_stats declaring `value` while emitting
+        # count/sum), and the certainty this check rests on — "a guarantee
+        # means every row WILL carry the field" — holds only for a guarantee
+        # about OUTPUT. The firewall is what distinguishes the two: an
+        # extras-allowing producer (a union coalesce's merged schema is
+        # mode: flexible, as is an under-declaring pass-through transform's)
+        # really does forward the fields it guarantees but never typed.
+        if producer_schema is not None and producer_schema.model_config["extra"] != "allow":
             continue
         _validate_locked_consumer_guaranteed_extras(
             graph,
@@ -348,10 +352,10 @@ def _validate_locked_consumer_guaranteed_extras(
     """Build-time mirror of composer Rule A: guaranteed extras vs a locked input.
 
     ``check_compatibility``'s extras arm compares schema against schema, so the
-    two edges it never sees (``_phase2_bypasses_type_validation``: dynamic
-    producer, observed producer) used to leave a locked (``extra='forbid'``)
-    consumer unchecked against a producer whose promises travel in the OTHER
-    channel — ``guaranteed_fields``. A
+    edges it never sees (a dynamic producer, an observed producer — the two arms
+    ``validate_single_edge`` abandons before Phase 2) used to leave a locked
+    (``extra='forbid'``) consumer unchecked against a producer whose promises
+    travel in the OTHER channel — ``guaranteed_fields``. A
     guarantee means every row WILL carry the field; a locked consumer that
     does not admit it kills every such row at the executor input preflight
     (``engine/executors/transform.py`` ``model_validate``; ``sink.py`` /
@@ -368,6 +372,10 @@ def _validate_locked_consumer_guaranteed_extras(
     Admitted = every declared model field, required or optional — an optional
     declared field is legitimate input, not an extra (the boundary
     ``TestExtrasFirewallDirection`` pins).
+
+    For a SINK consumer the rejection ACCUMULATES the sink required-fields
+    verdict rather than pre-empting it — see the raise site for why ordering
+    alone is not a fix.
     """
     if consumer_schema is None:
         return
@@ -381,7 +389,22 @@ def _validate_locked_consumer_guaranteed_extras(
 
     from_info = graph.get_node_info(from_node_id)
     to_info = graph.get_node_info(to_node_id)
-    raise EdgeContractError(
+
+    # A SINK consumer can violate BOTH rules on the same edge: the producer
+    # guarantees a field the locked sink forbids AND fails to guarantee one
+    # the sink requires. The dedicated sweep that reports the second half
+    # (validate_sink_required_fields) runs strictly AFTER this edge loop and
+    # is unreachable once this raises, so reporting extras alone left the
+    # runtime proposing "insert a field_mapper with select_only: true to drop
+    # the extras" — a repair that leaves the sink still requiring a field
+    # nothing provides. That is a FALSE repair signal to an LLM authoring
+    # loop, so the verdict is assembled here rather than ordered
+    # (elspeth-9615d6c75a). Phase 1 already defers sink required-fields to the
+    # sweep for the abstention reason documented above; consulting the rule's
+    # single owner keeps this raise site honest without duplicating it.
+    sink_missing = _sink_required_missing_fields(graph, to_node_id, from_node_id, {}) if to_info.node_type == NodeType.SINK else frozenset()
+
+    extras_report = (
         f"Schema contract violation: edge '{from_node_id}' → '{to_node_id}'\n"
         f"  Consumer ({to_info.plugin_name}) input is locked (mode: fixed) and accepts: "
         f"{sorted(consumer_schema.model_fields)}\n"
@@ -389,15 +412,36 @@ def _validate_locked_consumer_guaranteed_extras(
         f"  Extra fields rejected by consumer input contract: {sorted(extras)}\n"
         f"\n"
         f"Fix: Either:\n"
-        f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them, or\n"
-        f"  2. Relax the consumer schema (mode: flexible) to admit undeclared fields, or\n"
-        f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer",
+        f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them "
+        f"— and when the producer TYPES its own fields (a union coalesce merges its branches' "
+        f"declared schemas), declare them on those branches too, or this edge fails instead "
+        f"with 'Missing fields', or\n"
+        f"  2. Relax the consumer schema to mode: flexible WITHOUT declaring the extra fields, "
+        f"so it admits them as undeclared, or\n"
+        f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer"
+    )
+
+    if sink_missing:
+        message = (
+            f"{_sink_required_violation_message(to_info.plugin_name, from_node_id, sink_missing)}\n"
+            f"\n"
+            f"The same edge ALSO violates the consumer's locked input contract. "
+            f"BOTH must be repaired — dropping the extras alone leaves the sink "
+            f"requiring {sorted(sink_missing)} that nothing guarantees:\n"
+            f"{extras_report}"
+        )
+    else:
+        message = extras_report
+
+    raise EdgeContractError(
+        message,
         from_node_id=str(from_node_id),
         to_node_id=str(to_node_id),
         producer_schema_name=producer_schema.__name__ if producer_schema is not None else "(dynamic)",
         consumer_schema_name=consumer_schema.__name__,
         compatibility_result=CompatibilityResult(
             compatible=False,
+            missing_fields=tuple(sorted(sink_missing)),
             extra_fields=tuple(sorted(extras)),
         ),
         component_type=to_info.node_type.value,
@@ -834,6 +878,54 @@ def row_union_schema_configs_compatible(
     return False, conflicting_fields, f"Conflicting shared field types: {conflict_details}"
 
 
+def _sink_required_missing_fields(
+    graph: ExecutionGraph,
+    sink_node_id: str,
+    predecessor_id: str,
+    cache: dict[str, EffectiveGuaranteeVote],
+) -> frozenset[str]:
+    """Evaluate the sink required-fields rule for ONE (sink, predecessor) pair.
+
+    Single owner of the rule. ``validate_sink_required_fields`` sweeps every
+    sink through it, and ``_validate_locked_consumer_guaranteed_extras``
+    consults it for the one edge it is about to reject, so the two sites
+    cannot drift into disagreeing about the same graph — the failure mode
+    that produced elspeth-3283f2eaec and elspeth-cfcd333f83.
+
+    ABSTENTION belongs to the rule, not to the caller: a predecessor that
+    neither guarantees anything nor participated in the vote defers to
+    SinkExecutor's per-row ``declared_required_fields`` enforcement and
+    yields no build-time violation.
+    """
+    sink_required = graph.get_node_info(sink_node_id).declared_required_fields
+    if not sink_required:
+        return frozenset()
+
+    vote = walk_effective_guarantee_vote(graph, predecessor_id, cache)
+    if not vote.fields and not vote.participated:
+        return frozenset()
+
+    return sink_required - vote.fields
+
+
+def _sink_required_violation_message(sink_plugin_name: str, predecessor_id: str, missing: frozenset[str]) -> str:
+    """The one wording of the sink required-fields verdict.
+
+    Shared by the dedicated sweep and the per-edge combined report so a graph
+    tripping BOTH rules states the sink half in exactly the words a graph
+    tripping only the sink rule would use.
+    """
+    return (
+        f"Sink '{sink_plugin_name}' requires fields {sorted(missing)} "
+        f"but its upstream '{predecessor_id}' does not guarantee them. "
+        f"Likely causes: a coalesce union marked these fields optional "
+        f"(branch-exclusive or AND-downgraded), or an upstream transform "
+        f"did not declare them as guaranteed output. "
+        f"Fix: ensure the upstream node guarantees these fields, "
+        f"or remove them from the sink's declared_required_fields."
+    )
+
+
 def validate_sink_required_fields(graph: ExecutionGraph) -> None:
     """Validate each sink's declared_required_fields against upstream guarantees.
 
@@ -879,28 +971,16 @@ def validate_sink_required_fields(graph: ExecutionGraph) -> None:
         if info.node_type != NodeType.SINK:
             continue
 
-        sink_required = info.declared_required_fields
-        if not sink_required:
+        if not info.declared_required_fields:
             continue
 
         for predecessor_id in graph._graph.predecessors(node_id):
-            vote = walk_effective_guarantee_vote(graph, predecessor_id, effective_fields_cache)
-            guaranteed = vote.fields
-            if not guaranteed and not vote.participated:
-                continue
-
-            missing = sink_required - guaranteed
+            missing = _sink_required_missing_fields(graph, node_id, predecessor_id, effective_fields_cache)
             if not missing:
                 continue
 
             raise GraphValidationError(
-                f"Sink '{info.plugin_name}' requires fields {sorted(missing)} "
-                f"but its upstream '{predecessor_id}' does not guarantee them. "
-                f"Likely causes: a coalesce union marked these fields optional "
-                f"(branch-exclusive or AND-downgraded), or an upstream transform "
-                f"did not declare them as guaranteed output. "
-                f"Fix: ensure the upstream node guarantees these fields, "
-                f"or remove them from the sink's declared_required_fields.",
+                _sink_required_violation_message(info.plugin_name, predecessor_id, missing),
                 component_id=str(node_id),
                 component_type="sink",
             )

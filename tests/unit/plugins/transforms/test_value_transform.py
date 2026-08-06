@@ -302,9 +302,14 @@ class TestValueTransformBehavior:
                 "operations": [{"target": "subtotal", "expression": "row['price'] * row['quantity']"}],
             }
         )
-        # A fixed-mode producer guarantees its declared inputs as well as its
-        # operation targets, so the downstream locked consumer must admit
-        # price/quantity too — the negative case below pins why.
+        # Declares the whole arriving row, not just the field it reads. A
+        # value_transform's `schema` block is its INPUT contract and `mode: fixed`
+        # makes it extra="forbid", so a consumer naming only `subtotal` rejects
+        # the producer's `price`/`quantity` at preflight and kills row 1 — this
+        # pair built green but could never have run (elspeth-9615d6c75a).
+        # `required_input_fields` still narrows what it REQUIRES to `subtotal`,
+        # which keeps the locked-consumer path under test rather than relaxing
+        # the mode to make the build pass.
         consumer = ValueTransform(
             {
                 "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: float"]},

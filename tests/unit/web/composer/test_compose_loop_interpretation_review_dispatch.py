@@ -250,6 +250,26 @@ def sessions_service(engine) -> SessionServiceImpl:
     )
 
 
+# Every transform fixture below sets ``on_error`` explicitly. These NodeSpecs are
+# built directly, bypassing the mutation boundaries that supply the value in
+# production (``_execute_upsert_node``, ``_execute_set_pipeline``,
+# ``_prepare_transform_candidate``, all of which default it to "discard"), so an
+# omitted ``on_error`` here models a state NO authoring path can produce — and one
+# Stage 1 rejects outright with ``transform_missing_on_error``. It stayed harmless
+# only while nothing drove these states through YAML generation; e4fae9948 began
+# running a runtime preflight on the budget-exhaustion finalize path, which reaches
+# ``generate_yaml`` and trips its guard ("Transform ... has on_error=None"),
+# surfacing as an INTERNAL preflight error rather than a validation verdict.
+#
+# Do NOT "fix" that guard by defaulting ``on_error`` at the boundary by analogy
+# with the coalesce ``merge`` default: ``merge`` mirrors a real runtime default,
+# whereas ``TransformSettings.on_error`` is REQUIRED with no default, so defaulting
+# it would invent a routing decision and suppress ``transform_missing_on_error``.
+#
+# A/B-attributing a failure like this across commits needs one trick, because a
+# bare worktree run silently imports the MAIN checkout via the editable install:
+#     PYTHONPATH=<worktree>/src <venv>/bin/python -m pytest <test>
+# Verify ``elspeth.__file__`` points into the worktree BEFORE trusting the result.
 def _llm_node_spec(term: str = "cool") -> NodeSpec:
     return NodeSpec(
         id="rate_node",
@@ -257,7 +277,7 @@ def _llm_node_spec(term: str = "cool") -> NodeSpec:
         plugin="llm",
         input="rows",
         on_success="out",
-        on_error=None,
+        on_error="discard",
         options={"prompt_template": f"Rate how {{{{interpretation:{term}}}}} this row is."},
         condition=None,
         routes=None,
@@ -281,7 +301,7 @@ def _llm_node_spec_with_id(node_id: str, *, term: str = "cool") -> NodeSpec:
         plugin="llm",
         input="rows",
         on_success="out",
-        on_error=None,
+        on_error="discard",
         options={"prompt_template": f"Rate how {{{{interpretation:{term}}}}} this row is."},
         condition=None,
         routes=None,
@@ -314,7 +334,7 @@ def _state_with_prompt_template_review_node() -> CompositionState:
                 plugin="llm",
                 input="rows",
                 on_success="out",
-                on_error=None,
+                on_error="discard",
                 options={
                     "prompt_template": prompt,
                     INTERPRETATION_REQUIREMENTS_KEY: [
@@ -393,7 +413,7 @@ def _state_with_pipeline_decision_review() -> CompositionState:
                 plugin="field_mapper",
                 input="scored_rows",
                 on_success="clean_rows",
-                on_error=None,
+                on_error="discard",
                 options={
                     "mapping": {
                         "url": "url",
@@ -440,7 +460,7 @@ def _state_with_unreviewed_raw_html_cleanup() -> CompositionState:
                 plugin="web_scrape",
                 input="rows",
                 on_success="scraped_rows",
-                on_error=None,
+                on_error="discard",
                 options={
                     "url_field": "url",
                     "content_field": "content",
@@ -459,7 +479,7 @@ def _state_with_unreviewed_raw_html_cleanup() -> CompositionState:
                 plugin="field_mapper",
                 input="scored_rows",
                 on_success="clean_rows",
-                on_error=None,
+                on_error="discard",
                 options={
                     "mapping": {
                         "url": "url",
@@ -1483,7 +1503,7 @@ def _auto_wired_disclosure_node(node_id: str, *, draft: str) -> NodeSpec:
         plugin="content_safety",
         input=f"{node_id}_in",
         on_success=f"{node_id}_out",
-        on_error=None,
+        on_error="discard",
         options={
             "fields": ["content"],
             "schema": {"mode": "observed"},

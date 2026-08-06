@@ -1132,3 +1132,472 @@ class TestLockedInputProductionBuildPath:
             sinks=plugins.sinks,
             aggregations=plugins.aggregations,
         )
+
+
+# ---------------------------------------------------------------------------
+# Union coalesce: guaranteed fields the merged schema does not declare
+# (elspeth-1451ff385f)
+# ---------------------------------------------------------------------------
+
+_COALESCE_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'price: int'
+        - 'category: str'
+        - 'description: str'
+      on_validation_failure: discard
+
+gates:
+- name: fork_gate
+  input: raw
+  condition: "True"
+  routes:
+    'true': fork
+    'false': discard
+  fork_to:
+    - path_a
+    - path_b
+
+transforms:
+- name: truncate_branch_a
+  plugin: truncate
+  input: path_a
+  on_success: trunc_a
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+{branch_schema}
+- name: truncate_branch_b
+  plugin: truncate
+  input: path_b
+  on_success: trunc_b
+  on_error: discard
+  options:
+    fields:
+      description: 50
+    suffix: "..."
+{branch_schema}
+{extra_transforms}
+coalesce:
+- name: merge_results
+  branches:
+    path_a: trunc_a
+    path_b: trunc_b
+  policy: {policy}
+  merge: union
+  union_collision_policy: last_wins
+{coalesce_out}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: {sink_mode}
+{sink_fields}"""
+
+# A pass-through branch that declares only the field it rewrites. The fields it
+# carries untouched live in guaranteed_fields alone — the channel the merged
+# schema does not declare.
+_BRANCH_UNDERDECLARED = """    schema:
+      mode: flexible
+      fields:
+      - 'description: str'"""
+
+# The same branch declaring everything it actually passes through.
+_BRANCH_FULLY_DECLARED = """    schema:
+      mode: flexible
+      fields:
+      - 'id: int'
+      - 'product: str'
+      - 'price: int'
+      - 'category: str'
+      - 'description: str'"""
+
+_SINK_ADMITS_DESCRIPTION = """        fields:
+        - 'description: str'
+"""
+
+_SINK_ADMITS_ALL = """        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'price: int'
+        - 'category: str'
+        - 'description: str'
+"""
+
+# A locked TRANSFORM consumer: mode: fixed makes its input extra='forbid', so
+# it rejects the phantom-guaranteed fields exactly as a locked sink does.
+_LOCKED_TRANSFORM = """- name: lock_it
+  plugin: truncate
+  input: merge_results
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: fixed
+      fields:
+      - 'description: str'
+"""
+
+# field_mapper select_only drops the extras — remedy 3 of the rejection message.
+_SELECT_ONLY_MAPPER = """- name: drop_extras
+  plugin: field_mapper
+  input: merge_results
+  on_success: output
+  on_error: discard
+  options:
+    select_only: true
+    mapping:
+      description: description
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+"""
+
+
+def _build_coalesce_graph(
+    *,
+    branch_schema: str = _BRANCH_UNDERDECLARED,
+    sink_fields: str = _SINK_ADMITS_DESCRIPTION,
+    sink_mode: str = "fixed",
+    policy: str = "require_all",
+    extra_transforms: str = "",
+    coalesce_out: str = "\n  on_success: output",
+) -> ExecutionGraph:
+    """Build fork -> two pass-through branches -> union coalesce -> locked sink."""
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    settings = load_settings_from_yaml_string(
+        _COALESCE_PIPELINE.format(
+            branch_schema=branch_schema,
+            sink_mode=sink_mode,
+            policy=policy,
+            extra_transforms=extra_transforms,
+            sink_fields=sink_fields,
+            coalesce_out=coalesce_out,
+        )
+    )
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        gates=settings.gates,
+        coalesce_settings=settings.coalesce,
+    )
+
+
+class TestUnionCoalesceGuaranteedExtras:
+    """A union coalesce guarantees fields its own merged schema never declares.
+
+    The builder computes a coalesce's typed ``fields`` from each branch's
+    CONSTRUCTION-time schema but its ``guaranteed_fields`` from a separately
+    graph-walked effective guarantee (elspeth-0b14977817), so a pass-through
+    branch that declares only the field it rewrites yields a merged schema
+    whose guarantees exceed its declared fields. Those fields never enter the
+    pydantic model, so ``check_compatibility``'s extras arm — which compares
+    ``model_fields`` — cannot see them, and a locked consumer that rejects
+    every one of them was accepted at build (elspeth-1451ff385f).
+
+    The two channels are deliberately decoupled: ``fields`` is what the node
+    typed, ``guaranteed_fields`` is what the graph proves will be present. The
+    fix is therefore to check the guarantee channel against a locked consumer
+    on the typed path too, not to force the channels to agree.
+    """
+
+    def test_phantom_guarantee_against_locked_sink_is_rejected(self) -> None:
+        """At HEAD this built green and killed every row at the sink preflight."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph()
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_declared_branches_reach_the_same_verdict(self) -> None:
+        """Control: the SAME pipeline with branches declaring what they carry.
+
+        Semantically identical — rows carry five fields, the sink admits one —
+        and already rejected today by check_compatibility's extras arm. Pins
+        that under-declaring a branch cannot change the verdict, only which
+        arm reports it.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError, match="Extra fields forbidden"):
+            _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED)
+
+    def test_fully_declared_branches_against_admitting_sink_still_build(self) -> None:
+        """A locked sink admitting every field must stay green.
+
+        Names what this actually covers: with fully-declared branches the
+        guarantees are a SUBSET of the declared fields, so the merged schema
+        has no phantoms and ``check_compatibility`` alone decides this edge —
+        the new pass is not the discriminating arm. Keep it as the guard on
+        the declared channel; the guard on the NEW check is the flexible-
+        consumer test below, which is the case where guarantees exceed the
+        declared fields and the check must still decline to fire.
+        """
+        _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED, sink_fields=_SINK_ADMITS_ALL)
+
+    def test_flexible_consumer_admits_the_guaranteed_extras(self) -> None:
+        """False-reject guard for the NEW check: phantoms + a consumer that admits extras.
+
+        Same under-declared branches as the defect test, so the coalesce
+        guarantees four fields it never declares and the new pass DOES
+        evaluate this edge. A `mode: flexible` consumer is `extra='allow'`,
+        so no row can die at its preflight and the check must decline. This
+        is the shape that would break if the check ever stopped consulting
+        the consumer's extras policy.
+        """
+        _build_coalesce_graph(sink_mode="flexible")
+
+    @pytest.mark.xfail(
+        reason=(
+            "Inverse defect, deliberately out of scope for elspeth-1451ff385f: "
+            "check_compatibility's MISSING-fields arm reads the declared channel only, "
+            "the mirror of the extras-arm defect this class fixes. The coalesce declares "
+            "['description'], so a sink admitting every GUARANTEED field is rejected with "
+            "'Missing fields' even though the rows carry them and the pipeline runs. "
+            "Pinned so the asymmetry is visible in the suite, not only in the ticket."
+        ),
+        strict=True,
+    )
+    def test_sink_admitting_every_guaranteed_field_is_wrongly_rejected(self) -> None:
+        """The remedy the rejection message used to propose first — a false reject."""
+        _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
+
+    def test_select_only_field_mapper_clears_the_rejection(self) -> None:
+        """The rejection message's remedy 3 must actually clear the rejection.
+
+        Asserts BOTH halves in one test so the claim is falsifiable: the same
+        topology WITHOUT the field_mapper is rejected, and inserting one clears
+        it. Checking only the second half would pass even if the rejection had
+        never been live — the coalesce -> field_mapper edge is not itself
+        eligible for this check (field_mapper's own input contract is
+        extra='allow'), so it is the mapper doing the work, not the check
+        declining to fire.
+
+        The guarantee assertion is the mechanism: select_only narrows the walk
+        to 'description', so an error whose own remedy did not clear it would
+        mean the walk over-attributes through field-dropping nodes.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError):
+            _build_coalesce_graph()
+
+        graph = _build_coalesce_graph(extra_transforms=_SELECT_ONLY_MAPPER, coalesce_out="")
+
+        mapper = next(n for n in graph.get_nodes() if n.node_id.startswith("transform_drop_extras"))
+        assert schema_validation.get_effective_guaranteed_fields(graph, mapper.node_id) == frozenset({"description"})
+
+    def test_phantom_guarantee_is_rejected_under_intersection_policy(self) -> None:
+        """`best_effort` merges guarantees by INTERSECTION, a distinct code path.
+
+        `merge_guaranteed_fields` unions under require_all and intersects
+        otherwise. Every other fixture in this class is require_all, so without
+        this the intersection arm is unexercised — and it reaches the same
+        phantom today only because the branches are structurally identical. A
+        change narrowing that arm would silently reopen the defect on
+        non-require_all pipelines with nothing going red.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(policy="best_effort\n  timeout_seconds: 5")
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_phantom_guarantee_is_rejected_at_a_locked_transform_consumer(self) -> None:
+        """The check governs every edge, not only sink edges.
+
+        `validate_typed_producer_guaranteed_extras` excludes only COALESCE and
+        ROW_UNION consumers, so a locked TRANSFORM is equally in scope and its
+        rows die at the same input preflight. Pinned because every other case
+        in this class happens to terminate at a sink.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(sink_mode="observed", sink_fields="", extra_transforms=_LOCKED_TRANSFORM, coalesce_out="")
+
+        assert exc_info.value.to_node_id.startswith("transform_lock_it")
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+
+_LINEAR_PASS_THROUGH_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'description: str'
+      on_validation_failure: discard
+
+transforms:
+- name: shorten
+  plugin: truncate
+  input: raw
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: {sink_mode}
+{sink_fields}"""
+
+
+def _build_linear_pass_through_graph(*, sink_mode: str = "fixed", sink_fields: str = _SINK_ADMITS_DESCRIPTION) -> ExecutionGraph:
+    """Build source -> under-declaring pass-through transform -> sink. No coalesce."""
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    settings = load_settings_from_yaml_string(_LINEAR_PASS_THROUGH_PIPELINE.format(sink_mode=sink_mode, sink_fields=sink_fields))
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+    )
+
+
+class TestTypedPassThroughGuaranteedExtras:
+    """The defect is NOT specific to union coalesce — pin its real scope.
+
+    elspeth-1451ff385f was reported, diagnosed and fixed as a coalesce bug,
+    because that is where the builder decouples the two channels
+    STRUCTURALLY (typed fields from each branch's construction-time schema,
+    guarantees from a separate graph walk). But the failing ingredient is
+    only "a producer whose guarantees exceed its own declared fields, feeding
+    a locked consumer", and any `passes_through_input=True` transform that
+    declares a NARROWER schema than it forwards has exactly that shape with
+    no coalesce anywhere.
+
+    Verified by A/B against this same pipeline: with
+    ``validate_typed_producer_guaranteed_extras`` disabled the build is
+    GREEN, so this was a live silent defect on linear pipelines too and is
+    not merely a coalesce symptom reached by another route.
+    """
+
+    def test_under_declaring_pass_through_against_locked_sink_is_rejected(self) -> None:
+        """No fork, no coalesce — same phantom guarantees, same certain row death."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_linear_pass_through_graph()
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("id", "product")
+
+    def test_under_declaring_pass_through_into_admitting_sink_still_builds(self) -> None:
+        """False-reject guard: the same producer is fine when nothing is locked."""
+        _build_linear_pass_through_graph(sink_mode="observed", sink_fields="")
+
+
+class TestReductiveProducerExtrasFirewall:
+    """A producer that forbids extras cannot emit what it merely guarantees.
+
+    The guaranteed-extras check rests on "a guarantee means every row WILL
+    carry the field", which holds only for a guarantee about OUTPUT. A
+    REDUCTIVE producer's guarantee channel can describe fields it CONSUMES:
+    batch_stats declares `value` while emitting count/sum. Its output
+    contract is `mode: fixed` (extra='forbid'), so its rows are exactly its
+    declared fields — the guaranteed-but-undeclared name provably never
+    reaches the consumer and cannot kill a row there.
+
+    That extras firewall is the discriminator between this shape and the one
+    the check exists for: a union coalesce's merged schema is `mode:
+    flexible`, as is an under-declaring pass-through transform's, and those
+    really do forward fields they guarantee but never typed. Mirrors composer
+    `_producer_emit_profile`'s `extras_firewall`.
+
+    Regression guard: without it the check falsely rejected
+    tests/unit/core/test_dag.py::test_validate_aggregation_dual_schema, a
+    correct pipeline whose sink admits exactly what the aggregation emits.
+    """
+
+    @staticmethod
+    def _reductive_graph() -> ExecutionGraph:
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        consumed = SchemaConfig.from_dict({"mode": "fixed", "fields": ["value: float"]})
+        emitted = SchemaConfig.from_dict({"mode": "fixed", "fields": ["count: int", "sum: float"]})
+        consumed_model = create_schema_from_config(consumed, "Consumed", allow_coercion=False)
+        emitted_model = create_schema_from_config(emitted, "Emitted", allow_coercion=False)
+
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv", output_schema=consumed_model)
+        graph.add_node(
+            "agg",
+            node_type=NodeType.AGGREGATION,
+            plugin_name="batch_stats",
+            input_schema=consumed_model,
+            output_schema=emitted_model,
+            # The guarantee channel describes what it CONSUMES, not emits.
+            config={"schema": {"mode": "fixed", "fields": ["value: float"]}},
+        )
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", input_schema=emitted_model)
+        graph.add_edge("source", "agg", label="continue")
+        graph.add_edge("agg", "sink", label="continue")
+        return graph
+
+    def test_reductive_producer_guarantee_does_not_reject_a_locked_consumer(self) -> None:
+        """The sink admits exactly what the aggregation emits — this must build."""
+        graph = self._reductive_graph()
+
+        # The precondition that makes this a real guard, not a vacuous pass:
+        # the guarantee channel names a field the emitted model does not.
+        guaranteed = schema_validation.get_effective_guaranteed_fields(graph, "agg")
+        assert "value" in guaranteed
+        assert "value" not in graph.get_node_info("agg").output_schema.model_fields
+
+        graph.validate_edge_compatibility()
