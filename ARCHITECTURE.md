@@ -1016,7 +1016,7 @@ ELSPETH uses ADRs to document significant architectural choices.
 | **ADR-023** | Custom Python CI analyzer | Maintain `elspeth-lints` for project-specific static invariants | Captures architecture and audit rules that general linters cannot express |
 | **ADR-024** | Delivery governance for single-maintainer mode | Govern release and CI/CD delivery for single-maintainer operation | Makes delivery controls explicit where team-size assumptions do not apply |
 | **ADR-025** | Multi-source ingestion | The pipeline source surface is plural by contract and by code; the singular `source` surface is deleted, not deprecated | Removes the special case rather than carrying two ingestion shapes |
-| **ADR-026** | Durable token scheduler | Record the durable scheduler discipline and the two P0 correctness fixes found in the engine audit | Fixes the scheduler contract in the record rather than in commit archaeology |
+| **ADR-026** | Durable token scheduler | ELSPETH owns a durable token scheduler as a first-class engine primitive; the scheduler row is authoritative for resume, and in-memory work state is a cache that must never diverge from it | Resume replays from one durable authority instead of reconstructing work from memory |
 | **ADR-027** | Composer operator set sampling | Nullable `composer_temperature` / `composer_seed` on `WebSettings`, defaulting to `None` so the field is omitted from the provider request | Makes Composer LLM sampling explicit operator configuration instead of a hidden default |
 | **ADR-028** | QUEUE and COALESCE are not duplicates | Keep them separate; a future Barrier abstraction targets aggregation + coalesce, not queue + coalesce | The structural twins are aggregation and coalesce; unifying queue with them would merge unlike semantics |
 | **ADR-029** | Journal is barrier-buffer truth | The scheduler journal (`token_work_items` BLOCKED rows) is the single source of truth for barrier-buffer membership and payload on resume; the blob checkpoint-state families are deleted | One durable record for buffered work instead of two that can disagree |
@@ -1128,7 +1128,7 @@ ongoing CI enforcement.
 - Test LOC: ~891,300 (1,749 Python files, 2.4:1 ratio)
 - Subsystems: 11 major (20+ including sub-components)
 - Plugins: registry-discovered via `discover_all_plugins()` — the same code path as `elspeth plugins list`
-- ADRs: 38 accepted records (excluding the 000 template)
+- ADRs: 38 numbered records (excluding the 000 template)
 - Status: Pre-release (0.7.2)
 
 All diagrams use Mermaid syntax for version control compatibility.

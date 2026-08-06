@@ -52,10 +52,11 @@ profile; it names the deployment's standard profile, which the first-run
 tutorial happens to use. There is no compatibility alias, so any deployment
 setting the old variable must change its environment before upgrading, and the
 protected AWS acceptance env-var contract moves with it or the scenario binding
-hash no longer matches the deployed task definition. Configuring `llm_profiles`
-without naming the standard profile is now a startup error rather than an
-arbitrary alias silently becoming the house default; zero configured profiles
-stays valid.
+hash no longer matches the deployed task definition. Leaving
+`default_llm_profile` unset is a supported degraded-readiness state — ordinary
+pipelines and explicit profile authoring remain available while the first-run
+tutorial reports that no standard profile is configured — but a default that
+names an unconfigured profile is rejected at startup.
 
 **Breaking API rename:** `WebLLMProfileSettings` becomes `LLMProfileSettings`
 and `RuntimeWebLLMProfile` becomes `RuntimeLLMProfile`, with the alias and

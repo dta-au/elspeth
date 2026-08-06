@@ -212,9 +212,10 @@ local user accounts.
 **Operator setting rename:** `ELSPETH_WEB__TUTORIAL_LLM_PROFILE` is now
 `ELSPETH_WEB__DEFAULT_LLM_PROFILE`. There is no compatibility alias, so update
 the environment before upgrading. The setting names the deployment's standard
-LLM profile, which the first-run tutorial happens to use; configuring
-`ELSPETH_WEB__LLM_PROFILES` without naming that standard profile is now a
-startup error rather than an arbitrary alias silently becoming the default.
+LLM profile, which the first-run tutorial happens to use. Leaving it unset is a
+supported degraded-readiness state (the tutorial reports that no standard
+profile is configured); setting it to a profile that is not configured in
+`ELSPETH_WEB__LLM_PROFILES` is a startup error.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete release-level summary and
 [ADR-030](docs/architecture/adr/030-multi-worker-deployment-shape.md) for the
