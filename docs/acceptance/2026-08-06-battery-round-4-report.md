@@ -492,7 +492,7 @@ verdict on g05 was the driver equating HTTP 200 with "pipeline authored" —
 on a 200 it must read `body["state"]` and report "composer declined" when
 null, instead of a false `state_exists` failure.
 
-### The advisor FLAG rate could not be measured
+### The advisor FLAG rate could not be measured *(corrected 2026-08-06: it could — retro-measured from CloudWatch below)*
 
 The brief asks for the Sydney advisor FLAG rate against Singapore's 14-of-16
 `verdict=flagged` at `phase=early`. It is **not recoverable from the session
@@ -501,6 +501,56 @@ store**: no row in `chat_messages` — in any role — contains the string
 ran (12 `zai.glm-5` calls across 11 sessions, USD 0.2095), so the verdict is
 simply not persisted there. Whatever produced Singapore's 14-of-16 was a
 different surface. Reported unmeasured rather than estimated.
+
+#### Correction 2026-08-06 — the FLAG rate was measurable all along, from the log stream (elspeth-c804e5e3bb)
+
+The "different surface" exists and was wired throughout round 4. The
+session-store census above was correct but incomplete: it covered
+`chat_messages` and the `/tmp` archive, not the log stream.
+`record_advisor_checkpoint_pass`
+(`src/elspeth/web/composer/advisor_checkpoint_telemetry.py:36`, an ancestor of
+the `52ab3ec8b` image) emits a structlog INFO event
+`composer.advisor_checkpoint_pass` — `session_id`, `phase`, `pass_index`,
+`verdict`, `findings_hash` — on every completed checkpoint pass, clean
+included, and the round-4 web task definition ships container stdout to
+CloudWatch Logs (`/aws/ecs/a-9bf256b5c6305b89f30e-web`, stream prefix `web`).
+A `filter-log-events` pull over 2026-08-05T18:00Z→2026-08-06T04:5xZ returns
+**15 events, every one `phase=early` / `pass_index=1`**, archived with the
+round-4 evidence at
+`ops-local/acceptance/r4-preserve/advisor-checkpoint-events.json`.
+
+Per-session early-checkpoint verdicts, all 17 round-4 sessions:
+
+| Early verdict | Sessions |
+|---|---|
+| `flagged` (9) | g01-a3, g02 (all three attempts), g04, g06, g08-s1, g08-s2, g08-s3 |
+| `clean` (6) | g01-a1, g01-a2, g03, g07, g10, g11 |
+| no event (2) | g05, g09 — the compose ended (decline / wall 422) before an early checkpoint pass completed |
+
+**Sydney early-phase FLAG rate: 9 of 15 (60%)**, against Singapore's 14-of-16
+(87.5%). Restricted to the 12-session battery cohort it is 6 of 10 — the same
+60%. Three honesty limits:
+
+1. The event carries the verdict and a findings *hash*, not findings text —
+   *why* a session flagged is not recoverable from this surface.
+2. The window holds **no `phase=end` events**, so this measures the early
+   checkpoint only. The durable END-gate fact is persisted in the
+   `completion_gates` envelope (`5166baab2`, also an ancestor of the image),
+   readable via the same read-only database-bootstrap path the cost queries
+   used — a separate surface, not measured here.
+3. The 15 events are not the cost table's "12 calls / 11 sessions": four
+   events are from the g01/g02 repeat window (20:27–20:33Z), which postdates
+   the cost aggregate, and a completed-pass event is not identical to a
+   provider call. The counts are consistent in magnitude; exact
+   reconciliation would need the audit DB.
+
+One attribution note for `elspeth-3664e213c4`: on g01 the early verdict
+anti-correlates with the outcome — the two attempts that authored the failing
+mixed-case schema were `clean`, and the attempt that completed cleanly was
+`flagged`. The early checkpoint did not see the g01 defect.
+
+Round-5 brief P2 therefore resolves as **option (a) with zero code change**:
+the instrument already exists.
 
 ### Confirm target `elspeth-47fa7c01eb` — **PASSES**
 
@@ -759,7 +809,7 @@ on a single pass.
 | 5 | P2 | No surface discloses *why* rows were discarded — `/diagnostics` returns `errors: []` and `nodes: []`, and nothing reaches CloudWatch even with `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1` |
 | 6 | P2 | The runbook's zero-finding ECR scan gate is unsatisfiable for the cloudwatch-agent image; all 33 findings are unfixed-upstream OS packages from a `python:3.13-slim` runtime the image never uses |
 | 7 | P2 | Terraform teardown does not deregister task definitions registered out of band. 12 survived this run's destroy; 39 survived an earlier one |
-| 8 | P3 | The advisor verdict is not persisted to the session store, so the FLAG rate cannot be measured from it |
+| 8 | P3 | The advisor verdict is not persisted to the session store, so the FLAG rate cannot be measured from it *(corrected 2026-08-06: measured retroactively from the CloudWatch log stream — see the advisor section. The `chat_messages` half stays true; per-pass early verdicts are in the web log group, and the durable END-gate fact is in `completion_gates` since `5166baab2`)* |
 | 9 | P3 | Four battery-required settings are not Terraform inputs, and the package's default plugin allowlist (15) is not the share round 3 tested (40) |
 
 Findings 1, 2 and 3 are the priority. *(Corrected 2026-08-06: the original text

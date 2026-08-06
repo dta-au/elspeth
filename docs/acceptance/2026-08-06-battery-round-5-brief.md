@@ -144,6 +144,18 @@ it runs:
 Do not write a plan that "measures the FLAG rate from archived bodies". That
 was checked; the bodies do not carry it.
 
+*Corrected 2026-08-06 (elspeth-c804e5e3bb): the premise "absent from every
+surface the battery can reach" missed the log stream. The two checks covered
+`chat_messages` and the `/tmp` archive; `composer.advisor_checkpoint_pass`
+events (per-pass verdict, clean included —
+`advisor_checkpoint_telemetry.py:36`, an ancestor of the round-4 image) were
+in the round-4 CloudWatch web log group all along, and the round-4 FLAG rate
+is retro-measured at **9 of 15 early-phase `flagged` (60%)** — see the
+round-4 report's corrected advisor section. **P2 resolves as option (a) with
+zero code change**: round 5 measures the FLAG rate from the same log surface,
+plus the durable END-gate fact from `completion_gates` (`5166baab2`). Do not
+choose (b), and do not build a persistence fix the instrument does not need.*
+
 ### P3. Regenerate the ALB certificate — this is the tightest constraint
 
 The self-signed ALB certificate is valid **24 hours**, and because it is
