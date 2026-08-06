@@ -24,8 +24,12 @@ files are the record.
   retro-measured 9/15 (60%) — the "unmeasurable" verdict is corrected.
 - **The stock package render loses a corpus graph at its own wall**: arm C's
   g09 died at 240s; arm A's only g09 success settled at t=265.7s.
-- **Guided rider: 10/10** completions with composition state — the guided
-  cluster's first live signal, smoke-grade only.
+- **Guided rider: 10/10 successful starts** — HTTP 200 with a seeded
+  composition state on every attempt, matching closed `5904b1683a`'s
+  regression bar (round-2 baseline 10/10). The rider is **one call deep**:
+  all ten sessions sit at `step_1_source` with `terminal: null`, so this is
+  a no-regression datum on session *start*, not evidence any guided session
+  completed.
 
 ## Configuration and provenance
 
@@ -108,7 +112,7 @@ end-to-end, not compose time.
 | g11 | B | 0 | 319 | `afa5cee1` | completed_with_failures | **different** — csv seed + `llm` transform, not an `llm` source | **0/6 rows succeeded, 0 artifacts** (`b19dfe41fb`); authored around the mechanism under test |
 | g02 | C | 0 | 93 | `1cfa5245` | completed_with_failures | **different** — arrives form, same field | Clean 4th sample of the arm-A behaviour; fastest of the four |
 | g09 | C | 2 | 241 | `e4c54334` | wall, no state | n/a | **Structural at 240, marginal at 270** |
-| rider ×10 | D | 0 | — | ten sessions | 10/10 completed, all with state | n/a | Smoke datum only; closes nothing of the guided cluster |
+| rider ×10 | D | 0 | — | ten sessions | 10/10 **starts** OK | n/a | One call deep (`/guided/start` only); all at `step_1_source`, `terminal: null`. `"completed"` in the tally means the start call returned 200; `has_state` cannot fail on a 200 (the start seeds an empty state). Closes nothing of the guided cluster |
 
 Full session/run ids: `ops-local/acceptance/r5-preserve/analysis/report-tables.md`
 and the per-arm `summary.txt` files.
@@ -134,6 +138,7 @@ pass — after this round that includes g01 and g02.
 | `52af290183` | **PARTLY DISCHARGED + one adverse datum** | The named 240+`high` combination was eliminated by `b5047ef69` (its own fix, in the installed package). The actual stock render (240+`medium`) lost g09 at the wall — g09 *is* a compose that flips pass→fail at 240, against the commit's "ZERO flip" claim. n=1, no rate | No |
 | `a79f1b2e6b` | **MEASURED** — criterion satisfiable at last | Full battery achieved across A∪B; **USD 0.3618/session upper bound**, arm A comparable cohort 0.3077 | **Yes**, on the operator's read of the numbers |
 | `47fa7c01eb` | NOT ASSESSED this round | Carried re-confirm not evaluated; `elspeth-obs-62c0f57b6d` filed against it | No |
+| `5904b1683a` (F14, **closed**) | **NO REGRESSION** | Arm D matches its regression watch verbatim (`round3-scope-reconciled.md:111`): 10/10 HTTP 200 + non-null state, zero `REPAIR_EXHAUSTED`, zero 502s, canonical intent verbatim (coordinator-issued from `round3-graph-corpus.md:681`) | n/a — closed; stays closed |
 
 **Not covered** (stated so this report cannot over-claim): `9d13900064`,
 `82d4c5146c` (no graph reached their shape), `49b467d91a` (frontend DOM —
