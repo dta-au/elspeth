@@ -1326,8 +1326,7 @@ def _serialize_full_pipeline_state(state: CompositionState, *, requested_compone
 _DEFAULT_SOURCE_VALIDATION_FAILURE: Final[str] = "discard"
 
 _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
-    "How to handle source validation failures. Use 'discard' to drop invalid rows without routing. "
-    "Any other value, including 'quarantine', must match a configured output/sink name."
+    "'discard' drops rows that fail source validation. Any other value, including 'quarantine', must match a configured output/sink name."
 )
 
 

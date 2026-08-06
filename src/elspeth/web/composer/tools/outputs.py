@@ -74,13 +74,10 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
             "sink_name": {
                 "type": "string",
                 "description": (
-                    "Sink name. This string is BOTH the sink's identifier (used by "
-                    "patch_output_options/remove_output) AND the connection-name the sink "
-                    "consumes — it MUST equal some upstream's on_success value. Pick a name "
-                    "describing the data being written; it does not need to match an upstream "
-                    "node's id."
+                    "Sink name: BOTH the sink's identifier (used by patch_output_options/"
+                    "remove_output) AND the connection-name the sink consumes — it MUST equal "
+                    "some upstream's on_success value; it need not match any node id."
                 ),
-                "examples": ["lines_out", "scored_results", "errors_quarantine"],
             },
             "plugin": {"type": "string", "description": "Sink plugin name (e.g. 'csv', 'json')."},
             "options": {
@@ -92,7 +89,7 @@ _SET_OUTPUT_DECLARATION = ToolDeclaration(
             },
             "on_write_failure": {
                 "type": "string",
-                "description": "How to handle per-row write failures. Use 'discard' to drop with audit record, or a sink name (e.g. 'results_failures') to divert failed rows to that failsink.",
+                "description": "Per-row write-failure policy: 'discard' drops with an audit record; a sink name diverts failed rows to that failsink.",
                 "default": "discard",
             },
         },

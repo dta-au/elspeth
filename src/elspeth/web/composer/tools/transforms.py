@@ -193,32 +193,28 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "input": {
             "type": "string",
             "description": (
-                "Connection-name string this node CONSUMES. MUST equal the value of some "
-                "upstream's on_success (or routes value, or on_error) field. NOT the upstream "
-                "node's id — connections are matched by string, not by graph topology. "
-                "Example: if source.on_success='raw_url_rows', this node sets input='raw_url_rows'."
+                "Connection-name string this node CONSUMES: must equal an upstream's on_success "
+                "(or routes value, or on_error), NOT the upstream node's id — connections match "
+                "by string, not by graph topology."
             ),
-            "examples": ["raw_url_rows", "fetched_text", "scored_rows"],
         },
         "on_success": {
             "type": ["string", "null"],
             "description": (
-                "Output connection. Required for transform/aggregation/row_union. Null for gates "
-                "(routing is via condition/routes). A row_union MUST publish to a downstream "
-                "processing connection, never directly to a sink. A coalesce normally publishes "
-                "under its own node id; its optional on_success may name only a sink. For ordinary "
-                "nodes this connection-name string is consumed by some downstream input/sink_name. "
-                "The runtime matches strings, not topology."
+                "Output connection, consumed by a downstream input/sink_name (matched by string). "
+                "Required for transform/aggregation/row_union; null for gates (they route via "
+                "condition/routes). A row_union MUST publish to a processing connection, never "
+                "directly to a sink. A coalesce normally publishes under its own node id; its "
+                "optional on_success may name only a sink."
             ),
-            "examples": ["fetched_text", "scored_rows", "lines_out"],
         },
         "on_error": {
             "type": ["string", "null"],
             "minLength": 1,
             "description": (
-                "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared sink name. "
-                "For a gate this handles row expression-evaluation errors; omit it to preserve fail-fast behavior. "
-                "Gate on_error is authored here, never as an edge."
+                "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink name. "
+                "For a gate it covers row expression-evaluation errors and is authored here, never as an "
+                "edge; omit it to preserve fail-fast behavior."
             ),
         },
         "options": {"type": "object", "description": "Plugin-specific config (transform/aggregation only)."},
@@ -226,9 +222,8 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         "routes": {
             "type": ["object", "null"],
             "description": (
-                "Route mapping {true: sink_or_connection_or_discard, false: sink_or_connection_or_discard} "
-                "(gate only, mutually exclusive with fork_to). Use 'discard' to drop that route with "
-                "an audited gate_discarded terminal outcome."
+                "Gate route mapping {true: ..., false: ...}; each value is a sink, a connection, or "
+                "'discard' for an audited gate_discarded terminal drop. Mutually exclusive with fork_to."
             ),
         },
         "fork_to": {
@@ -241,10 +236,9 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "additionalProperties": {"type": "string"},
             "description": (
-                "Branch inputs for coalesce or row_union. Use list form when branch identity and "
-                "input connection are the same, or object form {branch_name: input_connection} "
-                "when a branch flows through transforms. A row_union consumes EVERY branches "
-                "value as a real input and releases the original rows without merging fields."
+                "Branch inputs for coalesce or row_union — list form, or {branch_name: input_connection} "
+                "when a branch flows through transforms. A row_union consumes EVERY branches value as a "
+                "real input and releases the original rows without merging fields."
             ),
         },
         "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
@@ -277,14 +271,12 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "expected_output_count": {
             "type": ["integer", "null"],
-            "description": "Expected number of output rows from aggregation (aggregation only). Optional; omit when output count depends on group_by distinct values.",
+            "description": "Expected aggregation output row count; omit when output count depends on group_by distinct values.",
         },
         "timeout_seconds": {
             "type": ["number", "null"],
             "exclusiveMinimum": 0,
-            "description": (
-                "Optional finite positive structural-barrier timeout in seconds (coalesce/row_union only). Omit for every other node type."
-            ),
+            "description": "A finite positive structural-barrier timeout in seconds (coalesce/row_union only).",
         },
     },
     "required": ["id", "node_type", "input"],

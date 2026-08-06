@@ -279,12 +279,11 @@ def get_tool_definitions() -> list[dict[str, Any]]:
     invalidates the cache for every follow-up turn.
 
     The skill at ``src/elspeth/web/composer/skills/pipeline_composer.md``
-    enumerates the same tool set in its Foundation-knowledge section
-    (under "## CRITICAL: Tool Schema Availability"). Any skill ↔ runtime
-    drift is caught by the per-tool prose tests in ``test_skill_drift.py``;
-    the older inventory-parser drift gate (which existed because
-    ``get_tool_definitions()`` was hand-maintained) was retired when
-    declarations became the source of truth.
+    enumerates the same tool set under "## Tool Inventory", in an autogen
+    block maintained by ``scripts/cicd/generate_skill_inventory.py``.
+    Skill ↔ runtime drift is caught by running that script with
+    ``--check``, which regenerates the block from the same declaration
+    registry (plus the two inline carve-outs) and fails on any difference.
     """
     # Every entry on every call is freshly ``deep_thaw``ed from the deeply
     # immutable module-level registry. This guarantees mutually-isolated

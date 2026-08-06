@@ -1468,26 +1468,18 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
             "source": {
                 "type": ["object", "null"],
                 "description": (
-                    "Source configuration: {plugin, on_success, options?, on_validation_failure?, blob_id?, inline_blob?}. "
-                    "Use blob_id to bind an already uploaded session blob, or inline_blob to "
-                    "materialize user-provided literal data while atomically setting the full pipeline."
+                    "Source configuration. Use blob_id to bind an already uploaded session blob, or "
+                    "inline_blob to materialize user-provided literal data atomically with the pipeline."
                 ),
                 "properties": {
                     "plugin": {"type": "string"},
                     "blob_id": {
                         "type": ["string", "null"],
-                        "description": (
-                            "Existing ready session blob ID to bind as this source. "
-                            "The tool resolves path/blob_ref authoritatively exactly like set_source_from_blob."
-                        ),
+                        "description": "Existing ready session blob ID to bind as this source (resolved exactly like set_source_from_blob).",
                     },
                     "options": {
                         "type": "object",
-                        "description": (
-                            "Plugin-specific source config. Required by most file/data sources even though "
-                            "the schema leaves it optional so the handler can return plugin-specific repair "
-                            "feedback instead of a generic missing-argument error."
-                        ),
+                        "description": "Plugin-specific source config. Required by most file/data sources.",
                     },
                     "on_success": {
                         "type": "string",
@@ -1496,7 +1488,6 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "consumer (node 'input' or output 'sink_name') MUST equal this. "
                             "Connections match by string, not by node id."
                         ),
-                        "examples": ["raw_url_rows", "csv_rows", "fetched_text"],
                     },
                     "on_validation_failure": {
                         "type": ["string", "null"],
@@ -1504,10 +1495,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "inline_blob": {
                         "type": ["object", "null"],
-                        "description": (
-                            "Optional inline source content to create as a session blob before binding the source. "
-                            "Fields mirror create_blob: filename, mime_type, content, and optional description."
-                        ),
+                        "description": "Inline source content to create as a session blob before binding. Fields mirror create_blob.",
                         "properties": {
                             "filename": {"type": "string"},
                             "mime_type": {
@@ -1525,8 +1513,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
             "sources": {
                 "type": ["object", "null"],
                 "description": (
-                    "Named source roots keyed by stable source name. Use this instead of source for multi-source pipelines. "
-                    "Each value has the same shape as source, but blob_id and inline_blob are only supported on the legacy source field in v1."
+                    "Named source roots keyed by stable source name; use instead of source for multi-source "
+                    "pipelines. Values share source's shape minus blob_id/inline_blob."
                 ),
                 "additionalProperties": {
                     "type": "object",
@@ -1553,34 +1541,27 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "input": {
                             "type": "string",
                             "description": (
-                                "Connection-name string this node CONSUMES. MUST equal some "
-                                "upstream's on_success/routes value/on_error. NOT the upstream "
-                                "node's id. If source.on_success='raw_url_rows', this node sets "
-                                "input='raw_url_rows'."
+                                "Connection-name string this node CONSUMES: must equal some "
+                                "upstream's on_success/routes value/on_error, NOT the upstream node's id."
                             ),
-                            "examples": ["raw_url_rows", "fetched_text", "scored_rows"],
                         },
                         "on_success": {
                             "type": ["string", "null"],
                             "description": (
-                                "Connection-name string this node PUBLISHES (transform/aggregation). "
-                                "Some downstream input/sink_name MUST equal this. Omit for gates "
-                                "(routing is via condition+routes). COALESCE EXCEPTION: a coalesce "
-                                "publishes its merged rows under its own node id — a downstream "
-                                "consumer sets input='<coalesce id>' — and its on_success, when set, "
-                                "may ONLY name a sink; pointing a coalesce on_success at another "
-                                "node's input is rejected. ROW_UNION EXCEPTION: row_union requires "
-                                "on_success to name a downstream processing connection, never a sink."
+                                "Connection-name string this node PUBLISHES; some downstream "
+                                "input/sink_name MUST equal it. Omit for gates (they route via "
+                                "condition+routes). A coalesce publishes under its own node id, and "
+                                "its on_success, when set, may ONLY name a sink. A row_union's "
+                                "on_success must name a downstream processing connection, never a sink."
                             ),
-                            "examples": ["fetched_text", "scored_rows", "lines_out"],
                         },
                         "on_error": {
                             "type": ["string", "null"],
                             "minLength": 1,
                             "description": (
-                                "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared "
-                                "sink name. For a gate this handles row expression-evaluation errors; omit it to preserve "
-                                "fail-fast behavior. Gate on_error is authored on the node, never as an edge."
+                                "Node-level error policy (transform/aggregation/gate): 'discard' or a declared sink "
+                                "name. For a gate it covers row expression-evaluation errors and is authored on the "
+                                "node, never as an edge; omit it to preserve fail-fast behavior."
                             ),
                         },
                         "options": {"type": "object"},
@@ -1625,15 +1606,12 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "required": ["id", "node_type", "input"],
                 },
                 "description": (
-                    "Array of node specs: [{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, "
-                    "routes?, fork_to?, branches?, policy?, merge?, trigger?, output_mode?, expected_output_count?, "
-                    "timeout_seconds?}]. "
-                    "A queue node is a structural fan-in point: node_type='queue', id == input to the shared connection "
-                    "name, plugin and every routing field omitted, options accepts only an optional description. "
-                    "Multiple producers may publish that connection name precisely because the queue is declared. "
-                    "A row_union is plugin-free require_all N-to-N fork reconvergence: declare at least two ordered "
-                    "branches, set input to the first branch connection, publish on_success to downstream processing "
-                    "(not a sink), omit options/routing/policy/merge fields, and optionally set timeout_seconds."
+                    "Node specs. A queue node is a structural fan-in point: node_type='queue', id == input == the "
+                    "shared connection name, plugin and every routing field omitted, options at most an optional "
+                    "description; multiple producers may publish that name precisely because the queue is declared. "
+                    "A row_union is plugin-free require_all fork reconvergence: at least two ordered branches, "
+                    "input set to the first branch connection, on_success published to downstream processing "
+                    "(not a sink), no options/routing/policy/merge fields, optional timeout_seconds."
                 ),
             },
             "edges": {
@@ -1653,9 +1631,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     "required": ["id", "from_node", "to_node", "edge_type"],
                 },
                 "description": (
-                    "Array of edge specs: [{id, from_node, to_node, edge_type}]. edge_type='on_error' is supported for "
-                    "transform/aggregation sink wiring only; configure a gate's evaluation-error policy with the node's "
-                    "on_error field."
+                    "Edge specs. edge_type='on_error' is supported for transform/aggregation sink wiring only; "
+                    "a gate's evaluation-error policy is the node's on_error field."
                 ),
             },
             "outputs": {
@@ -1666,20 +1643,15 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         "sink_name": {
                             "type": "string",
                             "description": (
-                                "Sink name. BOTH the sink's identifier AND the connection-name "
-                                "the sink consumes — it MUST equal some upstream's on_success "
-                                "value. Pick a descriptive name; it does not need to match an "
-                                "upstream node's id."
+                                "Sink name: BOTH the sink's identifier AND the connection-name the sink "
+                                "consumes — it MUST equal some upstream's on_success value; it need not "
+                                "match any node id."
                             ),
-                            "examples": ["lines_out", "scored_results", "errors_quarantine"],
                         },
                         "plugin": {"type": "string"},
                         "options": {
                             "type": "object",
-                            "description": (
-                                f"Plugin-specific sink config. For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web "
-                                "pipelines, include path, schema, and explicit collision_policy."
-                            ),
+                            "description": "Plugin-specific sink config.",
                         },
                         "on_write_failure": {"type": ["string", "null"]},
                     },
@@ -1699,9 +1671,9 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     ],
                 },
                 "description": (
-                    "Array of output specs: [{sink_name, plugin, options, on_write_failure?}]. "
-                    f"For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web pipelines, options must include "
-                    "path, schema, explicit mode ('write' or 'append'), and explicit collision_policy."
+                    f"Output specs. For {FILE_SINK_PLUGIN_SLASH_TEXT} file sinks in runnable web pipelines, "
+                    "options must include path, schema, explicit mode ('write' or 'append'), and explicit "
+                    "collision_policy."
                 ),
             },
             "metadata": {

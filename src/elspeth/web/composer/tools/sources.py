@@ -196,12 +196,9 @@ _SET_SOURCE_DECLARATION = ToolDeclaration(
                 "type": "string",
                 "description": (
                     "Connection-name string this source PUBLISHES. Some downstream consumer "
-                    "(transform 'input' or output 'sink_name') MUST equal this value for wiring "
-                    "to resolve. The runtime matches strings, not graph topology — pick any "
-                    "name unique within the pipeline; it does not need to be the downstream "
-                    "node's id."
+                    "(transform 'input' or output 'sink_name') MUST equal this value — the "
+                    "runtime matches strings, not graph topology."
                 ),
-                "examples": ["raw_url_rows", "csv_rows", "fetched_text"],
             },
             "options": {"type": "object", "description": "Plugin-specific config."},
             "on_validation_failure": {
