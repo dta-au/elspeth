@@ -114,6 +114,58 @@ _SAFE_CONSTANTS: frozenset[str] = frozenset({"True", "False", "None"})
 _ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
 
 
+# Expression node types the grammar handles, split by disposition.  Adding a
+# new visit_* method to a visitor is NOT sufficient to admit a type — it must
+# also appear here.  This prevents brute-force bypass where defining a
+# handler silently whitelists a new AST construct.
+#
+# Allowed constructs: the validator recurses into them via generic_visit and
+# _ExpressionEvaluator has a visit_* arm for every one of them (both enforced
+# at import time by _assert_visitor_coupling below).
+_ALLOWED_EXPR_TYPES: frozenset[type] = frozenset(
+    {
+        ast.Name,
+        ast.Subscript,
+        ast.Attribute,
+        ast.Call,
+        ast.Compare,
+        ast.BoolOp,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Constant,
+        ast.List,
+        ast.Dict,
+        ast.Tuple,
+        ast.Set,
+        ast.IfExp,
+    }
+)
+
+# Explicitly forbidden constructs: the validator's visit_* handler for each
+# appends an error.  Slice belongs here — visit_Slice rejects slice syntax —
+# even though subscript access itself is allowed.
+_FORBIDDEN_EXPR_TYPES: frozenset[type] = frozenset(
+    {
+        ast.Slice,
+        ast.Lambda,
+        ast.ListComp,
+        ast.DictComp,
+        ast.SetComp,
+        ast.GeneratorExp,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.NamedExpr,
+        ast.JoinedStr,
+        ast.FormattedValue,
+        ast.Starred,
+    }
+)
+
+# The validator's gate: every expression node type it recognises at all.
+_HANDLED_EXPR_TYPES: frozenset[type] = _ALLOWED_EXPR_TYPES | _FORBIDDEN_EXPR_TYPES
+
+
 class _ExpressionValidator(ast.NodeVisitor):
     """AST visitor that validates expressions for security.
 
@@ -368,44 +420,6 @@ class _ExpressionValidator(ast.NodeVisitor):
         """Starred expressions (*x) are forbidden."""
         self.errors.append("Starred expressions (*) are forbidden")
 
-    # Explicit allowset of handled expression node types.  Adding a new
-    # visit_* method is NOT sufficient — the type must also appear here.
-    # This prevents brute-force bypass where defining a handler silently
-    # whitelists a new AST construct.
-    _HANDLED_EXPR_TYPES: frozenset[type] = frozenset(
-        {
-            # Allowed constructs (handlers recurse via generic_visit)
-            ast.Name,
-            ast.Subscript,
-            ast.Slice,
-            ast.Attribute,
-            ast.Call,
-            ast.Compare,
-            ast.BoolOp,
-            ast.BinOp,
-            ast.UnaryOp,
-            ast.Constant,
-            ast.List,
-            ast.Dict,
-            ast.Tuple,
-            ast.Set,
-            ast.IfExp,
-            # Explicitly forbidden constructs (handlers append errors)
-            ast.Lambda,
-            ast.ListComp,
-            ast.DictComp,
-            ast.SetComp,
-            ast.GeneratorExp,
-            ast.Await,
-            ast.Yield,
-            ast.YieldFrom,
-            ast.NamedExpr,
-            ast.JoinedStr,
-            ast.FormattedValue,
-            ast.Starred,
-        }
-    )
-
     def visit(self, node: ast.AST) -> None:
         """Dispatch with fail-closed default for unhandled expression nodes.
 
@@ -420,34 +434,37 @@ class _ExpressionValidator(ast.NodeVisitor):
         through because they are structural metadata, not executable
         constructs.
         """
-        if isinstance(node, ast.expr) and type(node) not in self._HANDLED_EXPR_TYPES:
+        if isinstance(node, ast.expr) and type(node) not in _HANDLED_EXPR_TYPES:
             self.errors.append(f"Unsupported expression construct: {type(node).__name__}")
             return
         super().visit(node)
 
 
 # ── Module-level coupling enforcement ─────────────────────────────────
-# Every type in _HANDLED_EXPR_TYPES must have a visit_* method, and every
-# visit_* method must have a corresponding type.  Without this check,
-# adding a type without a handler silently falls through to generic_visit,
-# bypassing security validation.
-_handler_type_names = {t.__name__ for t in _ExpressionValidator._HANDLED_EXPR_TYPES}
-_visitor_method_names = {
-    name.removeprefix("visit_") for name in vars(_ExpressionValidator) if name.startswith("visit_") and name != "visit"
-}
+# Every expected type must have a visit_* method, and every visit_* method
+# must have a corresponding type entry.  Without this check, adding a type
+# without a handler silently falls through to generic_visit — bypassing
+# security validation in the validator, and (before _ExpressionEvaluator
+# grew its fail-closed visit()) silently evaluating to None.
+def _assert_visitor_coupling(visitor_cls: type, expected_type_names: set[str], *, label: str) -> None:
+    """Raise TypeError unless visitor_cls's visit_* arms match expected_type_names exactly."""
+    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_") and name != "visit"}
+    missing_handlers = expected_type_names - visitor_method_names
+    orphan_visitors = visitor_method_names - expected_type_names
+    if missing_handlers or orphan_visitors:
+        parts: list[str] = []
+        if missing_handlers:
+            parts.append(f"types without visit_* handler: {sorted(missing_handlers)}")
+        if orphan_visitors:
+            parts.append(f"visit_* handlers without type entry: {sorted(orphan_visitors)}")
+        raise TypeError(f"{label} handler/type coupling violation: {'; '.join(parts)}")
 
-_missing_handlers = _handler_type_names - _visitor_method_names
-_orphan_visitors = _visitor_method_names - _handler_type_names
 
-if _missing_handlers or _orphan_visitors:
-    _parts: list[str] = []
-    if _missing_handlers:
-        _parts.append(f"types without visit_* handler: {sorted(_missing_handlers)}")
-    if _orphan_visitors:
-        _parts.append(f"visit_* handlers without type entry: {sorted(_orphan_visitors)}")
-    raise TypeError(f"_ExpressionValidator handler/type coupling violation: {'; '.join(_parts)}")
-
-del _handler_type_names, _visitor_method_names, _missing_handlers, _orphan_visitors
+_assert_visitor_coupling(
+    _ExpressionValidator,
+    {t.__name__ for t in _HANDLED_EXPR_TYPES},
+    label="_ExpressionValidator",
+)
 
 
 class _ExpressionEvaluator(ast.NodeVisitor):
@@ -654,6 +671,31 @@ class _ExpressionEvaluator(ast.NodeVisitor):
         if self.visit(node.test):
             return self.visit(node.body)
         return self.visit(node.orelse)
+
+    def visit(self, node: ast.AST) -> Any:
+        """Dispatch with a fail-closed guard for uncovered node types.
+
+        Deliberately stricter than the validator's guard: the validator
+        generic-visits structural children (ast.Load, operator nodes), so it
+        scopes its check to ast.expr.  The evaluator never visits structural
+        children — each arm consumes them as attributes (node.ops, node.op,
+        contexts) — so ANY node reaching visit() without an arm is a
+        framework bug.  Raising here replaces generic_visit's silent None
+        return, which would let a gate route on the falsy branch.
+        ast.Expression is admitted explicitly: the root wrapper is not an
+        ast.expr subclass, so it can never appear in _ALLOWED_EXPR_TYPES.
+        """
+        node_type = type(node)
+        if node_type is not ast.Expression and node_type not in _ALLOWED_EXPR_TYPES:
+            raise ExpressionSecurityError(f"Evaluator has no handler for {node_type.__name__} nodes")
+        return super().visit(node)
+
+
+_assert_visitor_coupling(
+    _ExpressionEvaluator,
+    {t.__name__ for t in _ALLOWED_EXPR_TYPES} | {"Expression"},
+    label="_ExpressionEvaluator",
+)
 
 
 @dataclass(frozen=True)
