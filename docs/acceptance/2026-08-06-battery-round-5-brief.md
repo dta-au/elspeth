@@ -353,6 +353,15 @@ honest datum is worth more than the ticket's current zero.
 
 Expect it to be worse. That is the finding, not a failure of the round.
 
+*Corrected 2026-08-06: the premise is stale — `b5047ef69` ("pin the composer
+reasoning effort the module never shipped", the fix for `elspeth-52af290183`
+itself) is an ancestor of the installed package, so a stock install renders
+**240s + `medium`**, and the "240 + high" combination can no longer arise
+without a deliberate override. Arm C therefore exercises the actual stock
+render (240 + medium — one TD change: drop the 270 battery override), and
+the ticket's datum is: the named worst combination was eliminated by
+construction, and here is how the real default behaves.*
+
 ### Arm D — guided rider (optional, gated)
 
 `scripts/acceptance_battery.py guided-rider <attempts>` already exists and
@@ -397,6 +406,17 @@ compose.
 | `elspeth-43f52d69a4` — accounting contradiction | `routing.discarded` and `discard_summary.total` **agree**, and a discarded row's reason is retrievable from a named surface | Reproduce a zero-succeeded-token run and read the reason end to end |
 | `elspeth-878dedd7f5` — scan gate | Agent amd64 child scans **COMPLETE with 0 findings** | n/a — confirmed at push time |
 | `elspeth-a9967c55ff` — teardown TD sweep | Runbook fix only; no live evidence this round | n/a |
+
+*Corrected 2026-08-06 (Level-1 pass): the `elspeth-43f52d69a4` Level-1
+criterion named the wrong field. `routing.discarded` is TOKEN-units and
+correctly stays 0 for source-rejected rows (no-false-audit-records precedent,
+`7df62193b`). The landed invariant is `source.rows_rejected ==
+discard_summary.validation_errors`, and `DiscardSummary.total` is
+schema-enforced as the sum of its parts (`schemas.py:753`), so in the g01
+shape `rows_rejected == validation_errors == total`. Level 1 verified PASS on
+that reconciliation, on all three response carriers, with the reason
+retrievable from `/diagnostics` discards. Level 2 should assert the
+`rows_rejected` chain, not `routing.discarded`.*
 
 **Driver fix required first:** round 4's driver equated HTTP 200 with "pipeline
 authored" and reported a false `state_exists` failure on g05's honest decline.
