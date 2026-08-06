@@ -194,9 +194,15 @@ class Battery:
         reconciled against the server's authoritative outcome rather than
         counted as a failure.
         """
+        if self.ensure_account() != 0:
+            print("GUIDED RIDER: could not obtain a battery account")
+            return 2
         results: list[dict[str, Any]] = []
         for attempt in range(1, attempts + 1):
-            _, session = self.api("POST", "/api/sessions", json={"title": f"battery guided rider {attempt}"})
+            status, session = self.api("POST", "/api/sessions", json={"title": f"battery guided rider {attempt}"})
+            if status not in (200, 201):
+                print(f"GUIDED RIDER: session create failed on attempt {attempt}: {status} {str(session)[:200]}")
+                return 2
             session_id = session["id"]
             operation_id = str(uuid.uuid4())
             outcome: dict[str, Any] = {"attempt": attempt, "session": session_id, "operation": operation_id}
