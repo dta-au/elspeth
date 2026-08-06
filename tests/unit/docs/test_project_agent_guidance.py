@@ -9,10 +9,6 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SETTINGS_PATH = REPO_ROOT / ".claude" / "settings.json"
-WARDLINE_SKILLS = (
-    REPO_ROOT / ".agents" / "skills" / "wardline-gate" / "SKILL.md",
-    REPO_ROOT / ".claude" / "skills" / "wardline-gate" / "SKILL.md",
-)
 JUDGE_SKILLS = (
     REPO_ROOT / ".agents" / "skills" / "judge-signature-workflow" / "SKILL.md",
     REPO_ROOT / ".claude" / "skills" / "judge-signature-workflow" / "SKILL.md",
@@ -72,11 +68,22 @@ def test_hook_timeouts_are_bounded_seconds() -> None:
     assert all(isinstance(timeout, int) and 0 < timeout <= 30 for timeout in timeouts)
 
 
-def test_wardline_skill_copies_use_the_project_gate() -> None:
-    for path in WARDLINE_SKILLS:
-        text = path.read_text(encoding="utf-8")
-        assert ".venv/bin/python scripts/wardline_gate.py" in text
-        assert "wardline scan . --fail-on ERROR" not in text
+def test_agents_md_documents_the_granted_non_inert_gate() -> None:
+    """AGENTS.md must spell the gate with BOTH the pack grants and the inert gate.
+
+    Asserted against AGENTS.md rather than the wardline-gate skill copies: those
+    are written and overwritten by ``wardline install`` (they carry a
+    ``last-writer`` marker), so pinning project specifics there fails the moment
+    the installer runs. The ELSPETH section of AGENTS.md is ours to own.
+
+    Both halves are load-bearing. Without the grants the scan exits 2 — Wardline
+    trusts a pack only when the caller grants it. Without ``--fail-on-inert`` a
+    scan that recognised zero boundaries exits 0, indistinguishable from clean.
+    """
+    text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    assert "--trust-pack scripts.wardline_pack" in text
+    assert "--allow-custom-packs" in text
+    assert "--fail-on-inert" in text
 
 
 def test_judge_skill_copies_use_codex_readonly_signing() -> None:

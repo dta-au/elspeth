@@ -253,9 +253,13 @@ repos:
 # to it and the commit was rejected ("files were modified by this hook", no
 # exit-code line). It also violated this file's header contract (whole-repo
 # gates belong to CI, triggered locally only by their own policy metadata)
-# and was inert at removal time. The agent-level gate is now the canonical
-# project command `.venv/bin/python scripts/wardline_gate.py`; it loads the
-# declared ELSPETH vocabulary pack with explicit trust grants and rejects an
-# inert/zero-boundary result. Reinstate enforcement in CI (not here) only once
-# Wardline is installable from the project's dependency graph and the active
-# finding corpus is resolved without baselines or waivers.
+# and was inert at removal time. The agent-level gate is now a single documented
+# command (see "ELSPETH's Wardline invocation" in AGENTS.md): `wardline scan .`
+# with `--fail-on ERROR --fail-on-inert`, the declared vocabulary pack's trust
+# grants, and `--local-only`. It superseded the `scripts/wardline_gate.py`
+# wrapper once Wardline shipped `--fail-on-inert` upstream (2026-08-06); the
+# wrapper existed only to assert non-inertness, which the flag now does.
+# Re-run the installer as `wardline install --no-pre-commit` so it does not
+# re-add this hook. Reinstate enforcement in CI (not here) only once Wardline is
+# installable from the project's dependency graph and the active finding corpus
+# is resolved without baselines or waivers.
