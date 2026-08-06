@@ -2353,6 +2353,35 @@ def test_scenario_allowlist_authorizes_the_document_sink_alongside_the_text_sink
     assert {"sink:document", "sink:text"} <= _quoted_plugin_ids(core_match.group("body"))
 
 
+def test_scenario_allowlist_authorizes_the_remedies_the_sinks_name() -> None:
+    """A remedy the surface does not authorize is a remedy nobody can take.
+
+    ``text`` tells an author to route multiline values through ``line_explode``
+    and ``document`` tells them to combine rows with ``report_assemble``. Both
+    sinks are always authorized, so both remedies must be too — otherwise the
+    guidance names a plugin the Composer cannot see, which is the dead end that
+    produced elspeth-afdf55a17c: a prohibition with no reachable alternative.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    remedies = {"transform:line_explode", "transform:report_assemble"}
+
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\n  \]",
+        locals_text,
+        re.DOTALL,
+    )
+    assert allowlist_match is not None
+    assert remedies <= _quoted_plugin_ids(allowlist_match.group("body"))
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert remedies <= _quoted_plugin_ids(core_match.group("body"))
+
+
 def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
     """variables.tf restates the web core because HCL validation cannot read a local.
 

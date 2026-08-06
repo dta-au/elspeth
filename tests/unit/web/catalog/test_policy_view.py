@@ -84,7 +84,13 @@ def view() -> PolicyCatalogView:
 def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
     assert {item.name for item in view.list_sources()} == {"csv", "json", "llm", "text"}
     assert {item.name for item in view.list_sinks()} == {"csv", "document", "json", "text"}
-    assert {item.name for item in view.list_transforms()} == {"field_mapper", "llm", "web_scrape"}
+    assert {item.name for item in view.list_transforms()} == {
+        "field_mapper",
+        "line_explode",
+        "llm",
+        "report_assemble",
+        "web_scrape",
+    }
 
 
 def test_public_llm_schema_contains_only_usable_alias(view: PolicyCatalogView) -> None:

@@ -28,7 +28,11 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
         PluginId("sink", "json"),
         PluginId("sink", "text"),
         PluginId("transform", "field_mapper"),
+        # The remedies text and document name in their own guidance. A remedy
+        # the surface does not authorize is one the Composer cannot take.
+        PluginId("transform", "line_explode"),
         PluginId("transform", "llm"),
+        PluginId("transform", "report_assemble"),
         PluginId("transform", "web_scrape"),
     }
 )
