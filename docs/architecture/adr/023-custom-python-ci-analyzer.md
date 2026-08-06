@@ -18,7 +18,7 @@ ELSPETH's CI originally enforced a growing set of project-specific invariants th
 | **Composer** | `composer.catch_order`, `composer.exception_channel` | Except-handler ordering, composer exception-routing invariant |
 | **Manifest** | `manifest.contract_manifest`, `manifest.symbol_inventory`, `manifest.test_to_source_mapping` | Recompute a manifest from source, compare to checked-in declaration; symbol-inventory and test-to-source-mapping invariants |
 
-The enforcement scripts have grown organically. A structural review on 2026-05-19 (filigree epic `elspeth-8843308cfe`) identified that the 14 scripts should consolidate into a single `elspeth-lints` package with a rule registry, a shared CLI, SARIF output, and a findings-parity contract. **That consolidation has since landed** — `elspeth-lints/` ships the registry, CLI, rule tree, MCP surface, and SARIF output. The last script outside the package (`scripts/cicd/enforce_adapter_budget.py`) was ported on 2026-08-06 as `contract_invariants.adapter_method_budget` and deleted (`elspeth-3575a7f15d`); no `enforce_*.py` scripts remain. The original epic and its children live only in the pre-Jun-30 archived store (`.weft/filigree/filigree.db`).
+The enforcement scripts have grown organically. A structural review on 2026-05-19 (filigree epic `elspeth-8843308cfe`) identified that the 14 scripts should consolidate into a single `elspeth-lints` package with a rule registry, a shared CLI, SARIF output, and a findings-parity contract. **That consolidation has since landed** — `elspeth-lints/` ships the registry, CLI, rule tree, MCP surface, and SARIF output. The last script outside the package — the adapter-method-budget check — was ported on 2026-08-06 as `contract_invariants.adapter_method_budget` and deleted (`elspeth-3575a7f15d`); no `enforce_*.py` scripts remain. The original epic and its children live only in the pre-Jun-30 archived store (`.weft/filigree/filigree.db`).
 
 This ADR records the prior, more fundamental question: **should ELSPETH be writing this enforcement in custom Python at all, or porting the rules to an off-the-shelf static analyzer?**
 
@@ -114,7 +114,7 @@ None at ADR-acceptance time. The consolidation work has since landed in full; th
 
 ## References
 
-* **Consolidation residual (closed 2026-08-06):** filigree `elspeth-3575a7f15d` — the last CI enforcement script, `scripts/cicd/enforce_adapter_budget.py`, ported into elspeth-lints as `contract_invariants.adapter_method_budget` and deleted. The original epic `elspeth-8843308cfe` and its children were not carried across the 2026-06-30 tracker cutover and are readable only in `.weft/filigree/filigree.db`.
+* **Consolidation residual (closed 2026-08-06):** filigree `elspeth-3575a7f15d` — the last CI enforcement script (the adapter-method-budget check) ported into elspeth-lints as `contract_invariants.adapter_method_budget` and deleted. The original epic `elspeth-8843308cfe` and its children were not carried across the 2026-06-30 tracker cutover and are readable only in `.weft/filigree/filigree.db`.
 * **Rule-taxonomy rationale doc** (broader companion to this ADR, scoped to the catalog of rules rather than the toolchain decision): filigree `elspeth-797cac825e` — archived store only.
 * **SARIF upload to GitHub Code Scanning:** filigree `elspeth-b79958739e` — archived store only.
 * **CodeQL workflow:** [.github/workflows/codeql.yaml](../../../.github/workflows/codeql.yaml)
