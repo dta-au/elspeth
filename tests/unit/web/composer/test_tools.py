@@ -9227,6 +9227,64 @@ class TestSetPipeline:
         assert '"mode": "write"' in error
         assert '"collision_policy": "auto_increment"' in error
 
+    def test_every_file_sink_repair_suggestion_actually_validates(self) -> None:
+        """A repair hint that cannot validate is the defect it exists to fix.
+
+        Asserted against the two gates whose rejection PRODUCES this hint —
+        the sink's own config model and the collision-policy validator — rather
+        than against an expected key list, so a NEW single-field sink is covered
+        the day it is registered instead of silently inheriting an invalid
+        suggestion. That is exactly how ``document`` rotted: it shipped
+        requiring ``field``, fell through to the generic branch that omitted it,
+        and its suggestion could not validate. ``mode`` was missing for csv and
+        json on the same branch.
+        """
+        import json as json_module
+
+        from elspeth.contracts.sink import FILE_SINK_REPAIR_EXTENSIONS
+        from elspeth.web.composer.tools._common import (
+            _missing_output_options_repair_error,
+            validate_composer_file_sink_collision_policy,
+        )
+        from elspeth.web.composer.tools.sessions import _prevalidate_sink
+
+        assert "document" in FILE_SINK_REPAIR_EXTENSIONS, "the sink this test was written for must be in scope"
+
+        for plugin_name in sorted(FILE_SINK_REPAIR_EXTENSIONS):
+            message = _missing_output_options_repair_error(
+                sink_name="main",
+                plugin_name=plugin_name,
+                on_write_failure="discard",
+                validation_error=None,
+            )
+            suggested = json_module.loads(message[message.index("{") : message.rindex("}") + 1])
+            options = suggested["options"]
+
+            assert _prevalidate_sink(plugin_name, options) is None, (
+                f"the suggested repair for sink '{plugin_name}' fails its own config model"
+            )
+            assert validate_composer_file_sink_collision_policy(plugin_name, options, require_explicit=True) is None, (
+                f"the suggested repair for sink '{plugin_name}' fails the collision-policy gate"
+            )
+
+    def test_set_pipeline_missing_document_output_options_returns_runnable_repair_hint(self) -> None:
+        """document requires `field` exactly as text does; the hint must carry it."""
+        from elspeth.web.composer.tools._common import _missing_output_options_repair_error
+
+        error = _missing_output_options_repair_error(
+            sink_name="main",
+            plugin_name="document",
+            on_write_failure="discard",
+            validation_error=None,
+        )
+
+        assert '"plugin": "document"' in error
+        assert '"path": "outputs/main.txt"' in error
+        assert '"field": "line_text"' in error
+        assert '"mode": "write"' in error
+        assert '"collision_policy": "auto_increment"' in error
+        assert "Replace line_text with the actual selected string field." in error
+
     def test_set_pipeline_failure_leads_validation_with_rejection_reason(self) -> None:
         """Regression for composer session 58d7ede3 round 6.
 

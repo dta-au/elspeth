@@ -26,7 +26,7 @@ import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Final, TypedDict, cast
+from typing import Any, Final, NotRequired, TypedDict, cast
 
 from pydantic import BaseModel, JsonValue
 from pydantic import ValidationError as PydanticValidationError
@@ -2356,6 +2356,73 @@ _WRITE_COLLISION_POLICIES = frozenset({"fail_if_exists", "auto_increment"})
 _APPEND_COLLISION_POLICIES = frozenset({"append_or_create"})
 
 
+_FIELD_OPTION_PLACEHOLDER = "line_text"
+
+
+def _sink_required_option_keys(plugin_name: str) -> frozenset[str]:
+    """Return the option keys this sink's own config model marks required.
+
+    Read from ``model_json_schema()`` — the accessor ``PluginConfigProtocol``
+    actually declares — rather than from ``model_fields``, which the protocol
+    does not promise. It also returns keys in the OPTION namespace the repair
+    object is written in: ``TextSinkConfig``/``DocumentSinkConfig`` name the
+    attribute ``schema_config`` but the option key is ``schema``, and the JSON
+    Schema carries the latter.
+    """
+    config_model = get_sink_config_model(plugin_name)
+    if config_model is None:
+        return frozenset()
+    required = config_model.model_json_schema().get("required", ())
+    return frozenset(key for key in required if type(key) is str)
+
+
+class _FileSinkRepairOptions(TypedDict):
+    """The options object a file-sink repair hint suggests.
+
+    ``field`` is ``NotRequired`` because it is genuinely conditional: only a
+    single-value sink (``text``, ``document``) requires one, and that is read
+    from the sink's own config model rather than fixed here.
+    """
+
+    path: str
+    schema: dict[str, str]
+    mode: str
+    collision_policy: str
+    field: NotRequired[str]
+
+
+def _file_sink_repair_options(plugin_name: str, *, path: str) -> _FileSinkRepairOptions:
+    """Build repair options for a file sink that actually pass validation.
+
+    DERIVED, not enumerated. The two gates whose rejection produces this hint
+    are ``_prevalidate_sink`` (the sink's own config model) and
+    ``validate_composer_file_sink_collision_policy``; a suggestion that cannot
+    clear both is the authoring-surface defect this hint exists to repair, so
+    it is built from what those gates actually demand:
+
+    * ``field`` comes from the config model's own required set, so ``text`` and
+      ``document`` both get it and the NEXT single-field sink inherits it for
+      free. Naming the sinks instead is what silently rotted: ``document``
+      shipped requiring ``field``, fell through to the generic branch that
+      omitted it, and the suggested repair could not validate.
+    * ``mode`` is emitted even though every file-sink config model defaults it,
+      because ``validate_composer_file_sink_collision_policy`` requires it
+      EXPLICITLY for every ``FILE_SINK_PLUGINS`` member — a deliberate
+      operator decision (truncate vs. append), not an inferable one. The
+      generic branch omitted it, so the csv and json suggestions were invalid
+      on that gate too.
+    """
+    options: _FileSinkRepairOptions = {
+        "path": path,
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "auto_increment",
+    }
+    if "field" in _sink_required_option_keys(plugin_name):
+        options["field"] = _FIELD_OPTION_PLACEHOLDER
+    return options
+
+
 def _missing_output_options_repair_error(
     *,
     sink_name: str,
@@ -2364,45 +2431,26 @@ def _missing_output_options_repair_error(
     validation_error: str | None,
 ) -> str:
     """Return an exact output-object repair hint for omitted sink options."""
-    if plugin_name == "text":
-        path_fragment = _repair_identifier_fragment(sink_name, fallback="output")
-        repair_output = {
-            "sink_name": sink_name,
-            "plugin": plugin_name,
-            "options": {
-                "path": f"outputs/{path_fragment}.txt",
-                "schema": {"mode": "observed"},
-                "field": "line_text",
-                "mode": "write",
-                "collision_policy": "auto_increment",
-            },
-            "on_write_failure": on_write_failure,
-        }
-        detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
-        return (
-            f"Output '{sink_name}' is missing options. For the text file sink, include path, schema, field, mode, "
-            f"and collision_policy. Use this runnable output object and replace line_text with the actual selected "
-            f"string field: {json.dumps(repair_output)}.{detail}"
-        )
-
     if plugin_name in FILE_SINK_REPAIR_EXTENSIONS:
         path_fragment = _repair_identifier_fragment(sink_name, fallback="output")
         extension = FILE_SINK_REPAIR_EXTENSIONS[plugin_name]
+        options = _file_sink_repair_options(
+            plugin_name,
+            path=f"outputs/{path_fragment}.{extension}",
+        )
         repair_output = {
             "sink_name": sink_name,
             "plugin": plugin_name,
-            "options": {
-                "path": f"outputs/{path_fragment}.{extension}",
-                "schema": {"mode": "observed"},
-                "collision_policy": "auto_increment",
-            },
+            "options": options,
             "on_write_failure": on_write_failure,
         }
         detail = f" Empty options were rejected: {validation_error}" if validation_error is not None else ""
+        option_list = ", ".join(options)
+        field_note = f" Replace {_FIELD_OPTION_PLACEHOLDER} with the actual selected string field." if "field" in options else ""
         return (
             f"Output '{sink_name}' is missing options. For {plugin_name} file sinks, include "
-            f"an options object with path, schema, and collision_policy. Use this output object "
-            f"shape and adjust the path/schema if needed: {json.dumps(repair_output)}.{detail}"
+            f"an options object with {option_list}. Use this runnable output object and adjust "
+            f"the path/schema if needed: {json.dumps(repair_output)}.{field_note}{detail}"
         )
 
     repair_output = {

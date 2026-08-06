@@ -32,7 +32,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
-    from elspeth.contracts.plugin_semantics import InputSemanticRequirements
+    from elspeth.contracts.plugin_semantics import InputSemanticRequirements, OutputSemanticDeclaration
 
 
 DEFAULT_MAX_LINES = 10_000
@@ -198,6 +198,60 @@ def _build_line_explode_input_requirements(
     )
 
 
+def _build_line_explode_output_semantics(
+    *,
+    output_field: str,
+) -> OutputSemanticDeclaration:
+    """Declare what one emitted line provably is.
+
+    ``text_framing=COMPACT`` is a fact this transform mechanically knows, not
+    an estimate. ``_splitlines_bounded`` cuts the source at every ``\\r``,
+    ``\\r\\n`` and every member of ``_LINE_BOUNDARY_CHARS``, and emits only the
+    slices BETWEEN those cuts. So no emitted value can contain a line-boundary
+    character of any kind — strictly stronger than the "no CR or LF" that
+    ``TextSink``'s one-record-per-row invariant actually needs.
+
+    Declaring it is the point. Without this, ``llm -> line_explode -> text``
+    — the ONE correct spelling of "write generated multiline text to a file",
+    and the composition ADR-039 §Consequences claims is SATISFIED — resolved to
+    UNKNOWN, making the RECOMMENDED shape indistinguishable from an undeclared
+    one and leaving ``TextSink``'s requirement satisfied by nothing in the
+    registry.
+
+    ``value_type=STR``: ``process`` rejects a non-``str`` source with TypeError,
+    and a slice of a ``str`` is a ``str``.
+
+    ``content_kind=UNKNOWN`` is an honest ABSTENTION, not an omission.
+    Splitting changes where the line boundaries are, never what the text MEANS,
+    so one line of markdown is still markdown and one line of prose is still
+    prose — this transform cannot know which it forwarded. The input
+    requirement above deliberately leaves ``accepted_content_kinds`` empty for
+    the same reason, so there is nothing to forward even in principle.
+    Claiming PLAIN_TEXT here would manufacture false conflicts against any
+    future consumer constraining that dimension.
+    """
+    from elspeth.contracts.plugin_semantics import (
+        ContentKind,
+        FieldSemanticFacts,
+        OutputSemanticDeclaration,
+        SemanticValueType,
+        TextFraming,
+    )
+
+    return OutputSemanticDeclaration(
+        fields=(
+            FieldSemanticFacts(
+                field_name=output_field,
+                content_kind=ContentKind.UNKNOWN,
+                text_framing=TextFraming.COMPACT,
+                value_type=SemanticValueType.STR,
+                fact_code="line_explode.output_field.compact_line",
+                configured_by=("output_field",),
+            ),
+        ),
+    )
+
+
 def _splitlines_bounded(source_value: str, *, max_lines: int) -> tuple[list[str] | None, int]:
     """Split like str.splitlines(), stopping once the configured cap is exceeded."""
     lines: list[str] = []
@@ -239,7 +293,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a66f96fff9fa421d"
+    source_file_hash: str | None = "sha256:8046aff02b3c3bf8"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -297,6 +351,11 @@ class LineExplode(BaseTransform):
     def input_semantic_requirements(self) -> InputSemanticRequirements:
         return _build_line_explode_input_requirements(
             source_field=self._source_field,
+        )
+
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        return _build_line_explode_output_semantics(
+            output_field=self._output_field,
         )
 
     @classmethod
