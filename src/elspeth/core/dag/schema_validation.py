@@ -300,7 +300,10 @@ def validate_locked_consumer_guaranteed_extras(
     supply a field the producer never guaranteed, so the author was handed three
     fixes that all leave the graph invalid.
 
-    Only edges Phase 2 abandons are swept (``_phase2_bypasses_type_validation``).
+    Only edges Phase 2 abandons are swept (``_phase2_bypasses_type_validation``),
+    and only those whose consumer is not a correlated barrier — hoisting the rule
+    out of ``validate_single_edge`` inherited EVERY guard between that function's
+    entry and the old call site, not just the Phase-2 bypass arms.
     DIVERT edges carry quarantine/error payloads that never conformed to the
     producer schema, so they are skipped here exactly as the Phase 1/2 loop
     skips them.
@@ -309,8 +312,20 @@ def validate_locked_consumer_guaranteed_extras(
     for from_id, to_id, edge_data in graph._graph.edges(data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
+        to_info = graph.get_node_info(to_id)
+        # Correlated barriers are skipped for the same reason validate_single_edge
+        # skips them BEFORE Phase 2: their dedicated validators compare all
+        # incoming branches together, so consumer-style single-edge derivation
+        # does not apply. Skipping is not merely tidy — resolving a producer this
+        # pass would otherwise newly resolve is not inert, because
+        # get_effective_producer_schema itself raises on a gate with mixed
+        # observed/explicit branches. Without this, a multi-input gate feeding a
+        # nested/select coalesce was rejected despite those merge strategies
+        # having no cross-branch schema constraint at all.
+        if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+            continue
         producer_schema = get_effective_producer_schema(graph, from_id, _cache=cache)
-        consumer_schema = graph.get_node_info(to_id).input_schema
+        consumer_schema = to_info.input_schema
         if not _phase2_bypasses_type_validation(producer_schema, consumer_schema):
             continue
         _validate_locked_consumer_guaranteed_extras(
