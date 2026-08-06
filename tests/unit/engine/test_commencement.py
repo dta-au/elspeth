@@ -26,7 +26,6 @@ class TestEvaluateCommencementGates:
         context = {
             "dependency_runs": {},
             "collections": {"test": {"count": 10, "reachable": True}},
-            "env": {"HOME": "/home/user"},
         }
         results = evaluate_commencement_gates(gates, context)
         assert len(results) == 1
@@ -43,7 +42,6 @@ class TestEvaluateCommencementGates:
         context = {
             "dependency_runs": {},
             "collections": {"test": {"count": 0, "reachable": False}},
-            "env": {},
         }
         with pytest.raises(CommencementGateFailedError, match="ready"):
             evaluate_commencement_gates(gates, context)
@@ -58,39 +56,19 @@ class TestEvaluateCommencementGates:
         context: dict[str, dict[str, object]] = {
             "dependency_runs": {},
             "collections": {},
-            "env": {},
         }
         with pytest.raises(CommencementGateFailedError, match="bad"):
             evaluate_commencement_gates(gates, context)
 
-    def test_snapshot_excludes_env_values_but_includes_keys(self) -> None:
-        gates = [
-            CommencementGateConfig(
-                name="ready",
-                condition="collections['test']['count'] > 0",
-            )
-        ]
-        context = {
-            "dependency_runs": {},
-            "collections": {"test": {"count": 5, "reachable": True}},
-            "env": {"SECRET_KEY": "abc123", "API_TOKEN": "xyz789"},
-        }
-        results = evaluate_commencement_gates(gates, context)
-        snapshot = results[0].context_snapshot
-        # Snapshot includes env_keys (sorted key names) but not env values
-        assert set(snapshot.keys()) == {"dependency_runs", "collections", "env_keys"}
-        assert snapshot["env_keys"] == ("API_TOKEN", "SECRET_KEY")
-        # Values must not appear anywhere in the snapshot
-        assert "abc123" not in str(snapshot)
-        assert "xyz789" not in str(snapshot)
-
-    def test_non_bool_result_does_not_echo_env_secret(self) -> None:
-        """elspeth-83261b699c: a gate that returns an env secret string (non-bool) must
-        not embed the raw value in the failure reason/message — the audit snapshot is
-        scrubbed but the reason text bypasses that protection."""
+    def test_non_bool_result_does_not_echo_context_secret(self) -> None:
+        """elspeth-83261b699c invariant, re-expressed post-env-removal: a gate
+        that returns a sensitive context string (non-bool) must not embed the
+        raw value in the failure reason/message — the audit snapshot records
+        structure, but the reason text bypasses that protection. The original
+        vehicle was env['API_KEY']; the invariant survives the namespace."""
         secret = "sk-SUPERSECRET-9f3a"
-        gates = [CommencementGateConfig(name="check", condition="env['API_KEY']")]
-        context = {"dependency_runs": {}, "collections": {}, "env": {"API_KEY": secret}}
+        gates = [CommencementGateConfig(name="check", condition="dependency_runs['index']['run_id']")]
+        context = {"dependency_runs": {"index": {"run_id": secret}}, "collections": {}}
         with pytest.raises(CommencementGateFailedError) as exc_info:
             evaluate_commencement_gates(gates, context)
         err = exc_info.value
@@ -99,19 +77,18 @@ class TestEvaluateCommencementGates:
         # The diagnostic type is still present.
         assert "str" in (err.reason or "")
 
-    def test_expression_exception_does_not_echo_env_secret(self) -> None:
-        """Expression exception reasons must not include raw env-derived values."""
+    def test_expression_exception_does_not_echo_context_secret(self) -> None:
+        """Expression exception reasons must not include raw context-derived values."""
         secret = "sk-SUPERSECRET-9f3a"
         gates = [
             CommencementGateConfig(
                 name="lookup",
-                condition="collections[env['API_KEY']]['count'] > 0",
+                condition="collections[dependency_runs['index']['run_id']]['count'] > 0",
             )
         ]
         context = {
-            "dependency_runs": {},
+            "dependency_runs": {"index": {"run_id": secret}},
             "collections": {"known": {"count": 1}},
-            "env": {"API_KEY": secret},
         }
 
         with pytest.raises(CommencementGateFailedError) as exc_info:
@@ -132,7 +109,6 @@ class TestEvaluateCommencementGates:
         context = {
             "dependency_runs": {},
             "collections": {"test": {"count": 5, "reachable": True}},
-            "env": {},
         }
         results = evaluate_commencement_gates(gates, context)
         assert isinstance(results[0].context_snapshot, MappingProxyType)
@@ -148,7 +124,6 @@ class TestEvaluateCommencementGates:
                 "a": {"count": 5, "reachable": True},
                 "b": {"count": 3, "reachable": True},
             },
-            "env": {},
         }
         results = evaluate_commencement_gates(gates, context)
         assert len(results) == 2
@@ -164,29 +139,23 @@ class TestEvaluateCommencementGates:
                 "a": {"count": 5, "reachable": True},
                 "b": {"count": 0, "reachable": False},
             },
-            "env": {},
         }
         with pytest.raises(CommencementGateFailedError, match="g2"):
             evaluate_commencement_gates(gates, context)
 
-    def test_env_accessible_in_expression(self) -> None:
-        gates = [
+    def test_env_reference_rejected_at_config_time(self) -> None:
+        """``env`` is no longer an allowed name; the config class rejects the
+        condition at construction, before any evaluation can be reached."""
+        from elspeth.core.expression_parser import ExpressionSecurityError
+
+        with pytest.raises(ExpressionSecurityError, match="env"):
             CommencementGateConfig(
                 name="env_check",
                 condition="env['ENVIRONMENT'] == 'production'",
             )
-        ]
-        context = {
-            "dependency_runs": {},
-            "collections": {},
-            "env": {"ENVIRONMENT": "production"},
-        }
-        results = evaluate_commencement_gates(gates, context)
-        assert len(results) == 1
-        assert results[0].result is True
 
     def test_empty_gates_returns_empty(self) -> None:
-        results = evaluate_commencement_gates([], {"dependency_runs": {}, "collections": {}, "env": {}})
+        results = evaluate_commencement_gates([], {"dependency_runs": {}, "collections": {}})
         assert results == []
 
     def test_context_mutation_after_evaluation_does_not_affect_snapshot(self) -> None:
@@ -195,7 +164,6 @@ class TestEvaluateCommencementGates:
         context: dict[str, Any] = {
             "dependency_runs": {"dep1": {"run_id": "r1"}},
             "collections": {"col1": {"count": 5, "reachable": True}},
-            "env": {"KEY": "value"},
         }
         results = evaluate_commencement_gates([gate], context)
 
@@ -218,7 +186,6 @@ class TestCommencementGateCrashThrough:
         return {
             "dependency_runs": {},
             "collections": {},
-            "env": {},
         }
 
     def test_type_error_crashes_through(self) -> None:
@@ -280,19 +247,9 @@ class TestBuildPreflightContext:
         context = build_preflight_context(
             dependency_results={},
             collection_probes={"test": {"count": 5, "reachable": True}},
-            env={"HOME": "/home"},
         )
         assert "dependency_runs" in context
         assert "collections" in context
-        assert "env" in context
-
-    def test_env_defaults_to_empty_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("ELSPETH_SECRET_ORACLE", "sk-hidden")
-        context = build_preflight_context(
-            dependency_results={},
-            collection_probes={},
-        )
-        assert context["env"] == {}
 
 
 class TestCommencementGateTypeEnforcement:
@@ -309,7 +266,6 @@ class TestCommencementGateTypeEnforcement:
         context: dict[str, Any] = {
             "collections": {"data": {"count": 5}},
             "dependency_runs": {},
-            "env": {},
         }
         with pytest.raises(CommencementGateFailedError, match="not bool"):
             evaluate_commencement_gates(gates, context)
@@ -318,14 +274,13 @@ class TestCommencementGateTypeEnforcement:
         """Gate returning a truthy string is a config error."""
         gates = [
             CommencementGateConfig(
-                name="env_check",
-                condition="env.get('HOME')",
+                name="label_check",
+                condition="collections.get('data')",
             ),
         ]
         context: dict[str, Any] = {
-            "collections": {},
+            "collections": {"data": "ready"},
             "dependency_runs": {},
-            "env": {"HOME": "/home/user"},
         }
         with pytest.raises(CommencementGateFailedError, match="not bool"):
             evaluate_commencement_gates(gates, context)
@@ -341,8 +296,68 @@ class TestCommencementGateTypeEnforcement:
         context: dict[str, Any] = {
             "collections": {"data": {"count": 5}},
             "dependency_runs": {},
-            "env": {},
         }
         results = evaluate_commencement_gates(gates, context)
         assert len(results) == 1
         assert results[0].result is True
+
+
+class TestEnvNamespaceRemoved:
+    """The vestigial ``env`` namespace is gone (elspeth-83261b699c cleanup).
+
+    ``env`` was YAML-only, its sole caller never passed it, and it was the
+    surface of "Commencement gate non-bool failure can echo env secret
+    values into audit/error text". Removing the namespace removes that
+    surface entirely.
+    """
+
+    def test_preflight_context_has_exactly_two_namespaces(self) -> None:
+        context = build_preflight_context(
+            dependency_results={},
+            collection_probes={"test": {"count": 5, "reachable": True}},
+        )
+        assert set(context.keys()) == {"dependency_runs", "collections"}
+
+    def test_audit_snapshot_shape_has_no_env_keys(self) -> None:
+        gates = [
+            CommencementGateConfig(
+                name="check",
+                condition="collections['data']['count'] > 0",
+            ),
+        ]
+        context: dict[str, Any] = {
+            "collections": {"data": {"count": 1}},
+            "dependency_runs": {},
+        }
+        results = evaluate_commencement_gates(gates, context)
+        assert set(results[0].context_snapshot.keys()) == {"dependency_runs", "collections"}
+
+
+class TestExpressionSecurityErrorCrashesThrough:
+    """A post-A1 framework bug must not be relabelled as a gate failure.
+
+    The evaluator's fail-closed visit() raises ExpressionSecurityError for a
+    validator-allowed-but-evaluator-uncovered node — a framework bug, not a
+    user's failing gate. The ``except BaseException`` wrapper here previously
+    relabelled it CommencementGateFailedError ("Expression raised ...").
+    """
+
+    def test_expression_security_error_propagates_unwrapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError
+
+        def injected_framework_bug(self: ExpressionParser, context: Any) -> Any:
+            raise ExpressionSecurityError("Evaluator has no handler for FakeExpr nodes")
+
+        monkeypatch.setattr(ExpressionParser, "evaluate", injected_framework_bug)
+        gates = [
+            CommencementGateConfig(
+                name="check",
+                condition="collections['data']['count'] > 0",
+            ),
+        ]
+        context: dict[str, Any] = {
+            "collections": {"data": {"count": 1}},
+            "dependency_runs": {},
+        }
+        with pytest.raises(ExpressionSecurityError, match="no handler"):
+            evaluate_commencement_gates(gates, context)

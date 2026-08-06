@@ -103,11 +103,14 @@ class TestCommencementGateConfig:
             validate_commencement_gate_condition,
         )
 
-        assert COMMENCEMENT_GATE_ALLOWED_NAMES == ("collections", "dependency_runs", "env")
-        validate_commencement_gate_condition("collections['test']['count'] > 0 and env['READY'] == '1'")
+        assert COMMENCEMENT_GATE_ALLOWED_NAMES == ("collections", "dependency_runs")
+        validate_commencement_gate_condition("collections['test']['count'] > 0")
         validate_commencement_gate_condition("dependency_runs['index']['run_id'] == 'run-1'")
         with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'row'"):
             validate_commencement_gate_condition("row['status'] == 'ready'")
+        # env was removed (elspeth-83261b699c surface); it is a forbidden name now.
+        with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'env'"):
+            validate_commencement_gate_condition("collections['test']['count'] > 0 and env['READY'] == '1'")
         with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'row'"):
             CommencementGateConfig(name="bad", condition="row['status'] == 'ready'")
         gate = CommencementGateConfig.model_construct(name="bad", condition="row['status'] == 'ready'")
