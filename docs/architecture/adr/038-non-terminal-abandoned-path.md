@@ -174,7 +174,12 @@ every outcome write locks its token FK row first
 (`lock_token_outcome_dependencies`), so the read-then-insert serializes
 against a concurrent terminal write under READ COMMITTED instead of
 racing into a decided∧abandoned contradiction. SQLite's single-writer
-transaction gives the same guarantee and ignores `FOR UPDATE`.
+transaction gives the same guarantee and ignores `FOR UPDATE` — which
+also means the SQLite test suite cannot exercise this mitigation: the
+PostgreSQL claim currently rests on the FK lock-ordering argument alone,
+and a PG-lane (`ELSPETH_TEST_POSTGRES_URL`) race test is owed alongside
+the multi-replica integration work (`elspeth-4d6c0dd0f5`), the first
+deployment shape where the race becomes reachable.
 
 ### 4. Accounting: `abandoned` tokens and `closure='abandoned'`
 

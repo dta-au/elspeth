@@ -784,6 +784,14 @@ class RunLifecycleRepository:
         # writer either committed before our lock (the NOT EXISTS sees its
         # row) or blocks until we commit. SQLite ignores FOR UPDATE; its
         # single-writer transaction provides the same guarantee.
+        #
+        # VERIFICATION BOUNDARY: on SQLite ``with_for_update()`` compiles to
+        # a plain SELECT, so the SQLite test suite exercises none of this —
+        # the PostgreSQL serialization rests on the outcome INSERT's FK
+        # taking FOR KEY SHARE on the referenced tokens row (schema.py
+        # composite FK), which conflicts with FOR UPDATE here. A PG-lane
+        # race test is owed with the multi-replica integration
+        # (elspeth-4d6c0dd0f5); a green SQLite run is not evidence for it.
         undecided_token_ids = (
             conn.execute(
                 select(tokens_table.c.token_id)
