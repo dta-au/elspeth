@@ -97,7 +97,7 @@ class _EdgeFormatter(Protocol):
         exc: EdgeContractError,
         *,
         state: CompositionState,
-        graph: ExecutionGraph,
+        graph: ExecutionGraph | None,
     ) -> tuple[str, str]: ...
 
 
@@ -353,12 +353,49 @@ def validate_graph_structure(
     *,
     build_graph: _GraphBuilder,
     warning_to_validation_warning: Callable[[GraphValidationWarning], ValidationWarning],
+    edge_patch_target_for_node_id: _EdgePatchTargetResolver,
+    format_edge_contract_failure: _EdgeFormatter,
 ) -> PhaseReport[GraphedRuntime] | PhaseFailure:
-    """Build and structurally validate the exact runtime graph."""
+    """Build and structurally validate the exact runtime graph.
+
+    Edge compatibility is checked inside the graph BUILD, so a type-mismatch
+    edge failure raises here — phase 3's dedicated handler requires a built
+    graph and can never see it. This phase owns the same rich edge-contract
+    diagnostics; the graph does not exist when the build raises, so
+    patch-target resolution degrades to the DAG node id by design.
+    """
     try:
         graph = build_graph(instantiated.loaded.settings, instantiated.bundle)
         graph.validate()
         graph_warnings = tuple(warning_to_validation_warning(warning) for warning in graph.validation_warnings)
+    except EdgeContractError as exc:
+        policy_state = instantiated.loaded.materialized.authored.policy.state
+        consumer_target = edge_patch_target_for_node_id(
+            exc.to_node_id,
+            state=policy_state,
+            graph=None,
+            component_type=exc.component_type,
+        )
+        message, suggestion = format_edge_contract_failure(exc, state=policy_state, graph=None)
+        error = ValidationError(
+            component_id=consumer_target.component_id,
+            component_type=consumer_target.component_type,
+            message=message,
+            suggestion=suggestion,
+            error_code=None,
+        )
+        return PhaseFailure(
+            passed_checks=(),
+            failed_check=_check(RUNTIME_CHECK_GRAPH_STRUCTURE, passed=False, detail=str(exc)),
+            errors=(error,),
+            readiness=_blocked_readiness(
+                code="graph_structure",
+                detail="Graph validation failed.",
+                component_id=error.component_id,
+                component_type=error.component_type,
+            ),
+            semantic_contracts=_semantic_contracts(instantiated.loaded.materialized),
+        )
     except GraphValidationError as exc:
         return PhaseFailure(
             passed_checks=(),

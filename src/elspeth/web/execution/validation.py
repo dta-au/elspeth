@@ -452,6 +452,8 @@ def _validate_pipeline_impl(
             value_source_validated,
             build_graph=dependencies.build_graph,
             warning_to_validation_warning=_graph_warning_to_validation_warning,
+            edge_patch_target_for_node_id=_edge_patch_target_for_node_id,
+            format_edge_contract_failure=_format_edge_contract_failure,
         ),
     )
     routes_validated = _apply_phase(

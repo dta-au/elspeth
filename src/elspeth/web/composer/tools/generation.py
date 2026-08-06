@@ -2061,9 +2061,13 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
                 ),
                 suggested_repair=(
                     "Patch the source schema to declare the aggregated field with an explicit numeric type "
-                    f"(for example {value_field}: float), or insert a type_coerce node upstream of the aggregation. "
-                    "If the field is categorical and you want counts/frequencies, use batch_top_k instead of a "
-                    "numeric aggregation."
+                    f"(for example {value_field}: float), or insert a type_coerce node upstream of the aggregation "
+                    "with a conversions entry targeting the numeric type. A type_coerce (or value_transform) node's "
+                    f"own schema: block declares what ARRIVES at the node — here {value_field} arrives as str — never "
+                    "the transformed result; the coerced type belongs to the node's output contract and is derived "
+                    "automatically from its conversions. Declaring the post-coercion type on the node's own schema is "
+                    "an unsatisfiable input contract and is rejected at the edge. If the field is categorical and you "
+                    "want counts/frequencies, use batch_top_k instead of a numeric aggregation."
                 ),
                 evidence_locator={
                     "source": "blob",

@@ -134,8 +134,8 @@ def _graph(*, warnings: tuple[GraphValidationWarning, ...] = ()) -> MagicMock:
 def _unexpected_edge_target(
     dag_node_id: str,
     *,
-    state: CompositionState,
-    graph: ExecutionGraph,
+    state: CompositionState | None,
+    graph: ExecutionGraph | None,
     component_type: str | None,
 ) -> Never:
     del dag_node_id, state, graph, component_type
@@ -145,8 +145,8 @@ def _unexpected_edge_target(
 def _unexpected_edge_formatter(
     exc: EdgeContractError,
     *,
-    state: CompositionState,
-    graph: ExecutionGraph,
+    state: CompositionState | None,
+    graph: ExecutionGraph | None,
 ) -> tuple[str, str]:
     del exc, state, graph
     raise AssertionError("edge formatter must not be called")
@@ -374,7 +374,13 @@ def test_graph_phase_preserves_warning_order_and_first_node_attribution() -> Non
     build_graph = _autospec_callable(build_runtime_graph, return_value=graph)
     instantiated = _instantiated()
 
-    result = validate_graph_structure(instantiated, build_graph=build_graph, warning_to_validation_warning=_warning)
+    result = validate_graph_structure(
+        instantiated,
+        build_graph=build_graph,
+        warning_to_validation_warning=_warning,
+        edge_patch_target_for_node_id=_unexpected_edge_target,
+        format_edge_contract_failure=_unexpected_edge_formatter,
+    )
     assert isinstance(result, PhaseReport)
 
     assert result.artifact.graph is graph
@@ -393,6 +399,8 @@ def test_graph_phase_converts_graph_errors_and_propagates_unexpected_errors() ->
         _instantiated(),
         build_graph=_autospec_callable(build_runtime_graph, side_effect=graph_error),
         warning_to_validation_warning=_warning,
+        edge_patch_target_for_node_id=_unexpected_edge_target,
+        format_edge_contract_failure=_unexpected_edge_formatter,
     )
     assert isinstance(failure, PhaseFailure)
     assert failure.failed_check.name == "graph_structure"
@@ -404,7 +412,73 @@ def test_graph_phase_converts_graph_errors_and_propagates_unexpected_errors() ->
             _instantiated(),
             build_graph=_autospec_callable(build_runtime_graph, side_effect=RuntimeError("graph invariant")),
             warning_to_validation_warning=_warning,
+            edge_patch_target_for_node_id=_unexpected_edge_target,
+            format_edge_contract_failure=_unexpected_edge_formatter,
         )
+
+
+def test_graph_phase_routes_build_raised_edge_contract_error_to_rich_diagnostics() -> None:
+    """A build-raised EdgeContractError gets the phase-3 formatter treatment.
+
+    The graph never exists when the build raises, so both diagnostic
+    collaborators must receive the authored policy state and ``graph=None``
+    (patch-target resolution degrades to the DAG node id downstream).
+    """
+    policy_state = _state()
+    edge_error = EdgeContractError(
+        "edge mismatch",
+        from_node_id="producer",
+        to_node_id="consumer",
+        producer_schema_name="Producer",
+        consumer_schema_name="Consumer",
+        compatibility_result=CompatibilityResult(compatible=False, type_mismatches=(("score", "float", "str"),)),
+        component_type="transform",
+    )
+    seen: list[tuple[CompositionState | None, ExecutionGraph | None]] = []
+
+    def edge_target(
+        dag_node_id: str,
+        *,
+        state: CompositionState | None,
+        graph: ExecutionGraph | None,
+        component_type: str | None,
+    ) -> _EdgePatchTarget:
+        del component_type
+        assert dag_node_id == "consumer"
+        seen.append((state, graph))
+        return _EdgePatchTarget(
+            component_id="consumer",
+            component_type="transform",
+            display_name="transform 'consumer'",
+            schema_patch_tool_call="patch_node_options()",
+        )
+
+    def format_edge(
+        exc: EdgeContractError,
+        *,
+        state: CompositionState | None,
+        graph: ExecutionGraph | None,
+    ) -> tuple[str, str]:
+        del exc
+        seen.append((state, graph))
+        return "rich edge message", "rich edge suggestion"
+
+    failure = validate_graph_structure(
+        _instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state(version=2)))),
+        build_graph=_autospec_callable(build_runtime_graph, side_effect=edge_error),
+        warning_to_validation_warning=_warning,
+        edge_patch_target_for_node_id=edge_target,
+        format_edge_contract_failure=format_edge,
+    )
+
+    assert isinstance(failure, PhaseFailure)
+    assert [(state is policy_state, graph) for state, graph in seen] == [(True, None), (True, None)]
+    assert failure.failed_check.name == "graph_structure"
+    assert failure.failed_check.detail == "edge mismatch"
+    assert failure.errors[0].component_id == "consumer"
+    assert failure.errors[0].message == "rich edge message"
+    assert failure.errors[0].suggestion == "rich edge suggestion"
+    assert failure.readiness.blockers[0].code == "graph_structure"
 
 
 def test_route_phase_calls_runtime_validator_with_exact_admitted_artifacts() -> None:
