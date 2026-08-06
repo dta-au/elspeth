@@ -4108,6 +4108,23 @@ async def test_sync_planner_phases_run_off_loop_and_terminate_responsively(
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
+    # Warm the process-wide plugin-manager singleton and the content-keyed
+    # authoring-aids memo (elspeth-fe67412d90) before the timed portion of
+    # this test starts. `_plan()` builds a fresh catalog/snapshot/policy-view
+    # on every call, and the "candidate"/"discovery" arms also run an
+    # unblocked `build_planner_authoring_aids` off-loop call before ever
+    # reaching the phase under test — its own docstring calls a cold build
+    # "too much to repeat inside every planner call's wall-clock budget".
+    # Left cold, that sweep plus first-time plugin registration (measured
+    # ~1.2s cold vs ~0.0005s memoized) can consume the 0.2s deadline before
+    # the blocked phase is ever entered — a harness cost, not the off-loop
+    # responsiveness this test asserts, so it is paid here, outside the
+    # deadline clock, rather than by loosening that clock.
+    _warm_catalog = create_catalog_service()
+    _warm_snapshot = PluginAvailabilitySnapshot.for_trained_operator(_warm_catalog)
+    _warm_policy_catalog = PolicyCatalogView.for_trained_operator(_warm_catalog, _warm_snapshot)
+    build_planner_authoring_aids(_warm_policy_catalog)
+
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     entered = asyncio.Event()
@@ -4118,7 +4135,16 @@ async def test_sync_planner_phases_run_off_loop_and_terminate_responsively(
     def block_then_call(delegate: Any, *args: Any, **kwargs: Any) -> Any:
         worker_threads.append(threading.get_ident())
         loop.call_soon_threadsafe(entered.set)
-        release.wait(timeout=3.0)
+        # Self-release valve only — `finally:` always calls release.set()
+        # before teardown, so this ceiling never gates normal test runtime.
+        # It exists solely so a genuinely wedged run doesn't hang forever.
+        # Must clear the deadline arm's full budget (1.5s timeout_seconds +
+        # delivery lag observed via the 4.0s outer wait_for) with margin, or
+        # the "assert not worker_finished.is_set()" checks below can flip
+        # true from this valve firing under real contention rather than from
+        # a genuine off-loop regression — that regression is independently
+        # caught by the `thread_id != loop_thread` assertion at the end.
+        release.wait(timeout=20.0)
         try:
             return delegate(*args, **kwargs)
         finally:
@@ -4157,16 +4183,41 @@ async def test_sync_planner_phases_run_off_loop_and_terminate_responsively(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
-            model_overrides={"timeout_seconds": 0.2 if termination == "deadline" else 5.0},
+            # The deadline arm's budget must clear the *unblocked* preamble
+            # (policy validate + authoring aids + one scripted call_model
+            # round trip for the candidate/discovery phases) before the
+            # phase under test is ever entered, while staying well under the
+            # mock's own release.wait(timeout=20.0) self-release valve so a
+            # regression that runs the blocked phase on the loop is still
+            # caught (that valve is itself generous — see block_then_call —
+            # so 1.5s keeps ample separation from it either way). 0.2s
+            # measured as too tight for the preamble under real host
+            # contention (elspeth-fe67412d90: reproduced with
+            # `execute_discovery`'s pre-dispatch remaining<=0 short-circuit
+            # firing before block_then_call ever ran).
+            model_overrides={"timeout_seconds": 1.5 if termination == "deadline" else 5.0},
         )
     )
     try:
-        await asyncio.wait_for(entered.wait(), timeout=1.5)
+        # `_plan()` builds a fresh catalog/plugin-snapshot/policy-view on the
+        # loop thread before `plan_pipeline`'s own wall-clock deadline even
+        # starts (elspeth-fe67412d90): measured ~1.2s cold (first plugin
+        # registration in the process) and ~0.2-0.4s warm on an idle host,
+        # before entered.set() can ever fire. That is unrelated to the
+        # off-loop/deadline mechanism this test asserts, so the ceiling here
+        # only needs to rule out a genuine "runs on the loop" regression
+        # (which would show up as ~20s+, gated by the mock's own
+        # release.wait(timeout=20.0) self-release valve) — not pin a tight
+        # budget for harness setup cost under real host contention.
+        await asyncio.wait_for(entered.wait(), timeout=10.0)
         await asyncio.sleep(0)
         assert not worker_finished.is_set()
         if termination == "deadline":
+            # 2.5s of headroom over the 1.5s inner deadline for delivery/
+            # observation overhead under the same contention that can slow
+            # the deadline itself firing.
             with pytest.raises(PipelinePlannerError, match="wall-clock"):
-                await asyncio.wait_for(plan_task, timeout=2.0)
+                await asyncio.wait_for(plan_task, timeout=4.0)
         else:
             plan_task.cancel()
             with pytest.raises(asyncio.CancelledError):
