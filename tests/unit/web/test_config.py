@@ -221,6 +221,51 @@ class TestWebSettingsValidation:
 
         assert settings.composer_timeout_seconds == 300.0
 
+    def test_underfunded_turn_budget_warns_with_fundable_estimate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-f159d2394b: a turn budget the wall clock cannot fund is
+        disclosed at config time. The acceptance deploy authorised 12+8
+        turns on a 120s clock that funded ~6 at the measured per-turn cost
+        — 'a budget the system cannot spend is not a budget'. Disclosure,
+        not rejection: per-turn cost is workload-dependent, and existing
+        configs (including test fixtures) are deliberately turn-generous.
+        """
+        from unittest.mock import MagicMock
+
+        from elspeth.web import config as config_module
+
+        logger = MagicMock()
+        monkeypatch.setattr(config_module, "_slog", logger)
+        settings = WebSettings(
+            composer_max_composition_turns=12,
+            composer_max_discovery_turns=8,
+            composer_timeout_seconds=120.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        # Construction still succeeds — this is disclosure, not a gate.
+        assert settings.composer_timeout_seconds == 120.0
+        logger.warning.assert_called_once()
+        event, kwargs = logger.warning.call_args[0][0], logger.warning.call_args[1]
+        assert event == "composer_turn_budget_underfunded"
+        assert kwargs["configured_turns"] == 20
+        assert kwargs["fundable_turns_estimate"] == 8  # 120s // 15s planning floor
+
+    def test_fundable_turn_budget_does_not_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from unittest.mock import MagicMock
+
+        from elspeth.web import config as config_module
+
+        logger = MagicMock()
+        monkeypatch.setattr(config_module, "_slog", logger)
+        WebSettings(
+            composer_max_composition_turns=3,
+            composer_max_discovery_turns=2,
+            composer_timeout_seconds=85.0,
+            composer_rate_limit_per_minute=10,
+            shareable_link_signing_key=b"\x00" * 32,
+        )
+        logger.warning.assert_not_called()
+
     def test_composer_rate_limit_zero_rejected(self) -> None:
         with pytest.raises(ValueError):
             WebSettings(

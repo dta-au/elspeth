@@ -473,6 +473,22 @@ variable "default_llm_profile" {
   }
 }
 
+variable "composer_timeout_seconds" {
+  type        = number
+  default     = 240
+  description = "Composer whole-request wall clock in seconds (elspeth-f159d2394b: was a hardcoded 120 that funded ~6 of the authorised 20 turns). The 240 default funds ~16 turns at the app's 15s/turn planning floor and stays inside both guards below."
+
+  # A value above the app's transport guard (idle ceiling 300s - headroom 30s
+  # = 270s) is a web STARTUP error, so without this it is discovered only
+  # after the service is rolled. Checking it here fails `terraform plan`
+  # instead. The ALB idle timeout (network.tf, 300s) must also stay above
+  # this value — raise both together if you need more than 270s.
+  validation {
+    condition     = var.composer_timeout_seconds > 0 && var.composer_timeout_seconds <= 270
+    error_message = "composer_timeout_seconds must be in (0, 270]: the web app rejects values above its 270s transport-headroom guard (300s idle ceiling - 30s headroom)."
+  }
+}
+
 variable "prompt_guardrail" {
   type = object({
     filters = list(object({
