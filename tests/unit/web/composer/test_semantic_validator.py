@@ -914,13 +914,23 @@ class TestGenerativeProducerFeedsLineExplode:
         ), "llm -> line_explode must raise no semantic entry at all through the wired surface"
 
     def test_intervening_transform_degrades_to_advisory_not_refusal(self) -> None:
-        """The REAL g11 topology had a transform between the llm and the sink.
+        """An intervening transform breaks the fact chain — the CONSUMER side.
 
-        g11 was `llm source -> content_safety -> text sink`, and the authorable
-        repair keeps that middle transform. Pass-through propagation is
-        deliberately not performed, so an intervening producer that declares
-        nothing breaks the fact chain and the edge is UNKNOWN — no matter what
-        the llm upstream of it claims.
+        What this fixture builds is `csv source -> llm TRANSFORM -> passthrough
+        -> line_explode`. The spliced ``passthrough`` declares no output
+        semantics, so the fact chain stops there: ``line_explode``'s edge names
+        ``passthrough`` as its producer and grades UNKNOWN, whatever the llm
+        upstream of it claims. The assertions land on ``node:split_lines``, and
+        there is deliberately NO sink in this composition.
+
+        g11 itself was `llm SOURCE -> aws_bedrock_content_safety -> text SINK`,
+        and that is the motivation for this test rather than the shape it
+        pins — the authorable repair keeps the middle transform, so the
+        consumer-side behaviour proved here is half of what the report needs.
+        The sink-side verdict on the reported topology is pinned separately, by
+        ``TestSinkSemanticAcceptanceCriteria``'s
+        ``test_llm_through_an_intervening_transform_to_a_text_sink_is_not_blocked``.
+        Read the two together; neither covers the other's half.
 
         This is the honest split, and it is why BOTH changes were needed:
         UNCONSTRAINED (ADR-039 §1) makes only the DIRECT edge factual, while
@@ -1636,6 +1646,11 @@ class TestSinkSemanticAcceptanceCriteria:
         undeclared middle transform — the same over-blocking that refused
         `llm -> line_explode` and left the user's goal unauthorable
         (elspeth-b6d9f04827).
+
+        The CONSUMER-side half of this behaviour — the same broken fact chain
+        seen by a transform rather than a sink — is pinned by
+        ``TestGenerativeProducerFeedsLineExplode``'s
+        ``test_intervening_transform_degrades_to_advisory_not_refusal``.
 
         If propagation ever lands this becomes SATISFIED or CONFLICT; re-point
         this test at the new truth, do not delete it.
