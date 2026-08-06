@@ -14,9 +14,19 @@ taxonomy, severity policy, allowlist discipline, and lifecycle expectations.
 3. Export a `RULE` object from the package.
 4. Add that object to `BUILTIN_RULES` in
    `elspeth-lints/src/elspeth_lints/rules/__init__.py`.
-5. Add `examples_violation` and `examples_clean` fixtures under the rule
+5. Register a reaudit vocabulary: add a `_RULE_VOCABULARY_REGISTRY` entry in
+   `elspeth_lints/core/reaudit.py` (test-enforced — the exhaustiveness tests
+   in `tests/unit/elspeth_lints/test_reaudit_multi_rule.py` fail on any
+   `BUILTIN_RULES` member without one). Only carve a rule out via
+   `_EXCLUDED_FROM_REAUDIT` when its allowlist format or finding shape
+   genuinely cannot be dispatched; record the rationale in the comment there.
+6. Add the rule and its canonical CI scan root to `ALL_RULE_ROOTS` in
+   `tests/unit/elspeth_lints/test_allowlist_loader_unification.py`, plus a
+   matching key in `tests/unit/elspeth_lints/fixtures/fingerprint_baseline.json`
+   (an empty list when the rule is clean at HEAD).
+7. Add `examples_violation` and `examples_clean` fixtures under the rule
    package, plus focused tests under `tests/unit/elspeth_lints/`.
-6. If the rule ports an existing `scripts/cicd/enforce_*.py` check, add or
+8. If the rule ports an existing `scripts/cicd/enforce_*.py` check, add or
    update the entry in `config/cicd/lint_migration_status.yaml`.
 
 Set `RuleMetadata.path_filter` to the rule's real ownership boundary. The CLI
