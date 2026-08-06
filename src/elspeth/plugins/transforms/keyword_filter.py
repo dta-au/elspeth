@@ -218,7 +218,7 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2c4c436e73474e18"
+    source_file_hash: str | None = "sha256:a68d02cbefd06922"
     config_model = KeywordFilterConfig
     usage_when_to_use: str = (
         "Use for regex content screening when a pattern match must return an error for the node's "
@@ -265,6 +265,11 @@ class KeywordFilter(BaseTransform):
         cfg = KeywordFilterConfig.from_dict(config, plugin_name=self.name)
         self._initialize_declared_input_fields(cfg)
         self._fields = cfg.fields
+        # Explicitly named scan fields fail the row closed when missing or
+        # non-string; "all" mode skips non-strings instead, so it makes no
+        # static type claim (elspeth-b19dfe41fb).
+        if not isinstance(self._fields, str):
+            self.declared_string_input_fields = frozenset(self._fields)
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 

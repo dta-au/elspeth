@@ -440,6 +440,15 @@ class BaseTransform(ABC):
     # transform declares no pre-emission required-input contract.
     declared_input_fields: frozenset[str] = frozenset()
 
+    # Fail-closed string-scan declaration (elspeth-b19dfe41fb).
+    # Transforms that quarantine a row when an explicitly configured scan field
+    # is missing or non-string set this to those field names at construction.
+    # Consumed only at build time by
+    # validate_transform_string_typed_input_fields, which rejects a pipeline
+    # whose producer schema provably types such a field int/float/bool. Empty
+    # frozenset means the transform makes no string-typed input claim.
+    declared_string_input_fields: frozenset[str] = frozenset()
+
     # Runtime preflight opt-in. Transforms that need an engine-time external
     # readiness check before source iteration set this True and override
     # runtime_preflight(). The default remains closed and side-effect free.

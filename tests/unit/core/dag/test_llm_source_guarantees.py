@@ -44,6 +44,7 @@ class _UsageConsumerTransform:
     output_schema = None
     declared_output_fields: ClassVar[frozenset[str]] = frozenset()
     declared_input_fields: ClassVar[frozenset[str]] = frozenset()
+    declared_string_input_fields: ClassVar[frozenset[str]] = frozenset()
     passes_through_input = False
 
     def __init__(self) -> None:

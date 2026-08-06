@@ -154,6 +154,11 @@ class BaseAzureSafetyTransform(BaseTransform, BatchTransformMixin):
         self._endpoint = cfg.endpoint.rstrip("/")
         self._api_key = cfg.api_key
         self._fields = cfg.fields
+        # Explicitly named scan fields fail the row closed when missing or
+        # non-string; "all" mode skips non-strings instead, so it makes no
+        # static type claim (elspeth-b19dfe41fb).
+        if not isinstance(self._fields, str):
+            self.declared_string_input_fields = frozenset(self._fields)
         self._max_capacity_retry_seconds = cfg.max_capacity_retry_seconds
         self._batch_wait_timeout_seconds = cfg.batch_wait_timeout_seconds
         self._effective_batch_wait_timeout_seconds = max(

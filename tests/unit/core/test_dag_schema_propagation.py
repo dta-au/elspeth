@@ -40,6 +40,7 @@ class MockTransformWithSchemaConfig:
     on_success: str | None = "output"
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
 
     def __init__(self) -> None:
@@ -63,6 +64,7 @@ class MockTransformWithoutSchemaConfig:
     on_success: str | None = "output"
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
     _output_schema_config: SchemaConfig | None = None
 
@@ -448,6 +450,7 @@ class MockAggregationTransform:
     on_success: str | None = "output"
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
 
     def __init__(self) -> None:
@@ -1011,6 +1014,7 @@ class _ConfigurableTransform:
     on_success: str | None = "output"
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
 
     def __init__(self, name: str, guaranteed_fields: tuple[str, ...] | None) -> None:

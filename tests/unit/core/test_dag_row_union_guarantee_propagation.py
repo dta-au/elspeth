@@ -74,6 +74,7 @@ class _BranchTransform:
     on_error: str | None = None
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -103,6 +104,7 @@ class _RequiringTransform:
     on_error: str | None = None
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
 
     def __init__(self, required: tuple[str, ...], *, via: str = "required_input_fields") -> None:

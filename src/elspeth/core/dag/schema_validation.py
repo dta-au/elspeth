@@ -88,6 +88,11 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # (elspeth-ada5a60249).
     validate_transform_declared_input_fields(graph)
 
+    # Validate that no fail-closed text scanner targets a field its producer
+    # provably types non-string. Type-side sibling of the check above; runs
+    # last for the same pre-existing-error reason (elspeth-b19dfe41fb).
+    validate_transform_string_typed_input_fields(graph)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -988,6 +993,92 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
                 f"upstream actually emits (for web_scrape that is 'url_field', "
                 f"for blob_csv_expand 'blob_ref_field'), or add the field to the "
                 f"upstream's schema or guaranteed_fields.",
+                component_id=str(node_id),
+                component_type="transform",
+            )
+
+
+def validate_transform_string_typed_input_fields(graph: ExecutionGraph) -> None:
+    """Reject text scanners aimed at a field the producer provably types non-string.
+
+    Type-side sibling of ``validate_transform_declared_input_fields``. A
+    transform's ``declared_string_input_fields`` are fields it requires to be
+    present AND string-valued on every arriving row — the fail-closed contract
+    of the text-scanning family (Bedrock/Azure guardrails' ``fields``,
+    keyword_filter's named ``fields``, document intelligence's
+    ``source_field``), which quarantines the row otherwise. A producer whose
+    schema declares such a field ``int``/``float``/``bool`` therefore fails
+    100% of rows, first row onward — a pipeline *configuration* error whose
+    fatality is knowable statically, so it belongs on the build-time surface
+    both ``elspeth run`` and the web ``POST /validate`` reach. At HEAD the
+    round-5 g11 shape — an auto-wired ``aws_bedrock_prompt_shield`` on a
+    fixed-mode ``int`` seed column — passed every validation check and then
+    quarantined all six rows at runtime (elspeth-b19dfe41fb).
+
+    Why Phase 2 of ``validate_single_edge`` cannot catch this: the consumer's
+    generated ``input_schema`` comes from its ``schema:`` block, which the
+    composer's required-control auto-wire hard-codes to observed-mode — and an
+    observed consumer bypasses type validation entirely. The scan-field
+    options never fold into that block, so the type claim must travel on its
+    own declaration surface.
+
+    Soundness: reject only where the mismatch is certain. The producer's
+    declared field types are read from its effective ``SchemaConfig``
+    (resolved through pass-through gates); an observed/unknown producer, an
+    undeclared field, or a field typed ``str``/``any`` all abstain, leaving
+    enforcement per-row. ``required``/``nullable`` markers do not soften the
+    proof: a present value violates the string contract and an absent or None
+    value trips the same family's fail-closed missing/non-string handling.
+
+    ``_live_predecessors`` filters DIVERT edges for the same
+    never-reject-a-runnable-pipeline reason its siblings cite: a DIVERT
+    payload is an error envelope, not the producer's declared row.
+
+    Per-predecessor rejection is the correct granularity: if ONE live
+    predecessor provably types a scanned field non-string, every row arriving
+    from it dies at this node, whatever the other inbound paths carry.
+
+    ``NodeInfo`` enforces the same boundary by guarding
+    ``declared_string_input_fields`` to TRANSFORM nodes.
+
+    Raises:
+        GraphValidationError: if a transform declares a string-typed input
+            field that a live predecessor's schema provably types non-string.
+    """
+    for node_id, data in graph._graph.nodes(data=True):
+        info = data["info"]
+        if info.node_type != NodeType.TRANSFORM:
+            continue
+
+        declared = info.declared_string_input_fields
+        if not declared:
+            continue
+
+        for predecessor_id in _live_predecessors(graph, node_id):
+            producer_config = get_effective_producer_schema_config(graph, predecessor_id)
+            if producer_config is None or producer_config.fields is None:
+                continue
+
+            mismatches = sorted(
+                (field_def.name, field_def.field_type)
+                for field_def in producer_config.fields
+                if field_def.name in declared and field_def.field_type not in ("str", "any")
+            )
+            if not mismatches:
+                continue
+
+            described = ", ".join(f"'{name}' is declared {field_type}" for name, field_type in mismatches)
+            raise GraphValidationError(
+                f"Transform '{info.plugin_name}' (node '{node_id}') scans input "
+                f"fields that must be text, but its upstream '{predecessor_id}' "
+                f"declares them non-string: {described}. The transform fails "
+                f"closed on any non-string value in an explicitly configured "
+                f"scan field, so every row from this producer is quarantined "
+                f"and the pipeline fails on the first row. "
+                f"Fix: point the scan option ('fields', or 'source_field' for "
+                f"document intelligence) at a text column, or declare the "
+                f"field as 'str' in the upstream schema if the values are "
+                f"genuinely text.",
                 component_id=str(node_id),
                 component_type="transform",
             )

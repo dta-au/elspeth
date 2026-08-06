@@ -293,7 +293,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:ac9091aa4e81f2d4"
+    source_file_hash: str | None = "sha256:6c2fa90bc26f401e"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     creates_tokens = False
@@ -357,6 +357,10 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         self._model_id = cfg.model_id
         self._source_mode = cfg.source_mode
         self._source_field = cfg.source_field
+        # The document reference must arrive as a non-empty string or the row
+        # fails closed — declare the string-type half of that contract so the
+        # DAG rejects a provably non-string producer (elspeth-b19dfe41fb).
+        self.declared_string_input_fields = frozenset({cfg.source_field})
         self._max_base64_chars = cfg.max_base64_chars
         self._content_field = cfg.content_field
         self._output_content_format = cfg.output_content_format

@@ -137,6 +137,7 @@ class ExecutionGraph:
         declared_required_fields: frozenset[str] = _EMPTY_DECLARED_REQUIRED_FIELDS,
         declared_output_fields: frozenset[str] = frozenset(),
         declared_input_fields: frozenset[str] = frozenset(),
+        declared_string_input_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
     ) -> None:
         """Add a node to the execution graph.
@@ -174,6 +175,13 @@ class ExecutionGraph:
                 compute this as a property over their own options and the
                 `schema:` block never carries those field names
                 (elspeth-ada5a60249). Empty frozenset otherwise.
+            declared_string_input_fields: For TRANSFORM nodes only — the set of
+                fields the transform requires to be present AND string-valued
+                on every arriving row, failing the row closed otherwise.
+                Populated by the builder from
+                TransformProtocol.declared_string_input_fields; no derivation
+                from schema config for the same reason as its siblings
+                (elspeth-b19dfe41fb). Empty frozenset otherwise.
             passes_through_input: For TRANSFORM nodes only — True iff the transform
                 unconditionally emits rows containing every input field
                 (ADR-007). Validator walk propagates predecessor guarantees
@@ -214,6 +222,7 @@ class ExecutionGraph:
             declared_required_fields=declared_required_fields,
             declared_output_fields=declared_output_fields,
             declared_input_fields=declared_input_fields,
+            declared_string_input_fields=declared_string_input_fields,
             passes_through_input=passes_through_input,
         )
         self._graph.add_node(node_id, info=info)

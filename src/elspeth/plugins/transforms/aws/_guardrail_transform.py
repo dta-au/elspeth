@@ -107,6 +107,10 @@ class BedrockGuardrailTransformBase(BaseTransform, ABC):
         self._guardrail_version = cfg.guardrail_version
         self._region = cfg.region
         self._fields = tuple(cfg.fields)
+        # Every configured field must arrive string-valued or process() fails
+        # the row closed — declare that so the DAG rejects a provably
+        # non-string producer at build time (elspeth-b19dfe41fb).
+        self.declared_string_input_fields = frozenset(cfg.fields)
         self._schema_config = cfg.schema_config
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
         self.input_schema, self.output_schema = self._create_schemas(cfg.schema_config, schema_name)

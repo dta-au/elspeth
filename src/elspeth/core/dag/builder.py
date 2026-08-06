@@ -403,6 +403,7 @@ def build_execution_graph(
             output_schema_config=output_schema_config,
             declared_output_fields=transform.declared_output_fields,
             declared_input_fields=transform.declared_input_fields,
+            declared_string_input_fields=transform.declared_string_input_fields,
             passes_through_input=transform.passes_through_input,
         )
 

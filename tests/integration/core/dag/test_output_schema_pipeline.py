@@ -63,6 +63,7 @@ class MockFieldAddingTransform:
     # Left empty so these graph-level cases keep exercising the raw
     # required_input_fields contract surface below, not the projected one.
     declared_input_fields: frozenset[str] = frozenset()
+    declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
 
     def __init__(

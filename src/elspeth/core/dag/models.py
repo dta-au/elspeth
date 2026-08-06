@@ -239,6 +239,25 @@ class NodeInfo:
     # that invariant at graph construction.
     declared_input_fields: frozenset[str] = field(default_factory=frozenset)
 
+    # Populated only for TRANSFORM nodes by the builder from
+    # TransformProtocol.declared_string_input_fields — the fields the transform
+    # requires to be PRESENT and STRING-VALUED on every arriving row, failing
+    # the row closed otherwise (the text-scanning family: Bedrock/Azure
+    # guardrails' `fields`, keyword_filter's named `fields`, document
+    # intelligence's `source_field`). Used for build-time detection of the
+    # provable 100%-fatal shape where a producer's schema declares such a field
+    # as int/float/bool (elspeth-b19dfe41fb). Empty frozenset for all
+    # non-transform nodes.
+    #
+    # Type-side sibling of declared_input_fields above, and NOT derivable from
+    # input_schema/input_schema_config for the same reason: the scan-field
+    # options never fold into the `schema:` block, which the auto-wire
+    # hard-codes to observed-mode anyway. Unlike declared_input_fields this
+    # surface has NO runtime consumer — the plugins enforce the contract in
+    # their own process paths — so it is not scoped by ADR-013's batch
+    # exclusion and batch-aware family members (the Azure pair) declare too.
+    declared_string_input_fields: frozenset[str] = field(default_factory=frozenset)
+
     # Pass-through contract flag (ADR-007). Populated only for TRANSFORM nodes
     # by the builder from TransformProtocol.passes_through_input. When True,
     # the validator walk propagates predecessor guarantees through this node
@@ -319,6 +338,20 @@ class NodeInfo:
                 f"NodeInfo.declared_input_fields is only meaningful for TRANSFORM nodes; "
                 f"node {self.node_id!r} has type {self.node_type.name} "
                 f"with declared_input_fields={sorted(self.declared_input_fields)!r}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: declared_string_input_fields mirrors the
+        # declared_input_fields guard above and is TRANSFORM-only for the same
+        # reason — its only consumer,
+        # validate_transform_string_typed_input_fields, is scoped to TRANSFORM
+        # nodes, so any other node type would carry data with no reader
+        # (elspeth-b19dfe41fb).
+        if self.declared_string_input_fields and self.node_type != NodeType.TRANSFORM:
+            raise GraphValidationError(
+                f"NodeInfo.declared_string_input_fields is only meaningful for TRANSFORM nodes; "
+                f"node {self.node_id!r} has type {self.node_type.name} "
+                f"with declared_string_input_fields={sorted(self.declared_string_input_fields)!r}.",
                 component_id=self.node_id,
                 component_type=component_type,
             )
