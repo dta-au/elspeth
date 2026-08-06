@@ -19,7 +19,9 @@ receive validated data). When untrusted data reaches a trusted producer it raise
 
 1. **Scan.** Run `wardline scan . --fail-on ERROR` (or call the `scan` MCP tool).
    Read the gate verdict and the active (non-suppressed) findings — `active` is
-   the population the gate enforces on.
+   the population the gate enforces on. Pack projects need `--trust-pack
+   <name>` (+ `--allow-custom-packs` if local) or exit 2; `--fail-on-inert`
+   rejects an inert scan.
 2. **Explain.** For each active defect, call `explain_taint` (MCP) or run
    `wardline explain-taint <fingerprint> [PATH]` (CLI) with the finding's
    `fingerprint`, and its `qualname` as `sink_qualname`. Do this

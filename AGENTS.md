@@ -172,9 +172,9 @@ recordable override or human sign-off, or when you need git/CI context.
 Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
 <!-- /legis:instructions -->
 
-<!-- wardline:instructions:v1:bcd19330 -->
+<!-- wardline:instructions:v1:df4787d1 -->
 <!-- wardline:last-writer:wardline install -->
-This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `wardline scan . --fail-on ERROR` (exit 0 = clean, 1 = gate tripped, 2 = wardline error) and fix findings at the boundary, not the sink. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill and in `docs/agents.md`.
+This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `wardline scan . --fail-on ERROR --trust-pack scripts.wardline_pack --allow-custom-packs` (exit 0 = clean, 1 = gate tripped, 2 = wardline error) and fix findings at the boundary, not the sink. This project declares trust-grammar pack(s) scripts.wardline_pack in weft.toml; the grant flags shown are REQUIRED — without them the scan exits 2 (pack not trusted), because repository config cannot self-authorise importing code. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill and in `docs/agents.md`.
 <!-- /wardline:instructions -->
 
 ### ELSPETH's Wardline invocation
