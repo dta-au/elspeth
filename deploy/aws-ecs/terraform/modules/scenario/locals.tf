@@ -404,6 +404,11 @@ locals {
     { name = "ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT", value = "medium" },
     { name = "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", value = "30" },
     { name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "true" },
+    # JSON log rendering (elspeth-cd98ea9d82 Tier 3): CloudWatch Logs
+    # Insights auto-parses JSON, so `filter request_id = "..."` is a working
+    # field query — the middleware binds request_id onto every in-request
+    # line via structlog contextvars (Tier 2).
+    { name = "ELSPETH_WEB__LOG_JSON", value = "true" },
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
     { name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model },
     { name = "ELSPETH_WEB__REGISTRATION_MODE", value = "open" },

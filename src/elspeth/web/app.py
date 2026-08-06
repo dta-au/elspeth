@@ -46,6 +46,7 @@ from elspeth.contracts.secrets import (
 )
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.logging import configure_logging
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.plugins.transforms.llm.model_catalog import (
     prime_openrouter_catalog_from_live,
@@ -877,6 +878,17 @@ def _frontend_build_identity(dist_dir: Path) -> str | None:
     return match.group(1) if match else None
 
 
+def _configure_web_logging(settings: WebSettings) -> None:
+    """Route web-process logs through the shared structlog configuration.
+
+    ``log_json=True`` selects the JSON renderer whose lines CloudWatch Logs
+    Insights auto-parses into queryable fields — with the request-id
+    middleware's contextvar bind, ``filter request_id = "..."`` becomes a
+    working single-lookup query (elspeth-cd98ea9d82 Tiers 2+3).
+    """
+    configure_logging(json_output=settings.log_json)
+
+
 def create_app(settings: WebSettings | None = None) -> FastAPI:
     """Create the application and synchronously clean up failed engine ownership."""
     session_engine_finalizer: weakref.finalize[..., FastAPI] | None = None
@@ -910,6 +922,11 @@ def _create_app(
     """
     if settings is None:
         settings = settings_from_env()
+        # Only the env-driven path (the uvicorn factory in production) owns
+        # process logging. Callers passing explicit settings — tests,
+        # embedded harnesses — keep whatever logging configuration they
+        # arranged, including structlog capture processors.
+        _configure_web_logging(settings)
 
     resolved_state_mode = resolve_deployment_state_mode(settings)
     external_state = resolved_state_mode == "external-postgresql"

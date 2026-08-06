@@ -151,6 +151,62 @@ class TestMaxLengthConstant:
         assert 32 <= MAX_REQUEST_ID_LENGTH <= 128
 
 
+class TestRequestIdContextvarBinding:
+    """Tier 2 of elspeth-cd98ea9d82: the id is bound into structlog
+    contextvars for the request's whole scope, so EVERY log line emitted
+    while handling the request carries request_id — not just the error
+    envelope lines the handlers stamp explicitly."""
+
+    def test_request_id_bound_during_request(self) -> None:
+        import structlog
+
+        app = FastAPI()
+        app.add_middleware(RequestIdMiddleware)
+        seen: dict[str, object] = {}
+
+        @app.get("/_ctx")
+        async def ctx(request: Request) -> dict[str, str]:
+            seen.update(structlog.contextvars.get_contextvars())
+            rid: str = request.state.request_id
+            return {"request_id": rid}
+
+        client = TestClient(app)
+        resp = client.get("/_ctx")
+
+        assert seen["request_id"] == resp.json()["request_id"]
+
+    def test_contextvar_restored_after_request(self) -> None:
+        import structlog
+
+        app = _make_app()
+        client = TestClient(app)
+        client.get("/_echo")
+
+        assert "request_id" not in structlog.contextvars.get_contextvars()
+
+    def test_sanitised_id_is_what_gets_bound(self) -> None:
+        """A rejected inbound id must never reach the log stream — the
+        freshly generated replacement is bound, not the attacker value."""
+        import structlog
+
+        app = FastAPI()
+        app.add_middleware(RequestIdMiddleware)
+        seen: dict[str, object] = {}
+
+        @app.get("/_ctx")
+        async def ctx(request: Request) -> dict[str, str]:
+            seen.update(structlog.contextvars.get_contextvars())
+            rid: str = request.state.request_id
+            return {"request_id": rid}
+
+        client = TestClient(app)
+        poisoned = 'evil\r\nevent="fake_admin_login"'
+        resp = client.get("/_ctx", headers={REQUEST_ID_HEADER: poisoned})
+
+        assert seen["request_id"] == resp.json()["request_id"]
+        assert seen["request_id"] != poisoned
+
+
 @pytest.fixture(scope="module")
 def hypothesis_available() -> bool:
     try:

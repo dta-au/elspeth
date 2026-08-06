@@ -240,3 +240,39 @@ class TestLoggingConfig:
         assert "message from stdlib logger" in captured.out
         # Should NOT be JSON
         assert not captured.out.strip().split("\n")[-1].startswith("{")
+
+
+class TestBoundContextvarsInJsonOutput:
+    """Tier 2+3 of elspeth-cd98ea9d82 jointly: with JSON output configured,
+    a contextvar-bound request_id appears as a first-class field on every
+    event in scope — the shape CloudWatch Logs Insights auto-parses, making
+    `filter request_id = "..."` a working query."""
+
+    def test_json_line_carries_bound_request_id(self, capsys: pytest.CaptureFixture[str]) -> None:
+        import json as _json
+
+        import structlog
+
+        from elspeth.core.logging import configure_logging
+
+        configure_logging(json_output=True)
+        with structlog.contextvars.bound_contextvars(request_id="rid-cd98-probe"):
+            structlog.get_logger("probe").warning("correlation_probe_event", detail="x")
+
+        line = capsys.readouterr().out.strip().splitlines()[-1]
+        payload = _json.loads(line)
+        assert payload["event"] == "correlation_probe_event"
+        assert payload["request_id"] == "rid-cd98-probe"
+
+    def test_unbound_scope_has_no_request_id_field(self, capsys: pytest.CaptureFixture[str]) -> None:
+        import json as _json
+
+        import structlog
+
+        from elspeth.core.logging import configure_logging
+
+        configure_logging(json_output=True)
+        structlog.get_logger("probe").warning("uncorrelated_probe_event")
+
+        payload = _json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert "request_id" not in payload
