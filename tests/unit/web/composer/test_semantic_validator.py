@@ -1571,15 +1571,15 @@ class TestSinkSemanticAcceptanceCriteria:
         assert len(warnings) == 1, "but the gap must be disclosed, not dropped silently"
         assert warnings[0].component == "output:sink"
 
-    def test_llm_through_line_explode_to_text_sink_is_not_blocked(self) -> None:
-        """End to end: the composition the user actually wants must author clean.
+    def _llm_through_line_explode_state(self, *, sink_field: str) -> CompositionState:
+        """`llm -> line_explode -> text`, with the sink's field name as the knob.
 
-        `llm -> line_explode` is SATISFIED on its own edge, and the sink edge
-        downstream of line_explode is an honest UNKNOWN (line_explode declares
-        no output semantics, so the fact chain stops there) — advisory, not a
-        refusal.
+        ``output_field`` is set EXPLICITLY rather than left to default, so the
+        coupling this test turns on — sink field vs the field line_explode
+        actually emits — is visible at both ends instead of hidden in a plugin
+        default.
         """
-        state = CompositionState(
+        return CompositionState(
             metadata=PipelineMetadata(name="generate-and-write"),
             version=1,
             edges=(),
@@ -1598,6 +1598,7 @@ class TestSinkSemanticAcceptanceCriteria:
                     options={
                         "schema": {"mode": "flexible", "fields": ["announcement: str"]},
                         "source_field": "announcement",
+                        "output_field": "line",
                     },
                 ),
             ),
@@ -1607,8 +1608,8 @@ class TestSinkSemanticAcceptanceCriteria:
                     plugin="text",
                     options={
                         "path": "outputs/lines.txt",
-                        "field": "line_text",
-                        "schema": {"mode": "fixed", "fields": ["line_text: str"]},
+                        "field": sink_field,
+                        "schema": {"mode": "fixed", "fields": [f"{sink_field}: str"]},
                     },
                     on_write_failure="discard",
                 ),
@@ -1620,16 +1621,52 @@ class TestSinkSemanticAcceptanceCriteria:
                 ),
             ),
         )
+
+    def test_llm_through_line_explode_to_text_sink_is_not_blocked(self) -> None:
+        """End to end: the composition the user actually wants must author clean.
+
+        This is THE win of ADR-039 — the blessed repair for the `llm -> text`
+        refusal must itself author clean, or the gate can say "wrong" and never
+        "right". `llm -> line_explode` is SATISFIED, and so is the sink edge:
+        line_explode declares `text_framing=COMPACT` on its configured
+        `output_field`, which is exactly what `text` requires.
+
+        Reads the sink's field as ``"line"`` — the field line_explode actually
+        emits. This test previously read ``"line_text"``, which line_explode
+        never emits, so no edge was built at all and the assertion recorded the
+        UNDECLARED-producer fallback (UNKNOWN + a warning) while its docstring
+        blamed a missing declaration. It passed with line_explode's
+        `output_semantics()` fully reverted. The mismatch case is worth keeping,
+        so it is now its own test below.
+        """
+        state = self._llm_through_line_explode_state(sink_field="line")
         errors, warnings, contracts = validate_semantic_contracts(state)
 
         assert errors == (), "the only correct spelling of the user's goal must author clean"
+        assert warnings == (), "a fully declared chain must not warn"
 
         explode_edge = next(contract for contract in contracts if contract.to_id == "split_lines")
         assert explode_edge.outcome is SemanticOutcome.SATISFIED
 
         sink_edge = _one_sink_edge(contracts)
-        assert sink_edge.outcome is SemanticOutcome.UNKNOWN
+        assert sink_edge.outcome is SemanticOutcome.SATISFIED
         assert sink_edge.consumer_plugin == "text"
+
+    def test_sink_reading_a_field_the_producer_never_emits_is_advisory(self) -> None:
+        """A field-name mismatch degrades to UNKNOWN, not to a refusal.
+
+        Facts match by EXACT field name, so pointing the sink at a field
+        line_explode does not emit leaves the sink's requirement with no
+        producer facts to compare against. That is an honest abstention —
+        advisory, never a block, because the row may still carry the field from
+        somewhere this layer cannot see.
+        """
+        state = self._llm_through_line_explode_state(sink_field="line_text")
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == ()
+        sink_edge = _one_sink_edge(contracts)
+        assert sink_edge.outcome is SemanticOutcome.UNKNOWN
         assert [warning.component for warning in warnings] == ["output:sink"]
 
     def test_llm_through_an_intervening_transform_to_a_text_sink_is_not_blocked(self) -> None:
