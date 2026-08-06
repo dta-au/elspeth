@@ -319,11 +319,31 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
         # raised.
         if consumer_schema is None or consumer_schema.model_config["extra"] != "forbid":
             continue
+        producer_schema = get_effective_producer_schema(graph, from_id, _cache=schema_cache)
+        # The producer's own EXTRAS FIREWALL, mirroring composer
+        # `_producer_emit_profile`'s `extras_firewall`. A producer whose
+        # output contract forbids extras emits EXACTLY its declared fields —
+        # rows either match that set or die at its own preflight, never
+        # downstream of it — so a name in its guarantee channel that is not
+        # in its model provably never reaches this consumer and cannot kill
+        # a row here.
+        #
+        # Skipping is required for soundness, not just economy. A REDUCTIVE
+        # producer's guarantee channel can describe fields it consumes rather
+        # than emits (batch_stats declaring `value` while emitting
+        # count/sum), and the certainty this check rests on — "a guarantee
+        # means every row WILL carry the field" — holds only for a guarantee
+        # about OUTPUT. The firewall is what distinguishes the two: an
+        # extras-allowing producer (a union coalesce's merged schema is
+        # mode: flexible, as is an under-declaring pass-through transform's)
+        # really does forward the fields it guarantees but never typed.
+        if producer_schema is not None and producer_schema.model_config["extra"] != "allow":
+            continue
         _validate_locked_consumer_guaranteed_extras(
             graph,
             from_id,
             to_id,
-            producer_schema=get_effective_producer_schema(graph, from_id, _cache=schema_cache),
+            producer_schema=producer_schema,
             consumer_schema=consumer_schema,
         )
 

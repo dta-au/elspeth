@@ -1390,3 +1390,63 @@ class TestTypedPassThroughGuaranteedExtras:
     def test_under_declaring_pass_through_into_admitting_sink_still_builds(self) -> None:
         """False-reject guard: the same producer is fine when nothing is locked."""
         _build_linear_pass_through_graph(sink_mode="observed", sink_fields="")
+
+
+class TestReductiveProducerExtrasFirewall:
+    """A producer that forbids extras cannot emit what it merely guarantees.
+
+    The guaranteed-extras check rests on "a guarantee means every row WILL
+    carry the field", which holds only for a guarantee about OUTPUT. A
+    REDUCTIVE producer's guarantee channel can describe fields it CONSUMES:
+    batch_stats declares `value` while emitting count/sum. Its output
+    contract is `mode: fixed` (extra='forbid'), so its rows are exactly its
+    declared fields — the guaranteed-but-undeclared name provably never
+    reaches the consumer and cannot kill a row there.
+
+    That extras firewall is the discriminator between this shape and the one
+    the check exists for: a union coalesce's merged schema is `mode:
+    flexible`, as is an under-declaring pass-through transform's, and those
+    really do forward fields they guarantee but never typed. Mirrors composer
+    `_producer_emit_profile`'s `extras_firewall`.
+
+    Regression guard: without it the check falsely rejected
+    tests/unit/core/test_dag.py::test_validate_aggregation_dual_schema, a
+    correct pipeline whose sink admits exactly what the aggregation emits.
+    """
+
+    @staticmethod
+    def _reductive_graph() -> ExecutionGraph:
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        consumed = SchemaConfig.from_dict({"mode": "fixed", "fields": ["value: float"]})
+        emitted = SchemaConfig.from_dict({"mode": "fixed", "fields": ["count: int", "sum: float"]})
+        consumed_model = create_schema_from_config(consumed, "Consumed", allow_coercion=False)
+        emitted_model = create_schema_from_config(emitted, "Emitted", allow_coercion=False)
+
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv", output_schema=consumed_model)
+        graph.add_node(
+            "agg",
+            node_type=NodeType.AGGREGATION,
+            plugin_name="batch_stats",
+            input_schema=consumed_model,
+            output_schema=emitted_model,
+            # The guarantee channel describes what it CONSUMES, not emits.
+            config={"schema": {"mode": "fixed", "fields": ["value: float"]}},
+        )
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", input_schema=emitted_model)
+        graph.add_edge("source", "agg", label="continue")
+        graph.add_edge("agg", "sink", label="continue")
+        return graph
+
+    def test_reductive_producer_guarantee_does_not_reject_a_locked_consumer(self) -> None:
+        """The sink admits exactly what the aggregation emits — this must build."""
+        graph = self._reductive_graph()
+
+        # The precondition that makes this a real guard, not a vacuous pass:
+        # the guarantee channel names a field the emitted model does not.
+        guaranteed = schema_validation.get_effective_guaranteed_fields(graph, "agg")
+        assert "value" in guaranteed
+        assert "value" not in graph.get_node_info("agg").output_schema.model_fields
+
+        graph.validate_edge_compatibility()
