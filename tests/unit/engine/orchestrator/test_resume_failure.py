@@ -116,6 +116,56 @@ def _insert_failed_run(db: LandscapeDB, run_id: str) -> None:
         )
 
 
+def _insert_run_source(
+    db: LandscapeDB,
+    run_id: str,
+    *,
+    source_node_id: str = "source-node",
+    source_name: str = "source",
+    lifecycle_state: str = "loaded",
+) -> None:
+    """Persist the ``run_sources`` row the shared source-lifecycle gate reads.
+
+    ``check_source_lifecycle_resumable`` (elspeth-1f5b83cd28) queries the real
+    audit DB — mocked factories no longer feed it — so mock-heavy resume tests
+    must persist the source lifecycle for the run they resume, exactly as
+    :func:`_insert_failed_run` persists the ``runs`` row for the entry guard.
+    Requires the ``runs`` row to exist already (foreign key).
+    """
+    from elspeth.contracts import Determinism, NodeType
+    from elspeth.core.landscape.schema import nodes_table, run_sources_table
+
+    with db.write_connection() as conn:
+        conn.execute(
+            nodes_table.insert().values(
+                node_id=source_node_id,
+                run_id=run_id,
+                plugin_name="test_source",
+                node_type=NodeType.SOURCE,
+                plugin_version="1.0.0",
+                determinism=Determinism.DETERMINISTIC,
+                config_hash="src_cfg",
+                config_json="{}",
+                registered_at=datetime.now(UTC),
+            )
+        )
+        conn.execute(
+            run_sources_table.insert().values(
+                run_id=run_id,
+                source_node_id=source_node_id,
+                source_name=source_name,
+                plugin_name="test_source",
+                lifecycle_state=lifecycle_state,
+                config_hash="src_cfg",
+                schema_json="{}",
+                schema_contract_json=None,
+                schema_contract_hash=None,
+                field_resolution_json=None,
+                recorded_at=datetime.now(UTC),
+            )
+        )
+
+
 def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
     """Satisfy the resume() entry guard's read-only checkpoint checks.
 
@@ -259,6 +309,7 @@ class TestResumeFinalizesAsFailed:
         db = make_landscape_db()
         orch = _make_orchestrator(db)
         _insert_failed_run(db, "test-run-123")
+        _insert_run_source(db, "test-run-123")
 
         # Real resume point anchored to the run's (stubbed) latest checkpoint
         checkpoint = Checkpoint(
@@ -294,9 +345,6 @@ class TestResumeFinalizesAsFailed:
                 source_schema_json='{"properties": {}, "required": []}',
                 schema_contract=MagicMock(spec=SchemaContract, name="contract"),
             ),
-        }
-        mock_factory.run_lifecycle.get_run_source_lifecycle_records.return_value = {
-            NodeID("source-node"): SimpleNamespace(source_name="source", lifecycle_state="loaded"),
         }
         mock_factory.execution.get_incomplete_batches.return_value = []
         # FAILED finalization derives its counter baseline from the audit
@@ -1522,6 +1570,9 @@ class TestResumeFinalizesAsFailed:
         orch._checkpoint_manager = MagicMock(spec=CheckpointManager)
         orch._resume_coordinator._checkpoint_manager = orch._checkpoint_manager
         run_id = "run-multi-source-reconstruct"
+        _insert_failed_run(db, run_id)
+        _insert_run_source(db, run_id, source_node_id="source-orders", source_name="orders")
+        _insert_run_source(db, run_id, source_node_id="source-refunds", source_name="refunds")
         checkpoint = Checkpoint(
             checkpoint_id="cp-multi-source-reconstruct",
             run_id=run_id,
@@ -1620,6 +1671,8 @@ class TestResumeFinalizesAsFailed:
         orch._checkpoint_manager = MagicMock(spec=CheckpointManager)
         orch._resume_coordinator._checkpoint_manager = orch._checkpoint_manager
         run_id = "run-exhausted-source-reconstruct"
+        _insert_failed_run(db, run_id)
+        _insert_run_source(db, run_id, source_node_id="source-primary", source_name="primary", lifecycle_state="exhausted")
         checkpoint = Checkpoint(
             checkpoint_id="cp-exhausted-source-reconstruct",
             run_id=run_id,
@@ -1636,9 +1689,6 @@ class TestResumeFinalizesAsFailed:
         mock_factory = MagicMock(spec=RecorderFactory)
         prepare_for_run()
         mock_factory.run_lifecycle.get_runtime_val_manifest.return_value = canonical_json(build_runtime_val_manifest())
-        mock_factory.run_lifecycle.get_run_source_lifecycle_records.return_value = {
-            NodeID("source-primary"): SimpleNamespace(source_name="primary", lifecycle_state="exhausted")
-        }
         mock_factory.run_lifecycle.get_run_source_resume_records.return_value = {
             NodeID("source-primary"): SimpleNamespace(
                 source_name="primary",

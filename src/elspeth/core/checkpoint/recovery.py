@@ -43,8 +43,10 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler import BarrierJournalRepository, SchedulerEventStore
 from elspeth.core.landscape.schema import (
+    SOURCE_COMPLETE_LIFECYCLE_STATES,
     node_states_table,
     rows_table,
+    run_sources_table,
     runs_table,
     token_outcomes_table,
     tokens_table,
@@ -75,7 +77,9 @@ __all__ = [
     "ResumeCheck",  # Re-exported from contracts for convenience
     "ResumePoint",  # Re-exported from contracts for convenience
     "ResumeWorkSet",
+    "SourceLifecycleResumeGate",
     "check_run_status_resumable",
+    "check_source_lifecycle_resumable",
 ]
 
 
@@ -169,6 +173,62 @@ def check_run_status_resumable(db: LandscapeDB, run_id: str) -> tuple[RunStatus 
         return run_status, ResumeCheck(can_resume=False, reason=f"Run status {run_status.value!r} is not resumable")
 
     return run_status, ResumeCheck(can_resume=True)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceLifecycleResumeGate:
+    """Facts + verdict from the shared source-lifecycle resume gate.
+
+    ``lifecycle_by_source`` carries every declared source (name → state);
+    ``incomplete_sources`` is the subset outside
+    ``SOURCE_COMPLETE_LIFECYCLE_STATES`` — the exact payload
+    ``IncompleteSourceResumeError`` requires. ``check`` is the advisory
+    verdict: ``can_resume=False`` iff ``incomplete_sources`` is non-empty.
+    An empty ``lifecycle_by_source`` passes this gate vacuously; the
+    no-recorded-work refuse (``EmptyResumeStateError``) stays with its
+    existing owners.
+    """
+
+    lifecycle_by_source: Mapping[str, str]
+    incomplete_sources: Mapping[str, str]
+    check: ResumeCheck
+
+
+def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLifecycleResumeGate:
+    """Source-lifecycle portion of :meth:`RecoveryManager.can_resume`.
+
+    SINGLE shared implementation for the advisory ``can_resume`` surface and
+    the enforcing ``IncompleteSourceResumeError`` guard in
+    ``ResumeCoordinator.resume()`` — the two must never drift
+    (elspeth-1f5b83cd28; same parity contract as
+    :func:`check_run_status_resumable`, elspeth-2f23292372). Resume replays
+    only persisted row payloads through NullSource, so a source that never
+    reached a complete lifecycle state (``SOURCE_COMPLETE_LIFECYCLE_STATES``)
+    may have unread rows that no resume can recover.
+    """
+    with db.engine.connect() as conn:
+        rows = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+    lifecycle_by_source = {str(row.source_name): str(row.lifecycle_state) for row in rows}
+    incomplete_sources = {name: state for name, state in lifecycle_by_source.items() if state not in SOURCE_COMPLETE_LIFECYCLE_STATES}
+    if incomplete_sources:
+        source_summary = ", ".join(f"{source}={state}" for source, state in sorted(incomplete_sources.items()))
+        reason = (
+            f"source lifecycle is incomplete ({source_summary}) — resume replays only "
+            "persisted row payloads, so unread source rows may exist; start a fresh run "
+            "or use a source-aware resume path"
+        )
+        return SourceLifecycleResumeGate(
+            lifecycle_by_source=lifecycle_by_source,
+            incomplete_sources=incomplete_sources,
+            check=ResumeCheck(can_resume=False, reason=reason),
+        )
+    return SourceLifecycleResumeGate(
+        lifecycle_by_source=lifecycle_by_source,
+        incomplete_sources=incomplete_sources,
+        check=ResumeCheck(can_resume=True),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +396,9 @@ class RecoveryManager:
         - Its status is "failed" (not "completed" or "running")
         - At least one checkpoint exists for recovery
         - The checkpoint's upstream topology is compatible with current graph
+        - Every declared source reached a complete lifecycle state
+          (``SOURCE_COMPLETE_LIFECYCLE_STATES``) — the same precondition
+          ``resume()`` enforces via ``IncompleteSourceResumeError``
         - The stored schema contract passes integrity verification (if present)
 
         Args:
@@ -377,6 +440,13 @@ class RecoveryManager:
         topology_check = validator.validate(checkpoint, graph)
         if not topology_check.can_resume:
             return topology_check
+
+        # Source-lifecycle completeness (elspeth-1f5b83cd28): the same shared
+        # gate resume() enforces via IncompleteSourceResumeError. A clean,
+        # interpretable refuse, so it precedes the contract-corruption raise.
+        lifecycle_gate = check_source_lifecycle_resumable(self._db, run_id)
+        if not lifecycle_gate.check.can_resume:
+            return lifecycle_gate.check
 
         # Verify schema contract integrity (Tier 1 - raises on corruption)
         # This must happen AFTER topology validation passes, as contract

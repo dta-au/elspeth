@@ -53,7 +53,11 @@ from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.types import NodeID
 from elspeth.core.canonical import canonical_json
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
-from elspeth.core.checkpoint.recovery import NonResumableRunError, check_run_status_resumable
+from elspeth.core.checkpoint.recovery import (
+    NonResumableRunError,
+    check_run_status_resumable,
+    check_source_lifecycle_resumable,
+)
 from elspeth.core.landscape.factory import RecorderFactory
 
 # The immutable-success family (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY)
@@ -722,16 +726,15 @@ class ResumeCoordinator:
         # empty, so by the time we land here every declared source has a contract
         # record. We still assert the postcondition defensively against future
         # call-path changes: an empty map at resume time is Tier-1 audit corruption.
-        source_lifecycle_records = factory.run_lifecycle.get_run_source_lifecycle_records(run_id)
-        if not source_lifecycle_records:
+        # Source-lifecycle completeness runs through the SAME shared gate as
+        # the advisory can_resume() (elspeth-1f5b83cd28) so the two surfaces
+        # cannot drift; this enforcing arm turns the verdict into the
+        # operator-facing IncompleteSourceResumeError.
+        lifecycle_gate = check_source_lifecycle_resumable(self._db, run_id)
+        if not lifecycle_gate.lifecycle_by_source:
             raise EmptyResumeStateError(run_id=run_id)
-        incomplete_sources = {
-            record.source_name: record.lifecycle_state
-            for record in source_lifecycle_records.values()
-            if record.lifecycle_state not in SOURCE_COMPLETE_LIFECYCLE_STATES
-        }
-        if incomplete_sources:
-            raise IncompleteSourceResumeError(run_id, incomplete_sources)
+        if lifecycle_gate.incomplete_sources:
+            raise IncompleteSourceResumeError(run_id, lifecycle_gate.incomplete_sources)
 
         # NOTE: the resume WORK SET (row-replay IDs + incomplete-token
         # continuations) is NOT computed here. It reads row-level state a

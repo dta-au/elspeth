@@ -476,6 +476,54 @@ def test_can_resume_true_for_failed_run_with_valid_checkpoint(
     assert check.reason is None
 
 
+@pytest.mark.parametrize("lifecycle_state", ["ready", "loading", "interrupted"])
+def test_can_resume_rejects_incomplete_source_lifecycle(
+    db: LandscapeDB,
+    checkpoint_manager: CheckpointManager,
+    recovery_manager: RecoveryManager,
+    lifecycle_state: str,
+) -> None:
+    """elspeth-1f5b83cd28: the advisory gate must refuse what resume() refuses.
+
+    ``resume()`` raises ``IncompleteSourceResumeError`` for any source whose
+    lifecycle never reached ``SOURCE_COMPLETE_LIFECYCLE_STATES`` — resume
+    replays only persisted row payloads, so unread source rows would be
+    silently lost. ``can_resume`` answering True for such a run is a false
+    green: the operator is told the run is recoverable, then every resume
+    attempt raises.
+    """
+    run_id = f"run-incomplete-source-{lifecycle_state}"
+    graph = _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id)
+    with db.engine.begin() as conn:
+        conn.execute(update(run_sources_table).where(run_sources_table.c.run_id == run_id).values(lifecycle_state=lifecycle_state))
+
+    check = recovery_manager.can_resume(run_id, graph)
+    assert check.can_resume is False
+    assert check.reason is not None
+    assert f"primary={lifecycle_state}" in check.reason
+
+    # get_resume_point delegates to can_resume, so it must refuse too.
+    assert recovery_manager.get_resume_point(run_id, graph) is None
+
+
+@pytest.mark.parametrize("lifecycle_state", ["exhausted", "loaded"])
+def test_can_resume_accepts_complete_source_lifecycle(
+    db: LandscapeDB,
+    checkpoint_manager: CheckpointManager,
+    recovery_manager: RecoveryManager,
+    lifecycle_state: str,
+) -> None:
+    """Both ADR-038 complete states pass the source-lifecycle gate."""
+    run_id = f"run-complete-source-{lifecycle_state}"
+    graph = _create_failed_run_with_checkpoint(db, checkpoint_manager, run_id)
+    with db.engine.begin() as conn:
+        conn.execute(update(run_sources_table).where(run_sources_table.c.run_id == run_id).values(lifecycle_state=lifecycle_state))
+
+    check = recovery_manager.can_resume(run_id, graph)
+    assert check.can_resume is True
+    assert check.reason is None
+
+
 def test_get_resume_point_returns_none_when_run_cannot_resume(recovery_manager: RecoveryManager) -> None:
     assert recovery_manager.get_resume_point("missing", _create_graph()) is None
 

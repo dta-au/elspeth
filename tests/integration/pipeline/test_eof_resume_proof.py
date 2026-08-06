@@ -45,7 +45,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts import Determinism, PipelineRow, RunStatus
+from elspeth.contracts import Determinism, PipelineRow, ResumePoint, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
@@ -510,9 +510,20 @@ class TestExhaustedSourceEOFResume:
         assert _run_sources_states(db, run_id) == {"primary": "interrupted"}
         assert output_sink.results == []
 
+        # elspeth-1f5b83cd28: the advisory gate agrees with the enforcing
+        # guard — no false green for a run every resume attempt would refuse.
         recovery = RecoveryManager(db, checkpoint_mgr)
-        resume_point = recovery.get_resume_point(run_id, graph)
-        assert resume_point is not None
+        check = recovery.can_resume(run_id, graph)
+        assert check.can_resume is False
+        assert check.reason is not None
+        assert "primary=interrupted" in check.reason
+        assert recovery.get_resume_point(run_id, graph) is None
+
+        # resume() is advisory-independent: a hand-built ResumePoint that
+        # skips can_resume must still be refused by the enforcing guard.
+        checkpoint = checkpoint_mgr.get_latest_checkpoint(run_id)
+        assert checkpoint is not None
+        resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=checkpoint.sequence_number)
 
         with pytest.raises(IncompleteSourceResumeError, match=r"primary.*interrupted"):
             orchestrator.resume(
