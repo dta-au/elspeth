@@ -39,7 +39,7 @@ answers four questions, in priority order:
 - It is **not a cold install**. It produces **no evidence** for
   `elspeth-9f7d336e1c` and none for `elspeth-671a17d5c0`'s install path. Do not
   let the report read as having re-qualified the installer.
-- It does not verify the advisor cluster per-ticket — see precondition P3.
+- It does not verify the advisor cluster per-ticket — see precondition P2.
 - It does not owe coverage of the 70-ticket `verifying` queue. See
   §Proportionality.
 
@@ -177,6 +177,40 @@ regenerating, then spend the fresh 24 hours on the stack.
 
 The stack's own cleanup deadline is **2026-08-09**.
 
+*Corrected 2026-08-06: **do not regenerate — retire the self-signed path
+instead.** The delegated Route53 zone `aws.foundryside.dev` survives every
+teardown (the reality seam), and P4's lever is already captured (17/17
+sessions in `r4-preserve/manifest.json`), so nothing left in the round
+depends on the expiring leaf. Replace this precondition with:*
+
+1. *Request a **DNS-validated ACM certificate** for
+   `elspeth.aws.foundryside.dev` in **`ap-southeast-2`**. The existing ACM
+   certificates for that name are region-bound to Singapore
+   (`ops-local/README.md` §environment) and cannot attach to the Sydney ALB;
+   the zone is delegated, so validation is one Route53 record and issuance is
+   minutes.*
+2. *ALIAS `elspeth.aws.foundryside.dev` → the Sydney ALB (the name currently
+   points at the torn-down Singapore stack; repointing orphans nothing).*
+3. *Attach via SNI: `aws elbv2 add-listener-certificates`, **not**
+   `modify-listener` on the default certificate. Terraform hardwires the
+   self-signed import as the listener default (`network.tf:206-218`); swapping
+   the default out-of-band would be silently reverted by any later
+   `terraform apply` (the arm-B ALB change is exactly such an apply), while an
+   added SNI certificate is outside the module's management and survives.*
+4. *Update `r4-env.json`: `public_url` → `https://elspeth.aws.foundryside.dev`,
+   delete `ca_bundle`. `drive_graph.py` tolerates the absent key (`.get()` +
+   file check) and the public chain needs no bundle. `derive_env.py`'s CA
+   derivation is no longer needed.*
+5. *AWS ledger row per mutation, as ever.*
+
+*Consequences: the 24-hour clock is gone — the round is ordered by the
+**2026-08-09 cleanup deadline** only, and every "certificate time in hand"
+gate elsewhere in this brief (arm D) now reads "stack time in hand". Browser
+trust becomes real, which makes `elspeth-49b467d91a` (frontend DOM, previously
+not sampleable partly for self-signed browser trust) sampleable via Playwright
+— optional, and never at the cost of arm A. The raw-ALB hostname keeps serving
+the old leaf until 19:09Z and may simply be left to expire.*
+
 ### P4. Capture the attribution lever, then clear the credential cache
 
 The cached credential is a **Singapore-era** account against the Sydney Aurora
@@ -271,6 +305,30 @@ Raising it is therefore a coordinated **three-place** change:
 Change all three or none. Raising the composer's wall past the ALB's idle
 timeout inverts the ordering the validator exists to protect — the proxy aborts
 before the composer reports, and an honest 422 becomes a dead connection.
+
+*Corrected 2026-08-06: `f8873e2a9` (elspeth-f159d2394b, landed after this
+brief) changed the third place's plumbing. `COMPOSER_TIMEOUT_SECONDS` is now
+`var.composer_timeout_seconds` (default 240) with a **plan-time validation
+hard-capped at (0, 270]** — the Terraform variable cannot express 840;
+`terraform plan` fails by design. The three-place change is unchanged in
+substance but the routes are now:*
+
+1. *ALB `idle_timeout` 300 → 900: Terraform (still a literal in
+   `network.tf`). **Plan-gate the apply**: the module also owns the task
+   definition and service, and the round runs on `build_td_r4_sydney.py`'s
+   out-of-band TD — confirm the plan touches only the ALB attribute and does
+   not roll the service back to Terraform's own TD. (If the P3 correction's
+   SNI certificate was added, the plan must also not touch listener
+   certificates.)*
+2. *Both env vars (`IDLE_CEILING` → 900, `TIMEOUT` → 840): through the TD
+   builder's out-of-band overrides — the same path that set 270 in round 4.
+   Leave `var.composer_timeout_seconds` untouched at 240; it is overridden by
+   the TD and cannot follow anyway.*
+
+*Also from `f8873e2a9`: WebSettings now emits a
+`composer_turn_budget_underfunded` structured warning when the wall cannot
+fund the configured turn budget. If it appears at arm C's 240s it is a
+designed disclosure — record it as the package-default datum, not a defect.*
 
 Record the arm-B configuration in the ledger as a **deliberate deviation from
 the package**. Arm A stays at the package-permitted 270 so parity is intact.
