@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from elspeth.core.expression_parser import ExpressionParser
 
-COMMENCEMENT_GATE_ALLOWED_NAMES = ("collections", "dependency_runs", "env")
+# No "env": the namespace was never populated (the sole engine caller passed
+# nothing) and was the surface of elspeth-83261b699c — "Commencement gate
+# non-bool failure can echo env secret values into audit/error text".
+COMMENCEMENT_GATE_ALLOWED_NAMES = ("collections", "dependency_runs")
 
 
 def validate_commencement_gate_condition(condition: str) -> None:

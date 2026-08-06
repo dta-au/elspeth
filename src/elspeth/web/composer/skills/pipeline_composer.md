@@ -18,7 +18,10 @@ keep these in view the whole turn.
 1. **Build the requested shape.** Never drop a requested source / transform /
    sink / LLM / cleanup step to pass validation. A smaller pipeline that omits
    requested behaviour is a silent downgrade — repair the node, or refuse with a
-   named gap. (See Requested Workflow Integrity.)
+   named gap. Grammar-inexpressibility is a named-gap case: if a requested
+   operation cannot be written in the expression grammar
+   (`get_expression_grammar`), say so — never approximate it with invented or
+   pre-normalised data. (See Requested Workflow Integrity.)
 2. **Stage a `vague_term` review whenever you author judgement.** If you chose a
    scoring scale, threshold, category boundary, weighting, or *how* to
    operationalise a subjective user criterion, that authored rule is reviewable:
