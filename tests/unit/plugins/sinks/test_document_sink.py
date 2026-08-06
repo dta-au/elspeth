@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.sink_effects import (
     ResolvedSinkEffectMode,
@@ -31,6 +32,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+from elspeth.plugins.infrastructure.runtime_factory import validate_sink_effect_type_capability
 from elspeth.plugins.sinks.document_sink import DocumentSink, DocumentSinkConfig
 from tests.fixtures.base_classes import inject_write_failure
 
@@ -389,3 +391,19 @@ def test_publication_requires_the_effect_coordinator(tmp_path: Path) -> None:
 def test_effect_protocol_metadata_declares_write_only_pipeline_members() -> None:
     assert DocumentSink.supported_effect_modes == frozenset({"write"})
     assert DocumentSink.supported_effect_input_kinds == frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+
+
+def test_admission_gate_accepts_the_declared_capability_and_refuses_the_rest() -> None:
+    """Run the validator that reads the declarations, not just the declarations.
+
+    ``_resolve_sink_effect_mode`` answers "write" for every purpose including
+    AUDIT_EXPORT, which is only safe because the input-kind gate refuses the
+    audit-export snapshot outright.
+    """
+    validate_sink_effect_type_capability(DocumentSink, "write", SinkEffectInputKind.PIPELINE_MEMBERS)
+
+    with pytest.raises(SinkEffectCapabilityError):
+        validate_sink_effect_type_capability(DocumentSink, "append", SinkEffectInputKind.PIPELINE_MEMBERS)
+
+    with pytest.raises(SinkEffectCapabilityError):
+        validate_sink_effect_type_capability(DocumentSink, "write", SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT)
