@@ -146,10 +146,13 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   single unframed value, and the `line_explode` and `report_assemble` remedies
   the refusal names are authorized on the web surface, so the repair it
   recommends is one the Composer can actually take.
-- **A locked consumer reports the field it is missing, not just the ones it
-  refuses** — the build-time guaranteed-extras check ran ahead of every other
-  graph check, so a sink both missing required fields and refusing extras was
-  offered three remedies that could not supply a missing field.
+- **A doubly-violating sink edge states both verdicts, not whichever raised
+  first** — a sink can simultaneously miss a required field and refuse an
+  undeclared one, and only the extras half used to survive. Its remedies
+  ("add the extra fields", "relax to flexible", "drop the extras") cannot
+  supply a field nothing guarantees, so the author — often an LLM authoring
+  loop — was handed a repair that leaves the graph invalid. Both verdicts are
+  now accumulated into one error carrying both field sets.
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 

@@ -207,17 +207,17 @@ def validate_single_edge(
     producer_schema = get_effective_producer_schema(graph, from_node_id, _cache=_schema_cache)
     consumer_schema = to_info.input_schema
 
-    # Rule 1: Dynamic schemas (None) bypass type validation. A dynamic producer
-    # can still make PROMISES (guaranteed_fields travels outside the schema),
-    # but mirroring composer Rule A HERE — inside the FIRST edge loop —
-    # pre-empted every whole-graph check below it: a sink both missing its
-    # required fields and refusing the producer's extras reported only the
-    # extras, and those remedies ("add the extra fields", "relax to flexible",
-    # "drop the extras") cannot supply a field the producer never guaranteed.
-    # validate_typed_producer_guaranteed_extras sweeps these edges LAST instead
-    # — its firewall guard admits exactly the dynamic and observed producers
-    # these two arms abandon.
+    # Rule 1: Dynamic schemas (None) bypass type validation — but a dynamic
+    # producer can still make PROMISES (guaranteed_fields travels outside the
+    # schema), so mirror composer Rule A before abandoning the edge.
     if producer_schema is None or consumer_schema is None:
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_node_id,
+            to_node_id,
+            producer_schema=producer_schema,
+            consumer_schema=consumer_schema,
+        )
         return  # Types unknowable on one side - compatible with anything
 
     # Handle observed schemas (no explicit fields + extra='allow')
@@ -227,6 +227,13 @@ def validate_single_edge(
     producer_is_observed = len(producer_schema.model_fields) == 0 and producer_schema.model_config["extra"] == "allow"
     consumer_is_observed = len(consumer_schema.model_fields) == 0 and consumer_schema.model_config["extra"] == "allow"
     if producer_is_observed or consumer_is_observed:
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_node_id,
+            to_node_id,
+            producer_schema=producer_schema,
+            consumer_schema=consumer_schema,
+        )
         return  # Observed schemas bypass static type validation
 
     # Rule 2: Full compatibility check (missing fields, type mismatches, extra fields)

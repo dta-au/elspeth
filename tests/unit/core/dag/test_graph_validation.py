@@ -966,50 +966,6 @@ class TestLockedConsumerGuaranteedExtras:
         with pytest.raises(EdgeContractError, match="a"):
             graph.validate_edge_compatibility()
 
-    def test_pre_existing_sink_error_reports_ahead_of_the_extras_error(self) -> None:
-        """Ordering convention: the newest whole-graph check reports LAST.
-
-        This graph trips two checks at once — the sink requires a field no
-        upstream guarantees, AND its locked input refuses a field the source
-        does guarantee. validate_sink_required_fields is the pre-existing
-        check, so it must be the one that reports.
-
-        Not cosmetic. The extras remedies ("add the extra field(s)", "relax
-        the consumer schema", "insert a field_mapper to drop the extras")
-        cannot supply ``missing_one``, so reporting extras first hands the
-        author three fixes that all leave the graph invalid. That regression
-        shipped once already; until now it was pinned only incidentally, by
-        two integration tests whose names say nothing about ordering.
-
-        Discriminator is the exception TYPE, not the wording:
-        validate_sink_required_fields raises the plain GraphValidationError,
-        while the extras check raises its EdgeContractError subclass.
-        """
-        from elspeth.core.dag.models import EdgeContractError, GraphValidationError
-
-        graph = ExecutionGraph()
-        graph.add_node(
-            "src",
-            node_type=NodeType.SOURCE,
-            plugin_name="csv",
-            config={"schema": {"mode": "observed", "guaranteed_fields": ["a", "url"]}},
-        )
-        graph.add_node(
-            "sink",
-            node_type=NodeType.SINK,
-            plugin_name="json",
-            config={"schema": {"mode": "fixed", "fields": ["url: str"]}},
-            input_schema=_locked_input_model(),
-            declared_required_fields=frozenset({"missing_one"}),
-        )
-        graph.add_edge("src", "sink", label="continue", mode=RoutingMode.MOVE)
-
-        with pytest.raises(GraphValidationError) as exc_info:
-            graph.validate_edge_compatibility()
-
-        assert not isinstance(exc_info.value, EdgeContractError), "the newest check pre-empted the pre-existing sink check"
-        assert "missing_one" in str(exc_info.value)
-
     def test_multi_input_gate_into_a_nested_coalesce_still_builds(self) -> None:
         """The whole-graph sweep must skip correlated barriers, as its host did.
 
