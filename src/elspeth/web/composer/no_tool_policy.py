@@ -344,7 +344,13 @@ type VisibleMessageSegment = AssistantTextSegment | TrustedSystemNoticeSegment
 
 
 class PipelineMutationIntentDecision(Enum):
-    """Closed request-intent decision used at Composer lifecycle gates."""
+    """Closed request-intent decision for authoring-surface selection.
+
+    Not an authority value: ``__bool__`` raises so it can never be consumed
+    as a truthy consent signal. Real mutation authority is
+    ``trust_mode == "explicit_approve"`` (``web/composer/tool_batch.py:563``
+    and ``:965``); see :func:`classify_pipeline_mutation_intent`.
+    """
 
     EXPLICIT_MUTATION = "explicit_mutation"
     CONVERSATIONAL = "conversational"
@@ -607,15 +613,26 @@ def _matches_complete_multi_clause_pipeline_request(message: str) -> bool:
 
 
 def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDecision:
-    """Classify whether the user explicitly authorizes pipeline mutation.
+    """Select the authoring surface for a request — NOT an authority gate.
 
-    Authority requires the complete bounded request to match a closed positive
-    production. Quoted material cannot be elided to manufacture authority;
-    only a complete registered recipe envelope may contain its prescribed
-    quotes. Multi-clause productions require an authorizing pipeline-build or
-    data-source root and reject request revocation. Unmatched governing
-    prefixes, bare questions, unrelated objects, and oversized input fail
-    closed to clarification on the conversational path.
+    This classifier ROUTES (planner vs compose_loop) and gates one
+    repair-prompt nudge; its consumers are surface selection, referential
+    context threading, and disclosure only. Nothing here grants or denies
+    mutation: real mutation authority is ``trust_mode == "explicit_approve"``
+    (``web/composer/tool_batch.py:563`` and ``:965``) plus the tool-call
+    guards (interpretation review, preflight, advisor veto). Its
+    misclassifications fail SAFE — toward clarification — and its recall on
+    open phrasing is poor by construction: a closed vocabulary cannot cover
+    open human language. **Do not wire a consent or authority gate to this
+    predicate.**
+
+    Classification contract: EXPLICIT_MUTATION requires the complete bounded
+    request to match a closed positive production. Quoted material cannot be
+    elided to manufacture a match; only a complete registered recipe envelope
+    may contain its prescribed quotes. Multi-clause productions require a
+    pipeline-build or data-source root and reject request revocation.
+    Unmatched governing prefixes, bare questions, unrelated objects, and
+    oversized input fail closed to clarification on the conversational path.
     """
     if len(message) > _MAX_INTENT_CLASSIFICATION_CHARS:
         return PipelineMutationIntentDecision.AMBIGUOUS
@@ -700,12 +717,14 @@ def carries_build_action(message: str) -> bool:
 def is_referential_pipeline_mutation_intent(message: str) -> bool:
     """Return whether an admitted mutation request depends on prior prose.
 
-    Mutation authority remains wholly owned by
-    :func:`classify_pipeline_mutation_intent`. This second decision reuses that
-    closed grammar, then identifies only deictic request shapes whose current
-    text cannot specify the requested topology by itself. Complete registered
-    recipes are self-contained even if their inline data happens to contain a
-    matching phrase.
+    Surface selection remains wholly owned by
+    :func:`classify_pipeline_mutation_intent` — neither function grants
+    mutation authority (that is ``trust_mode``; see the classifier's
+    docstring). This second decision reuses that closed grammar, then
+    identifies only deictic request shapes whose current text cannot specify
+    the requested topology by itself. Complete registered recipes are
+    self-contained even if their inline data happens to contain a matching
+    phrase.
     """
     if classify_pipeline_mutation_intent(message) is not PipelineMutationIntentDecision.EXPLICIT_MUTATION:
         return False

@@ -679,3 +679,30 @@ class TestRevocationVocabularyUnification:
         it does not revoke it."""
         message = "Build a pipeline that reads customers.csv and writes results.jsonl. Do not add a generic transform."
         assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
+
+
+def test_intent_classifier_has_no_new_consumers() -> None:
+    """B3 consumer-shape tripwire: the classifier is a surface selector.
+
+    Every production consumer of classify_pipeline_mutation_intent today is
+    router/disclosure-only (authoring-surface selection, one repair-prompt
+    nudge, referential-context threading). Real mutation authority is
+    trust_mode == "explicit_approve" (web/composer/tool_batch.py) — this
+    classifier has 0/13 held-out recall on open phrasing and must NEVER
+    acquire a consent-gate consumer. A new consuming module fails this pin:
+    read the surface-selector doctrine in no_tool_policy.py before extending
+    the set, and never wire mutation authority to this predicate.
+    """
+    import elspeth
+
+    src_root = Path(elspeth.__file__).resolve().parent
+    consumers = {
+        path.relative_to(src_root).as_posix()
+        for path in src_root.rglob("*.py")
+        if path.name != "no_tool_policy.py" and "classify_pipeline_mutation_intent" in path.read_text(encoding="utf-8")
+    }
+    # service.py: the live consumer (surface routing + repair nudge, via the
+    # module alias). no_tool_finalize.py: a comment-only historical reference
+    # ("which this path no longer" consults) — not a call. The pin is a TEXT
+    # search on purpose: any new reference, even in prose, warrants a look.
+    assert consumers == {"web/composer/service.py", "web/composer/no_tool_finalize.py"}
