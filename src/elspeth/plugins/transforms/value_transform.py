@@ -335,7 +335,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:ba3a73db2103ce25"
+    source_file_hash: str | None = "sha256:371633ee910e5a1d"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -520,12 +520,12 @@ class ValueTransform(BaseTransform):
                 ),
                 composer_hints=(
                     "Call get_expression_grammar to see the allowed operations — only stdlib-safe expressions are permitted.",
-                    "Achievable here: arithmetic (row['a'] + row['b'], len(row['text']) * 2, abs(row['n'])), field copies and "
-                    "overwrites, string concatenation (row['a'] + '-suffix'), membership tests, and conditional values "
-                    "(1 if row['score'] > 10 else 0). For type changes use type_coerce.",
-                    "NOT achievable here: string methods and regular expressions (case changes such as upper/lower/title, "
-                    "pattern extraction, splitting) — the sandbox rejects attribute calls and imports, and only len() and "
-                    "abs() are callable. Route text rewriting through an llm transform instead.",
+                    "Achievable here: arithmetic (row['a'] + row['b'], abs(row['n'])), field copies and overwrites, string "
+                    "concatenation, case folding/trimming via lower(row['x']), upper(row['x']), strip(row['x']), "
+                    "casefold(row['x']), membership tests, conditionals. For type changes use type_coerce.",
+                    "NOT achievable here: regex (pattern extraction, splitting), title-casing, and method-call syntax "
+                    "(row['x'].lower() is rejected; use lower(row['x'])). Only len, abs, lower, upper, strip, casefold "
+                    "are callable. Route text rewriting beyond case folding through an llm transform.",
                     "A value_transform node's schema: block declares what ARRIVES at the node (its pre-transform input), "
                     "never an expression's computed result — declaring the output type on the node's own schema authors an "
                     "unsatisfiable input contract that is rejected at the edge.",

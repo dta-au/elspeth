@@ -606,3 +606,103 @@ def test_oversized_classification_request_fails_closed() -> None:
 def test_closed_intent_decision_cannot_be_used_as_a_truthy_authority_value() -> None:
     with pytest.raises(TypeError, match="compared to an explicit member"):
         bool(PipelineMutationIntentDecision.EXPLICIT_MUTATION)
+
+
+# ── B1/B2: revocation fail-open fixes (THREAT-002 + F4) ──────────────────
+#
+# AMBIGUOUS is also the classifier's fall-through default, so every
+# revocation case below is paired with a positive control: the same carrier
+# minus the revocation clause must classify EXPLICIT_MUTATION, proving the
+# carrier reaches a complete production at all.
+
+_REVOCATION_CARRIER_BASE = "Build a pipeline that reads rows from data.csv"
+_REVOCATION_POSITIVE_CONTROL = _REVOCATION_CARRIER_BASE + "."
+
+
+def test_revocation_carrier_positive_control_reaches_explicit_mutation() -> None:
+    assert classify_pipeline_mutation_intent(_REVOCATION_POSITIVE_CONTROL) is (PipelineMutationIntentDecision.EXPLICIT_MUTATION)
+
+
+class TestApostropheConfusableClass:
+    """THREAT-002: every apostrophe confusable suppresses revocation alike.
+
+    elspeth-80feb17704 patched U+2019 as a codepoint, not the class. NFKC
+    cannot fix this (only U+FF07 folds), so the class is pinned as a set.
+    """
+
+    def test_class_pinned_as_set(self) -> None:
+        from elspeth.web.composer.no_tool_policy import _APOSTROPHE_CLASS
+
+        assert set(_APOSTROPHE_CLASS) == {"'", "\u2019", "\u02bc", "\uff07", "\u00b4", "\u2032"}
+
+    @pytest.mark.parametrize(
+        "codepoint",
+        ["'", "\u2019", "\u02bc", "\uff07", "\u00b4", "\u2032"],
+        ids=["ascii", "u2019-right-quote", "u02bc-modifier", "uff07-fullwidth", "u00b4-acute", "u2032-prime"],
+    )
+    def test_confusable_apostrophe_revocation_is_ambiguous(self, codepoint: str) -> None:
+        message = f"{_REVOCATION_CARRIER_BASE}, actually don{codepoint}t do that."
+        assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
+
+
+class TestRevocationVocabularyUnification:
+    """F4: the revocation vocabulary is built from the same canonical tuple
+    as the authority vocabulary, so the subset relation cannot recur."""
+
+    def test_property_every_authority_verb_is_revocable(self) -> None:
+        from elspeth.web.composer.no_tool_policy import _MUTATION_ACTION_PHRASES
+
+        for phrase in _MUTATION_ACTION_PHRASES:
+            message = f"{_REVOCATION_CARRIER_BASE}, do not {phrase} anything."
+            decision = classify_pipeline_mutation_intent(message)
+            assert decision is not PipelineMutationIntentDecision.EXPLICIT_MUTATION, (
+                f"revocation with verb {phrase!r} failed open: {decision}"
+            )
+
+    @pytest.mark.parametrize(
+        "verb",
+        ["wire", "add", "modify", "route", "split", "set up"],
+        ids=["wire", "add", "modify", "route", "split", "set-up"],
+    )
+    def test_previously_leaking_verbs_now_revoke(self, verb: str) -> None:
+        message = f"{_REVOCATION_CARRIER_BASE}, do not {verb} anything."
+        assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
+
+    @pytest.mark.parametrize("verb", ["build", "run"], ids=["build", "run"])
+    def test_pinned_true_positives_still_revoke(self, verb: str) -> None:
+        message = f"{_REVOCATION_CARRIER_BASE}, do not {verb} anything."
+        assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
+
+    def test_scoped_negative_constraint_still_explicit_mutation(self) -> None:
+        """Widening must not turn scoped constraints into whole-request
+        revocations — 'do not add a generic transform' constrains the build,
+        it does not revoke it."""
+        message = "Build a pipeline that reads customers.csv and writes results.jsonl. Do not add a generic transform."
+        assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
+
+
+def test_intent_classifier_has_no_new_consumers() -> None:
+    """B3 consumer-shape tripwire: the classifier is a surface selector.
+
+    Every production consumer of classify_pipeline_mutation_intent today is
+    router/disclosure-only (authoring-surface selection, one repair-prompt
+    nudge, referential-context threading). Real mutation authority is
+    trust_mode == "explicit_approve" (web/composer/tool_batch.py) — this
+    classifier has 0/13 held-out recall on open phrasing and must NEVER
+    acquire a consent-gate consumer. A new consuming module fails this pin:
+    read the surface-selector doctrine in no_tool_policy.py before extending
+    the set, and never wire mutation authority to this predicate.
+    """
+    import elspeth
+
+    src_root = Path(elspeth.__file__).resolve().parent
+    consumers = {
+        path.relative_to(src_root).as_posix()
+        for path in src_root.rglob("*.py")
+        if path.name != "no_tool_policy.py" and "classify_pipeline_mutation_intent" in path.read_text(encoding="utf-8")
+    }
+    # service.py: the live consumer (surface routing + repair nudge, via the
+    # module alias). no_tool_finalize.py: a comment-only historical reference
+    # ("which this path no longer" consults) — not a call. The pin is a TEXT
+    # search on purpose: any new reference, even in prose, warrants a look.
+    assert consumers == {"web/composer/service.py", "web/composer/no_tool_finalize.py"}

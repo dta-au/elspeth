@@ -200,8 +200,9 @@ def _schema_required_fields(schema: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 _EXPRESSION_GRAMMAR = """\
-Gate Expression Syntax Reference
-=================================
+Expression Syntax Reference
+===========================
+Applies to gate conditions and value_transform expressions.
 
 Variables:
   row      - The current row as a dict. Access fields via row['field_name'].
@@ -212,14 +213,25 @@ Field access:
 
 Operators:
   ==, !=, <, >, <=, >=   Comparison
+  is, is not              Identity (None checks only, e.g. row.get('x') is not None)
   and, or, not            Boolean logic
   in, not in              Membership test
   +, -, *, /, //, %       Arithmetic
+  x if condition else y   Ternary conditional
+
+Literals:
+  Strings, numbers, and the constants True, False, None
+  [..] lists, (..) tuples, {..} sets, {'k': v} dicts — for membership tests
 
 Built-in functions (only these are allowed):
-  len()    Length of a sequence or string
-  abs()    Absolute value of a number
+  len()       Length of a sequence or string
+  abs()       Absolute value of a number
+  lower()     Lowercase a string, e.g. lower(row['name'])
+  upper()     Uppercase a string
+  strip()     Trim whitespace (or given characters: strip(row['x'], 'z'))
+  casefold()  Aggressive lowercase for caseless matching
 
+Case folding is function-call form only — row['x'].lower() is rejected.
 Type coercion functions (int, str, float, bool) are NOT available.
 Types are guaranteed by the source schema — no coercion is needed in expressions.
 
@@ -234,6 +246,7 @@ Examples:
 Forbidden:
   row.get('field', default)   Default values fabricate data — use 'is not None' test
   int(row['x'])               Type coercion — coerce at source schema instead
+  row['x'] is row['y']        'is'/'is not' compare against None only
   Imports, lambdas, comprehensions, attribute access (except row.get)
 """
 
@@ -1614,7 +1627,9 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
         "csv_fixed_schema_omits_observed_columns",
         "csv_source_blob_header_mismatch",
         "csv_source_field_resolution_error",
+        "gate_expression_preview_memory_exhaustion",
         "gate_expression_type_mismatch_against_source_schema",
+        "gate_expression_unbounded_string_amplification",
         "text_source_url_without_web_scrape",
         "source_inspection_failed",
     }
@@ -1880,6 +1895,37 @@ def _gate_expression_type_diagnostics_for_observed_csv(
             continue
         parser = ExpressionParser(condition)
         field = fields[0] if fields else None
+        if parser.has_string_amplification_risk():
+            # THREAT-001: str repetition / printf-formatting over observed
+            # (string-typed) fields allocates output linear in the literal,
+            # per sampled row, inside the web process. Diagnose IN PLACE OF
+            # evaluating — never evaluate, never silently skip.
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="gate_expression_unbounded_string_amplification",
+                    message=(
+                        f"Gate '{node.id}' condition {condition!r} multiplies or %-formats a field that is "
+                        "string-typed under this observed CSV source. String repetition and formatting "
+                        "allocate output proportional to their inputs, so this expression is not evaluated "
+                        "at preview. If the field is meant to be numeric, declare it in the source schema; "
+                        "if string repetition/formatting is intended, it is not a routable gate condition."
+                    ),
+                    suggested_repair=(
+                        "Patch the source schema to declare the field with an explicit numeric type, for "
+                        "example schema.mode='fixed' or 'flexible' with schema.fields including "
+                        f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
+                    ),
+                    evidence_locator={
+                        "source": "blob",
+                        "blob_id": str(blob_id),
+                        "node_id": node.id,
+                        "field": field,
+                        "fields": list(fields),
+                        "source_schema_mode": "observed",
+                    },
+                )
+            )
+            continue
         for row_index, row in enumerate(rows):
             try:
                 parser.evaluate(row)
@@ -1897,6 +1943,35 @@ def _gate_expression_type_diagnostics_for_observed_csv(
                             "Patch the source schema to declare the compared field with an explicit numeric "
                             "type, for example schema.mode='fixed' or 'flexible' with schema.fields including "
                             f"{field + ': int' if field is not None else '<field>: int'}, then re-run preview_pipeline."
+                        ),
+                        evidence_locator={
+                            "source": "blob",
+                            "blob_id": str(blob_id),
+                            "node_id": node.id,
+                            "field": field,
+                            "fields": list(fields),
+                            "sample_row_index": row_index,
+                            "source_schema_mode": "observed",
+                        },
+                    )
+                )
+                break
+            except MemoryError:
+                # Belt-and-braces behind the amplification predicate: a
+                # resource event must not receive the schema-typing repair.
+                # By the time this fires the process is already degraded, so
+                # the diagnostic is best-effort — the predicate above is the
+                # actual bound.
+                diagnostics.append(
+                    _blocking_diagnostic(
+                        code="gate_expression_preview_memory_exhaustion",
+                        message=(
+                            f"Gate '{node.id}' condition {condition!r} exhausted memory while being "
+                            "evaluated against sampled observed CSV rows at preview. This is a resource "
+                            "failure, not a field-typing mismatch."
+                        ),
+                        suggested_repair=(
+                            "Simplify the gate condition so it does not build large intermediate values, then re-run preview_pipeline."
                         ),
                         evidence_locator={
                             "source": "blob",

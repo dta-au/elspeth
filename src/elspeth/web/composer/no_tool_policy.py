@@ -107,9 +107,42 @@ ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE: Final = (
 ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE: Final = "ELSPETH completed the advisor repair turn. Pipeline readiness was not determined this turn; run validation to confirm the pipeline state."
 
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
-_MUTATION_ACTION_PATTERN: Final = (
-    r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
+
+# THREAT-002: apostrophe confusables. U+2019 was once patched as a lone
+# codepoint, not the class — any codepoint here that the grammars miss
+# suppresses revocation (fail-open to EXPLICIT_MUTATION). NFKC cannot
+# substitute (only U+FF07 folds). All members verified to survive
+# _strip_quoted_text; re-verify that if _QUOTE_TERMINATORS is ever touched.
+_APOSTROPHE_CLASS: Final = "'\u2019\u02bc\uff07\u00b4\u2032"
+_APOSTROPHE_GRAMMAR: Final = f"[{_APOSTROPHE_CLASS}]"
+
+# The canonical mutation-verb vocabulary, as data. BOTH the authority
+# pattern (_MUTATION_ACTION_PATTERN) and the revocation pattern
+# (_WHOLE_REQUEST_ACTION_GRAMMAR) are built from this tuple, so the
+# revocation vocabulary can never silently become a subset of the
+# authority vocabulary again (F4). Multi-word phrases stay ahead of their
+# prefixes so alternation matches longest-first.
+_MUTATION_ACTION_PHRASES: Final[tuple[str, ...]] = (
+    "set this up",
+    "set it up",
+    "set up",
+    "setup",
+    "build",
+    "create",
+    "make",
+    "wire",
+    "add",
+    "update",
+    "modify",
+    "change",
+    "run",
+    "execute",
+    "process",
+    "route",
+    "split",
+    "save",
 )
+_MUTATION_ACTION_PATTERN: Final = "(?:" + "|".join(r"\s+".join(map(re.escape, phrase.split())) for phrase in _MUTATION_ACTION_PHRASES) + ")"
 _CONTROLLED_OBJECT_BODY_GRAMMAR: Final = (
     r"(?:"
     r"[a-z0-9_.-]+\s+to\s+[a-z0-9_.-]+\s+pipeline|"
@@ -131,7 +164,7 @@ _CONTROLLED_COMPLEMENT_GRAMMAR: Final = (
 )
 _DIRECT_MUTATION_GRAMMAR: Final = rf"{_MUTATION_ACTION_PATTERN}\b\s+{_CONTROLLED_OBJECT_GRAMMAR}{_CONTROLLED_COMPLEMENT_GRAMMAR}"
 _POSITIVE_LEAD_GRAMMAR: Final = r"(?:(?:please[\s,]+)|(?:now|actually|just|simply)\s+|go\s+ahead\s+(?:and\s+)?)*"
-_FIRST_PERSON_REQUEST_GRAMMAR: Final = r"(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+|let(?:'|\u2019)s\s+)"
+_FIRST_PERSON_REQUEST_GRAMMAR: Final = rf"(?:(?:i|we)\s+(?:want|need|would\s+like)\s+(?:you\s+)?to\s+|let{_APOSTROPHE_GRAMMAR}s\s+)"
 _SINGLE_CLAUSE_IMPERATIVE_PATTERN: Final = re.compile(
     rf"{_POSITIVE_LEAD_GRAMMAR}(?:{_FIRST_PERSON_REQUEST_GRAMMAR})?"
     rf"{_POSITIVE_LEAD_GRAMMAR}{_DIRECT_MUTATION_GRAMMAR}[.!]?",
@@ -214,8 +247,10 @@ _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
     rf"{_PIPELINE_OPERATION_OBJECT_GRAMMAR}",
     re.IGNORECASE,
 )
-_NEGATED_DO_GRAMMAR: Final = r"(?:do\s+not|don(?:'|\u2019)t)"
-_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|change|create|execute|make|process|run|save|update)"
+_NEGATED_DO_GRAMMAR: Final = rf"(?:do\s+not|don{_APOSTROPHE_GRAMMAR}t)"
+# Same canonical vocabulary as the authority pattern \u2014 see
+# _MUTATION_ACTION_PHRASES. A verb that can authorize can be revoked.
+_WHOLE_REQUEST_ACTION_GRAMMAR: Final = _MUTATION_ACTION_PATTERN
 _WHOLE_REQUEST_TARGET_GRAMMAR: Final = (
     r"(?:anything|any\s+changes?|it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
 )
@@ -309,7 +344,13 @@ type VisibleMessageSegment = AssistantTextSegment | TrustedSystemNoticeSegment
 
 
 class PipelineMutationIntentDecision(Enum):
-    """Closed request-intent decision used at Composer lifecycle gates."""
+    """Closed request-intent decision for authoring-surface selection.
+
+    Not an authority value: ``__bool__`` raises so it can never be consumed
+    as a truthy consent signal. Real mutation authority is
+    ``trust_mode == "explicit_approve"`` (``web/composer/tool_batch.py:563``
+    and ``:965``); see :func:`classify_pipeline_mutation_intent`.
+    """
 
     EXPLICIT_MUTATION = "explicit_mutation"
     CONVERSATIONAL = "conversational"
@@ -572,15 +613,26 @@ def _matches_complete_multi_clause_pipeline_request(message: str) -> bool:
 
 
 def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDecision:
-    """Classify whether the user explicitly authorizes pipeline mutation.
+    """Select the authoring surface for a request — NOT an authority gate.
 
-    Authority requires the complete bounded request to match a closed positive
-    production. Quoted material cannot be elided to manufacture authority;
-    only a complete registered recipe envelope may contain its prescribed
-    quotes. Multi-clause productions require an authorizing pipeline-build or
-    data-source root and reject request revocation. Unmatched governing
-    prefixes, bare questions, unrelated objects, and oversized input fail
-    closed to clarification on the conversational path.
+    This classifier ROUTES (planner vs compose_loop) and gates one
+    repair-prompt nudge; its consumers are surface selection, referential
+    context threading, and disclosure only. Nothing here grants or denies
+    mutation: real mutation authority is ``trust_mode == "explicit_approve"``
+    (``web/composer/tool_batch.py:563`` and ``:965``) plus the tool-call
+    guards (interpretation review, preflight, advisor veto). Its
+    misclassifications fail SAFE — toward clarification — and its recall on
+    open phrasing is poor by construction: a closed vocabulary cannot cover
+    open human language. **Do not wire a consent or authority gate to this
+    predicate.**
+
+    Classification contract: EXPLICIT_MUTATION requires the complete bounded
+    request to match a closed positive production. Quoted material cannot be
+    elided to manufacture a match; only a complete registered recipe envelope
+    may contain its prescribed quotes. Multi-clause productions require a
+    pipeline-build or data-source root and reject request revocation.
+    Unmatched governing prefixes, bare questions, unrelated objects, and
+    oversized input fail closed to clarification on the conversational path.
     """
     if len(message) > _MAX_INTENT_CLASSIFICATION_CHARS:
         return PipelineMutationIntentDecision.AMBIGUOUS
@@ -665,12 +717,14 @@ def carries_build_action(message: str) -> bool:
 def is_referential_pipeline_mutation_intent(message: str) -> bool:
     """Return whether an admitted mutation request depends on prior prose.
 
-    Mutation authority remains wholly owned by
-    :func:`classify_pipeline_mutation_intent`. This second decision reuses that
-    closed grammar, then identifies only deictic request shapes whose current
-    text cannot specify the requested topology by itself. Complete registered
-    recipes are self-contained even if their inline data happens to contain a
-    matching phrase.
+    Surface selection remains wholly owned by
+    :func:`classify_pipeline_mutation_intent` — neither function grants
+    mutation authority (that is ``trust_mode``; see the classifier's
+    docstring). This second decision reuses that closed grammar, then
+    identifies only deictic request shapes whose current text cannot specify
+    the requested topology by itself. Complete registered recipes are
+    self-contained even if their inline data happens to contain a matching
+    phrase.
     """
     if classify_pipeline_mutation_intent(message) is not PipelineMutationIntentDecision.EXPLICIT_MUTATION:
         return False

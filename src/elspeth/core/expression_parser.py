@@ -97,11 +97,23 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
 # Safe built-in functions allowed in expressions (immutable to prevent runtime tampering).
 # Only non-coercive operations are permitted. Coercive builtins (str, int, float, bool)
 # are forbidden because they silently normalize Tier 2 data in gate expressions,
-# masking upstream contract bugs and weakening audit attributability.
+# masking upstream contract bugs and weakening audit attributability. str→str case
+# folding coerces nothing — the no-coercion rule targets TYPE coercion.
+#
+# The str callables MUST be the unbound str.* descriptors, never lambdas:
+# str.lower(5) raises TypeError, which visit_Call wraps into a clean
+# ExpressionEvaluationError; a lambda's AttributeError would ride evaluate()'s
+# crash-through tuple into the caller unwrapped. Do NOT add str-returning
+# entries to _ALWAYS_NUMERIC_BUILTINS, and stop at these four — no replace,
+# split, or format (format is a known sandbox-escape vector).
 _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
     {
         "len": len,
         "abs": abs,
+        "lower": str.lower,
+        "upper": str.upper,
+        "strip": str.strip,
+        "casefold": str.casefold,
     }
 )
 
@@ -119,7 +131,8 @@ _ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
 # also appear here.  This prevents brute-force bypass where defining a
 # handler silently whitelists a new AST construct.
 #
-# Allowed constructs: the validator recurses into them via generic_visit and
+# Allowed constructs: the validator validates their children recursively
+# (some arms via generic_visit, the stateful ones via explicit self.visit) and
 # _ExpressionEvaluator has a visit_* arm for every one of them (both enforced
 # at import time by _assert_visitor_coupling below).
 _ALLOWED_EXPR_TYPES: frozenset[type] = frozenset(
@@ -448,7 +461,7 @@ class _ExpressionValidator(ast.NodeVisitor):
 # grew its fail-closed visit()) silently evaluating to None.
 def _assert_visitor_coupling(visitor_cls: type, expected_type_names: set[str], *, label: str) -> None:
     """Raise TypeError unless visitor_cls's visit_* arms match expected_type_names exactly."""
-    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_") and name != "visit"}
+    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_")}
     missing_handlers = expected_type_names - visitor_method_names
     orphan_visitors = visitor_method_names - expected_type_names
     if missing_handlers or orphan_visitors:
@@ -725,7 +738,9 @@ class ExpressionParser:
     Allowed operations:
     - Subscript access: name['field'], name['key1']['key2']
     - Method: name.get('field') (single-arg only — defaults are fabrication)
-    - Safe builtins: len(), abs()
+    - Safe builtins: len(), abs(), lower(), upper(), strip(), casefold()
+      (case folding is function-call form only — row['x'].lower() stays
+      forbidden; attribute access remains closed to name.get)
     - Comparisons: ==, !=, <, >, <=, >=
     - Boolean operators: and, or, not
     - Membership: in, not in
@@ -909,6 +924,34 @@ class ExpressionParser:
                 return self._is_numeric_constant(node.left) or self._is_numeric_constant(node.right)
 
         # Field access, ambiguous ops, ternaries, str-returning calls: routable.
+        return False
+
+    def has_string_amplification_risk(self) -> bool:
+        """Check if the expression contains a Mult/Mod whose operand can be a string.
+
+        THREAT-001 counterpart to is_provably_non_routable(): str repetition
+        (``s * n``) and printf-style formatting (``fmt % x``) allocate output
+        linear in their inputs, and the same property that keeps Mult/Mod
+        routable exempts them from the non-routable guard. Callers that
+        evaluate expressions against untrusted-size data (preview sampling)
+        use this to refuse evaluation up front.
+
+        CONSERVATIVE by polarity, not node shape: an operand "can be a
+        string" unless ``_is_non_routable_node`` proves it numeric, so
+        str-returning Call operands fire the moment such builtins exist in
+        ``_SAFE_BUILTINS``.
+        """
+        return self._node_has_string_amplification(self._ast.body)
+
+    def _node_has_string_amplification(self, node: ast.expr) -> bool:
+        """True if any Mult/Mod BinOp under ``node`` has a can-be-string operand."""
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.BinOp)
+                and isinstance(child.op, (ast.Mult, ast.Mod))
+                and (not self._is_non_routable_node(child.left) or not self._is_non_routable_node(child.right))
+            ):
+                return True
         return False
 
     def static_field_reads(self, name: str = "row") -> StaticFieldReads:

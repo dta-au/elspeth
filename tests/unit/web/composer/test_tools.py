@@ -3710,6 +3710,82 @@ class TestDiscoveryTools:
         assert "row" in grammar
         assert isinstance(grammar, str)
 
+    def test_expression_grammar_documents_every_operator(self) -> None:
+        """Text↔parser doc-parity tripwire: every operator the parser accepts
+        has a token in the served Operators section (A4).
+
+        The operator sets map AST types to callables, so the token table here
+        is hand-maintained — the completeness assertion runs FIRST so an
+        operator added to the parser without a table entry fails loudly
+        before any text check.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import (
+            _BINARY_OPS,
+            _BOOL_OPS,
+            _COMPARISON_OPS,
+            _SAFE_CONSTANTS,
+            _UNARY_OPS,
+        )
+
+        token_table: dict[type, str] = {
+            _ast.Eq: "==",
+            _ast.NotEq: "!=",
+            _ast.Lt: "<",
+            _ast.LtE: "<=",
+            _ast.Gt: ">",
+            _ast.GtE: ">=",
+            _ast.Is: "is",
+            _ast.IsNot: "is not",
+            _ast.In: "in",
+            _ast.NotIn: "not in",
+            _ast.Add: "+",
+            _ast.Sub: "-",
+            _ast.Mult: "*",
+            _ast.Div: "/",
+            _ast.FloorDiv: "//",
+            _ast.Mod: "%",
+            _ast.Not: "not",
+            _ast.USub: "-",
+            _ast.UAdd: "+",
+            _ast.And: "and",
+            _ast.Or: "or",
+        }
+        # Completeness before text: an unmapped operator must fail here, not
+        # silently skip the documentation check.
+        assert set(token_table) == set(_COMPARISON_OPS) | set(_BINARY_OPS) | set(_UNARY_OPS) | set(_BOOL_OPS)
+
+        grammar = get_expression_grammar()
+        operators_section = grammar.split("Operators:")[1].split("Built-in functions")[0]
+        for op_type, token in token_table.items():
+            assert token in operators_section, f"{op_type.__name__} token {token!r} missing from Operators section"
+
+        # Safe constants are part of the accepted grammar too.
+        for constant in _SAFE_CONSTANTS:
+            assert constant in grammar, f"constant {constant!r} undocumented"
+
+    def test_expression_grammar_documents_every_builtin_bidirectionally(self) -> None:
+        """Text↔parser doc-parity for builtins, both directions (A4).
+
+        Every key of _SAFE_BUILTINS appears in the Built-in functions
+        section, and nothing is documented there that is not in the set —
+        so growing _SAFE_BUILTINS without the text update (or vice versa)
+        fails here, inside the same commit.
+        """
+        import re as _re
+
+        from elspeth.core.expression_parser import _SAFE_BUILTINS
+
+        grammar = get_expression_grammar()
+        builtins_section = grammar.split("Built-in functions")[1].split("Type coercion functions")[0]
+
+        for name in _SAFE_BUILTINS:
+            assert f"{name}(" in builtins_section, f"builtin {name!r} undocumented"
+
+        documented = set(_re.findall(r"^\s*([a-z_]+)\(", builtins_section, flags=_re.MULTILINE))
+        assert documented == set(_SAFE_BUILTINS), f"documented builtins {sorted(documented)} != parser set {sorted(_SAFE_BUILTINS)}"
+
 
 class TestToolDefinitions:
     def test_all_have_json_schema(self) -> None:
@@ -10728,6 +10804,62 @@ class TestSetPipeline:
         assert result.success is False
         assert "Invalid gate condition syntax" in result.data["error"]
 
+    def test_value_transform_bad_expression_error_code_parity(self) -> None:
+        """Both authoring routes code the same prevalidation failure (A6).
+
+        The same _prevalidate_transform_for_context failure was returned
+        UNCODED on upsert_node but coded plugin_options_invalid on
+        set_pipeline, so explain_validation_error misdiagnosed the
+        upsert_node path. Parity is pinned so it cannot drift back.
+        """
+        bad_operations = [{"target": "out", "expression": "title(row['text'])"}]
+
+        catalog = _mock_catalog()
+        r1 = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "t1",
+                "options": {"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
+                "on_validation_failure": "quarantine",
+            },
+            _empty_state(),
+            catalog,
+        )
+        node_result = execute_tool(
+            "upsert_node",
+            {
+                "id": "t1",
+                "node_type": "transform",
+                "plugin": "value_transform",
+                "input": "t1",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}, "operations": bad_operations},
+            },
+            r1.updated_state,
+            catalog,
+        )
+        assert node_result.success is False
+
+        args = _valid_pipeline_args()
+        args["nodes"].append(
+            {
+                "id": "t_bad",
+                "node_type": "transform",
+                "plugin": "value_transform",
+                "input": "source_out",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}, "operations": bad_operations},
+            }
+        )
+        pipeline_result = execute_tool("set_pipeline", args, _empty_state(), catalog)
+        assert pipeline_result.success is False
+
+        assert pipeline_result.data["error_code"] == "plugin_options_invalid"
+        assert node_result.data.get("error_code") == pipeline_result.data["error_code"]
+
     def test_set_pipeline_gate_valid_condition_accepted(self) -> None:
         """set_pipeline accepts gate nodes with valid conditions."""
         state = _empty_state()
@@ -15407,6 +15539,109 @@ class TestPreviewProofStep:
         assert mismatch[0]["evidence_locator"]["node_id"] == "price_gate"
         assert mismatch[0]["evidence_locator"]["field"] == "price"
         assert result.data["is_valid"] is False
+
+    def test_observed_csv_string_amplification_gate_blocks_without_evaluating(self, monkeypatch) -> None:
+        """A Mult over an observed (string-typed) field must be diagnosed
+        BEFORE evaluation, never evaluated at preview (THREAT-001).
+
+        ``row['price'] * 100000`` on observed CSV is str-repetition: sampling
+        would allocate the amplified string per sampled row inside the web
+        process. The amplification diagnostic replaces evaluation entirely.
+        """
+        from elspeth.core.expression_parser import ExpressionParser
+
+        state = self._state_with_csv_source(schema_mode="observed")
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "amp_gate",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "row['price'] * 100000",
+                "routes": {"true": "out", "false": "out"},
+                "options": {},
+            },
+            state,
+            _mock_catalog(),
+        )
+        assert result.success, result.data
+
+        evaluated_expressions: list[str] = []
+        original_evaluate = ExpressionParser.evaluate
+
+        def counting_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
+            evaluated_expressions.append(repr(self))
+            return original_evaluate(self, context)
+
+        monkeypatch.setattr(ExpressionParser, "evaluate", counting_evaluate)
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            result.updated_state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        amplification = [d for d in diagnostics if d["code"] == "gate_expression_unbounded_string_amplification"]
+        assert amplification, diagnostics
+        assert amplification[0]["severity"] == "blocking"
+        assert amplification[0]["evidence_locator"]["node_id"] == "amp_gate"
+        assert result.data["is_valid"] is False
+        # The mechanism, not just the symptom: the amplifying condition was
+        # never evaluated against sampled rows.
+        assert not any("100000" in expr for expr in evaluated_expressions), evaluated_expressions
+        # And the new branch did not misfile the finding as a type mismatch.
+        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+        assert not mismatch, mismatch
+
+    def test_observed_csv_memory_error_yields_resource_code(self, monkeypatch) -> None:
+        """MemoryError during sampled-row evaluation gets its own resource
+        diagnostic, not the schema-typing repair (belt-and-braces arm)."""
+        from elspeth.core.expression_parser import ExpressionParser
+
+        state = self._state_with_csv_source(schema_mode="observed")
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "oom_gate",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "row['price'] >= 100",
+                "routes": {"true": "out", "false": "out"},
+                "options": {},
+            },
+            state,
+            _mock_catalog(),
+        )
+        assert result.success, result.data
+
+        def exploding_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
+            raise MemoryError("simulated allocation failure")
+
+        monkeypatch.setattr(ExpressionParser, "evaluate", exploding_evaluate)
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            result.updated_state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+        diagnostics = result.data["proof_diagnostics"]
+        resource = [d for d in diagnostics if d["code"] == "gate_expression_preview_memory_exhaustion"]
+        assert resource, diagnostics
+        assert resource[0]["severity"] == "blocking"
+        assert resource[0]["evidence_locator"]["node_id"] == "oom_gate"
+        # A resource event must not receive the schema-typing repair.
+        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+        assert not mismatch, mismatch
 
     def test_observed_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Observed CSV strings must not reach numeric batch_stats at runtime.
