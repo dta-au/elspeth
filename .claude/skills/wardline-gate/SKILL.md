@@ -17,12 +17,9 @@ receive validated data). When untrusted data reaches a trusted producer it raise
 
 ## The loop
 
-1. **Scan.** From the selected ELSPETH checkout, run
-   `.venv/bin/python scripts/wardline_gate.py`. This wrapper supplies the
-   project's configuration and exact local vocabulary grants, requests the
-   agent summary, and rejects an otherwise-green inert or zero-boundary scan.
-   A bare `wardline scan` (CLI or MCP) is useful for diagnosis but is not this
-   project's acceptance gate.
+1. **Scan.** Run `wardline scan . --fail-on ERROR` (or call the `scan` MCP tool).
+   Read the gate verdict and the active (non-suppressed) findings — `active` is
+   the population the gate enforces on.
 2. **Explain.** For each active defect, call `explain_taint` (MCP) or run
    `wardline explain-taint <fingerprint> [PATH]` (CLI) with the finding's
    `fingerprint`, and its `qualname` as `sink_qualname`. Do this
@@ -33,11 +30,19 @@ receive validated data). When untrusted data reaches a trusted producer it raise
    where untrusted data should have been checked — not a band-aid at the sink.
 4. **Re-scan.** Confirm the finding is gone.
 
-## Exit codes (project gate)
+## MCP-safe scans
 
-- `0` — clean and non-inert.
-- `1` — active `ERROR` findings, or an inert/zero-boundary scan.
-- `2` — a Wardline or configuration error. Not a finding.
+Before any MCP scan on a large or unfamiliar checkout, read
+`references/mcp-safe-scans.md` next to this file: the `strict_defaults` trap
+(`true` DISCARDS the repo's `weft.toml` scope, policy, and packs — it is not
+"strictest"), the asynchronous `scan_job_start`/`scan_job_status`/
+`scan_job_cancel` surface, response bounding, and pack loading.
+
+## Exit codes (CLI path)
+
+- `0` — clean (or gate not requested).
+- `1` — the gate tripped: a non-suppressed defect at/above `--fail-on`.
+- `2` — a wardline error (bad config, unreadable path). Not a finding.
 
 Branch on the code. On a trip, read the structured report wardline just wrote —
 the finding names the function, file, and lines, which is enough to locate the
@@ -58,16 +63,15 @@ non-issue, always with a reason:
   loud with no API key so "couldn't triage" is never mistaken for "nothing to
   triage". Above-floor false positives can be recorded as audited suppressions.
 
-## Project gate vs diagnostic interfaces
+## CLI vs MCP
 
-- **ELSPETH gate:** `.venv/bin/python scripts/wardline_gate.py`. Run this before
-  handing back code that touches external input.
-- **Diagnostic CLI:** `wardline scan`, `wardline explain-taint`, `wardline findings`
+- **CLI:** `wardline scan`, `wardline explain-taint`, `wardline findings`
   (read-only filtered query: `--rule-id` / `--severity` / `--sink` or a JSON
   `--where`), `wardline judge`, `wardline baseline create/update`.
   Branch on the exit code; read the findings file it writes.
-- **Diagnostic MCP:** `wardline mcp` exposes `scan`, `explain_taint`, `fix`, `judge`
-  (network), `baseline`, `waiver_add`; resources
+- **MCP:** `wardline mcp` exposes `scan`, `explain_taint`, `fix`, `judge`
+  (network), `baseline`, `waiver_add`, and the asynchronous
+  `scan_job_start` / `scan_job_status` / `scan_job_cancel` surface; resources
   `wardline://vocab|rules|config|config-schema`; and the `wardline:loop` prompt.
-  The server is stateless — the read-only tools are pure functions of your code
-  on disk and your config.
+  Treat scans as potentially side-effecting: they write local cache/artifact
+  state, and configured integrations can perform network writes.

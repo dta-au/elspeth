@@ -174,8 +174,36 @@ Full reference: the `legis-workflow` skill, `legis --help`, MCP schemas.
 
 <!-- wardline:instructions:v1:bcd19330 -->
 <!-- wardline:last-writer:wardline install -->
-This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `.venv/bin/python scripts/wardline_gate.py` (exit 0 = clean and non-inert, 1 = active ERROR findings or an inert/zero-boundary gate, 2 = Wardline/configuration error) and fix genuine findings at the boundary, not the sink. The project command supplies the exact trust grants for ELSPETH's local vocabulary pack and rejects Wardline's otherwise-green inert posture; a bare `wardline scan` is not this project's gate. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill.
+This project uses **wardline** as its trust-boundary gate. Before handing back code that touches external input, run `wardline scan . --fail-on ERROR` (exit 0 = clean, 1 = gate tripped, 2 = wardline error) and fix findings at the boundary, not the sink. The full scan -> explain -> fix -> rescan loop and the baseline-vs-waiver discipline live in the `wardline-gate` skill and in `docs/agents.md`.
 <!-- /wardline:instructions -->
+
+### ELSPETH's Wardline invocation
+
+The block above is written and overwritten by `wardline install`; do not edit
+inside it. Two project facts it cannot express:
+
+1. **A bare `wardline scan .` does not gate this repo.** ELSPETH marks its Tier-3
+   boundaries with its own `@trust_boundary`
+   (`src/elspeth/contracts/trust_boundary.py`), whose metadata the elspeth-lints
+   tier model also consumes; `scripts/wardline_pack.py` maps that vocabulary onto
+   Wardline's grammar. Wardline only trusts a pack when the *caller* grants it —
+   there is no machine-level trust store — so an invocation without
+   `--trust-pack scripts.wardline_pack --allow-custom-packs` errors on the pack
+   and still **exits 0**.
+2. **Wardline exits 0 on an inert scan.** A run that recognises zero boundaries is
+   indistinguishable from a clean one by exit code alone.
+
+So the gate of record is `.venv/bin/python scripts/wardline_gate.py` (exit 0 =
+clean *and* non-inert, 1 = active ERROR findings or an inert/zero-boundary gate,
+2 = Wardline/configuration error). It passes the grants above and asserts
+`resolution.inert is False` with a positive `recognized_boundaries`. The
+`mcp__wardline__*` tools are equivalent because `.mcp.json` carries the same
+grants at server launch.
+
+Re-run the installer as **`wardline install --no-pre-commit`** — the whole-tree
+scan belongs in CI, not the commit path (see the header contract in
+`.pre-commit-config.yaml`). Everything else is Wardline's to own: let it rewrite
+its own block and skill rather than hand-patching them.
 
 ## Judge-signature stage (tier-model allowlist signing)
 
