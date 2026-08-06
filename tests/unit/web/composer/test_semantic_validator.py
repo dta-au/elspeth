@@ -1612,6 +1612,66 @@ class TestSinkSemanticAcceptanceCriteria:
         assert sink_edge.consumer_plugin == "text"
         assert [warning.component for warning in warnings] == ["output:sink"]
 
+    def test_llm_through_an_intervening_transform_to_a_text_sink_is_not_blocked(self) -> None:
+        """g11's ACTUAL topology, and the single most important limit of this change.
+
+        The pipeline that failed was `llm source -> aws_bedrock_content_safety
+        -> text sink`: a transform sits BETWEEN the generative producer and the
+        sink (``passthrough`` stands in for it here — any transform declaring
+        no output semantics reproduces the shape).
+
+        Semantic facts are deliberately NOT propagated through an intervening
+        transform, so the fact chain stops at that transform: the sink edge
+        reports ``passthrough`` as its producer with NO facts, and grades
+        UNKNOWN — an advisory. It is emphatically NOT the hard CONFLICT that
+        the DIRECT `llm -> text` edge now earns
+        (``test_llm_to_text_sink_is_a_hard_conflict``).
+
+        So the change does not, by itself, prevent the exact pipeline that
+        produced g11. That is the honest scope and it is deliberate, not an
+        oversight. Propagating an upstream producer's claim across a transform
+        that has declared nothing would be inventing a fact: the transform is
+        free to rewrite the field, and `aws_bedrock_content_safety` genuinely
+        might. Blocking on it instead would refuse every composition with an
+        undeclared middle transform — the same over-blocking that refused
+        `llm -> line_explode` and left the user's goal unauthorable
+        (elspeth-b6d9f04827).
+
+        If propagation ever lands this becomes SATISFIED or CONFLICT; re-point
+        this test at the new truth, do not delete it.
+        """
+        state = _sink_state(
+            producer=_llm_node(on_success="screen_in"),
+            sink_plugin="text",
+            sink_field="announcement",
+        )
+        screen = _transform_node(
+            id="screen",
+            plugin="passthrough",
+            input="screen_in",
+            on_success="sink",
+            options={"schema": {"mode": "flexible", "fields": ["announcement: str"]}},
+        )
+        state = state.with_node(screen)
+
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.UNKNOWN, (
+            "an intervening transform must degrade the sink edge to an advisory. CONFLICT here would mean "
+            "propagation landed silently; SATISFIED would mean a fact was invented for a transform that declared none."
+        )
+        assert edge.producer_plugin == "passthrough", (
+            "the sink's producer is the transform immediately upstream, not the llm behind it — this is the broken fact chain made visible"
+        )
+        assert edge.producer_facts is None, "passthrough declares nothing, so there are no facts to compare"
+        assert edge.consumer_plugin == "text"
+
+        assert errors == (), "g11's real topology must NOT be refused — the block lands only on the direct edge"
+        assert [warning.component for warning in warnings] == ["output:sink"], (
+            "the gap must still be disclosed on the sink edge, and nothing else may warn"
+        )
+
 
 class TestSinkFanIn:
     """A sink takes MANY producers. The rule is conservative: ANY conflict blocks."""
