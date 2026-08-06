@@ -63,6 +63,9 @@ _FAILED_STATE_CORRELATION_SCAN_LIMIT = 50
 # Exact matches are exempt at any length: a candidate equal to the whole message
 # is positive identification, not a fragment that happens to appear in one.
 _MINIMUM_SUBSTRING_CORRELATION_LENGTH = 12
+# ExecutionError.exception_type values written by SinkExecutor's diversion
+# anchors (discard mode and the failsink primary anchor respectively).
+_DIVERSION_ERROR_TYPES = frozenset({"SinkDiscard", "SinkDiversion"})
 
 _SafeFailureClassification = Literal[
     "authentication_failed",
@@ -238,6 +241,18 @@ def _node_state_error_correlating_exception(error_json: str | None, operation_er
         # projection to scope attribution, never fail the diagnostics read.
         return None
     if not isinstance(payload, dict):
+        return None
+    if payload.get("type") in _DIVERSION_ERROR_TYPES:
+        # A diverted row is never the cause of a failed operation: its batch
+        # effect published, and the operation that failed is a different one.
+        # This was structurally unreachable while these states recorded only
+        # `effect-diversion:<hash>`, which could not appear inside another
+        # exception's message. Now that they disclose the sink's own prose
+        # (elspeth-9595abb7b0), a diversion sharing a driver-error phrase with a
+        # genuinely failed operation could out-rank the true raiser and point
+        # the operator at a sink that merely dropped a row. Excluded by kind
+        # rather than left to the substring gate, because the kind is exactly
+        # what makes it a non-cause.
         return None
     candidate = payload.get("exception")
     if not isinstance(candidate, str) or not candidate.strip():

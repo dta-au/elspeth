@@ -910,6 +910,44 @@ class SinkExecutor:
             primary_effect_id_by_token={member.token_id: member.effect_id for member in durable_members},
         )
 
+    @staticmethod
+    def _disclosable_diversion_reason(*, reason: str, reason_hash: str) -> str:
+        """The sink's own reason when it can be disclosed verbatim, else the hash form.
+
+        One rule for both diversion anchors, so exactly one invariant holds on
+        every path: what lands in ``ExecutionError.exception`` is EITHER the
+        verbatim reason — which ``_write_primary_effect`` proved hashes to
+        ``reason_hash`` before building the ``RowDiversion`` — OR the
+        ``effect-diversion:<hash>`` form naming that same evidence. Nothing else
+        is ever recorded, so the ``diversion_reason_hash`` in ``context`` always
+        checks out against the text sitting beside it.
+
+        Two independent conditions force the hash form:
+
+        * A recovered batch has no live diversion log, so ``RowDiversion.reason``
+          is already this exact string (``_write_primary_effect``).
+        * A reason quoting a driver error can trip the audit scrubber, which
+          replaces the WHOLE string rather than the matched span. Falling back
+          here rather than letting ``ExecutionError`` scrub in place is the
+          difference between "no disclosure, still checkable" and
+          "``<redacted-secret>`` whose neighbouring hash it does not match" —
+          precisely for the sinks whose reasons are most worth reading
+          (``database_sink`` constraint violations, ``dataverse`` HTTP bodies).
+
+        Decided per TOKEN, not per batch. A crash between two
+        ``complete_node_state`` calls can split one batch's anchors across a
+        live and a recovered attempt (``_open_or_reuse_effect_states``,
+        elspeth-d1a1399381), leaving some tokens with prose and some with the
+        hash form. That is tolerable because both texts are honest and both are
+        checkable — unlike ``output_data``, which feeds ``output_hash`` and is
+        therefore held to the hash form on every path so one logical state
+        cannot hash differently by recovery provenance.
+        """
+        hash_form = f"effect-diversion:{reason_hash}"
+        if reason == hash_form or scrub_text_for_audit(reason) != reason:
+            return hash_form
+        return reason
+
     def _handle_failsink_effect_diversions(
         self,
         *,
@@ -1089,7 +1127,22 @@ class SinkExecutor:
                     status=NodeStateStatus.FAILED,
                     output_data={"diverted_to": failsink_name, "reason_hash": reason_hash},
                     duration_ms=0.0,
-                    error=ExecutionError(exception=reason["diversion_reason"], exception_type="SinkDiversion", phase="write"),
+                    # Same audit column and same disclosure contract as the
+                    # discard anchor, so it gets the same treatment: a quarantined
+                    # row's primary state named only the hash, leaving failsink
+                    # mode as undiagnosable as discard mode was
+                    # (elspeth-9595abb7b0). The routing event above keeps the hash
+                    # form — that is a typed routing payload, not the operator's
+                    # reason surface.
+                    error=ExecutionError(
+                        exception=self._disclosable_diversion_reason(
+                            reason=diversion_by_index[index].reason,
+                            reason_hash=reason_hash,
+                        ),
+                        exception_type="SinkDiversion",
+                        phase="write",
+                        context={"diversion_reason_hash": reason_hash},
+                    ),
                 )
             elif isinstance(current, NodeStateFailed):
                 events = self._factory.query.get_routing_events(current.state_id)
@@ -1126,25 +1179,23 @@ class SinkExecutor:
         every surface at once (elspeth-9595abb7b0).
 
         ``output_data`` deliberately keeps the hash form while ``error`` carries
-        the reason. Only the former is hashed into ``output_hash``, and the live
-        reason is unavailable to a recovered batch, so disclosing it there would
-        make one logical state hash differently depending on whether it was
-        recovered.
+        the reason: only the former is hashed into ``output_hash``, which must
+        not depend on whether the state was recovered. See
+        ``_disclosable_diversion_reason`` for what ``error`` may hold and why
+        that field can afford to vary where ``output_data`` cannot.
         """
         discard_count = 0
         # Discard mode: complete primary states and record DIVERTED outcomes.
         # No routing_event (no DAG edge for discard), no failsink write.
         for token, idx, primary_state in primary_divert_states:
             recovery_stable_reason = f"effect-diversion:{diversion_reason_hashes[idx]}"
-            # The sink's own words. _write_primary_effect proved this string
-            # hashes to the durable attribution before building the RowDiversion,
-            # and already substitutes `recovery_stable_reason` when a recovered batch has
-            # no live diversion log — so this degrades to the old text rather
-            # than inventing one. ExecutionError scrubs it (reasons quoting a
-            # driver error can carry row values, e.g. database_sink constraint
-            # violations), and the reason hash rides along in `context` so the
-            # disclosed text stays checkable against the durable evidence.
-            disclosed_reason = diversion_by_index[idx].reason
+            # The sink's own words when they can be disclosed verbatim, else the
+            # hash form; the reason hash rides along in `context` either way, so
+            # the recorded text always checks out against the durable evidence.
+            disclosed_reason = self._disclosable_diversion_reason(
+                reason=diversion_by_index[idx].reason,
+                reason_hash=diversion_reason_hashes[idx],
+            )
 
             # FAILED — the row didn't reach its destination (discarded).
             discard_error = ExecutionError(

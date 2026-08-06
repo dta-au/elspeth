@@ -105,6 +105,56 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
     ]
 
 
+def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> None:
+    """One discarded token counts once however many failed sink states it has.
+
+    This is the whole reason attribution uses a correlated scalar subquery
+    rather than a join: a join emits one row per failed sink state, which would
+    push the sink_discard stage total past ``sink_discards`` and trip
+    ``DiscardSummary``'s balance check.
+    """
+    setup = make_recorder_with_run(run_id="sink-discard-fanout-run", source_node_id="source-0")
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        data={"payload": "x"},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    token = setup.data_flow.create_token(row.row_id)
+    for step_index, sink_name in enumerate(("sink_first", "sink_second")):
+        sink_id = register_test_node(
+            setup.data_flow,
+            setup.run_id,
+            sink_name,
+            node_type=NodeType.SINK,
+            plugin_name="text",
+        )
+        node_state = setup.execution.begin_node_state(token.token_id, sink_id, setup.run_id, step_index, {"payload": "x"})
+        setup.execution.complete_node_state(
+            node_state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=1.0,
+            error=ExecutionError(exception="sink refused the row", exception_type="SinkDiscard", phase="write"),
+        )
+    setup.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.SINK_DISCARDED,
+        sink_name=DISCARD_SINK_NAME,
+        error_hash="d" * 64,
+    )
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    # The balance check inside DiscardSummary would already have rejected an
+    # inflated stage total, so reaching this assertion is itself the evidence.
+    assert summary.total == 1
+    assert summary.sink_discards == 1
+    assert sum(stage.count for stage in summary.stages if stage.stage == "sink_discard") == 1
+
+
 def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> None:
     setup = make_recorder_with_run(run_id="gate-error-discard-summary-run", source_node_id="source-0")
     gate_id = register_test_node(
