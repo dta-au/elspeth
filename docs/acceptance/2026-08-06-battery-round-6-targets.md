@@ -57,6 +57,48 @@ spent on Level 2.
 | 7 | `elspeth-obs-340d35c55c` — `type_coerce.conversions` shape undiscoverable without `get_plugin_schema` | 4/4 blind composes spent a repair turn on list-vs-dict; the 1 schema-first compose got it right; ~10% of a 240s envelope per occurrence | Carry the shape in `composer_hints` or the discovery digest |
 | 8 | `elspeth-obs-62c0f57b6d` — two discard surfaces report 0 and 6 for the same run | `/diagnostics` discards `[]`/0 vs `discard_summary.total` 6; reason on a third surface | Resolve with `elspeth-47fa7c01eb` (its readable-but-uninformative sibling) — unify or rename the vocabularies |
 
+## Rapid re-test protocol (operator-selected priorities, 2026-08-06)
+
+The operator's burn-down order is `41bcaa882e` → `9d59c33480` →
+`09c91778f5` (labelled `priority-next`). **When those fixes land, run this
+targeted pass instead of a full battery.** Everything below assumes the
+Sydney stack is still up — **its cleanup deadline is 2026-08-09**; after
+teardown this protocol needs a fresh install first, which changes its cost
+by an order of magnitude.
+
+Common mechanics: pin the fix SHA; one full `pytest tests/ -n 12` + lints +
+wardline at the pin (the fix sessions own their own merge gates — this is
+the acceptance pin); rebuild/push images (`r4_build_images.sh` from the
+detached worktree; expect the immutable-tag refusal, push under a new
+suffixed tag); respin the live TD images-only (`r5_respin_web_td.py`
+pattern); label driver sessions `--round r5p` so the cost/advisor cohorts
+stay separable. **Roll the service to the parity TD (`:3`-equivalent, 270s)
+first** — the stock 240 would confound g08/g04 timings with the envelope
+question.
+
+1. **`41bcaa882e` (row_union suggestion)** — L1 off-stack: rebuild the
+   g08-s2 authored form (`r5-preserve/elspeth-battery-r5-A/g08-s2/state.json`
+   is the fixture) and assert the edge failure now carries a non-null
+   suggestion naming an option the node actually has. L2 live: `drive_graph`
+   g08-s1/s2/s3 — **3/3 clean is the `902fc354b2` unblock**. Record whether
+   each sample *authored* the failing form (repair exercised) or avoided it
+   (prevention); either passes, the report must say which.
+2. **`9d59c33480` (review byte-match)** — L1: a draft with decoded newlines
+   round-trips through `request_interpretation_review` under the fixed
+   contract. L2 live: `drive_graph` g04 ×2 (the loop recurred 2/2) —
+   review surfaced **in-band**, no driver `/resolve` rescue, inside the
+   parity wall; expect the compose to shorten by the ~40–110s the loop
+   burned.
+3. **`09c91778f5` (envelope)** — branches on the product decision. (a)
+   Package raise: all legs together (ALB idle_timeout, transport ceiling,
+   timeout, **and** the `f8873e2a9` plan-time cap), `terraform plan` clean at
+   the new values, doctor green, then `drive_graph` g03 ×1 at the new
+   package render — round-5 datum says it needs ≥ ~500s end-to-end and is
+   the round's most expensive compose (~USD 0.88); also confirm g09 gains
+   real margin (it settled 4.3s inside 270). (b) Corpus note: no live test —
+   verify the shipped docs state g03 (and marginal g09) exceed the stock
+   envelope.
+
 ### Carried into round 6 (not faults; owed verification)
 
 - **g01 + g02 second stochastic pass** — both CONFIRMED 3/3 and 4/4 this
