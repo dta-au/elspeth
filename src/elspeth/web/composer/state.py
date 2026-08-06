@@ -22,6 +22,7 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import TransformProtocol
+from elspeth.contracts.data import check_compatibility
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
     SchemaConfig,
@@ -3494,6 +3495,78 @@ def _check_schema_contracts(
         schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
         return schema_config is not None and not schema_config.is_observed
 
+    def _edge_field_type_conflict(producer: ProducerEntry, node: NodeSpec) -> ValidationEntry | None:
+        """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
+
+        Stage 1's edge-contract accounting compares field NAMES only, so a
+        producer declaring ``age: int`` into a consumer declaring ``age: str``
+        validated green while the DAG build raised ``EdgeContractError``
+        (elspeth-f2eb8fef9f) — a divergence needing no coalesce, no row_union
+        and no special topology.
+
+        Reuses the CANONICAL checker rather than reimplementing type
+        comparison: both declarations are built into their PluginSchema via
+        ``build_coalesce_schema`` — the same factory
+        ``row_union_schema_configs_compatible`` uses — and compared with
+        ``contracts/data.py::check_compatibility``, which the runtime reaches
+        through ``validate_single_edge``. Coercion and strictness rules
+        therefore cannot drift between the two surfaces (the Shape 18
+        precedent, elspeth-85f3cc3022).
+
+        Only ``type_mismatches`` is reported. ``missing_fields`` is the
+        name-direction check the surrounding loop already owns, and
+        ``extra_fields`` belongs to the Rule A/B extras walkers; reporting
+        them here would double-attribute one defect.
+
+        Callers gate on ``_producer_is_typed_source``, which is the runtime's
+        own Phase-2 bypass — observed sources and transform/gate/coalesce
+        producers resolve to a dynamic effective producer schema at runtime and
+        are skipped there, so they are skipped here too.
+        """
+        # Deferred like ``row_union_schema_configs_compatible`` below: the
+        # composer's authoring surface does not import ``core.dag`` at module
+        # scope.
+        from elspeth.core.dag.models import GraphValidationError
+        from elspeth.core.dag.schema_factory import build_coalesce_schema
+
+        try:
+            producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+            consumer_options = node.options
+            consumer_owner = f"node:{node.id}"
+            if node.node_type == "aggregation":
+                consumer_options, consumer_owner = get_aggregation_contract_options(node.options, owner=consumer_owner)
+            consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
+        except ValueError:
+            # Malformed declarations own their rejection through the
+            # ``contract_config_invalid`` parsers; do not double-report.
+            return None
+
+        if producer_schema_config is None or consumer_schema_config is None:
+            return None
+        if consumer_schema_config.is_observed:
+            return None
+        if producer_schema_config.fields is None or consumer_schema_config.fields is None:
+            return None
+
+        try:
+            producer_schema = build_coalesce_schema(producer_schema_config)
+            consumer_schema = build_coalesce_schema(consumer_schema_config)
+        except GraphValidationError:
+            # The factory rejects field-less configs; both sides are known to
+            # declare fields here, so this is an abstention, not a verdict.
+            return None
+
+        mismatches = check_compatibility(producer_schema, consumer_schema).type_mismatches
+        if not mismatches:
+            return None
+        detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)
+        return _err(
+            f"node:{node.id}",
+            f"Schema contract violation: '{producer.producer_id}' -> '{node.id}'. Incompatible field types: {detail}.",
+            "high",
+            "edge_field_type_incompatible",
+        )
+
     for node in nodes:
         consumer_required, consumer_required_error = _parse_node_required_fields(node)
         if consumer_required_error is not None:
@@ -3574,6 +3647,9 @@ def _check_schema_contracts(
         contract_required = consumer_required
         if producer_is_typed_source:
             contract_required = consumer_required | consumer_effective_required
+            type_error = _edge_field_type_conflict(actual_producer, node)
+            if type_error is not None:
+                errors.append(type_error)
 
         if contract_required:
             contract_missing_fields = contract_required - producer_guaranteed

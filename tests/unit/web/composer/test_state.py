@@ -3348,6 +3348,68 @@ class TestSchemaContractValidation:
             on_write_failure="discard",
         )
 
+    def _make_typed_edge_state(self, producer_type: str, consumer_type: str) -> CompositionState:
+        """Build csv(fixed age:<producer_type>) -> value_transform(fixed age:<consumer_type>) -> sink.
+
+        The two calls differ ONLY in the declared field type, so a test that
+        pins the mismatch against its own type-agreeing control cannot pass by
+        accident on an unrelated error (elspeth-f2eb8fef9f). See the clean-probe
+        rule in the module docstring of the agreement suite.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={"schema": {"mode": "fixed", "fields": [f"age: {producer_type}"]}},
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {"mode": "fixed", "fields": [f"age: {consumer_type}"]},
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        return state.with_output(self._make_output("main"))
+
+    def test_edge_field_type_mismatch_is_rejected(self) -> None:
+        """A plain producer/consumer field-TYPE conflict must not validate green.
+
+        elspeth-f2eb8fef9f. Stage 1's edge-contract accounting compares field
+        NAMES; the runtime compares TYPES via
+        ``core/dag/schema_validation.py::validate_single_edge`` ->
+        ``contracts/data.py::check_compatibility``. Before this fix a plain
+        two-node pipeline whose producer declared ``age: int`` and whose
+        consumer declared ``age: str`` returned ``is_valid=True`` with ZERO
+        errors — byte-identical to the type-agreeing control below — while the
+        DAG build raised ``EdgeContractError`` "Type mismatches: age (expected
+        str, got int)". No coalesce, no row_union, no special topology.
+        """
+        result = self._make_typed_edge_state("int", "str").validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
+    def test_edge_field_type_agreement_is_accepted(self) -> None:
+        """Positive control for :meth:`test_edge_field_type_mismatch_is_rejected`.
+
+        Identical topology and identical field NAME; only the declared type
+        agrees. This is what makes the mismatch test falsifiable — without it a
+        blanket rejection would pass the test above.
+        """
+        result = self._make_typed_edge_state("int", "int").validate()
+
+        assert result.is_valid, [(e.error_code, e.message) for e in result.errors]
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors)
+
     def test_schema_validation_closes_every_constructed_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every schema-inspection instance is owned and closed exactly once."""
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
