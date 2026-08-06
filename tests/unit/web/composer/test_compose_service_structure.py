@@ -62,3 +62,23 @@ def test_composer_service_impl_not_patched_at_module_tail(module_path: Path) -> 
             if isinstance(target, ast.Name) and target.id.startswith("_PHASE3_"):
                 hits.append(target.id)
     assert hits == [], f"forbidden module-tail patches in {module_path}: {hits}"
+
+
+def test_authoring_surface_telemetry_emission_shape_is_pinned() -> None:
+    """B4: the recall denominator's event name and field names are pinned.
+
+    ``composer_authoring_surface_selected`` (with ``authoring_surface`` and
+    ``intent_is_explicit_mutation``) is the ONLY denominator for any
+    intent-classifier recall measurement, and it had zero test coverage —
+    a rename or field drop would silently end the measurement mid-stream.
+    This is a source-shape pin: it proves the emission still exists with
+    these names, not that the path executes (the live journald events are
+    the execution evidence, and they are first-turn-only —
+    ``intent_is_explicit_mutation`` is None unless the state is empty).
+    """
+    source = (_COMPOSER_DIR / "service.py").read_text(encoding="utf-8")
+    emission_start = source.index('"composer_authoring_surface_selected"')
+    emission_window = source[emission_start : emission_start + 400]
+    assert 'authoring_surface="planner" if planner_eligible else "compose_loop"' in emission_window
+    assert "intent_is_explicit_mutation=intent_is_explicit_mutation" in emission_window
+    assert "session_id=session_id" in emission_window
