@@ -161,6 +161,33 @@ def test_document_sink_is_not_resumable_and_refuses_resume_configuration(tmp_pat
         sink.configure_for_resume()
 
 
+def test_one_value_rule_depends_on_this_sink_never_resuming(tmp_path: Path) -> None:
+    """The one-value rule's safety rests on an invariant enforced in ANOTHER file.
+
+    ``prepare_effect`` decides publication from the cumulative snapshot AND a
+    per-INSTANCE in-memory tally. That pair is only a sound "exactly one" test
+    within one instance: a row another instance diverted is in neither the
+    snapshot (diverted members are dropped) nor this tally (foreign instance),
+    so both read one while the run delivered more — and it publishes
+    (elspeth-694f771c69).
+
+    Nothing local can detect that; what keeps it unreachable is that a second
+    instance for one run cannot arise, because resume is refused. Those two
+    facts live in different files with nothing tying them together, so this test
+    is the tie: if ``supports_resume`` is ever flipped, THIS fails and names the
+    tally as the reason, rather than the cross-instance publish surfacing later
+    as silent partial output.
+    """
+    sink = _sink(tmp_path / "out.txt")
+
+    assert sink.supports_resume is False, (
+        "DocumentSink's per-instance delivery tally is not durable, so a resumed run could "
+        "publish a lone-row document while reporting success — make the tally durable "
+        "(elspeth-694f771c69) before enabling resume."
+    )
+    assert sink._delivered_by_effect == {}, "the tally is per-instance in-memory state, which is the whole problem"
+
+
 @pytest.mark.parametrize("purpose", list(SinkEffectExecutionPurpose))
 def test_every_purpose_resolves_the_write_mode_actually_executed(purpose: SinkEffectExecutionPurpose) -> None:
     """No purpose switches this sink to append, so every purpose resolves "write"."""

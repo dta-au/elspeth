@@ -254,11 +254,25 @@ class DocumentSink(BaseSink):
         #     single-row run;
         #   * the per-run tally counts every member this instance was handed,
         #     diverted or not, and so closes exactly that blind spot.
-        # Both are lower bounds on the run's true delivery, so requiring BOTH to
-        # equal one is fail-closed: a row neither count can see only ever makes
-        # the true total larger. That is what makes the one-value rule hold
-        # however rows are batched into effects — [2] then [1], [1] then [2] and
-        # [3] as one effect all refuse to publish.
+        # Both are lower bounds on the run's true delivery, and requiring BOTH to
+        # equal one is what makes the rule hold however rows are BATCHED into
+        # effects — [2] then [1], [1] then [2] and [3] as one effect all refuse
+        # to publish, because the tally sees the diverted rows the snapshot drops.
+        #
+        # SCOPE, precisely: that argument covers one sink INSTANCE. It does not
+        # generalise, and calling it "fail-closed" without qualification would be
+        # wrong — a row invisible to BOTH counts leaves both reading one while the
+        # true delivery is larger, and this publishes. That is reachable only
+        # across instances: the tally is per-instance in-memory state, so rows
+        # another instance diverted are in neither its snapshot (dropped) nor this
+        # tally (foreign). No local signal survives to detect it — a diverted row
+        # leaves nothing in the shared snapshot to notice.
+        #
+        # What keeps that unreachable today is supports_resume = False plus the
+        # CLI's pre-database resume refusal, i.e. an invariant enforced OUTSIDE
+        # this file. test_one_value_rule_depends_on_this_sink_never_resuming pins
+        # that coupling; do not flip supports_resume without making the tally
+        # durable first (elspeth-694f771c69).
         publishable = len(emitted_members) == 1 and delivered == 1
         # The tightest lower bound on rows delivered to this output: the two
         # counts see different rows, so the larger is the closer of the two.
@@ -404,6 +418,15 @@ class DocumentSink(BaseSink):
         composition this sink exists to bless into a mere advisory.
 
         ``unknown_policy=WARN``: an undeclared producer must not be blocked.
+
+        The accepted set is DERIVED by subtraction, not enumerated. Enumerating
+        it would be fail-closed against this sink's own intent: a future
+        ``TextFraming`` member would be absent, so the sink that exists to
+        accept every framing would CONFLICT on it — and unlike an UNKNOWN, a
+        positive conflicting claim cannot be softened by ``unknown_policy``.
+        Subtraction inverts the default, so a new member is accepted unless
+        someone states a reason to exclude it. (``TextSink``'s ``{COMPACT}`` is
+        also fail-closed, but there fail-closed MATCHES the intent.)
         """
         from elspeth.contracts.plugin_semantics import (
             FieldSemanticRequirement,
@@ -418,14 +441,10 @@ class DocumentSink(BaseSink):
                 FieldSemanticRequirement(
                     field_name=self._field,
                     accepted_content_kinds=frozenset(),
-                    accepted_text_framings=frozenset(
-                        {
-                            TextFraming.UNCONSTRAINED,
-                            TextFraming.COMPACT,
-                            TextFraming.NEWLINE_FRAMED,
-                            TextFraming.LINE_COMPATIBLE,
-                        }
-                    ),
+                    # UNKNOWN is not an acceptance: compare_semantic short-circuits
+                    # an UNKNOWN fact to an UNKNOWN outcome whatever the set says,
+                    # so listing it would be inert. NOT_TEXT is the real exclusion.
+                    accepted_text_framings=frozenset(TextFraming) - {TextFraming.NOT_TEXT, TextFraming.UNKNOWN},
                     accepted_value_types=frozenset({SemanticValueType.STR}),
                     requirement_code="document.field.verbatim_text",
                     unknown_policy=UnknownSemanticPolicy.WARN,
