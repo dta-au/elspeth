@@ -15,7 +15,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 import httpx
@@ -84,6 +84,7 @@ from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.routes import create_execution_router
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.execution.websocket_ticket import WebSocketTicketStore
 from elspeth.web.external_state_startup import (
     _CONNECT_TIMEOUT_SECONDS,
@@ -129,6 +130,11 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry, build_sessions_te
 from elspeth.web.shareable_reviews.routes import create_shareable_reviews_router
 from elspeth.web.shareable_reviews.service import ShareableReviewService
 from elspeth.web.shareable_reviews.signer import ShareTokenSigner
+
+if TYPE_CHECKING:
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.execution.schemas import ValidationResult
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 # Assigned by create_app only after the idempotent process MeterProvider
 # bootstrap. Keeping these names module-level preserves the existing lifespan
@@ -1328,6 +1334,30 @@ def _create_app(
         generation_key=settings.secret_key.encode("utf-8"),
     )
 
+    # Interpretation-resolution state writes persist the full runtime-preflight
+    # verdict, not the authoring-only one (elspeth-155947ca47). Same binding as
+    # ComposerServiceImpl._runtime_preflight; the sessions layer receives it as
+    # an opaque callable so it never imports the execution stack.
+    def _session_runtime_preflight(
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+    ) -> ValidationResult:
+        if plugin_snapshot is None:
+            raise ValueError("session runtime preflight requires a principal snapshot")
+        return validate_pipeline(
+            state,
+            settings,
+            yaml_generator_module,
+            secret_service=app.state.scoped_secret_resolver,
+            user_id=user_id,
+            session_id=session_id,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=app.state.operator_profile_registry,
+            catalog=app.state.catalog_service,
+        )
+
     session_service = SessionServiceImpl(
         session_engine,
         data_dir=settings.data_dir,
@@ -1336,6 +1366,7 @@ def _create_app(
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
+        runtime_preflight=_session_runtime_preflight,
     )
     app.state.session_service = session_service
     readiness_probe_runner = ReadinessProbeRunner()

@@ -955,6 +955,262 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
     assert stale_error not in list(new_state.validation_errors or ())
 
 
+_GRAPH_STRUCTURE_ERROR = (
+    "Schema contract violation: edge 'row_union_1' → 'map1'\n"
+    "  Consumer (field_mapper) requires fields: ['summary']\n"
+    "  Producer (row_union:stack) guarantees: (none - dynamic schema)"
+)
+
+
+def _runtime_preflight_result(*, is_valid: bool, messages: tuple[str, ...] = ()):
+    from elspeth.web.execution.schemas import (
+        ValidationError as RuntimeValidationError,
+    )
+    from elspeth.web.execution.schemas import (
+        ValidationReadiness,
+        ValidationResult,
+    )
+
+    return ValidationResult(
+        is_valid=is_valid,
+        checks=[],
+        errors=[
+            RuntimeValidationError(
+                component_id="map1",
+                component_type="transform",
+                message=message,
+                suggestion=None,
+                error_code=None,
+            )
+            for message in messages
+        ],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=is_valid,
+            completion_ready=is_valid,
+            blockers=[],
+        ),
+    )
+
+
+def _preflight_service(engine, runtime_preflight) -> SessionServiceImpl:
+    return SessionServiceImpl(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test"),
+        runtime_preflight=runtime_preflight,
+    )
+
+
+def _authoring_valid_pipeline_dict() -> dict:
+    """Full source→llm→output pipeline that passes ``state.validate()``.
+
+    The runtime-preflight merge only runs after the authoring gate passes, so
+    these tests need a state whose only possible invalidity is runtime-level.
+    """
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="input",
+            options={"path": "/tmp/input.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="llm_transform_1",
+                node_type="transform",
+                plugin="llm",
+                input="input",
+                on_success="out",
+                on_error="discard",
+                options={"prompt_template": "Rate how {{interpretation:cool}} this is."},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="out",
+                plugin="json",
+                options={"path": "/tmp/out.json", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Phase 5b Test", description=""),
+        version=1,
+    )
+    return state.to_dict()
+
+
+async def _seed_authoring_valid_state(
+    service: SessionServiceImpl,
+    *,
+    session_id: UUID,
+    is_valid: bool = True,
+    validation_errors: list[str] | None = None,
+    insert_session: bool = True,
+) -> CompositionStateRecord:
+    if insert_session:
+        with service._engine.begin() as conn:
+            _insert_session(conn, str(session_id))
+    pipeline = _authoring_valid_pipeline_dict()
+    return await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            sources=pipeline["sources"],
+            nodes=pipeline["nodes"],
+            edges=pipeline["edges"],
+            outputs=pipeline["outputs"],
+            metadata_=pipeline["metadata"],
+            is_valid=is_valid,
+            validation_errors=validation_errors,
+        ),
+        provenance="tool_call",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_persists_runtime_preflight_verdict_over_authoring_validity(engine) -> None:
+    """battery-r5 g08-s2/s3 (elspeth-155947ca47): resolve must not flip a
+    runtime-invalid state to is_valid=true.
+
+    The persisted ``is_valid`` contract is the full runtime-preflight verdict
+    (the compose path persists ``validate_pipeline``'s outcome). The resolution
+    writer re-validates the patched state; when a runtime preflight is wired it
+    must persist that verdict — a graph_structure violation only the engine
+    graph build can see keeps the row invalid and disclosed, even though the
+    authoring-only validator passes the patched state.
+    """
+    preflight_calls: list[tuple] = []
+
+    def runtime_preflight(state, user_id, session_id, plugin_snapshot):
+        preflight_calls.append((state, user_id, session_id, plugin_snapshot))
+        return _runtime_preflight_result(is_valid=False, messages=(_GRAPH_STRUCTURE_ERROR,))
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_verdict",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    # The live row was persisted invalid by the compose path (runtime verdict).
+    await _seed_authoring_valid_state(
+        service,
+        session_id=session_id,
+        is_valid=False,
+        validation_errors=[_GRAPH_STRUCTURE_ERROR],
+        insert_session=False,
+    )
+
+    _resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert new_state.is_valid is False
+    assert _GRAPH_STRUCTURE_ERROR in list(new_state.validation_errors or ())
+    (call,) = preflight_calls
+    called_state, called_user_id, called_session_id, called_snapshot = call
+    assert called_user_id == "alice"
+    assert called_session_id == str(session_id)
+    assert called_snapshot is None  # no plugin_snapshot_factory in this fixture
+    # The preflight must see the PATCHED state — the placeholder is consumed.
+    patched_node = next(node for node in called_state.nodes if node.id == "llm_transform_1")
+    assert "{{interpretation:cool}}" not in patched_node.options["prompt_template"]
+    assert "Innovative and creative" in patched_node.options["prompt_template"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_runtime_preflight_valid_persists_true(engine) -> None:
+    """A passing runtime preflight keeps the resolve row valid (no blanket False)."""
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot):
+        return _runtime_preflight_result(is_valid=True)
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_valid",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+
+    _resolved, new_state = await service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=event.id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    assert new_state.is_valid is True
+    assert new_state.validation_errors is None
+
+
+@pytest.mark.asyncio
+async def test_opt_out_auto_resolve_persists_runtime_preflight_verdict(engine) -> None:
+    """The opt-out auto-resolve state writer shares the resolve path's contract:
+    a runtime-invalid patched state persists is_valid=False with the finding
+    disclosed (second writer at _prepare_or_create_pending_interpretation_event).
+    """
+
+    def runtime_preflight(_state, _user_id, _session_id, _plugin_snapshot):
+        return _runtime_preflight_result(is_valid=False, messages=(_GRAPH_STRUCTURE_ERROR,))
+
+    service = _preflight_service(engine, runtime_preflight)
+    session_id = uuid4()
+    surfacing_state = await _seed_authoring_valid_state(service, session_id=session_id)
+    with service._engine.begin() as conn:
+        conn.execute(update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True))
+
+    event = await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=surfacing_state.id,
+        affected_node_id="llm_transform_1",
+        tool_call_id="call_preflight_opt_out",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Innovative and creative",
+        model_identifier="anthropic/claude-opus-4-7",
+        model_version="2026-05-01",
+        provider="anthropic",
+        composer_skill_hash="a" * 64,
+    )
+    assert event.choice is InterpretationChoice.OPTED_OUT
+
+    current_state = await service.get_current_state(session_id)
+    assert current_state is not None
+    assert current_state.is_valid is False
+    assert _GRAPH_STRUCTURE_ERROR in list(current_state.validation_errors or ())
+
+
 @pytest.mark.parametrize(
     ("composer_meta", "expected_errors"),
     [
@@ -1000,7 +1256,7 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
     monkeypatch.setattr(
         service,
         "_validate_patched_composition_state",
-        lambda _state, *, plugin_snapshot: ValidationSummary(
+        lambda _state, *, plugin_snapshot, session_id, user_id: ValidationSummary(
             is_valid=False,
             errors=(ValidationEntry(component="node", message=canary, severity="high"),),
         ),

@@ -239,8 +239,18 @@ if TYPE_CHECKING:
     from elspeth.web.catalog.protocol import CatalogService
     from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedProposalRef, GuidedSession
     from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.execution.schemas import ValidationResult
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+# Runtime-equivalent preflight for interpretation-resolution state writes:
+# ``(patched_state, user_id, session_id, plugin_snapshot) -> ValidationResult``.
+# Bound at app wiring over ``validate_pipeline`` with the app's settings and
+# secret resolver — the sessions layer never imports the execution stack.
+SessionRuntimePreflight = Callable[
+    ["CompositionState", str | None, str, "PluginAvailabilitySnapshot | None"],
+    "ValidationResult",
+]
 
 # Process-wide SQLite session-write lock registry.
 #
@@ -3396,6 +3406,7 @@ class SessionServiceImpl:
         operator_profile_registry: OperatorProfileRegistry | None = None,
         catalog: CatalogService | None = None,
         run_diagnostics_audit_authority: RunDiagnosticsAuditMutationAuthority | None = None,
+        runtime_preflight: SessionRuntimePreflight | None = None,
     ) -> None:
         if (plugin_snapshot_factory is None) != (operator_profile_registry is None):
             raise ValueError("plugin_snapshot_factory and operator_profile_registry must be configured together")
@@ -3408,6 +3419,7 @@ class SessionServiceImpl:
         self._plugin_snapshot_factory = plugin_snapshot_factory
         self._operator_profile_registry = operator_profile_registry
         self._catalog = catalog
+        self._runtime_preflight = runtime_preflight
         self._run_diagnostics_audit_authority = run_diagnostics_audit_authority or RepositoryRunDiagnosticsAuditAuthority(engine)
 
     def _validate_patched_composition_state(
@@ -3415,39 +3427,89 @@ class SessionServiceImpl:
         state: CompositionState,
         *,
         plugin_snapshot: PluginAvailabilitySnapshot | None,
+        session_id: str,
+        user_id: str | None,
     ) -> ValidationSummary:
-        """Validate a post-review state through its executable profile view."""
+        """Validate a post-review state through its executable profile view.
+
+        The persisted ``is_valid`` contract is the full runtime-preflight
+        verdict — the compose path persists ``validate_pipeline``'s outcome
+        (``_composer_persisted_validation``). When the authoring gate passes
+        and a runtime preflight is wired, the runtime verdict is merged in so
+        an interpretation-resolution row never claims validity over engine
+        stages (graph_structure, route resolution, schema compatibility) the
+        authoring validator cannot see (elspeth-155947ca47). The preflight is
+        side-effect-free (see ``web/execution/runtime_preflight.py``) and the
+        session locks it may run under are per-session, so calling it inside
+        the resolution transaction serialises only this session's writes.
+        """
         if self._plugin_snapshot_factory is None:
-            return state.validate()
-        if plugin_snapshot is None:
-            raise AuditIntegrityError("Profile-aware composition validation has no principal snapshot")
+            summary = state.validate()
+        else:
+            if plugin_snapshot is None:
+                raise AuditIntegrityError("Profile-aware composition validation has no principal snapshot")
 
-        from elspeth.web.plugin_policy.validation import validate_authored_composition_state
+            from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 
-        assert self._operator_profile_registry is not None
-        assert self._catalog is not None
-        result = validate_authored_composition_state(
-            state,
-            snapshot=plugin_snapshot,
-            profile_registry=self._operator_profile_registry,
-            catalog=self._catalog,
+            assert self._operator_profile_registry is not None
+            assert self._catalog is not None
+            result = validate_authored_composition_state(
+                state,
+                snapshot=plugin_snapshot,
+                profile_registry=self._operator_profile_registry,
+                catalog=self._catalog,
+            )
+            summary = result.validation
+        if not summary.is_valid or self._runtime_preflight is None:
+            return summary
+
+        runtime = self._runtime_preflight(state, user_id, session_id, plugin_snapshot)
+        if runtime.is_valid:
+            return summary
+
+        from elspeth.web.composer.state import ValidationEntry
+
+        def _component(component_id: str | None, component_type: str | None) -> str:
+            if component_id is None:
+                return "pipeline"
+            if component_type == "transform":
+                return f"node:{component_id}"
+            if component_type == "sink":
+                return f"output:{component_id}"
+            return component_id
+
+        runtime_entries = tuple(
+            ValidationEntry(
+                component=_component(error.component_id, error.component_type),
+                message=error.message,
+                severity="high",
+                error_code=error.error_code,
+            )
+            for error in runtime.errors
         )
-        return result.validation
+        return replace(summary, is_valid=False, errors=(*summary.errors, *runtime_entries))
+
+    async def _session_principal_context(self, session_id: str) -> tuple[str | None, PluginAvailabilitySnapshot | None]:
+        """Read the session principal and build its snapshot before a write transaction."""
+
+        def _sync() -> tuple[str | None, PluginAvailabilitySnapshot | None]:
+            with self._engine.connect() as conn:
+                user_id = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one_or_none()
+            if user_id is None or self._plugin_snapshot_factory is None:
+                return user_id, None
+            return user_id, self._plugin_snapshot_factory(user_id)
+
+        return cast(
+            "tuple[str | None, PluginAvailabilitySnapshot | None]",
+            await self._run_sync(_sync),
+        )
 
     async def _plugin_snapshot_for_session(self, session_id: str) -> PluginAvailabilitySnapshot | None:
         """Build a principal snapshot before a session write transaction starts."""
         if self._plugin_snapshot_factory is None:
             return None
-
-        def _sync() -> PluginAvailabilitySnapshot | None:
-            with self._engine.connect() as conn:
-                user_id = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one_or_none()
-            if user_id is None:
-                return None
-            assert self._plugin_snapshot_factory is not None
-            return self._plugin_snapshot_factory(user_id)
-
-        return cast("PluginAvailabilitySnapshot | None", await self._run_sync(_sync))
+        _user_id, snapshot = await self._session_principal_context(session_id)
+        return snapshot
 
     async def _run_sync(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         """Run a synchronous callable in the thread pool executor."""
@@ -6771,7 +6833,7 @@ class SessionServiceImpl:
         state_id_str = str(composition_state_id)
         kind_value = kind.value
         event_id = str(_event_id if _event_id is not None else uuid.uuid4())
-        plugin_snapshot = await self._plugin_snapshot_for_session(sid)
+        principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
 
         def _sync(connection: Connection | None = None) -> InterpretationEventRecord:
             if connection is None:
@@ -7188,6 +7250,8 @@ class SessionServiceImpl:
                     patched_validation = self._validate_patched_composition_state(
                         state_from_record(patched_state_record),
                         plugin_snapshot=plugin_snapshot,
+                        session_id=sid,
+                        user_id=principal_user_id,
                     )
                     # Free-form validator text can echo filesystem paths,
                     # credentials, and provider diagnostics. The state keeps
@@ -7347,7 +7411,7 @@ class SessionServiceImpl:
         now = self._ensure_utc(resolved_at) if resolved_at is not None else self._now()
         sid = str(session_id)
         eid = str(event_id)
-        plugin_snapshot = await self._plugin_snapshot_for_session(sid)
+        principal_user_id, plugin_snapshot = await self._session_principal_context(sid)
 
         def _sync() -> tuple[InterpretationEventRecord, CompositionStateRecord]:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
@@ -7542,6 +7606,8 @@ class SessionServiceImpl:
                 patched_validation = self._validate_patched_composition_state(
                     state_from_record(patched_state_record),
                     plugin_snapshot=plugin_snapshot,
+                    session_id=sid,
+                    user_id=principal_user_id,
                 )
                 raw_validation_errors = [error.message for error in patched_validation.errors] or None
                 patched_validation_errors = validation_errors_for_composer_surface(
