@@ -1049,3 +1049,215 @@ class TestLockedInputProductionBuildPath:
             sinks=plugins.sinks,
             aggregations=plugins.aggregations,
         )
+
+
+# ---------------------------------------------------------------------------
+# Union coalesce: guaranteed fields the merged schema does not declare
+# (elspeth-1451ff385f)
+# ---------------------------------------------------------------------------
+
+_COALESCE_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'price: int'
+        - 'category: str'
+        - 'description: str'
+      on_validation_failure: discard
+
+gates:
+- name: fork_gate
+  input: raw
+  condition: "True"
+  routes:
+    'true': fork
+    'false': discard
+  fork_to:
+    - path_a
+    - path_b
+
+transforms:
+- name: truncate_branch_a
+  plugin: truncate
+  input: path_a
+  on_success: trunc_a
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+{branch_schema}
+- name: truncate_branch_b
+  plugin: truncate
+  input: path_b
+  on_success: trunc_b
+  on_error: discard
+  options:
+    fields:
+      description: 50
+    suffix: "..."
+{branch_schema}
+{extra_transforms}
+coalesce:
+- name: merge_results
+  branches:
+    path_a: trunc_a
+    path_b: trunc_b
+  policy: require_all
+  merge: union
+  union_collision_policy: last_wins
+{coalesce_out}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+{sink_fields}"""
+
+# A pass-through branch that declares only the field it rewrites. The fields it
+# carries untouched live in guaranteed_fields alone — the channel the merged
+# schema does not declare.
+_BRANCH_UNDERDECLARED = """    schema:
+      mode: flexible
+      fields:
+      - 'description: str'"""
+
+# The same branch declaring everything it actually passes through.
+_BRANCH_FULLY_DECLARED = """    schema:
+      mode: flexible
+      fields:
+      - 'id: int'
+      - 'product: str'
+      - 'price: int'
+      - 'category: str'
+      - 'description: str'"""
+
+_SINK_ADMITS_DESCRIPTION = """        fields:
+        - 'description: str'
+"""
+
+_SINK_ADMITS_ALL = """        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'price: int'
+        - 'category: str'
+        - 'description: str'
+"""
+
+# field_mapper select_only drops the extras — remedy 3 of the rejection message.
+_SELECT_ONLY_MAPPER = """- name: drop_extras
+  plugin: field_mapper
+  input: merge_results
+  on_success: output
+  on_error: discard
+  options:
+    select_only: true
+    mapping:
+      description: description
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+"""
+
+
+def _build_coalesce_graph(
+    *,
+    branch_schema: str = _BRANCH_UNDERDECLARED,
+    sink_fields: str = _SINK_ADMITS_DESCRIPTION,
+    extra_transforms: str = "",
+    coalesce_out: str = "\n  on_success: output",
+) -> ExecutionGraph:
+    """Build fork -> two pass-through branches -> union coalesce -> locked sink."""
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    settings = load_settings_from_yaml_string(
+        _COALESCE_PIPELINE.format(
+            branch_schema=branch_schema,
+            extra_transforms=extra_transforms,
+            sink_fields=sink_fields,
+            coalesce_out=coalesce_out,
+        )
+    )
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        gates=settings.gates,
+        coalesce_settings=settings.coalesce,
+    )
+
+
+class TestUnionCoalesceGuaranteedExtras:
+    """A union coalesce guarantees fields its own merged schema never declares.
+
+    The builder computes a coalesce's typed ``fields`` from each branch's
+    CONSTRUCTION-time schema but its ``guaranteed_fields`` from a separately
+    graph-walked effective guarantee (elspeth-0b14977817), so a pass-through
+    branch that declares only the field it rewrites yields a merged schema
+    whose guarantees exceed its declared fields. Those fields never enter the
+    pydantic model, so ``check_compatibility``'s extras arm — which compares
+    ``model_fields`` — cannot see them, and a locked consumer that rejects
+    every one of them was accepted at build (elspeth-1451ff385f).
+
+    The two channels are deliberately decoupled: ``fields`` is what the node
+    typed, ``guaranteed_fields`` is what the graph proves will be present. The
+    fix is therefore to check the guarantee channel against a locked consumer
+    on the typed path too, not to force the channels to agree.
+    """
+
+    def test_phantom_guarantee_against_locked_sink_is_rejected(self) -> None:
+        """At HEAD this built green and killed every row at the sink preflight."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph()
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_declared_branches_reach_the_same_verdict(self) -> None:
+        """Control: the SAME pipeline with branches declaring what they carry.
+
+        Semantically identical — rows carry five fields, the sink admits one —
+        and already rejected today by check_compatibility's extras arm. Pins
+        that under-declaring a branch cannot change the verdict, only which
+        arm reports it.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError, match="Extra fields forbidden"):
+            _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED)
+
+    def test_sink_admitting_every_guaranteed_field_still_builds(self) -> None:
+        """False-reject guard: a locked sink that admits all five must stay green."""
+        _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED, sink_fields=_SINK_ADMITS_ALL)
+
+    def test_select_only_field_mapper_clears_the_rejection(self) -> None:
+        """The rejection message's remedy 3 must actually clear the rejection.
+
+        A field_mapper with select_only drops the extras, so the walk carries
+        only 'description' past it — an error whose own remedy did not clear it
+        would mean the guarantee walk over-attributes through field-dropping
+        nodes.
+        """
+        graph = _build_coalesce_graph(extra_transforms=_SELECT_ONLY_MAPPER, coalesce_out="")
+
+        mapper = next(n for n in graph.get_nodes() if n.node_id.startswith("transform_drop_extras"))
+        assert schema_validation.get_effective_guaranteed_fields(graph, mapper.node_id) == frozenset({"description"})

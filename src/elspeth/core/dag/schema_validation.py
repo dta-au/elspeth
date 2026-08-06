@@ -93,6 +93,11 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # last for the same pre-existing-error reason (elspeth-b19dfe41fb).
     validate_transform_string_typed_input_fields(graph)
 
+    # Close the guaranteed-extras check over TYPED producers. Runs last for the
+    # same pre-existing-error reason its neighbours each cite
+    # (elspeth-1451ff385f).
+    validate_typed_producer_guaranteed_extras(graph)
+
 
 def validate_single_edge(
     graph: ExecutionGraph,
@@ -251,6 +256,56 @@ def validate_single_edge(
             compatibility_result=result,
             component_type=to_info.node_type.value,
             from_component_type=graph.get_node_info(from_node_id).node_type.value,
+        )
+
+
+def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
+    """Apply the locked-consumer guarantee check to TYPED producers too.
+
+    ``validate_single_edge`` mirrors composer Rule A only on its two bypass
+    paths (dynamic producer, observed producer). An edge whose producer has
+    real ``model_fields`` takes the ``check_compatibility`` path instead, and
+    that function compares schema against schema — it never reads
+    ``guaranteed_fields``. A producer can therefore promise fields its own
+    model does not declare and still validate clean.
+
+    A union coalesce is exactly that shape: the builder merges its typed
+    ``fields`` from each branch's CONSTRUCTION-time schema but its
+    ``guaranteed_fields`` from a separately graph-walked effective guarantee
+    (elspeth-0b14977817), so a pass-through branch declaring only the field it
+    rewrites yields a merged schema guaranteeing category/id/price/product
+    while declaring description alone. Against a locked sink the build stayed
+    green and every row died at the sink's input preflight
+    (elspeth-1451ff385f).
+
+    The two channels are decoupled BY DESIGN — ``fields`` is what the node
+    typed, ``guaranteed_fields`` is what the graph proves will be present, and
+    the walk yields names without types, so forcing them to agree could only
+    declare the missing names as ``any``, which is incompatible with every
+    concrete consumer type. The fix is to check the second channel, not to
+    collapse it into the first.
+
+    Runs as a final pass rather than inline in ``validate_single_edge`` so a
+    graph tripping this AND a pre-existing check keeps reporting the
+    pre-existing error — the ordering discipline
+    ``validate_transform_output_field_collisions`` (elspeth-cfcd333f83) and
+    its two siblings each cite. The bypass-path calls stay where they are:
+    moving them here would relocate errors that shape is already reported at.
+    """
+    for from_id, to_id, edge_data in graph._graph.edges(data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        to_info = graph.get_node_info(to_id)
+        # Correlated barriers compare all incoming branches together in their
+        # own validators — same exclusion validate_single_edge applies.
+        if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+            continue
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_id,
+            to_id,
+            producer_schema=get_effective_producer_schema(graph, from_id),
+            consumer_schema=to_info.input_schema,
         )
 
 
