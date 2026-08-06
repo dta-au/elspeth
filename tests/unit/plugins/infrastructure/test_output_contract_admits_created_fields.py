@@ -277,6 +277,95 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
             f"output schema."
         )
 
+    def test_no_registered_transform_publishes_an_output_config_its_own_parser_rejects(self) -> None:
+        """Invariant arm (elspeth-97487736ca): guaranteed fields must be DECLARED.
+
+        The omission arm above unions each plugin's created fields into
+        ``schema.fields`` before rebuilding, so it constructs the very fix for
+        the shape it checks and can never reconstruct guaranteed-but-not-declared
+        — the state where ``_build_output_schema_config`` (or a plugin-local
+        equivalent) merges created fields into ``guaranteed_fields`` while
+        copying the authored ``fields`` through untouched. Under ``mode: fixed``
+        the model built from that config is ``extra='forbid'`` over the authored
+        fields alone, so the created field is simultaneously guaranteed on
+        output and forbidden by the output model.
+
+        This arm re-declares each plugin's schema as ``mode: fixed`` over the
+        probe's own fields WITHOUT the created fields, then uses
+        ``SchemaConfig.from_dict(config.to_dict())`` as the oracle — the exact
+        validator the direct ``SchemaConfig(...)`` construction bypasses.
+        """
+        parser_rejected: dict[str, str] = {}
+        omitting: dict[str, str] = {}
+        unbuildable: set[str] = set()
+        round_tripped = 0
+        for cls in _roster():
+            probe_config = getattr(cls, "probe_config", None)
+            if probe_config is None:
+                continue
+            base = probe_config()
+            candidate = copy.deepcopy(base)
+            schema_block: dict[str, Any] = dict(candidate.get("schema") or {})
+            schema_block["mode"] = "fixed"
+            if not schema_block.get("fields"):
+                # A fixed schema needs at least one authored field; two neutral
+                # columns stand in for the user's own data. Created fields are
+                # deliberately NOT added — that omission is the shape under test.
+                schema_block["fields"] = ["probe_a: str", "probe_b: str"]
+            candidate["schema"] = schema_block
+            try:
+                built = cls(candidate)
+            except Exception:
+                # Plugin-local guards rejecting this shape are a separate,
+                # acceptable contract — pinned exactly below.
+                unbuildable.add(_label(cls))
+                continue
+            if not _created_fields(built):
+                continue
+            config = built._output_schema_config
+            if config is None:
+                # Shape-preserving plugins leave the config unset; the DAG
+                # builder falls back to parsing the raw schema via from_dict,
+                # which is valid by construction.
+                continue
+            round_tripped += 1
+            try:
+                SchemaConfig.from_dict(config.to_dict())
+            except ValueError as exc:
+                parser_rejected[_label(cls)] = str(exc)
+            violation = _output_contract_violations(built).get(_OMITS)
+            if violation is not None:
+                omitting[_label(cls)] = violation
+
+        # json_explode / line_explode require their source field in an explicit
+        # schema and refuse this candidate outright — the same fail-closed
+        # guards the omission arm pins, minus the collision-guard plugins,
+        # which have nothing to collide with here.
+        assert unbuildable == {"json_explode", "line_explode"}, (
+            f"the set of transforms rejecting the fixed-mode probe changed: {sorted(unbuildable)}. "
+            f"A newly-rejecting transform has left this arm's coverage; a newly-accepting one "
+            f"must now satisfy it."
+        )
+        # A FLOOR: 20 field-creating transforms publish an explicit output
+        # config under this candidate today.
+        assert round_tripped >= 20, (
+            f"only {round_tripped} output configs reached the from_dict oracle, expected at "
+            f"least 20 — the roster shrank or plugins moved to observed/unset configs."
+        )
+        # batch_outlier_annotator injects value_field into required_fields
+        # without declaring it (elspeth-d3958d90f5, input-side sibling); remove
+        # this pin when that issue is fixed.
+        assert set(parser_rejected) == {"batch_outlier_annotator"}, (
+            f"output configs their own parser rejects: {parser_rejected}. "
+            f"A guaranteed or required field is not declared in the schema — the transform "
+            f"publishes a contract SchemaConfig.from_dict would refuse to build."
+        )
+        assert omitting == {}, (
+            f"transforms whose closed output contract omits fields they create: {omitting}. "
+            f"The transform's own emitted row would fail extra_forbidden against its own "
+            f"output schema."
+        )
+
 
 class TestTheSweepPredicateActuallyFires:
     """Negative controls: prove the shared predicate is live, not merely quiet.

@@ -743,6 +743,40 @@ class SchemaConfig:
         return explicit
 
 
+def declare_missing_guaranteed_fields(
+    fields: tuple[FieldDefinition, ...] | None,
+    guaranteed_fields: tuple[str, ...] | None,
+) -> tuple[FieldDefinition, ...] | None:
+    """Extend an explicit fields tuple so every guaranteed field is declared.
+
+    Output-contract builders compute guaranteed_fields as input guarantees
+    plus the fields the transform creates, then construct SchemaConfig
+    directly — bypassing the from_dict validator that rejects
+    'guaranteed_fields contains fields not declared in schema'. Under
+    mode: fixed the model built from such a config is extra='forbid' over
+    the declared fields alone, so the created field is simultaneously
+    guaranteed on output and forbidden by the output model, and the
+    transform's own emitted rows fail validation against its own contract
+    (elspeth-97487736ca).
+
+    Appends a required, any-typed FieldDefinition for each guaranteed name
+    not already declared: a guarantee asserts the field WILL exist, which
+    is required-ness, but the caller does not know its type. Authored
+    declarations are never modified — a guaranteed name already declared
+    keeps its authored type and (possibly optional) requiredness.
+
+    Returns fields unchanged when the schema is observed-style
+    (fields is None) or nothing is guaranteed.
+    """
+    if fields is None or not guaranteed_fields:
+        return fields
+    declared = {field.name for field in fields}
+    missing = [name for name in guaranteed_fields if name not in declared]
+    if not missing:
+        return fields
+    return fields + tuple(FieldDefinition(name=name, field_type="any", required=True) for name in missing)
+
+
 def raw_options_have_schema(options: Mapping[str, Any]) -> bool:
     """Return whether raw plugin options expose schema config under either alias."""
     return "schema" in options or "schema_config" in options

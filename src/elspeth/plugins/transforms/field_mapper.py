@@ -17,7 +17,7 @@ from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
@@ -273,7 +273,10 @@ class FieldMapper(BaseTransform):
 
         return SchemaConfig(
             mode=cfg.schema_config.mode,
-            fields=cfg.schema_config.fields,
+            # Mapping targets are guaranteed on output but absent from the
+            # authored input fields; declare them so the config satisfies the
+            # guaranteed-fields-are-declared invariant (elspeth-97487736ca).
+            fields=declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result),
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=cfg.schema_config.audit_fields,
             required_fields=cfg.schema_config.required_fields,

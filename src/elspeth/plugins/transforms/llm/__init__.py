@@ -40,7 +40,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal
 
 from elspeth.contracts.identifiers import validate_field_name
-from elspeth.contracts.schema import FieldDefinition, SchemaConfig
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.token_usage import TokenUsage
 
 if TYPE_CHECKING:
@@ -149,7 +149,13 @@ def _build_llm_output_schema_config(
     schema_config: SchemaConfig,
     guaranteed_fields: Iterable[str],
 ) -> SchemaConfig:
-    """Build LLM output schema config while preserving current audit-field policy."""
+    """Build LLM output schema config while preserving current audit-field policy.
+
+    Guaranteed LLM output fields absent from an explicit authored fields
+    tuple are declared as required any-typed fields — a guaranteed field
+    the schema does not declare is an invalid SchemaConfig state
+    (elspeth-97487736ca).
+    """
     base_guaranteed = set(schema_config.guaranteed_fields or ())
     output_fields = base_guaranteed | set(guaranteed_fields)
     upstream_declared = schema_config.guaranteed_fields is not None
@@ -159,7 +165,7 @@ def _build_llm_output_schema_config(
         guaranteed_fields_result = None
     return SchemaConfig(
         mode=schema_config.mode,
-        fields=schema_config.fields,
+        fields=declare_missing_guaranteed_fields(schema_config.fields, guaranteed_fields_result),
         guaranteed_fields=guaranteed_fields_result,
         required_fields=schema_config.required_fields,
     )

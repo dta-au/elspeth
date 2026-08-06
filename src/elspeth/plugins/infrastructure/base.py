@@ -1158,7 +1158,7 @@ class BaseTransform(ABC):
         Returns:
             SchemaConfig with guaranteed_fields including declared output fields.
         """
-        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 
         base_guaranteed = set(schema_config.guaranteed_fields or ())
         output_fields = base_guaranteed | self.declared_output_fields
@@ -1173,7 +1173,7 @@ class BaseTransform(ABC):
 
         return SchemaConfig(
             mode=schema_config.mode,
-            fields=schema_config.fields,
+            fields=declare_missing_guaranteed_fields(schema_config.fields, guaranteed_fields_result),
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=schema_config.audit_fields,
             required_fields=schema_config.required_fields,

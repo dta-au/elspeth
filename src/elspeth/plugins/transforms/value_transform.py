@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from elspeth.contracts import Determinism
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.plugin_assistance import PluginAssistance
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema import SchemaConfig, declare_missing_guaranteed_fields
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.type_normalization import classify_runtime_type, require_supported_contract_type
 from elspeth.core.expression_parser import (
@@ -426,7 +426,11 @@ class ValueTransform(BaseTransform):
 
         return SchemaConfig(
             mode=cfg.schema_config.mode,
-            fields=cfg.schema_config.fields,
+            # Configured targets are guaranteed on output but may be absent
+            # from the authored input fields; declare them so the config
+            # satisfies the guaranteed-fields-are-declared invariant
+            # (elspeth-97487736ca).
+            fields=declare_missing_guaranteed_fields(cfg.schema_config.fields, guaranteed_fields_result),
             guaranteed_fields=guaranteed_fields_result,
             audit_fields=cfg.schema_config.audit_fields,
             required_fields=cfg.schema_config.required_fields,

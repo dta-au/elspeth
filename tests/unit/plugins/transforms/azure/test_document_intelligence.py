@@ -210,6 +210,23 @@ def test_probe_config_instantiates() -> None:
     AzureDocumentIntelligence(AzureDocumentIntelligence.probe_config())
 
 
+def test_output_schema_admits_created_fields_under_fixed_schema() -> None:
+    """The output contract must not forbid the field it creates (elspeth-97487736ca).
+
+    Under mode: fixed the output model is extra='forbid'; if di_content lands
+    only in guaranteed_fields and never in the declared fields, every emitted
+    row fails the post-emission output-schema check against the transform's
+    own contract.
+    """
+    t = _transform(schema={"mode": "fixed", "fields": ["doc_id: str", "doc_url: str"]})
+    assert "di_content" in t.output_schema.model_fields
+    validated = t.output_schema.model_validate(
+        {"doc_id": "a", "doc_url": "https://docs.example/d.pdf", "di_content": "text"},
+        strict=True,
+    )
+    assert validated.di_content == "text"
+
+
 # ── source_field must name an arriving column, not a created one ───────────
 #
 # source_field is read to locate the document and the analysis results are

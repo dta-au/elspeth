@@ -3554,12 +3554,16 @@ class TestLLMDeclaredOutputFieldContracts:
         finally:
             transform._query_executor.shutdown(wait=True)
 
-    def test_provenance_side_fields_are_not_restamped(self) -> None:
-        """Auto-appended usage/model side fields keep their inferred contracts.
+    def test_provenance_side_fields_are_restamped_as_declared(self) -> None:
+        """Auto-appended usage/model side fields carry DECLARED contracts.
 
-        They reach the output schema config as guaranteed_fields, never as
-        declared ``fields``, and _apply_declared_output_field_contracts only
-        consults declared fields — so the restamp cannot reach them.
+        The output schema config declares every field it guarantees — a
+        guaranteed-but-undeclared field is the invalid SchemaConfig state
+        that made the output contract forbid the transform's own outputs
+        (elspeth-97487736ca). The side fields are declared as required
+        any-typed fields, so the restamp reaches them: declared source,
+        required, object-typed. Before that fix they stayed inferred and
+        optional, understating what the plugin has always guaranteed.
         """
         transform, mock_provider = _make_transform_with_mock_provider(
             _make_config(schema=DECLARED_SCHEMA),
@@ -3576,11 +3580,12 @@ class TestLLMDeclaredOutputFieldContracts:
         assert result.status == "success"
         assert result.row is not None
         assert transform._output_schema_config is not None
-        declared_names = {field.name for field in transform._output_schema_config.fields}
+        declared_by_name = {field.name: field for field in transform._output_schema_config.fields}
         for side_field in ("llm_response", "llm_response_usage", "llm_response_model"):
-            assert side_field not in declared_names
+            assert side_field in declared_by_name
+            assert declared_by_name[side_field].field_type == "any"
             emitted = result.row.contract.get_field(side_field)
-            assert emitted.source == "inferred"
-            assert emitted.required is False
-        # Guarantees still admit them, so fixed mode reports no undeclared extras.
+            assert emitted.source == "declared"
+            assert emitted.required is True
+        # Guarantees continue to admit them, and the declaration now matches.
         assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)
