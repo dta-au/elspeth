@@ -3523,7 +3523,21 @@ def _check_schema_contracts(
             # literal "source" — else the parity check silently skips every
             # named typed source (elspeth-3332619032).
             return False
-        schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+        # ABSTAIN on a malformed declaration rather than raising. This predicate
+        # is a bool gate, not a reporter: the malformed block owns its rejection
+        # through the lazy ``contract_config_invalid`` parsers and the eager
+        # syntax sweep, both of which run in this same function. Letting the
+        # ValueError escape would leave ``validate()`` — the authoring
+        # validator — raising a 500 where its whole contract is to return a
+        # verdict, which is the defect class tracked as elspeth-bceffeba19.
+        # Safe today only by loop ordering (``_parse_producer_guarantees`` runs
+        # first on the same options and ``continue``s); that invariant is
+        # implicit, and this range made this predicate MORE load-bearing by
+        # gating ``_edge_field_type_conflict`` on it.
+        try:
+            schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
+        except ValueError:
+            return False
         return schema_config is not None and not schema_config.is_observed
 
     def _edge_field_type_conflict(producer: ProducerEntry, node: NodeSpec) -> ValidationEntry | None:
