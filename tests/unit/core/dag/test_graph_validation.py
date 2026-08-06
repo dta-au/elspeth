@@ -759,3 +759,293 @@ class TestTransformOutputFieldCollisions:
         )
 
         schema_validation.validate_transform_output_field_collisions(graph)
+
+
+# ---------------------------------------------------------------------------
+# Build-time Rule A mirror: guaranteed extras vs locked consumer input
+# (elspeth-9615d6c75a)
+# ---------------------------------------------------------------------------
+
+
+def _locked_input_model(*, optional_a: bool = False) -> type[PluginSchema]:
+    """The consumer half of the seam: a mode:fixed input model admitting [url]."""
+    from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+    fields = [FieldDefinition("url", "str")]
+    if optional_a:
+        fields.append(FieldDefinition("a", "str", required=False))
+    return create_schema_from_config(
+        SchemaConfig(mode="fixed", fields=tuple(fields)),
+        "LockedUrlInput",
+        allow_coercion=False,
+    )
+
+
+def _locked_consumer_graph(
+    *,
+    source_schema: dict[str, object],
+    consumer_input_schema: type[PluginSchema] | None,
+    consumer_node_type: NodeType = NodeType.TRANSFORM,
+) -> ExecutionGraph:
+    """source -> locked consumer (-> sink when the consumer is a transform)."""
+    graph = ExecutionGraph()
+    graph.add_node(
+        "src",
+        node_type=NodeType.SOURCE,
+        plugin_name="csv",
+        config={"schema": source_schema},
+    )
+    if consumer_node_type == NodeType.SINK:
+        graph.add_node(
+            "t1",
+            node_type=NodeType.SINK,
+            plugin_name="json",
+            config={"schema": {"mode": "fixed", "fields": ["url: str"]}},
+            input_schema=consumer_input_schema,
+        )
+        graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)
+        return graph
+    graph.add_node(
+        "t1",
+        node_type=NodeType.TRANSFORM,
+        plugin_name="web_scrape",
+        config={"schema": {"mode": "fixed", "fields": ["url: str"]}},
+        input_schema=consumer_input_schema,
+    )
+    graph.add_node(
+        "sink",
+        node_type=NodeType.SINK,
+        plugin_name="json",
+        config={"schema": {"mode": "observed"}},
+    )
+    graph.add_edge("src", "t1", label="continue", mode=RoutingMode.MOVE)
+    graph.add_edge("t1", "sink", label="out", mode=RoutingMode.MOVE)
+    return graph
+
+
+class TestLockedConsumerGuaranteedExtras:
+    """Build-time mirror of composer Rule A (locked_input_extras).
+
+    A producer guarantee means every row WILL carry the field; a locked
+    (mode: fixed, extra=forbid) consumer that does not admit it therefore
+    kills every row at the executor input preflight
+    (engine/executors/transform.py model_validate). That certainty makes
+    build-time rejection sound. The composer already rejects this shape
+    (Rule A, web/composer/state.py locked_input_extras); these tests close
+    the YAML/DAG half of the seam (elspeth-9615d6c75a).
+    """
+
+    def test_guaranteed_extra_against_locked_consumer_is_rejected(self) -> None:
+        """Ticket shape: observed source guarantees {a,url}; locked consumer admits [url]."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["a", "url"]},
+            consumer_input_schema=_locked_input_model(),
+        )
+
+        with pytest.raises(EdgeContractError, match="a") as exc_info:
+            graph.validate_edge_compatibility()
+
+        assert exc_info.value.from_node_id == "src"
+        assert exc_info.value.to_node_id == "t1"
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        # Only the un-admitted field is an extra; the admitted one must not be named.
+        assert result.extra_fields == ("a",)
+
+    def test_abstaining_observed_producer_is_accepted(self) -> None:
+        """Abstention control: no guarantee, no certainty, no build rejection.
+
+        Enforcement stays per-row at the executor preflight — same doctrine as
+        the neighbouring guarantee-based validators.
+        """
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed"},
+            consumer_input_schema=_locked_input_model(),
+        )
+
+        vote = walk_effective_guarantee_vote(graph, "src", {})
+        assert vote.participated is False
+        assert vote.fields == frozenset()
+
+        graph.validate_edge_compatibility()
+
+    def test_guaranteed_field_declared_optional_is_admitted(self) -> None:
+        """An optional declared field is admitted input, not an extra.
+
+        Mirrors TestExtrasFirewallDirection's boundary: rejecting here would
+        trade an unreachable false accept for a live false reject.
+        """
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["a", "url"]},
+            consumer_input_schema=_locked_input_model(optional_a=True),
+        )
+
+        graph.validate_edge_compatibility()
+
+    def test_flexible_consumer_admits_extras(self) -> None:
+        """mode: flexible is extra='allow' — not locked, nothing to reject."""
+        from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
+
+        flexible = create_schema_from_config(
+            SchemaConfig(mode="flexible", fields=(FieldDefinition("url", "str"),)),
+            "FlexibleUrlInput",
+            allow_coercion=False,
+        )
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["a", "url"]},
+            consumer_input_schema=flexible,
+        )
+
+        graph.validate_edge_compatibility()
+
+    def test_dynamic_consumer_schema_is_skipped(self) -> None:
+        """No input model (gates, dynamic transforms) means no lock to enforce."""
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["a", "url"]},
+            consumer_input_schema=None,
+        )
+
+        graph.validate_edge_compatibility()
+
+    def test_multi_hop_guarantee_through_pass_through_is_rejected(self) -> None:
+        """The check consults the effective-guarantee walk, not the raw predecessor.
+
+        The extra field is guaranteed by the SOURCE and only reaches the locked
+        consumer's edge through ADR-007 pass-through propagation.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="csv",
+            config={"schema": {"mode": "observed", "guaranteed_fields": ["a", "url"]}},
+        )
+        graph.add_node(
+            "passthru",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="enrich",
+            config={"schema": {"mode": "observed"}},
+            passes_through_input=True,
+        )
+        graph.add_node(
+            "t1",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="web_scrape",
+            config={"schema": {"mode": "fixed", "fields": ["url: str"]}},
+            input_schema=_locked_input_model(),
+        )
+        graph.add_node(
+            "sink",
+            node_type=NodeType.SINK,
+            plugin_name="json",
+            config={"schema": {"mode": "observed"}},
+        )
+        graph.add_edge("src", "passthru", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("passthru", "t1", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("t1", "sink", label="out", mode=RoutingMode.MOVE)
+
+        with pytest.raises(EdgeContractError, match="a") as exc_info:
+            graph.validate_edge_compatibility()
+
+        assert exc_info.value.to_node_id == "t1"
+
+    def test_locked_sink_guaranteed_extras_rejected(self) -> None:
+        """The sink half (composer Rule B): same certainty, same rejection."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        graph = _locked_consumer_graph(
+            source_schema={"mode": "observed", "guaranteed_fields": ["a", "url"]},
+            consumer_input_schema=_locked_input_model(),
+            consumer_node_type=NodeType.SINK,
+        )
+
+        with pytest.raises(EdgeContractError, match="a"):
+            graph.validate_edge_compatibility()
+
+
+def _locked_input_pipeline_settings(*, guaranteed_fields: list[str]) -> object:
+    """The ticket's repro via the production path: observed source -> mode:fixed web_scrape."""
+    from elspeth.core.config import (
+        ElspethSettings,
+        SinkSettings,
+        SourceSettings,
+        TransformSettings,
+    )
+
+    return ElspethSettings(
+        sources={
+            "primary": SourceSettings(
+                plugin="csv",
+                on_success="urls",
+                options={
+                    "path": "input.csv",
+                    "on_validation_failure": "discard",
+                    "schema": {"mode": "observed", "guaranteed_fields": guaranteed_fields},
+                },
+            )
+        },
+        transforms=[
+            TransformSettings(
+                name="scraper",
+                plugin="web_scrape",
+                input="urls",
+                on_success="output",
+                on_error="discard",
+                options={
+                    "url_field": "url",
+                    "content_field": "page_content",
+                    "fingerprint_field": "page_fingerprint",
+                    "http": {
+                        "abuse_contact": "test@example.com",
+                        "scraping_reason": "contract validation test",
+                        "allowed_hosts": ["127.0.0.0/8"],
+                    },
+                    "schema": {"mode": "fixed", "fields": ["url: str"]},
+                },
+            )
+        ],
+        sinks={
+            "output": SinkSettings(
+                plugin="json",
+                on_write_failure="discard",
+                options={"path": "out.jsonl", "format": "jsonl", "schema": {"mode": "observed"}},
+            )
+        },
+    )
+
+
+class TestLockedInputProductionBuildPath:
+    """The builder must wire input_schema so the Rule A mirror reaches `elspeth run`."""
+
+    def test_guaranteed_extra_is_rejected_at_build(self, plugin_manager: object) -> None:
+        """At HEAD this built green and then killed every row at the preflight."""
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+
+        plugins = instantiate_plugins_from_config(_locked_input_pipeline_settings(guaranteed_fields=["a", "url"]))
+
+        with pytest.raises(GraphValidationError, match="a"):
+            ExecutionGraph.from_plugin_instances(
+                sources=plugins.sources,
+                source_settings_map=plugins.source_settings_map,
+                transforms=plugins.transforms,
+                sinks=plugins.sinks,
+                aggregations=plugins.aggregations,
+            )
+
+    def test_admitted_guarantee_builds(self, plugin_manager: object) -> None:
+        """Baseline: guaranteeing only admitted fields must keep building."""
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+
+        plugins = instantiate_plugins_from_config(_locked_input_pipeline_settings(guaranteed_fields=["url"]))
+
+        ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+        )

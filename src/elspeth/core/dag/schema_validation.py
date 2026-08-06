@@ -202,9 +202,18 @@ def validate_single_edge(
     producer_schema = get_effective_producer_schema(graph, from_node_id, _cache=_schema_cache)
     consumer_schema = to_info.input_schema
 
-    # Rule 1: Dynamic schemas (None) bypass type validation
+    # Rule 1: Dynamic schemas (None) bypass type validation — but a dynamic
+    # producer can still make PROMISES (guaranteed_fields travels outside the
+    # schema), so mirror composer Rule A before abandoning the edge.
     if producer_schema is None or consumer_schema is None:
-        return  # Observed schema - compatible with anything
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_node_id,
+            to_node_id,
+            producer_schema=producer_schema,
+            consumer_schema=consumer_schema,
+        )
+        return  # Types unknowable on one side - compatible with anything
 
     # Handle observed schemas (no explicit fields + extra='allow')
     # These are created by _create_dynamic_schema and accept anything
@@ -213,6 +222,13 @@ def validate_single_edge(
     producer_is_observed = len(producer_schema.model_fields) == 0 and producer_schema.model_config["extra"] == "allow"
     consumer_is_observed = len(consumer_schema.model_fields) == 0 and consumer_schema.model_config["extra"] == "allow"
     if producer_is_observed or consumer_is_observed:
+        _validate_locked_consumer_guaranteed_extras(
+            graph,
+            from_node_id,
+            to_node_id,
+            producer_schema=producer_schema,
+            consumer_schema=consumer_schema,
+        )
         return  # Observed schemas bypass static type validation
 
     # Rule 2: Full compatibility check (missing fields, type mismatches, extra fields)
@@ -236,6 +252,73 @@ def validate_single_edge(
             component_type=to_info.node_type.value,
             from_component_type=graph.get_node_info(from_node_id).node_type.value,
         )
+
+
+def _validate_locked_consumer_guaranteed_extras(
+    graph: ExecutionGraph,
+    from_node_id: str,
+    to_node_id: str,
+    *,
+    producer_schema: type[PluginSchema] | None,
+    consumer_schema: type[PluginSchema] | None,
+) -> None:
+    """Build-time mirror of composer Rule A: guaranteed extras vs a locked input.
+
+    ``check_compatibility``'s extras arm compares schema against schema, so
+    both bypass paths above it (dynamic producer, observed producer) used to
+    leave a locked (``extra='forbid'``) consumer unchecked against a producer
+    whose promises travel in the OTHER channel — ``guaranteed_fields``. A
+    guarantee means every row WILL carry the field; a locked consumer that
+    does not admit it kills every such row at the executor input preflight
+    (``engine/executors/transform.py`` ``model_validate``; ``sink.py`` /
+    ``aggregation.py`` for their consumers). That certainty is what makes
+    build-time rejection sound: reject only where the death is certain, never
+    on a guess — an abstaining producer has no guarantees, so it cannot trip
+    this.
+
+    The composer half is Rule A (``locked_input_extras``,
+    ``web/composer/state.py``); without this arm the compose-vs-runtime seam
+    was open on the YAML surface (elspeth-9615d6c75a): the locked-input
+    pipeline built green and died per-row on row 1.
+
+    Admitted = every declared model field, required or optional — an optional
+    declared field is legitimate input, not an extra (the boundary
+    ``TestExtrasFirewallDirection`` pins).
+    """
+    if consumer_schema is None:
+        return
+    if consumer_schema.model_config["extra"] != "forbid":
+        return
+
+    producer_guaranteed = get_effective_guaranteed_fields(graph, from_node_id)
+    extras = producer_guaranteed - frozenset(consumer_schema.model_fields)
+    if not extras:
+        return
+
+    from_info = graph.get_node_info(from_node_id)
+    to_info = graph.get_node_info(to_node_id)
+    raise EdgeContractError(
+        f"Schema contract violation: edge '{from_node_id}' → '{to_node_id}'\n"
+        f"  Consumer ({to_info.plugin_name}) input is locked (mode: fixed) and accepts: "
+        f"{sorted(consumer_schema.model_fields)}\n"
+        f"  Producer ({from_info.plugin_name}) guarantees fields: {sorted(producer_guaranteed)}\n"
+        f"  Extra fields rejected by consumer input contract: {sorted(extras)}\n"
+        f"\n"
+        f"Fix: Either:\n"
+        f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them, or\n"
+        f"  2. Relax the consumer schema (mode: flexible) to admit undeclared fields, or\n"
+        f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer",
+        from_node_id=str(from_node_id),
+        to_node_id=str(to_node_id),
+        producer_schema_name=producer_schema.__name__ if producer_schema is not None else "(dynamic)",
+        consumer_schema_name=consumer_schema.__name__,
+        compatibility_result=CompatibilityResult(
+            compatible=False,
+            extra_fields=tuple(sorted(extras)),
+        ),
+        component_type=to_info.node_type.value,
+        from_component_type=from_info.node_type.value,
+    )
 
 
 def get_effective_producer_schema(
@@ -943,10 +1026,14 @@ def validate_transform_declared_input_fields(graph: ExecutionGraph) -> None:
     and a row carrying one of those dies AT that node — so wherever rows still
     flow the walk's answer is already correct, and the over-promise names a
     field at a point no row reaches. Firewall-gating this walk is therefore
-    defensive; the substantive gap is that no build-time DAG check mirrors
-    Rule A at all, so the locked-input death itself builds green. Until
-    elspeth-9c5ff8fa7d settles both, treat DAG-accept with composer-reject as
-    the expected asymmetry and the reverse as a defect.
+    defensive — doubly so now that
+    ``_validate_locked_consumer_guaranteed_extras`` (the build-time Rule A
+    mirror, elspeth-9615d6c75a) rejects the edge INTO the firewall node
+    whenever a participating producer guarantees a field the locked input
+    would kill: any edge where this walk over-promises sits downstream of an
+    edge that mirror already refuses to build. The remaining divergence is
+    elspeth-9c5ff8fa7d's walk gating only; DAG-accept with composer-reject
+    stays the expected asymmetry there and the reverse a defect.
 
     Per-predecessor rejection is the correct granularity: if ONE live
     participating predecessor definitely omits a declared field, every row
