@@ -302,9 +302,12 @@ class TestValueTransformBehavior:
                 "operations": [{"target": "subtotal", "expression": "row['price'] * row['quantity']"}],
             }
         )
+        # A fixed-mode producer guarantees its declared inputs as well as its
+        # operation targets, so the downstream locked consumer must admit
+        # price/quantity too — the negative case below pins why.
         consumer = ValueTransform(
             {
-                "schema": {"mode": "fixed", "fields": ["subtotal: float"]},
+                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int", "subtotal: float"]},
                 "required_input_fields": ["subtotal"],
                 "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
             }
@@ -313,6 +316,36 @@ class TestValueTransformBehavior:
         assert producer._output_schema_config is not None
         assert "subtotal" in producer._output_schema_config.get_effective_guaranteed_fields()
         build_linear_pipeline([{"price": 100, "quantity": 2}], transforms=[producer, consumer])
+
+    def test_locked_consumer_omitting_guaranteed_passthrough_fields_is_rejected_at_build(self) -> None:
+        """A narrower fixed consumer is rejected at build, not at row 1.
+
+        ``ValueTransformInput`` is ``extra='forbid'``, so a consumer declaring
+        only ``subtotal`` rejects every row the producer emits — it carries
+        ``price`` and ``quantity`` as well. Build-time rejection is sound
+        because the producer GUARANTEES those fields (elspeth-9615d6c75a).
+        """
+        from elspeth.core.dag.models import EdgeContractError
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        producer = ValueTransform(
+            {
+                "schema": {"mode": "fixed", "fields": ["price: int", "quantity: int"]},
+                "operations": [{"target": "subtotal", "expression": "row['price'] * row['quantity']"}],
+            }
+        )
+        consumer = ValueTransform(
+            {
+                "schema": {"mode": "fixed", "fields": ["subtotal: float"]},
+                "required_input_fields": ["subtotal"],
+                "operations": [{"target": "with_tax", "expression": "row['subtotal'] * 1.2"}],
+            }
+        )
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            build_linear_pipeline([{"price": 100, "quantity": 2}], transforms=[producer, consumer])
+        message = str(exc_info.value)
+        assert "Extra fields rejected by consumer input contract: ['price', 'quantity']" in message
 
     def test_unexpected_evaluator_exceptions_propagate(self, ctx: "PluginContext", monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.plugins.transforms.value_transform import ValueTransform
