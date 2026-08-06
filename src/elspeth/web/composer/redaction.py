@@ -2961,6 +2961,23 @@ class _RowUnionSchemaDetailShadowModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _CoalesceUnionTypeDetailShadowModel(BaseModel):
+    """Redaction shadow for ``CoalesceUnionTypeDetail.to_dict()`` (state.py).
+
+    A field name plus two branch names and their declared types, all read from
+    validated schema config — pipeline identifiers and schema field names,
+    never user row content. Same custody class as the row-union shadow above.
+    """
+
+    field: str
+    branch_a: str
+    type_a: str
+    branch_b: str
+    type_b: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class _ValidationEntryShadowModel(BaseModel):
     """Redaction shadow for ``ValidationEntry.to_dict()`` (state.py).
 
@@ -2969,10 +2986,17 @@ class _ValidationEntryShadowModel(BaseModel):
     ``Severity`` literal alias to its string value); ``error_code`` is the
     closed machine-readable discriminant, emitted only when set, and
     ``contract`` the structured schema-contract facts, emitted only for the
-    schema-contract family, and ``row_union_schema`` the branch declarations
-    emitted only for row-union incompatibility. The response scalar projection
-    preserves the closed severity value and summarizes all free-form
-    diagnostic text.
+    schema-contract family, ``row_union_schema`` the branch declarations
+    emitted only for row-union incompatibility, and ``coalesce_union_type``
+    the conflicting declaration emitted only for a union-coalesce type clash.
+    The response scalar projection preserves the closed severity value and
+    summarizes all free-form diagnostic text.
+
+    This model is ``extra="forbid"``, so it must carry EVERY optional key
+    ``ValidationEntry.to_dict()`` can emit: a missing one is not a silent
+    passthrough but a hard validation failure on the response path.
+    ``tests/unit/web/composer/test_redaction.py`` pins the two shapes against
+    each other so a new detail field cannot land on only one side.
     """
 
     component: str
@@ -2981,6 +3005,7 @@ class _ValidationEntryShadowModel(BaseModel):
     error_code: str | None = None
     contract: _SchemaContractDetailShadowModel | None = None
     row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
+    coalesce_union_type: _CoalesceUnionTypeDetailShadowModel | None = None
 
     model_config = ConfigDict(extra="forbid")
 
