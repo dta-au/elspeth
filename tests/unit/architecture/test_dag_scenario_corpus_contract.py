@@ -460,12 +460,16 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # together with the checkpoint-deterministic-resume case's derived
 # ``resumed_full_projection_sha256`` pin, which digests the full durable
 # history and therefore moves whenever a node record's ``source_file_hash``
-# does. Verified mechanical
+# does. Rotated again 2026-08-06 for the value_transform PH3 refresh from the
+# A3 case-folding hint re-target (elspeth-38dffd9bec): only the three
+# value_transform ``source_file_hash`` tokens on the union-collision-fail node
+# records changed (token-normalized old/new manifests byte-identical).
+# Verified mechanical
 # each time: a field-by-field diff of the live durable projection against the
 # frozen expectation showed every other field equal — schema_fields,
 # schema_hash and schema_mode are unchanged, so no audit projection material
 # moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "2fce91dc14e29e1ba0f157d7d313f2f2271842a76c56ce1a320ce12c2e4bb651"
+EXPECTED_CASE_REGISTRY_SHA256 = "b8205c74d047715deba86e306d71c5ffdc0e1a29985c233f1d81e4c022991922"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -1716,6 +1716,66 @@ class TestStringAmplificationRisk:
         assert parser._node_has_string_amplification(numeric) is False
 
 
+class TestCaseFoldingBuiltins:
+    """A3 (elspeth-38dffd9bec): lower/upper/strip/casefold in function-call form.
+
+    str→str case folding coerces nothing — the no-coercion doctrine targets
+    type coercion (int/str/float/bool). The callables MUST be the unbound
+    str.* descriptors, not lambdas: str.lower(5) raises TypeError, which
+    visit_Call wraps into a clean ExpressionEvaluationError; a lambda's
+    AttributeError rides evaluate()'s crash-through tuple into the web
+    process unwrapped.
+    """
+
+    @pytest.mark.parametrize(
+        ("expression", "row", "expected"),
+        [
+            ("lower(row['x'])", {"x": "AbC"}, "abc"),
+            ("upper(row['x'])", {"x": "AbC"}, "ABC"),
+            ("casefold(row['x'])", {"x": "Straße"}, "strasse"),
+            ("strip(row['x'])", {"x": "  padded  "}, "padded"),
+            ("strip(row['x'], 'z')", {"x": "zzabczz"}, "abc"),  # 2-arg surface, pinned
+        ],
+    )
+    def test_evaluates_on_str_input(self, expression: str, row: dict, expected: str) -> None:
+        assert ExpressionParser(expression).evaluate(row) == expected
+
+    @pytest.mark.parametrize("name", ["lower", "upper", "strip", "casefold"])
+    def test_non_str_input_raises_evaluation_error(self, name: str) -> None:
+        """The descriptor tripwire: TypeError wrapped clean, never an
+        AttributeError riding the crash-through tuple."""
+        parser = ExpressionParser(f"{name}(row['x'])")
+        with pytest.raises(ExpressionEvaluationError):
+            parser.evaluate({"x": 5})
+
+    @pytest.mark.parametrize("name", ["lower", "upper", "strip", "casefold"])
+    def test_stays_routable(self, name: str) -> None:
+        """str-returning builtins must stay routable (route labels are str) —
+        they must never join _ALWAYS_NUMERIC_BUILTINS."""
+        assert ExpressionParser(f"{name}(row['x'])").is_provably_non_routable() is False
+
+    @pytest.mark.parametrize("name", ["replace", "split", "format", "title"])
+    def test_other_str_builtins_still_rejected(self, name: str) -> None:
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser(f"{name}(row['x'])")
+
+    def test_bare_name_reference_still_rejected(self) -> None:
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser("lower")
+
+    def test_method_call_form_still_rejected(self) -> None:
+        """Only the function-call form is admitted; attribute access stays
+        closed to row.get."""
+        with pytest.raises(ExpressionSecurityError):
+            ExpressionParser("row['x'].lower()")
+
+    def test_amplification_regression_takes_a2_path(self) -> None:
+        """The A2-before-A3 ordering, mechanically enforced: the first
+        str-producing builtins widen what Mult/Mod can amplify, and the
+        polarity predicate must fire on the Call-operand form."""
+        assert ExpressionParser("lower(row['x']) * 1000000").has_string_amplification_risk() is True
+
+
 class TestExpressionParserDictContext:
     """Tests for evaluating expressions against plain dict contexts.
 

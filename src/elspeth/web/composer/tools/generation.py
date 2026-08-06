@@ -224,9 +224,14 @@ Literals:
   [..] lists, (..) tuples, {..} sets, {'k': v} dicts — for membership tests
 
 Built-in functions (only these are allowed):
-  len()    Length of a sequence or string
-  abs()    Absolute value of a number
+  len()       Length of a sequence or string
+  abs()       Absolute value of a number
+  lower()     Lowercase a string, e.g. lower(row['name'])
+  upper()     Uppercase a string
+  strip()     Trim whitespace (or given characters: strip(row['x'], 'z'))
+  casefold()  Aggressive lowercase for caseless matching
 
+Case folding is function-call form only — row['x'].lower() is rejected.
 Type coercion functions (int, str, float, bool) are NOT available.
 Types are guaranteed by the source schema — no coercion is needed in expressions.
 

@@ -97,11 +97,23 @@ _BOOL_OPS: MappingProxyType[type[ast.boolop], str] = MappingProxyType(
 # Safe built-in functions allowed in expressions (immutable to prevent runtime tampering).
 # Only non-coercive operations are permitted. Coercive builtins (str, int, float, bool)
 # are forbidden because they silently normalize Tier 2 data in gate expressions,
-# masking upstream contract bugs and weakening audit attributability.
+# masking upstream contract bugs and weakening audit attributability. str→str case
+# folding coerces nothing — the no-coercion rule targets TYPE coercion.
+#
+# The str callables MUST be the unbound str.* descriptors, never lambdas:
+# str.lower(5) raises TypeError, which visit_Call wraps into a clean
+# ExpressionEvaluationError; a lambda's AttributeError would ride evaluate()'s
+# crash-through tuple into the caller unwrapped. Do NOT add str-returning
+# entries to _ALWAYS_NUMERIC_BUILTINS, and stop at these four — no replace,
+# split, or format (format is a known sandbox-escape vector).
 _SAFE_BUILTINS: MappingProxyType[str, Any] = MappingProxyType(
     {
         "len": len,
         "abs": abs,
+        "lower": str.lower,
+        "upper": str.upper,
+        "strip": str.strip,
+        "casefold": str.casefold,
     }
 )
 
@@ -726,7 +738,9 @@ class ExpressionParser:
     Allowed operations:
     - Subscript access: name['field'], name['key1']['key2']
     - Method: name.get('field') (single-arg only — defaults are fabrication)
-    - Safe builtins: len(), abs()
+    - Safe builtins: len(), abs(), lower(), upper(), strip(), casefold()
+      (case folding is function-call form only — row['x'].lower() stays
+      forbidden; attribute access remains closed to name.get)
     - Comparisons: ==, !=, <, >, <=, >=
     - Boolean operators: and, or, not
     - Membership: in, not in

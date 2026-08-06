@@ -3765,6 +3765,27 @@ class TestDiscoveryTools:
         for constant in _SAFE_CONSTANTS:
             assert constant in grammar, f"constant {constant!r} undocumented"
 
+    def test_expression_grammar_documents_every_builtin_bidirectionally(self) -> None:
+        """Text↔parser doc-parity for builtins, both directions (A4).
+
+        Every key of _SAFE_BUILTINS appears in the Built-in functions
+        section, and nothing is documented there that is not in the set —
+        so growing _SAFE_BUILTINS without the text update (or vice versa)
+        fails here, inside the same commit.
+        """
+        import re as _re
+
+        from elspeth.core.expression_parser import _SAFE_BUILTINS
+
+        grammar = get_expression_grammar()
+        builtins_section = grammar.split("Built-in functions")[1].split("Type coercion functions")[0]
+
+        for name in _SAFE_BUILTINS:
+            assert f"{name}(" in builtins_section, f"builtin {name!r} undocumented"
+
+        documented = set(_re.findall(r"^\s*([a-z_]+)\(", builtins_section, flags=_re.MULTILINE))
+        assert documented == set(_SAFE_BUILTINS), f"documented builtins {sorted(documented)} != parser set {sorted(_SAFE_BUILTINS)}"
+
 
 class TestToolDefinitions:
     def test_all_have_json_schema(self) -> None:
