@@ -369,6 +369,54 @@ describe("ChatPanel", () => {
     expect(screen.getByText("Revise the request and send it again.")).toBeInTheDocument();
   });
 
+  it("scopes an unsent freeform draft to its session across switches", () => {
+    // elspeth-ca38667856: ChatPanel stays mounted across session switches, so
+    // an unscoped inputText leaked session A's unsent draft into session B's
+    // composer. The draft is keyed by session id: invisible on B, restored on
+    // returning to A (clearing on switch would destroy typed content, which
+    // the elspeth-49b467d91a retention doctrine forbids).
+    const sessionA: Session = {
+      id: "session-a",
+      title: "Freeform session A",
+      created_at: "2026-04-26T10:00:00Z",
+      updated_at: "2026-04-26T10:00:00Z",
+    };
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-a",
+      sessions: [sessionA],
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    act(() => {
+      screen.getByTestId("chat-input-type").click();
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "retyped while pending",
+    );
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-b" });
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe("");
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-a" });
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "retyped while pending",
+    );
+  });
+
   it("shows the quiet introduction in an empty freeform session", () => {
     const sendMessage = vi.fn();
     const session: Session = {
@@ -1507,6 +1555,42 @@ describe("ChatPanel mode discriminator", () => {
     });
 
     await waitFor(() => expect(scope).toHaveValue("amend"));
+  });
+
+  it("scopes an unsent guided draft to its session across switches", () => {
+    // elspeth-ca38667856: same per-session scoping as the freeform draft —
+    // the docked guided composer is controlled on guidedDraft, which leaked
+    // an unsent prompt across session switches while ChatPanel stayed
+    // mounted. Keyed by session id: hidden on the other session, restored on
+    // return.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: activeGuidedSession(),
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    act(() => {
+      screen.getByTestId("chat-input-type").click();
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "retyped while pending",
+    );
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-other" });
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe("");
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-guided" });
+    });
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "retyped while pending",
+    );
   });
 
   it("submits amend immediately after proposal identity changes before passive reset effects", async () => {

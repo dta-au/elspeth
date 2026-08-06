@@ -6,6 +6,7 @@ import {
   useRef,
   useCallback,
   useState,
+  type SetStateAction,
 } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
@@ -771,6 +772,14 @@ export function ChatPanel({
       ),
     [chatGuided, composeTimeoutReady],
   );
+  // Unsent drafts are keyed by session id (elspeth-ca38667856): ChatPanel
+  // stays mounted across session switches, so a bare useState draft typed on
+  // session A would still be sitting in session B's composer. Each session
+  // owns a slot — switching away hides the draft, switching back restores it.
+  // Clearing on switch instead would destroy typed content, which the
+  // retention doctrine below forbids. The "" key carries the draft typed
+  // while no session is active.
+  const draftSessionKey = activeSessionId ?? "";
   // Plain-guided prompt draft (elspeth-49b467d91a). The docked guided composer
   // is CONTROLLED on this state — the same ChatInput controlled mode the
   // tutorial (frozen per-step prompt) and freeform (`inputText`) already use;
@@ -778,7 +787,22 @@ export function ChatPanel({
   // prompt lived only inside ChatInput and was unrecoverable after the
   // clear-on-send. ChatInput still clears this on Send (onChange("")); the
   // retention wrapper below restores it when the send did not deliver.
-  const [guidedDraft, setGuidedDraft] = useState("");
+  const [guidedDraftsBySession, setGuidedDraftsBySession] = useState<
+    ReadonlyMap<string, string>
+  >(new Map());
+  const guidedDraft = guidedDraftsBySession.get(draftSessionKey) ?? "";
+  const updateGuidedDraftForSession = useCallback(
+    (sessionKey: string, action: SetStateAction<string>) =>
+      setGuidedDraftsBySession((drafts) =>
+        withSessionDraftSlot(drafts, sessionKey, action),
+      ),
+    [],
+  );
+  const setGuidedDraft = useCallback(
+    (action: SetStateAction<string>) =>
+      updateGuidedDraftForSession(draftSessionKey, action),
+    [updateGuidedDraftForSession, draftSessionKey],
+  );
   // Parity with the tutorial frame (elspeth-49b467d91a): the tutorial retains
   // its locked prompt until the server-authoritative chat_history carries the
   // user turn (tutorialPromptSentForStep). The live composer gets the same
@@ -793,9 +817,11 @@ export function ChatPanel({
   //   - start path (compositionState was null → /guided/start): the intent is
   //     durably rooted as a session MESSAGE, not a chat turn, so delivery is
   //     the durable checkpoint chatGuided demands (compositionState non-null).
-  // Restore is skipped when the session changed mid-flight (a draft must not
-  // leak across sessions) and never clobbers newer typing — the textarea
-  // stays editable while the send is pending.
+  // Restore is skipped when the session changed mid-flight: the delivered
+  // check reads the ACTIVE session's guided state, so it cannot be evaluated
+  // for a session that is no longer active, and restoring unverified would
+  // re-offer a prompt that may have been delivered. Restore never clobbers
+  // newer typing — the textarea stays editable while the send is pending.
   const sendGuidedChatRetainingDraft = useCallback(
     async (content: string, revisionMode?: GuidedRevisionMode) => {
       const before = useSessionStore.getState();
@@ -820,12 +846,17 @@ export function ChatPanel({
               ) ?? false)
             : after.compositionState !== null;
           if (!delivered) {
-            setGuidedDraft((current) => (current === "" ? content : current));
+            // Slot-targeted (sessionAtSend, not the live draftSessionKey):
+            // under the same-session guard above they are equal, but the
+            // stable identity keeps this callback from churning per switch.
+            updateGuidedDraftForSession(sessionAtSend ?? "", (current) =>
+              current === "" ? content : current,
+            );
           }
         }
       }
     },
-    [sendGuidedChat],
+    [sendGuidedChat, updateGuidedDraftForSession],
   );
   const cancelGuidedChat = useCallback(() => {
     guidedChatControllerRef.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
@@ -925,7 +956,19 @@ export function ChatPanel({
   const guidedWorkspaceAtBottomRef = useRef(true);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const [showBlobManager, setShowBlobManager] = useState(false);
-  const [inputText, setInputText] = useState("");
+  // Freeform draft: same per-session scoping as guidedDraft above
+  // (elspeth-ca38667856).
+  const [freeformDraftsBySession, setFreeformDraftsBySession] = useState<
+    ReadonlyMap<string, string>
+  >(new Map());
+  const inputText = freeformDraftsBySession.get(draftSessionKey) ?? "";
+  const setInputText = useCallback(
+    (action: SetStateAction<string>) =>
+      setFreeformDraftsBySession((drafts) =>
+        withSessionDraftSlot(drafts, draftSessionKey, action),
+      ),
+    [draftSessionKey],
+  );
   const [guidedSourceBlobCandidateSet, setGuidedSourceBlobCandidateSet] =
     useState<GuidedSourceBlobCandidateSet | null>(null);
   const pendingGuidedUploadsRef = useRef(new Map<string, GuidedUploadFence>());
@@ -2969,6 +3012,26 @@ export function ChatPanel({
       />
     </div>
   );
+}
+
+// Apply a setState-style action to one session's draft slot. Preserves map
+// identity when the value is unchanged (no spurious re-render) and drops
+// empty slots so the map only holds sessions with a live unsent draft.
+function withSessionDraftSlot(
+  drafts: ReadonlyMap<string, string>,
+  sessionKey: string,
+  action: SetStateAction<string>,
+): ReadonlyMap<string, string> {
+  const current = drafts.get(sessionKey) ?? "";
+  const value = typeof action === "function" ? action(current) : action;
+  if (value === current) return drafts;
+  const next = new Map(drafts);
+  if (value === "") {
+    next.delete(sessionKey);
+  } else {
+    next.set(sessionKey, value);
+  }
+  return next;
 }
 
 type WorkflowStepId = GuidedStep | "ready";
