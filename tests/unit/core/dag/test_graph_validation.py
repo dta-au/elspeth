@@ -1110,7 +1110,7 @@ coalesce:
   branches:
     path_a: trunc_a
     path_b: trunc_b
-  policy: require_all
+  policy: {policy}
   merge: union
   union_collision_policy: last_wins
 {coalesce_out}
@@ -1155,6 +1155,23 @@ _SINK_ADMITS_ALL = """        fields:
         - 'description: str'
 """
 
+# A locked TRANSFORM consumer: mode: fixed makes its input extra='forbid', so
+# it rejects the phantom-guaranteed fields exactly as a locked sink does.
+_LOCKED_TRANSFORM = """- name: lock_it
+  plugin: truncate
+  input: merge_results
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: fixed
+      fields:
+      - 'description: str'
+"""
+
 # field_mapper select_only drops the extras — remedy 3 of the rejection message.
 _SELECT_ONLY_MAPPER = """- name: drop_extras
   plugin: field_mapper
@@ -1177,6 +1194,7 @@ def _build_coalesce_graph(
     branch_schema: str = _BRANCH_UNDERDECLARED,
     sink_fields: str = _SINK_ADMITS_DESCRIPTION,
     sink_mode: str = "fixed",
+    policy: str = "require_all",
     extra_transforms: str = "",
     coalesce_out: str = "\n  on_success: output",
 ) -> ExecutionGraph:
@@ -1188,6 +1206,7 @@ def _build_coalesce_graph(
         _COALESCE_PIPELINE.format(
             branch_schema=branch_schema,
             sink_mode=sink_mode,
+            policy=policy,
             extra_transforms=extra_transforms,
             sink_fields=sink_fields,
             coalesce_out=coalesce_out,
@@ -1290,15 +1309,64 @@ class TestUnionCoalesceGuaranteedExtras:
     def test_select_only_field_mapper_clears_the_rejection(self) -> None:
         """The rejection message's remedy 3 must actually clear the rejection.
 
-        A field_mapper with select_only drops the extras, so the walk carries
-        only 'description' past it — an error whose own remedy did not clear it
-        would mean the guarantee walk over-attributes through field-dropping
-        nodes.
+        Asserts BOTH halves in one test so the claim is falsifiable: the same
+        topology WITHOUT the field_mapper is rejected, and inserting one clears
+        it. Checking only the second half would pass even if the rejection had
+        never been live — the coalesce -> field_mapper edge is not itself
+        eligible for this check (field_mapper's own input contract is
+        extra='allow'), so it is the mapper doing the work, not the check
+        declining to fire.
+
+        The guarantee assertion is the mechanism: select_only narrows the walk
+        to 'description', so an error whose own remedy did not clear it would
+        mean the walk over-attributes through field-dropping nodes.
         """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError):
+            _build_coalesce_graph()
+
         graph = _build_coalesce_graph(extra_transforms=_SELECT_ONLY_MAPPER, coalesce_out="")
 
         mapper = next(n for n in graph.get_nodes() if n.node_id.startswith("transform_drop_extras"))
         assert schema_validation.get_effective_guaranteed_fields(graph, mapper.node_id) == frozenset({"description"})
+
+    def test_phantom_guarantee_is_rejected_under_intersection_policy(self) -> None:
+        """`best_effort` merges guarantees by INTERSECTION, a distinct code path.
+
+        `merge_guaranteed_fields` unions under require_all and intersects
+        otherwise. Every other fixture in this class is require_all, so without
+        this the intersection arm is unexercised — and it reaches the same
+        phantom today only because the branches are structurally identical. A
+        change narrowing that arm would silently reopen the defect on
+        non-require_all pipelines with nothing going red.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(policy="best_effort\n  timeout_seconds: 5")
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_phantom_guarantee_is_rejected_at_a_locked_transform_consumer(self) -> None:
+        """The check governs every edge, not only sink edges.
+
+        `validate_typed_producer_guaranteed_extras` excludes only COALESCE and
+        ROW_UNION consumers, so a locked TRANSFORM is equally in scope and its
+        rows die at the same input preflight. Pinned because every other case
+        in this class happens to terminate at a sink.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(sink_mode="observed", sink_fields="", extra_transforms=_LOCKED_TRANSFORM, coalesce_out="")
+
+        assert exc_info.value.to_node_id.startswith("transform_lock_it")
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.extra_fields == ("category", "id", "price", "product")
 
 
 _LINEAR_PASS_THROUGH_PIPELINE = """sources:
