@@ -10804,6 +10804,62 @@ class TestSetPipeline:
         assert result.success is False
         assert "Invalid gate condition syntax" in result.data["error"]
 
+    def test_value_transform_bad_expression_error_code_parity(self) -> None:
+        """Both authoring routes code the same prevalidation failure (A6).
+
+        The same _prevalidate_transform_for_context failure was returned
+        UNCODED on upsert_node but coded plugin_options_invalid on
+        set_pipeline, so explain_validation_error misdiagnosed the
+        upsert_node path. Parity is pinned so it cannot drift back.
+        """
+        bad_operations = [{"target": "out", "expression": "title(row['text'])"}]
+
+        catalog = _mock_catalog()
+        r1 = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "t1",
+                "options": {"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
+                "on_validation_failure": "quarantine",
+            },
+            _empty_state(),
+            catalog,
+        )
+        node_result = execute_tool(
+            "upsert_node",
+            {
+                "id": "t1",
+                "node_type": "transform",
+                "plugin": "value_transform",
+                "input": "t1",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}, "operations": bad_operations},
+            },
+            r1.updated_state,
+            catalog,
+        )
+        assert node_result.success is False
+
+        args = _valid_pipeline_args()
+        args["nodes"].append(
+            {
+                "id": "t_bad",
+                "node_type": "transform",
+                "plugin": "value_transform",
+                "input": "source_out",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}, "operations": bad_operations},
+            }
+        )
+        pipeline_result = execute_tool("set_pipeline", args, _empty_state(), catalog)
+        assert pipeline_result.success is False
+
+        assert pipeline_result.data["error_code"] == "plugin_options_invalid"
+        assert node_result.data.get("error_code") == pipeline_result.data["error_code"]
+
     def test_set_pipeline_gate_valid_condition_accepted(self) -> None:
         """set_pipeline accepts gate nodes with valid conditions."""
         state = _empty_state()

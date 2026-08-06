@@ -608,7 +608,7 @@ def _execute_upsert_node(
 
         prevalidation_error = _prevalidate_transform_for_context(context, plugin, review_options)
         if prevalidation_error is not None:
-            return _failure_result(state, prevalidation_error)
+            return _failure_result(state, prevalidation_error, error_code="plugin_options_invalid")
 
         # Operator-profiled nodes carry their private provider config (retry
         # budget / provider binding) in the profile, injected only at lowering;
