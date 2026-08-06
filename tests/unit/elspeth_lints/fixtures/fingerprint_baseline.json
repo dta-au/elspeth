@@ -5,6 +5,7 @@
   "audit_evidence.tier_1_decoration": [],
   "composer.catch_order": [],
   "composer.exception_channel": [],
+  "contract_invariants.adapter_method_budget": [],
   "contract_invariants.portable_sqlite_insert": [],
   "contract_invariants.session_engine_factory": [],
   "contract_invariants.validation_theatre": [],

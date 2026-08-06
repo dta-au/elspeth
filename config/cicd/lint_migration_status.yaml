@@ -30,9 +30,9 @@ rules:
     status: pending
     migration_issue: elspeth-313cd53771
   - old_script: scripts/cicd/enforce_adapter_budget.py
-    new_rule: null
-    status: pending
-    migration_issue: null
+    new_rule: contract_invariants.adapter_method_budget
+    status: deleted
+    migration_issue: elspeth-3575a7f15d
   - old_script: scripts/cicd/generate_skill_inventory.py
     new_rule: null
     status: pending

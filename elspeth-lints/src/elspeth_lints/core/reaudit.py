@@ -608,6 +608,10 @@ _RULE_VOCABULARY_REGISTRY: dict[str, _VocabularySpec] = {
         "elspeth_lints.rules.contract_invariants.validation_theatre.rule",
         ("RULE_ID",),
     ),
+    "contract_invariants.adapter_method_budget": _VocabularySpec(
+        "elspeth_lints.rules.contract_invariants.adapter_method_budget.rule",
+        ("RULE_ID",),
+    ),
     "audit_evidence.guard_symmetry": _VocabularySpec(
         "elspeth_lints.rules.audit_evidence.guard_symmetry.rule",
         ("LEGACY_RULE_ID",),
