@@ -19,10 +19,10 @@ from typing import Any, Literal, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.data import check_compatibility
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import TransformProtocol
-from elspeth.contracts.data import check_compatibility
 from elspeth.contracts.plugin_semantics import SemanticEdgeContract
 from elspeth.contracts.schema import (
     SchemaConfig,
@@ -4119,6 +4119,39 @@ def _check_schema_contracts(
                 ),
             )
         )
+
+    # Eager schema-SYNTAX sweep (elspeth-33738eedb6). Every parser above is
+    # LAZY: it resolves a declaration only when some contract comparison needs
+    # it. So a declared schema block that nothing consumes was never parsed at
+    # all, and a malformed field spec validated GREEN — `source -> sink` with a
+    # plain unschema'd sink is among the most common pipeline shapes — then
+    # died at plugin construction with PluginConfigError. A declared schema
+    # block is authored config: its SYNTAX is checkable with no topology
+    # context whatsoever, so it must not depend on who reads it.
+    #
+    # Deduped by owner against the lazy parsers above: where a contract
+    # comparison did reach the declaration, it has already reported, and one
+    # authoring defect owes exactly one error.
+    schema_config_reported = {error.component for error in errors if error.error_code == "contract_config_invalid"}
+
+    def _sweep_schema_syntax(owner: str, options: Mapping[str, Any], *, node_type: str | None = None) -> None:
+        if owner in schema_config_reported:
+            return
+        try:
+            contract_options = options
+            if node_type == "aggregation":
+                contract_options, _ = get_aggregation_contract_options(options, owner=owner)
+            get_raw_schema_config(contract_options, owner=owner)
+        except ValueError as exc:
+            schema_config_reported.add(owner)
+            errors.append(_err(owner, f"Invalid contract config: {exc}", "high", "contract_config_invalid"))
+
+    for sweep_source_name, sweep_source in sources.items():
+        _sweep_schema_syntax(source_producer_id(sweep_source_name), sweep_source.options)
+    for sweep_node in nodes:
+        _sweep_schema_syntax(f"node:{sweep_node.id}", sweep_node.options, node_type=sweep_node.node_type)
+    for sweep_output in outputs:
+        _sweep_schema_syntax(f"output:{sweep_output.name}", sweep_output.options)
 
     return tuple(errors), tuple(contract_warnings), tuple(edge_contracts)
 
