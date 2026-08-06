@@ -212,13 +212,41 @@ Round 5: 1 completed, 2 validate-FAILED on the `row_union` edge with
 path each sample took, and the transcripts answer: s1 repaired once, s2 and s3
 repaired four times each (`set_pipeline[failed] → set_pipeline[applied] →
 get_pipeline_state → patch_node_options[rejected] → upsert_node[applied]` for
-s2). Round 5's g08-s2 made **zero** repair attempts because the failure it got
-carried a null suggestion and a remediation naming an option `row_union` does
-not have. So the repair channel is not merely present, it is being used and it
-converges.
+s2). Round 5's g08-s2 made **zero** repair attempts.
 
-Combined with the L1 PREVENTION result — the round-5 authored form now builds
-clean — the ticket is settled at both levels.
+**What the live samples do and do not evidence.** They show the composer
+repairing and converging. They do **not** show *which* rejection each repair
+answered: the transcript API does not expose tool-result rows
+(`elspeth-de3638b6ac`), and the `/state` captures are the final, valid states,
+so `validation_errors` and `validation_suggestions` are `null` on all three.
+g03 in this same round proves rejections come from other seams too. The
+suggestion-channel claim therefore rests on L1, not on these transcripts.
+
+**L1 repair probe — the channel verified directly.** PREVENTION means the
+unmodified round-5 form no longer reaches the missing-fields arm, so the
+repaired channel cannot be observed from it. The probe takes that same authored
+form and demands one field no branch can guarantee, so the arm fires
+(`r6-evidence/l1-41bcaa882e-repair-probe.txt`):
+
+| | Round 5 (`59cb6f75e`) | Round 6 (`69c6ad4b5`) |
+|---|---|---|
+| exception | bare `GraphValidationError` | structured `EdgeContractError` |
+| producer guarantees | `(none - dynamic schema)` | `['complaint_id','complaint_text','style_tag','summary','summary_model','summary_usage']` |
+| `missing_fields` | — | `('no_branch_supplies_this',)` |
+| `from_component_type` | — | `row_union` (new in `c408ea870`) |
+| suggestion | `None` | non-null and actionable |
+| remediation names | `required_input_fields` only | *"its required_input_fields option **or its schema.required_fields**, whichever declares them"* |
+
+The suggestion the web preflight emits:
+
+> The plugin-free row_union … exposes an engine-owned observed schema; it has no
+> plugin schema options to patch. Relax the real downstream consumer transform
+> … Tool: `patch_node_options(node_id=…, patch={'schema': {…}})`
+
+That is defect #3 answered precisely: it recognises `row_union` has no options
+to patch — which is exactly why round 5's advice to add `guaranteed_fields` was
+unusable — and redirects to the node that does. All three of the ticket's
+defects are verified with controls.
 
 ### `elspeth-9d59c33480` — **loop gone; one caveat**
 
@@ -286,9 +314,33 @@ The root cause of the write failure is **still open** — a CloudWatch look at
 the task log for the run window should name it; AWS credentials expired before
 that could be done and the evidence was already sufficient to file.
 
-`elspeth-b19dfe41fb` was **not** re-sampled live: round 6's g11 authored a
-different shape (no shield on an int field), so the live leg for that ticket
-was not exercised. Its L1 is decisive; its L2 remains owed.
+### `elspeth-b19dfe41fb` — L2 discharged without spending a compose
+
+Round 6's g11 authored a *different* shape (no shield on an int field), so the
+live leg was not exercised by the drive. It did not need to be: the rejection
+is **statically knowable**, so the shape can be put in front of the live
+preflight directly. Round 5's own g11 export was imported into a fresh session
+on the round-6 stack via `POST /api/sessions/{id}/state/yaml` and validated:
+
+```
+is_valid: False
+FAILED graph_structure ::
+  Transform 'aws_bedrock_prompt_shield' (node 'transform_prompt_shield_auto_1_…')
+  scans input fields that must be text, but its upstream 'source_source_…'
+  declares them non-string: 'sentence_num' is declared int. …
+```
+
+Round 5 passed this same shape and then quarantined 100% of rows. **L2 met,
+zero composes.**
+
+Two incidental notes from that import, both showing controls working as
+designed: a `csv` source path of `inputs/…` and of `outputs/…` were **both**
+rejected with *"Path traversal blocked … resolves outside allowed
+directories"* — the web surface does not accept author-controlled filesystem
+source paths, so the import had to go through an uploaded blob and
+`source_blob_ids`. And the round-5 export carried neither the source path nor
+the sink path, which is consistent with `elspeth-b73666ac82`: these exports are
+records, not re-runnable artefacts.
 
 ## Verdicts
 
@@ -298,7 +350,7 @@ was not exercised. Its L1 is decisive; its L2 remains owed.
 | `elspeth-9d59c33480` | contract changed, control-verified | 1 review call per site, 6/6; g04 164s/100s | **PASS with caveat** — see `elspeth-obs-8ad9b34eea` before closing |
 | `elspeth-09c91778f5` | n/a (infrastructure) | g03 composes in 191s; ALB 900 verified on the ALB | **PASS** — criterion met, though not for the predicted reason |
 | `elspeth-155947ca47` | divergence reproduced in r5 evidence | 7/7 agree, incl. an invalid state | **PASS** — recommend close |
-| `elspeth-b19dfe41fb` | build-time rejection, control-verified | not exercised (g11 authored a different shape) | **L1 PASS, L2 owed** |
+| `elspeth-b19dfe41fb` | build-time rejection, control-verified | live `/validate` rejects round-5's exact shape | **PASS** — recommend close |
 
 ## New defects found this round
 
@@ -341,22 +393,19 @@ artefact, or a record?) and is left to the operator rather than guessed.
 
 ## What round 7 owes
 
-1. **`elspeth-b19dfe41fb` L2** — not exercised this round; needs a compose that
-   actually auto-wires a shield onto a non-string field, or an explicit
-   acknowledgement that L1 suffices for a statically-knowable rejection.
-2. **The g11 sink root cause** — one CloudWatch query on run
+1. **The g11 sink root cause** — one CloudWatch query on run
    `badfc85f-5657-416e-9624-7cfe5caedcf5`'s window names it.
-3. **g01/g02 second stochastic pass** — still carried from round 5; untouched
+2. **g01/g02 second stochastic pass** — still carried from round 5; untouched
    here because the operator scoped this round to the priority trio.
-4. **Advisor END gate** — still unmeasured; zero `phase=end` events in rounds
+3. **Advisor END gate** — still unmeasured; zero `phase=end` events in rounds
    3–5, and round 6 ran no cost/advisor pass at all.
-5. **Cost pass** — not run this round. Seven composes at TD `:6`; the
+4. **Cost pass** — not run this round. Seven composes at TD `:6`; the
    per-arm cohort query (`make_r5_cost_override.py` pattern) would give a
    900/840-render figure to set against round 5's 0.3077/session parity number.
 
 ## Proportionality note
 
-This round spent 7 composes. Three of the five ticket verdicts were settled
+This round spent 7 composes, and all five ticket verdicts closed. Three were settled
 *deterministically off-stack, before any compose*, by replaying round 5's own
 preserved artefacts against both code pins with the same harness. That is what
 made the live legs cheap: they were confirmation, not discovery. Two of the
