@@ -381,13 +381,16 @@ locals {
     { name = "ELSPETH_WEB__PAYLOAD_STORE_PATH", value = local.payload_store_path },
     { name = "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS", value = "12" },
     { name = "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS", value = "8" },
-    # Operator-tunable (var.composer_timeout_seconds; was a hardcoded 120,
-    # then a hardcoded 240 — elspeth-f159d2394b). Default 240: at the
-    # measured ~20s per authoring turn a 120s clock funded ~6 turns, so the
-    # 12+8 turn budget above was unreachable at any observed turn cost. The
-    # variable's plan-time validation enforces the 270s WebSettings guard;
-    # raising past that requires raising the ALB idle timeout (network.tf)
-    # first — see the terraform README.
+    # The composer envelope is a coupled three-leg chain driven by
+    # var.alb_idle_timeout_seconds: the ALB idle_timeout (network.tf), the
+    # transport ceiling below (so the app's boot guard validates against the
+    # real proxy limit, not the WebSettings default 300), and the wall clock
+    # (var.composer_timeout_seconds, plan-time capped at ceiling - 30s
+    # headroom). Defaults 900/840 (elspeth-09c91778f5): the prior 300/240
+    # envelope could not fund the shipped corpus - battery round-5 g03's
+    # first authoring call lands at t=413s and its compose settles at
+    # ~490-514s. Wall history: 120 hardcoded, then 240 (elspeth-f159d2394b).
+    { name = "ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS", value = tostring(var.alb_idle_timeout_seconds) },
     { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = tostring(var.composer_timeout_seconds) },
     # "medium", not the code default "high": the candidate role is the other
     # half of the wall-clock budget above, and the value is measured rather

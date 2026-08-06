@@ -1693,7 +1693,7 @@ def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs(initial
 
 def test_networking_has_long_request_support_and_correct_listener_target() -> None:
     network = _text("modules/scenario/network.tf")
-    assert re.search(r"idle_timeout\s+=\s+300", network)
+    assert re.search(r"idle_timeout\s+=\s+var\.alb_idle_timeout_seconds", network)
     assert re.search(r'type\s+=\s+"forward"', network)
     assert re.search(r"target_group_arn\s+=\s+aws_lb_target_group\.web\.arn", network)
 
@@ -2060,43 +2060,61 @@ def test_dashboard_metrics_preserve_one_row_per_metric() -> None:
 def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
     """The composer wall clock must fail before the transport does.
 
-    Three files have to agree and none of them can see the others:
-    `locals.tf` sets the backend's own timeout, `network.tf` sets the ALB
-    idle timeout, and `WebSettings` supplies the ceiling/headroom the boot
-    guard enforces. The pin was raised from 120s to 240s
-    (elspeth-f159d2394b) because at the measured ~20s per authoring turn a
-    120s clock funded ~6 turns against a 12+8 turn budget. That raise moved
-    the value from "huge margin" to "exactly at the boundary", so the
-    relationship now needs a gate: 240 + 30 headroom is 270, which is both
-    the app ceiling and 30s clear of the ALB's 300s idle timeout.
+    The envelope is a coupled three-leg chain driven by one variable
+    (elspeth-09c91778f5): `var.alb_idle_timeout_seconds` sets the ALB
+    idle_timeout in `network.tf`, `locals.tf` wires the app's transport
+    ceiling env var to the same variable (so the boot guard validates
+    against the real proxy limit, not the WebSettings default), and
+    `var.composer_timeout_seconds`'s plan-time validation caps the wall
+    clock at the ceiling minus the app's headroom. A wall clock past the
+    proxy's patience would let the load balancer abort the connection
+    before the backend's own timeout fired, replacing the discriminated
+    422 (which persists the partial pipeline) with an opaque 504 (which
+    does not). That is a live-only failure, so it is caught here.
 
-    Raising the pin further without raising the ALB idle timeout would let
-    the load balancer abort the connection before the backend's own timeout
-    fired, replacing the discriminated 422 (which persists the partial
-    pipeline) with an opaque 504 (which does not). That is a live-only
-    failure, so it is caught here rather than in production.
+    The chain replaced independent literals that had to agree by
+    discipline: 300/240 (elspeth-f159d2394b) could not fund the shipped
+    corpus — battery round-5 g03's first authoring call lands at t=413s
+    and its compose settles at ~490-514s, so the ceiling itself was the
+    defect, not the wall-clock's margin under it.
 
-    The ceiling and headroom are read from the `WebSettings` field defaults,
-    which is only the value the task actually boots with while this module
-    ships no environment override for them — so the absence of an override
-    is asserted rather than assumed. A deployment that does override them
-    (staging does, in `deploy/elspeth-web.env`) moves the real ceiling, and
-    this test would otherwise keep validating the wrong chain in silence.
+    Headroom is still read from the `WebSettings` field default, which is
+    only the value the task actually boots with while this module ships no
+    environment override for it — so the absence of a headroom override is
+    asserted rather than assumed. The ceiling, by contrast, IS shipped as
+    an override now, and this test asserts it is wired to the ALB variable
+    verbatim rather than pinned to a divergent literal.
     """
     tf_sources = "\n".join(path.read_text(encoding="utf-8") for path in _source_files() if path.name.endswith(".tf"))
-    assert "ELSPETH_WEB__COMPOSER_TRANSPORT_" not in tf_sources, (
-        "the module now overrides a composer transport bound, so this test's ceiling/headroom "
-        "must be read from that override instead of from the WebSettings defaults"
+    assert "ELSPETH_WEB__COMPOSER_TRANSPORT_HEADROOM_" not in tf_sources, (
+        "the module now overrides the composer transport headroom, so this test's headroom "
+        "must be read from that override instead of from the WebSettings default"
     )
-    ceiling = WebSettings.model_fields["composer_transport_idle_ceiling_seconds"].default
     headroom = WebSettings.model_fields["composer_transport_headroom_seconds"].default
 
+    locals_text = _text("modules/scenario/locals.tf")
+    assert re.search(
+        r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS",\s*value\s*=\s*tostring\(var\.alb_idle_timeout_seconds\)\s*\}',
+        locals_text,
+    ), (
+        "the scenario module no longer wires ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS "
+        "to var.alb_idle_timeout_seconds; the boot guard would validate the wall clock against the "
+        "WebSettings default ceiling instead of the real ALB idle timeout"
+    )
     assert re.search(
         r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",\s*value\s*=\s*tostring\(var\.composer_timeout_seconds\)\s*\}',
-        _text("modules/scenario/locals.tf"),
+        locals_text,
     ), "the scenario module no longer wires ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS to var.composer_timeout_seconds"
 
     variables_text = _text("modules/scenario/variables.tf")
+    alb_var_match = re.search(
+        r'variable\s+"alb_idle_timeout_seconds"\s*\{.*?default\s*=\s*(?P<seconds>[\d.]+)',
+        variables_text,
+        re.DOTALL,
+    )
+    assert alb_var_match is not None, "var.alb_idle_timeout_seconds no longer declares a default; a stock install would prompt for it"
+    alb_idle_seconds = float(alb_var_match.group("seconds"))
+
     var_match = re.search(
         r'variable\s+"composer_timeout_seconds"\s*\{.*?default\s*=\s*(?P<seconds>[\d.]+)',
         variables_text,
@@ -2106,32 +2124,42 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
     timeout_seconds = float(var_match.group("seconds"))
 
     cap_match = re.search(
-        r'variable\s+"composer_timeout_seconds"\s*\{.*?condition\s*=[^\n]*<=\s*(?P<cap>[\d.]+)',
+        r'variable\s+"composer_timeout_seconds"\s*\{.*?condition\s*=[^\n]*<=\s*var\.alb_idle_timeout_seconds\s*-\s*(?P<headroom>[\d.]+)',
         variables_text,
         re.DOTALL,
     )
-    assert cap_match is not None, "var.composer_timeout_seconds lost its plan-time validation cap"
-    assert float(cap_match.group("cap")) == ceiling - headroom, (
-        f"the plan-time validation cap {cap_match.group('cap')}s no longer mirrors the WebSettings "
-        f"guard ({ceiling}s ceiling - {headroom}s headroom); a plan-clean value could still refuse to boot"
+    assert cap_match is not None, (
+        "var.composer_timeout_seconds lost its plan-time validation cap against "
+        "var.alb_idle_timeout_seconds; an over-limit value would be discovered at service roll "
+        "instead of terraform plan"
+    )
+    assert float(cap_match.group("headroom")) == headroom, (
+        f"the plan-time validation's headroom literal {cap_match.group('headroom')}s no longer "
+        f"mirrors the WebSettings composer_transport_headroom_seconds default ({headroom}s); "
+        f"a plan-clean value could still refuse to boot"
     )
 
-    idle_match = re.search(
-        r"idle_timeout\s*=\s*(?P<seconds>\d+)",
+    assert re.search(
+        r"idle_timeout\s*=\s*var\.alb_idle_timeout_seconds",
         _text("modules/scenario/network.tf"),
+    ), (
+        "the scenario ALB idle_timeout is no longer wired to var.alb_idle_timeout_seconds; "
+        "the transport ceiling env var would advertise a limit the proxy does not honour"
     )
-    assert idle_match is not None, "the scenario ALB no longer declares an explicit idle_timeout"
-    alb_idle_seconds = float(idle_match.group("seconds"))
 
-    assert timeout_seconds <= ceiling - headroom, (
-        f"composer timeout {timeout_seconds}s exceeds the WebSettings guard "
-        f"({ceiling}s ceiling - {headroom}s headroom); the web task would refuse to boot"
-    )
     assert timeout_seconds + headroom <= alb_idle_seconds, (
         f"composer timeout {timeout_seconds}s plus {headroom}s headroom exceeds the ALB "
         f"idle_timeout {alb_idle_seconds}s; the ALB would abort with a 504 before the "
-        f"composer returned its 422 and the partial pipeline would be lost. Raise "
-        f"idle_timeout in modules/scenario/network.tf first."
+        f"composer returned its 422 and the partial pipeline would be lost."
+    )
+
+    # The floor matters as much as the ceiling now: the corpus needs ~490-514s
+    # of compose wall (round-5 arm-B g03), so a default that drifts back under
+    # that re-opens elspeth-09c91778f5 silently.
+    assert timeout_seconds >= 840, (
+        f"composer timeout default {timeout_seconds}s is below the 840s battery-proven envelope; "
+        f"the shipped corpus (g03 ~490-514s compose) would no longer be fundable at package defaults "
+        f"(elspeth-09c91778f5)"
     )
 
 

@@ -473,19 +473,32 @@ variable "default_llm_profile" {
   }
 }
 
+variable "alb_idle_timeout_seconds" {
+  type        = number
+  default     = 900
+  description = "ALB idle_timeout, and thereby the composer transport ceiling: locals.tf wires ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS to this value so the app's boot guard validates the wall clock against the real proxy limit. Default 900 (was 300, the AWS default) because the shipped corpus needs it: battery round-5 g03's compose settled at ~490-514s and could not reach its first authoring call inside the old 270s ceiling (elspeth-09c91778f5)."
+
+  validation {
+    condition     = var.alb_idle_timeout_seconds >= 60 && var.alb_idle_timeout_seconds <= 4000
+    error_message = "alb_idle_timeout_seconds must be in [60, 4000]: 4000 is the ALB maximum, and below 60 the composer envelope cannot fund even a single authoring turn."
+  }
+}
+
 variable "composer_timeout_seconds" {
   type        = number
-  default     = 240
-  description = "Composer whole-request wall clock in seconds (elspeth-f159d2394b: was a hardcoded 120 that funded ~6 of the authorised 20 turns). The 240 default funds ~16 turns at the app's 15s/turn planning floor and stays inside both guards below."
+  default     = 840
+  description = "Composer whole-request wall clock in seconds. Default 840 (elspeth-09c91778f5: the shipped 240 could not fund the shipped corpus - g03's first authoring call lands at t=413s; 840 is the battery round-5 arm-B proven value, funding 56 turns at the app's 15s/turn planning floor). Was 240 (elspeth-f159d2394b), before that a hardcoded 120 that funded ~6 of the authorised 20 turns."
 
-  # A value above the app's transport guard (idle ceiling 300s - headroom 30s
-  # = 270s) is a web STARTUP error, so without this it is discovered only
-  # after the service is rolled. Checking it here fails `terraform plan`
-  # instead. The ALB idle timeout (network.tf, 300s) must also stay above
-  # this value — raise both together if you need more than 270s.
+  # A wall clock above (transport idle ceiling - 30s headroom) is a web
+  # STARTUP error, so without this check it is discovered only after the
+  # service is rolled. Checking it here fails `terraform plan` instead. The
+  # ceiling IS the ALB idle timeout (locals.tf wires the env var to
+  # var.alb_idle_timeout_seconds), so the two legs cannot drift: raising the
+  # wall past the proxy's patience is rejected at plan time. The 30 literal
+  # mirrors the WebSettings composer_transport_headroom_seconds default.
   validation {
-    condition     = var.composer_timeout_seconds > 0 && var.composer_timeout_seconds <= 270
-    error_message = "composer_timeout_seconds must be in (0, 270]: the web app rejects values above its 270s transport-headroom guard (300s idle ceiling - 30s headroom)."
+    condition     = var.composer_timeout_seconds > 0 && var.composer_timeout_seconds <= var.alb_idle_timeout_seconds - 30
+    error_message = "composer_timeout_seconds must be in (0, alb_idle_timeout_seconds - 30]: the web app rejects a wall clock inside the transport headroom, because the ALB would abort with an opaque 504 before the composer reported its honest 422."
   }
 }
 

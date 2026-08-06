@@ -48,7 +48,7 @@ spent on Level 2.
 | # | Ticket | Fault | Criterion |
 |---|---|---|---|
 | 5 | `elspeth-3d391accce` | `graph_structure` violation reaches only assistant free text at compose settle; structured `validation_errors` omits it | Machine consumers see the violation in the structured field; g08-s2's settle payload is the fixture |
-| 6 | `elspeth-09c91778f5` | Shipped envelope cannot fund the shipped corpus (g03 t=413s vs 270 ceiling; g09 marginal at 4.3s; `b5047ef69`'s "ZERO composes flip at 240" now falsified by g09) | **Product decision, not a patch**: raise the package ALB/ceiling legs together, or shrink the corpus claim. The three-place change is documented in the round-5 brief's arm-B correction |
+| 6 | `elspeth-09c91778f5` | Shipped envelope cannot fund the shipped corpus (g03 t=413s vs 270 ceiling; g09 marginal at 4.3s; `b5047ef69`'s "ZERO composes flip at 240" now falsified by g09) | **Decision taken 2026-08-06: raise.** The three legs are now one coupled variable — `var.alb_idle_timeout_seconds` (default 900) drives the ALB idle_timeout, the transport-ceiling env var, and the wall-clock cap; `var.composer_timeout_seconds` defaults to 840 (arm-B proven). Live criterion below at item 3(a); (b) is moot |
 
 ### Cheap wins (buy wall-clock directly)
 
@@ -89,15 +89,16 @@ question.
    review surfaced **in-band**, no driver `/resolve` rescue, inside the
    parity wall; expect the compose to shorten by the ~40–110s the loop
    burned.
-3. **`09c91778f5` (envelope)** — branches on the product decision. (a)
-   Package raise: all legs together (ALB idle_timeout, transport ceiling,
-   timeout, **and** the `f8873e2a9` plan-time cap), `terraform plan` clean at
-   the new values, doctor green, then `drive_graph` g03 ×1 at the new
+3. **`09c91778f5` (envelope)** — decision taken: package raise, landed as a
+   coupled single-variable chain (`var.alb_idle_timeout_seconds` 900 →
+   ALB idle_timeout + transport-ceiling env var; `var.composer_timeout_seconds`
+   840, plan-time capped at ALB − 30; plan-level rejection of any drifted
+   pair is mutation-verified). Live criterion: `terraform plan`/apply clean
+   at the new defaults, doctor green, then `drive_graph` g03 ×1 at the stock
    package render — round-5 datum says it needs ≥ ~500s end-to-end and is
    the round's most expensive compose (~USD 0.88); also confirm g09 gains
-   real margin (it settled 4.3s inside 270). (b) Corpus note: no live test —
-   verify the shipped docs state g03 (and marginal g09) exceed the stock
-   envelope.
+   real margin (it settled 4.3s inside 270). Closure evidence for the
+   ticket is that live g03 compose, not the landed code.
 
 ### Carried into round 6 (not faults; owed verification)
 
