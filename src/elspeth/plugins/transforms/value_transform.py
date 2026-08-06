@@ -335,7 +335,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:05a567ef753e5833"
+    source_file_hash: str | None = "sha256:ba3a73db2103ce25"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (
@@ -520,7 +520,15 @@ class ValueTransform(BaseTransform):
                 ),
                 composer_hints=(
                     "Call get_expression_grammar to see the allowed operations — only stdlib-safe expressions are permitted.",
-                    "Use this for field-level transformations (uppercase, regex extract, arithmetic). For type changes use type_coerce.",
+                    "Achievable here: arithmetic (row['a'] + row['b'], len(row['text']) * 2, abs(row['n'])), field copies and "
+                    "overwrites, string concatenation (row['a'] + '-suffix'), membership tests, and conditional values "
+                    "(1 if row['score'] > 10 else 0). For type changes use type_coerce.",
+                    "NOT achievable here: string methods and regular expressions (case changes such as upper/lower/title, "
+                    "pattern extraction, splitting) — the sandbox rejects attribute calls and imports, and only len() and "
+                    "abs() are callable. Route text rewriting through an llm transform instead.",
+                    "A value_transform node's schema: block declares what ARRIVES at the node (its pre-transform input), "
+                    "never an expression's computed result — declaring the output type on the node's own schema authors an "
+                    "unsatisfiable input contract that is rejected at the edge.",
                     "Rows always pass through: an expression that evaluates to False just stores False — it does not drop or "
                     "error-route the row. Conditional row filtering is a gate node, not this transform.",
                     "Expressions are sandboxed — file I/O, imports, and external calls are rejected at parse time.",

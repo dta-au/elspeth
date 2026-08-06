@@ -1,6 +1,6 @@
 """Tests for ValueTransform transform — behavioral unit tests."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -799,3 +799,62 @@ class TestValueTransformDemotesSelfCreatedInputs:
             }
         )
         assert transform is not None
+
+
+class TestComposerHintsMatchSandboxReality:
+    """The composer_hints capability claims must be sandbox-true (elspeth-18bcf7dd09).
+
+    Battery r4 g05: the hints advertised uppercase and regex extract, neither
+    of which has ANY sandbox-accepted spelling (only ``len``/``abs`` are
+    callable and attribute calls are rejected), sending the composer down a
+    53-second dead end before an honest decline. Every capability the
+    achievable-capabilities hint claims is pinned here against the real
+    ``ExpressionParser``; the impossible ones are pinned as rejected so the
+    not-achievable hint stays true as the grammar evolves.
+    """
+
+    ACHIEVABLE_CLAIMS: ClassVar[dict[str, str]] = {
+        "arithmetic": "row['a'] + row['b']",
+        "len": "len(row['text']) * 2",
+        "abs": "abs(row['n'])",
+        "field copy/overwrite": "row['a']",
+        "string concatenation": "row['a'] + '-suffix'",
+        "membership test": "row['status'] in ['open', 'closed']",
+        "conditional value": "1 if row['score'] > 10 else 0",
+    }
+
+    IMPOSSIBLE_CLAIMS: tuple[str, ...] = (
+        "row['a'].upper()",
+        "row['a'].title()",
+        "row['a'].lower()",
+        "re.match('x', row['a'])",
+    )
+
+    def test_capabilities_advertised_as_achievable_parse(self) -> None:
+        from elspeth.core.expression_parser import ExpressionParser
+
+        for capability, expression in self.ACHIEVABLE_CLAIMS.items():
+            try:
+                ExpressionParser(expression)
+            except Exception as exc:  # pragma: no cover - failure message only
+                raise AssertionError(f"advertised capability {capability!r} has no sandbox-accepted spelling: {exc}") from exc
+
+    def test_string_methods_and_regex_stay_rejected(self) -> None:
+        from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError
+
+        for expression in self.IMPOSSIBLE_CLAIMS:
+            with pytest.raises(ExpressionSecurityError):
+                ExpressionParser(expression)
+
+    def test_achievable_hint_names_only_sandbox_true_capabilities(self) -> None:
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        assistance = ValueTransform.get_agent_assistance()
+        assert assistance is not None
+        achievable_hints = [hint for hint in assistance.composer_hints if hint.startswith("Achievable here:")]
+        assert len(achievable_hints) == 1, "composer_hints must carry exactly one achievable-capabilities hint"
+        hint = achievable_hints[0]
+        assert "uppercase" not in hint, "uppercase has no sandbox-accepted spelling (elspeth-18bcf7dd09)"
+        assert "regex" not in hint, "regex extraction has no sandbox-accepted spelling (elspeth-18bcf7dd09)"
+        not_achievable_hints = [hint for hint in assistance.composer_hints if hint.startswith("NOT achievable here:")]
+        assert len(not_achievable_hints) == 1, "composer_hints must state what the sandbox rejects"

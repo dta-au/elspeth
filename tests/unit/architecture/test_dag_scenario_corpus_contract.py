@@ -447,12 +447,25 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # (elspeth-d6eeb3a71d). Rotated again 2026-08-06 for the value_transform PH3
 # refresh from the alias-aware read-analysis fix (elspeth-f605f0a94e): only the
 # three value_transform ``source_file_hash`` tokens on the union-collision-fail
-# node records changed. Verified mechanical each time: a field-by-field diff of
-# the live durable projection against the frozen expectation showed every other
-# field equal — schema_fields, schema_hash and schema_mode are unchanged (all
-# observed/null), and the csv/json source_file_hashes on the same line are
-# byte-identical, so no audit projection material moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "84203d078ceb746c07004f9a7c485c6919a919eb0bfd4b130f1cb8150ac7d4f6"
+# node records changed (the csv/json source_file_hashes on the same line were
+# byte-identical that time). Rotated again 2026-08-06 for the csv/json source
+# PH3 refresh from the declared-field reachability fix (elspeth-3664e213c4):
+# only the 15 csv and 1 json ``source_file_hash`` tokens in the manifest
+# changed (token-normalized old/new manifests diff empty). Rotated again
+# 2026-08-06 for the value_transform PH3 refresh from the composer-hints
+# capability correction (elspeth-18bcf7dd09): only the three value_transform
+# ``source_file_hash`` tokens on the union-collision-fail node records changed.
+# Rotated again 2026-08-06 when the csv/json composer-hint text was shortened
+# to the 280-char assistance cap (same reachability fix, second hash refresh),
+# together with the checkpoint-deterministic-resume case's derived
+# ``resumed_full_projection_sha256`` pin, which digests the full durable
+# history and therefore moves whenever a node record's ``source_file_hash``
+# does. Verified mechanical
+# each time: a field-by-field diff of the live durable projection against the
+# frozen expectation showed every other field equal — schema_fields,
+# schema_hash and schema_mode are unchanged, so no audit projection material
+# moved.
+EXPECTED_CASE_REGISTRY_SHA256 = "2fce91dc14e29e1ba0f157d7d313f2f2271842a76c56ce1a320ce12c2e4bb651"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
