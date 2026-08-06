@@ -119,7 +119,8 @@ _ALWAYS_NUMERIC_BUILTINS: frozenset[str] = frozenset({"len", "abs"})
 # also appear here.  This prevents brute-force bypass where defining a
 # handler silently whitelists a new AST construct.
 #
-# Allowed constructs: the validator recurses into them via generic_visit and
+# Allowed constructs: the validator validates their children recursively
+# (some arms via generic_visit, the stateful ones via explicit self.visit) and
 # _ExpressionEvaluator has a visit_* arm for every one of them (both enforced
 # at import time by _assert_visitor_coupling below).
 _ALLOWED_EXPR_TYPES: frozenset[type] = frozenset(
@@ -448,7 +449,7 @@ class _ExpressionValidator(ast.NodeVisitor):
 # grew its fail-closed visit()) silently evaluating to None.
 def _assert_visitor_coupling(visitor_cls: type, expected_type_names: set[str], *, label: str) -> None:
     """Raise TypeError unless visitor_cls's visit_* arms match expected_type_names exactly."""
-    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_") and name != "visit"}
+    visitor_method_names = {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_")}
     missing_handlers = expected_type_names - visitor_method_names
     orphan_visitors = visitor_method_names - expected_type_names
     if missing_handlers or orphan_visitors:

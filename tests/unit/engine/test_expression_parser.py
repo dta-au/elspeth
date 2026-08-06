@@ -1577,6 +1577,24 @@ class TestEvaluatorFailClosed:
         evaluator = _ExpressionEvaluator({"x": 1})
         assert evaluator.visit(tree) is True
 
+    def test_structural_node_rejected(self) -> None:
+        """Non-ast.expr structural nodes raise too — the strictness delta.
+
+        The evaluator guard deliberately omits the validator's
+        isinstance(node, ast.expr) qualifier: the evaluator never visits
+        structural children, so ast.Load reaching visit() is a framework
+        bug. FakeExpr alone cannot pin this — it IS an ast.expr, so a
+        weaker validator-shaped guard would still pass that test while
+        silently returning None for structural nodes.
+        """
+        import ast as _ast
+
+        from elspeth.core.expression_parser import _ExpressionEvaluator
+
+        evaluator = _ExpressionEvaluator({"x": 1})
+        with pytest.raises(ExpressionSecurityError, match="Load"):
+            evaluator.visit(_ast.Load())
+
 
 class TestVisitorCouplingAssertion:
     """The import-time visitor/type coupling check is a testable mechanism."""
@@ -1618,6 +1636,27 @@ class TestVisitorCouplingAssertion:
                 pass
 
         _assert_visitor_coupling(MatchedVisitor, {"Name"}, label="synthetic")
+
+    def test_production_visitors_satisfy_their_coupling_relations(self) -> None:
+        """The coupling relation holds for both production visitors.
+
+        The import-time _assert_visitor_coupling calls enforce this at
+        module load; this test re-derives the relation independently so
+        deleting one of those calls (which would silently drop the
+        enforcement) is caught here rather than never.
+        """
+        from elspeth.core.expression_parser import (
+            _ALLOWED_EXPR_TYPES,
+            _HANDLED_EXPR_TYPES,
+            _ExpressionEvaluator,
+            _ExpressionValidator,
+        )
+
+        def arm_names(visitor_cls: type) -> set[str]:
+            return {name.removeprefix("visit_") for name in vars(visitor_cls) if name.startswith("visit_")}
+
+        assert arm_names(_ExpressionValidator) == {t.__name__ for t in _HANDLED_EXPR_TYPES}
+        assert arm_names(_ExpressionEvaluator) == {t.__name__ for t in _ALLOWED_EXPR_TYPES} | {"Expression"}
 
 
 class TestExpressionParserDictContext:
