@@ -44,6 +44,12 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - Worktrees live under `.claude/worktrees/<name>` and symlink `.venv` to the
   main checkout: a bare `uv pip install` inside a worktree clobbers the main
   venv.
+- The same trap runs the other way for READS: a bare `python`/`pytest` inside a
+  worktree silently imports the MAIN checkout, because the editable install
+  resolves `elspeth` there. A cross-commit A/B run that way measures the wrong
+  tree and returns a *confidently wrong* answer, not an error. Use
+  `PYTHONPATH=<worktree>/src <venv>/bin/python -m pytest ...` and verify
+  `elspeth.__file__` points into the worktree before trusting a single result.
 - Do not silently switch the shared checkout onto a task branch. If work is
   intended to happen on a branch without creating a separate worktree, surface
   that choice to the user before switching; prefer a dedicated worktree for
