@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8b80c271b195f617"
+    source_file_hash: str | None = "sha256:cedc9f147d7ed95b"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
