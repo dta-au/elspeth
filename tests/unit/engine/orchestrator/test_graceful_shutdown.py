@@ -66,9 +66,15 @@ class TestGracefulShutdownError:
         assert "run-abc" in str(err)
 
     def test_error_message_includes_resume_hint(self) -> None:
-        """Error message includes resume command."""
+        """Message suggests the dry-run probe, not an --execute promise.
+
+        elspeth-1f5b83cd28: the exception cannot see source lifecycle or the
+        resume baseline, so it must not promise that ``--execute`` will
+        succeed — the CLI handlers consult the shared gate for that.
+        """
         err = GracefulShutdownError(rows_processed=10, run_id="run-xyz")
-        assert "elspeth resume run-xyz --execute" in str(err)
+        assert "elspeth resume run-xyz" in str(err)
+        assert "--execute" not in str(err)
 
     def test_error_is_exception(self) -> None:
         """GracefulShutdownError is an Exception subclass."""

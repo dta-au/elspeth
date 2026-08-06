@@ -881,7 +881,7 @@ class MaxRetriesExceeded(Exception):
         super().__init__(f"Max retries ({attempts}) exceeded: {last_error}")
 
 
-# TIER-2: Control-flow signal for interrupted runs (SIGINT/SIGTERM) — run is resumable; not a system corruption or framework bug.
+# TIER-2: Control-flow signal for interrupted runs (SIGINT/SIGTERM) — not a system corruption or framework bug.
 class GracefulShutdownError(Exception):
     """Raised when a pipeline run is interrupted by a shutdown signal.
 
@@ -889,7 +889,11 @@ class GracefulShutdownError(Exception):
     orchestrator stopped processing new rows due to SIGINT/SIGTERM but
     completed all in-flight work (aggregation flush, sink writes, checkpoints).
 
-    The run is marked INTERRUPTED and is resumable via ``elspeth resume``.
+    The run is marked INTERRUPTED. Whether it is *resumable* depends on
+    state this exception cannot see (source lifecycle, resume baseline —
+    elspeth-1f5b83cd28), so the message suggests the ``elspeth resume``
+    dry-run probe rather than promising ``--execute`` will succeed; the CLI
+    handlers consult the shared gate and print the definitive guidance.
     """
 
     def __init__(
@@ -913,7 +917,7 @@ class GracefulShutdownError(Exception):
         self.rows_routed_failure = rows_routed_failure
         self.routed_destinations: Mapping[str, int] = deep_freeze(dict(routed_destinations) if routed_destinations is not None else {})
         super().__init__(
-            f"Pipeline interrupted after {rows_processed} rows (run_id={run_id}). Resume with: elspeth resume {run_id} --execute"
+            f"Pipeline interrupted after {rows_processed} rows (run_id={run_id}). Check resumability with: elspeth resume {run_id}"
         )
 
 

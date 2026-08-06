@@ -878,7 +878,7 @@ def run(
             )
         else:
             typer.echo(f"\nPipeline interrupted after {e.rows_processed} rows.")
-            typer.echo(f"Resume with: elspeth resume {e.run_id} --execute")
+            _emit_interrupted_resume_guidance_from_url(config.landscape.url, passphrase, e.run_id)
         raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
     except RunWorkerEvictedError as e:
         if output_format == "json":
@@ -2294,6 +2294,60 @@ def _build_resume_graphs(
     return validation_graph, execution_graph
 
 
+def _emit_interrupted_resume_guidance(db: LandscapeDB, run_id: str) -> None:
+    """Suggest ``elspeth resume`` after an interrupt only when it can succeed.
+
+    elspeth-1f5b83cd28 (observation elspeth-obs-d8958eb450): a graceful
+    shutdown that lands mid-source records an incomplete source lifecycle,
+    and both the advisory gate and ``resume()`` refuse such runs — an
+    unconditional "Resume with: ... --execute" here is a false promise.
+    Consult the shared source-lifecycle gate plus the resume-baseline row
+    and print the refuse reason instead when the run is not resumable.
+    Graph-dependent checks (topology, contract integrity) stay with the
+    resume pre-flight: they need the rebuilt validation graph, and
+    evaluating them here could refuse falsely.
+
+    Never raises: the interrupted exit contract (exit 3) must survive a
+    guidance failure, so errors degrade to the dry-run probe suggestion
+    with the failure surfaced.
+    """
+    from elspeth.core.checkpoint import CheckpointManager
+    from elspeth.core.checkpoint.recovery import check_source_lifecycle_resumable
+
+    try:
+        gate = check_source_lifecycle_resumable(db, run_id)
+        if not gate.check.can_resume:
+            typer.echo(f"This run cannot be resumed: {gate.check.reason}")
+            return
+        if CheckpointManager(db).get_latest_checkpoint(run_id) is None:
+            typer.echo("This run cannot be resumed: no resume baseline exists (checkpointing was disabled). Start a fresh run.")
+            return
+    except Exception as exc:  # guidance must not mask the interrupted exit (see docstring)
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+        return
+    typer.echo(f"Resume with: elspeth resume {run_id} --execute")
+
+
+def _emit_interrupted_resume_guidance_from_url(db_url: str, passphrase: str | None, run_id: str) -> None:
+    """Open the audit DB and emit interrupted-resume guidance, never raising.
+
+    Used by the ``run`` command's shutdown handler, which has no open
+    LandscapeDB in scope; the ``resume`` command passes its open handle to
+    :func:`_emit_interrupted_resume_guidance` directly.
+    """
+    from elspeth.core.landscape import LandscapeDB
+
+    try:
+        guidance_db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as exc:  # guidance must not mask the interrupted exit
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+        return
+    try:
+        _emit_interrupted_resume_guidance(guidance_db, run_id)
+    finally:
+        _close_landscape_db(guidance_db, pending_exc=None)
+
+
 def _emit_not_resumable_event(
     error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError, output_format: str
 ) -> None:
@@ -2729,7 +2783,7 @@ def resume(
                 )
             else:
                 typer.echo(f"\nResume interrupted after {e.rows_processed} rows.")
-                typer.echo(f"Resume with: elspeth resume {e.run_id} --execute")
+                _emit_interrupted_resume_guidance(db, e.run_id)
             raise typer.Exit(3)  # noqa: B904 -- distinct exit code: 0=success, 1=error, 3=interrupted
         except (EmptyResumeStateError, IncompleteSourceResumeError, NonResumableRunError) as e:
             # ADR-025 §3: this catch MUST precede the TIER_1_ERRORS
