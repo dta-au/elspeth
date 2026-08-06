@@ -2255,11 +2255,22 @@ def _check_schema_contracts(
                 )
                 return None
             if producer_node.node_type == "queue":
-                # A queue publishes an observed/unknown schema and never merges
-                # its predecessors' guarantees (elspeth-a5b86149d4). Stop here
-                # rather than picking one predecessor, so a downstream consumer's
-                # required-field check abstains at the queue boundary instead of
-                # comparing against a single arbitrary upstream.
+                # Engine parity (83a53388a / elspeth-5a372d3267): when every
+                # fan-in arm participates, the queue's effective guarantee is
+                # the arm intersection and the contract check proceeds against
+                # the queue as producer (the guarantee parsers resolve it
+                # through ``_producer_entry_propagation_vote``). The check
+                # still never compares against a single arbitrary upstream
+                # (elspeth-a5b86149d4) — the intersection is the fan-in-sound
+                # aggregate. When any arm abstains the vote collapses to
+                # abstention: the runtime defers to per-row enforcement, and
+                # the skip warning stays the honest "not yet checked" signal.
+                queue_participates, _queue_fields = _producer_entry_propagation_vote(
+                    current_producer,
+                    visited_queue_ids=frozenset(),
+                )
+                if queue_participates:
+                    return current_producer
                 warnings.append(
                     _warn(
                         f"node:{producer_node.id}",
@@ -2437,7 +2448,11 @@ def _check_schema_contracts(
         finally:
             transform.close()
 
-    def _effective_producer_vote(producer: ProducerEntry) -> tuple[bool, frozenset[str]]:
+    def _effective_producer_vote(
+        producer: ProducerEntry,
+        *,
+        visited_queue_ids: frozenset[str] = frozenset(),
+    ) -> tuple[bool, frozenset[str]]:
         """Return (participates, guarantees) for preview propagation.
 
         Raw schema blocks are the baseline. For transform/aggregation nodes,
@@ -2541,7 +2556,10 @@ def _check_schema_contracts(
 
         if is_pass_through_instance:
             base = output_schema_config.get_effective_guaranteed_fields() if output_schema_config is not None else frozenset()
-            inherited_participates, inherited_fields = _connection_propagation_vote(producer_node.input)
+            inherited_participates, inherited_fields = _connection_propagation_vote(
+                producer_node.input,
+                visited_queue_ids=visited_queue_ids,
+            )
             # ADR-009 §Clause 1: share the aggregation rule with graph.py.
             # Composer's producer-graph is single-upstream at this level
             # (coalesce absorbs fan-in via pre-computed output), so we pass a
@@ -2767,7 +2785,11 @@ def _check_schema_contracts(
             )
             break
 
-    def _connection_propagation_vote(connection_name: str) -> tuple[bool, frozenset[str]]:
+    def _connection_propagation_vote(
+        connection_name: str,
+        *,
+        visited_queue_ids: frozenset[str] = frozenset(),
+    ) -> tuple[bool, frozenset[str]]:
         """Resolve a connection's propagation vote across structural nodes.
 
         Unlike ``_walk_to_real_producer()``, this helper is only used for
@@ -2785,20 +2807,50 @@ def _check_schema_contracts(
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
             return False, frozenset()
+        return _producer_entry_propagation_vote(producer, visited_queue_ids=visited_queue_ids)
 
+    def _producer_entry_propagation_vote(
+        producer: ProducerEntry,
+        *,
+        visited_queue_ids: frozenset[str],
+    ) -> tuple[bool, frozenset[str]]:
+        """Structural dispatch for one producer entry's propagation vote.
+
+        Factored out of ``_connection_propagation_vote`` because queue fan-in
+        arms are several producers publishing the SAME connection (the queue
+        id), so an arm's vote must be resolved per-entry, not per-connection.
+        ``visited_queue_ids`` terminates routing loops back into a queue —
+        drafts are not DAG-checked at Stage 1, and a revisited queue votes
+        conservative abstention instead of recursing unboundedly.
+        """
         if is_source_producer_id(producer.producer_id):
-            return _effective_producer_vote(producer)
+            return _effective_producer_vote(producer, visited_queue_ids=visited_queue_ids)
 
         producer_node = node_by_id[producer.producer_id]
         if producer_node.node_type == "gate":
-            return _connection_propagation_vote(producer_node.input)
+            return _connection_propagation_vote(producer_node.input, visited_queue_ids=visited_queue_ids)
 
         if producer_node.node_type == "queue":
-            # Observed/unknown schema: a queue never propagates or unions its
-            # predecessors' pass-through guarantees, so a downstream consumer's
-            # required_input_fields must not be resolved against one of them
-            # (elspeth-a5b86149d4). Abstaining here keeps explicit required
-            # fields on a valid consumer from being falsely rejected.
+            # Engine parity (83a53388a / elspeth-5a372d3267, mirrored here for
+            # elspeth-3619b8774f): the queue is the sanctioned fan-in point,
+            # so the walk aggregates arms with fan-in-sound semantics —
+            # intersection when every arm participates, total abstention when
+            # any arm abstains. ``compose_propagation``'s abstainer-skip is
+            # deliberately NOT reused: it is sound only for same-row
+            # pass-throughs, and queue rows arrive from exactly one arm, so
+            # promoting a single arm's guarantee to the interleaved stream
+            # would over-claim — the elspeth-a5b86149d4 hazard this branch
+            # previously abstained over entirely.
+            if producer_node.id in visited_queue_ids:
+                return False, frozenset()
+            arm_entries = resolver.queue_predecessors(producer_node.id)
+            if not arm_entries:
+                return False, frozenset()
+            arm_votes = [
+                _producer_entry_propagation_vote(arm, visited_queue_ids=visited_queue_ids | {producer_node.id}) for arm in arm_entries
+            ]
+            if all(arm_participates for arm_participates, _ in arm_votes):
+                return True, frozenset.intersection(*[arm_fields for _, arm_fields in arm_votes])
             return False, frozenset()
 
         if producer_node.node_type == "row_union":
@@ -2817,7 +2869,10 @@ def _check_schema_contracts(
                 _coalesce_branch_connections(producer_node.branches),
                 strict=True,
             ):
-                branch_participates, branch_guarantees = _connection_propagation_vote(branch_connection)
+                branch_participates, branch_guarantees = _connection_propagation_vote(
+                    branch_connection,
+                    visited_queue_ids=visited_queue_ids,
+                )
                 if not branch_participates:
                     continue
                 branch_schemas[branch_name] = SchemaConfig(
@@ -2835,7 +2890,7 @@ def _check_schema_contracts(
             )
             return True, frozenset(merged or ())
 
-        return _effective_producer_vote(producer)
+        return _effective_producer_vote(producer, visited_queue_ids=visited_queue_ids)
 
     def _format_fields(fields: frozenset[str]) -> str:
         return ", ".join(sorted(fields)) if fields else "(none)"
@@ -3224,7 +3279,8 @@ def _check_schema_contracts(
         producer: ProducerEntry,
     ) -> tuple[frozenset[str] | None, ValidationEntry | None]:
         try:
-            return _effective_producer_guarantees(producer), None
+            _participates, guarantees = _producer_entry_propagation_vote(producer, visited_queue_ids=frozenset())
+            return guarantees, None
         except ValueError as exc:
             return None, _err(_producer_owner(producer), f"Invalid contract config: {exc}", "high", "contract_config_invalid")
 
@@ -3237,9 +3293,15 @@ def _check_schema_contracts(
         "participated and guarantees collapsed to empty" — the runtime twin
         (``validate_sink_required_fields``) skips abstaining producers and
         defers to per-row validation, and the composer must mirror that.
+
+        Both parsers resolve through the STRUCTURAL vote so a walked-back
+        queue entry (engine-parity fan-in, elspeth-3619b8774f) yields the arm
+        intersection; for the source/transform entries the walk-back returned
+        historically, the structural dispatch falls through to
+        ``_effective_producer_vote`` unchanged.
         """
         try:
-            return _effective_producer_vote(producer), None
+            return _producer_entry_propagation_vote(producer, visited_queue_ids=frozenset()), None
         except ValueError as exc:
             return None, _err(_producer_owner(producer), f"Invalid contract config: {exc}", "high", "contract_config_invalid")
 

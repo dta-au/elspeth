@@ -128,9 +128,12 @@ where the architectural fix landed:
   Fixed in ``core/dag/guarantees.py``: the walk now propagates through QUEUE
   nodes — intersection of arm guarantees when every arm participates, total
   abstention when any arm abstains (fan-in soundness; ``compose_propagation``'s
-  abstainer-skip applies only to same-row pass-throughs). Engine-level pinning
-  in ``tests/unit/core/test_dag_queue_guarantee_propagation.py``; this suite
-  pins the cross-surface agreement via
+  abstainer-skip applies only to same-row pass-throughs). The composer Stage-1
+  preview walker mirrors the same fan-in vote (elspeth-3619b8774f), so both
+  surfaces accept AND reject identically — composer-level pinning in
+  ``tests/unit/web/composer/test_state.py::TestCompositionStateQueueGuaranteePropagation``,
+  engine-level in ``tests/unit/core/test_dag_queue_guarantee_propagation.py``;
+  this suite pins the cross-surface agreement via
   ``TestComposerRuntimeQueueGuaranteeAgreement``.
 * Shape 15 — row_union locked-input extras (battery-2026-08-04 g02b, run
   ``f6bbca45``, ``elspeth-9d13900064``). The composer's Rule A/Rule B extras
@@ -4810,8 +4813,9 @@ class TestComposerRuntimeQueueGuaranteeAgreement:
     graph build with ``GraphValidationError: Schema contract violation: edge
     'queue_inbound_…' → 'transform_consumer_…' … Producer (queue:inbound)
     guarantees: (none - dynamic schema)``. Verified by manual revert on
-    2026-08-05; restored. The negative control passes both pre- and post-fix
-    by design — it pins that the fix did not fail open.
+    2026-08-05; restored. The negative control pins that neither surface fails
+    open: the runtime rejects at graph build, and since elspeth-3619b8774f the
+    composer Stage-1 fan-in mirror rejects the same YAML at /validate.
     """
 
     def _yaml(self, *, required_field: str) -> str:
@@ -4888,10 +4892,27 @@ class TestComposerRuntimeQueueGuaranteeAgreement:
 
         composer_result = composition_state_from_runtime_yaml(settings_yaml).validate()
         assert composer_result.is_valid, [error.message for error in composer_result.errors]
+        # Strict walker parity (elspeth-3619b8774f): the composer resolves the
+        # contract through the queue fan-in vote — no abstention warning where
+        # the engine renders a definitive verdict.
+        assert not [
+            warning.message
+            for warning in composer_result.warnings
+            if "Contract check skipped" in warning.message and "queue" in warning.message
+        ]
 
-    def test_runtime_still_rejects_queue_consumer_requiring_unguaranteed_field(self) -> None:
+    def test_both_reject_queue_consumer_requiring_unguaranteed_field(self) -> None:
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
         settings_yaml = self._yaml(required_field="never_guaranteed")
 
         with pytest.raises(GraphValidationError) as exc_info:
             self._build_runtime_graph(settings_yaml)
         assert "never_guaranteed" in str(exc_info.value)
+
+        # Red-parity (elspeth-3619b8774f): Stage 1 mirrors the engine's queue
+        # fan-in vote, so the composer rejects at /validate rather than
+        # abstaining green and letting the runtime preflight surface it.
+        composer_result = composition_state_from_runtime_yaml(settings_yaml).validate()
+        assert not composer_result.is_valid
+        assert any("never_guaranteed" in error.message for error in composer_result.errors)

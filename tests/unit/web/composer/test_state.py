@@ -7179,6 +7179,225 @@ class TestCompositionStateQueue:
         assert any("Duplicate producer" in e.message for e in result.errors)
 
 
+class TestCompositionStateQueueGuaranteePropagation:
+    """Stage-1 mirrors engine queue guarantee propagation (elspeth-3619b8774f).
+
+    Since 83a53388a (elspeth-5a372d3267) the engine walker propagates
+    effective guarantees through QUEUE nodes: intersection of arm votes when
+    every arm participates, total abstention when any arm abstains. The
+    composer preview must vote identically — checking a queue consumer's
+    required fields against the fan-in intersection instead of abstaining
+    with the medium 'Contract check skipped' warning — so validate() agrees
+    with the runtime walker in both directions (green where the engine
+    passes, red where it rejects).
+    """
+
+    def _queue(self, queue_id: str = "inbound") -> NodeSpec:
+        return NodeSpec(
+            id=queue_id,
+            node_type="queue",
+            plugin=None,
+            input=queue_id,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _source(self, *, guarantees: list[str] | None = None, on_success: str = "inbound") -> SourceSpec:
+        schema: dict[str, Any] = {"mode": "observed"}
+        if guarantees is not None:
+            schema["guaranteed_fields"] = guarantees
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"schema": schema},
+            on_validation_failure="discard",
+        )
+
+    def _consumer(
+        self,
+        node_id: str = "consumer",
+        *,
+        input: str = "inbound",
+        on_success: str = "combined",
+        required: list[str] | None = None,
+    ) -> NodeSpec:
+        options: dict[str, Any] = {"schema": {"mode": "observed"}}
+        if required is not None:
+            options["required_input_fields"] = required
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input,
+            on_success=on_success,
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _sink(self, name: str = "combined", *, required: list[str] | None = None) -> OutputSpec:
+        schema: dict[str, Any] = {"mode": "observed"}
+        if required is not None:
+            schema["required_fields"] = required
+        return OutputSpec(name=name, plugin="json", options={"schema": schema}, on_write_failure="discard")
+
+    def _state(self, *, sources: dict[str, SourceSpec], nodes: tuple[NodeSpec, ...], outputs: tuple[OutputSpec, ...]) -> CompositionState:
+        return CompositionState(
+            source=None,
+            sources=sources,
+            nodes=nodes,
+            edges=(),
+            outputs=outputs,
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _queue_skip_warnings(self, result: Any) -> list[str]:
+        return [w.message for w in result.warnings if "Contract check skipped" in w.message and "queue" in w.message]
+
+    def test_queue_consumer_requiring_arm_guaranteed_field_validates_without_skip_warning(self) -> None:
+        # Battery g08 shape (plugin-neutral): every arm guarantees the field
+        # the consumer requires — the engine accepts, so Stage 1 must accept
+        # WITHOUT the abstention warning.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["llm_response"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+        assert self._queue_skip_warnings(result) == []
+
+    def test_queue_consumer_requiring_unguaranteed_field_is_rejected(self) -> None:
+        # Red-parity direction: the engine rejects this at graph build
+        # ("guarantees: (none - dynamic schema)" pre-fix / missing-field
+        # post-fix), so Stage 1 must reject it too instead of abstaining.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["never_guaranteed"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert not result.is_valid
+        assert any(e.error_code == "schema_contract_violation" for e in result.errors), [e.message for e in result.errors]
+
+    def test_fan_in_intersects_arm_guarantees(self) -> None:
+        # A field only ONE arm guarantees is not guaranteed on the queue's
+        # interleaved stream (rows arrive from exactly one arm).
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["shared", "only_orders"]),
+                "refunds": self._source(guarantees=["shared"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["only_orders"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert not result.is_valid
+        assert any(e.error_code == "schema_contract_violation" for e in result.errors)
+
+        shared_state = self._state(
+            sources={
+                "orders": self._source(guarantees=["shared", "only_orders"]),
+                "refunds": self._source(guarantees=["shared"]),
+            },
+            nodes=(self._queue(), self._consumer(required=["shared"])),
+            outputs=(self._sink(),),
+        )
+        shared_result = shared_state.validate()
+        assert shared_result.is_valid, [e.message for e in shared_result.errors]
+
+    def test_abstaining_arm_collapses_queue_vote_and_keeps_skip_warning(self) -> None:
+        # One dynamic (no-guarantee) arm collapses the whole vote to
+        # abstention — mirroring the engine — and the abstention warning
+        # stays: the runtime enforces the requirement per-row, and the
+        # warning is the honest "not yet checked" signal.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(),
+            },
+            nodes=(self._queue(), self._consumer(required=["llm_response"])),
+            outputs=(self._sink(),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+        assert self._queue_skip_warnings(result) != []
+
+    def test_queue_guarantee_flows_through_pass_through_to_sink_check(self) -> None:
+        # The _connection_propagation_vote path: a pass-through transform
+        # downstream of the queue inherits the fan-in intersection, so the
+        # sink's required-fields check resolves instead of abstaining.
+        state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer()),
+            outputs=(self._sink(required=["llm_response"]),),
+        )
+        result = state.validate()
+        assert result.is_valid, [e.message for e in result.errors]
+
+        missing_state = self._state(
+            sources={
+                "orders": self._source(guarantees=["llm_response"]),
+                "refunds": self._source(guarantees=["llm_response"]),
+            },
+            nodes=(self._queue(), self._consumer()),
+            outputs=(self._sink(required=["never_guaranteed"]),),
+        )
+        missing_result = missing_state.validate()
+        assert not missing_result.is_valid
+        assert any(e.error_code == "sink_contract_violation" for e in missing_result.errors), [e.message for e in missing_result.errors]
+
+    def test_gate_arm_routing_back_into_queue_terminates(self) -> None:
+        # Drafts are not DAG-checked at Stage 1: a gate consuming the queue
+        # and routing one label back into it makes the fan-in walk cyclic.
+        # The vote must terminate (conservative abstention on the revisit),
+        # never recurse unboundedly.
+        gate = NodeSpec(
+            id="triage",
+            node_type="gate",
+            plugin=None,
+            input="inbound",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row.get('retry') == True",
+            routes={"true": "inbound", "false": "combined"},
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(
+            sources={"orders": self._source(guarantees=["llm_response"])},
+            nodes=(self._queue(), gate),
+            outputs=(self._sink(required=["llm_response"]),),
+        )
+        result = state.validate()  # must not raise RecursionError
+        assert result is not None
+
+
 def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
     """Node-shape validation entries must carry closed error codes.
 
