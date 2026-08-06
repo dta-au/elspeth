@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7066ff2782b891eb"
+    source_file_hash: str | None = "sha256:8b80c271b195f617"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -126,8 +126,10 @@ class DocumentSink(BaseSink):
     )
     usage_when_not_to_use: str = (
         "Do not use for one record per row — that is the text sink, which writes each value as its own LF-delimited line. "
-        "Do not use to concatenate several rows into one file: this sink publishes nothing and diverts every row unless the "
-        "run delivers exactly one value, so join rows with the report_assemble aggregation first."
+        "Do not use to concatenate several rows into one file: this sink publishes only for a run that delivers exactly one "
+        "value to it and diverts every row it can see beyond the first, so join rows with the report_assemble aggregation "
+        "first. Do not use for a field that can be empty: a zero-byte document is diverted rather than published, because an "
+        "empty value would otherwise write a file or not depending on whether the target already existed."
     )
     example_use: str = """sinks:
   announcement:
@@ -187,6 +189,29 @@ class DocumentSink(BaseSink):
         )
         self.input_schema = self._schema_class
         self.declared_required_fields = self._schema_config.get_effective_required_fields() | {self._field}
+        # Rows handed to this output, keyed by effect id, for the run named by
+        # _delivery_run_id. Keyed rather than summed so that re-preparing one
+        # effect — which happens whenever a RESERVED effect's prepare raises
+        # and re-enters — overwrites its entry instead of inflating the total.
+        self._delivery_run_id: str | None = None
+        self._delivered_by_effect: dict[str, int] = {}
+
+    def _record_delivery(self, *, run_id: str, effect_id: str, member_count: int) -> int:
+        """Tally rows delivered to this output and return the running total.
+
+        The tally spans every effect this sink instance prepares for ``run_id``
+        and resets when a new run reaches the instance. One instance serves the
+        whole flush loop of a run context, so in a single-worker run — the
+        ordinary case — the total is the run's true row count. Effects claimed
+        by a different worker have their own instance and are not counted here,
+        which is why the caller treats this as a lower bound rather than as the
+        run's whole delivery.
+        """
+        if self._delivery_run_id != run_id:
+            self._delivery_run_id = run_id
+            self._delivered_by_effect = {}
+        self._delivered_by_effect[effect_id] = member_count
+        return sum(self._delivered_by_effect.values())
 
     def inspect_effect(
         self,
@@ -206,7 +231,6 @@ class DocumentSink(BaseSink):
         request: SinkEffectPrepareRequest,
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectPlan:
-        del ctx
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("DocumentSink effects require pipeline member input")
         members = request.effect_input.members
@@ -218,6 +242,30 @@ class DocumentSink(BaseSink):
         # this output, not about this effect alone: two single-row effects put
         # two members in the snapshot and must not publish either.
         emitted_members = tuple(request.effect_input.target_snapshot_members)
+        delivered = self._record_delivery(run_id=ctx.run_id, effect_id=request.effect_id, member_count=len(members))
+        # One sink can produce several effects per run — the flush loop groups
+        # pending tokens by outcome (engine/orchestrator/sink_flush.py) and runs
+        # once per drain — so neither available count sees every row on its own:
+        #   * the cumulative snapshot carries accepted predecessor members, from
+        #     any worker, but silently drops diverted ones (_target_snapshot_members
+        #     in engine/executors/sink_effects.py skips prepared_disposition
+        #     "diverted"). A run whose earlier effects all diverted therefore
+        #     hands this effect a snapshot indistinguishable from a fresh
+        #     single-row run;
+        #   * the per-run tally counts every member this instance was handed,
+        #     diverted or not, and so closes exactly that blind spot.
+        # Both are lower bounds on the run's true delivery, so requiring BOTH to
+        # equal one is fail-closed: a row neither count can see only ever makes
+        # the true total larger. That is what makes the one-value rule hold
+        # however rows are batched into effects — [2] then [1], [1] then [2] and
+        # [3] as one effect all refuse to publish.
+        publishable = len(emitted_members) == 1 and delivered == 1
+        # The tightest lower bound on rows delivered to this output: the two
+        # counts see different rows, so the larger is the closer of the two.
+        # Reporting len(emitted_members) alone under-counted every run whose
+        # earlier effects diverted — a [2] then [2] run said "2 rows" for a
+        # delivery of four.
+        row_count_seen = max(len(emitted_members), delivered)
 
         accepted: list[int] = []
         payload: bytes | None = None
@@ -227,7 +275,7 @@ class DocumentSink(BaseSink):
         # happens together and cannot drift apart.
         pending_diversions: list[tuple[dict[str, Any], int, str]] = []
 
-        if len(emitted_members) == 1:
+        if publishable:
             snapshot_member = emitted_members[0]
             current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
             row = deep_thaw(snapshot_member.row)
@@ -236,6 +284,19 @@ class DocumentSink(BaseSink):
             reason: str | None = None
             if type(value) is not str:
                 reason = f"Document field {self._field!r} must be a string"
+            elif not value:
+                # An accepted row that stages zero bytes is reported accepted
+                # but does not reliably produce a file: with no predecessor the
+                # shared helper classes the plan NO_PUBLICATION/"virtual" and
+                # writes nothing, while an existing target instead falls through
+                # to atomic_replace and truncates it. Publication that depends
+                # on what happened to be on disk is the dishonesty, and a
+                # genuinely empty file is not reachable from here — the branch
+                # that decides this lives in _local_file_effects.py, which four
+                # sinks share. So the empty value is diverted: one outcome for
+                # one input, whatever the target's prior state, and the row is
+                # never reported accepted for a document that was never written.
+                reason = f"Document field {self._field!r} is empty; this sink publishes no file for a zero-byte document"
             else:
                 try:
                     # Verbatim: CR and LF are content here, and no record
@@ -255,9 +316,18 @@ class DocumentSink(BaseSink):
             # byte is staged. Rows an earlier effect already published are not
             # in this effect's members and are left alone: a committed row
             # cannot honestly be reported as diverted.
-            reason = (
-                f"Document sinks publish exactly one value per file; this output received {len(emitted_members)} rows. {_ONE_VALUE_REMEDY}"
-            )
+            #
+            # That leaves one residual this sink cannot close from here. When a
+            # run's first effect carries exactly one row it publishes — at that
+            # moment the run has legitimately delivered one value, and there is
+            # no lookahead: commit_effect writes inside the effect and flush()
+            # is a no-op. If later effects then deliver more rows, those rows
+            # divert with the reason below, but the first document stays on
+            # disk. Nothing here can retract it, and raising instead would not
+            # remove the file — it would only turn a documented partial into a
+            # run failure. What this sink can guarantee is that it never
+            # publishes for a delivery it can already see is larger than one.
+            reason = f"Document sinks publish exactly one value per file; this output received {row_count_seen} rows. {_ONE_VALUE_REMEDY}"
             for member in sorted(members, key=lambda candidate: candidate.ordinal):
                 pending_diversions.append((deep_thaw(member.row), member.ordinal, reason))
 
@@ -386,8 +456,11 @@ class DocumentSink(BaseSink):
                     "markdown document. The value is written exactly as produced, with no quoting, no \\n escaping, and "
                     "no trailing newline added.",
                     "Set field to the field holding the whole document; its value must be a string.",
-                    "It publishes exactly one value per file. If the run delivers more than one row to this output, every "
-                    "row is diverted and no file is written — put report_assemble upstream to combine rows into one value first.",
+                    "It publishes exactly one value per file, counted over the whole run, not per batch. If the run delivers "
+                    "more than one row here, every row the sink can still act on is diverted and no file is written — put "
+                    "report_assemble upstream to combine rows into one value first.",
+                    "The value must be a non-empty string: an empty one is diverted, because a zero-byte document cannot be "
+                    "published honestly — it would leave no file at all, or silently truncate an existing one.",
                     "Use the text sink instead when each row is its own record and should become its own line; text "
                     "rejects any value containing CR or LF, which is why it cannot carry a generated document.",
                     "Choose only utf-8, ascii, latin-1, or cp1252; a value not representable in the configured encoding is "

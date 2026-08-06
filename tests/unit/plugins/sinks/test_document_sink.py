@@ -189,6 +189,9 @@ def test_document_sink_assistance_names_the_remedy_and_the_text_sibling() -> Non
     assert "text sink" in hints
     assert "multiline" in hints
     assert "no trailing newline" in hints
+    # Empty-value diversion is real behaviour, so the guidance has to carry it.
+    assert "empty" in hints
+    assert "empty" in DocumentSink.usage_when_not_to_use
 
 
 # ── the single accepted value ────────────────────────────────────────────────
@@ -334,6 +337,125 @@ def test_second_effect_diverts_its_own_row_and_leaves_the_published_document_int
     assert target.read_bytes() == b"published"
 
 
+def test_a_diverted_first_effect_cannot_let_a_later_single_row_publish(tmp_path: Path) -> None:
+    """The batching-independence case: a 3-row run split [2] then [1] publishes nothing.
+
+    Both engine mechanisms conspire to hide the first effect from the second.
+    ``_target_snapshot_members`` drops predecessor members whose disposition is
+    "diverted", and ``_predecessor_descriptor`` walks back past a plan that
+    performed no publication — so the second effect is handed a snapshot of
+    length one and no predecessor descriptor, which is byte-for-byte what a
+    legitimate single-row run looks like. Only the per-run tally tells them
+    apart, and a three-row run must refuse whichever way it is batched.
+    """
+    target = tmp_path / "out.txt"
+    sink = _sink(target)
+
+    first = _prepare(sink, effect_id="e1" * 32, rows=[{"announcement_text": "one"}, {"announcement_text": "two"}])
+    assert first.safe_evidence["diverted_ordinals"] == (0, 1)
+    assert not target.exists()
+
+    # Exactly what the coordinator hands the second effect: the diverted
+    # members are gone from the snapshot, so it carries only this row.
+    second = _prepare(sink, effect_id="e2" * 32, rows=[{"announcement_text": "three"}])
+
+    assert second.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert second.safe_evidence["accepted_ordinals"] == ()
+    assert second.safe_evidence["diverted_ordinals"] == (0,)
+    assert "received 3 rows" in sink._get_diversions()[-1].reason
+    assert not target.exists()
+
+
+def test_a_later_effect_cannot_retract_the_document_the_first_effect_published(tmp_path: Path) -> None:
+    """The residual the sink cannot close: [1] then [2] leaves the first document.
+
+    The opening effect publishes because, at that moment, the run really has
+    delivered one value and there is no lookahead. When the rest of the run
+    arrives those rows divert and no new file is written, but the committed
+    document stays on disk. This pins that behaviour so it is a documented
+    consequence rather than a silent one.
+    """
+    target = tmp_path / "out.txt"
+    sink = _sink(target)
+
+    first_result = sink.commit_effect(_prepare(sink, effect_id="f1" * 32, rows=[{"announcement_text": "published"}]), _CTX)
+    assert target.read_bytes() == b"published"
+
+    second = _prepare(
+        sink,
+        effect_id="f2" * 32,
+        rows=[{"announcement_text": "second"}, {"announcement_text": "third"}],
+        predecessor=first_result.descriptor,
+        predecessor_rows=[{"announcement_text": "published"}],
+    )
+
+    assert second.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert second.safe_evidence["accepted_ordinals"] == ()
+    assert second.safe_evidence["diverted_ordinals"] == (0, 1)
+    assert "received 3 rows" in sink._get_diversions()[-1].reason
+    assert target.read_bytes() == b"published"
+
+
+def test_re_preparing_one_effect_does_not_inflate_the_run_tally(tmp_path: Path) -> None:
+    """A prepare that raised leaves its effect RESERVED and re-enters.
+
+    The tally is keyed by effect id precisely so that replay overwrites rather
+    than accumulates — otherwise a retried single-row effect would count as two
+    and refuse to publish the run's only value.
+    """
+    target = tmp_path / "out.txt"
+    sink = _sink(target)
+    rows: list[dict[str, object]] = [{"announcement_text": "only"}]
+
+    _prepare(sink, effect_id="ea" * 32, rows=rows)
+    replayed = _prepare(sink, effect_id="ea" * 32, rows=rows)
+
+    assert replayed.descriptor_mode is SinkEffectDescriptorMode.PRECOMPUTED
+    assert replayed.safe_evidence["accepted_ordinals"] == (0,)
+
+    sink.commit_effect(replayed, _CTX)
+    assert target.read_bytes() == b"only"
+
+
+def test_the_diversion_reason_counts_rows_earlier_effects_already_diverted(tmp_path: Path) -> None:
+    """The reason once read the snapshot alone, which had already forgotten the diverted rows."""
+    sink = _sink(tmp_path / "out.txt")
+
+    _prepare(sink, effect_id="eb" * 32, rows=[{"announcement_text": "a"}, {"announcement_text": "b"}])
+    _prepare(sink, effect_id="ec" * 32, rows=[{"announcement_text": "c"}, {"announcement_text": "d"}])
+
+    reasons = [diversion.reason for diversion in sink._get_diversions()]
+    assert "received 2 rows" in reasons[0]
+    # Four rows reached this output, and the second effect's snapshot showed two.
+    assert "received 4 rows" in reasons[-1]
+
+
+def test_a_fresh_run_on_the_same_instance_starts_a_new_tally(tmp_path: Path) -> None:
+    """The tally is a per-run fact, so a later run's single value still publishes."""
+    target = tmp_path / "out.txt"
+    sink = _sink(target)
+
+    _prepare(sink, effect_id="ed" * 32, rows=[{"announcement_text": "a"}, {"announcement_text": "b"}])
+
+    later_run = replace(_CTX, run_id="run-2")
+    members = (_member(0, {"announcement_text": "solo"}),)
+    inspection = sink.inspect_effect(
+        SinkEffectInspectionRequest(effect_id="ee" * 32, target="{}", predecessor_descriptor=None),
+        later_run,
+    )
+    plan = sink.prepare_effect(
+        SinkEffectPrepareRequest(
+            effect_id="ee" * 32,
+            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            inspection=inspection,
+        ),
+        later_run,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.PRECOMPUTED
+    assert plan.safe_evidence["accepted_ordinals"] == (0,)
+
+
 # ── per-value rejections ─────────────────────────────────────────────────────
 
 
@@ -368,6 +490,43 @@ def test_unrepresentable_value_is_diverted_without_leaking_content(tmp_path: Pat
     assert "ascii" in reason
     assert "secret" not in reason
     assert not target.exists()
+
+
+def test_an_empty_value_is_diverted_rather_than_accepted_for_a_file_never_written(tmp_path: Path) -> None:
+    """An accepted zero-byte row would report success for an absent document.
+
+    Staging no bytes sends the shared plan builder down its
+    NO_PUBLICATION/"virtual" branch, which writes nothing at all — so accepting
+    the row would claim a document that does not exist.
+    """
+    target = tmp_path / "out.txt"
+    sink = _sink(target)
+
+    plan = _prepare(sink, effect_id="ef" * 32, rows=[{"announcement_text": ""}])
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["accepted_ordinals"] == ()
+    assert plan.safe_evidence["diverted_ordinals"] == (0,)
+    assert "is empty" in sink._get_diversions()[0].reason
+    assert not target.exists()
+
+
+def test_an_empty_value_does_not_silently_truncate_an_existing_target(tmp_path: Path) -> None:
+    """The same input must have the same outcome whatever is already on disk.
+
+    Accepting an empty value wrote no file when the target was absent but
+    truncated it when the target existed — publication decided by prior disk
+    state. Diverting is the one outcome that holds either way.
+    """
+    target = tmp_path / "out.txt"
+    target.write_bytes(b"previous")
+    sink = _sink(target)
+
+    plan = _prepare(sink, effect_id="fa" * 32, rows=[{"announcement_text": ""}])
+
+    assert plan.safe_evidence["accepted_ordinals"] == ()
+    assert plan.safe_evidence["diverted_ordinals"] == (0,)
+    assert target.read_bytes() == b"previous"
 
 
 def test_missing_field_is_diverted(tmp_path: Path) -> None:
