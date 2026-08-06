@@ -974,6 +974,146 @@ describe("sessionStore", () => {
       });
     });
 
+    it("states what persisted when a stopped turn had already saved pipeline changes (elspeth-2784531888)", async () => {
+      // In auto_commit mode a Stop can land after durable mutations. The
+      // generic "revise your request and send it again" copy misrepresents
+      // that outcome — once the abort resync observes the durable head, the
+      // banner must state what persisted instead of implying nothing did.
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      const appliedToolRow: ChatMessage = {
+        id: "asst-tools",
+        session_id: "session-1",
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          {
+            id: "call-1",
+            type: "function",
+            function: { name: "set_pipeline", arguments: "{}" },
+          },
+        ],
+        created_at: "2026-08-06T00:00:01Z",
+      };
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([
+        {
+          id: "user-1",
+          session_id: "session-1",
+          role: "user",
+          content: "hello",
+          tool_calls: null,
+          created_at: "2026-08-06T00:00:00Z",
+        },
+        appliedToolRow,
+      ]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(3));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_user_cancel");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      // The banner states the durable outcome: 1 -> 3 is two saved changes.
+      expect(state.error).toContain("Composition stopped");
+      expect(state.error).toContain("2 pipeline changes");
+      expect(state.error).toContain("version 3");
+      expect(state.error).not.toContain("revise your request");
+      // The applied tool prefix stays in the transcript for inspection.
+      const toolRow = state.messages.find((m) => m.id === "asst-tools");
+      expect(toolRow?.tool_calls?.[0]?.function.name).toBe("set_pipeline");
+    });
+
+    it("states that nothing was saved when a stopped turn had not advanced the pipeline (elspeth-2784531888)", async () => {
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(1));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_user_cancel");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      // Version 1 -> 1: the explicit no-change statement replaces silence,
+      // and the revise-and-resend invitation stays because it is true.
+      expect(state.error).toContain("Composition stopped");
+      expect(state.error).toContain("No pipeline changes had been saved");
+      expect(state.error).toContain("revise your request");
+    });
+
+    it("keeps the saved-changes statement on the compose-timeout abort flavour (elspeth-2784531888)", async () => {
+      const apiMod = await import("@/api/client");
+      const controller = new AbortController();
+      (apiMod.sendMessage as ReturnType<typeof vi.fn>).mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            controller.signal.addEventListener("abort", () =>
+              reject(controller.signal.reason),
+            );
+          }),
+      );
+      (apiMod.fetchMessages as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+      (
+        apiMod.fetchCompositionState as ReturnType<typeof vi.fn>
+      ).mockResolvedValue(makeCompositionState(2));
+      (
+        apiMod.fetchCompositionProposals as ReturnType<typeof vi.fn>
+      ).mockResolvedValue([]);
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(1),
+      });
+      const sendPromise = useSessionStore
+        .getState()
+        .sendMessage("hello", controller.signal);
+      controller.abort("compose_timeout");
+      await sendPromise;
+
+      const state = useSessionStore.getState();
+      expect(state.error).toMatch(/took too long/i);
+      expect(state.error).toContain("1 pipeline change");
+      expect(state.error).toContain("version 2");
+    });
+
     it("waits for the cancelled turn's terminal progress before resyncing", async () => {
       // The disconnect watcher cancels the route task, but the compose
       // loop's dispatch+persist critical section is shielded (deferred

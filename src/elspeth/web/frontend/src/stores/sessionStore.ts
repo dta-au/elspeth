@@ -386,6 +386,43 @@ function composeAbortMessage(signal?: AbortSignal): string {
     : COMPOSE_TIMEOUT_MESSAGE;
 }
 
+/**
+ * Refine the abort banner once the post-stop resync knows the durable head
+ * (elspeth-2784531888). In auto_commit mode a Stop can land after committed
+ * mutations; the generic abort copy ("revise your request and send it
+ * again") then misrepresents what persisted. Composition-state versions are
+ * allocated COALESCE(MAX(version), 0) + 1 per session (sessions/service.py),
+ * so `resyncedVersion - (preTurnVersion ?? 0)` is an exact count of pipeline
+ * changes the stopped turn saved.
+ *
+ * Returns null when the banner must not be rewritten: the current error is
+ * not this turn's abort copy (a newer surface owns the banner), or the
+ * resync learned nothing (state fetch returned no version) — a false "no
+ * changes were saved" claim is worse than the generic copy.
+ */
+function stoppedComposeOutcomeMessage(
+  currentError: string | null,
+  preTurnVersion: number | null,
+  resyncedVersion: number | null,
+): string | null {
+  if (resyncedVersion === null) return null;
+  const isCancel = currentError === COMPOSE_CANCELLED_MESSAGE;
+  const isTimeout = currentError === COMPOSE_TIMEOUT_MESSAGE;
+  if (!isCancel && !isTimeout) return null;
+  const saved = resyncedVersion - (preTurnVersion ?? 0);
+  if (saved <= 0) {
+    return isCancel
+      ? "Composition stopped. No pipeline changes had been saved yet. You can revise your request and send it again."
+      : "ELSPETH took too long to compose a response. No pipeline changes had been saved yet. Try a smaller request or split it into multiple steps.";
+  }
+  const changes =
+    saved === 1 ? "1 pipeline change" : `${saved} pipeline changes`;
+  const outcome = `${changes} had already been saved (now at version ${resyncedVersion}). Your next message continues from the saved draft.`;
+  return isCancel
+    ? `Composition stopped — ${outcome}`
+    : `ELSPETH took too long to compose a response and was stopped — ${outcome}`;
+}
+
 function isHttpConflict(err: unknown): boolean {
   if (typeof err !== "object" || err === null) {
     return false;
@@ -680,6 +717,7 @@ async function waitForCancelledComposeToSettle(
 async function resyncAfterAbortedComposeTurn(
   sessionId: string,
   ownerGeneration: number,
+  preTurnVersion: number | null,
 ): Promise<void> {
   // ownerGeneration is the aborted turn's progress-poller claim (returned
   // by its startComposerProgressPolling). It fences every stage of the
@@ -729,9 +767,18 @@ async function resyncAfterAbortedComposeTurn(
     const nodeStillExists =
       !s.selectedNodeId ||
       newState?.nodes.some((n) => n.id === s.selectedNodeId);
+    // Now that the durable head is known, replace the generic abort copy
+    // with what actually persisted (elspeth-2784531888). Exact-match on the
+    // current error keeps this from clobbering any newer banner.
+    const refinedError = stoppedComposeOutcomeMessage(
+      s.error,
+      preTurnVersion,
+      state?.version ?? null,
+    );
     return {
       compositionState: newState,
       compositionProposals: proposals ?? s.compositionProposals,
+      ...(refinedError !== null ? { error: refinedError } : {}),
       ...(nodeStillExists ? {} : { selectedNodeId: null }),
     };
   });
@@ -1815,6 +1862,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         await resyncAfterAbortedComposeTurn(
           activeSessionId,
           progressPollGeneration,
+          recoveryStartedCompositionVersion,
         );
       }
     } finally {
@@ -2275,6 +2323,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         await resyncAfterAbortedComposeTurn(
           activeSessionId,
           progressPollGeneration,
+          recoveryStartedCompositionVersion,
         );
       }
     } finally {
