@@ -67,17 +67,38 @@ a **change-detector**, not a controlled comparison.
 
 **The one attribution lever available is the round-4 authored artefact.**
 Round 3's were lost to teardown — precisely why round 4 could not attribute.
-Do not repeat it:
+Do not repeat it, and note that **the driver does not currently capture it**:
 
-- Archive the round-4 composition state / authored pipeline **per graph** before
-  registering the new task definition. A redeploy does not wipe the session
-  store, but treat that as a property to verify, not to assume.
+`drive_graph.py` saves `compose.json`, `compose-reconciled.json`, `validate`,
+`run`, `diagnostics`, `outputs`, `execute` and `resolve-*`. **None of those is
+the authored pipeline.** `compose.json` is `{status, body:{message:{…}}}` — one
+assistant message. Archiving `/tmp/elspeth-battery` preserves the transcript and
+*not* the lever.
+
+The authored artefact is a **live API read** and must happen before the
+redeploy:
+
+```
+GET /api/sessions/{session_id}/state        # composition state
+GET /api/sessions/{session_id}/state/yaml   # rendered pipeline
+```
+
+- Pull both for **every round-4 session id** (they are in the round-4 report's
+  per-graph table) into `ops-local/acceptance/r4-preserve/`, the existing
+  convention for irreplaceable evidence (`r3-preserve/` holds Singapore's).
+- Add the same two reads to `drive_graph.py` so round 5 captures its own lever
+  without a second manual pass. Round 6 will need it for exactly this reason.
 - For every round-5 row, record whether the authored artefact **differs** from
   round 4's, and how. *Same authored shape, different outcome* is a code
   change. *Different authored shape* is the hints. Only the first supports a
   claim about the fix.
 
 ## Preconditions — complete before the stack is touched
+
+**Do P4 first.** It is the only step that reads state which later steps
+destroy or make unreachable: the certificate rotation invalidates the current
+CA bundle, and the redeploy changes what `/state` returns. Everything else can
+be reordered freely.
 
 ### P1. Pin the SHA; run the full suite on it
 
@@ -139,14 +160,19 @@ regenerating, then spend the fresh 24 hours on the stack.
 
 The stack's own cleanup deadline is **2026-08-09**.
 
-### P4. Clear the credential cache
+### P4. Capture the attribution lever, then clear the credential cache
+
+The cached credential is a **Singapore-era** account against the Sydney Aurora
+in round 4's case; any stale cache 401s every call.
 
 ```bash
+cp -a /tmp/elspeth-battery ops-local/acceptance/r4-preserve/transcripts/   # transcripts only
 rm -rf /tmp/elspeth-battery
 ```
 
-...but archive it first (P-framing, above) — it holds round 4's authored
-artefacts, which are this round's only attribution lever.
+**Copying that directory is not the archive step.** It holds compose
+transcripts, not authored pipelines. The lever is the two live `/state` reads
+in §Framing, and they must happen while the round-4 stack is still serving.
 
 ## Part 1 — redeploy
 
@@ -198,10 +224,47 @@ rate, budget for losing 2–4 composes across the round and re-sampling them.
 
 ### Arm B — completeness (the full battery)
 
-Re-compose **only** the graphs that hit the wall in arm A, at a raised ceiling
-(600s is a reasonable first choice; record what you used). Purpose: establish
-whether those graphs *ever* compose, and give `elspeth-a79f1b2e6b` the full
-battery its criterion requires.
+Re-compose **only** the graphs that hit the wall in arm A, at a raised ceiling.
+Purpose: establish whether those graphs *ever* compose, and give
+`elspeth-a79f1b2e6b` the full battery its criterion requires.
+
+**The ceiling is not a free knob, and 270 is not a conservative setting — it is
+the maximum the package permits.** `config.py:929-941` enforces
+
+```
+composer_timeout_seconds  ≤  composer_transport_idle_ceiling_seconds
+                             − composer_transport_headroom_seconds
+                          =  300 − 30  =  270
+```
+
+and 300 is not arbitrary either: it is the ALB's own `idle_timeout`
+(`modules/scenario/network.tf:154`). The stack carries no `TRANSPORT` overrides,
+so the package defaults apply. **Round 4 ran at the exact structural ceiling**,
+and a naive `COMPOSER_TIMEOUT_SECONDS=600` is a **boot crash** at config
+validation, not a warning.
+
+Raising it is therefore a coordinated **three-place** change:
+
+| Place | From | To (example) |
+|---|---|---|
+| ALB `idle_timeout` (`network.tf:154`) | 300 | 900 |
+| `ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS` | 300 (default) | 900 |
+| `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` | 270 | 840 |
+
+Change all three or none. Raising the composer's wall past the ALB's idle
+timeout inverts the ordering the validator exists to protect — the proxy aborts
+before the composer reports, and an honest 422 becomes a dead connection.
+
+Record the arm-B configuration in the ledger as a **deliberate deviation from
+the package**. Arm A stays at the package-permitted 270 so parity is intact.
+
+**This reframes the wall as a finding in its own right.** It is not a
+conservatively-chosen timeout; it is the ALB idle timeout minus headroom, and
+25% of real composes exceed it. "Raise the timeout" is an infrastructure change,
+not a config change. Related class: `elspeth-f159d2394b` (wall cannot fund the
+configured turn budget; not operator-tunable). If arm B shows the graphs compose
+fine at 840, the defect is that the shipped envelope cannot fund the shipped
+corpus — file it.
 
 Report arm B as its own cohort. For the cost ticket, report the **union** and
 label it an upper bound — arm B sessions ran longer by construction.
