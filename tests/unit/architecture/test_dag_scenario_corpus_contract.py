@@ -479,7 +479,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # frozen expectation showed every other field equal — schema_fields,
 # schema_hash and schema_mode are unchanged, so no audit projection material
 # moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "5dd6fd06de1a5d96eae0d5c2a3a59d53c6d32fd388b5ae804efa016f40d5409c"
+# Rotated again 2026-08-07 for the json_explode comment correction: editing that
+# plugin file changed its ``source_file_hash``, which the manifest pins verbatim
+# inside one node record's audit material. Exactly ONE token moved
+# (sha256:28c5145404eee89e -> sha256:b1bcb40d6a2e5a02), asserted to be a single
+# occurrence before the rewrite; line_explode gained an output_semantics() in the
+# same change but is not pinned in the manifest, so nothing else moved. Verified
+# mechanical by A/B: reverting that one token restores the previous digest
+# exactly, so no audit projection material other than the hash changed.
+EXPECTED_CASE_REGISTRY_SHA256 = "a46b42c7b777f1d652223a182bf6f40ac4dacf4b770d591c04dccfe769b2a0e0"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

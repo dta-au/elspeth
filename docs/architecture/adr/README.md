@@ -58,6 +58,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [036](036-textract-profile-bound-bucket.md) | Textract Document Buckets Bind Through a Dedicated Operator Profile, Not Row Data | 2026-08-04 | **Accepted** |
 | [037](037-interpretation-caps-govern-llm-churn-only.md) | Interpretation Review Caps Govern LLM Churn Only — Server-Shaped Obligations Are Bounded by Dedup and Graph Size | 2026-08-04 | **Accepted** |
 | [038](038-non-terminal-abandoned-path.md) | Non-Terminal ABANDONED Path — Run-Death Fate Decision for Undecided Tokens | 2026-08-06 | **Accepted** |
+| [039](039-unconstrained-text-framing.md) | Unconstrained Text Framing — A Positive Claim That Makes Generative Producers Gateable | 2026-08-07 | **Accepted** |
 
 ## Status Definitions
 

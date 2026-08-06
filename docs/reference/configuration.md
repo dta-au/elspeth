@@ -543,7 +543,7 @@ sinks:
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `aws_s3`, `database`, `azure_blob`, `dataverse`, `chroma_sink` |
+| `plugin` | string | **Yes** | Plugin name: `csv`, `json`, `text`, `document`, `aws_s3`, `database`, `azure_blob`, `dataverse`, `chroma_sink` |
 | `on_write_failure` | string | **Yes** | Per-row write failure handling: `discard` to drop with audit record, or a sink name to divert to a failsink |
 | `options` | object | No | Plugin-specific configuration |
 

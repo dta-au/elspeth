@@ -1843,6 +1843,46 @@ class BaseSink(ABC, SinkEffectContract):
         """
         self._on_complete_called = True
 
+    # ── Plugin-declared semantics (mirrors BaseTransform's hook) ──
+    # A sink is a semantic CONSUMER: it reads configured fields and can
+    # require properties of them. It is never a producer, so it gains
+    # input_semantic_requirements() only — there is no output_semantics()
+    # counterpart because nothing downstream reads a sink.
+
+    def input_semantic_requirements(self) -> InputSemanticRequirements:
+        """Return semantic requirements for fields this sink consumes.
+
+        Default returns no requirements. Override to declare that a
+        configured input field must satisfy specific ContentKind /
+        TextFraming / SemanticValueType acceptance sets — for example
+        ``TextSink``, whose one-record-per-row invariant makes any
+        newline-bearing framing a hard conflict.
+
+        A sink that overrides this MUST also provide ``probe_config()``:
+        ``tests/invariants/test_semantic_requirements_are_satisfiable``
+        fails loudly rather than silently skipping a declarer it cannot
+        instantiate.
+        """
+        from elspeth.contracts.plugin_semantics import InputSemanticRequirements
+
+        return InputSemanticRequirements()
+
+    @classmethod
+    def probe_config(cls) -> dict[str, Any]:
+        """Return a minimal config dict sufficient to instantiate this sink.
+
+        Same contract as ``BaseTransform.probe_config``: the dict is passed
+        directly to ``cls(...)`` and must not require external services,
+        network calls, or credentials. Required of any sink that declares
+        ``input_semantic_requirements()``.
+        """
+        raise NotImplementedError(
+            f"{cls.__name__}.probe_config() is not implemented. "
+            "Sinks that declare input_semantic_requirements() must declare how "
+            "to instantiate in isolation so the satisfiability invariant can "
+            "read their requirements."
+        )
+
     @classmethod
     def get_agent_assistance(
         cls,
@@ -2188,6 +2228,24 @@ class BaseSource(ABC):
             is a dict mapping original header name → final field name.
         """
         return None  # Default: no field resolution metadata
+
+    # ── Plugin-declared semantics (mirrors BaseTransform's hook) ──
+    # A source is a semantic PRODUCER: it is the root of every pipeline and
+    # can declare facts about the fields it emits. It consumes nothing, so
+    # it gains output_semantics() only.
+
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        """Return semantic facts for the fields this source emits.
+
+        Default returns an empty declaration: the source makes no semantic
+        claims beyond what the schema contract already expresses. Override
+        to declare ContentKind / TextFraming / SemanticValueType for
+        configured output fields — ``LLMSource`` does, because a generated
+        response is unconstrained free text (ADR-039).
+        """
+        from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
+
+        return OutputSemanticDeclaration()
 
     # === Composer assistance hooks ===
 

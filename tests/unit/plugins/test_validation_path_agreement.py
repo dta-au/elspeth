@@ -452,6 +452,19 @@ _SINK_REJECTION_CASES = [
         "alternate_key.*not found in field_mapping",
         id="dataverse-alternate_key-missing",
     ),
+    # ── document sink ─────────────────────────────────────────────────────
+    pytest.param(
+        "document",
+        {
+            "path": "/tmp/announcement.txt",
+            "field": "announcement_text",
+            # append_or_create is meaningless for a sink that only ever writes.
+            "collision_policy": "append_or_create",
+            "schema": _make_observed_schema(),
+        },
+        "collision_policy='append_or_create' requires mode='append'",
+        id="document-append-collision-policy",
+    ),
     # ── json sink ─────────────────────────────────────────────────────────
     pytest.param(
         "json",

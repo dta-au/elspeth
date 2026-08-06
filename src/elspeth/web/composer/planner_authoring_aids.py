@@ -60,12 +60,21 @@ _RAW_HTML_CLEANUP_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scra
 
 
 class _PluginDigestEntry(TypedDict):
-    """Closed policy-visible plugin summary rendered into the planner prompt."""
+    """Closed policy-visible plugin summary rendered into the planner prompt.
+
+    ``not_for`` carries the plugin's ``usage_when_not_to_use``; ``purpose`` and
+    ``required_options`` likewise rename ``description`` and the required
+    ``config_fields``. The digest names each field for what the planner does
+    with it, so a parity sweep over the catalog vocabulary should grep this
+    module rather than the field names alone.
+    """
 
     name: str
     purpose: str
     required_options: list[str]
     composer_hints: list[str]
+    not_for: NotRequired[str]
+    capability_tags: NotRequired[list[str]]
     profile_aliases: NotRequired[list[str]]
 
 
@@ -1160,15 +1169,48 @@ def build_schema_contract_evidence(
 
 
 def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
-    return [
-        {
+    """Render one entry per plugin, reference content carried verbatim.
+
+    ``not_for`` is the plugin's ``usage_when_not_to_use`` — its own stated
+    prohibition, already profile-projected when it reaches this function,
+    because an operator-profiled summary rewrites the field in the catalog view
+    itself (``plugin_policy.profiles``). It carried
+    the ``text`` sink's "not for multiline values" rule that a planner authored
+    straight past (elspeth-afdf55a17c), because until now the only tier that
+    stated it was a ``list_sinks`` result the planner is told it rarely needs.
+
+    Reference content is carried whole or not at all. A sliced prohibition
+    ("Do not use for multi-field, nested, binary, or multi…") reads as a
+    narrower rule than the one the plugin declared, and dropping the entry is
+    not available either: ``prompts.py`` retired its duplicate ``plugin_hints``
+    block on the strength of this digest being a strict superset, so every
+    policy-visible plugin must appear.
+
+    ``example_use`` is deliberately not carried. It is YAML, while this surface
+    authors through ``set_pipeline``; it is not validated against the live
+    catalog, unlike every worked exemplar this module renders; and it is the
+    largest of the reference fields. ``usage_when_to_use`` is not carried
+    either — ``purpose`` and ``capability_tags`` already say what a plugin is
+    for. Both stay reachable through ``list_sources``/``list_transforms``/
+    ``list_sinks``, which return the whole ``PluginSummary``.
+    """
+    entries: list[_PluginDigestEntry] = []
+    for plugin in plugins:
+        entry: _PluginDigestEntry = {
             "name": plugin.name,
             "purpose": plugin.description,
             "required_options": [field.name for field in plugin.config_fields if field.required],
             "composer_hints": list(plugin.composer_hints),
         }
-        for plugin in plugins
-    ]
+        # PluginSummary is a strict Tier-1 response model: the catalog service
+        # is the boundary that already rejected a non-str prohibition or a
+        # non-tuple tag set, so presence is the only question left here.
+        if plugin.usage_when_not_to_use is not None:
+            entry["not_for"] = plugin.usage_when_not_to_use
+        if plugin.capability_tags:
+            entry["capability_tags"] = list(plugin.capability_tags)
+        entries.append(entry)
+    return entries
 
 
 def discovery_digest(
@@ -1181,9 +1223,14 @@ def discovery_digest(
     Targets ``planner_code=DISCOVERY_CYCLE`` churn: a significant share of
     planner calls were ``list_*``/``get_plugin_schema`` rounds re-learning the
     same catalog every session. Each entry carries the plugin's name, one-line
-    purpose, required-knob names, and its ``composer_hints`` verbatim. This is
-    selection and coaching metadata, not the plugin's option contract; types,
-    optional knobs, defaults, enums, and conditional rules remain schema facts.
+    purpose, required-knob names, its ``composer_hints`` verbatim, its stated
+    prohibition (``not_for``) and its ``capability_tags``. This is selection
+    and coaching metadata, not the plugin's option contract; types, optional
+    knobs, defaults, enums, and conditional rules remain schema facts.
+
+    Because the planner is told it rarely needs ``list_*``, a selection fact
+    that lives only in a ``list_*`` result is a fact it will usually not read.
+    That is why the prohibition belongs here and not only in the catalog tier.
     """
     if summaries is None:
         summaries = _plugin_summaries(catalog)
@@ -1221,7 +1268,13 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "not a full option contract: required-option names are incomplete without "
     "types, optional knobs, defaults, enums, and conditional rules. Author "
     "options only from schema_contract_evidence for this request or a current "
-    "get_plugin_schema result. You rarely need list_sources/list_transforms/"
+    "get_plugin_schema result. An entry's not_for is that plugin's own stated "
+    "prohibition and is binding on selection: when the value you intend to "
+    "write matches it, choose a different plugin or reshape the value upstream "
+    "first. capability_tags is the plugin's declared capability vocabulary. "
+    "Entries carry no worked example; the worked shapes validated for this "
+    "deployment are the other authoring_aids sections. "
+    "You rarely need list_sources/list_transforms/"
     "list_sinks calls. Model identifiers still come only from "
     "list_models. A list_models result is a session snapshot and can become "
     "stale, so refresh it before binding a literal model; blob/secret "

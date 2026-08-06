@@ -358,10 +358,11 @@ def _validate_locked_consumer_guaranteed_extras(
 ) -> None:
     """Build-time mirror of composer Rule A: guaranteed extras vs a locked input.
 
-    ``check_compatibility``'s extras arm compares schema against schema, so
-    both bypass paths above it (dynamic producer, observed producer) used to
-    leave a locked (``extra='forbid'``) consumer unchecked against a producer
-    whose promises travel in the OTHER channel — ``guaranteed_fields``. A
+    ``check_compatibility``'s extras arm compares schema against schema, so the
+    edges it never sees (a dynamic producer, an observed producer — the two arms
+    ``validate_single_edge`` abandons before Phase 2) used to leave a locked
+    (``extra='forbid'``) consumer unchecked against a producer whose promises
+    travel in the OTHER channel — ``guaranteed_fields``. A
     guarantee means every row WILL carry the field; a locked consumer that
     does not admit it kills every such row at the executor input preflight
     (``engine/executors/transform.py`` ``model_validate``; ``sink.py`` /

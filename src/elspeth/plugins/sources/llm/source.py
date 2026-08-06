@@ -7,7 +7,7 @@ import time
 from collections.abc import Generator, Iterator, Mapping
 from functools import reduce
 from operator import or_
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import structlog
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -49,6 +49,9 @@ from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMPro
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
 from elspeth.plugins.transforms.llm.validation import strip_markdown_fences
+
+if TYPE_CHECKING:
+    from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
 logger = structlog.get_logger(__name__)
 
@@ -115,7 +118,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:264ff70508a73f77"
+    source_file_hash: str | None = "sha256:7b3d1fafb91751d8"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -607,7 +610,21 @@ class LLMSource(BaseSource):
         if failures and not suppress_errors:
             raise failures[0]
 
-    def output_semantics(self) -> Any:
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        """Declare that the generated response field is an unconstrained string.
+
+        ``text_framing=UNCONSTRAINED`` is a positive claim, not an abstention:
+        the value is free text and whether the model emits a newline is not
+        decidable before the run. ``content_kind`` stays UNKNOWN because prose
+        versus markdown is a genuine per-response unknown (ADR-039).
+
+        Read by the composer's semantic validator through
+        ``_semantic_validator._instantiate_source_producer``, which builds the
+        source with ``create_source`` and the ``BaseSource.output_semantics()``
+        hook. Both landed with the sink-consumer plumbing; before that this
+        declaration was unreachable dead code and every source-fed edge was
+        UNKNOWN whatever the source claimed.
+        """
         from elspeth.contracts.plugin_semantics import (
             ContentKind,
             FieldSemanticFacts,
@@ -621,7 +638,7 @@ class LLMSource(BaseSource):
                 FieldSemanticFacts(
                     field_name=self._response_field,
                     content_kind=ContentKind.UNKNOWN,
-                    text_framing=TextFraming.UNKNOWN,
+                    text_framing=TextFraming.UNCONSTRAINED,
                     value_type=SemanticValueType.STR,
                     fact_code="llm.source_response_field.string",
                     configured_by=("response_field",),

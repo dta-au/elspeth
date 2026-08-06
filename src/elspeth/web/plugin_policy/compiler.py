@@ -20,10 +20,19 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
         PluginId("source", "llm"),
         PluginId("source", "text"),
         PluginId("sink", "csv"),
+        # Paired with sink:text. text refuses any value carrying CR or LF, so
+        # document is the only sink that can publish generated multiline text;
+        # authorizing text alone leaves that request with no correct sink and
+        # is what produced elspeth-afdf55a17c.
+        PluginId("sink", "document"),
         PluginId("sink", "json"),
         PluginId("sink", "text"),
         PluginId("transform", "field_mapper"),
+        # The remedies text and document name in their own guidance. A remedy
+        # the surface does not authorize is one the Composer cannot take.
+        PluginId("transform", "line_explode"),
         PluginId("transform", "llm"),
+        PluginId("transform", "report_assemble"),
         PluginId("transform", "web_scrape"),
     }
 )

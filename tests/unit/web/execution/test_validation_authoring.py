@@ -573,3 +573,145 @@ def _web_scrape_line_explode_state() -> CompositionState:
         ),
         outputs=(_output({"path": "/tmp/test_data/outputs/test-session/lines.json"}, plugin="json"),),
     )
+
+
+def _llm_to_text_sink_state() -> CompositionState:
+    """The g11 shape: a generative producer routed straight at the text sink.
+
+    Fully configured on purpose — a draft sink config makes the semantic probe
+    abstain, and an abstaining probe emits no finding at all, which would make
+    every assertion below pass for the wrong reason.
+    """
+    return _state(
+        source=_source(
+            {
+                "path": "/tmp/test_data/blobs/test-session/topics.csv",
+                "schema": {"mode": "fixed", "fields": ["topic: str"]},
+            },
+            on_success="generate_in",
+        ),
+        nodes=(
+            _node(
+                node_id="generate",
+                plugin="llm",
+                input_name="generate_in",
+                on_success="announcement",
+                options={
+                    "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                    "required_input_fields": ["topic"],
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-3.7-sonnet",
+                    "api_key": "sk-test-key",
+                    "prompt_template": "Write an announcement about {{ row['topic'] }}",
+                    "temperature": 0,
+                    "response_field": "announcement_text",
+                    "pool_size": 1,
+                    "max_tokens": 300,
+                },
+            ),
+        ),
+        outputs=(
+            _output(
+                {
+                    "path": "/tmp/test_data/outputs/test-session/announcement.txt",
+                    "field": "announcement_text",
+                    "schema": {"mode": "fixed", "fields": ["announcement_text: str"]},
+                },
+                name="announcement",
+                plugin="text",
+            ),
+        ),
+    )
+
+
+def test_semantic_phase_attributes_a_sink_violation_to_the_sink() -> None:
+    """A sink finding must not be reported as a transform node that does not exist.
+
+    ``component_type`` was hardcoded to "transform" and the component id was
+    stripped with ``removeprefix("node:")``, so a sink entry (``output:<name>``)
+    landed in the ledger as a transform whose id still carried the prefix.
+    """
+    state = _llm_to_text_sink_state()
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert isinstance(result, PhaseFailure), "llm -> text must block at the authoring gate (ADR-039)"
+    assert result.failed_check.name == "semantic_contracts"
+
+    sink_contracts = [contract for contract in result.semantic_contracts if contract.to_id == "output:announcement"]
+    assert len(sink_contracts) == 1, "the sink edge must be evaluated, or this test is vacuous"
+    assert sink_contracts[0].outcome == "conflict"
+    assert sink_contracts[0].consumer_plugin == "text"
+    assert sink_contracts[0].requirement_code == "text.field.single_line_text"
+
+    assert len(result.errors) == 1
+    error = result.errors[0]
+    assert error.component_type == "sink", "a sink violation must be typed as a sink"
+    assert error.component_id == "announcement", "the output: qualifier must be stripped, like node: is for a node"
+
+
+def test_semantic_phase_surfaces_the_sinks_own_remedy_for_a_sink_violation() -> None:
+    """Assistance must route to the SINK registry, and name both repairs.
+
+    ``assistance_suggestion_for`` looked the consumer up with
+    get_transform_by_name unconditionally; the two registries are separate, so
+    that raised for every sink consumer. A prohibition with no alternative is
+    what produced g11 in the first place, so the arm has to actually arrive.
+    """
+    state = _llm_to_text_sink_state()
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert isinstance(result, PhaseFailure)
+    suggestion = result.errors[0].suggestion
+    assert suggestion is not None, "the text sink owns a remedy for this requirement_code and it must reach the ledger"
+    assert "line_explode" in suggestion
+    assert "document" in suggestion
+
+
+def test_semantic_phase_keeps_the_output_qualifier_on_a_sink_advisory() -> None:
+    """``affected_nodes`` has no type column, so a sink advisory keeps ``output:``.
+
+    Stripping it would make a sink advisory indistinguishable from a node
+    advisory, and would silently merge a sink with a same-named node.
+    """
+    state = _state(
+        source=_source(
+            {
+                "path": "/tmp/test_data/blobs/test-session/rows.csv",
+                "schema": {"mode": "fixed", "fields": ["value: str"]},
+            },
+            on_success="map_in",
+        ),
+        nodes=(
+            _node(
+                node_id="rename",
+                plugin="field_mapper",
+                input_name="map_in",
+                on_success="lines",
+                options={"schema": {"mode": "observed"}, "mapping": {"value": "line_text"}},
+            ),
+        ),
+        outputs=(
+            _output(
+                {
+                    "path": "/tmp/test_data/outputs/test-session/lines.txt",
+                    "field": "line_text",
+                    "schema": {"mode": "fixed", "fields": ["line_text: str"]},
+                },
+                name="lines",
+                plugin="text",
+            ),
+        ),
+    )
+    secret_state = SecretValidatedState(policy=_policy(state), all_secret_refs=(), env_ref_names=frozenset())
+
+    result = validate_semantic_evidence(secret_state)
+
+    assert not isinstance(result, PhaseFailure), "an undeclared producer must not block the text sink"
+    check = result.checks[0]
+    assert check.name == "semantic_contracts"
+    assert check.affected_nodes == ("output:lines",)
+    assert "text.field.single_line_text" in check.detail

@@ -139,6 +139,7 @@ EXPECTED_SINK_DETERMINISMS: dict[str, Determinism] = {
     "csv": Determinism.IO_WRITE,
     "database": Determinism.IO_WRITE,
     "dataverse": Determinism.EXTERNAL_CALL,
+    "document": Determinism.IO_WRITE,
     "json": Determinism.IO_WRITE,
     "text": Determinism.IO_WRITE,
 }

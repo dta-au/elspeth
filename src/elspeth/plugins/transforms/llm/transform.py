@@ -1158,7 +1158,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f263d3532dc7894a"
+    source_file_hash: str | None = "sha256:b75d8ce3136ba2ab"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1557,13 +1557,25 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         return self._config
 
     def output_semantics(self) -> OutputSemanticDeclaration:
-        """Declare that raw LLM response fields are strings.
+        """Declare that raw LLM response fields are unconstrained strings.
 
         Single-query mode emits ``response_field`` directly. Multi-query mode
         emits one raw response field per query using ``<query>_<response_field>``.
         Structured multi-query extracted fields have their own schema types, but
         this semantic contract only claims the raw response-content fields whose
         runtime value is mechanically known here.
+
+        ``text_framing=UNCONSTRAINED`` is a positive claim, not an abstention:
+        the value is free text and whether the model emits a newline is not
+        decidable before the run, under any configuration. Declaring UNKNOWN
+        instead would be an abstention, and ``compare_semantic`` can never
+        raise a CONFLICT against an abstention — which left a generative
+        producer ungateable and every wrong composition merely advisory
+        (ADR-039).
+
+        ``content_kind`` stays UNKNOWN deliberately. Prose or markdown is a
+        genuine unknown per response, and claiming either would manufacture
+        false conflicts against consumers that constrain that dimension.
         """
         from elspeth.contracts.plugin_semantics import (
             ContentKind,
@@ -1579,7 +1591,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                     FieldSemanticFacts(
                         field_name=f"{spec.name}_{self._response_field}",
                         content_kind=ContentKind.UNKNOWN,
-                        text_framing=TextFraming.UNKNOWN,
+                        text_framing=TextFraming.UNCONSTRAINED,
                         value_type=SemanticValueType.STR,
                         fact_code="llm.response_field.string",
                         configured_by=("queries", "response_field"),
@@ -1593,7 +1605,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 FieldSemanticFacts(
                     field_name=self._response_field,
                     content_kind=ContentKind.UNKNOWN,
-                    text_framing=TextFraming.UNKNOWN,
+                    text_framing=TextFraming.UNCONSTRAINED,
                     value_type=SemanticValueType.STR,
                     fact_code="llm.response_field.string",
                     configured_by=("response_field", "queries"),

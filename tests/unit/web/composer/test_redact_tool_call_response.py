@@ -1260,3 +1260,81 @@ def test_declared_sensitive_envelope_key_still_wins_over_implicit_knowledge(
     assert result["validation"] == REDACTED_SENSITIVE_NO_SUMMARIZER
     assert result["success"] is True
     assert result["version"] == 1
+
+
+def test_validation_entry_shadow_model_carries_every_optional_detail_key() -> None:
+    """The shadow model is extra="forbid", so a missing key is a HARD FAIL.
+
+    ``ValidationEntry.to_dict()`` emits its structured detail fields only when
+    set, so an entry shape added on the state side and not mirrored here is
+    invisible until the day a real rejection carries it — then the whole
+    response fails validation rather than degrading. ``coalesce_union_type``
+    reached exactly that state: it was added to ``to_dict()`` without a shadow
+    counterpart.
+
+    Pinned against ``ValidationEntryDict`` itself rather than a fixture, so a
+    future detail field cannot land on only one side.
+    """
+    from typing import get_type_hints
+
+    from elspeth.web.composer.redaction import _ValidationEntryShadowModel
+    from elspeth.web.composer.state import ValidationEntryDict
+
+    serialized_keys = set(get_type_hints(ValidationEntryDict).keys())
+    shadow_keys = set(_ValidationEntryShadowModel.model_fields.keys())
+
+    assert serialized_keys <= shadow_keys, (
+        f"ValidationEntry.to_dict() can emit {sorted(serialized_keys - shadow_keys)}, "
+        "which the extra='forbid' redaction shadow would reject"
+    )
+
+
+def test_validation_entry_shadow_model_accepts_every_structured_detail() -> None:
+    """The same guarantee end-to-end, on real serialized entries."""
+    from elspeth.web.composer.redaction import _ValidationEntryShadowModel
+    from elspeth.web.composer.state import (
+        CoalesceUnionTypeDetail,
+        RowUnionBranchSchemaDetail,
+        RowUnionFieldSchemaDetail,
+        RowUnionSchemaDetail,
+        SchemaContractDetail,
+        ValidationEntry,
+    )
+
+    entries = (
+        ValidationEntry(
+            "node:consumer",
+            "schema contract violation",
+            "high",
+            "schema_contract_violation",
+            contract=SchemaContractDetail(producer="producer", consumer="output:sink", missing_fields=("body",)),
+        ),
+        ValidationEntry(
+            "node:merge",
+            "row union schema incompatible",
+            "high",
+            "row_union_schema_incompatible",
+            row_union_schema=RowUnionSchemaDetail(
+                branches=(
+                    RowUnionBranchSchemaDetail(
+                        branch="a",
+                        mode="fixed",
+                        fields=(RowUnionFieldSchemaDetail(name="amount", field_type="int", required=True, nullable=False),),
+                    ),
+                ),
+                conflicting_fields=("amount",),
+            ),
+        ),
+        ValidationEntry(
+            "node:merge",
+            "union coalesce type incompatible",
+            "high",
+            "coalesce_union_type_incompatible",
+            coalesce_union_type=CoalesceUnionTypeDetail(field="amount", branch_a="a", type_a="int", branch_b="b", type_b="str"),
+        ),
+    )
+
+    for entry in entries:
+        payload = entry.to_dict()
+        validated = _ValidationEntryShadowModel.model_validate(payload)
+        assert validated.component == entry.component

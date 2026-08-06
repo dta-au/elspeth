@@ -32,7 +32,7 @@ from elspeth.plugins.infrastructure.results import TransformResult
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_assistance import PluginAssistance
-    from elspeth.contracts.plugin_semantics import InputSemanticRequirements
+    from elspeth.contracts.plugin_semantics import InputSemanticRequirements, OutputSemanticDeclaration
 
 
 DEFAULT_MAX_LINES = 10_000
@@ -143,7 +143,6 @@ def _build_line_explode_input_requirements(
     source_field: str,
 ) -> InputSemanticRequirements:
     from elspeth.contracts.plugin_semantics import (
-        ContentKind,
         FieldSemanticRequirement,
         InputSemanticRequirements,
         TextFraming,
@@ -152,18 +151,102 @@ def _build_line_explode_input_requirements(
 
     return InputSemanticRequirements(
         fields=(
+            # Constrain ONE dimension: framing. splitlines() cares where the
+            # line boundaries are, not what the text MEANS, so content_kind is
+            # deliberately unconstrained (the shape json_explode already uses).
+            # Every producer this requirement should block conflicts on framing
+            # alone — web_scrape raw html declares NOT_TEXT, its compact text
+            # declares COMPACT — so constraining content_kind blocked nothing
+            # extra, while downgrading to UNKNOWN every producer that declares
+            # framing but honestly abstains on kind (an LLM: prose or markdown
+            # is not statically decidable). It was also wrong in one real case:
+            # JSON_STRUCTURED + NEWLINE_FRAMED is JSONL, and splitting JSONL
+            # into one object per row is correct rather than a defect. NOT_TEXT
+            # remains the member that carries "no line operations on this".
             FieldSemanticRequirement(
                 field_name=source_field,
-                accepted_content_kinds=frozenset(
-                    {ContentKind.PLAIN_TEXT, ContentKind.MARKDOWN},
-                ),
+                accepted_content_kinds=frozenset(),
                 accepted_text_framings=frozenset(
-                    {TextFraming.NEWLINE_FRAMED, TextFraming.LINE_COMPATIBLE},
+                    {
+                        TextFraming.NEWLINE_FRAMED,
+                        TextFraming.LINE_COMPATIBLE,
+                        # Splitting unconstrained free text is legitimate: it is
+                        # how generated multiline text becomes one row per line,
+                        # which is the only correct way to write it to a file.
+                        TextFraming.UNCONSTRAINED,
+                    },
                 ),
                 requirement_code="line_explode.source_field.line_framed_text",
                 severity="high",
-                unknown_policy=UnknownSemanticPolicy.FAIL,
+                # WARN, not FAIL. line_explode is a USEFULNESS guard, not a
+                # correctness one: compact text yields a single row holding the
+                # whole value — a no-op, not data loss. Contrast TextSink, which
+                # DISCARDS the row, and so earns a hard requirement.
+                #
+                # Nothing genuinely wrong is unblocked by this. A wrong producer
+                # declares a conflicting framing, and CONFLICT short-circuits
+                # ahead of UNKNOWN in compare_semantic, so it stays blocked
+                # under every policy. FAIL was blocking exactly one class:
+                # producers that did not DECLARE. That included both LLM
+                # plugins, which made `llm -> line_explode -> text` unauthorable
+                # and left "write generated text to a file" with no correct
+                # spelling at all (elspeth-b6d9f04827, ADR-039).
+                unknown_policy=UnknownSemanticPolicy.WARN,
                 configured_by=("source_field",),
+            ),
+        ),
+    )
+
+
+def _build_line_explode_output_semantics(
+    *,
+    output_field: str,
+) -> OutputSemanticDeclaration:
+    """Declare what one emitted line provably is.
+
+    ``text_framing=COMPACT`` is a fact this transform mechanically knows, not
+    an estimate. ``_splitlines_bounded`` cuts the source at every ``\\r``,
+    ``\\r\\n`` and every member of ``_LINE_BOUNDARY_CHARS``, and emits only the
+    slices BETWEEN those cuts. So no emitted value can contain a line-boundary
+    character of any kind — strictly stronger than the "no CR or LF" that
+    ``TextSink``'s one-record-per-row invariant actually needs.
+
+    Declaring it is the point. Without this, ``llm -> line_explode -> text``
+    — the ONE correct spelling of "write generated multiline text to a file",
+    and the composition ADR-039 §Consequences claims is SATISFIED — resolved to
+    UNKNOWN, making the RECOMMENDED shape indistinguishable from an undeclared
+    one and leaving ``TextSink``'s requirement satisfied by nothing in the
+    registry.
+
+    ``value_type=STR``: ``process`` rejects a non-``str`` source with TypeError,
+    and a slice of a ``str`` is a ``str``.
+
+    ``content_kind=UNKNOWN`` is an honest ABSTENTION, not an omission.
+    Splitting changes where the line boundaries are, never what the text MEANS,
+    so one line of markdown is still markdown and one line of prose is still
+    prose — this transform cannot know which it forwarded. The input
+    requirement above deliberately leaves ``accepted_content_kinds`` empty for
+    the same reason, so there is nothing to forward even in principle.
+    Claiming PLAIN_TEXT here would manufacture false conflicts against any
+    future consumer constraining that dimension.
+    """
+    from elspeth.contracts.plugin_semantics import (
+        ContentKind,
+        FieldSemanticFacts,
+        OutputSemanticDeclaration,
+        SemanticValueType,
+        TextFraming,
+    )
+
+    return OutputSemanticDeclaration(
+        fields=(
+            FieldSemanticFacts(
+                field_name=output_field,
+                content_kind=ContentKind.UNKNOWN,
+                text_framing=TextFraming.COMPACT,
+                value_type=SemanticValueType.STR,
+                fact_code="line_explode.output_field.compact_line",
+                configured_by=("output_field",),
             ),
         ),
     )
@@ -210,7 +293,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b7ee4ee216ec1a00"
+    source_file_hash: str | None = "sha256:8046aff02b3c3bf8"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -270,6 +353,11 @@ class LineExplode(BaseTransform):
             source_field=self._source_field,
         )
 
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        return _build_line_explode_output_semantics(
+            output_field=self._output_field,
+        )
+
     @classmethod
     def get_agent_assistance(
         cls,
@@ -284,8 +372,9 @@ class LineExplode(BaseTransform):
                 issue_code=None,
                 summary="Deaggregate a string field by splitting on newlines — emits one row per non-empty line.",
                 composer_hints=(
-                    "source_field must contain newline-framed text — empty/compact text yields a single row with the whole content.",
+                    "source_field must contain newline-framed, line-compatible, or unconstrained free text — compact text yields a single row with the whole content.",
                     "Producer compatibility: web_scrape with format: 'markdown' or text_separator: '\\n' works; format: 'text' with whitespace separator does NOT.",
+                    "Generated text qualifies: put line_explode between an llm producer and a text sink, because the text sink writes one line per row and diverts any value containing CR or LF.",
                     "If you need to split on a non-newline delimiter, use field_mapper + value_transform first to insert newlines.",
                 ),
             )
@@ -298,13 +387,26 @@ class LineExplode(BaseTransform):
                 "line_explode calls splitlines() on the configured source_field. "
                 "Compact text (a single string with no newlines) emits one row "
                 "containing the whole content — the opposite of line "
-                "deaggregation. The producer must emit newline-framed or "
-                "line-compatible text."
+                "deaggregation. The producer must emit newline-framed, "
+                "line-compatible, or unconstrained free text.\n"
+                "\n"
+                "A GENERATIVE producer (the llm source or transform) declares "
+                "text_framing=unconstrained and SATISFIES this requirement — "
+                "whether a model emits a newline is not knowable before the "
+                "run, and splitting that text is legitimate rather than a "
+                "compromise. It is how generated multiline text reaches a "
+                "file, because the text sink writes one line per row and "
+                "diverts any value containing CR or LF. So if you are reading "
+                "this for an llm producer, the fix is not to remove "
+                "line_explode."
             ),
             suggested_fixes=(
                 "Configure the upstream producer to emit newline-framed text "
                 "(for web_scrape: text_separator: '\\n', or use format: markdown).",
-                "Choose a producer whose output_semantics() declares a text_framing of newline_framed or line_compatible.",
+                "Choose a producer whose output_semantics() declares a text_framing of newline_framed, line_compatible, or unconstrained.",
+                "Writing generated text to a file: author llm -> line_explode -> text, "
+                "with line_explode's source_field set to the llm response_field and the "
+                "text sink's field set to line_explode's output_field.",
             ),
         )
 

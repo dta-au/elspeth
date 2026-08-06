@@ -5,6 +5,13 @@ L0 module (contracts layer). Imports nothing above L0.
 Vocabulary is intentionally CLOSED. Additions require design review and
 a plan amendment — adding enum values lazily is exactly how the project
 ends up rebuilding ad hoc runtime validation as expanding prose.
+
+Closure is enforced, not merely asserted: ``tests/unit/contracts/
+test_plugin_semantics.py`` pins each enum's exact membership, so an addition
+cannot land without a deliberate edit to that pin. An addition must carry an
+ADR recording what the member claims and why the existing members could not
+express it — ``TextFraming.UNCONSTRAINED`` under ADR-039 is the worked
+precedent.
 """
 
 from __future__ import annotations
@@ -75,13 +82,33 @@ class ContentKind(StrEnum):
 
 
 class TextFraming(StrEnum):
-    """How a text-bearing field is framed for downstream line operations."""
+    """How a text-bearing field is framed for downstream line operations.
+
+    ``UNKNOWN`` and ``UNCONSTRAINED`` are NOT synonyms, and the difference is
+    load-bearing (ADR-039):
+
+    * ``UNKNOWN`` is ABSTENTION — nobody declared anything. ``compare_semantic``
+      short-circuits it to an UNKNOWN outcome on that dimension, so an abstaining
+      producer can never CONFLICT no matter what the consumer requires. Its
+      severity is decided by the consumer's ``unknown_policy``, not by the facts.
+    * ``UNCONSTRAINED`` is a positive CLAIM — the producer knows the value is
+      free text and knows its framing is not statically decidable. A generative
+      model may or may not emit a newline, and no configuration settles it.
+      Being a real member it is compared by ordinary set membership, so a
+      consumer that does not accept it gets a CONFLICT.
+
+    That is the whole point: a producer that abstains cannot be gated, and a
+    generative producer must still be gateable. Declare ``UNCONSTRAINED`` only
+    where the value genuinely is unbounded free text — using it as a shortcut
+    for "I did not look" re-creates the abstention it exists to replace.
+    """
 
     UNKNOWN = "unknown"
     NOT_TEXT = "not_text"
     COMPACT = "compact"
     NEWLINE_FRAMED = "newline_framed"
     LINE_COMPATIBLE = "line_compatible"
+    UNCONSTRAINED = "unconstrained"
 
 
 class SemanticValueType(StrEnum):
@@ -101,9 +128,17 @@ class SemanticValueType(StrEnum):
 class UnknownSemanticPolicy(StrEnum):
     """How a consumer treats an UNKNOWN producer fact for a required field.
 
-    Phase 1 line_explode uses FAIL — every producer that semantically
-    feeds it must declare semantics. WARN and ALLOW are present for
-    future consumers but are not used in Phase 1.
+    FAIL blocks authoring, WARN discloses the gap without blocking, ALLOW is
+    silent. Note this governs ABSTENTION only — a CONFLICT is a fact-level
+    contradiction and blocks under every policy.
+
+    Choose FAIL only when some registered producer can actually declare the
+    fact; ``tests/invariants/test_semantic_requirements_are_satisfiable.py``
+    enforces that, because a FAIL requirement nothing can satisfy removes the
+    consumer from the Composer rather than protecting anything. WARN is the
+    honest policy where the property is knowable only per row — both current
+    consumers use it (``json_explode``'s list requirement, ``line_explode``'s
+    line framing). ALLOW has no consumer today.
     """
 
     ALLOW = "allow"

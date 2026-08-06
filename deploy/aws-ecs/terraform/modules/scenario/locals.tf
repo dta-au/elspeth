@@ -111,14 +111,30 @@ locals {
     "source:text",
     "sink:aws_s3",
     "sink:csv",
+    # sink:document is paired with sink:text and must be authorized wherever
+    # text is. text refuses any value carrying CR or LF to hold its
+    # one-row-one-record invariant, so document is the only sink that can
+    # publish generated multiline text. Authorizing text alone reproduces the
+    # state that produced elspeth-afdf55a17c: a composer asked to write a
+    # generated announcement to a file has no correct sink to choose and
+    # authors the refusing one, which discards the row and publishes nothing.
+    "sink:document",
     "sink:json",
     "sink:text",
     "transform:aws_bedrock_content_safety",
     "transform:aws_bedrock_prompt_shield",
     "transform:aws_textract_document_analysis",
     "transform:field_mapper",
+    # line_explode and report_assemble are the REMEDIES the sinks' own guidance
+    # names: text says route multiline values through line_explode, document
+    # says combine rows with report_assemble. A remedy a deployment does not
+    # authorize is a remedy the Composer cannot take, which leaves the same
+    # dead end that produced elspeth-afdf55a17c — a prohibition naming no
+    # reachable alternative. They ride with the sinks that cite them.
+    "transform:line_explode",
     "transform:llm",
     "transform:passthrough",
+    "transform:report_assemble",
     "transform:web_scrape",
   ]
   default_plugin_preferences = {
@@ -138,10 +154,13 @@ locals {
     "source:llm",
     "source:text",
     "sink:csv",
+    "sink:document",
     "sink:json",
     "sink:text",
     "transform:field_mapper",
+    "transform:line_explode",
     "transform:llm",
+    "transform:report_assemble",
     "transform:web_scrape",
   ])
 

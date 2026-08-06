@@ -62,9 +62,11 @@ def _build_json_explode_input_requirements(
                 severity="high",
                 # WARN, not FAIL. No plugin declares SemanticValueType.LIST as
                 # a fact — it appears only here, as a requirement — so FAIL made
-                # json_explode unwireable from EVERY producer, web_scrape
-                # included (it declares content_kind/text_framing, never
-                # value_type).
+                # json_explode unwireable from EVERY producer, including the
+                # ones that declare nothing about this field at all (a json or
+                # csv source), which are precisely the producers that DO put a
+                # real list in the row. That was elspeth-7a2c9a24c3: the gate
+                # rejected this transform's actual use case.
                 #
                 # That gap follows from the row model and no declaration can
                 # close it. ELSPETH's atomic unit is one row and a row field
@@ -106,7 +108,31 @@ def _build_json_explode_input_requirements(
                 # every valid pipeline to pre-empt a case that surfaces loudly
                 # and legibly when it does occur.
                 #
-                # A CONFLICT — e.g. llm declaring STR — remains a hard error.
+                # WARN softens exactly that case and nothing else: it grades
+                # UNKNOWN — an ABSTAINING producer — as an advisory, and never
+                # touches CONFLICT.
+                #
+                # A CONFLICT remains a hard error, and that is not a gap in the
+                # above — it is the other half of it. Every producer that
+                # DECLARES a type for a field it writes declares STR: the llm
+                # source and transform (``llm.response_field.string``) and
+                # web_scrape (``web_scrape.content.*``, which provably encodes
+                # a str). Pointing array_field at one of those fields is a
+                # pipeline that raises TypeError on row 1 in ``process`` below,
+                # so refusing it at authoring time is correct rather than a
+                # false reject.
+                #
+                # This does NOT make json_explode unwireable, and the
+                # distinction is load-bearing: ``_find_producer_facts`` matches
+                # facts to requirements by EXACT FIELD NAME, so the refusal
+                # binds only when array_field IS the declared string field. A
+                # list-bearing field alongside it carries no facts, compares
+                # UNKNOWN, and stays authorable under the WARN above. The
+                # blocked wiring and the supported one are different edges, not
+                # different verdicts on the same edge.
+                # Pinned by TestWebScrapeValueTypeDeclarationSideEffect and
+                # test_llm_response_field_cannot_feed_json_explode_array_field.
+                #
                 # Restore FAIL if a producer ever declares LIST honestly.
                 #
                 # SCOPE WARNING: unknown_policy applies to the whole
@@ -242,7 +268,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:28c5145404eee89e"
+    source_file_hash: str | None = "sha256:b1bcb40d6a2e5a02"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "

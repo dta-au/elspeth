@@ -2321,6 +2321,67 @@ def test_scenario_allowlist_authorizes_the_llm_source_like_every_other_llm_plugi
     assert {"source:llm", "transform:llm"} <= _quoted_plugin_ids(core_match.group("body"))
 
 
+def test_scenario_allowlist_authorizes_the_document_sink_alongside_the_text_sink() -> None:
+    """``sink:document`` carries the same posture as ``sink:text``.
+
+    ``text`` refuses any value carrying CR or LF to hold its one-row-one-record
+    invariant, so ``document`` is the only sink that can publish generated
+    multiline text. Authorizing ``text`` alone leaves a composer asked to write
+    a generated announcement to a file with no correct sink to choose — it
+    authors the refusing one, which discards the row and publishes a zero-byte
+    artifact (elspeth-afdf55a17c).
+
+    Pinned as a pair for the same reason ``source:llm``/``transform:llm`` is:
+    dropping one and keeping the other silently restores the gap.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\n  \]",
+        locals_text,
+        re.DOTALL,
+    )
+    assert allowlist_match is not None
+    assert {"sink:document", "sink:text"} <= _quoted_plugin_ids(allowlist_match.group("body"))
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert {"sink:document", "sink:text"} <= _quoted_plugin_ids(core_match.group("body"))
+
+
+def test_scenario_allowlist_authorizes_the_remedies_the_sinks_name() -> None:
+    """A remedy the surface does not authorize is a remedy nobody can take.
+
+    ``text`` tells an author to route multiline values through ``line_explode``
+    and ``document`` tells them to combine rows with ``report_assemble``. Both
+    sinks are always authorized, so both remedies must be too — otherwise the
+    guidance names a plugin the Composer cannot see, which is the dead end that
+    produced elspeth-afdf55a17c: a prohibition with no reachable alternative.
+    """
+    locals_text = _text("modules/scenario/locals.tf")
+    remedies = {"transform:line_explode", "transform:report_assemble"}
+
+    allowlist_match = re.search(
+        r"default_plugin_allowlist\s*=\s*\[(?P<body>.*?)\n  \]",
+        locals_text,
+        re.DOTALL,
+    )
+    assert allowlist_match is not None
+    assert remedies <= _quoted_plugin_ids(allowlist_match.group("body"))
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        locals_text,
+        re.DOTALL,
+    )
+    assert core_match is not None
+    assert remedies <= _quoted_plugin_ids(core_match.group("body"))
+
+
 def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
     """variables.tf restates the web core because HCL validation cannot read a local.
 
@@ -2344,3 +2405,33 @@ def test_always_authorized_web_core_mirror_matches_the_locals_set() -> None:
     assert core_match is not None
     assert mirror_match is not None
     assert _quoted_plugin_ids(core_match.group("body")) == _quoted_plugin_ids(mirror_match.group("body"))
+
+
+def test_terraform_web_core_matches_the_python_required_set() -> None:
+    """The HCL mirrors must equal REQUIRED_WEB_PLUGIN_IDS, the runtime authority.
+
+    The test above pins the two HCL copies against EACH OTHER, and nothing
+    compared either to Python. So all three could agree with one another and
+    still disagree with the set the runtime actually authorizes
+    (``compile_web_plugin_policy`` unions ``REQUIRED_WEB_PLUGIN_IDS`` in
+    regardless of what Terraform says).
+
+    Drift is not an access-control hole — Python stays authoritative — but the
+    deployment record an operator reads becomes false, and the plan-time
+    precondition in ecs.tf then rejects a plugin the deployment does authorize.
+
+    This is the FOURTH instance of one archetype on this branch alone: an
+    authorization list maintained by hand in more places than anything checks.
+    Deriving the expectation from Python is what stops a fifth
+    (elspeth-4efd6a7242).
+    """
+    from elspeth.web.plugin_policy.compiler import REQUIRED_WEB_PLUGIN_IDS
+
+    core_match = re.search(
+        r"required_web_plugin_ids\s*=\s*toset\(\[(?P<body>.*?)\n  \]\)",
+        _text("modules/scenario/locals.tf"),
+        re.DOTALL,
+    )
+    assert core_match is not None
+
+    assert _quoted_plugin_ids(core_match.group("body")) == {str(plugin_id) for plugin_id in REQUIRED_WEB_PLUGIN_IDS}

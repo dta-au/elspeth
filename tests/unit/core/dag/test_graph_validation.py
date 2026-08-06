@@ -966,6 +966,45 @@ class TestLockedConsumerGuaranteedExtras:
         with pytest.raises(EdgeContractError, match="a"):
             graph.validate_edge_compatibility()
 
+    def test_multi_input_gate_into_a_nested_coalesce_still_builds(self) -> None:
+        """The whole-graph sweep must skip correlated barriers, as its host did.
+
+        ``validate_single_edge`` returns for a COALESCE/ROW_UNION consumer
+        BEFORE Phase 2, so it never resolves those producers' schemas. Hoisting
+        the extras check into a whole-graph pass inherited every guard between
+        that function's entry and the old call site — and dropping this one is
+        not inert, because ``get_effective_producer_schema`` itself raises on a
+        gate with mixed observed/explicit branches.
+
+        A ``nested`` merge has no cross-branch schema constraint at all (each
+        branch is keyed separately in the output), so this topology is
+        legitimate and built cleanly before the hoist. Without the skip it
+        raises "Gate 'gate' has mixed observed/explicit schemas".
+        """
+        from elspeth.contracts import PluginSchema
+
+        class _FixedBranch(PluginSchema):
+            a: str
+
+        graph = ExecutionGraph()
+        graph.add_node("src_obs", node_type=NodeType.SOURCE, plugin_name="csv", config={"schema": {"mode": "observed"}})
+        graph.add_node("src_fixed", node_type=NodeType.SOURCE, plugin_name="csv", output_schema=_FixedBranch)
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork")
+        graph.add_node(
+            "coalesce",
+            node_type=NodeType.COALESCE,
+            plugin_name="coalesce:merge",
+            config={"branches": {"path_a": "path_a", "path_b": "path_b"}, "policy": "require_all", "merge": "nested"},
+        )
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_edge("src_obs", "gate", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("src_fixed", "gate", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("gate", "coalesce", label="path_a", mode=RoutingMode.COPY)
+        graph.add_edge("gate", "coalesce", label="path_b", mode=RoutingMode.COPY)
+        graph.add_edge("coalesce", "sink", label="continue", mode=RoutingMode.MOVE)
+
+        graph.validate_edge_compatibility()
+
 
 def _locked_input_pipeline_settings(*, guaranteed_fields: list[str]) -> object:
     """The ticket's repro via the production path: observed source -> mode:fixed web_scrape."""

@@ -1699,6 +1699,80 @@ class TestWebScrapeOutputSemantics:
         assert facts.field_name == "body"
 
 
+class TestWebScrapeValueTypeBindsToTheFieldNotTheTopology:
+    """web_scrape declaring STR must not cost json_explode its use case.
+
+    Every format CONFLICTS into ``json_explode`` when array_field IS the
+    scraped content field, and that refusal is correct: json_explode raises
+    TypeError on a str rather than parsing it, so the composition dies on row 1
+    (pinned end-to-end by TestWebScrapeValueTypeDeclarationSideEffect).
+
+    The regression to guard is the OTHER half — that the refusal binds to a
+    WIRING and not to the pair of plugins. ``_find_producer_facts`` matches
+    facts to requirements by exact field name, so a list-bearing field carried
+    alongside the scraped content compares UNKNOWN and stays authorable under
+    json_explode's WARN. Losing that would re-enter elspeth-7a2c9a24c3 from the
+    producer side, which is the claim this class exists to falsify.
+    """
+
+    def _content_facts(self, *, fmt: str, separator: str):
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+
+        return _build_web_scrape_output_semantics(
+            content_field="content",
+            format=fmt,
+            text_separator=separator,
+        ).fields[0]
+
+    @pytest.mark.parametrize(
+        ("fmt", "separator"),
+        [("markdown", "\n"), ("text", "\n"), ("text", " "), ("raw", "\n")],
+    )
+    def test_every_format_declares_str_and_conflicts_on_the_content_field(self, fmt: str, separator: str) -> None:
+        from elspeth.contracts.plugin_semantics import (
+            SemanticOutcome,
+            SemanticValueType,
+            compare_semantic,
+        )
+        from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
+
+        facts = self._content_facts(fmt=fmt, separator=separator)
+        requirement = _build_json_explode_input_requirements(array_field="content").fields[0]
+
+        assert facts.value_type is SemanticValueType.STR
+        assert compare_semantic(facts, requirement) is SemanticOutcome.CONFLICT
+
+    @pytest.mark.parametrize(
+        ("fmt", "separator"),
+        [("markdown", "\n"), ("text", "\n"), ("text", " "), ("raw", "\n")],
+    )
+    def test_a_sibling_field_stays_authorable_for_every_format(self, fmt: str, separator: str) -> None:
+        """web_scrape declares facts for content_field ONLY, so exploding a
+        different column is untouched: UNKNOWN, graded advisory by WARN."""
+        from elspeth.contracts.plugin_semantics import (
+            SemanticOutcome,
+            UnknownSemanticPolicy,
+            compare_semantic,
+        )
+        from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+        from elspeth.web.composer._semantic_validator import _find_producer_facts
+
+        declaration = _build_web_scrape_output_semantics(
+            content_field="content",
+            format=fmt,
+            text_separator=separator,
+        )
+        requirement = _build_json_explode_input_requirements(array_field="items").fields[0]
+
+        facts = _find_producer_facts(declaration, "items")
+        assert facts is None, "web_scrape must not claim a field it does not write"
+        assert compare_semantic(facts, requirement) is SemanticOutcome.UNKNOWN
+        assert requirement.unknown_policy is UnknownSemanticPolicy.WARN, (
+            "UNKNOWN is only authorable because json_explode grades it as an advisory"
+        )
+
+
 class TestWebScrapeAssistance:
     def test_returns_assistance_for_compact_text_issue(self):
         from elspeth.plugins.transforms.web_scrape import WebScrapeTransform

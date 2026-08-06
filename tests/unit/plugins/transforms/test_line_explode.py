@@ -185,8 +185,8 @@ class TestLineExplodeInputSemanticRequirements:
         return get_shared_plugin_manager().create_transform("line_explode", defaults)
 
     def test_default_source_field_requirement(self):
+        """ADR-039: constrain framing only, accept unconstrained text, warn on abstention."""
         from elspeth.contracts.plugin_semantics import (
-            ContentKind,
             TextFraming,
             UnknownSemanticPolicy,
         )
@@ -196,11 +196,65 @@ class TestLineExplodeInputSemanticRequirements:
         assert len(reqs.fields) == 1
         req = reqs.fields[0]
         assert req.field_name == "content"
-        assert req.accepted_content_kinds == frozenset({ContentKind.PLAIN_TEXT, ContentKind.MARKDOWN})
-        assert req.accepted_text_framings == frozenset({TextFraming.NEWLINE_FRAMED, TextFraming.LINE_COMPATIBLE})
+        # Deliberately unconstrained: splitlines() cares about line boundaries,
+        # not about what the text means. Constraining content_kind blocked
+        # nothing extra (every wrong producer conflicts on framing) and falsely
+        # blocked JSONL, which is JSON_STRUCTURED + NEWLINE_FRAMED.
+        assert req.accepted_content_kinds == frozenset()
+        assert req.accepted_text_framings == frozenset(
+            {
+                TextFraming.NEWLINE_FRAMED,
+                TextFraming.LINE_COMPATIBLE,
+                TextFraming.UNCONSTRAINED,
+            }
+        )
         assert req.requirement_code == "line_explode.source_field.line_framed_text"
-        assert req.unknown_policy is UnknownSemanticPolicy.FAIL
+        # WARN, not FAIL: line_explode is a usefulness guard (compact text is a
+        # one-row no-op), not a correctness one like TextSink (which discards
+        # the row). FAIL blocked only producers that did not DECLARE, which is
+        # what refused `llm -> line_explode` (elspeth-b6d9f04827).
+        assert req.unknown_policy is UnknownSemanticPolicy.WARN
         assert req.configured_by == ("source_field",)
+
+    def test_requirement_accepts_generative_text_but_still_rejects_compact(self):
+        """The ADR-039 outcome table, against the REAL requirement object.
+
+        A hand-built FieldSemanticRequirement would pass even if the plugin's
+        own declaration regressed, so this drives the plugin.
+        """
+        from elspeth.contracts.plugin_semantics import (
+            ContentKind,
+            FieldSemanticFacts,
+            SemanticOutcome,
+            SemanticValueType,
+            TextFraming,
+            compare_semantic,
+        )
+
+        req = self._build().input_semantic_requirements().fields[0]
+
+        def _facts(framing: TextFraming, kind: ContentKind = ContentKind.UNKNOWN) -> FieldSemanticFacts:
+            return FieldSemanticFacts(
+                field_name="content",
+                content_kind=kind,
+                text_framing=framing,
+                value_type=SemanticValueType.STR,
+                fact_code="t.content.gen",
+            )
+
+        # The generative producer (llm) — the composition g11 needed.
+        assert compare_semantic(_facts(TextFraming.UNCONSTRAINED), req) is SemanticOutcome.SATISFIED
+        # Genuinely-wrong producers stay blocked under the relaxed policy,
+        # because CONFLICT short-circuits ahead of UNKNOWN.
+        assert compare_semantic(_facts(TextFraming.COMPACT, ContentKind.PLAIN_TEXT), req) is SemanticOutcome.CONFLICT
+        assert compare_semantic(_facts(TextFraming.NOT_TEXT, ContentKind.HTML_RAW), req) is SemanticOutcome.CONFLICT
+        # Line-bearing producers unchanged.
+        assert compare_semantic(_facts(TextFraming.NEWLINE_FRAMED, ContentKind.PLAIN_TEXT), req) is SemanticOutcome.SATISFIED
+        assert compare_semantic(_facts(TextFraming.LINE_COMPATIBLE, ContentKind.MARKDOWN), req) is SemanticOutcome.SATISFIED
+        # JSONL: the case the dropped content_kind constraint falsely blocked.
+        assert compare_semantic(_facts(TextFraming.NEWLINE_FRAMED, ContentKind.JSON_STRUCTURED), req) is SemanticOutcome.SATISFIED
+        # A producer that declares nothing still abstains — WARN, not SATISFIED.
+        assert compare_semantic(_facts(TextFraming.UNKNOWN), req) is SemanticOutcome.UNKNOWN
 
     def test_custom_source_field_changes_requirement_field_name(self):
         plugin = self._build(
@@ -209,6 +263,156 @@ class TestLineExplodeInputSemanticRequirements:
         )
         req = plugin.input_semantic_requirements().fields[0]
         assert req.field_name == "body"
+
+
+class TestLineExplodeOutputSemantics:
+    """line_explode is the blessed repair for writing generated text to a file.
+
+    Until it declared its own output, ``llm -> line_explode -> text`` resolved
+    to UNKNOWN — the RECOMMENDED shape was indistinguishable from an undeclared
+    one, and ``TextSink``'s requirement was satisfied by NOTHING in the whole
+    registry. These pin the declaration and its complete blast radius.
+    """
+
+    def _build(self, **opts):
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        defaults = {
+            "schema": {"mode": "flexible", "fields": ["content: str"]},
+            "source_field": "content",
+        }
+        defaults.update(opts)
+        return get_shared_plugin_manager().create_transform("line_explode", defaults)
+
+    def test_declares_compact_string_on_the_output_field(self):
+        from elspeth.contracts.plugin_semantics import (
+            ContentKind,
+            SemanticValueType,
+            TextFraming,
+        )
+
+        decl = self._build().output_semantics()
+
+        assert len(decl.fields) == 1
+        facts = decl.fields[0]
+        assert facts.field_name == "line", "the declaration must track the configured output_field"
+        # COMPACT is mechanically true, not an estimate — see the property test
+        # below, which asserts the claim against the real splitter.
+        assert facts.text_framing is TextFraming.COMPACT
+        # process() rejects a non-str source; a slice of a str is a str.
+        assert facts.value_type is SemanticValueType.STR
+        # Honest ABSTENTION: splitting changes where the boundaries are, never
+        # what the text means, so one line of markdown is still markdown.
+        # Claiming PLAIN_TEXT would manufacture false conflicts.
+        assert facts.content_kind is ContentKind.UNKNOWN
+        assert facts.fact_code == "line_explode.output_field.compact_line"
+        assert facts.configured_by == ("output_field",)
+
+    def test_declaration_tracks_a_renamed_output_field(self):
+        decl = self._build(output_field="body_line").output_semantics()
+        assert decl.fields[0].field_name == "body_line"
+
+    def test_no_emitted_line_can_contain_a_line_boundary_character(self, ctx: PluginContext):
+        """The COMPACT claim, verified against the real splitter rather than restated.
+
+        ``_splitlines_bounded`` cuts at every ``\\r``, ``\\r\\n`` and every
+        member of ``_LINE_BOUNDARY_CHARS`` and emits only the slices BETWEEN
+        the cuts, so an emitted value cannot carry a boundary char of any kind
+        — strictly stronger than the "no CR or LF" TextSink actually needs.
+        """
+        from elspeth.plugins.transforms.line_explode import (
+            _LINE_BOUNDARY_CHARS,
+            LineExplode,
+        )
+
+        forbidden = frozenset(_LINE_BOUNDARY_CHARS) | {"\r"}
+        transform = LineExplode({"schema": DYNAMIC_SCHEMA, "source_field": "content"})
+
+        result = transform.process(
+            make_pipeline_row({"content": "a\nb\r\nc\rd\x85e\u2028f\vg\x1ch"}),
+            ctx,
+        )
+
+        emitted = [row["line"] for row in result.rows]
+        assert emitted, "the probe must actually produce rows or this asserts nothing"
+        for line in emitted:
+            assert not (forbidden & set(line)), f"COMPACT is a lie for {line!r}"
+
+    def _outcome_against(self, consumer_requirement):
+        from elspeth.contracts.plugin_semantics import compare_semantic
+
+        return compare_semantic(self._build().output_semantics().fields[0], consumer_requirement)
+
+    def _sink_requirement(self, plugin_name: str):
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        sink = get_shared_plugin_manager().create_sink(
+            plugin_name,
+            {
+                "path": "outputs/o.txt",
+                "field": "line",
+                "schema": DYNAMIC_SCHEMA,
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+        )
+        return sink.input_semantic_requirements().fields[0]
+
+    def test_line_explode_into_text_sink_is_satisfied(self):
+        """The win. TextSink requires COMPACT + STR and nothing else declared it."""
+        from elspeth.contracts.plugin_semantics import SemanticOutcome
+
+        assert self._outcome_against(self._sink_requirement("text")) is SemanticOutcome.SATISFIED
+
+    def test_line_explode_into_document_sink_is_satisfied(self):
+        from elspeth.contracts.plugin_semantics import SemanticOutcome
+
+        assert self._outcome_against(self._sink_requirement("document")) is SemanticOutcome.SATISFIED
+
+    def test_chained_line_explode_is_now_a_hard_conflict(self):
+        """A NEW block, and a correct one: exploding an already-compact line is
+        a provable no-op — one row holding the whole value. Same rule that
+        already blocks web_scrape compact text into line_explode."""
+        from elspeth.contracts.plugin_semantics import SemanticOutcome
+
+        downstream = self._build(
+            schema={"mode": "flexible", "fields": ["line: str"]},
+            source_field="line",
+            output_field="subline",
+        )
+        outcome = self._outcome_against(downstream.input_semantic_requirements().fields[0])
+        assert outcome is SemanticOutcome.CONFLICT
+
+    def test_line_explode_into_json_explode_is_now_a_hard_conflict(self):
+        """The second NEW block, also correct: a text line is not a list, and
+        json_explode raises TypeError on a str rather than parsing it."""
+        from elspeth.contracts.plugin_semantics import SemanticOutcome
+        from elspeth.plugins.transforms.json_explode import _build_json_explode_input_requirements
+
+        requirement = _build_json_explode_input_requirements(array_field="line").fields[0]
+        assert self._outcome_against(requirement) is SemanticOutcome.CONFLICT
+
+    def test_the_four_declared_consumers_are_the_whole_blast_radius(self):
+        """Guard the enumeration the two blocks above are complete against.
+
+        A fifth consumer declaring input_semantic_requirements() would take a
+        verdict from this declaration that nobody has reasoned about. ADR-039
+        §5 makes the same closed-enumeration argument for its own change.
+        """
+        from elspeth.plugins.infrastructure.base import BaseSink, BaseTransform
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        manager = get_shared_plugin_manager()
+        declaring = {
+            cls.name
+            for cls in (*manager.get_transforms(), *manager.get_sinks(), *manager.get_sources())
+            if "input_semantic_requirements" in vars(cls)
+        }
+        assert declaring == {"line_explode", "json_explode", "text", "document"}, (
+            "the consumer roster changed; re-derive line_explode's blast radius before trusting these tests"
+        )
+        assert "input_semantic_requirements" in vars(BaseTransform)
+        assert "input_semantic_requirements" in vars(BaseSink)
 
 
 class TestLineExplodeAssistance:

@@ -32,6 +32,7 @@ from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribution
 from elspeth.plugins.sinks.csv_sink import CSVSink
+from elspeth.plugins.sinks.document_sink import DocumentSink
 from elspeth.plugins.sinks.json_sink import JSONSink
 from elspeth.plugins.sinks.text_sink import TextSink
 from tests.fixtures.base_classes import inject_write_failure
@@ -61,7 +62,7 @@ def _member(ordinal: int, row: dict[str, object], *, generation: str = "token") 
 
 
 def _prepare(
-    sink: CSVSink | JSONSink | TextSink,
+    sink: CSVSink | DocumentSink | JSONSink | TextSink,
     *,
     effect_id: str,
     rows: list[dict[str, object]],
@@ -287,34 +288,125 @@ def test_local_owned_inspection_evidence_requires_every_field(
         local_effects._inspection_snapshot(divergent, effect_id=effect_id)
 
 
+def _assert_plan_really_publishes(plan, rows: list[dict[str, object]]) -> None:
+    """Guard the reconciliation cases below against a diverted, no-op plan.
+
+    A sink that diverts every row still returns a plan, and a reconciliation
+    assertion made against it passes while proving nothing — there was no
+    atomic replace to abandon and no bytes to identify. ``DocumentSink`` makes
+    that failure mode reachable rather than hypothetical: hand it more than one
+    row and it publishes NO file at all (elspeth-afdf55a17c — a 0-byte result
+    is a diversion, never a failed write).
+    """
+    assert plan.descriptor_mode is not SinkEffectDescriptorMode.NO_PUBLICATION, (
+        "the plan publishes nothing, so the reconciliation assertions are vacuous"
+    )
+    assert plan.safe_evidence["accepted_ordinals"] == tuple(range(len(rows)))
+    assert plan.safe_evidence["diverted_ordinals"] == ()
+
+
+def _document_sink(path: Path) -> DocumentSink:
+    return inject_write_failure(DocumentSink({"path": str(path), "field": "message", "encoding": "utf-8", "schema": _SCHEMA}))
+
+
+# Which shared effect-protocol cases DocumentSink is deliberately absent from,
+# so a future reader does not read the gaps as oversights:
+#
+# - test_local_effect_plans_persist_exact_diversion_attribution asserts a MIXED
+#   partition (accepted (0,), diverted (1,)). DocumentSink can never produce
+#   one: one row is wholly accepted or wholly diverted, and two or more diverts
+#   every row. Its own equivalent is
+#   test_many_rows_in_one_effect_divert_every_row_and_publish_nothing in
+#   test_document_sink.py, which pins the same diversion_attribution evidence
+#   for the all-diverted shape.
+# - the append/baseline cases (test_append_*) and
+#   test_disjoint_effects_publish_predecessor_then_successor_without_loss do
+#   not apply at all: DocumentSink offers no append mode and refuses resume
+#   configuration outright, and a second effect diverts its own row rather than
+#   extending the document.
+# - the *_evidence_requires_every_field cases are parametrized over the missing
+#   key and call local_effects directly, so they are sink-agnostic already.
+
+
+# DocumentSink takes exactly ONE row on purpose in both cases below: it
+# publishes only when the cumulative snapshot holds a single member. This is
+# not a weakened case — a single verbatim multiline value IS the whole of what
+# the sink does, so one row exercises its complete publication path.
+@pytest.mark.parametrize(
+    ("sink", "rows"),
+    [
+        pytest.param(
+            lambda path: CSVSink({"path": str(path), "schema": _SCHEMA}),
+            [{"id": 1}, {"id": 2}],
+            id="csv",
+        ),
+        pytest.param(
+            _document_sink,
+            [{"message": "Announcement\n\n  * one\n  * two"}],
+            id="document",
+        ),
+    ],
+)
 def test_abandoned_atomic_replace_reconciles_by_staged_file_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    sink,
+    rows: list[dict[str, object]],
 ) -> None:
-    target = tmp_path / "out.csv"
-    sink = CSVSink({"path": str(target), "schema": _SCHEMA})
-    plan = _prepare(sink, effect_id="a" * 64, rows=[{"id": 1}, {"id": 2}])
+    """A crash between the replace and the response is recovered by file identity.
+
+    The reconciling sink is a FRESH instance: crash recovery happens in a new
+    process, so anything the committing instance held in memory is gone and the
+    verdict must come from the filesystem alone.
+    """
+    target = tmp_path / "out"
+    plan = _prepare(sink(target), effect_id="a" * 64, rows=rows)
+    _assert_plan_really_publishes(plan, rows)
 
     def crash_after_replace(_target: Path) -> None:
         raise RuntimeError("lost response")
 
     monkeypatch.setattr(local_effects, "_after_replace", crash_after_replace)
     with pytest.raises(RuntimeError, match="lost response"):
-        sink.commit_effect(plan, _CTX)
+        sink(target).commit_effect(plan, _CTX)
 
-    fresh = CSVSink({"path": str(target), "schema": _SCHEMA})
-    result = fresh.reconcile_effect(plan, _CTX)
+    result = sink(target).reconcile_effect(plan, _CTX)
     assert result.kind is SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR
     assert result.descriptor == plan.expected_descriptor
 
 
-def test_equal_bytes_from_unrelated_inode_are_unknown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("sink", "rows"),
+    [
+        pytest.param(
+            lambda path: TextSink({"path": str(path), "field": "message", "schema": _SCHEMA}),
+            [{"message": "hello"}],
+            id="text",
+        ),
+        pytest.param(
+            _document_sink,
+            [{"message": "Announcement\n\n  * one\n  * two"}],
+            id="document",
+        ),
+    ],
+)
+def test_equal_bytes_from_unrelated_inode_are_unknown(
+    tmp_path: Path,
+    sink,
+    rows: list[dict[str, object]],
+) -> None:
+    """Identical bytes are NOT proof this effect wrote them.
+
+    Reconciliation is keyed on staged-file identity, not content, so a target
+    some other writer happened to fill with the same bytes must grade UNKNOWN
+    rather than be claimed as this effect's own publication.
+    """
     target = tmp_path / "out.txt"
-    sink = TextSink({"path": str(target), "field": "message", "schema": _SCHEMA})
-    plan = _prepare(sink, effect_id="b" * 64, rows=[{"message": "hello"}])
+    plan = _prepare(sink(target), effect_id="b" * 64, rows=rows)
+    _assert_plan_really_publishes(plan, rows)
     target.write_bytes(_stage_path(plan).read_bytes())
 
-    result = TextSink({"path": str(target), "field": "message", "schema": _SCHEMA}).reconcile_effect(plan, _CTX)
+    result = sink(target).reconcile_effect(plan, _CTX)
 
     assert result.kind is SinkEffectReconcileKind.UNKNOWN
 
