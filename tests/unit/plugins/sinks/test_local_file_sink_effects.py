@@ -137,6 +137,34 @@ def test_local_effect_plans_persist_exact_diversion_attribution(tmp_path: Path, 
     assert recovered.diverted_ordinals is None
 
 
+def test_multiline_value_diverts_every_row_into_a_virtual_zero_byte_descriptor(tmp_path: Path) -> None:
+    """Pin the g11 signature: multiline text diverts, and nothing is published.
+
+    A generated announcement is multiline, and TextSink cannot represent a value
+    spanning records. Every row diverting leaves ``accepted`` empty, which is the
+    one way to reach the virtual no-publication descriptor — so a 0-byte artifact
+    carrying the empty-string hash is evidence of diversion, never of a failed
+    write (elspeth-afdf55a17c).
+    """
+    target = tmp_path / "announcement.txt"
+    sink = inject_write_failure(TextSink({"path": str(target), "field": "llm_response", "schema": _SCHEMA}))
+
+    plan = _prepare(sink, effect_id="c7" * 32, rows=[{"llm_response": "Announcing the release.\n\nIt ships today."}])
+
+    assert plan.safe_evidence["accepted_ordinals"] == ()
+    assert plan.safe_evidence["diverted_ordinals"] == (0,)
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["publication_kind"] == "virtual"
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == sha256(b"").hexdigest()
+    assert plan.expected_descriptor.size_bytes == 0
+    assert not target.exists()
+
+    diversion = sink._get_diversions()[0]
+    assert diversion.reason == "Text values cannot contain CR or LF record separators"
+    assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
+
+
 def test_json_effect_plan_persists_exact_diversion_attribution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
