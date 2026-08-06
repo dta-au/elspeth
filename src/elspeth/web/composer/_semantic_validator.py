@@ -52,7 +52,8 @@ Layer: L3.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -88,6 +89,27 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 
 
+@contextmanager
+def _side_effect_free_probe() -> Iterator[None]:
+    """Construct a probe with side-effectful constructor work suppressed.
+
+    Semantic validation is a QUESTION, not a run: it builds a plugin only to
+    ask what it declares, then closes it. Several constructors do real work
+    unless preflight mode is set — ``CSVSink``/``JSONSink`` resolve an output
+    collision path, which inspects the filesystem and picks the name the run
+    would actually write. Probing outside the guard let a validate() call
+    reach the disk and, on ``auto_increment``, observe a name no run claimed.
+
+    ``plugin_preflight_mode`` already exists for precisely this and is what
+    ``runtime_factory`` uses when it instantiates plugins to check them rather
+    than to run them.
+    """
+    from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
+
+    with plugin_preflight_mode(True):
+        yield
+
+
 def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:
     """Construct a consumer transform instance to read its requirements.
 
@@ -121,13 +143,14 @@ def _instantiate_consumer(node: NodeSpec) -> BaseTransform | None:
     if node.plugin is None:
         return None
     try:
-        return cast(
-            "BaseTransform",
-            get_shared_plugin_manager().create_transform(
-                node.plugin,
-                prepare_validation_probe_options(node.options),
-            ),
-        )
+        with _side_effect_free_probe():
+            return cast(
+                "BaseTransform",
+                get_shared_plugin_manager().create_transform(
+                    node.plugin,
+                    prepare_validation_probe_options(node.options),
+                ),
+            )
     except Exception as exc:
         if _is_config_probe_exception(exc):
             return None
@@ -163,10 +186,11 @@ def _instantiate_source_producer(producer: ProducerEntry, sources: Mapping[str, 
         return None
     probe_options = prepare_validation_probe_options(source_spec.options)
     probe_options["on_validation_failure"] = source_spec.on_validation_failure
-    return cast(
-        "BaseSource",
-        get_shared_plugin_manager().create_source(producer.plugin_name, probe_options),
-    )
+    with _side_effect_free_probe():
+        return cast(
+            "BaseSource",
+            get_shared_plugin_manager().create_source(producer.plugin_name, probe_options),
+        )
 
 
 def _instantiate_transform_producer(producer: ProducerEntry) -> BaseTransform | None:
@@ -175,13 +199,14 @@ def _instantiate_transform_producer(producer: ProducerEntry) -> BaseTransform | 
 
     if producer.plugin_name is None:
         return None
-    return cast(
-        "BaseTransform",
-        get_shared_plugin_manager().create_transform(
-            producer.plugin_name,
-            prepare_validation_probe_options(producer.options),
-        ),
-    )
+    with _side_effect_free_probe():
+        return cast(
+            "BaseTransform",
+            get_shared_plugin_manager().create_transform(
+                producer.plugin_name,
+                prepare_validation_probe_options(producer.options),
+            ),
+        )
 
 
 def _safe_output_semantics(
@@ -244,13 +269,14 @@ def _instantiate_sink_consumer(output: OutputSpec) -> BaseSink | None:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
     try:
-        return cast(
-            "BaseSink",
-            get_shared_plugin_manager().create_sink(
-                output.plugin,
-                prepare_validation_probe_options(output.options),
-            ),
-        )
+        with _side_effect_free_probe():
+            return cast(
+                "BaseSink",
+                get_shared_plugin_manager().create_sink(
+                    output.plugin,
+                    prepare_validation_probe_options(output.options),
+                ),
+            )
     except Exception as exc:
         if _is_sink_config_probe_exception(exc):
             return None

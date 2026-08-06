@@ -265,3 +265,99 @@ class TestProducerResolverQueue:
         resolver = ProducerResolver.build(source=None, sources=self._two_sources(), nodes=(), sink_names=frozenset())
         assert "inbound" in resolver.duplicate_connections
         assert resolver.find_producer_for("inbound") is None
+
+
+class TestProducerResolverSinkProducers:
+    """Direct-to-sink edges are kept OUT of the connection map, not discarded.
+
+    They are still real producer->consumer edges. Before ``sink_producers``,
+    the schema-contract validator rebuilt this map by hand from five call
+    sites; every sink-side consumer had to mirror that walk or go blind.
+    """
+
+    def test_direct_sink_edge_is_recorded_but_not_in_the_connection_map(self):
+        source = SourceSpec(plugin="csv", on_success="step1", options={}, on_validation_failure="discard")
+        nodes = (_node("step1", plugin="t", input="step1", on_success="out"),)
+        resolver = ProducerResolver.build(source=source, nodes=nodes, sink_names=frozenset({"out"}))
+
+        assert resolver.find_producer_for("out") is None, "a sink is terminal — nothing walks back THROUGH it"
+        producers = resolver.sink_producers("out")
+        assert [producer.producer_id for producer in producers] == ["step1"]
+        assert producers[0].plugin_name == "t"
+
+    def test_unknown_or_unfed_sink_returns_empty(self):
+        resolver = ProducerResolver.build(source=None, nodes=(), sink_names=frozenset({"out"}))
+        assert resolver.sink_producers("out") == ()
+        assert resolver.sink_producers("never_declared") == ()
+
+    def test_source_routed_straight_at_a_sink_is_recorded(self):
+        source = SourceSpec(plugin="csv", on_success="out", options={}, on_validation_failure="discard")
+        resolver = ProducerResolver.build(source=source, nodes=(), sink_names=frozenset({"out"}))
+
+        producers = resolver.sink_producers("out")
+        assert [producer.producer_id for producer in producers] == ["source"]
+        assert producers[0].plugin_name == "csv"
+
+    def test_sink_fan_in_records_every_producer_in_order(self):
+        source = SourceSpec(plugin="csv", on_success="step1", options={}, on_validation_failure="discard")
+        nodes = (
+            _node("step1", plugin="a", input="step1", on_success="out"),
+            _node("step2", plugin="b", input="step1", on_success="out"),
+        )
+        resolver = ProducerResolver.build(source=source, nodes=nodes, sink_names=frozenset({"out"}))
+
+        assert [producer.producer_id for producer in resolver.sink_producers("out")] == ["step1", "step2"]
+        assert "out" not in resolver.duplicate_connections, "several producers writing to one sink is fan-in, not a contended connection"
+
+    def test_error_route_to_a_sink_is_recorded_and_discard_is_not(self):
+        source = SourceSpec(plugin="csv", on_success="step1", options={}, on_validation_failure="discard")
+        nodes = (
+            _node("step1", plugin="a", input="step1", on_success="ok", on_error="bad"),
+            _node("step2", plugin="b", input="step1", on_success="ok", on_error="discard"),
+        )
+        resolver = ProducerResolver.build(source=source, nodes=nodes, sink_names=frozenset({"ok", "bad"}))
+
+        assert [producer.producer_id for producer in resolver.sink_producers("bad")] == ["step1"]
+        assert resolver.sink_producers("discard") == ()
+
+
+class TestProducerResolverWalkEntry:
+    """``walk_entry_to_real_producer`` is the entry form of the same traversal.
+
+    Sink producers arrive as entries rather than connection names, because a
+    sink-targeted edge never entered the connection map. Both entry points
+    share one loop so gate traversal cannot drift between them.
+    """
+
+    def test_gate_producer_of_a_sink_walks_back_to_the_real_upstream(self):
+        source = SourceSpec(plugin="csv", on_success="raw", options={}, on_validation_failure="discard")
+        nodes = (
+            _node("worker", plugin="t", input="raw", on_success="gate_in"),
+            _node("router", plugin=None, node_type="gate", input="gate_in", routes={"pass": "out"}),
+        )
+        resolver = ProducerResolver.build(source=source, nodes=nodes, sink_names=frozenset({"out"}))
+
+        direct = resolver.sink_producers("out")
+        assert [producer.producer_id for producer in direct] == ["router"], "the IMMEDIATE producer is the gate"
+
+        actual = resolver.walk_entry_to_real_producer(direct[0])
+        assert actual is not None
+        assert actual.producer_id == "worker", "the gate is structural — facts come from the node behind it"
+
+    def test_walk_entry_returns_a_source_root_without_a_node_lookup(self):
+        source = SourceSpec(plugin="csv", on_success="gate_in", options={}, on_validation_failure="discard")
+        nodes = (_node("router", plugin=None, node_type="gate", input="gate_in", routes={"pass": "out"}),)
+        resolver = ProducerResolver.build(source=source, nodes=nodes, sink_names=frozenset({"out"}))
+
+        actual = resolver.walk_entry_to_real_producer(resolver.sink_producers("out")[0])
+        assert actual is not None
+        assert actual.producer_id == "source", "a source is not a NodeSpec; indexing the node table would KeyError"
+
+    def test_walk_entry_abstains_on_a_routing_loop(self):
+        nodes = (
+            _node("gate_a", plugin=None, node_type="gate", input="b_out", routes={"pass": "a_out"}),
+            _node("gate_b", plugin=None, node_type="gate", input="a_out", routes={"pass": "out"}),
+        )
+        resolver = ProducerResolver.build(source=None, nodes=nodes, sink_names=frozenset({"out"}))
+
+        assert resolver.walk_entry_to_real_producer(resolver.sink_producers("out")[0]) is None

@@ -17,6 +17,7 @@ import pytest
 
 from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.plugin_semantics import SemanticValueType, TextFraming, UnknownSemanticPolicy
 from elspeth.contracts.sink_effects import (
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
@@ -407,3 +408,106 @@ def test_admission_gate_accepts_the_declared_capability_and_refuses_the_rest() -
 
     with pytest.raises(SinkEffectCapabilityError):
         validate_sink_effect_type_capability(DocumentSink, "write", SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT)
+
+
+class TestDocumentSinkSemanticRequirement:
+    """This sink exists so a generative producer HAS a correct destination.
+
+    ``llm -> text`` became a hard authoring CONFLICT in the same change; that
+    is only a repair if ``llm -> document`` is SATISFIED in the same breath.
+    """
+
+    def _requirement(self, path: Path):
+        requirements = DocumentSink(_config(path)).input_semantic_requirements()
+        assert len(requirements.fields) == 1
+        return requirements.fields[0]
+
+    def test_requirement_is_declared_on_the_configured_field(self, tmp_path: Path) -> None:
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert requirement.field_name == "announcement_text"
+        assert requirement.requirement_code == "document.field.verbatim_text"
+        assert requirement.configured_by == ("field",)
+
+    def test_accepts_unconstrained_framing(self, tmp_path: Path) -> None:
+        """The point of the sink, as a declared fact rather than as prose.
+
+        A generative producer claims UNCONSTRAINED (ADR-039). Accepting it is
+        what turns ``llm -> document`` into a SATISFIED edge instead of an
+        advisory that still rests on unknown_policy.
+        """
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert TextFraming.UNCONSTRAINED in requirement.accepted_text_framings
+
+    def test_accepts_every_text_bearing_framing(self, tmp_path: Path) -> None:
+        """Verbatim output means a line break is content; no framing is wrong."""
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert requirement.accepted_text_framings == frozenset(
+            {
+                TextFraming.UNCONSTRAINED,
+                TextFraming.COMPACT,
+                TextFraming.NEWLINE_FRAMED,
+                TextFraming.LINE_COMPATIBLE,
+            }
+        )
+
+    def test_rejects_a_positively_non_text_producer(self, tmp_path: Path) -> None:
+        """NOT_TEXT is a real contradiction: this sink encodes a str."""
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert TextFraming.NOT_TEXT not in requirement.accepted_text_framings
+        assert requirement.accepted_value_types == frozenset({SemanticValueType.STR})
+
+    def test_content_kind_is_deliberately_unconstrained(self, tmp_path: Path) -> None:
+        """Non-empty here would defeat the sink's own purpose.
+
+        A generative producer declares content_kind=UNKNOWN because prose vs
+        markdown is not statically decidable, and ANY non-empty set downgrades
+        that edge to UNKNOWN — turning the one composition this sink exists to
+        bless back into a mere advisory.
+        """
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert requirement.accepted_content_kinds == frozenset()
+
+    def test_unknown_policy_is_warn(self, tmp_path: Path) -> None:
+        requirement = self._requirement(tmp_path / "out.txt")
+        assert requirement.unknown_policy is UnknownSemanticPolicy.WARN
+
+    def test_probe_config_constructs_standalone(self) -> None:
+        sink = DocumentSink(DocumentSink.probe_config())
+        try:
+            assert sink.input_semantic_requirements().fields[0].requirement_code == "document.field.verbatim_text"
+        finally:
+            sink.close()
+
+
+def test_document_sink_accepts_the_multiline_value_text_refuses(tmp_path: Path) -> None:
+    """The pair, stated as one fact: the framings differ by exactly UNCONSTRAINED.
+
+    TextSink's set is {COMPACT}; DocumentSink's is a superset that adds every
+    newline-bearing member. That difference IS the g11 repair — the same value
+    that text must divert, document must accept.
+    """
+    from elspeth.plugins.sinks.text_sink import TextSink
+
+    text_framings = (
+        TextSink(
+            {
+                "path": str(tmp_path / "lines.txt"),
+                "field": "announcement_text",
+                "schema": _SCHEMA,
+            }
+        )
+        .input_semantic_requirements()
+        .fields[0]
+        .accepted_text_framings
+    )
+    document_framings = DocumentSink(_config(tmp_path / "doc.txt")).input_semantic_requirements().fields[0].accepted_text_framings
+
+    assert text_framings == frozenset({TextFraming.COMPACT})
+    assert text_framings < document_framings, "document must accept strictly more framings than text"
+    assert document_framings - text_framings == frozenset(
+        {
+            TextFraming.UNCONSTRAINED,
+            TextFraming.NEWLINE_FRAMED,
+            TextFraming.LINE_COMPATIBLE,
+        }
+    )

@@ -921,7 +921,18 @@ async def test_run_sync_in_worker_preserves_preflight_mode_for_plugin_constructo
     )
 
     assert result.is_valid is True
-    assert observed == [("source", True), ("sink", True)]
+    # EVERY constructor call, not a fixed sequence. Validation constructs
+    # plugins more than once — the semantic-contract validator probes each
+    # sink to read its input_semantic_requirements() before the runtime
+    # instantiation runs at all — and the contract this test names is that no
+    # constructor EVER runs outside preflight mode during validation. Pinning
+    # the exact list made an added probe read as a regression while a probe
+    # that genuinely escaped the guard (CSVSink resolves an output collision
+    # path, touching the filesystem, unless preflight is set) would have read
+    # the same way.
+    assert observed, "constructors must actually run, or this test is vacuous"
+    assert all(preflight for _kind, preflight in observed), f"every constructor must observe preflight mode; saw {observed}"
+    assert {kind for kind, _preflight in observed} == {"source", "sink"}
 
 
 def test_validate_pipeline_rejects_chroma_persist_directory_outside_data_dir(tmp_path: Path) -> None:

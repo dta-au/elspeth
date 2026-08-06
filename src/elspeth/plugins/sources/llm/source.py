@@ -618,13 +618,12 @@ class LLMSource(BaseSource):
         decidable before the run. ``content_kind`` stays UNKNOWN because prose
         versus markdown is a genuine per-response unknown (ADR-039).
 
-        NOTE: this declaration is currently unreachable from the composer's
-        semantic validator, which has no typed route to construct a source and
-        ask it — ``BaseSource`` has no ``output_semantics()`` hook and the probe
-        only knows ``create_transform``. The declaration is correct and is what
-        the hook will read once it lands; see ``_semantic_validator.
-        _instantiate_producer``. Until then the llm TRANSFORM is the reachable
-        generative producer.
+        Read by the composer's semantic validator through
+        ``_semantic_validator._instantiate_source_producer``, which builds the
+        source with ``create_source`` and the ``BaseSource.output_semantics()``
+        hook. Both landed with the sink-consumer plumbing; before that this
+        declaration was unreachable dead code and every source-fed edge was
+        UNKNOWN whatever the source claimed.
         """
         from elspeth.contracts.plugin_semantics import (
             ContentKind,

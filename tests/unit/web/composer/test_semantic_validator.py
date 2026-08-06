@@ -26,6 +26,9 @@ def _wardline_state(*, text_separator: str = " ", scrape_format: str = "text"):
     - csv source has schema (DataPluginConfig.schema_config is required)
     - web_scrape transform has schema, on_success, on_error
     - line_explode transform has schema, on_success, on_error
+    - both json sinks have schema — sinks are semantic consumers too, and a
+      schema-less sink fails construction as a "draft config" error, so the
+      sink probe abstains and every sink-side assertion goes vacuous
     Without these, plugin construction fails as a "draft config" error,
     the validator's tolerant probe path silently skips, and the test
     becomes vacuous (no error raised, but no contract emitted either).
@@ -96,13 +99,13 @@ def _wardline_state(*, text_separator: str = " ", scrape_format: str = "text"):
             OutputSpec(
                 name="sink",
                 plugin="json",
-                options={"path": "out.json"},
+                options={"path": "out.json", "schema": {"mode": "observed"}},
                 on_write_failure="discard",
             ),
             OutputSpec(
                 name="errors",
                 plugin="json",
-                options={"path": "err.json"},
+                options={"path": "err.json", "schema": {"mode": "observed"}},
                 on_write_failure="discard",
             ),
         ),
@@ -122,8 +125,42 @@ class TestValidateSemanticContracts:
 
         validate_semantic_contracts(_wardline_state(text_separator="\n"))
 
-        assert len(tracking.instances) >= 3, "fixture did not exercise consumer and producer probes"
+        # EXACT membership, not `>=`. Every transform node is probed as a
+        # candidate consumer before its requirements are known, line_explode's
+        # producer is probed for facts, and each sink is probed as a consumer
+        # too. A `>=` bound would be met by the transform probes alone and
+        # would therefore HIDE a leaked, never-closed sink probe — the precise
+        # defect this test exists to catch.
+        assert sorted(type(instance._delegate).__name__ for instance in tracking.instances) == [
+            "JSONSink",
+            "JSONSink",
+            "LineExplode",
+            "WebScrapeTransform",
+            "WebScrapeTransform",
+        ], "fixture must exercise both transform-consumer probes, the producer probe, and BOTH sink probes"
         assert [instance.close_count for instance in tracking.instances] == [1] * len(tracking.instances)
+
+    def test_sink_probe_is_closed_even_when_it_leaks_no_requirements(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A sink that declares nothing is still constructed, and must still close.
+
+        The early `if not requirements.fields: continue` happens AFTER the probe
+        exists, so the close has to be in a finally — an easy leak to introduce
+        and an invisible one without a sink-aware tracker.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+        from tests.unit.web.composer._probe_lifecycle_helpers import TrackingPluginManager
+
+        tracking = TrackingPluginManager(get_shared_plugin_manager())
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: tracking,
+        )
+
+        validate_semantic_contracts(_wardline_state(text_separator="\n"))
+
+        sink_probes = [instance for instance in tracking.instances if type(instance._delegate).__name__ == "JSONSink"]
+        assert len(sink_probes) == 2, "both json sinks must be probed"
+        assert [probe.close_count for probe in sink_probes] == [1, 1]
 
     def test_consumer_probe_closes_when_semantic_inspection_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from elspeth.contracts.plugin_semantics import InputSemanticRequirements
@@ -763,11 +800,11 @@ class TestGenerativeProducerFeedsLineExplode:
     containing CR or LF. Authoring refused that composition, so the request had
     no correct answer at all.
 
-    The llm TRANSFORM is the producer here, deliberately. The llm SOURCE's
-    output_semantics() is unreachable from this validator — the probe can only
-    call create_transform and BaseSource has no output_semantics() hook — so a
-    source-fed edge is UNKNOWN no matter what the source declares. Using the
-    source here would assert the plumbing gap, not this behaviour.
+    The llm TRANSFORM is the producer here. Either would now work — the sink
+    plumbing gave BaseSource an output_semantics() hook and taught the producer
+    probe to use create_source, so LLMSource's declaration is live rather than
+    dead code (see TestSourceProducerFactsAreRead). The transform is kept
+    because these assertions predate that and pin the transform's own claim.
     """
 
     def _llm_to_line_explode_state(self) -> CompositionState:
@@ -1243,3 +1280,524 @@ class TestSemanticValidatorSecretLeakage:
             assert self.SENTINEL not in entry.component
         for contract in contracts:
             assert self.SENTINEL not in repr(contract)
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Sinks as semantic consumers (Phase 2b/2c, elspeth-afdf55a17c, ADR-039)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _sink_state(
+    *,
+    producer: NodeSpec,
+    sink_plugin: str,
+    sink_field: str,
+    source_fields: tuple[str, ...] = ("url: str", "topic: str"),
+) -> CompositionState:
+    """One producer routed straight at one sink, plus a failure sink.
+
+    Every plugin here is fully configured on purpose. A draft config makes the
+    probe abstain, and an abstaining probe emits NO sink edge at all — which
+    passes any assertion phrased as "no error", so the sink tests below assert
+    positively that the edge exists.
+    """
+    return CompositionState(
+        metadata=PipelineMetadata(name="sink-semantics"),
+        version=1,
+        edges=(),
+        source=SourceSpec(
+            plugin="csv",
+            on_success="producer_in",
+            options={"path": "data/rows.csv", "schema": {"mode": "fixed", "fields": list(source_fields)}},
+            on_validation_failure="quarantine",
+        ),
+        nodes=(producer,),
+        outputs=(
+            OutputSpec(
+                name="sink",
+                plugin=sink_plugin,
+                options={
+                    "path": "outputs/out.txt",
+                    "field": sink_field,
+                    "schema": {"mode": "fixed", "fields": [f"{sink_field}: str"]},
+                },
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="errors",
+                plugin="json",
+                options={"path": "outputs/err.json", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+
+
+def _transform_node(**overrides: object) -> NodeSpec:
+    fields: dict[str, object] = {
+        "id": "produce",
+        "node_type": "transform",
+        "plugin": None,
+        "input": "producer_in",
+        "on_success": "sink",
+        "on_error": "errors",
+        "options": {},
+        "condition": None,
+        "routes": None,
+        "fork_to": None,
+        "branches": None,
+        "policy": None,
+        "merge": None,
+    }
+    fields.update(overrides)
+    return NodeSpec(**fields)  # type: ignore[arg-type]
+
+
+def _llm_node(**overrides: object) -> NodeSpec:
+    return _transform_node(
+        plugin="llm",
+        options={
+            "schema": {"mode": "fixed", "fields": ["topic: str"]},
+            "required_input_fields": ["topic"],
+            "provider": "openrouter",
+            "model": "anthropic/claude-3.7-sonnet",
+            "api_key": "sk-test-key",
+            "prompt_template": "Write an announcement about {{ row['topic'] }}",
+            "temperature": 0,
+            "response_field": "announcement",
+            "pool_size": 1,
+            "max_tokens": 300,
+        },
+        **overrides,
+    )
+
+
+def _web_scrape_node(*, scrape_format: str, text_separator: str, **overrides: object) -> NodeSpec:
+    return _transform_node(
+        plugin="web_scrape",
+        options={
+            "schema": {"mode": "flexible", "fields": ["url: str"]},
+            "required_input_fields": ["url"],
+            "url_field": "url",
+            "content_field": "content",
+            "fingerprint_field": "fingerprint",
+            "format": scrape_format,
+            "text_separator": text_separator,
+            "http": {
+                "abuse_contact": "x@example.com",
+                "scraping_reason": "t",
+                "timeout": 5,
+                "allowed_hosts": "public_only",
+            },
+        },
+        **overrides,
+    )
+
+
+def _sink_edges(contracts: tuple, sink_name: str = "sink") -> list:
+    return [contract for contract in contracts if contract.to_id == f"output:{sink_name}"]
+
+
+def _one_sink_edge(contracts: tuple, sink_name: str = "sink"):
+    """Return THE sink edge, failing loudly when the sink loop never ran.
+
+    This is the vacuousness guard. Every "not blocked" assertion below passes
+    identically whether the sink was evaluated and found acceptable or was
+    never evaluated at all, so each one is paired with this.
+    """
+    edges = _sink_edges(contracts, sink_name)
+    assert len(edges) == 1, (
+        f"expected exactly one semantic edge into output:{sink_name}, got {len(edges)}. "
+        "Zero means the sink loop did not run (or the sink probe abstained on a draft "
+        "config) and the surrounding assertions are vacuous."
+    )
+    return edges[0]
+
+
+class TestSinkSemanticAcceptanceCriteria:
+    """The six outcomes g11 turns on (elspeth-afdf55a17c).
+
+    Before this, `validate_semantic_contracts` never evaluated a sink at all:
+    sinks are OutputSpec, never NodeSpec, and NodeType has no sink member, so
+    no relaxation of the node loop could reach one. A TextSink requirement was
+    declarable and never read.
+    """
+
+    def test_llm_to_text_sink_is_a_hard_conflict(self) -> None:
+        """The g11 defect itself: generated text into a one-line-per-row sink."""
+        state = _sink_state(producer=_llm_node(), sink_plugin="text", sink_field="announcement")
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.CONFLICT
+        assert edge.from_id == "produce"
+        assert edge.producer_plugin == "llm"
+        assert edge.consumer_plugin == "text"
+        assert edge.requirement.requirement_code == "text.field.single_line_text"
+        assert edge.producer_facts is not None
+        assert edge.producer_facts.text_framing is TextFraming.UNCONSTRAINED
+
+        assert len(errors) == 1, "a CONFLICT must block, not warn"
+        assert warnings == ()
+        assert errors[0].component == "output:sink", "a sink finding must be attributed to the sink, not to a node"
+        assert errors[0].error_code == "semantic_contract_violation"
+
+    def test_llm_to_text_conflict_is_independent_of_unknown_policy(self) -> None:
+        """CONFLICT short-circuits ahead of UNKNOWN, so WARN cannot soften it.
+
+        TextSink's policy is WARN precisely so an undeclared producer is not
+        blocked. That relaxation must not also unblock a producer that makes a
+        positively incompatible claim — which is the whole reason ADR-039 added
+        UNCONSTRAINED as a member rather than reusing UNKNOWN.
+        """
+        state = _sink_state(producer=_llm_node(), sink_plugin="text", sink_field="announcement")
+        _errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.requirement.unknown_policy.value == "warn"
+        assert edge.outcome is SemanticOutcome.CONFLICT
+
+    def test_llm_to_document_sink_is_satisfied(self) -> None:
+        """The authorable answer, live in the same change that blocks the wrong one."""
+        state = _sink_state(producer=_llm_node(), sink_plugin="document", sink_field="announcement")
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.SATISFIED, (
+            "SATISFIED, not merely tolerated: an advisory would leave the outcome resting on "
+            "unknown_policy rather than on the producer's declared facts."
+        )
+        assert edge.consumer_plugin == "document"
+        assert edge.requirement.requirement_code == "document.field.verbatim_text"
+        assert TextFraming.UNCONSTRAINED in edge.requirement.accepted_text_framings
+        assert errors == ()
+        assert warnings == ()
+
+    def test_web_scrape_markdown_to_text_sink_is_a_conflict(self) -> None:
+        """LINE_COMPATIBLE must NOT be accepted — it is the newline-BEARING member.
+
+        Accepting it alongside COMPACT would bless exactly this composition,
+        which is the zero-byte failure the requirement exists to prevent.
+        """
+        state = _sink_state(
+            producer=_web_scrape_node(scrape_format="markdown", text_separator=" "),
+            sink_plugin="text",
+            sink_field="content",
+        )
+        errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.CONFLICT
+        assert edge.producer_facts is not None
+        assert edge.producer_facts.text_framing is TextFraming.LINE_COMPATIBLE
+        assert TextFraming.LINE_COMPATIBLE not in edge.requirement.accepted_text_framings
+        assert len(errors) == 1
+
+    def test_web_scrape_newline_framed_to_text_sink_is_a_conflict(self) -> None:
+        """The other newline-bearing framing blocks for the same reason."""
+        state = _sink_state(
+            producer=_web_scrape_node(scrape_format="text", text_separator="\n"),
+            sink_plugin="text",
+            sink_field="content",
+        )
+        errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.CONFLICT
+        assert edge.producer_facts is not None
+        assert edge.producer_facts.text_framing is TextFraming.NEWLINE_FRAMED
+        assert len(errors) == 1
+
+    def test_web_scrape_compact_to_text_sink_is_satisfied(self) -> None:
+        """The genuinely correct use of the text sink stays fully clean."""
+        state = _sink_state(
+            producer=_web_scrape_node(scrape_format="text", text_separator=" "),
+            sink_plugin="text",
+            sink_field="content",
+        )
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.SATISFIED
+        assert edge.producer_facts is not None
+        assert edge.producer_facts.text_framing is TextFraming.COMPACT
+        assert edge.producer_facts.content_kind is ContentKind.PLAIN_TEXT
+        assert errors == ()
+        assert warnings == (), "a fully declared, compatible producer must leave no advisory behind"
+
+    def test_undeclared_producer_to_text_sink_is_advisory_not_blocked(self) -> None:
+        """An abstaining producer is disclosed, never refused.
+
+        Only a positive conflicting claim blocks. Blocking here would make the
+        text sink unwireable from the ordinary single-field extract — the same
+        over-blocking that refused `llm -> line_explode` before Phase 1.
+        """
+        producer = _transform_node(
+            id="produce",
+            plugin="field_mapper",
+            options={"schema": {"mode": "observed"}, "mapping": {"topic": "announcement"}},
+        )
+        state = _sink_state(producer=producer, sink_plugin="text", sink_field="announcement")
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.UNKNOWN
+        assert edge.producer_facts is None
+        assert errors == (), "an undeclared producer must NOT block the text sink"
+        assert len(warnings) == 1, "but the gap must be disclosed, not dropped silently"
+        assert warnings[0].component == "output:sink"
+
+    def test_llm_through_line_explode_to_text_sink_is_not_blocked(self) -> None:
+        """End to end: the composition the user actually wants must author clean.
+
+        `llm -> line_explode` is SATISFIED on its own edge, and the sink edge
+        downstream of line_explode is an honest UNKNOWN (line_explode declares
+        no output semantics, so the fact chain stops there) — advisory, not a
+        refusal.
+        """
+        state = CompositionState(
+            metadata=PipelineMetadata(name="generate-and-write"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="csv",
+                on_success="producer_in",
+                options={"path": "data/topics.csv", "schema": {"mode": "fixed", "fields": ["topic: str"]}},
+                on_validation_failure="quarantine",
+            ),
+            nodes=(
+                _llm_node(on_success="explode_in"),
+                _transform_node(
+                    id="split_lines",
+                    plugin="line_explode",
+                    input="explode_in",
+                    options={
+                        "schema": {"mode": "flexible", "fields": ["announcement: str"]},
+                        "source_field": "announcement",
+                    },
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin="text",
+                    options={
+                        "path": "outputs/lines.txt",
+                        "field": "line_text",
+                        "schema": {"mode": "fixed", "fields": ["line_text: str"]},
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="errors",
+                    plugin="json",
+                    options={"path": "outputs/err.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == (), "the only correct spelling of the user's goal must author clean"
+
+        explode_edge = next(contract for contract in contracts if contract.to_id == "split_lines")
+        assert explode_edge.outcome is SemanticOutcome.SATISFIED
+
+        sink_edge = _one_sink_edge(contracts)
+        assert sink_edge.outcome is SemanticOutcome.UNKNOWN
+        assert sink_edge.consumer_plugin == "text"
+        assert [warning.component for warning in warnings] == ["output:sink"]
+
+
+class TestSinkFanIn:
+    """A sink takes MANY producers. The rule is conservative: ANY conflict blocks."""
+
+    def _fan_in_state(self, *, second_scrape_format: str) -> CompositionState:
+        return CompositionState(
+            metadata=PipelineMetadata(name="sink-fan-in"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="csv",
+                on_success="producer_in",
+                options={"path": "data/rows.csv", "schema": {"mode": "fixed", "fields": ["url: str"]}},
+                on_validation_failure="quarantine",
+            ),
+            nodes=(
+                _web_scrape_node(id="scrape_a", scrape_format="text", text_separator=" "),
+                _web_scrape_node(
+                    id="scrape_b",
+                    input="fan_in",
+                    scrape_format=second_scrape_format,
+                    text_separator=" ",
+                ),
+                _transform_node(
+                    id="tee",
+                    plugin="field_mapper",
+                    input="producer_in",
+                    on_success="fan_in",
+                    options={"schema": {"mode": "observed"}, "mapping": {"url": "url"}},
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin="text",
+                    options={
+                        "path": "outputs/out.txt",
+                        "field": "content",
+                        "schema": {"mode": "fixed", "fields": ["content: str"]},
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="errors",
+                    plugin="json",
+                    options={"path": "outputs/err.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_every_producer_of_a_sink_is_evaluated(self) -> None:
+        """Both arms produce their own edge — the sink is not judged on one arm."""
+        state = self._fan_in_state(second_scrape_format="text")
+        _errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edges = _sink_edges(contracts)
+        assert sorted(edge.from_id for edge in edges) == ["scrape_a", "scrape_b"], (
+            "sink fan-in must evaluate EVERY producer; judging one arm would let a conflicting sibling through"
+        )
+        assert all(edge.outcome is SemanticOutcome.SATISFIED for edge in edges)
+
+    def test_one_conflicting_arm_blocks_the_whole_sink(self) -> None:
+        """Conservative rule: a satisfied sibling does not rescue a conflicting arm."""
+        state = self._fan_in_state(second_scrape_format="markdown")
+        errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edges = {edge.from_id: edge.outcome for edge in _sink_edges(contracts)}
+        assert edges == {
+            "scrape_a": SemanticOutcome.SATISFIED,
+            "scrape_b": SemanticOutcome.CONFLICT,
+        }
+        assert len(errors) == 1
+        assert errors[0].component == "output:sink"
+        assert "scrape_b" in errors[0].message
+
+
+class TestSourceProducerFactsAreRead:
+    """A source-fed sink reads the SOURCE's facts, not a blanket UNKNOWN.
+
+    BaseSource had no output_semantics() hook and the producer probe knew only
+    create_transform, so LLMSource's declaration was unreachable dead code and
+    every source-fed edge was UNKNOWN whatever the source claimed.
+    """
+
+    def _llm_source_state(self, *, sink_plugin: str) -> CompositionState:
+        return CompositionState(
+            metadata=PipelineMetadata(name="llm-source-to-sink"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="llm",
+                on_success="sink",
+                options={
+                    "schema": {"mode": "fixed", "fields": ["announcement: str"]},
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-3.7-sonnet",
+                    "api_key": "sk-test-key",
+                    "prompt_template": "Write an announcement.",
+                    "response_field": "announcement",
+                },
+                on_validation_failure="quarantine",
+            ),
+            nodes=(),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin=sink_plugin,
+                    options={
+                        "path": "outputs/out.txt",
+                        "field": "announcement",
+                        "schema": {"mode": "fixed", "fields": ["announcement: str"]},
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_llm_source_to_text_sink_is_a_conflict(self) -> None:
+        state = self._llm_source_state(sink_plugin="text")
+        errors, _warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.producer_facts is not None, (
+            "the source probe must READ the source's declaration; None here means create_source was never reached and the gate is inert"
+        )
+        assert edge.producer_facts.text_framing is TextFraming.UNCONSTRAINED
+        assert edge.outcome is SemanticOutcome.CONFLICT
+        assert edge.producer_plugin == "llm"
+        assert edge.from_id == "source"
+        assert len(errors) == 1
+
+    def test_llm_source_to_document_sink_is_satisfied(self) -> None:
+        state = self._llm_source_state(sink_plugin="document")
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        edge = _one_sink_edge(contracts)
+        assert edge.outcome is SemanticOutcome.SATISFIED
+        assert errors == ()
+        assert warnings == ()
+
+
+class TestSinkProbeToleratesDraftConfig:
+    """A half-authored sink must not crash validation, and must not fake a verdict."""
+
+    def test_draft_sink_config_abstains_rather_than_crashing(self) -> None:
+        state = _sink_state(producer=_llm_node(), sink_plugin="text", sink_field="announcement")
+        draft = state.outputs[0]
+        # A text sink with no schema: exactly what an in-progress composition
+        # looks like between "add the sink" and "configure it".
+        drafted = OutputSpec(
+            name=draft.name,
+            plugin=draft.plugin,
+            options={"path": "outputs/out.txt", "field": "announcement"},
+            on_write_failure=draft.on_write_failure,
+        )
+        state = CompositionState(
+            metadata=state.metadata,
+            version=state.version,
+            edges=state.edges,
+            sources=state.sources,
+            nodes=state.nodes,
+            outputs=(drafted, state.outputs[1]),
+        )
+
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert _sink_edges(contracts) == [], "an unconstructable sink must assert nothing about its edge"
+        assert errors == ()
+        assert warnings == ()
+
+    def test_unregistered_sink_plugin_abstains_rather_than_crashing(self) -> None:
+        state = _sink_state(producer=_llm_node(), sink_plugin="text", sink_field="announcement")
+        unknown = OutputSpec(
+            name="sink",
+            plugin="no_such_sink_plugin",
+            options={"path": "outputs/out.txt"},
+            on_write_failure="discard",
+        )
+        state = CompositionState(
+            metadata=state.metadata,
+            version=state.version,
+            edges=state.edges,
+            sources=state.sources,
+            nodes=state.nodes,
+            outputs=(unknown, state.outputs[1]),
+        )
+
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert _sink_edges(contracts) == []
+        assert errors == ()
+        assert warnings == ()
