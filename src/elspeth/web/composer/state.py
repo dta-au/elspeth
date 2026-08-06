@@ -19,7 +19,6 @@ from typing import Any, Literal, NotRequired, Self, TypedDict
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.data import check_compatibility
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.plugin_protocols import TransformProtocol
@@ -3549,31 +3548,44 @@ def _check_schema_contracts(
         (elspeth-f2eb8fef9f) — a divergence needing no coalesce, no row_union
         and no special topology.
 
-        Reuses the CANONICAL checker rather than reimplementing type
-        comparison: both declarations are built into their PluginSchema via
-        ``build_coalesce_schema`` — the same factory
-        ``row_union_schema_configs_compatible`` uses — and compared with
-        ``contracts/data.py::check_compatibility``, which the runtime reaches
-        through ``validate_single_edge``. Coercion and strictness rules
-        therefore cannot drift between the two surfaces (the Shape 18
-        precedent, elspeth-85f3cc3022).
+        Compares the DECLARED ``field_type`` strings directly, the way the
+        union-coalesce mirror a few hundred lines above does through
+        ``merge_union_field_flags`` and the way
+        ``row_union_schema_configs_compatible`` does on its non-fixed branch.
 
-        Only ``type_mismatches`` is reported. ``missing_fields`` is the
-        name-direction check the surrounding loop already owns, and
-        ``extra_fields`` belongs to the Rule A/B extras walkers; reporting
-        them here would double-attribute one defect.
+        AN EARLIER VERSION RECONSTRUCTED BOTH SIDES AS PluginSchema MODELS VIA
+        ``build_coalesce_schema`` AND CALLED ``check_compatibility``. That was
+        wrong and produced FALSE REDS, which for a validator gating an LLM
+        authoring loop is worse than the gap it closed.
+        ``build_coalesce_schema`` widens a field to ``X | None`` when
+        ``fd.nullable or not fd.required`` (``core/dag/schema_factory.py``),
+        because a coalesce branch can lose a ``last_wins`` collision and yield
+        None. The factory that actually builds ordinary source/transform
+        schemas — ``plugins/infrastructure/schema_factory.py::_get_python_type``
+        — widens ONLY on ``not required`` and never reads ``nullable`` at all.
+        So a producer declaring ``{required: true, nullable: true}`` into a
+        consumer declaring ``{required: true, nullable: false}``, both ``int``,
+        reconstructed as ``int | None`` vs ``int`` and was REJECTED, while the
+        real schemas are both plain ``int`` and build fine. Reusing a canonical
+        function is only safe when it is canonical FOR THIS EDGE; that one is
+        built for coalesce OUTPUT.
+
+        Comparing declared type strings cannot drift that way because it
+        reconstructs nothing. It is deliberately the weaker check: it abstains
+        wherever either side declares ``any``, and it does not model coercion.
+        Under-rejecting is the correct direction here — the runtime remains
+        authoritative, and a false red misdirects the authoring loop while a
+        missed one is caught downstream.
+
+        Only the type direction is reported. Field NAMES are the surrounding
+        loop's job and extras belong to the Rule A/B walkers; reporting either
+        here would double-attribute one defect.
 
         Callers gate on ``_producer_is_typed_source``, which is the runtime's
         own Phase-2 bypass — observed sources and transform/gate/coalesce
         producers resolve to a dynamic effective producer schema at runtime and
         are skipped there, so they are skipped here too.
         """
-        # Deferred like ``row_union_schema_configs_compatible`` below: the
-        # composer's authoring surface does not import ``core.dag`` at module
-        # scope.
-        from elspeth.core.dag.models import GraphValidationError
-        from elspeth.core.dag.schema_factory import build_coalesce_schema
-
         try:
             producer_schema_config = get_raw_schema_config(producer.options, owner=_producer_owner(producer))
             consumer_options = node.options
@@ -3593,15 +3605,17 @@ def _check_schema_contracts(
         if producer_schema_config.fields is None or consumer_schema_config.fields is None:
             return None
 
-        try:
-            producer_schema = build_coalesce_schema(producer_schema_config)
-            consumer_schema = build_coalesce_schema(consumer_schema_config)
-        except GraphValidationError:
-            # The factory rejects field-less configs; both sides are known to
-            # declare fields here, so this is an abstention, not a verdict.
-            return None
-
-        mismatches = check_compatibility(producer_schema, consumer_schema).type_mismatches
+        producer_types = {field.name: field.field_type for field in producer_schema_config.fields}
+        # ``any`` is a declared abstention on BOTH sides — the author has said
+        # the type is not pinned, so no conflict is mechanically provable.
+        mismatches = [
+            (field.name, field.field_type, producer_types[field.name])
+            for field in consumer_schema_config.fields
+            if field.name in producer_types
+            and field.field_type != "any"
+            and producer_types[field.name] != "any"
+            and producer_types[field.name] != field.field_type
+        ]
         if not mismatches:
             return None
         detail = ", ".join(f"{name} (consumer expects {expected}, producer emits {actual})" for name, expected, actual in mismatches)

@@ -3405,6 +3405,58 @@ class TestSchemaContractValidation:
             (e.error_code, e.message) for e in result.errors
         ]
 
+    def test_edge_field_type_check_does_not_false_red_on_nullable(self) -> None:
+        """A nullable-but-required producer field must not be read as a type conflict.
+
+        Regression pin. The first implementation reconstructed both sides as
+        PluginSchema models via ``build_coalesce_schema`` and called
+        ``check_compatibility``. That factory widens a field to ``X | None``
+        when ``fd.nullable or not fd.required`` — correct for coalesce output,
+        where a branch can lose a ``last_wins`` collision — but the factory that
+        builds ordinary source/transform schemas
+        (``plugins/infrastructure/schema_factory.py::_get_python_type``) widens
+        ONLY on ``not required`` and never reads ``nullable``. So this pipeline,
+        whose real schemas are both plain ``int``, was REJECTED as ``int |
+        None`` vs ``int``.
+
+        A false red is worse than the gap it closed: it misdirects the LLM
+        authoring loop toward a defect that does not exist, and the runtime
+        would have accepted the pipeline.
+        """
+        state = self._empty_state()
+        state = state.with_source(
+            self._make_source(
+                on_success="t1_in",
+                plugin="csv",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": True}],
+                    }
+                },
+            )
+        )
+        state = state.with_node(
+            self._make_transform(
+                "t1",
+                "t1_in",
+                "main",
+                plugin="value_transform",
+                options={
+                    "schema": {
+                        "mode": "fixed",
+                        "fields": [{"name": "age", "field_type": "int", "required": True, "nullable": False}],
+                    },
+                    "operations": [{"field": "age", "operation": "upper"}],
+                },
+            )
+        )
+        result = state.with_output(self._make_output("main")).validate()
+
+        assert not any(error.error_code == "edge_field_type_incompatible" for error in result.errors), [
+            (e.error_code, e.message) for e in result.errors
+        ]
+
     def test_edge_field_type_agreement_is_accepted(self) -> None:
         """Positive control for :meth:`test_edge_field_type_mismatch_is_rejected`.
 
