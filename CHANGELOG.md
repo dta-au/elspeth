@@ -136,6 +136,20 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
 - **Authentication and deployment state fail closed** — local auth files,
   external identity keys, token expiry, JWT secrets, deployment roots, and ECS
   PostgreSQL transport must pass their admission checks before use.
+- **Generated multiline text is no longer silently discarded** (ADR-039) — the
+  `text` sink refuses any value carrying a CR or LF record separator, so an LLM
+  answer spanning paragraphs was diverted row by row and published as a
+  zero-byte artifact while the run reported success. A producer whose framing
+  cannot be decided statically now declares `TextFraming.UNCONSTRAINED` rather
+  than abstaining, which turns that composition into a build-time contract
+  conflict instead of a runtime diversion. A new `document` sink publishes a
+  single unframed value, and the `line_explode` and `report_assemble` remedies
+  the refusal names are authorized on the web surface, so the repair it
+  recommends is one the Composer can actually take.
+- **A locked consumer reports the field it is missing, not just the ones it
+  refuses** — the build-time guaranteed-extras check ran ahead of every other
+  graph check, so a sink both missing required fields and refusing extras was
+  offered three remedies that could not supply a missing field.
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 
