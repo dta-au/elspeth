@@ -677,6 +677,58 @@ def test_diagnostics_failure_detail_prefers_failed_node_state_over_operation_own
         db.close()
 
 
+def test_diagnostics_failure_detail_ignores_a_diverted_rows_failed_state(tmp_path) -> None:
+    """A discarded row is never the cause, however well its text matches.
+
+    Correlation is a substring match against the failed operation's message,
+    and it was structurally safe while diversion anchors recorded only
+    ``effect-diversion:<hash>``. elspeth-9595abb7b0 made them disclose the
+    sink's own prose, so a diversion quoting the same driver error as a
+    genuinely failed operation became an exact-match candidate — and would
+    outrank the operation owner, pointing the operator at a sink that merely
+    dropped a row. The row here reached its sink and was discarded; the run
+    failed for an unrelated reason at the source.
+    """
+    shared_driver_error = "Constraint violation: duplicate key value violates unique constraint"
+    db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
+    try:
+        web_run_id = "web-run-diversion-correlation"
+        factory = RecorderFactory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=web_run_id)
+        _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
+        _register_node(factory, web_run_id, "sink_rows", NodeType.SINK, "database")
+
+        row = factory.data_flow.create_row(
+            web_run_id, "source", 0, {"id": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0
+        )
+        token = factory.data_flow.create_token(row.row_id, token_id="token-0")
+        state = factory.execution.begin_node_state(
+            token.token_id, "sink_rows", web_run_id, 1, {"id": 1}, state_id="state-token-0"
+        )
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            duration_ms=1.0,
+            error=ExecutionError(exception=shared_driver_error, exception_type="SinkDiscard", phase="write"),
+        )
+
+        source_op = factory.execution.begin_operation(web_run_id, "source", "source_load")
+        factory.execution.complete_operation(source_op.operation_id, "failed", error=shared_driver_error, duration_ms=5.0)
+
+        diagnostics = load_run_diagnostics_from_db(
+            db,
+            run_id=web_run_id,
+            landscape_run_id=web_run_id,
+            run_status="failed",
+            limit=50,
+        )
+
+        assert diagnostics.failure_detail is not None
+        assert diagnostics.failure_detail.node_id == "source"
+    finally:
+        db.close()
+
+
 def test_diagnostics_failure_detail_keeps_operation_owner_when_no_failed_node_state(tmp_path) -> None:
     """Genuine source failures (no failed node_state) keep operation attribution."""
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
