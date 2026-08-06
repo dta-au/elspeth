@@ -185,8 +185,8 @@ class TestLineExplodeInputSemanticRequirements:
         return get_shared_plugin_manager().create_transform("line_explode", defaults)
 
     def test_default_source_field_requirement(self):
+        """ADR-039: constrain framing only, accept unconstrained text, warn on abstention."""
         from elspeth.contracts.plugin_semantics import (
-            ContentKind,
             TextFraming,
             UnknownSemanticPolicy,
         )
@@ -196,11 +196,65 @@ class TestLineExplodeInputSemanticRequirements:
         assert len(reqs.fields) == 1
         req = reqs.fields[0]
         assert req.field_name == "content"
-        assert req.accepted_content_kinds == frozenset({ContentKind.PLAIN_TEXT, ContentKind.MARKDOWN})
-        assert req.accepted_text_framings == frozenset({TextFraming.NEWLINE_FRAMED, TextFraming.LINE_COMPATIBLE})
+        # Deliberately unconstrained: splitlines() cares about line boundaries,
+        # not about what the text means. Constraining content_kind blocked
+        # nothing extra (every wrong producer conflicts on framing) and falsely
+        # blocked JSONL, which is JSON_STRUCTURED + NEWLINE_FRAMED.
+        assert req.accepted_content_kinds == frozenset()
+        assert req.accepted_text_framings == frozenset(
+            {
+                TextFraming.NEWLINE_FRAMED,
+                TextFraming.LINE_COMPATIBLE,
+                TextFraming.UNCONSTRAINED,
+            }
+        )
         assert req.requirement_code == "line_explode.source_field.line_framed_text"
-        assert req.unknown_policy is UnknownSemanticPolicy.FAIL
+        # WARN, not FAIL: line_explode is a usefulness guard (compact text is a
+        # one-row no-op), not a correctness one like TextSink (which discards
+        # the row). FAIL blocked only producers that did not DECLARE, which is
+        # what refused `llm -> line_explode` (elspeth-b6d9f04827).
+        assert req.unknown_policy is UnknownSemanticPolicy.WARN
         assert req.configured_by == ("source_field",)
+
+    def test_requirement_accepts_generative_text_but_still_rejects_compact(self):
+        """The ADR-039 outcome table, against the REAL requirement object.
+
+        A hand-built FieldSemanticRequirement would pass even if the plugin's
+        own declaration regressed, so this drives the plugin.
+        """
+        from elspeth.contracts.plugin_semantics import (
+            ContentKind,
+            FieldSemanticFacts,
+            SemanticOutcome,
+            SemanticValueType,
+            TextFraming,
+            compare_semantic,
+        )
+
+        req = self._build().input_semantic_requirements().fields[0]
+
+        def _facts(framing: TextFraming, kind: ContentKind = ContentKind.UNKNOWN) -> FieldSemanticFacts:
+            return FieldSemanticFacts(
+                field_name="content",
+                content_kind=kind,
+                text_framing=framing,
+                value_type=SemanticValueType.STR,
+                fact_code="t.content.gen",
+            )
+
+        # The generative producer (llm) — the composition g11 needed.
+        assert compare_semantic(_facts(TextFraming.UNCONSTRAINED), req) is SemanticOutcome.SATISFIED
+        # Genuinely-wrong producers stay blocked under the relaxed policy,
+        # because CONFLICT short-circuits ahead of UNKNOWN.
+        assert compare_semantic(_facts(TextFraming.COMPACT, ContentKind.PLAIN_TEXT), req) is SemanticOutcome.CONFLICT
+        assert compare_semantic(_facts(TextFraming.NOT_TEXT, ContentKind.HTML_RAW), req) is SemanticOutcome.CONFLICT
+        # Line-bearing producers unchanged.
+        assert compare_semantic(_facts(TextFraming.NEWLINE_FRAMED, ContentKind.PLAIN_TEXT), req) is SemanticOutcome.SATISFIED
+        assert compare_semantic(_facts(TextFraming.LINE_COMPATIBLE, ContentKind.MARKDOWN), req) is SemanticOutcome.SATISFIED
+        # JSONL: the case the dropped content_kind constraint falsely blocked.
+        assert compare_semantic(_facts(TextFraming.NEWLINE_FRAMED, ContentKind.JSON_STRUCTURED), req) is SemanticOutcome.SATISFIED
+        # A producer that declares nothing still abstains — WARN, not SATISFIED.
+        assert compare_semantic(_facts(TextFraming.UNKNOWN), req) is SemanticOutcome.UNKNOWN
 
     def test_custom_source_field_changes_requirement_field_name(self):
         plugin = self._build(

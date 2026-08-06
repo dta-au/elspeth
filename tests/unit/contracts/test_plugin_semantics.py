@@ -27,8 +27,9 @@ class TestContentKind:
     def test_is_str_subclass(self):
         assert isinstance(ContentKind.PLAIN_TEXT, str)
 
-    def test_membership_is_closed_for_phase_1(self):
-        # Phase 1 vocabulary — additions require explicit plan amendment.
+    def test_membership_is_closed(self):
+        # Closed vocabulary — an addition requires an ADR recording what the
+        # member claims and why no existing member expressed it (ADR-039).
         assert {member.value for member in ContentKind} == {
             "unknown",
             "plain_text",
@@ -40,18 +41,71 @@ class TestContentKind:
 
 
 class TestTextFraming:
-    def test_membership_is_closed_for_phase_1(self):
+    def test_membership_is_closed(self):
         assert {member.value for member in TextFraming} == {
             "unknown",
             "not_text",
             "compact",
             "newline_framed",
             "line_compatible",
+            # ADR-039. NOT a synonym for "unknown": abstention can never
+            # CONFLICT, a positive claim can. See the pair of tests below.
+            "unconstrained",
         }
+
+    def test_unconstrained_conflicts_where_unknown_only_abstains(self):
+        """The ADR-039 mechanism, stated as an executable difference.
+
+        Same consumer requirement, same everything else — only the producer's
+        declaration differs. UNKNOWN is ungateable; UNCONSTRAINED is gateable.
+        If this pair ever agrees, the distinction has collapsed and a
+        generative producer has silently become impossible to block.
+        """
+        single_line_only = FieldSemanticRequirement(
+            field_name="value",
+            accepted_content_kinds=frozenset(),
+            accepted_text_framings=frozenset({TextFraming.COMPACT}),
+            requirement_code="t.value.single_line",
+        )
+
+        def _facts(framing: TextFraming) -> FieldSemanticFacts:
+            return FieldSemanticFacts(
+                field_name="value",
+                content_kind=ContentKind.UNKNOWN,
+                text_framing=framing,
+                fact_code="t.value.gen",
+            )
+
+        assert compare_semantic(_facts(TextFraming.UNKNOWN), single_line_only) is SemanticOutcome.UNKNOWN
+        assert compare_semantic(_facts(TextFraming.UNCONSTRAINED), single_line_only) is SemanticOutcome.CONFLICT
+
+    def test_unconstrained_conflict_outranks_every_unknown_policy(self):
+        """A CONFLICT is a fact-level contradiction; no policy may soften it.
+
+        This is what makes the relaxed ``line_explode`` policy safe, so it is
+        pinned rather than left as an argument.
+        """
+        for policy in UnknownSemanticPolicy:
+            requirement = FieldSemanticRequirement(
+                field_name="value",
+                accepted_content_kinds=frozenset(),
+                accepted_text_framings=frozenset({TextFraming.COMPACT}),
+                requirement_code="t.value.single_line",
+                unknown_policy=policy,
+            )
+            facts = FieldSemanticFacts(
+                field_name="value",
+                content_kind=ContentKind.UNKNOWN,
+                text_framing=TextFraming.UNCONSTRAINED,
+                fact_code="t.value.gen",
+            )
+            assert compare_semantic(facts, requirement) is SemanticOutcome.CONFLICT, (
+                f"unknown_policy={policy.value} must not soften a CONFLICT"
+            )
 
 
 class TestSemanticValueType:
-    def test_membership_is_closed_for_phase_1(self):
+    def test_membership_is_closed(self):
         assert {member.value for member in SemanticValueType} == {
             "unknown",
             "str",
@@ -60,7 +114,7 @@ class TestSemanticValueType:
 
 
 class TestUnknownSemanticPolicy:
-    def test_membership_is_closed_for_phase_1(self):
+    def test_membership_is_closed(self):
         assert {member.value for member in UnknownSemanticPolicy} == {
             "allow",
             "warn",
@@ -69,7 +123,7 @@ class TestUnknownSemanticPolicy:
 
 
 class TestSemanticOutcome:
-    def test_membership_is_closed_for_phase_1(self):
+    def test_membership_is_closed(self):
         assert {member.value for member in SemanticOutcome} == {
             "satisfied",
             "conflict",

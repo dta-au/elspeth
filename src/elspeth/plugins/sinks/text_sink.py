@@ -104,7 +104,9 @@ class TextSink(BaseSink):
     usage_when_to_use: str = "Use when exactly one existing string field from each row should become one canonical LF-delimited text line."
     usage_when_not_to_use: str = (
         "Do not use for multi-field, nested, binary, or multiline values, or as a generic rejected-row sink that must "
-        "preserve the whole row."
+        "preserve the whole row. A multiline value is not a dead end: put line_explode in front to turn one multiline "
+        "value into one row per line, then set this sink's field to that transform's output_field — that is how "
+        "generated or scraped multiline text gets written to a file."
     )
     example_use: str = """sinks:
   lines:
@@ -295,6 +297,7 @@ class TextSink(BaseSink):
                 composer_hints=(
                     "Set field to the configured field whose value should become each output line; every accepted value must be a string.",
                     "Text values containing CR or LF are rejected rather than escaped, so one input row always maps to exactly one output record.",
+                    "To write a multiline value — anything an llm generates, or scraped page text — put line_explode in front and set field to its output_field; sending the multiline value straight here diverts every row and writes an empty file.",
                     "Choose only utf-8, ascii, latin-1, or cp1252; values not representable in the configured encoding are diverted without leaking their content.",
                     "Use mode: append with collision_policy: append_or_create for append/resume; existing bytes must decode cleanly and end with canonical LF.",
                     "Text is not a generic failure sink because it deliberately writes only one configured field and cannot preserve a rejected row losslessly.",

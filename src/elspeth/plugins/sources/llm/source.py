@@ -7,7 +7,7 @@ import time
 from collections.abc import Generator, Iterator, Mapping
 from functools import reduce
 from operator import or_
-from typing import Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import structlog
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -49,6 +49,9 @@ from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMPro
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
 from elspeth.plugins.transforms.llm.validation import strip_markdown_fences
+
+if TYPE_CHECKING:
+    from elspeth.contracts.plugin_semantics import OutputSemanticDeclaration
 
 logger = structlog.get_logger(__name__)
 
@@ -607,7 +610,22 @@ class LLMSource(BaseSource):
         if failures and not suppress_errors:
             raise failures[0]
 
-    def output_semantics(self) -> Any:
+    def output_semantics(self) -> OutputSemanticDeclaration:
+        """Declare that the generated response field is an unconstrained string.
+
+        ``text_framing=UNCONSTRAINED`` is a positive claim, not an abstention:
+        the value is free text and whether the model emits a newline is not
+        decidable before the run. ``content_kind`` stays UNKNOWN because prose
+        versus markdown is a genuine per-response unknown (ADR-039).
+
+        NOTE: this declaration is currently unreachable from the composer's
+        semantic validator, which has no typed route to construct a source and
+        ask it — ``BaseSource`` has no ``output_semantics()`` hook and the probe
+        only knows ``create_transform``. The declaration is correct and is what
+        the hook will read once it lands; see ``_semantic_validator.
+        _instantiate_producer``. Until then the llm TRANSFORM is the reachable
+        generative producer.
+        """
         from elspeth.contracts.plugin_semantics import (
             ContentKind,
             FieldSemanticFacts,
@@ -621,7 +639,7 @@ class LLMSource(BaseSource):
                 FieldSemanticFacts(
                     field_name=self._response_field,
                     content_kind=ContentKind.UNKNOWN,
-                    text_framing=TextFraming.UNKNOWN,
+                    text_framing=TextFraming.UNCONSTRAINED,
                     value_type=SemanticValueType.STR,
                     fact_code="llm.source_response_field.string",
                     configured_by=("response_field",),

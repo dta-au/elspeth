@@ -230,9 +230,11 @@ class TestValidateSemanticContracts:
         assert contracts[0].outcome is SemanticOutcome.SATISFIED
         assert contracts[0].producer_facts.content_kind is ContentKind.MARKDOWN
 
-    def test_source_fed_fail_policy_consumer_emits_unknown_contract_and_error(self):
-        # Sources do not yet declare output semantics, so their facts are
-        # UNKNOWN. A consumer with UnknownSemanticPolicy.FAIL must block.
+    def test_source_fed_consumer_discloses_unknown_without_blocking(self):
+        # No source's facts are readable here — the probe can only call
+        # create_transform and BaseSource has no output_semantics() hook — so a
+        # source-fed edge is always UNKNOWN. Under line_explode's WARN policy
+        # (ADR-039) that is DISCLOSED but must not block authoring.
         state = CompositionState(
             metadata=PipelineMetadata(name="t"),
             version=1,
@@ -282,12 +284,12 @@ class TestValidateSemanticContracts:
             ),
         )
         errors, warnings, contracts = validate_semantic_contracts(state)
-        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
-        assert len(errors) == 1
-        assert errors[0].component == "node:explode"
-        assert "source" in errors[0].message
-        assert "csv" in errors[0].message
-        assert "declares no semantic facts" in errors[0].message
+        assert errors == (), "A WARN-policy requirement must never block authoring on abstention"
+        assert len(warnings) == 1, "The gap must still be DISCLOSED, not silently dropped"
+        assert warnings[0].component == "node:explode"
+        assert "source" in warnings[0].message
+        assert "csv" in warnings[0].message
+        assert "declares no semantic facts" in warnings[0].message
 
         assert len(contracts) == 1
         assert contracts[0].from_id == "source"
@@ -296,9 +298,9 @@ class TestValidateSemanticContracts:
         assert contracts[0].producer_facts is None
         assert contracts[0].outcome is SemanticOutcome.UNKNOWN
 
-    def test_named_source_fed_fail_policy_consumer_emits_unknown_contract_and_error(self):
+    def test_named_source_fed_consumer_discloses_unknown_without_blocking(self):
         # Named multi-source roots use stable producer IDs such as
-        # source:orders and must receive the same UNKNOWN/FAIL treatment.
+        # source:orders and must receive the same UNKNOWN/WARN treatment.
         state = CompositionState(
             metadata=PipelineMetadata(name="t"),
             version=1,
@@ -351,12 +353,12 @@ class TestValidateSemanticContracts:
             ),
         )
         errors, warnings, contracts = validate_semantic_contracts(state)
-        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
-        assert len(errors) == 1
-        assert errors[0].component == "node:explode"
-        assert "source:orders" in errors[0].message
-        assert "csv" in errors[0].message
-        assert "declares no semantic facts" in errors[0].message
+        assert errors == (), "A WARN-policy requirement must never block authoring on abstention"
+        assert len(warnings) == 1, "The gap must still be DISCLOSED, not silently dropped"
+        assert warnings[0].component == "node:explode"
+        assert "source:orders" in warnings[0].message
+        assert "csv" in warnings[0].message
+        assert "declares no semantic facts" in warnings[0].message
 
         assert len(contracts) == 1
         assert contracts[0].from_id == "source:orders"
@@ -365,11 +367,12 @@ class TestValidateSemanticContracts:
         assert contracts[0].producer_facts is None
         assert contracts[0].outcome is SemanticOutcome.UNKNOWN
 
-    def test_undeclared_transform_producer_with_fail_policy_emits_error(self):
+    def test_undeclared_transform_producer_is_disclosed_not_blocking(self):
         # Real registered transform that does NOT declare output_semantics:
         # `passthrough` (src/elspeth/plugins/transforms/passthrough.py:39).
         # passthrough → line_explode is exactly the "pass-through degrades
-        # to UNKNOWN" case the design decision documents.
+        # to UNKNOWN" case the design decision documents. Under WARN it is
+        # disclosed rather than refused (ADR-039).
         state = CompositionState(
             metadata=PipelineMetadata(name="t"),
             version=1,
@@ -436,17 +439,17 @@ class TestValidateSemanticContracts:
             ),
         )
         errors, warnings, contracts = validate_semantic_contracts(state)
-        assert warnings == (), "FAIL-policy requirements must land in errors, never the advisory channel"
+        assert errors == (), "A WARN-policy requirement must never block authoring on abstention"
 
         assert len(contracts) == 1
         assert contracts[0].outcome is SemanticOutcome.UNKNOWN
         assert contracts[0].consumer_plugin == "line_explode"
         assert contracts[0].producer_plugin == "passthrough"
 
-        # FAIL policy → UNKNOWN producer fails.
-        assert len(errors) == 1
-        assert "no semantic facts" in errors[0].message.lower() or "undeclared" in errors[0].message.lower()
-        assert errors[0].component == "node:explode"
+        # WARN policy → UNKNOWN producer is disclosed, not refused.
+        assert len(warnings) == 1, "The gap must still be DISCLOSED, not silently dropped"
+        assert "no semantic facts" in warnings[0].message.lower() or "undeclared" in warnings[0].message.lower()
+        assert warnings[0].component == "node:explode"
 
     def test_gate_between_producer_and_consumer_is_traversed(self):
         # Gates are STRUCTURAL — plugin=None and condition/routes carry
@@ -750,6 +753,159 @@ class TestLLMJsonExplodeRegression:
             and "value_type=str" in entry.message
             for entry in result.errors
         )
+
+
+class TestGenerativeProducerFeedsLineExplode:
+    """ADR-039 / g11 (elspeth-afdf55a17c, elspeth-b6d9f04827).
+
+    `llm -> line_explode` is the ONLY correct way to write generated multiline
+    text to a file: the text sink writes one line per row and diverts any value
+    containing CR or LF. Authoring refused that composition, so the request had
+    no correct answer at all.
+
+    The llm TRANSFORM is the producer here, deliberately. The llm SOURCE's
+    output_semantics() is unreachable from this validator — the probe can only
+    call create_transform and BaseSource has no output_semantics() hook — so a
+    source-fed edge is UNKNOWN no matter what the source declares. Using the
+    source here would assert the plumbing gap, not this behaviour.
+    """
+
+    def _llm_to_line_explode_state(self) -> CompositionState:
+        return CompositionState(
+            metadata=PipelineMetadata(name="generate-and-write"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="csv",
+                on_success="raw_rows",
+                options={
+                    "path": "data/topics.csv",
+                    "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                },
+                on_validation_failure="quarantine",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="generate",
+                    node_type="transform",
+                    plugin="llm",
+                    input="raw_rows",
+                    on_success="explode_in",
+                    on_error="discard",
+                    options={
+                        "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                        "required_input_fields": ["topic"],
+                        "provider": "openrouter",
+                        "model": "anthropic/claude-3.7-sonnet",
+                        "api_key": "sk-test-key",
+                        "prompt_template": "Write an announcement about {{ row['topic'] }}",
+                        "temperature": 0,
+                        "response_field": "announcement",
+                        "pool_size": 1,
+                        "max_tokens": 300,
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                NodeSpec(
+                    id="split_lines",
+                    node_type="transform",
+                    plugin="line_explode",
+                    input="explode_in",
+                    on_success="sink",
+                    on_error="discard",
+                    options={
+                        "schema": {"mode": "flexible", "fields": ["announcement: str"]},
+                        "source_field": "announcement",
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin="json",
+                    options={"path": "out.json"},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_llm_to_line_explode_is_satisfied_not_merely_advisory(self) -> None:
+        state = self._llm_to_line_explode_state()
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == (), "The only correct spelling of 'write generated text to a file' must not be refused"
+        assert warnings == (), (
+            "SATISFIED, not tolerated: an advisory here would mean the outcome still rests on unknown_policy "
+            "rather than on the producer's declared facts (ADR-039)."
+        )
+
+        assert len(contracts) == 1
+        contract = contracts[0]
+        assert contract.from_id == "generate"
+        assert contract.to_id == "split_lines"
+        assert contract.producer_plugin == "llm"
+        assert contract.consumer_plugin == "line_explode"
+        assert contract.outcome is SemanticOutcome.SATISFIED
+        assert contract.producer_facts is not None
+        assert contract.producer_facts.text_framing is TextFraming.UNCONSTRAINED, (
+            "The llm transform must make a POSITIVE claim. UNKNOWN is an abstention, and an abstention can "
+            "never CONFLICT — which is what made `llm -> text` ungateable."
+        )
+        # content_kind stays an honest abstention: prose vs markdown is a real
+        # per-response unknown, and claiming either manufactures false conflicts.
+        assert contract.producer_facts.content_kind is ContentKind.UNKNOWN
+
+    def test_llm_to_line_explode_is_not_blocked_by_full_validate(self) -> None:
+        """The wired surface, not just the validator in isolation."""
+        state = self._llm_to_line_explode_state()
+        result = state.validate()
+
+        assert not any(
+            entry.component == "node:split_lines" and "line_explode.source_field.line_framed_text" in entry.message
+            for entry in (*result.errors, *result.warnings)
+        ), "llm -> line_explode must raise no semantic entry at all through the wired surface"
+
+    def test_unconstrained_text_is_rejected_by_a_compact_only_requirement(self) -> None:
+        """The gate a later phase installs on the text sink.
+
+        `TextSink` will require ``accepted_text_framings={COMPACT}``. This pins
+        that the llm transform's real declared facts CONFLICT with it — the
+        hard, policy-independent block that UNKNOWN could never reach. If this
+        ever returns UNKNOWN, the g11 prevention has silently become inert.
+        """
+        from elspeth.contracts.plugin_semantics import (
+            FieldSemanticRequirement,
+            UnknownSemanticPolicy,
+            compare_semantic,
+        )
+
+        state = self._llm_to_line_explode_state()
+        _errors, _warnings, contracts = validate_semantic_contracts(state)
+        llm_facts = contracts[0].producer_facts
+        assert llm_facts is not None
+
+        for policy in UnknownSemanticPolicy:
+            compact_only = FieldSemanticRequirement(
+                field_name=llm_facts.field_name,
+                accepted_content_kinds=frozenset(),
+                accepted_text_framings=frozenset({TextFraming.COMPACT}),
+                requirement_code="text.field.single_line",
+                unknown_policy=policy,
+            )
+            assert compare_semantic(llm_facts, compact_only) is SemanticOutcome.CONFLICT, (
+                f"unknown_policy={policy.value} must not soften the block on llm -> text"
+            )
 
 
 class TestWardlineRegressionPin:

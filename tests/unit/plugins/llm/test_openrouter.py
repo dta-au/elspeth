@@ -507,7 +507,7 @@ class TestLLMTransformOpenRouterInit:
         assert "llm_response_model" in transform.declared_output_fields
 
     def test_output_semantics_declares_single_query_response_field_as_string(self) -> None:
-        """Single-query raw LLM output is a string semantic value."""
+        """Single-query raw LLM output is an unconstrained string (ADR-039)."""
         from elspeth.contracts.plugin_semantics import ContentKind, SemanticValueType, TextFraming
 
         transform = LLMTransform(_openrouter_config(response_field="analysis", prompt_template="{{ row.text }}"))
@@ -518,8 +518,14 @@ class TestLLMTransformOpenRouterInit:
         facts = declaration.fields[0]
         assert facts.field_name == "analysis"
         assert facts.value_type is SemanticValueType.STR
+        # content_kind abstains: prose vs markdown is a real per-response
+        # unknown, and claiming either manufactures false conflicts.
         assert facts.content_kind is ContentKind.UNKNOWN
-        assert facts.text_framing is TextFraming.UNKNOWN
+        # text_framing makes a POSITIVE claim. UNKNOWN here would be an
+        # abstention, and compare_semantic can never raise a CONFLICT against
+        # an abstention — which is exactly what left `llm -> text` ungateable
+        # and produced the g11 empty-file failure (elspeth-afdf55a17c).
+        assert facts.text_framing is TextFraming.UNCONSTRAINED
         assert facts.configured_by == ("response_field", "queries")
 
 

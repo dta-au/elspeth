@@ -8,23 +8,37 @@ and high-severity ValidationEntry errors on CONFLICT or on UNKNOWN +
 FAIL policy.
 
 UNKNOWN + WARN emits an advisory ValidationEntry instead of an error.
-WARN is for a requirement whose dimension no producer in the registry
-can currently declare: blocking on it would make the consumer plugin
-unwireable rather than fail-closed, while dropping it silently would
-hide a real contract gap. The warning discloses the gap and leaves the
+WARN is the honest policy wherever a required property is not statically
+decidable for some legitimate producer: blocking would make the consumer
+unwireable rather than fail-closed, while dropping it silently would hide
+a real contract gap. The warning discloses the gap and leaves the
 runtime's ``on_error`` route to handle a value that turns out wrong.
-Reserve it for that case — a requirement with a real declarer (see
-``line_explode``, satisfied by ``web_scrape``) must keep FAIL.
+Both current consumers are WARN — ``json_explode`` because no producer
+can declare ``SemanticValueType.LIST`` at all, and ``line_explode``
+because a generative producer's line framing is knowable only per row
+(ADR-039). Reserve FAIL for a requirement every legitimate producer can
+declare; ``tests/invariants/test_semantic_requirements_are_satisfiable``
+enforces that a FAIL requirement has at least one possible producer.
 
-This module reuses ProducerResolver — there must be exactly ONE
-walk-back implementation across composer state.
+``unknown_policy`` never governs a CONFLICT. A CONFLICT is a fact-level
+contradiction and blocks under every policy, because ``compare_semantic``
+short-circuits it ahead of UNKNOWN. That is precisely what makes the
+relaxed policies safe: relaxing one cannot unblock a wrong composition,
+only a silent one.
 
-Pass-through propagation is intentionally NOT performed in Phase 1.
-A pass-through transform between a declared producer and a declared
-consumer breaks the chain — the consumer sees outcome=UNKNOWN, which
-combined with line_explode's FAIL policy means the chain rejects.
-This is by design: it forces a real propagation API decision rather
-than making an ad hoc choice.
+This module reuses ProducerResolver rather than adding another walk-back,
+but it is NOT the only implementation. ``state._walk_producer_entry_to_
+real_producer`` and ``state._walk_to_real_producer`` are a second and
+third, hand-mirrored for paths ProducerResolver deliberately drops (it
+discards sink-targeted edges). Consolidating them is tracked as sink-side
+plumbing; until then a change to producer walking must be mirrored across
+all three, never assumed unique.
+
+Pass-through propagation is intentionally NOT performed. A pass-through
+transform between a declared producer and a declared consumer breaks the
+chain, so the consumer sees outcome=UNKNOWN and its own ``unknown_policy``
+grades it. This is by design: it forces a real propagation API decision
+rather than an ad hoc one.
 
 Layer: L3.
 """
@@ -114,7 +128,17 @@ def _instantiate_producer(producer: ProducerEntry) -> BaseTransform | None:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
     if producer.plugin_name is None or is_source_producer_id(producer.producer_id):
-        # Sources do not expose output_semantics(), so their facts are unknown.
+        # Source facts are treated as unknown here — but NOT because sources
+        # cannot declare them. ``LLMSource.output_semantics()`` exists
+        # (plugins/sources/llm/source.py) and is simply unreachable from this
+        # probe: it can only call ``create_transform``, and ``BaseSource`` has
+        # no ``output_semantics()`` hook, so there is no typed route to
+        # construct a source and ask it. ADR-032 rules out bridging that with
+        # hasattr/duck-typing. Reading source facts needs ``create_source``
+        # plus the BaseSource hook; until both land, LLMSource's declaration is
+        # dead code and every source-fed edge is UNKNOWN regardless of what the
+        # source declares.
+        #
         # Recognize both the legacy "source" ID and named "source:<name>"
         # IDs; named sources must never be mis-probed as transforms.
         return None

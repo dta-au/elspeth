@@ -17,6 +17,7 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.plugin_semantics import ContentKind, TextFraming
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
@@ -1228,6 +1229,13 @@ def test_metadata_and_catalogue_hooks_are_source_native(
     assert "runtime_preflight" not in dir(source)
     assert source.get_agent_assistance(issue_code=None) is not None
     assert source.output_semantics().fields[0].field_name == "answer"
+    # ADR-039: a generative producer makes a POSITIVE claim about framing.
+    # UNKNOWN would be an abstention, and compare_semantic can never CONFLICT
+    # against an abstention. NOTE this declaration is not yet reachable from
+    # the composer's semantic validator (BaseSource has no output_semantics()
+    # hook), so it is pinned here at the plugin rather than through a pipeline.
+    assert source.output_semantics().fields[0].text_framing is TextFraming.UNCONSTRAINED
+    assert source.output_semantics().fields[0].content_kind is ContentKind.UNKNOWN
     discriminator, variants = source.discriminated_variants()
     assert discriminator == "provider"
     assert set(variants) == {"azure", "openrouter", "bedrock", "gateway"}
