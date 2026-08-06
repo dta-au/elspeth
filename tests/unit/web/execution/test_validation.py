@@ -5488,6 +5488,7 @@ class TestEdgeContractFailureFormatting:
         type_mismatches: tuple[tuple[str, str, str], ...] = (),
         extra_fields: tuple[str, ...] = (),
         constraint_mismatches: tuple[tuple[str, str], ...] = (),
+        from_component_type: str | None = None,
     ) -> EdgeContractError:
         result = CompatibilityResult(
             compatible=False,
@@ -5504,6 +5505,7 @@ class TestEdgeContractFailureFormatting:
             consumer_schema_name=consumer_schema_name,
             compatibility_result=result,
             component_type="transform",
+            from_component_type=from_component_type,
         )
 
     def test_edge_contract_error_is_graph_validation_error(self) -> None:
@@ -5815,6 +5817,28 @@ class TestEdgeContractFailureFormatting:
         assert "patch_node_options(node_id='variant_union'" not in suggestion
         assert "patch_node_options(node_id='row_union_variant_union_d4e5f6'" not in suggestion
 
+    def test_row_union_producer_advice_survives_build_time_without_a_graph(self) -> None:
+        """elspeth-41bcaa882e: the missing-fields family fires during graph BUILD.
+
+        There the graph does not exist, so DAG-id → composer-component
+        resolution degrades and the producer's row_union-ness can only come
+        from the raise site via ``from_component_type``. The suggestion must
+        still steer to the real downstream consumer instead of falling back
+        to generic advice that tells the model to patch a plugin-free node.
+        """
+        exc = self._make_edge_error(
+            from_node_id="row_union_variant_union_a1b2c3",
+            to_node_id="transform_consume_d4e5f6",
+            missing_fields=("variant",),
+            from_component_type="row_union",
+        )
+
+        suggestion = _build_edge_contract_suggestion(exc, state=None, graph=None)
+
+        assert "plugin-free row_union" in suggestion
+        assert "patch_node_options(node_id='transform_consume_d4e5f6'" in suggestion
+        assert "patch_node_options(node_id='row_union_variant_union_a1b2c3'" not in suggestion
+
     def test_suggestion_for_type_mismatch_mentions_changing_declared_type(self) -> None:
         exc = self._make_edge_error(
             type_mismatches=(("fetch_status", "str | None", "int"),),
@@ -5827,7 +5851,12 @@ class TestEdgeContractFailureFormatting:
             missing_fields=("content",),
         )
         suggestion = _build_edge_contract_suggestion(exc)
-        assert "Drop missing required fields" in suggestion
+        # The advice names BOTH declaration surfaces (elspeth-41bcaa882e):
+        # the requirement set merges the required_input_fields option and
+        # schema.required_fields, and g08's wrong-key text stranded repair.
+        assert "Drop the missing required fields" in suggestion
+        assert "schema.required_fields" in suggestion
+        assert "required_input_fields" in suggestion
 
     def test_suggestion_for_extra_fields_mentions_flexible_mode(self) -> None:
         exc = self._make_edge_error(

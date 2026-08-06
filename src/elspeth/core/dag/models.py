@@ -76,6 +76,12 @@ class EdgeContractError(GraphValidationError):
             ``missing_fields``, ``type_mismatches[(field, expected, actual)]``,
             ``extra_fields``, and ``constraint_mismatches``. The error-message
             formatter walks this to produce actionable per-field guidance.
+        from_component_type: The PRODUCER's node type (e.g. ``'row_union'``),
+            when known at the raise site. The suggestion builder needs it to
+            pick producer-shaped advice (a plugin-free row_union has no
+            schema options to patch) even when the failure fires during graph
+            BUILD, where no graph exists to map the DAG id back to a composer
+            component (elspeth-41bcaa882e).
     """
 
     def __init__(
@@ -88,6 +94,7 @@ class EdgeContractError(GraphValidationError):
         consumer_schema_name: str,
         compatibility_result: CompatibilityResult,
         component_type: str | None = None,
+        from_component_type: str | None = None,
     ) -> None:
         super().__init__(
             message,
@@ -99,6 +106,7 @@ class EdgeContractError(GraphValidationError):
         self.producer_schema_name: str = producer_schema_name
         self.consumer_schema_name: str = consumer_schema_name
         self.compatibility_result: CompatibilityResult = compatibility_result
+        self.from_component_type: str | None = from_component_type
 
 
 @dataclass(frozen=True, slots=True)

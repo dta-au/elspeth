@@ -305,7 +305,11 @@ def _build_edge_contract_suggestion_with_resolver(
         exc.from_node_id,
         state=state,
         graph=graph,
-        component_type=None,
+        # The raise site's producer node type keeps producer-shaped advice
+        # (e.g. the plugin-free row_union branch below) reachable when the
+        # failure fires during graph BUILD, where graph=None degrades
+        # resolution to the DAG node id (elspeth-41bcaa882e).
+        component_type=exc.from_component_type,
     )
 
     if producer.component_type == "row_union":
@@ -333,7 +337,10 @@ def _build_edge_contract_suggestion_with_resolver(
     if has_type_mismatch:
         parts.append("      - Change the declared field type(s) to match what the producer emits (see Type mismatches above).")
     if has_missing:
-        parts.append("      - Drop missing required fields from the consumer's required_fields if the consumer doesn't actually need them.")
+        parts.append(
+            "      - Drop the missing required fields from wherever the consumer declares them — its schema.required_fields "
+            "or its required_input_fields option — if the consumer doesn't actually need them."
+        )
     if has_extras:
         parts.append(
             "      - Switch the consumer's input schema mode to 'flexible' or 'observed' so it accepts the producer's extra fields."

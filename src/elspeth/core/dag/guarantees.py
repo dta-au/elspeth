@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from elspeth.contracts.enums import NodeType
+from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.guarantee_propagation import compose_propagation
 from elspeth.contracts.schema import get_raw_node_required_fields
@@ -210,6 +210,45 @@ def walk_effective_guarantee_vote(
             if all(vote.participated for vote in arm_votes):
                 result = EffectiveGuaranteeVote(
                     fields=frozenset.intersection(*[vote.fields for vote in arm_votes]),
+                    participated=True,
+                )
+            else:
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+    elif node_info.node_type is NodeType.ROW_UNION:
+        # row_union is the correlated UNION ALL barrier: every released row
+        # is exactly one branch's payload, unchanged (elspeth-a5b86149d4).
+        # The builder stamps it observed ("no schema synthesis"), so stopping
+        # at the node's own declaration falsely rejected runnable
+        # fork → branches → row_union → consumer pipelines with
+        # "(none - dynamic schema)" (elspeth-41bcaa882e) — sibling of the
+        # queue fan-in walk above, governed by the same rule: a field is
+        # guaranteed on the released stream only if EVERY branch vouches for
+        # it, and one abstaining (dynamic) branch collapses the whole vote to
+        # abstention. compose_propagation's abstainer-skip stays unsound here
+        # for the same reason it is for queues: rows arrive from exactly one
+        # branch, so promoting a single branch's guarantee would over-claim.
+        #
+        # A DIVERT in-edge forces abstention rather than being skipped: a
+        # divert payload is an error envelope, not the producer's declared
+        # row, so a stream containing one cannot vouch for any field. The
+        # builder never wires DIVERT into a row_union today (error routing is
+        # terminal — see _live_predecessors in schema_validation.py); this
+        # guards the public add_edge surface.
+        in_edges = list(graph._graph.in_edges(node_id, data=True))
+        if not in_edges:
+            # The builder rejects unwired row_unions at construction;
+            # hand-built test graphs fall back to the node's own (empty,
+            # abstaining) declaration rather than crashing.
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+        elif any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
+            result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+        else:
+            branch_votes = [
+                walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in graph._graph.predecessors(node_id)
+            ]
+            if all(vote.participated for vote in branch_votes):
+                result = EffectiveGuaranteeVote(
+                    fields=frozenset.intersection(*[vote.fields for vote in branch_votes]),
                     participated=True,
                 )
             else:

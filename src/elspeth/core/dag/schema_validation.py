@@ -14,6 +14,7 @@ from itertools import combinations
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import PluginSchema, RoutingMode, check_compatibility
+from elspeth.contracts.data import CompatibilityResult
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
@@ -157,9 +158,18 @@ def validate_single_edge(
 
         missing = consumer_required - producer_guaranteed
         if missing:
-            # Build actionable error message
+            # Raise the structured subclass — not the bare parent — so the
+            # composer runtime preflight formatter can build an LLM-actionable
+            # suggestion for the missing-fields family too, instead of the
+            # suggestion:null it previously carried (elspeth-41bcaa882e).
+            # The prose message remains backwards-compatible for legacy
+            # str(exc) consumers. The requirement set merges TWO authoring
+            # surfaces (get_raw_node_required_fields: the
+            # ``required_input_fields`` option and ``schema.required_fields``),
+            # so the remediation must name both — g08-s2/s3 declared the
+            # latter and were told to remove the former.
             from_info = graph.get_node_info(from_node_id)
-            raise GraphValidationError(
+            raise EdgeContractError(
                 f"Schema contract violation: edge '{from_node_id}' → '{to_node_id}'\n"
                 f"  Consumer ({to_info.plugin_name}) requires fields: {sorted(consumer_required)}\n"
                 f"  Producer ({from_info.plugin_name}) guarantees: "
@@ -168,9 +178,18 @@ def validate_single_edge(
                 f"\n"
                 f"Fix: Either:\n"
                 f"  1. Add missing fields to producer's schema or guaranteed_fields, or\n"
-                f"  2. Remove from consumer's required_input_fields if truly optional",
-                component_id=str(to_node_id),
+                f"  2. Remove them from the consumer's declaration — its required_input_fields "
+                f"option or its schema.required_fields, whichever declares them — if truly optional",
+                from_node_id=str(from_node_id),
+                to_node_id=str(to_node_id),
+                producer_schema_name=from_info.output_schema.__name__ if from_info.output_schema is not None else "(dynamic)",
+                consumer_schema_name=to_info.input_schema.__name__ if to_info.input_schema is not None else "(dynamic)",
+                compatibility_result=CompatibilityResult(
+                    compatible=False,
+                    missing_fields=tuple(sorted(missing)),
+                ),
                 component_type=to_info.node_type.value,
+                from_component_type=from_info.node_type.value,
             )
 
     # ===== PHASE 2: TYPE VALIDATION (schema compatibility) =====
@@ -210,6 +229,7 @@ def validate_single_edge(
             consumer_schema_name=consumer_schema.__name__,
             compatibility_result=result,
             component_type=to_info.node_type.value,
+            from_component_type=graph.get_node_info(from_node_id).node_type.value,
         )
 
 

@@ -2281,6 +2281,24 @@ def _check_schema_contracts(
                 )
                 return None
             if producer_node.node_type == "row_union":
+                # Engine parity (elspeth-41bcaa882e), sibling of the queue rule
+                # above: when every branch participates, the union's effective
+                # guarantee is the branch intersection and the contract check
+                # proceeds against the row_union as producer (the guarantee
+                # parsers resolve it through
+                # ``_producer_entry_propagation_vote``). Unconditionally
+                # skipping here let the composer author union-consumer
+                # requirements the engine then deterministically rejected at
+                # /validate (battery-2026-08-06 g08-s2/s3). When any branch
+                # abstains the vote collapses to abstention: the runtime defers
+                # to per-row enforcement, and the skip warning stays the honest
+                # "not yet checked" signal.
+                union_participates, _union_fields = _producer_entry_propagation_vote(
+                    current_producer,
+                    visited_queue_ids=frozenset(),
+                )
+                if union_participates:
+                    return current_producer
                 warnings.append(
                     _warn(
                         f"node:{producer_node.id}",
@@ -2855,9 +2873,22 @@ def _check_schema_contracts(
             return False, frozenset()
 
         if producer_node.node_type == "row_union":
-            # Row union releases payloads without merging fields and publishes
-            # an observed schema. It must not invent guarantees from one or all
-            # branch predecessors.
+            # Engine parity (elspeth-41bcaa882e, mirroring the queue rule
+            # above): row_union releases every branch payload unchanged as one
+            # long-format stream, so a field is guaranteed on the stream only
+            # when EVERY branch vouches for it — intersection when all
+            # branches participate, total abstention when any abstains. It
+            # still must not invent guarantees from a SINGLE branch:
+            # released rows arrive from exactly one branch, so
+            # ``compose_propagation``'s abstainer-skip would over-claim.
+            branch_connections = _coalesce_branch_connections(producer_node.branches)
+            if not branch_connections:
+                return False, frozenset()
+            branch_votes = [
+                _connection_propagation_vote(connection, visited_queue_ids=visited_queue_ids) for connection in branch_connections
+            ]
+            if all(branch_participates for branch_participates, _ in branch_votes):
+                return True, frozenset.intersection(*[branch_fields for _, branch_fields in branch_votes])
             return False, frozenset()
 
         if producer_node.node_type == "coalesce":
@@ -2964,6 +2995,17 @@ def _check_schema_contracts(
             # flow, not a missing-key anomaly, so fall back to the declared set.
             return _effective_producer_guarantees(producer), False
         producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "row_union":
+            # The two directions have opposite safety polarities
+            # (elspeth-9d13900064): the union's GUARANTEE is the branch
+            # intersection (a field must arrive on every released row), but its
+            # EMIT set is the branch union — rows from any single arm carry that
+            # arm's fields, so a locked consumer forbidding one is a definite
+            # runtime rejection. Now that the guarantee walk-back resolves a
+            # participating row_union (elspeth-41bcaa882e) instead of abstaining
+            # into the dedicated boundary path, this profile must answer with
+            # the same arm-emit union that path computes.
+            return _row_union_definite_emits(producer_node, visited_connections=frozenset()), False
         if producer_node.plugin is None:
             return _effective_producer_guarantees(producer), False
         if producer_node.node_type not in {"transform", "aggregation"}:

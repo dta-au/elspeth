@@ -8581,7 +8581,16 @@ class TestCompositionStateRowUnion:
 
         assert any(error.error_code == "row_union_on_success_must_be_connection" for error in result.errors)
 
-    def test_row_union_output_schema_is_observed_and_abstains_from_guarantee_propagation(self) -> None:
+    def test_row_union_with_participating_branches_propagates_guarantees(self) -> None:
+        """elspeth-41bcaa882e: a participating union is checked, not skipped.
+
+        Historically the walk-back abstained at every row_union with a
+        medium "Contract check skipped" warning and emitted no EdgeContract,
+        which let the composer author union-consumer requirements the engine
+        then deterministically rejected at /validate. When every branch
+        participates, the contract check now proceeds against the union's
+        branch-intersection guarantee.
+        """
         state = self._state(
             tail_options={
                 "required_input_fields": ["id"],
@@ -8604,8 +8613,10 @@ class TestCompositionStateRowUnion:
         result = state.validate()
 
         assert result.is_valid, result.errors
-        assert not any(contract.to_id == "after_union" for contract in result.edge_contracts)
-        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
+        contract = next(contract for contract in result.edge_contracts if contract.to_id == "after_union")
+        assert contract.from_id == "variant_union"
+        assert contract.satisfied
+        assert not any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
 
     def _union_arm_queue(self, connection_name: str) -> NodeSpec:
         """An in-place queue on a branch connection: an arm Composer cannot resolve."""
@@ -8741,7 +8752,14 @@ class TestCompositionStateRowUnion:
         assert result.is_valid, result.errors
 
     def test_row_union_unresolvable_arm_does_not_invent_locked_input_extras(self) -> None:
-        """An arm Composer cannot resolve contributes no fields, and no error."""
+        """An arm the EMIT walker cannot resolve contributes no fields, and no error.
+
+        The guarantee-direction vote sees through the in-place queue (fan-in
+        intersection, elspeth-3619b8774f), so the union participates and the
+        contract check runs — no skip warning. The emit direction stays
+        conservative: the queued arm contributes nothing, so no extras are
+        invented for it.
+        """
         state = self._state(
             arms=self._llm_arms(treatment_field="tone"),
             extra_nodes=(self._union_arm_queue("treatment_done"),),
@@ -8751,14 +8769,12 @@ class TestCompositionStateRowUnion:
         result = state.validate()
 
         assert not any(error.error_code == "locked_input_extras" for error in result.errors), result.errors
-        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
 
     def test_row_union_known_arm_extras_survive_an_unresolvable_sibling(self) -> None:
         """Partial knowledge still errors on what IS known.
 
-        The queued treatment arm is opaque, but the control arm's guarantees
-        are proven — so its extras are reported while the abstention warning
-        stays for the part Composer cannot see.
+        The queued treatment arm is opaque to the EMIT walker, but the
+        control arm's guarantees are proven — so its extras are reported.
         """
         state = self._state(
             arms=self._llm_arms(treatment_field="tone"),
@@ -8772,7 +8788,6 @@ class TestCompositionStateRowUnion:
         detail = entry.contract
         assert detail is not None
         assert detail.extra_fields == ("verdict_model", "verdict_usage")
-        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
 
     def test_row_union_arm_emits_reach_a_locked_sink_through_a_gate(self) -> None:
         """Rule B shares Rule A's walker, so it shares the row_union hole.
@@ -8875,6 +8890,66 @@ class TestCompositionStateRowUnion:
         assert detail is not None
         assert detail.producer == "variant_union"
         assert detail.extra_fields == ("complaint_text",)
+
+    def test_union_consumer_requirement_satisfied_by_every_branch_validates(self) -> None:
+        """elspeth-41bcaa882e (battery-2026-08-06 g08): the barrier is transparent.
+
+        Both arms are pass-through, so a source-guaranteed field arrives on
+        every released row. A consumer downstream of the union requiring it
+        must validate — the walker abstaining at the row_union previously
+        reported "guarantees: (none)" and rejected the runnable pipeline,
+        mirroring the engine's "(none - dynamic schema)" rejection.
+        """
+        state = self._state(
+            tail_options={
+                "schema": {"mode": "observed"},
+                "required_input_fields": ["amount"],
+            },
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(schema={"mode": "observed", "guaranteed_fields": ["id", "amount"]})},
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, [e.message for e in result.errors]
+
+    def test_union_consumer_requiring_branch_only_field_still_errors(self) -> None:
+        """Fail-closed twin: a field only ONE branch guarantees is not union-guaranteed.
+
+        Control rows never carry the treatment arm's extra field, and every
+        released group contains a control row, so the intersection must drop
+        it and the consumer requirement must still reject.
+        """
+        arms = (
+            self._transform("control", "control_branch", "control_done"),
+            self._transform(
+                "treatment",
+                "treatment_branch",
+                "treatment_done",
+                options={"schema": {"mode": "observed", "guaranteed_fields": ["treatment_tag"]}},
+            ),
+        )
+        state = self._state(
+            arms=arms,
+            tail_options={
+                "schema": {"mode": "observed"},
+                "required_input_fields": ["treatment_tag"],
+            },
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(schema={"mode": "observed", "guaranteed_fields": ["id", "amount"]})},
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "schema_contract_violation")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.consumer == "after_union"
+        assert detail.missing_fields == ("treatment_tag",)
 
 
 class TestPassThroughArrivalExtras:
