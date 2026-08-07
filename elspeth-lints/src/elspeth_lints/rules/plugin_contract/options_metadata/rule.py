@@ -63,7 +63,7 @@ class OptionsMetadataRule:
             plugin_manager = self.plugin_manager_factory()
         except ModuleNotFoundError as exc:
             return [_missing_runtime_dependency_finding(exc)]
-        allowlist = load_options_metadata_allowlist(context.root / self.allowlist_path)
+        allowlist = load_options_metadata_allowlist(_repository_root(context.root, context.repo_root) / self.allowlist_path)
         try:
             return collect_metadata_findings(
                 plugin_manager=plugin_manager,
@@ -122,6 +122,23 @@ def collect_metadata_findings(*, plugin_manager: PluginCatalog, allowlist: set[s
                     if not field_info.description:
                         findings.append(_finding(identifier, "missing description", "missing-description", location))
     return findings
+
+
+def _repository_root(root: Path, explicit_repo_root: Path | None) -> Path:
+    """Return the repository root for a scan root.
+
+    Mirrors ``trust_boundary.shared.repository_root``: an explicit
+    ``RuleContext.repo_root`` wins; the canonical ``<repo>/src/elspeth`` scan
+    root resolves to ``<repo>``; any other scan root is its own repository
+    root (fixture case directories rely on this). Allowlist governance lives
+    under ``<repo>/config/cicd``, so joining the relative allowlist path onto
+    the scan root itself cannot resolve under the canonical invocation.
+    """
+    if explicit_repo_root is not None:
+        return explicit_repo_root
+    if root.name == "elspeth" and root.parent.name == "src":
+        return root.parent.parent
+    return root
 
 
 def load_options_metadata_allowlist(path: Path) -> set[str]:

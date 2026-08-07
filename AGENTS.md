@@ -14,7 +14,8 @@ diagnostics.
 ```bash
 source .venv/bin/activate      # uv-managed venv (Python 3.12+)
 pytest tests/                  # full suite; the plain default selection IS the CI-equivalent run
-elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
+  elspeth-lints check --rules all --root src/elspeth   # static-analysis / trust-tier lint gate
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
@@ -27,7 +28,16 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   ran zero rules and exited 0 — a green that certified any tree. Whole-repo
   rules also assume `--root` is a real source tree, so scope it
   (`--root src/elspeth`) rather than letting it default to the cwd and walk
-  `.venv`/`.uv-cache`.
+  `.venv`/`.uv-cache`. The `ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE`
+  prefix is what lets a keyless agent run it at all: signature verification
+  otherwise demands `ELSPETH_JUDGE_METADATA_HMAC_KEY`, which agents must never
+  hold ([O1]). Shape-only verification cannot detect forged judge metadata, so
+  a trusted context must re-verify before any merge is authoritative — the
+  same treatment CI gives fork PRs.
+- That gate currently exits 1 with a large finding corpus. This is the
+  deliberate fail-closed state described under "Judge-signature stage", tracked
+  as `elspeth-13f0cc04fb` — not a regression you introduced. Compare against
+  the corpus before and after your change rather than expecting zero.
 - Treat the trust-tier gate as a catch-obvious-bug-hiding check, not a death
   pact. Review every touched file in full, not only changed lines; apply the
   trust-tier rules to production code and clean related tests, configuration,

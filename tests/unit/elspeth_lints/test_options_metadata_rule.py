@@ -87,6 +87,39 @@ def test_options_metadata_cli_json_mode_succeeds_on_current_plugins() -> None:
     assert json.loads(result.stdout) == []
 
 
+def test_options_metadata_cli_resolves_allowlist_from_the_canonical_scan_root() -> None:
+    """The rule must run under ``--root src/elspeth``, the documented gate invocation.
+
+    Allowlist governance lives at ``<repo>/config/cicd`` while the canonical scan
+    root is ``<repo>/src/elspeth``, so joining the relative allowlist path onto the
+    scan root points at a path that cannot exist.
+    """
+    project_root = Path(__file__).resolve().parents[3]
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "elspeth_lints.core.cli",
+            "check",
+            "--rules",
+            "plugin_contract.options_metadata",
+            "--root",
+            "src/elspeth",
+            "--format",
+            "json",
+        ],
+        cwd=project_root,
+        env={"PYTHONPATH": str(project_root / "elspeth-lints" / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert "FileNotFoundError" not in result.stderr, result.stderr
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_registered_rule_is_production_rule() -> None:
     assert isinstance(RULE, OptionsMetadataRule)
     assert RULE.id == "plugin_contract.options_metadata"
