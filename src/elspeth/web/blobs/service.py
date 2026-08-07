@@ -953,6 +953,111 @@ def _persist_blob_content(
             raise
 
 
+def persist_inline_custody_blob_on_connection(
+    conn: Connection,
+    *,
+    data_dir: Path,
+    max_storage_per_session: int,
+    request: InlineCustodyRequest,
+    write_fence: BlobGuidedOperationWriteFence | None,
+) -> Row[Any]:
+    """Settle one inline-custody blob inside an enclosing atomic transaction.
+
+    The three-phase committed protocol (:func:`_persist_blob_content`) keeps
+    partial custody crash-safe when the blob write is its own operation. The
+    guided-full atomic staging cohort provides that atomicity itself: the
+    originating chat message, this blob row, and the proposal settle in ONE
+    caller-owned transaction, which is the only ordering under which the
+    composite lineage FK (created_from_message_id, session_id) is satisfiable
+    at insert time (elspeth-1e3ad83d89). No transaction is opened or committed
+    here. The single external effect is the content file write — validated by
+    hash and idempotent under the deterministic blob id — whose
+    orphan-file-on-rollback residue matches the committed protocol's own crash
+    residue.
+    """
+    if type(max_storage_per_session) is not int or max_storage_per_session <= 0:
+        raise ValueError("max_storage_per_session must be a positive exact integer")
+    if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
+        raise TypeError("write_fence must be an exact BlobGuidedOperationWriteFence")
+    fields = _normalized_inline_custody_fields(request)
+    blob_id = str(inline_custody_blob_id(request))
+    session_id = fields["session_id"]
+    storage = data_dir.expanduser().resolve() / "blobs" / session_id / f"{blob_id}_{fields['filename']}"
+    expected: _ExpectedBlobFields = {
+        "session_id": session_id,
+        "filename": fields["filename"],
+        "mime_type": fields["mime_type"],
+        "size_bytes": len(request.content),
+        "content_hash": content_hash(request.content),
+        "created_by": "assistant",
+        "source_description": fields["source_description"],
+        "creation_modality": fields["creation_modality"],
+        "created_from_message_id": fields["created_from_message_id"],
+        "creating_model_identifier": fields["creating_model_identifier"],
+        "creating_model_version": fields["creating_model_version"],
+        "creating_provider": fields["creating_provider"],
+        "creating_composer_skill_hash": fields["creating_composer_skill_hash"],
+        "creating_arguments_hash": fields["creating_arguments_hash"],
+    }
+    _acquire_blob_phase_lock(conn, session_id)
+    _lock_session_for_blob_quota(conn, session_id)
+    _require_live_blob_write_fence(
+        conn,
+        session_id=session_id,
+        fork_write_fence=None,
+        guided_operation_write_fence=write_fence,
+    )
+    row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
+    if row is None:
+        current_total = conn.execute(
+            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
+        ).scalar()
+        if type(current_total) is not int:
+            raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
+        if current_total + expected["size_bytes"] > max_storage_per_session:
+            raise BlobQuotaExceededError(
+                session_id,
+                current_bytes=current_total,
+                limit_bytes=max_storage_per_session,
+            )
+        conn.execute(
+            blobs_table.insert().values(
+                id=blob_id,
+                session_id=session_id,
+                filename=expected["filename"],
+                mime_type=expected["mime_type"],
+                size_bytes=expected["size_bytes"],
+                content_hash=expected["content_hash"],
+                storage_path=str(storage),
+                created_at=datetime.now(UTC),
+                created_by=expected["created_by"],
+                source_description=expected["source_description"],
+                status="pending",
+                creation_modality=expected["creation_modality"].value,
+                created_from_message_id=expected["created_from_message_id"],
+                creating_model_identifier=expected["creating_model_identifier"],
+                creating_model_version=expected["creating_model_version"],
+                creating_provider=expected["creating_provider"],
+                creating_composer_skill_hash=expected["creating_composer_skill_hash"],
+                creating_arguments_hash=expected["creating_arguments_hash"],
+            )
+        )
+        row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+    _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
+    _write_or_validate_reserved_blob(
+        row=row,
+        storage=storage,
+        content=request.content,
+        expected_hash=expected["content_hash"],
+        blob_id=blob_id,
+    )
+    if row.status == "pending":
+        conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id).values(status="ready"))
+    final_row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+    _guard_blob_row_literals(final_row)
+    return final_row
+
+
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
     """Recursively inspect an option value for blob identity markers."""
     if type(value) is dict:

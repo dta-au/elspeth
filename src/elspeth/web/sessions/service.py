@@ -29,7 +29,7 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError, SQLAlchemyError
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.blobs import BlobForkPlanEntry, fork_blob_id
+from elspeth.contracts.blobs import BlobForkPlanEntry, BlobGuidedOperationWriteFence, fork_blob_id
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
 from elspeth.contracts.composer_audit import ComposerToolStatus, PipelineDispatchAuditPayload
 from elspeth.contracts.composer_interpretation import (
@@ -46,6 +46,7 @@ from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stabl
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
+from elspeth.web.composer.pipeline_custody import finalize_pipeline_custody_on_connection
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -10326,6 +10327,25 @@ class SessionServiceImpl:
             payloads=(),
             payload_store=None,
         )
+        custody_preparation = command.plan.custody_preparation
+        custody_data_dir: Path | None = None
+        if custody_preparation is not None:
+            # Deferred inline custody (elspeth-1e3ad83d89): the blob row's
+            # composite FK (created_from_message_id, session_id) is
+            # satisfiable only after the originating chat message insert
+            # below, so the planner carried the preparation here instead of
+            # finalizing mid-plan. Bind it to THIS cohort before any write.
+            if self._data_dir is None:
+                raise AuditIntegrityError("guided-full deferred custody requires a service data_dir")
+            custody_data_dir = self._data_dir
+            if custody_preparation.request.session_id != command.fence.session_id:
+                raise AuditIntegrityError("guided-full deferred custody targets a different session")
+            if custody_preparation.request.created_from_message_id != str(command.originating_message.message_id):
+                raise AuditIntegrityError("guided-full deferred custody is not anchored to the originating message")
+            staged_source = proposal.pipeline.get("source")
+            staged_blob_id = staged_source.get("blob_id") if isinstance(staged_source, Mapping) else None
+            if staged_blob_id != str(custody_preparation.blob_id):
+                raise AuditIntegrityError("guided-full deferred custody blob differs from the staged source")
         sid = str(command.fence.session_id)
         pid = str(command.proposal_id)
         event_id = str(uuid.uuid4())
@@ -10356,12 +10376,9 @@ class SessionServiceImpl:
                     if composition_content_hash(state_from_record(current_record)) != command.expected_current_content_hash:
                         raise AuditIntegrityError("guided-full observed composition content changed before staging")
 
-                validate_proposal_blob_references(
-                    conn,
-                    session_id=sid,
-                    tool_name="set_pipeline",
-                    arguments=deep_thaw(proposal.pipeline),
-                )
+                # Blob-reference validation moved below the deferred-custody
+                # settle: the staged source's blob row may be materialized in
+                # THIS transaction (elspeth-1e3ad83d89).
                 checkpoint_id = self._insert_composition_state(
                     conn,
                     session_id=sid,
@@ -10405,6 +10422,31 @@ class SessionServiceImpl:
                     sequence_no=sequence_no,
                     composition_state_id=checkpoint.id,
                     writer_principal="route_user_message",
+                )
+                if custody_preparation is not None:
+                    # After the originating-message insert, before the blob
+                    # reference check: the one ordering that satisfies the
+                    # lineage FK and keeps message, blob, and proposal in a
+                    # single atomic cohort (elspeth-1e3ad83d89).
+                    assert command.custody_max_storage_per_session is not None  # command __post_init__ contract
+                    assert custody_data_dir is not None  # validated with the preparation above
+                    finalize_pipeline_custody_on_connection(
+                        custody_preparation,
+                        conn=conn,
+                        data_dir=custody_data_dir,
+                        max_storage_per_session=command.custody_max_storage_per_session,
+                        write_fence=BlobGuidedOperationWriteFence(
+                            session_id=command.fence.session_id,
+                            operation_id=command.fence.operation_id,
+                            lease_token=command.fence.lease_token,
+                            attempt=command.fence.attempt,
+                        ),
+                    )
+                validate_proposal_blob_references(
+                    conn,
+                    session_id=sid,
+                    tool_name="set_pipeline",
+                    arguments=deep_thaw(proposal.pipeline),
                 )
                 audit_messages = self._insert_prepared_guided_audit_rows_on_connection(
                     conn,

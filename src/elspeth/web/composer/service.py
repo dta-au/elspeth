@@ -3048,6 +3048,10 @@ class ComposerServiceImpl:
                     lease_token=operation_fence.lease_token,
                     attempt=operation_fence.attempt,
                 ),
+                # Guided-full inserts its originating chat message only inside
+                # the atomic staging settlement; finalizing inline custody
+                # mid-plan violates the blob lineage FK (elspeth-1e3ad83d89).
+                defer_finalize=True,
             ),
             lifecycle=self._planner_request_lifecycle(progress),
             recorder=recorder,

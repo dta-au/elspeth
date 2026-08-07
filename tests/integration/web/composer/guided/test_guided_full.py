@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -21,6 +22,7 @@ from elspeth.web.composer.pipeline_proposal import PipelineProposal, PresentBase
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.guided_replay import project_composition_proposal
 from elspeth.web.sessions.models import (
+    blobs_table,
     chat_messages_table,
     composition_proposals_table,
     composition_states_table,
@@ -1141,6 +1143,189 @@ def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_
     # provider fault.
     bare_expected = "planner_repair_exhausted" if code == "REPAIR_EXHAUSTED" else "invalid_provider_response"
     assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == bare_expected
+
+
+_INLINE_CSV_CONTENT = b"color_name,hex\nred,#f00\n"
+
+
+class _InlineCustodyPlanner:
+    """Deterministic planner that performs REAL inline-custody preparation.
+
+    The provider is scripted, but nothing about custody is mocked: the
+    preparation is the production ``prepare_pipeline_custody`` output and the
+    settlement materializes the blob against the real session database with
+    foreign keys enforced (elspeth-1e3ad83d89's fix_verification demands
+    exactly this shape — the FK defect was invisible to every test that
+    stubbed custody out).
+    """
+
+    async def plan_guided_full_pipeline(self, *, base, recorder, policy_catalog, originating_message, **_kwargs):
+        from elspeth.contracts.enums import CreationModality
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.blobs.service import content_hash
+        from elspeth.web.composer.pipeline_custody import prepare_pipeline_custody
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PlannerSurface
+        from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
+
+        pipeline = {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "results",
+                "on_validation_failure": "discard",
+                "inline_blob": {
+                    "filename": "input.csv",
+                    "mime_type": "text/csv",
+                    "content": _INLINE_CSV_CONTENT.decode("utf-8"),
+                },
+            },
+            "nodes": [],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": "results",
+                    "plugin": "json",
+                    "options": {"path": "/data/results.jsonl"},
+                    "on_write_failure": "discard",
+                }
+            ],
+        }
+        prepared = _PreparedBlobCreate(
+            blob_id="00000000-0000-4000-8000-00000000feed",
+            filename="input.csv",
+            mime_type="text/csv",
+            content_bytes=_INLINE_CSV_CONTENT,
+            content_hash=content_hash(_INLINE_CSV_CONTENT),
+            storage_path=Path("unused-provisional-path"),
+            description=None,
+            creation_modality=CreationModality.LLM_GENERATED,
+            created_from_message_id=originating_message.message_id,
+            creating_model_identifier="deterministic-inline-custody-planner",
+            creating_model_version="v1",
+            creating_provider="test",
+            creating_composer_skill_hash=stable_hash("inline-custody-planner-skill"),
+            creating_arguments_hash=stable_hash("inline-custody-planner-arguments"),
+        )
+        preparation = prepare_pipeline_custody(
+            pipeline,
+            prepared,
+            session_id=originating_message.session_id,
+        )
+        proposal = PipelineProposal.create(
+            pipeline=deep_thaw(preparation.arguments),
+            base=base,
+            reviewed_facts={},
+            surface=PlannerSurface.GUIDED_FULL,
+            repair_count=0,
+            skill_hash=stable_hash("deterministic-inline-custody-planner"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        )
+        return (
+            PipelinePlanResult(
+                proposal=proposal,
+                tool_call_id=f"guided-full-inline-{proposal.draft_hash[:16]}",
+                custody_result="ready",
+                model_identifier="deterministic-inline-custody-planner",
+                model_version="v1",
+                provider="test",
+                custody_preparation=preparation,
+            ),
+            {
+                "source": frozenset(item.name for item in policy_catalog.list_sources()),
+                "transform": frozenset(item.name for item in policy_catalog.list_transforms()),
+                "sink": frozenset(item.name for item in policy_catalog.list_sinks()),
+            },
+        )
+
+
+def test_guided_full_inline_custody_settles_atomically_with_its_originating_message(composer_test_client) -> None:
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody"}).json()
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={
+            "operation_id": "00000000-0000-4000-8000-000000000021",
+            "intent": "Load my inline CSV and write it out as JSON.",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    engine = composer_test_client.app.state.session_engine
+    with engine.connect() as conn:
+        blob = conn.execute(select(blobs_table)).mappings().one()
+        user_row = conn.execute(select(chat_messages_table).where(chat_messages_table.c.role == "user")).mappings().one()
+        proposal_row = conn.execute(select(composition_proposals_table)).mappings().one()
+        # The lineage FK is REAL here (session engines refuse to start
+        # without enforcement); prove the settled graph satisfies it.
+        assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+        assert blob["status"] == "ready"
+        assert blob["session_id"] == session["id"]
+        assert blob["created_from_message_id"] == user_row["id"]
+        assert blob["creation_modality"] == "llm_generated"
+        assert proposal_row["arguments_json"]["source"]["blob_id"] == blob["id"]
+    assert Path(blob["storage_path"]).read_bytes() == _INLINE_CSV_CONTENT
+
+    replay = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={
+            "operation_id": "00000000-0000-4000-8000-000000000021",
+            "intent": "Load my inline CSV and write it out as JSON.",
+        },
+    )
+    assert replay.status_code == 200
+    assert replay.json() == response.json()
+
+
+def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(composer_test_client) -> None:
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full inline custody fault"}).json()
+    engine = composer_test_client.app.state.session_engine
+    armed = True
+
+    def inject_fault(_conn, _cursor, _statement, _parameters, context, _executemany):
+        nonlocal armed
+        if not armed:
+            return
+        compiled = getattr(context, "compiled", None)
+        target_table = getattr(getattr(compiled, "statement", None), "table", None)
+        if target_table is blobs_table:
+            armed = False
+            raise RuntimeError("injected blob fault")
+
+    event.listen(engine, "before_cursor_execute", inject_fault)
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000022",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", inject_fault)
+
+    assert response.status_code == 500, response.text
+    assert not armed, "blob fault point was not reached"
+    with engine.connect() as conn:
+        # The blob write joined the atomic cohort: its fault must take the
+        # originating message, checkpoint, and proposal down with it.
+        assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_states_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000022")
+            )
+            .mappings()
+            .one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["originating_message_id"] is None
 
 
 @pytest.mark.parametrize(

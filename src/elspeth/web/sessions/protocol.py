@@ -1740,6 +1740,11 @@ class GuidedFullPipelineProposalStageCommand:
     actor: str
     originating_message: GuidedOriginatingUserMessageDraft
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+    # Required exactly when plan.custody_preparation is present: the quota
+    # ceiling the deferred inline-custody settlement enforces when it
+    # materializes the blob inside the staging transaction
+    # (elspeth-1e3ad83d89).
+    custody_max_storage_per_session: int | None = None
 
     def __post_init__(self) -> None:
         from elspeth.web.composer.pipeline_planner import PipelinePlanResult
@@ -1783,6 +1788,12 @@ class GuidedFullPipelineProposalStageCommand:
             raise AuditIntegrityError("guided-full originating message must be exact")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided-full audit evidence must be exact")
+        if self.custody_max_storage_per_session is not None and (
+            type(self.custody_max_storage_per_session) is not int or self.custody_max_storage_per_session <= 0
+        ):
+            raise AuditIntegrityError("guided-full custody storage ceiling must be a positive int or None")
+        if self.plan.custody_preparation is not None and self.custody_max_storage_per_session is None:
+            raise AuditIntegrityError("guided-full deferred custody requires a storage ceiling")
         freeze_fields(self, "affects", "arguments_redacted_json")
 
 

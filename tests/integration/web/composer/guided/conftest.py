@@ -362,6 +362,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     # reviews through the session principal's snapshot.
     session_service = SessionServiceImpl(
         engine,
+        data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.conftest"),
         plugin_snapshot_factory=_principal_snapshot,
@@ -433,6 +434,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         restarted_app.state.execution_service = _GuidedTestExecutionService(restarted_app)
         restarted_app.state.session_service = SessionServiceImpl(
             restarted_engine,
+            data_dir=tmp_path,
             telemetry=build_sessions_telemetry(),
             log=structlog.get_logger("test.guided.conftest.restarted"),
             plugin_snapshot_factory=_restarted_principal_snapshot,

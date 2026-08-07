@@ -490,6 +490,9 @@ async def post_guided_plan(
                             llm_calls=recorder.llm_calls,
                             chat_turns=recorder.chat_turns,
                         ),
+                        # Quota ceiling for the deferred inline-custody settle
+                        # inside the staging transaction (elspeth-1e3ad83d89).
+                        custody_max_storage_per_session=(request.app.state.settings.max_blob_storage_per_session_bytes),
                     )
                 )
             )

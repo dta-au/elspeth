@@ -60,7 +60,11 @@ from elspeth.web.composer.llm_response_parsing import (
     build_llm_call_record,
     supports_anthropic_prompt_cache_markers,
 )
-from elspeth.web.composer.pipeline_custody import finalize_pipeline_custody, prepare_pipeline_custody
+from elspeth.web.composer.pipeline_custody import (
+    PipelineCustodyPreparation,
+    finalize_pipeline_custody,
+    prepare_pipeline_custody,
+)
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, ProposalBase, reviewed_anchor_hash
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.progress import (
@@ -549,6 +553,12 @@ class PlannerCustodyConfig:
     secret_service: WebSecretResolver | None
     runtime_preflight: RuntimePreflight | None
     write_fence: BlobGuidedOperationWriteFence | None = None
+    # Guided-full defers inline-custody finalization into the atomic staging
+    # settlement: the blob row's composite lineage FK requires the originating
+    # chat message row, which that surface only inserts at settlement
+    # (elspeth-1e3ad83d89). Surfaces whose originating message already exists
+    # (freeform chat) keep finalizing mid-plan.
+    defer_finalize: bool = False
 
     def __post_init__(self) -> None:
         if type(self.data_dir) is not str or not self.data_dir.strip():
@@ -557,6 +567,8 @@ class PlannerCustodyConfig:
             raise ValueError("max_storage_per_session must be a positive exact integer")
         if self.write_fence is not None and type(self.write_fence) is not BlobGuidedOperationWriteFence:
             raise TypeError("PlannerCustodyConfig.write_fence must be an exact BlobGuidedOperationWriteFence")
+        if type(self.defer_finalize) is not bool:
+            raise TypeError("PlannerCustodyConfig.defer_finalize must be an exact bool")
 
 
 PlannerSettlement = Literal["complete", "failed", "cancelled"]
@@ -662,6 +674,12 @@ class PipelinePlanResult:
     model_identifier: str
     model_version: str
     provider: str
+    # Present exactly when custody finalization was deferred to the staging
+    # settlement (elspeth-1e3ad83d89): the prepared inline source the
+    # settlement must materialize atomically with the originating message.
+    # In-memory only — never persisted or projected; ``custody_result`` stays
+    # "ready" because the proposal cannot settle without the blob settling.
+    custody_preparation: PipelineCustodyPreparation | None = None
 
     def __post_init__(self) -> None:
         if type(self.proposal) is not PipelineProposal:
@@ -671,6 +689,10 @@ class PipelinePlanResult:
         custody_result = cast(Any, self.custody_result)
         if type(custody_result) is not str or custody_result not in {"not_required", "ready"}:
             raise ValueError("custody_result must be 'not_required' or 'ready'")
+        if self.custody_preparation is not None and type(self.custody_preparation) is not PipelineCustodyPreparation:
+            raise TypeError("custody_preparation must be an exact PipelineCustodyPreparation or None")
+        if self.custody_preparation is not None and custody_result != "ready":
+            raise ValueError("custody_preparation requires custody_result 'ready'")
         for name, value in (
             ("model_identifier", self.model_identifier),
             ("model_version", self.model_version),
@@ -2088,6 +2110,7 @@ async def _build_valid_pipeline_plan(
 
     safe_pipeline: Mapping[str, Any] = pipeline
     custody_result: PipelineCustodyResult = "not_required"
+    custody_preparation: PipelineCustodyPreparation | None = None
     if candidate.prepared_inline_blob is not None:
         if custody_config.session_engine is None:
             raise AuditIntegrityError("inline pipeline custody requires session_engine")
@@ -2096,15 +2119,22 @@ async def _build_valid_pipeline_plan(
             candidate.prepared_inline_blob,
             session_id=originating_message.session_id,
         )
-        await _await_custody_settlement(
-            finalize_pipeline_custody(
-                preparation,
-                engine=custody_config.session_engine,
-                data_dir=custody_config.data_dir,
-                max_storage_per_session=custody_config.max_storage_per_session,
-                write_fence=custody_config.write_fence,
+        if custody_config.defer_finalize:
+            # The blob row's lineage FK needs the originating chat message,
+            # which this surface inserts only inside the atomic staging
+            # settlement — carry the preparation there instead of violating
+            # the FK here (elspeth-1e3ad83d89).
+            custody_preparation = preparation
+        else:
+            await _await_custody_settlement(
+                finalize_pipeline_custody(
+                    preparation,
+                    engine=custody_config.session_engine,
+                    data_dir=custody_config.data_dir,
+                    max_storage_per_session=custody_config.max_storage_per_session,
+                    write_fence=custody_config.write_fence,
+                )
             )
-        )
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
         safe_context = replace(
             terminal_context,
@@ -2144,6 +2174,7 @@ async def _build_valid_pipeline_plan(
         model_identifier=model_identifier,
         model_version=model_version,
         provider=provider,
+        custody_preparation=custody_preparation,
     )
 
 

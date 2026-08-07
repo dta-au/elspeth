@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from pydantic import JsonValue
-from sqlalchemy import Engine
+from sqlalchemy import Connection, Engine
 
 from elspeth.contracts.blobs import (
     AllowedMimeType,
@@ -32,6 +32,7 @@ from elspeth.web.blobs.service import (
     BlobServiceImpl,
     content_hash,
     inline_custody_blob_id,
+    persist_inline_custody_blob_on_connection,
     sanitize_filename,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
@@ -238,6 +239,40 @@ def prepare_pipeline_custody(
         request=request,
         blob_id=blob_id,
     )
+
+
+def finalize_pipeline_custody_on_connection(
+    preparation: PipelineCustodyPreparation,
+    *,
+    conn: Connection,
+    data_dir: str | Path,
+    max_storage_per_session: int,
+    write_fence: BlobGuidedOperationWriteFence | None,
+) -> None:
+    """Materialize a prepared inline source inside a caller-owned transaction.
+
+    The guided-full staging settlement calls this AFTER inserting the
+    originating chat message on the same connection, so the blob row's
+    composite lineage FK (created_from_message_id, session_id) is satisfiable
+    — the mid-planning :func:`finalize_pipeline_custody` path cannot order
+    those writes and fails the FK on every inline guided-full plan
+    (elspeth-1e3ad83d89).
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
+        raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
+    if write_fence is not None and write_fence.session_id != preparation.request.session_id:
+        raise AuditIntegrityError("Pipeline custody write fence targets a different session")
+    row = persist_inline_custody_blob_on_connection(
+        conn,
+        data_dir=Path(data_dir),
+        max_storage_per_session=max_storage_per_session,
+        request=preparation.request,
+        write_fence=write_fence,
+    )
+    if str(row.id) != str(preparation.blob_id):
+        raise AuditIntegrityError("Inline custody settled a blob id different from the prepared proposal")
 
 
 async def finalize_pipeline_custody(
