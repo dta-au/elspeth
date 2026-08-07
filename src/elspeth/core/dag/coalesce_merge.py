@@ -22,8 +22,8 @@ Three operations are provided:
 Both functions are called by builder.py during graph construction and can
 be called directly by tests to verify semantics without reimplementing logic.
 
-merge_union_contracts is re-exported here for discoverability next to its
-build-time sibling.
+The runtime sibling merge_union_contracts lives in
+elspeth.contracts.union_merge; import it from there.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ from typing import Literal
 from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.union_merge import (
     UnionTypeConflictError,
-    merge_union_contracts,
     merge_union_field_flags,
 )
 from elspeth.core.dag.models import GraphValidationError
@@ -42,7 +41,6 @@ from elspeth.core.dag.models import GraphValidationError
 __all__ = [
     "merge_coalesce_schema",
     "merge_guaranteed_fields",
-    "merge_union_contracts",
     "merge_union_fields",
 ]
 
