@@ -69,6 +69,7 @@ class TestCachedRuntimePreflightTelemetry:
         monkeypatch: pytest.MonkeyPatch,
         *,
         strict: ValidationResult,
+        interpretation_tolerant: bool = False,
     ) -> list[tuple[int, dict[str, Any]]]:
         counter = _FakeCounter()
         monkeypatch.setattr(service_module, "_RUNTIME_PREFLIGHT_COUNTER", counter)
@@ -88,13 +89,14 @@ class TestCachedRuntimePreflightTelemetry:
             cache=service._new_runtime_preflight_cache(),
             initial_version=1,
             session_scope="session:test",
+            interpretation_tolerant=interpretation_tolerant,
         )
         return counter.emitted
 
     @pytest.mark.anyio
     async def test_green_verdict(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         emitted = await self._emit(tmp_path, monkeypatch, strict=_valid_result())
-        assert emitted == [(1, {"outcome": "returned", "verdict": "valid"})]
+        assert emitted == [(1, {"outcome": "returned", "verdict": "valid", "interpretation_tolerant": False})]
 
     @pytest.mark.anyio
     async def test_red_verdict_is_not_recorded_as_a_success(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -102,13 +104,22 @@ class TestCachedRuntimePreflightTelemetry:
         ``outcome=success``, so "the preflight ran and said no" had no
         observability surface anywhere."""
         emitted = await self._emit(tmp_path, monkeypatch, strict=_structural_failure_result())
-        assert emitted == [(1, {"outcome": "returned", "verdict": "invalid"})]
+        assert emitted == [(1, {"outcome": "returned", "verdict": "invalid", "interpretation_tolerant": False})]
         assert all(attrs.get("outcome") != "success" for _value, attrs in emitted)
 
     @pytest.mark.anyio
     async def test_pending_review_verdict(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         emitted = await self._emit(tmp_path, monkeypatch, strict=_handoff_result())
-        assert emitted == [(1, {"outcome": "returned", "verdict": "pending_review"})]
+        assert emitted == [(1, {"outcome": "returned", "verdict": "pending_review", "interpretation_tolerant": False})]
+
+    @pytest.mark.anyio
+    async def test_tolerant_revalidation_is_marked_on_the_verdict_series(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The masked re-validation runs with ``interpretation_tolerant=True`` and
+        its verdicts must not land on the strict series: the cache key carries
+        the flag, so an emit without it double-counts every pending-review turn
+        as a strict green (handover E-7)."""
+        emitted = await self._emit(tmp_path, monkeypatch, strict=_valid_result(), interpretation_tolerant=True)
+        assert emitted == [(1, {"outcome": "returned", "verdict": "valid", "interpretation_tolerant": True})]
 
     @pytest.mark.anyio
     async def test_raising_preflight_still_reports_the_transport_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

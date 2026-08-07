@@ -2294,7 +2294,17 @@ class ComposerServiceImpl:
                 initial_version=initial_version,
                 llm_calls=llm_calls,
             )
-        _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "returned", "verdict": _preflight_verdict(entry)})
+        _RUNTIME_PREFLIGHT_COUNTER.add(
+            1,
+            {
+                "outcome": "returned",
+                "verdict": _preflight_verdict(entry),
+                # The cache key carries this flag, so without it here the masked
+                # re-validation's "valid" lands on the same series as a strict
+                # green and every pending-review turn double-counts.
+                "interpretation_tolerant": interpretation_tolerant,
+            },
+        )
         return entry
 
     async def _pending_handoff_outstanding_findings(
@@ -4140,13 +4150,18 @@ class ComposerServiceImpl:
                 # BATCH — ``request_interpretation_review`` succeeded and
                 # terminated the batch — which is ground truth that a review was
                 # staged even when the preflight was not computed this turn
-                # (None) or came back green. Re-appending on the pending-handoff
-                # shape would emit the suffix TWICE and pass
+                # (None), came back green, or came back red for an unrelated
+                # reason. The one exclusion is the pending-handoff shape: the
+                # shared tail in ``_surface_and_finalize_no_tools`` appends the
+                # suffix for exactly that shape, so this predicate is its exact
+                # complement — one side always announces the staged card, never
+                # both. Re-appending on the pending-handoff shape would emit the
+                # suffix TWICE and pass
                 # ``_enforce_augmentation_prefix_invariant`` silently, since a
                 # doubled suffix still keeps the prose as a strict prefix.
                 handoff_result = (
                     _append_interpretation_review_handoff_message(result, dispatch.raw_assistant_content)
-                    if (result.runtime_preflight is None or result.runtime_preflight.is_valid)
+                    if (result.runtime_preflight is None or not _is_pending_interpretation_handoff(result.runtime_preflight))
                     else result
                 )
                 threaded = replace(
