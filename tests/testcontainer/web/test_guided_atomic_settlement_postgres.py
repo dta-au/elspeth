@@ -86,6 +86,7 @@ def _command(
                     status=ComposerChatTurnStatus.SUCCESS,
                     started_at=now,
                     finished_at=now,
+                    turn_token="e" * 64,
                 ),
             )
         )

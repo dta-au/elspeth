@@ -344,6 +344,15 @@ class ComposerChatTurn:
     accepted at the route to assistant message persisted in
     ``chat_history``.  On the synthetic-unavailable path it is still
     populated (the time spent waiting for the failing LLM call).
+
+    ``turn_token`` is the guided occurrence token the user message was
+    submitted under (validated against ``guided_turn_token`` before the
+    turn settles), mirroring ``ChatTurn.turn_token`` on the session side
+    (elspeth-ea80e34fdc).  Without it an auditor cannot tell which
+    occurrence a chat turn answered — a retry of an earlier occurrence
+    and a fresh message at the current one are indistinguishable after
+    the fact.  A ``USER`` turn always has one; a ``STEP_ENTRY_OPENER``
+    is server-initiated with no submitted token and must carry ``None``.
     """
 
     step: str
@@ -356,6 +365,7 @@ class ComposerChatTurn:
     status: ComposerChatTurnStatus
     started_at: datetime
     finished_at: datetime
+    turn_token: str | None
     error_class: str | None = None
 
     def __post_init__(self) -> None:
@@ -373,6 +383,11 @@ class ComposerChatTurn:
             raise TypeError(f"initiator must be ComposerChatInitiator, got {type(self.initiator).__name__}")
         if type(self.status) is not ComposerChatTurnStatus:
             raise TypeError(f"status must be ComposerChatTurnStatus, got {type(self.status).__name__}")
+        _require_non_empty_str(self.turn_token, "turn_token", optional=True)
+        if self.initiator is ComposerChatInitiator.USER and self.turn_token is None:
+            raise ValueError("turn_token must be populated when initiator is USER")
+        if self.initiator is ComposerChatInitiator.STEP_ENTRY_OPENER and self.turn_token is not None:
+            raise ValueError("turn_token must be None when initiator is STEP_ENTRY_OPENER")
         _require_non_empty_str(self.error_class, "error_class", optional=True)
         if self.status is ComposerChatTurnStatus.SUCCESS and self.error_class is not None:
             raise ValueError("error_class must be None when status is SUCCESS")

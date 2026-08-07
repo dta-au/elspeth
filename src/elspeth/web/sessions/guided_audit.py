@@ -225,6 +225,7 @@ def prepare_guided_audit_rows(
                 "chat_turn_seq": turn.chat_turn_seq,
                 "model": turn.model,
                 "latency_ms": turn.latency_ms,
+                "turn_token": turn.turn_token,
                 "error_class": turn.error_class,
             }
         )

@@ -332,6 +332,7 @@ def _audit_evidence() -> tuple[ComposerToolInvocation, ComposerLLMCall, Composer
         status=ComposerChatTurnStatus.SUCCESS,
         started_at=now,
         finished_at=now,
+        turn_token="e" * 64,
     )
     return invocation, llm_call, chat_turn
 

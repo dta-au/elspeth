@@ -1672,6 +1672,11 @@ async def post_guided_chat_schema8(
                             status=chat_result.status,
                             started_at=started_at,
                             finished_at=finished_at,
+                            # Same occurrence binding the session-side ChatTurn
+                            # carries: the token this message answered, so the
+                            # audit trail can distinguish a retry of an earlier
+                            # occurrence from a fresh message (elspeth-ea80e34fdc).
+                            turn_token=body.turn_token,
                             error_class=chat_result.error_class,
                         )
                     )

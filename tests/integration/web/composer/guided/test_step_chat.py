@@ -374,6 +374,8 @@ class TestStepChatSuccess:
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        submitted_token = guided.json()["next_turn"]["turn_token"]
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,
@@ -383,6 +385,7 @@ class TestStepChatSuccess:
                 composer_test_client,
                 session_id,
                 message="ping",
+                turn_token=submitted_token,
             )
 
         # The content carries the slim summary fields.
@@ -394,6 +397,10 @@ class TestStepChatSuccess:
         assert body["step"] == "step_1_source"
         assert body["initiator"] == "user"
         assert body["chat_turn_seq"] == 0
+        # The audit row binds the occurrence the message answered — the
+        # token the request was submitted under, not merely "a" token
+        # (elspeth-ea80e34fdc).
+        assert body["turn_token"] == submitted_token
         # latency is captured but non-deterministic; assert presence only.
         assert isinstance(body["latency_ms"], int)
         assert body["latency_ms"] >= 0
@@ -437,6 +444,8 @@ class TestStepChatSuccess:
         """
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        submitted_token = guided.json()["next_turn"]["turn_token"]
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,
@@ -446,6 +455,7 @@ class TestStepChatSuccess:
                 composer_test_client,
                 session_id,
                 message="ping",
+                turn_token=submitted_token,
             )
 
         audit_bodies = _chat_turn_audit_bodies(composer_test_client, session_id)
@@ -453,6 +463,9 @@ class TestStepChatSuccess:
         body = audit_bodies[0]
         assert body["status"] == "synthetic_unavailable"
         assert body["error_class"] == "TimeoutError"
+        # The synthetic-failure row is exactly the one a later Retry answers:
+        # it must record which occurrence failed (elspeth-ea80e34fdc).
+        assert body["turn_token"] == submitted_token
         assert body["chat_turn_seq"] == 0
         llm_audits = _llm_call_audit_bodies(composer_test_client, session_id)
         assert len(llm_audits) == 1, llm_audits
