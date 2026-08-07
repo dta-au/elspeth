@@ -662,6 +662,63 @@ async def test_empty_choices_records_malformed_response() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case", "choice"),
+    [
+        ("missing-message", SimpleNamespace()),
+        ("non-string-content", SimpleNamespace(message=SimpleNamespace(content=["part-a", "part-b"], tool_calls=None))),
+        ("dict-content", SimpleNamespace(message=SimpleNamespace(content={"text": "hi"}, tool_calls=None))),
+        ("int-content", SimpleNamespace(message=SimpleNamespace(content=7, tool_calls=None))),
+        ("missing-content-attr", SimpleNamespace(message=SimpleNamespace(tool_calls=None))),
+        ("non-sequence-tool-calls", SimpleNamespace(message=SimpleNamespace(content=None, tool_calls={"id": "x"}))),
+        ("missing-tool-calls-attr", SimpleNamespace(message=SimpleNamespace(content="hi"))),
+        (
+            "tool-call-missing-id",
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(function=SimpleNamespace(name="set_metadata", arguments="{}"))],
+                )
+            ),
+        ),
+        (
+            "tool-call-non-string-function-metadata",
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None,
+                    tool_calls=[SimpleNamespace(id="tc_1", function=SimpleNamespace(name=42, arguments="{}"))],
+                )
+            ),
+        ),
+    ],
+)
+async def test_malformed_nonempty_response_records_malformed_not_success(case: str, choice: Any) -> None:
+    """Regression for elspeth-b6be9e991f: a nonempty-but-malformed provider
+    response must classify as MALFORMED_RESPONSE before the audit wrapper
+    records SUCCESS — previously only choices cardinality was validated, so
+    the caller crashed dereferencing message/content/tool_calls after durable
+    audit evidence had already recorded the call as successful.
+    """
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    malformed = _FakeLLMResponse(
+        choices=[choice],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=None, total_tokens=3),
+    )
+
+    with (
+        patch("elspeth.web.composer.service._litellm_acompletion", new_callable=AsyncMock, return_value=malformed),
+        pytest.raises(ComposerServiceError) as exc_info,
+    ):
+        await service.compose("Hello", [], _empty_state())
+
+    llm_calls = _captured_llm_calls(exc_info.value)
+    assert len(llm_calls) == 1
+    call = llm_calls[0]
+    assert call.status is ComposerLLMCallStatus.MALFORMED_RESPONSE, case
+    assert call.error_message == "malformed_response"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_model_call_records_cancelled_status() -> None:
     service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
     cancelled = asyncio.CancelledError()

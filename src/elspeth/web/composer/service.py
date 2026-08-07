@@ -5769,6 +5769,32 @@ class ComposerServiceImpl:
         # index into choices[0].
         if not response.choices:
             raise _MalformedLLMResponseError("LLM returned empty choices array — cannot continue composition", response=response)
+        # elspeth-b6be9e991f: validate every field the compose loop
+        # dereferences BEFORE _call_llm_with_audit classifies the call as
+        # SUCCESS. A malformed-but-nonempty response otherwise crashes after
+        # durable audit evidence already recorded the call as successful.
+        # Tool-batch admission runs here too so provider-authored malformed
+        # tool-call metadata classifies as MALFORMED_RESPONSE instead of
+        # escaping as a post-success AuditIntegrityError; the caller re-runs
+        # admission on the same response, which is pure and cannot diverge.
+        from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+        missing = object()
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, KeyError, TypeError):
+            raise _MalformedLLMResponseError("LLM response choice carries no message", response=response) from None
+        content = getattr(message, "content", missing)
+        if content is missing or (content is not None and type(content) is not str):
+            raise _MalformedLLMResponseError("LLM message content is neither absent nor a string", response=response)
+        tool_calls = getattr(message, "tool_calls", missing)
+        if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
+            raise _MalformedLLMResponseError("LLM message tool_calls is neither absent nor a sequence", response=response)
+        if tool_calls:
+            try:
+                _admit_tool_batch(tool_calls)
+            except AuditIntegrityError as exc:
+                raise _MalformedLLMResponseError(f"LLM tool batch failed admission: {exc}", response=response) from exc
         return response
 
     async def _call_text_llm(
@@ -6319,10 +6345,20 @@ class ComposerServiceImpl:
             # empty-guidance. Empty success would consume budget and tell
             # the composer LLM "you got advice" while no information was
             # actually produced.
-            raw_content = response.choices[0].message.content
-            if raw_content is None or not str(raw_content).strip():
+            try:
+                raw_content = response.choices[0].message.content
+            except (AttributeError, IndexError, KeyError, TypeError):
                 raise _MalformedLLMResponseError(
-                    "Advisor returned empty or whitespace-only content",
+                    "Advisor response carries no message content",
+                    response=response,
+                ) from None
+            # elspeth-b6be9e991f: exact runtime type check, mirroring the
+            # diagnostics path. The earlier ``str(raw_content).strip()``
+            # emptiness probe let a non-string content object (list/dict/int
+            # stringifies non-empty) pass and escape as wrong-typed guidance.
+            if type(raw_content) is not str or not raw_content.strip():
+                raise _MalformedLLMResponseError(
+                    "Advisor returned empty, whitespace-only, or non-string content",
                     response=response,
                 )
             guidance = raw_content

@@ -1160,6 +1160,52 @@ async def test_f4_advisor_empty_content_classified_as_malformed() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(["chunk-a", "chunk-b"], id="list"),
+        pytest.param({"text": "advice"}, id="dict"),
+        pytest.param(7, id="int"),
+        pytest.param("   \n\t ", id="whitespace"),
+        pytest.param("", id="empty-string"),
+    ],
+)
+async def test_advisor_non_string_content_classified_as_malformed(content: object) -> None:
+    """Regression for elspeth-b6be9e991f: the advisor emptiness probe used
+    ``str(raw_content).strip()`` but returned the ORIGINAL object, so a
+    list/dict/int content (which stringifies non-empty) passed as SUCCESS and
+    escaped as wrong-typed guidance. Only an exact non-empty ``str`` may
+    reach the guidance surface; everything else is MALFORMED_RESPONSE.
+    """
+    catalog = _mock_catalog()
+    service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings(budget=3))
+    state = _empty_state()
+    turns = [_make_advisor_tool_call("call_nonstr"), _make_text_only_response("ok")]
+    malformed_response = _FakeLLMResponse(
+        choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))],  # type: ignore[arg-type]
+    )
+
+    with (
+        patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+        patch(
+            "elspeth.web.composer.service._litellm_acompletion",
+            new_callable=AsyncMock,
+            return_value=malformed_response,
+        ),
+    ):
+        mock_llm.side_effect = turns
+        result = await service.compose("help", [], state)
+
+    invs = [i for i in result.tool_invocations if i.tool_name == "request_advisor_hint"]
+    assert len(invs) == 1
+    assert "ADVISOR_ERROR" in _result_canonical(invs[0]), "non-string advisor content was treated as success — should be ADVISOR_ERROR"
+
+    advisor_calls = [c for c in result.llm_calls if c.model_requested == "anthropic/claude-sonnet-4-6"]
+    assert len(advisor_calls) == 1
+    assert advisor_calls[0].status.name == "MALFORMED_RESPONSE"
+
+
+@pytest.mark.asyncio
 async def test_f2_failed_advisor_call_consumes_budget() -> None:
     """F2: When budget is 1 and the first advisor call fails (any LLM-level
     failure), the second call MUST hit BUDGET_EXHAUSTED. Otherwise
