@@ -317,3 +317,159 @@ def walk_effective_guaranteed_fields(
     result = walk_effective_guarantee_vote(graph, node_id, {}, cache)
     cache[node_id] = result.fields
     return result.fields
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedGuaranteeType:
+    """Nearest ancestor declaration for a guarantee-carried field.
+
+    ``field_type`` is the SchemaConfig vocabulary (never ``"any"`` — an
+    ``any`` declaration abstains to ``None`` at the resolution site, because
+    it states no type to check). BASE TYPE ONLY, deliberately: the two
+    pydantic materializations disagree about nullability
+    (``build_coalesce_schema`` folds ``nullable or not required`` into
+    ``| None``; the plugin factory's ``_get_python_type`` reads ``required``
+    alone), so any nullability bit carried here would make the walk stricter
+    than one declared arm or the other and break monotonicity — declaring
+    the identical field must never flip a verdict (elspeth-85e8afa2f5 panel
+    review; the composer's ``_edge_field_type_conflict`` documents abandoning
+    model reconstruction for the same reason). None-at-runtime deaths stay
+    with the per-row preflight. ``declared_by`` names the declaring node(s) —
+    more than one when several branches independently declare the same type —
+    so a rejection can point at the declaration it is enforcing.
+    """
+
+    field_type: str
+    declared_by: frozenset[str]
+
+
+def resolve_guaranteed_field_type(
+    graph: ExecutionGraph,
+    node_id: str,
+    field_name: str,
+    *,
+    _visited: frozenset[str] = frozenset(),
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None = None,
+) -> ResolvedGuaranteeType | None:
+    """Resolve the nearest ancestor DECLARED type of a guarantee-carried field.
+
+    The guarantee walk (``walk_effective_guarantee_vote``) proves presence and
+    deliberately strips types; this walk recovers the type where an ancestor
+    stated one, so build-time validation of a forgiven field
+    (elspeth-85e8afa2f5) can check what is knowable and keep forgiving what is
+    not. ``None`` is ABSTENTION — the type is not provable — and every
+    uncertain arm below collapses to it rather than guessing.
+
+    Nearest declaration wins: a node whose ``output_schema_config`` declares
+    the field settles it (the node may have rewritten or coerced the field —
+    a farther declaration describes a value that no longer flows), and the
+    walk recurses only through nodes that did NOT declare it, following the
+    same topology the guarantee walk traverses (transparent gates,
+    pass-through transforms, queue/row_union fan-in, coalesce branches).
+
+    Soundness for the REJECTING caller is unanimity: every path a runtime
+    value can take must resolve to the same base ``field_type``.
+    The contributor sets below may over-include paths that cannot actually
+    supply the value (e.g. every coalesce branch, regardless of collision
+    policy); that is safe by construction — the true path is always among
+    those considered, so an extra path can only force abstention or agree,
+    never manufacture a wrong unanimous type. Any DIVERT in-edge on a
+    recursed node abstains outright (the row_union guarantee-walk posture):
+    a divert payload is an error envelope, so a stream carrying one has no
+    provable field types — unreachable on builder-produced graphs, where
+    error routing is terminal (see ``_live_predecessors``), and defensive on
+    the public ``add_edge`` surface.
+
+    ``cache`` memoizes on ``(node_id, field_name)`` — same discipline as
+    ``walk_effective_guaranteed_fields``'s cache parameter, and load-bearing
+    for the same reason: without it, nested fan-in re-resolves shared
+    ancestors once per path, which is exponential in fan-in depth (panel
+    F5). Sound to share across a validation pass because built graphs are
+    DAGs, so a resolution is path-independent; on a hand-built cyclic graph
+    the visited-guard's ``None`` is conservative (abstention) either way.
+    """
+    if node_id in _visited:
+        # A cycle-break is a fact about this PATH, not about the node —
+        # never cached.
+        return None
+    if cache is not None and (node_id, field_name) in cache:
+        return cache[(node_id, field_name)]
+    result = _resolve_guaranteed_field_type_uncached(graph, node_id, field_name, _visited=_visited, cache=cache)
+    if cache is not None:
+        cache[(node_id, field_name)] = result
+    return result
+
+
+def _resolve_guaranteed_field_type_uncached(
+    graph: ExecutionGraph,
+    node_id: str,
+    field_name: str,
+    *,
+    _visited: frozenset[str],
+    cache: dict[tuple[str, str], ResolvedGuaranteeType | None] | None,
+) -> ResolvedGuaranteeType | None:
+    """Worker for ``resolve_guaranteed_field_type`` — see its docstring."""
+    node_info = graph.get_node_info(node_id)
+    config = node_info.output_schema_config
+    # A gate's own config is its upstream producer's RAW config copied in by
+    # the builder (``_assign_schema(gate_id, _best_schema_config(producer_id))``),
+    # not a declaration the gate made. Recursing past it reaches the identical
+    # declaration at its true owner, so ``declared_by`` attributes the type to
+    # a node the author actually wrote a schema on.
+    if config is not None and config.fields is not None and node_info.node_type is not NodeType.GATE:
+        for field_def in config.fields:
+            if field_def.name == field_name:
+                if field_def.field_type == "any":
+                    return None
+                return ResolvedGuaranteeType(
+                    field_type=field_def.field_type,
+                    declared_by=frozenset({node_id}),
+                )
+
+    recurses = (
+        node_info.node_type in (NodeType.GATE, NodeType.QUEUE, NodeType.ROW_UNION, NodeType.COALESCE) or node_info.passes_through_input
+    )
+    if not recurses:
+        return None
+
+    # A pass-through TRANSFORM runs plugin code that may rewrite a field's
+    # type in place — recursion past it is sound only under the declaration
+    # discipline: a transform that rewrites a field declares it in its output
+    # config (``value_transform`` declares operation targets as ``any``;
+    # ``type_coerce`` declares conversion targets as their target type), so
+    # the own-declaration check above settles rewritten fields before this
+    # point. A pass-through with NO field declarations (observed mode, or no
+    # config at all) has opted out of that discipline and states nothing
+    # about its output — treating its silence as type-preservation readmitted
+    # elspeth-85e8afa2f5 through an observed-mode ``type_coerce`` (panel
+    # review), so it abstains. ``not config.fields`` rather than
+    # ``fields is None``: a declaring config with an EMPTY fields tuple has
+    # equally declared nothing — ``blob_csv_expand`` with ``columns: null``
+    # and ``include_row_index: false`` builds exactly that shape while
+    # merging data-derived CSV headers onto the row (panel sweep), so the
+    # empty tuple must abstain too. Gates, queues, row_unions, and coalesces
+    # stay recursable: they are pure routing/merge and run no row-rewriting
+    # code.
+    if node_info.node_type is NodeType.TRANSFORM and node_info.passes_through_input and (config is None or not config.fields):
+        return None
+
+    in_edges = list(graph._graph.in_edges(node_id, data=True))
+    if any(edge_data["mode"] == RoutingMode.DIVERT for _from_id, _to_id, edge_data in in_edges):
+        return None
+    contributors = sorted({from_id for from_id, _to_id, _edge_data in in_edges})
+    if not contributors:
+        return None
+
+    visited = _visited | {node_id}
+    resolutions = [
+        resolve_guaranteed_field_type(graph, contributor, field_name, _visited=visited, cache=cache) for contributor in contributors
+    ]
+    if any(resolution is None for resolution in resolutions):
+        return None
+    first, *rest = [r for r in resolutions if r is not None]
+    if any(other.field_type != first.field_type for other in rest):
+        return None
+    return ResolvedGuaranteeType(
+        field_type=first.field_type,
+        declared_by=frozenset().union(*(resolution.declared_by for resolution in [first, *rest])),
+    )

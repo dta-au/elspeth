@@ -177,6 +177,27 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   insert a `field_mapper` with `select_only: true` ahead of the locked
   consumer — declaring fewer fields on the consumer cannot drop fields an
   upstream guarantees will arrive.
+- **A guarantee-forgiven field with a conflicting ancestor type is now a
+  build-time error** — the guarantee channel proves a field's presence without
+  its type, so a consumer-required field the producer never declared used to
+  pass build on presence alone even when an ancestor DID type it (a `fixed`
+  source declaring `id: int` four nodes upstream) and the consumer demands an
+  incompatible type (`id: str`): the build stayed green and every row died
+  typed at the consumer's input preflight. Edge validation now walks the
+  guarantee topology for the nearest ancestor declaration and rejects on a
+  unanimous, concrete, incompatible type — the same verdict declaring the
+  field on the producing branches would have produced, attributed to the
+  declaring node. Where the type is genuinely unknowable (observed ancestors,
+  `any` declarations, branches that disagree) the forgiveness stands and the
+  per-row preflight keeps the verdict. Re-typing a stream on purpose needs a
+  declared conversion: insert a `type_coerce` transform declaring the target
+  type in its `schema.fields` ahead of the consumer. In support of this,
+  `type_coerce` with a declaring (non-observed) schema now includes its
+  conversion targets in its output schema declaration even when the input
+  schema omits them — the transform rewrites those fields' types either way,
+  and leaving the rewrite undeclared hid it from build-time validation (and
+  from this check's ancestor walk, which would otherwise enforce a stale
+  upstream type in both directions).
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 

@@ -1114,7 +1114,7 @@ _COALESCE_PIPELINE = """sources:
       schema:
         mode: fixed
         fields:
-        - 'id: int'
+        - 'id: {source_id_type}'
         - 'product: str'
         - 'price: int'
         - 'category: str'
@@ -1230,6 +1230,43 @@ _LOCKED_TRANSFORM = """- name: lock_it
       - 'description: str'
 """
 
+# A two-transform chain after the coalesce: type_coerce genuinely re-types id
+# (input declares 'id: int' — what arrives — and the conversion derives an
+# output config declaring 'id: str'), then a truncate under-declares it back
+# into the guarantee channel. The final producer's model never carries id, so
+# the ancestor-type walk must recurse — and must stop at the NEAREST
+# declaration (retype_id's derived 'id: str'), not the farther source
+# ('id: int'), because the nearer node rewrote the value the farther
+# declaration describes.
+_RETYPE_THEN_PASS = """- name: retype_id
+  plugin: type_coerce
+  input: merge_results
+  on_success: retyped
+  on_error: discard
+  options:
+    conversions:
+      - field: id
+        to: str
+    schema:
+      mode: flexible
+      fields:
+      - 'id: int'
+      - 'description: str'
+- name: pass_after_retype
+  plugin: truncate
+  input: retyped
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 5
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+"""
+
 # field_mapper select_only drops the extras — remedy 3 of the rejection message.
 _SELECT_ONLY_MAPPER = """- name: drop_extras
   plugin: field_mapper
@@ -1255,6 +1292,7 @@ def _build_coalesce_graph(
     policy: str = "require_all",
     extra_transforms: str = "",
     coalesce_out: str = "\n  on_success: output",
+    source_id_type: str = "int",
 ) -> ExecutionGraph:
     """Build fork -> two pass-through branches -> union coalesce -> locked sink."""
     from elspeth.cli_helpers import instantiate_plugins_from_config
@@ -1268,6 +1306,7 @@ def _build_coalesce_graph(
             extra_transforms=extra_transforms,
             sink_fields=sink_fields,
             coalesce_out=coalesce_out,
+            source_id_type=source_id_type,
         )
     )
     plugins = instantiate_plugins_from_config(settings)
@@ -1369,27 +1408,30 @@ class TestUnionCoalesceGuaranteedExtras:
         """
         _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
 
-    @pytest.mark.xfail(
-        reason=(
-            "Type-axis residue of elspeth-7d68b04878, tracked as elspeth-85e8afa2f5: a "
-            "forgiven field's ANCESTOR TYPE is not consulted. The source types id as int and "
-            "this sink demands id: str; with under-declared branches the missing arm forgives "
-            "id on presence alone, the build is GREEN, and every row dies typed at the sink "
-            "preflight (audited FAILED, not silent). The declared control alongside proves the "
-            "same pipeline with fully-declared branches IS rejected with a type mismatch — the "
-            "verdict must not depend on how much a branch declared. Closing needs an "
-            "ancestor-type walk (check when knowable, forgive when not); none exists yet "
-            "(get_effective_producer_schema_config resolves through gates only, and the "
-            "guarantee walk carries names without types by design)."
-        ),
-        strict=True,
-    )
     def test_forgiven_field_with_conflicting_ancestor_type_is_rejected(self) -> None:
-        """Should fail at build with a type mismatch; today it builds green."""
+        """A forgiven field's ancestor type IS consulted (elspeth-85e8afa2f5).
+
+        Formerly a strict xfail pinning the type-axis residue of
+        elspeth-7d68b04878: the source types id as int and this sink demands
+        id: str; with under-declared branches the missing arm forgives id on
+        presence alone, the build was GREEN, and every row died typed at the
+        sink preflight. ``validate_forgiven_field_ancestor_types`` now walks
+        the guarantee topology for the nearest ancestor declaration and
+        restores the declared-control verdict — the same mismatch the
+        declared A/B control below reports, attributed to the declaring
+        SOURCE (not the gate that inherited its config by copy).
+        """
         from elspeth.core.dag.models import EdgeContractError
 
-        with pytest.raises(EdgeContractError):
+        with pytest.raises(EdgeContractError) as exc_info:
             _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE)
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "str", "int"),)
+        assert exc_info.value.from_node_id is not None and exc_info.value.from_node_id.startswith("coalesce_merge_results")
+        assert exc_info.value.to_node_id is not None and exc_info.value.to_node_id.startswith("sink_output")
+        assert "declared by: source_primary" in str(exc_info.value)
 
     def test_declared_branches_expose_the_conflicting_type(self) -> None:
         """The A/B control for the xfail above: declaration restores the verdict.
@@ -1404,6 +1446,58 @@ class TestUnionCoalesceGuaranteedExtras:
 
         with pytest.raises(EdgeContractError, match="Type mismatches"):
             _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED, sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE)
+
+    def test_ancestor_declaring_any_abstains_and_builds(self) -> None:
+        """An ``any`` ancestor declaration states no type — the walk abstains.
+
+        False-reject guard on the new pass: the same wrong-type sink as the
+        rejection test, but the source declares ``id: any``. There is no
+        declared type to enforce, so the forgiven field keeps the per-row
+        posture and the build stays green. Guards against the ``Any``
+        asymmetry in ``_types_compatible`` (universal on the expected side
+        only): letting ``any`` through as the actual type would reject a
+        pipeline for a type nobody stated.
+        """
+        _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE, source_id_type="any")
+
+    def test_nearest_declaration_wins_through_a_retyping_chain(self) -> None:
+        """A nearer re-typing declaration governs over the farther source.
+
+        ``retype_id`` declares ``id: str`` mid-chain and ``pass_after_retype``
+        under-declares it back into the guarantee channel, so the sink's
+        producer never types id. The sink demands ``id: str`` — compatible
+        with the NEAREST declaration and conflicting with the source's
+        ``id: int``. Green proves the walk stops at the nearest declaration;
+        taking the farther source type would reject this runnable pipeline.
+        """
+        _build_coalesce_graph(
+            sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE,
+            extra_transforms=_RETYPE_THEN_PASS,
+            coalesce_out="",
+        )
+
+    def test_nearest_declaration_rejects_against_the_farther_matching_type(self) -> None:
+        """The rejecting direction of the nearest-wins pair above.
+
+        Same chain, but the sink demands ``id: int`` — matching the FARTHER
+        source declaration and conflicting with the nearest (``retype_id``'s
+        ``id: str``). Red with the mismatch attributed to ``retype_id`` proves
+        the walk enforces the declaration closest to the consumer in both
+        directions, not whichever ancestor happens to agree.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(
+                sink_fields=_SINK_ADMITS_ALL,
+                extra_transforms=_RETYPE_THEN_PASS,
+                coalesce_out="",
+            )
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+        assert "declared by: transform_retype_id" in str(exc_info.value)
 
     def test_select_only_field_mapper_clears_the_rejection(self) -> None:
         """The rejection message's remedy 3 must actually clear the rejection.
@@ -1474,6 +1568,335 @@ class TestUnionCoalesceGuaranteedExtras:
 # assemble the verdict.
 _BRANCH_OBSERVED = """    schema:
       mode: observed"""
+
+
+class TestResolveGuaranteedFieldType:
+    """Unit tests for the ancestor-type walk arms the builder fixtures above
+    cannot reach: every ``_build_coalesce_graph`` branch shares ONE source, so
+    cross-branch disagreement, multi-node attribution, partial abstention,
+    fan-in recursion, and DIVERT abstention need hand-built graphs. These are
+    the walk's false-reject guards: each abstention below is a pipeline the
+    new pass must keep GREEN.
+    """
+
+    @staticmethod
+    def _config(fields: list[str], mode: str = "fixed") -> SchemaConfig:
+        return SchemaConfig.from_dict({"mode": mode, "fields": fields})
+
+    def _two_branch_coalesce(self, field_a: str, field_b: str) -> ExecutionGraph:
+        from elspeth.core.dag.graph import ExecutionGraph
+
+        graph = ExecutionGraph()
+        graph.add_node("src_a", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config([field_a]))
+        graph.add_node("src_b", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config([field_b]))
+        graph.add_node("coal", node_type=NodeType.COALESCE, plugin_name="coalesce")
+        graph.add_edge("src_a", "coal", label="a")
+        graph.add_edge("src_b", "coal", label="b")
+        return graph
+
+    def test_cross_branch_disagreement_abstains(self) -> None:
+        """int vs str across branches: the runtime type depends on which
+        branch wins the collision, so no unanimous type exists and the walk
+        must abstain rather than pick a side."""
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = self._two_branch_coalesce("id: int", "id: str")
+        assert resolve_guaranteed_field_type(graph, "coal", "id") is None
+
+    def test_cross_branch_agreement_resolves_and_attributes_both(self) -> None:
+        """Unanimous branches resolve, and declared_by carries every declaring
+        node so the rejection can cite the declarations it enforces."""
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = self._two_branch_coalesce("id: int", "id: int")
+        resolved = resolve_guaranteed_field_type(graph, "coal", "id")
+        assert resolved is not None
+        assert resolved.field_type == "int"
+        assert resolved.declared_by == frozenset({"src_a", "src_b"})
+
+    def test_nullability_disagreement_still_resolves_the_base_type(self) -> None:
+        """'id: int' vs 'id: int?' agree on the BASE type, which is all the
+        walk carries: the two declared-arm materializations disagree about
+        nullability (the plugin factory ignores ``nullable``, the coalesce
+        factory folds it into ``| None``), so consulting it would make the
+        walk stricter than one declared control or the other and break the
+        declare-more monotonicity invariant (panel Blocker 2). None deaths
+        stay with the per-row preflight."""
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = self._two_branch_coalesce("id: int", "id: int?")
+        resolved = resolve_guaranteed_field_type(graph, "coal", "id")
+        assert resolved is not None
+        assert resolved.field_type == "int"
+
+    def test_partial_abstention_collapses_the_vote(self) -> None:
+        """One branch resolves, its sibling cannot (an observed source
+        declares nothing): the value may come from the silent branch, so the
+        resolving branch must not carry the vote alone."""
+        from elspeth.core.dag.graph import ExecutionGraph
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = ExecutionGraph()
+        graph.add_node("src_a", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config(["id: int"]))
+        graph.add_node(
+            "src_b",
+            node_type=NodeType.SOURCE,
+            plugin_name="json",
+            output_schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        )
+        graph.add_node("coal", node_type=NodeType.COALESCE, plugin_name="coalesce")
+        graph.add_edge("src_a", "coal", label="a")
+        graph.add_edge("src_b", "coal", label="b")
+        assert resolve_guaranteed_field_type(graph, "coal", "id") is None
+
+    def test_declaring_but_empty_pass_through_abstains(self) -> None:
+        """A pass-through transform whose output config declares an EMPTY
+        fields tuple has declared nothing — same abstention as observed mode.
+        Pinned because ``blob_csv_expand`` with ``columns: null`` and
+        ``include_row_index: false`` builds exactly this shape while merging
+        data-derived CSV headers onto the row (panel sweep): ``fields is
+        None`` alone would recurse through it to a stale ancestor type."""
+        from elspeth.contracts.schema import SchemaConfig
+        from elspeth.core.dag.graph import ExecutionGraph
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = ExecutionGraph()
+        graph.add_node("src", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config(["id: int"]))
+        graph.add_node(
+            "expander",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="blob_csv_expand",
+            output_schema_config=SchemaConfig(mode="flexible", fields=(), guaranteed_fields=None),
+            passes_through_input=True,
+        )
+        graph.add_edge("src", "expander", label="in")
+        assert resolve_guaranteed_field_type(graph, "expander", "id") is None
+
+    def test_queue_and_row_union_fan_in_resolve_on_agreement(self) -> None:
+        """The QUEUE and ROW_UNION recursion arms resolve when every arm
+        agrees — pinned per kind because the fixture family above never
+        exercises either barrier."""
+        from elspeth.core.dag.graph import ExecutionGraph
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        for barrier_type, barrier_plugin in ((NodeType.QUEUE, "queue"), (NodeType.ROW_UNION, "row_union")):
+            graph = ExecutionGraph()
+            graph.add_node("src_a", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config(["id: int"]))
+            graph.add_node("src_b", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config(["id: int"]))
+            graph.add_node("barrier", node_type=barrier_type, plugin_name=barrier_plugin)
+            graph.add_edge("src_a", "barrier", label="a")
+            graph.add_edge("src_b", "barrier", label="b")
+            resolved = resolve_guaranteed_field_type(graph, "barrier", "id")
+            assert resolved is not None, barrier_plugin
+            assert resolved.field_type == "int", barrier_plugin
+
+    def test_any_declaration_abstains(self) -> None:
+        """'id: any' states no type — the walk abstains at the declaration."""
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = self._two_branch_coalesce("id: any", "id: any")
+        assert resolve_guaranteed_field_type(graph, "coal", "id") is None
+
+    def test_divert_in_edge_abstains_even_when_move_arms_agree(self) -> None:
+        """A DIVERT in-edge carries error envelopes, not declared rows: the
+        stream has no provable field types, so the walk abstains outright —
+        the row_union guarantee-walk posture, defensive on the public
+        add_edge surface (builder error routing is terminal)."""
+        from elspeth.core.dag.graph import ExecutionGraph
+        from elspeth.core.dag.guarantees import resolve_guaranteed_field_type
+
+        graph = ExecutionGraph()
+        graph.add_node("src_a", node_type=NodeType.SOURCE, plugin_name="csv", output_schema_config=self._config(["id: int"]))
+        graph.add_node("err", node_type=NodeType.TRANSFORM, plugin_name="truncate", output_schema_config=self._config(["id: int"]))
+        graph.add_node("ru", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        graph.add_edge("src_a", "ru", label="a")
+        graph.add_edge("err", "ru", label="divert", mode=RoutingMode.DIVERT)
+        assert resolve_guaranteed_field_type(graph, "ru", "id") is None
+
+
+_INVISIBLE_RETYPE_PIPELINE = """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'description: str'
+      on_validation_failure: discard
+transforms:
+- name: coerce_id
+  plugin: type_coerce
+  input: raw
+  on_success: coerced
+  on_error: discard
+  options:
+    conversions:
+      - field: id
+        to: str
+    schema:
+{coerce_schema}
+- name: passthru
+  plugin: truncate
+  input: coerced
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+    schema:
+      mode: flexible
+      fields:
+      - 'description: str'
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+        fields:
+        - 'id: {sink_id_type}'
+        - 'description: str'
+"""
+
+_COERCE_OBSERVED = "      mode: observed"
+_COERCE_FLEX_WITHOUT_TARGET = """      mode: flexible
+      fields:
+      - 'description: str'"""
+
+
+def _build_invisible_retype_graph(*, coerce_schema: str, sink_id_type: str) -> ExecutionGraph:
+    """source(id: int) -> type_coerce(id -> str) -> under-declared truncate -> locked sink."""
+    from elspeth.cli_helpers import instantiate_plugins_from_config
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    settings = load_settings_from_yaml_string(_INVISIBLE_RETYPE_PIPELINE.format(coerce_schema=coerce_schema, sink_id_type=sink_id_type))
+    plugins = instantiate_plugins_from_config(settings)
+    return ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        gates=settings.gates,
+        coalesce_settings=settings.coalesce,
+    )
+
+
+class TestInvisibleRetypeThroughPassThrough:
+    """A pass-through that rewrites a field's type must not leave the walk
+    trusting a stale ancestor declaration (elspeth-85e8afa2f5 panel review).
+
+    type_coerce converts id int->str mid-chain while the final producer
+    under-declares id back into the guarantee channel. Two closure halves,
+    each pinned in both directions: with declared fields, type_coerce now
+    DECLARES its conversion targets (nearest declaration correct); in
+    observed mode the walk ABSTAINS at an undeclared pass-through rather
+    than resolving through it (silence is not type-preservation).
+    """
+
+    def test_observed_coercer_with_matching_sink_builds(self) -> None:
+        """The false-reject regression pin: rows genuinely carry str after the
+        coercion, so the sink demanding str must build even though the only
+        ancestor DECLARATION says int. The walk abstains at the observed
+        type_coerce instead of resolving the stale source type."""
+        _build_invisible_retype_graph(coerce_schema=_COERCE_OBSERVED, sink_id_type="str")
+
+    def test_observed_coercer_with_conflicting_sink_keeps_per_row_posture(self) -> None:
+        """Rows carry str and the sink demands int — doomed at runtime, but an
+        observed coercer states nothing the build can prove either way, so the
+        historical per-row preflight posture stands (green build). Pinned so a
+        later 'improvement' that resolves through observed pass-throughs
+        cannot silently reintroduce the stale-type claim."""
+        _build_invisible_retype_graph(coerce_schema=_COERCE_OBSERVED, sink_id_type="int")
+
+    def test_declaring_coercer_with_matching_sink_builds(self) -> None:
+        """With declared fields, the appended conversion-target declaration
+        (id: str) is the nearest declaration and matches the sink."""
+        _build_invisible_retype_graph(coerce_schema=_COERCE_FLEX_WITHOUT_TARGET, sink_id_type="str")
+
+    def test_declaring_coercer_with_conflicting_sink_is_rejected(self) -> None:
+        """The improvement direction: the same doomed pipeline the observed
+        arm must tolerate is CAUGHT when the coercer declares fields, because
+        the appended target declaration is graph-visible."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_invisible_retype_graph(coerce_schema=_COERCE_FLEX_WITHOUT_TARGET, sink_id_type="int")
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.type_mismatches == (("id", "int", "str"),)
+        assert exc_info.value.to_node_id is not None and exc_info.value.to_node_id.startswith("sink_output")
+        assert "declared by: transform_coerce_id" in str(exc_info.value)
+
+    def test_observed_direct_producer_keeps_the_bypass_posture(self) -> None:
+        """An observed node DIRECTLY feeding the consumer stays on the bypass
+        path even when a farther ancestor typed the field against the
+        consumer. Two independent guards deliver this verdict — the pass
+        skips observed producers, and the walk abstains at undeclared
+        pass-throughs — so this build-level pin guards the OUTCOME, the
+        posture the dynamic/observed paths have always shipped (per-row
+        preflight, not build rejection)."""
+        from elspeth.cli_helpers import instantiate_plugins_from_config
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(
+            """sources:
+  primary:
+    plugin: csv
+    on_success: raw
+    options:
+      path: examples/fork_coalesce/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'description: str'
+      on_validation_failure: discard
+transforms:
+- name: opaque
+  plugin: truncate
+  input: raw
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 20
+    suffix: "..."
+    schema:
+      mode: observed
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: out.jsonl
+      format: jsonl
+      schema:
+        mode: fixed
+        fields:
+        - 'id: str'
+        - 'description: str'
+"""
+        )
+        plugins = instantiate_plugins_from_config(settings)
+        ExecutionGraph.from_plugin_instances(
+            sources=plugins.sources,
+            source_settings_map=plugins.source_settings_map,
+            transforms=plugins.transforms,
+            sinks=plugins.sinks,
+            aggregations=plugins.aggregations,
+            gates=settings.gates,
+            coalesce_settings=settings.coalesce,
+        )
+
 
 # A locked sink that ALSO requires a field nothing upstream produces.
 _SINK_REQUIRES_UNPRODUCED = """        fields:

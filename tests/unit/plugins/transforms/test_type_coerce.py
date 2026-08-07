@@ -546,6 +546,48 @@ class TestTypeCoerceBehavior:
         assert result.row.contract.mode == "FIXED"
         assert result.row.contract.locked is True
 
+    def test_undeclared_conversion_target_is_declared_in_output_schema_config(self, ctx: "PluginContext") -> None:
+        """A conversion target absent from schema.fields joins the output config.
+
+        The transform rewrites the target's type whether or not the input
+        schema declares it, and an output config silent about the rewrite left
+        it invisible to graph validation: the ancestor-type walk recursed past
+        this node to a stale upstream declaration — a false accept AND a false
+        reject on the same root cause (elspeth-85e8afa2f5 panel review).
+        ``required=True, nullable=False`` is the truthful success-stream
+        contract: a missing or None conversion field errors the row onto the
+        divert path, so every emitted row carries a non-None converted value —
+        the same declare-your-targets discipline value_transform follows.
+        Observed mode stays observed (asserted here) so downstream edges keep
+        the observed bypass path.
+        """
+        from elspeth.plugins.transforms.type_coerce import TypeCoerce
+
+        transform = TypeCoerce(
+            {
+                "schema": {"mode": "flexible", "fields": ["description: str"]},
+                "conversions": [{"field": "id", "to": "str"}],
+            }
+        )
+        config = transform._output_schema_config
+        assert config is not None
+        assert config.fields is not None
+        declared = {field.name: field for field in config.fields}
+        assert declared["id"].field_type == "str"
+        assert declared["id"].required is True
+        assert declared["id"].nullable is False
+        assert declared["description"].field_type == "str"
+
+        observed = TypeCoerce(
+            {
+                "schema": {"mode": "observed"},
+                "conversions": [{"field": "id", "to": "str"}],
+            }
+        )
+        assert observed._output_schema_config is not None
+        assert observed._output_schema_config.mode == "observed"
+        assert observed._output_schema_config.fields is None
+
     def test_success_updates_emitted_contract_field_type(self, ctx: "PluginContext") -> None:
         """Successful coercion must evolve the emitted contract, not just the payload."""
         from elspeth.contracts.schema_contract import SchemaContract

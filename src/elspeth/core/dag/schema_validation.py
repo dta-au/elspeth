@@ -14,15 +14,18 @@ from itertools import combinations
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import PluginSchema, RoutingMode, check_compatibility
-from elspeth.contracts.data import CompatibilityResult
+from elspeth.contracts.data import CompatibilityResult, resolved_guarantee_type_mismatch
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
     EffectiveGuaranteeVote,
+    ResolvedGuaranteeType,
     get_effective_guaranteed_fields,
     get_required_fields,
+    resolve_guaranteed_field_type,
     walk_effective_guarantee_vote,
+    walk_effective_guaranteed_fields,
 )
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError
 from elspeth.core.dag.schema_factory import build_coalesce_schema
@@ -97,6 +100,11 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # same pre-existing-error reason its neighbours each cite
     # (elspeth-1451ff385f).
     validate_typed_producer_guaranteed_extras(graph)
+
+    # Type-check forgiven fields whose ancestor declared a type. Type-axis
+    # sibling of the check above; runs last for the same pre-existing-error
+    # reason (elspeth-85e8afa2f5).
+    validate_forgiven_field_ancestor_types(graph)
 
 
 def validate_single_edge(
@@ -361,6 +369,130 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
             producer_schema=producer_schema,
             consumer_schema=consumer_schema,
         )
+
+
+def validate_forgiven_field_ancestor_types(graph: ExecutionGraph) -> None:
+    """Type-check missing-arm-forgiven fields against their ancestor declarations.
+
+    ``check_compatibility``'s missing arm forgives a consumer-required field
+    the producer never typed when the guarantee channel proves it present and
+    the producer's contract admits undeclared fields (elspeth-7d68b04878).
+    The forgiveness is name-based, so the forgiven population exits the
+    type-mismatch arm entirely — even when an ancestor DID declare the
+    field's type and it provably conflicts with the consumer's declaration.
+    The verdict then flips on how much a BRANCH declared: fully-declared
+    branches are rejected by the type arm, under-declared branches build
+    green and every row dies typed at the consumer's input preflight
+    (elspeth-85e8afa2f5, the type-axis residue of the guarantee-aware
+    missing arm).
+
+    This pass restores the declared-control verdict where it is knowable:
+    for each field the missing arm forgave, ``resolve_guaranteed_field_type``
+    walks the guarantee topology for the NEAREST ancestor declaration and
+    rejects only on a unanimous, concrete, incompatible type — the same
+    ``FIELD_TYPE_MAP`` + ``_types_compatible`` policy the declared arm
+    applies, via ``resolved_guarantee_type_mismatch``. Everywhere the type is
+    genuinely unknowable (observed ancestors, ``any`` declarations,
+    cross-branch disagreement) it ABSTAINS and the per-row preflight keeps
+    the verdict — the posture the dynamic/observed bypass paths have always
+    shipped. Monotonicity is the invariant: this pass may only reproduce
+    verdicts that declaring the field on the producing branches would
+    already produce, so declaring MORE can never flip a green build red or
+    a red build green.
+
+    Scope mirrors the forgiveness exactly: TYPED producer (an observed or
+    dynamic producer never reaches the missing arm — its edges keep their
+    historical per-row posture), producer ``extra='allow'`` (the extras
+    firewall: a closed producer forwards nothing undeclared, so the
+    guarantee describes what it consumed, not what arrives), consumer-
+    required fields absent from the producer's model. A field not in the
+    guarantee channel is not forgiven — its verdict belongs to the missing
+    arm and the sink required-fields sweep, both of which ran earlier.
+
+    Runs as a final pass, after every pre-existing check, for the ordering
+    discipline its neighbours cite: a graph tripping this AND an earlier
+    check keeps reporting the earlier error. Unlike
+    ``_validate_locked_consumer_guaranteed_extras`` this raise site needs no
+    sink-missing accumulation: ``validate_sink_required_fields`` runs before
+    this pass, so a dual-violation graph already reported its missing-field
+    verdict and never reaches here.
+    """
+    schema_cache: dict[str, type[PluginSchema] | None] = {}
+    guarantee_cache: dict[str, frozenset[str]] = {}
+    type_cache: dict[tuple[str, str], ResolvedGuaranteeType | None] = {}
+    for from_id, to_id, edge_data in graph._graph.edges(data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        to_info = graph.get_node_info(to_id)
+        # Correlated barriers compare all incoming branches together in their
+        # own validators — same exclusion the sibling passes apply.
+        if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
+            continue
+        consumer_schema = to_info.input_schema
+        if consumer_schema is None or not consumer_schema.model_fields:
+            continue
+        producer_schema = get_effective_producer_schema(graph, from_id, _cache=schema_cache)
+        if producer_schema is None:
+            continue
+        # NOTE: We control all schemas via PluginSchema base class which sets
+        # model_config["extra"]. Direct access is correct per Tier 1 trust
+        # model - missing key would be our bug.
+        if len(producer_schema.model_fields) == 0:
+            continue  # observed producer: bypass paths keep their per-row posture
+        if producer_schema.model_config["extra"] != "allow":
+            continue  # extras firewall: a closed producer forwards nothing undeclared
+        forgiven_candidates = [
+            (field_name, consumer_field)
+            for field_name, consumer_field in consumer_schema.model_fields.items()
+            if consumer_field.is_required() and field_name not in producer_schema.model_fields
+        ]
+        if not forgiven_candidates:
+            continue
+        producer_guaranteed = walk_effective_guaranteed_fields(graph, from_id, guarantee_cache)
+        # NOTE: consumer strictness read directly for the same Tier-1 reason.
+        consumer_strict = consumer_schema.model_config["strict"]
+        for field_name, consumer_field in forgiven_candidates:
+            if field_name not in producer_guaranteed:
+                continue
+            resolved = resolve_guaranteed_field_type(graph, from_id, field_name, cache=type_cache)
+            if resolved is None:
+                continue  # unknowable: the per-row preflight keeps the verdict
+            mismatch = resolved_guarantee_type_mismatch(
+                resolved.field_type,
+                consumer_field.annotation,
+                consumer_strict=consumer_strict,
+            )
+            if mismatch is None:
+                continue
+            expected_name, actual_name = mismatch
+            from_info = graph.get_node_info(from_id)
+            declared_by = ", ".join(sorted(resolved.declared_by))
+            raise EdgeContractError(
+                f"Schema contract violation: edge '{from_id}' → '{to_id}'\n"
+                f"  Consumer ({to_info.plugin_name}) declares '{field_name}' as {expected_name} (required), "
+                f"but rows arrive typed {actual_name}: the graph guarantees '{field_name}' is present — "
+                f"the producing nodes never declare it — and the nearest ancestor declaration types it "
+                f"{actual_name} (declared by: {declared_by}). Every row would fail the consumer's input "
+                f"preflight at runtime.\n"
+                f"\n"
+                f"Fix: Either:\n"
+                f"  1. Align the consumer's declared type ('{field_name}: {resolved.field_type}') if it "
+                f"should accept what arrives, or\n"
+                f"  2. Insert a type_coerce transform before this consumer converting '{field_name}' to "
+                f"{expected_name} and declaring it in the transform's schema.fields, or\n"
+                f"  3. Remove '{field_name}' from the consumer's declaration AND drop it before this "
+                f"consumer (a field_mapper with select_only: true) if the consumer does not need it",
+                from_node_id=str(from_id),
+                to_node_id=str(to_id),
+                producer_schema_name=producer_schema.__name__,
+                consumer_schema_name=consumer_schema.__name__,
+                compatibility_result=CompatibilityResult(
+                    compatible=False,
+                    type_mismatches=((field_name, expected_name, actual_name),),
+                ),
+                component_type=to_info.node_type.value,
+                from_component_type=from_info.node_type.value,
+            )
 
 
 def _validate_locked_consumer_guaranteed_extras(

@@ -280,7 +280,7 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:bac871c04b15ecb6"
+    source_file_hash: str | None = "sha256:96417ef64dbb534f"
     config_model = TypeCoerceConfig
     usage_when_to_use: str = (
         "Use for explicit field-by-field type normalization when values such as CSV strings must become "
@@ -437,7 +437,25 @@ class TypeCoerce(BaseTransform):
         pass
 
     def _build_type_coerce_output_schema_config(self, schema_config: SchemaConfig) -> SchemaConfig:
-        """Return the output schema config after applying configured target types."""
+        """Return the output schema config after applying configured target types.
+
+        Conversion targets the input schema does NOT declare are appended, not
+        skipped: this transform rewrites those fields' types either way, and an
+        output config silent about them left the rewrite invisible to graph
+        validation — the ancestor-type walk (``resolve_guaranteed_field_type``)
+        recursed past this node to a stale upstream declaration, producing both
+        a false accept and a false reject on the same root cause
+        (elspeth-85e8afa2f5 panel review). ``value_transform`` already declares
+        its operation targets (as ``any``, since expression result types are
+        uninferable); a conversion target's type is exactly ``spec.to``, so the
+        declaration here is concrete. ``required=True, nullable=False`` is
+        truthful for the success stream: a missing or ``None`` conversion field
+        errors the row onto the divert path, so every emitted row carries a
+        non-None converted value. Observed-mode configs (``fields is None``)
+        stay observed — declaring into them would flip downstream edges off the
+        observed bypass path; the walk abstains at undeclared pass-throughs
+        instead.
+        """
         if schema_config.fields is None:
             return self._build_output_schema_config(schema_config)
 
@@ -450,6 +468,15 @@ class TypeCoerce(BaseTransform):
                 nullable=False if field.name in target_types else field.nullable,
             )
             for field in schema_config.fields
+        ) + tuple(
+            FieldDefinition(
+                name=field_name,
+                field_type=target_types[field_name],
+                required=True,
+                nullable=False,
+            )
+            for field_name in sorted(target_types)
+            if field_name not in {field.name for field in schema_config.fields}
         )
         return SchemaConfig(
             mode=schema_config.mode,

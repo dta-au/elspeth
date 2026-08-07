@@ -21,6 +21,8 @@ from typing import Annotated, Any, TypeVar, Union, get_args, get_origin
 from pydantic import BaseModel, ConfigDict, ValidationError
 from pydantic.fields import FieldInfo
 
+from elspeth.contracts.schema import FIELD_TYPE_MAP
+
 T = TypeVar("T", bound="PluginSchema")
 
 
@@ -430,3 +432,38 @@ def _types_compatible(
             return all(any(_types_compatible(a, e, consumer_strict=consumer_strict) for e in expected_args) for a in actual_args)
 
     return False
+
+
+def resolved_guarantee_type_mismatch(
+    field_type: str,
+    consumer_annotation: Any,
+    *,
+    consumer_strict: bool,
+) -> tuple[str, str] | None:
+    """Compare a guarantee-channel ancestor declaration against a consumer field.
+
+    The guarantee walk proves a field's PRESENCE without its type; when the
+    nearest ancestor declaration IS knowable (``ResolvedGuaranteeType``,
+    ``core.dag.guarantees``), this applies the declared type-mismatch arm's
+    compatibility policy — same ``FIELD_TYPE_MAP`` materialization, same
+    ``_types_compatible`` coercion rules, same ``_type_name`` spelling — on
+    the BASE type alone. Nullability is deliberately excluded: the two
+    declared-arm materializations disagree about it (the coalesce factory
+    folds ``nullable``/optional into ``| None``, the plugin factory reads
+    ``required`` alone), so consulting it here would reject pipelines whose
+    fully-declared control builds green. Comparing bare base types is never
+    stricter than either materialization, which is what keeps the
+    declare-more monotonicity invariant true.
+
+    Returns ``(expected_name, actual_name)`` on a provable conflict, ``None``
+    when compatible — or when ``field_type`` is ``"any"``, which is an
+    ABSTENTION: ``_types_compatible`` treats ``Any`` as universal only on the
+    expected side, so letting an ``any`` declaration through as the actual
+    type would manufacture rejections for a type nobody stated.
+    """
+    if field_type == "any":
+        return None
+    actual = FIELD_TYPE_MAP[field_type]
+    if _types_compatible(actual, consumer_annotation, consumer_strict=consumer_strict):
+        return None
+    return (_type_name(consumer_annotation), _type_name(actual))
