@@ -304,6 +304,57 @@ def test_advisory_chat_settles_once_and_exact_replay_ignores_mutable_provider_an
     assert _chat_operation_count(composer_test_client, session_id) == 1
 
 
+def test_chat_pair_binds_its_occurrence_and_retry_authority_is_occurrence_bound(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """elspeth-ea80e34fdc: retry authority is occurrence-bound, not content-based.
+
+    The persisted user chat turn records the turn_token it was submitted
+    under, the wire projection carries it to the frontend Retry affordance,
+    a retry under the SAME still-current occurrence succeeds, and a retry
+    under a superseded occurrence draws the ordinary stale-turn 409 without
+    reaching the provider — historical prose can never ride the newest token.
+    """
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _advisory_provider, raising=False)
+
+    first = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=_chat_body(turn))
+
+    assert first.status_code == 200, first.json()
+    history = first.json()["guided_session"]["chat_history"]
+    assert [item["role"] for item in history[-2:]] == ["user", "assistant"]
+    assert history[-2]["turn_token"] == turn["turn_token"]
+    assert history[-1]["turn_token"] is None
+
+    # The reload projection (what a restored frontend renders Retry from)
+    # carries the persisted occurrence verbatim.
+    reloaded = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
+    assert reloaded["guided_session"]["chat_history"][-2]["turn_token"] == turn["turn_token"]
+
+    # Same-occurrence retry: the advisory exchange left the turn unanswered,
+    # so resending the RECORDED token as a fresh operation succeeds.
+    retry = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=_chat_body(turn))
+    assert retry.status_code == 200, retry.json()
+
+    # Advance the occurrence through the wizard: the turn token rotates.
+    schema_turn = _choose_source(composer_test_client, session_id, turn)["next_turn"]
+    assert schema_turn["turn_token"] != turn["turn_token"]
+
+    # Stale retry: the recorded token no longer identifies the current
+    # unanswered turn — rejected before any provider call.
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("stale retry called provider")),
+        raising=False,
+    )
+    stale = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=_chat_body(turn))
+    assert stale.status_code == 409, stale.json()
+    assert stale.json()["detail"] == "turn_token does not identify the current unanswered turn."
+
+
 def test_reused_operation_id_with_different_message_conflicts_without_provider(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

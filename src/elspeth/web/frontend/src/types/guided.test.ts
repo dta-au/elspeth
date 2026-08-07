@@ -328,6 +328,7 @@ describe("guided protocol types", () => {
       ts_iso: "t",
       assistant_message_kind: "synthetic_failure",
       synthetic_failure_reason: "unavailable",
+      turn_token: null,
     };
     expect(withKind.assistant_message_kind).toBe("synthetic_failure");
     expect(withKind.synthetic_failure_reason).toBe("unavailable");
@@ -340,6 +341,7 @@ describe("guided protocol types", () => {
       ts_iso: "t",
       assistant_message_kind: "synthetic_failure",
       synthetic_failure_reason: "not_applied",
+      turn_token: null,
     };
     expect(notApplied.synthetic_failure_reason).toBe("not_applied");
   });

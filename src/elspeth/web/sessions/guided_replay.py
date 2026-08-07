@@ -298,6 +298,7 @@ def _guided_session_response(guided: GuidedSession) -> GuidedSessionResponse:
                 ts_iso=turn.ts_iso,
                 assistant_message_kind=turn.assistant_message_kind,
                 synthetic_failure_reason=turn.synthetic_failure_reason,
+                turn_token=turn.turn_token,
             )
             for turn in guided.chat_history
         ],

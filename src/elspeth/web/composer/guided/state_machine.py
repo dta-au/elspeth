@@ -44,9 +44,11 @@ from elspeth.web.composer.guided.resolved import (
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PresentBase, ProposalBase, reviewed_anchor_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 
-# Schema 10 is a pre-release hard cut. There is no older-schema decoder or
-# converter: session epoch 34 owns the current store recreation boundary.
-GUIDED_SESSION_SCHEMA_VERSION = 10
+# Schema 11 is a pre-release hard cut (chat_history entries gain the
+# occurrence-binding ``turn_token`` key, elspeth-ea80e34fdc). There is no
+# older-schema decoder or converter: the lockstep session epoch in
+# ``web/sessions/models.py`` owns the store recreation boundary.
+GUIDED_SESSION_SCHEMA_VERSION = 11
 GUIDED_MAX_DEFERRED_INTENTS = 256
 GUIDED_MAX_CONSTRAINTS_PER_INTENT = 64
 GUIDED_MAX_TOTAL_CONSTRAINTS = 4_096
@@ -208,6 +210,7 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
                 "ts_iso",
                 "assistant_message_kind",
                 "synthetic_failure_reason",
+                "turn_token",
             }
         ),
         "GuidedSession.from_dict: chat_history entry",
@@ -231,6 +234,9 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
     synthetic_failure_reason_raw = entry["synthetic_failure_reason"]
     if synthetic_failure_reason_raw is not None and type(synthetic_failure_reason_raw) is not str:
         raise InvariantError("GuidedSession.from_dict: chat_history.synthetic_failure_reason must be str or None")
+    turn_token_raw = entry["turn_token"]
+    if turn_token_raw is not None and type(turn_token_raw) is not str:
+        raise InvariantError("GuidedSession.from_dict: chat_history.turn_token must be str or None")
     return ChatTurn(
         role=ChatRole(role_raw),
         content=content_raw,
@@ -239,6 +245,7 @@ def _chat_turn_from_guided_dict(entry: Any) -> ChatTurn:
         ts_iso=ts_iso_raw,
         assistant_message_kind=cast(Any, assistant_message_kind_raw),
         synthetic_failure_reason=cast(Any, synthetic_failure_reason_raw),
+        turn_token=turn_token_raw,
     )
 
 
@@ -1210,6 +1217,7 @@ class GuidedSession:
                     "ts_iso": t.ts_iso,
                     "assistant_message_kind": t.assistant_message_kind,
                     "synthetic_failure_reason": t.synthetic_failure_reason,
+                    "turn_token": t.turn_token,
                 }
                 for t in self.chat_history
             ],
@@ -1229,7 +1237,7 @@ class GuidedSession:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> GuidedSession:
-        """Restore and revalidate one exact schema-10 checkpoint."""
+        """Restore and revalidate one exact schema-11 checkpoint."""
         try:
             if type(d) is not dict:
                 raise InvariantError("GuidedSession.from_dict: record must be an exact dict")

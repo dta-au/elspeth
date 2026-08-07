@@ -1259,6 +1259,7 @@ interface SessionState {
     message: string,
     signal?: AbortSignal,
     revisionMode?: GuidedRevisionMode,
+    retryTurnToken?: string,
   ) => Promise<void>;
   exitToFreeform: () => Promise<GuidedRespondOutcome>;
   clearError: () => void;
@@ -3381,6 +3382,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     message: string,
     signal?: AbortSignal,
     revisionMode: GuidedRevisionMode = "amend",
+    retryTurnToken?: string,
   ) {
     const { activeSessionId, guidedSession, guidedNextTurn, compositionState } = get();
     // Offensive guards: caller must not invoke without an active session
@@ -3548,9 +3550,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // unaffected — they are not propose_pipeline turns. (deferred_intents are not
     // on the GuidedSessionResponse wire, so the gate is the proposal turn itself.)
     if (
+      retryTurnToken === undefined &&
       guidedSession.step === "step_3_transforms" &&
       guidedNextTurn.type === "propose_pipeline"
     ) {
+      // Never reroute a RETRY: this branch reuses respondGuided's CURRENT
+      // turn_token custody, which is exactly the stale-prose laundering an
+      // occurrence-bound retry exists to prevent (elspeth-ea80e34fdc). A
+      // retry whose occurrence has been superseded by a propose_pipeline
+      // turn must fall through to /guided/chat with its recorded token and
+      // draw the ordinary 409 resync.
       await get().respondGuided({
         proposal_id: guidedNextTurn.payload.proposal_id,
         draft_hash: guidedNextTurn.payload.draft_hash,
@@ -3569,7 +3578,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     // mirroring respondGuided / startGuided).  If the user switches
     // session or the wizard advances mid-flight, the response is dropped.
     const requestedSessionId = activeSessionId;
-    const requestedTurnToken = guidedNextTurn.turn_token;
+    // Occurrence binding (elspeth-ea80e34fdc): a Retry of a historical
+    // failure submits the token its message was ORIGINALLY submitted under,
+    // never the current one — the server's stale-turn 409 is the authority
+    // on whether that occurrence is still answerable.
+    const requestedTurnToken = retryTurnToken ?? guidedNextTurn.turn_token;
     let acquisition = acquireGuidedRetry("guided_chat", requestedSessionId, [
       requestedTurnToken,
       message,

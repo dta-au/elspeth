@@ -287,18 +287,18 @@ class TestGuidedSession:
         restored = facts_from_dict(d)
         assert restored.observed_headers == ("name", "age")
 
-    def test_guided_session_schema_version_is_10(self) -> None:
-        assert GUIDED_SESSION_SCHEMA_VERSION == 10
+    def test_guided_session_schema_version_is_11(self) -> None:
+        assert GUIDED_SESSION_SCHEMA_VERSION == 11
 
     def test_guided_session_to_dict_includes_schema_version(self) -> None:
         sess = GuidedSession.initial()
-        assert sess.to_dict()["schema_version"] == 10
+        assert sess.to_dict()["schema_version"] == 11
 
-    def test_guided_session_rejects_schema_9_without_migration(self) -> None:
+    def test_guided_session_rejects_schema_10_without_migration(self) -> None:
         old = GuidedSession.initial().to_dict()
-        old["schema_version"] = 9
+        old["schema_version"] = 10
 
-        with pytest.raises(InvariantError, match="unsupported schema_version 9"):
+        with pytest.raises(InvariantError, match="unsupported schema_version 10"):
             GuidedSession.from_dict(old)
 
     def test_guided_session_requires_schema_version(self) -> None:

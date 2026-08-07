@@ -1821,7 +1821,7 @@ function decodeTerminal(value: unknown, path: string): TerminalState | null {
 
 function decodeChatTurn(value: unknown, path: string): ChatTurn {
   const turn = exactRecord(value, path, [
-    "role", "content", "seq", "step", "ts_iso", "assistant_message_kind", "synthetic_failure_reason",
+    "role", "content", "seq", "step", "ts_iso", "assistant_message_kind", "synthetic_failure_reason", "turn_token",
   ]);
   const role = stringValue(turn.role, `${path}.role`);
   if (role !== "user" && role !== "assistant") invalid(`${path}.role`, "unknown chat role");
@@ -1831,6 +1831,12 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
   const tsIso = stringValue(turn.ts_iso, `${path}.ts_iso`);
   const kind = turn.assistant_message_kind === null ? null : stringValue(turn.assistant_message_kind, `${path}.assistant_message_kind`);
   const reason = turn.synthetic_failure_reason === null ? null : stringValue(turn.synthetic_failure_reason, `${path}.synthetic_failure_reason`);
+  // Occurrence binding for Retry (elspeth-ea80e34fdc): the token the user
+  // message was submitted under. Only user turns may carry it, and it is the
+  // same sha256 shape as next_turn.turn_token.
+  const turnToken = turn.turn_token === null ? null : stringValue(turn.turn_token, `${path}.turn_token`);
+  if (turnToken !== null && !SHA256.test(turnToken)) invalid(`${path}.turn_token`, "expected sha256");
+  if (role === "assistant" && turnToken !== null) invalid(`${path}.turn_token`, "assistant chat turn carries a turn token");
   if (role === "user" && (kind !== null || reason !== null)) invalid(path, "user chat turn carries assistant discriminator");
   if (role === "assistant" && kind !== "assistant" && kind !== "synthetic_failure") invalid(path, "assistant chat turn lacks closed discriminator");
   if ((kind === "synthetic_failure") !== (reason !== null)) invalid(path, "synthetic failure discriminator is inconsistent");
@@ -1844,6 +1850,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
       ts_iso: tsIso,
       assistant_message_kind: null,
       synthetic_failure_reason: null,
+      turn_token: turnToken,
     };
   }
   if (kind === "assistant") {
@@ -1855,6 +1862,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
       ts_iso: tsIso,
       assistant_message_kind: kind,
       synthetic_failure_reason: null,
+      turn_token: null,
     };
   }
   if (kind !== "synthetic_failure") return invalid(path, "assistant chat turn lacks closed discriminator");
@@ -1869,6 +1877,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
     ts_iso: tsIso,
     assistant_message_kind: kind,
     synthetic_failure_reason: reason,
+    turn_token: null,
   };
 }
 

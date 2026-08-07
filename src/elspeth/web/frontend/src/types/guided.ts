@@ -104,6 +104,13 @@ export interface ChatTurn {
    *  reply violated a tool contract — retry is the designed remedy, unlike
    *  the deterministic "not_applied" causes (Retry is suppressed there). */
   synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | null;
+  /** Occurrence the user message was submitted under (elspeth-ea80e34fdc).
+   *  Retry must resend THIS token verbatim — never the current one — so a
+   *  stale retry draws the server's ordinary 409 instead of applying old
+   *  prose to newer session state. Non-null only on user turns recorded
+   *  through the chat submission path; assistant turns and transcript-only
+   *  user turns (respond-path revision instructions) carry null. */
+  turn_token: string | null;
 }
 
 /**

@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 45 and Landscape epoch 30)
+## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 46 and Landscape epoch 30)
 
-0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 45. Epoch 36 ensures a committed
+0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 46. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -26,12 +26,18 @@ attributed to their real writer instead of the compose loop. Epoch 44 adds
 `planner_repair_exhausted` to the closed `guided_operations.failure_code`
 CHECK so planner repair exhaustion settles under its own honest coded failure
 (HTTP 500 with a retry offer) instead of the provider-blaming
-`invalid_provider_response` 502 (elspeth-5904b1683a).
-An epoch-35 through epoch-43 database cannot represent
+`invalid_provider_response` 502 (elspeth-5904b1683a). Epoch 45 moves web
+Textract authoring to operator document profiles (ADR-036): sessions authored
+against the old public schema (`bucket_field` / the `deployment` alias) can no
+longer validate or replay. Epoch 46 is the lockstep cut for guided schema 11:
+persisted chat-history turns gain the occurrence-binding `turn_token` key so
+guided Retry is occurrence-bound instead of content-based
+(elspeth-ea80e34fdc).
+An epoch-35 through epoch-45 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
-references. Guided checkpoint schema remains 10.
+references. Guided checkpoint schema advances to 11.
 
 0.7.1 advances the session store from epoch 26 through epoch 35. Epoch 27 lets
 `user_preferences.freeform_intro_dismissed_at` persist the account-wide
@@ -85,9 +91,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-45 release forward,
+unsupported: keep the service drained, repair the epoch-46 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-45/Landscape-epoch-30 record when binding candidate and rollback
+session-epoch-46/Landscape-epoch-30 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -558,7 +564,7 @@ After health checks pass, prove the recreated session store carries the current
 hard-cut sentinel before creating any session:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 45 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 46 (== SESSION_SCHEMA_EPOCH)
 ```
 
 An epoch-35, epoch-36, epoch-37, epoch-38, epoch-39, or epoch-40 result is not repairable in place: keep the service drained,

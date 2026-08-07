@@ -343,6 +343,7 @@ describe("api/client guided functions", () => {
         ts_iso: "2026-07-19T00:00:00Z",
         assistant_message_kind: null,
         synthetic_failure_reason: null,
+        turn_token: null,
       }];
       body.guided_session.chat_turn_seq = 1;
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
@@ -373,6 +374,7 @@ describe("api/client guided functions", () => {
             ts_iso: "2026-07-19T00:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           }];
           (body.guided_session.chat_history[0] as unknown as Record<string, unknown>).canary = true;
         }

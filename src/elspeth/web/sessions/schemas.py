@@ -486,6 +486,14 @@ class ChatTurnResponse(_StrictResponse):
     :class:`elspeth.web.composer.guided.protocol.ChatTurn`: both are ``None``
     only for user turns; assistant turns always carry a kind, and synthetic
     failures always carry a closed reason.
+
+    ``turn_token`` is the occurrence the user message was submitted under
+    (elspeth-ea80e34fdc): the Retry affordance must resend it verbatim so a
+    historical retry is rejected by the ordinary stale-turn 409 instead of
+    borrowing the current token. Non-null only on user turns recorded through
+    the chat submission path; assistant turns and transcript-only user turns
+    (respond-path revision instructions/corrections, which have no retry
+    affordance) carry ``None``.
     """
 
     role: str
@@ -495,6 +503,7 @@ class ChatTurnResponse(_StrictResponse):
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None
     synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None
+    turn_token: str | None
 
 
 class WorkflowProfileResponse(_StrictResponse):

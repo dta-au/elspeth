@@ -53,6 +53,7 @@ const TURN_USER: ChatTurn = {
   ts_iso: "2026-05-13T12:00:00+00:00",
   assistant_message_kind: null,
   synthetic_failure_reason: null,
+  turn_token: null,
 };
 
 const TURN_ASSISTANT: ChatTurn = {
@@ -63,6 +64,7 @@ const TURN_ASSISTANT: ChatTurn = {
   ts_iso: "2026-05-13T12:00:00+00:00",
   assistant_message_kind: "assistant",
   synthetic_failure_reason: null,
+  turn_token: null,
 };
 
 const TWO_TURNS: ChatTurn[] = [TURN_USER, TURN_ASSISTANT];
@@ -265,6 +267,7 @@ const TURN_SYNTHETIC_FAILURE: ChatTurn = {
   ts_iso: "2026-05-13T12:00:00+00:00",
   assistant_message_kind: "synthetic_failure",
   synthetic_failure_reason: "unavailable",
+  turn_token: null,
 };
 
 describe("GuidedChatHistory synthetic-failure turns", () => {
@@ -303,6 +306,7 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
       ...TURN_SYNTHETIC_FAILURE,
       content: "I did not apply generated source content.",
       synthetic_failure_reason: "not_applied",
+      turn_token: null,
     };
     const { container } = render(<GuidedChatHistory chatHistory={[notApplied]} />);
 
@@ -353,6 +357,7 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
       ts_iso: "2026-05-13T12:01:00+00:00",
       assistant_message_kind: "assistant",
       synthetic_failure_reason: null,
+      turn_token: null,
     };
     render(
       <GuidedChatHistory
@@ -373,6 +378,7 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
       ...TURN_SYNTHETIC_FAILURE,
       content: "I couldn't apply that configuration, so I didn't change your pipeline.",
       synthetic_failure_reason: "not_applied",
+      turn_token: null,
     };
     render(
       <GuidedChatHistory
@@ -390,6 +396,7 @@ describe("GuidedChatHistory synthetic-failure turns", () => {
       const turn: ChatTurn = {
         ...TURN_SYNTHETIC_FAILURE,
         synthetic_failure_reason: reason,
+        turn_token: null,
       };
       render(
         <GuidedChatHistory chatHistory={[turn]} onRetrySyntheticFailure={vi.fn()} />,

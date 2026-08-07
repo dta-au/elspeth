@@ -782,15 +782,17 @@ export function ChatPanel({
   // guidedChatPending so the turn can be retried.
   const guidedChatControllerRef = useRef<AbortController | null>(null);
   const sendGuidedChat = useCallback(
-    (content: string, revisionMode?: GuidedRevisionMode) =>
+    (content: string, revisionMode?: GuidedRevisionMode, retryTurnToken?: string) =>
       // Same shared primitive freeform's useComposer.runWithTimeout uses: one
       // timer + readiness guard for both paths. Until the backend wall clock
       // has landed at boot the guided send does not run (no request, no
       // timer) — the guided input is disabled until readiness.
       runComposeWithTimeout(guidedChatControllerRef, composeTimeoutReady, (signal) =>
-        revisionMode === undefined
-          ? chatGuided(content, signal)
-          : chatGuided(content, signal, revisionMode),
+        retryTurnToken !== undefined
+          ? chatGuided(content, signal, undefined, retryTurnToken)
+          : revisionMode === undefined
+            ? chatGuided(content, signal)
+            : chatGuided(content, signal, revisionMode),
       ),
     [chatGuided, composeTimeoutReady],
   );
@@ -889,19 +891,27 @@ export function ChatPanel({
   // seq-1 (ChatRole's docstring: Phase A has no unpaired "opener" turns yet).
   // Resend THAT message down the normal chat path — same retry semantics as
   // freeform's MessageBubble Retry, reusing sendGuidedChat rather than a
-  // bespoke request. If no such user turn exists (a future proactive opener,
-  // or any other shape this invariant doesn't cover), there is nothing
-  // sound to resend blind; refetch the guided state instead so the wizard
-  // resyncs to the server's current truth — the same recovery the
-  // turn_not_emitted self-heal uses.
+  // bespoke request — under the OCCURRENCE it was originally submitted for:
+  // the persisted turn_token rides the retry verbatim, so a retry whose
+  // occurrence has since been answered draws the server's ordinary stale-turn
+  // 409 (and its resync) instead of applying old prose to newer session
+  // state (elspeth-ea80e34fdc). If no token-bearing user turn exists (a
+  // future proactive opener, a transcript-only pair, or any other shape this
+  // invariant doesn't cover), there is nothing sound to resend blind;
+  // refetch the guided state instead so the wizard resyncs to the server's
+  // current truth — the same recovery the turn_not_emitted self-heal uses.
   const handleRetrySyntheticFailure = useCallback(
     (turn: GuidedChatTurn) => {
       if (guidedSession === null || activeSessionId === null) return;
       const preceding = guidedSession.chat_history.find(
         (t) => t.seq === turn.seq - 1,
       );
-      if (preceding !== undefined && preceding.role === "user") {
-        void sendGuidedChat(preceding.content);
+      if (
+        preceding !== undefined &&
+        preceding.role === "user" &&
+        preceding.turn_token !== null
+      ) {
+        void sendGuidedChat(preceding.content, undefined, preceding.turn_token);
       } else {
         void startGuided(activeSessionId);
       }

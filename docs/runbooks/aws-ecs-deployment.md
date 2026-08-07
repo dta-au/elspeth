@@ -1510,9 +1510,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 45, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 46, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_45_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
+    "structural_changes": "session_epoch_35_to_46_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
@@ -3236,7 +3236,7 @@ fi
 
 The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
 the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-45 session/epoch-30 Landscape code.
+drained and repair forward with epoch-46 session/epoch-30 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
 

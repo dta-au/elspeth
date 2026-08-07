@@ -251,13 +251,13 @@ def _full_session() -> GuidedSession:
     )
 
 
-def test_schema10_round_trip_retains_plural_order_and_stable_ids_after_restart() -> None:
+def test_schema11_round_trip_retains_plural_order_and_stable_ids_after_restart() -> None:
     session = _full_session()
 
     encoded = session.to_dict()
     restored = GuidedSession.from_dict(encoded)
 
-    assert GUIDED_SESSION_SCHEMA_VERSION == 10
+    assert GUIDED_SESSION_SCHEMA_VERSION == 11
     assert restored == session
     assert restored.source_order == (SOURCE_B, SOURCE_A)
     assert restored.output_order == (OUTPUT_B, OUTPUT_A)

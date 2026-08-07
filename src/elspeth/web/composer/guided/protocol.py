@@ -516,6 +516,15 @@ class ChatTurn:
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
     synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
+    # The guided turn token under which this USER chat message was submitted —
+    # the occurrence the retry affordance must be bound to. Without it, Retry
+    # on a historical synthetic failure resubmits old prose under whatever
+    # token is CURRENT, applying stale intent against newer session state
+    # (elspeth-ea80e34fdc). Carried only by user turns recorded through the
+    # /guided/chat submission path; transcript-only user turns (respond-path
+    # revision instructions and corrections, which have no retry affordance)
+    # and assistant turns carry None.
+    turn_token: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.role) is not ChatRole:
@@ -556,6 +565,11 @@ class ChatTurn:
             raise TypeError(f"ts_iso must be str, got {type(self.ts_iso).__name__}")
         if self.ts_iso == "":
             raise ValueError("ts_iso must be non-empty")
+        if self.turn_token is not None:
+            if self.role is not ChatRole.USER:
+                raise ValueError("turn_token is not applicable to an ASSISTANT turn")
+            if type(self.turn_token) is not str or self.turn_token == "":
+                raise TypeError("turn_token must be a non-empty str or None")
 
 
 _LEGAL_TURN_MATRIX: Mapping[GuidedStep, frozenset[TurnType]] = {

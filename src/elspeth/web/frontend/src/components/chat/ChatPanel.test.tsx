@@ -1940,6 +1940,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "t",
       assistant_message_kind: null,
       synthetic_failure_reason: null,
+      turn_token: null,
           },
         ],
       },
@@ -2074,6 +2075,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "t",
             assistant_message_kind: "assistant",
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -2615,6 +2617,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -3046,6 +3049,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -3099,6 +3103,7 @@ describe("ChatPanel mode discriminator", () => {
               ts_iso: "2026-05-12T10:00:01Z",
               assistant_message_kind: "assistant",
               synthetic_failure_reason: null,
+              turn_token: null,
             },
           ],
         },
@@ -3125,6 +3130,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -3177,6 +3183,7 @@ describe("ChatPanel mode discriminator", () => {
               ts_iso: "2026-05-12T10:00:01Z",
               assistant_message_kind: "assistant",
               synthetic_failure_reason: null,
+              turn_token: null,
             },
           ],
         },
@@ -3503,6 +3510,7 @@ describe("ChatPanel mode discriminator", () => {
               ts_iso: "2026-08-04T00:00:00Z",
               assistant_message_kind: null,
               synthetic_failure_reason: null,
+              turn_token: null,
             },
             {
               role: "assistant",
@@ -3512,6 +3520,7 @@ describe("ChatPanel mode discriminator", () => {
               ts_iso: "2026-08-04T00:00:00Z",
               assistant_message_kind: "assistant",
               synthetic_failure_reason: null,
+              turn_token: null,
             },
           ],
           chat_turn_seq: 2,
@@ -3747,13 +3756,15 @@ describe("ChatPanel mode discriminator", () => {
   // C-2iii (composer first-principles review 2026-07-04): Retry on a
   // synthetic-failure turn.
   describe("synthetic-failure Retry", () => {
+    const RECORDED_TURN_TOKEN = "a".repeat(64);
+
     function guidedSessionWithSyntheticFailure(): GuidedSession {
       return {
         step: "step_1_source",
         history: [],
         terminal: null,
         chat_history: [
-          { role: "user", content: "scrape this page", seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null },
+          { role: "user", content: "scrape this page", seq: 1, step: "step_1_source", ts_iso: "t", assistant_message_kind: null, synthetic_failure_reason: null, turn_token: RECORDED_TURN_TOKEN },
           {
             role: "assistant",
             content: "I'm unavailable right now; you can still use the wizard controls.",
@@ -3762,6 +3773,7 @@ describe("ChatPanel mode discriminator", () => {
             ts_iso: "t",
 assistant_message_kind: "synthetic_failure",
             synthetic_failure_reason: "unavailable",
+            turn_token: null,
           },
         ],
         chat_turn_seq: 2,
@@ -3810,7 +3822,10 @@ assistant_message_kind: "synthetic_failure",
       ).toBeInTheDocument();
     });
 
-    it("Retry resends the preceding user message via the normal chat path", async () => {
+    it("Retry resends the preceding user message under its RECORDED occurrence token", async () => {
+      // elspeth-ea80e34fdc: the retry must submit the token the message was
+      // originally submitted under — never the current one — so the server's
+      // stale-turn 409 owns the staleness verdict.
       const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
         activeSessionId: "session-guided",
@@ -3831,8 +3846,44 @@ assistant_message_kind: "synthetic_failure",
         expect(chatGuidedSpy).toHaveBeenCalledWith(
           "scrape this page",
           expect.any(AbortSignal),
+          undefined,
+          RECORDED_TURN_TOKEN,
         );
       });
+    });
+
+    it("Retry falls back to refetching guided state when the preceding user turn carries no occurrence token", async () => {
+      // A token-less user turn (transcript-only pair, or any shape outside
+      // the chat submission path) proves nothing about which occurrence the
+      // prose answered — resending it blind would launder old intent under
+      // the current token (elspeth-ea80e34fdc). Resync instead.
+      const startGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+      const tokenless = guidedSessionWithSyntheticFailure();
+      const [userTurn, failureTurn] = tokenless.chat_history;
+      useSessionStore.setState({
+        activeSessionId: "session-guided",
+        sessions: [guidedSessionFixture],
+        messages: [],
+        guidedSession: {
+          ...tokenless,
+          chat_history: [{ ...userTurn, turn_token: null }, failureTurn],
+        },
+        guidedNextTurn: singleSelectTurn(),
+        startGuided: startGuidedSpy,
+        chatGuided: chatGuidedSpy,
+      });
+
+      render(<ChatPanel />);
+
+      await act(async () => {
+        screen.getByRole("button", { name: "Retry" }).click();
+      });
+
+      await waitFor(() => {
+        expect(startGuidedSpy).toHaveBeenCalledWith("session-guided");
+      });
+      expect(chatGuidedSpy).not.toHaveBeenCalled();
     });
 
     it("Retry falls back to refetching guided state when there is no preceding user turn to resend", async () => {
@@ -3850,6 +3901,7 @@ assistant_message_kind: "synthetic_failure",
             ts_iso: "t",
 assistant_message_kind: "synthetic_failure",
             synthetic_failure_reason: "unavailable",
+            turn_token: null,
           },
         ],
         chat_turn_seq: 0,
@@ -3930,6 +3982,7 @@ assistant_message_kind: "synthetic_failure",
             ts_iso: "2026-07-03T00:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -4194,6 +4247,7 @@ assistant_message_kind: "synthetic_failure",
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -4235,6 +4289,7 @@ assistant_message_kind: "synthetic_failure",
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },
@@ -4276,6 +4331,7 @@ assistant_message_kind: "synthetic_failure",
             ts_iso: "2026-05-12T10:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       },

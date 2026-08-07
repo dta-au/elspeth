@@ -1215,6 +1215,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:00Z",
           assistant_message_kind: null,
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "assistant",
@@ -1224,6 +1225,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:01Z",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "user",
@@ -1233,6 +1235,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:02Z",
           assistant_message_kind: null,
           synthetic_failure_reason: null,
+          turn_token: null,
         },
         {
           role: "assistant",
@@ -1242,6 +1245,7 @@ describe("ChatPanelTutorialWorkspace", () => {
           ts_iso: "2026-07-03T00:00:03Z",
           assistant_message_kind: "assistant",
           synthetic_failure_reason: null,
+          turn_token: null,
         },
       ],
       chat_turn_seq: 4,

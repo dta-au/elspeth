@@ -46,7 +46,7 @@ def test_current_state_names_the_live_session_epoch() -> None:
     """
     current_state = _text("docs/product/current-state.md")
 
-    assert f"`SESSION_SCHEMA_EPOCH` is {SESSION_SCHEMA_EPOCH}, guided checkpoint schema is 10" in current_state
+    assert f"`SESSION_SCHEMA_EPOCH` is {SESSION_SCHEMA_EPOCH}, guided checkpoint schema is 11" in current_state
 
 
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:

@@ -1585,6 +1585,13 @@ async def post_guided_chat_schema8(
                         seq=resulting_guided.chat_turn_seq,
                         step=prospective.step,
                         ts_iso=finished_at.isoformat(),
+                        # The occurrence this message answered (validated
+                        # against guided_turn_token above): Retry must resend
+                        # THIS token, not whatever is current at click time,
+                        # so a stale retry draws the ordinary 409 instead of
+                        # applying old prose to newer session state
+                        # (elspeth-ea80e34fdc).
+                        turn_token=body.turn_token,
                     )
                     assistant_kind: Literal["assistant", "synthetic_failure"] = (
                         "assistant" if chat_result.status is ComposerChatTurnStatus.SUCCESS else "synthetic_failure"

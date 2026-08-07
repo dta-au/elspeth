@@ -219,7 +219,14 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        (bucket_field / ``deployment``) can no longer validate or replay,
 #        so pre-release policy applies: delete stale session databases
 #        (sessions.db only — auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 45
+#   46 -> no SQL-shape change; bumped in lockstep with
+#        GUIDED_SESSION_SCHEMA_VERSION 10->11 (composer_meta JSON
+#        chat_history entries gain the occurrence-binding ``turn_token``
+#        key so guided Retry is occurrence-bound instead of content-based,
+#        elspeth-ea80e34fdc). Pre-release delete-and-recreate policy for
+#        stale session databases (sessions.db only — auth.db is never
+#        touched).
+SESSION_SCHEMA_EPOCH = 46
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

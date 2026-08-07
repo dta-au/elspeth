@@ -931,6 +931,7 @@ async def get_guided(
                         ts_iso=t.ts_iso,
                         assistant_message_kind=t.assistant_message_kind,
                         synthetic_failure_reason=t.synthetic_failure_reason,
+                        turn_token=t.turn_token,
                     )
                     for t in guided.chat_history
                 ],
@@ -1453,6 +1454,7 @@ async def post_guided_start(
                         ts_iso=chat_turn.ts_iso,
                         assistant_message_kind=chat_turn.assistant_message_kind,
                         synthetic_failure_reason=chat_turn.synthetic_failure_reason,
+                        turn_token=chat_turn.turn_token,
                     )
                     for chat_turn in guided.chat_history
                 ],
@@ -1819,6 +1821,7 @@ async def post_guided_convert(
                         ts_iso=chat_turn.ts_iso,
                         assistant_message_kind=chat_turn.assistant_message_kind,
                         synthetic_failure_reason=chat_turn.synthetic_failure_reason,
+                        turn_token=chat_turn.turn_token,
                     )
                     for chat_turn in guided.chat_history
                 ],

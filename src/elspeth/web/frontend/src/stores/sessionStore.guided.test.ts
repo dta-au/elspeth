@@ -208,6 +208,7 @@ const sampleChatResponse: GuidedChatResponse = {
         ts_iso: "2026-05-13T00:00:00+00:00",
         assistant_message_kind: null,
         synthetic_failure_reason: null,
+        turn_token: null,
       },
       {
         role: "assistant",
@@ -217,6 +218,7 @@ const sampleChatResponse: GuidedChatResponse = {
         ts_iso: "2026-05-13T00:00:00+00:00",
         assistant_message_kind: "assistant",
         synthetic_failure_reason: null,
+        turn_token: null,
       },
     ],
     chat_turn_seq: 2,
@@ -3610,6 +3612,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
             ts_iso: "2026-07-11T00:00:00Z",
             assistant_message_kind: null,
             synthetic_failure_reason: null,
+            turn_token: null,
           },
           {
             role: "assistant",
@@ -3619,6 +3622,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
             ts_iso: "2026-07-11T00:00:01Z",
             assistant_message_kind: "assistant",
             synthetic_failure_reason: null,
+            turn_token: null,
           },
         ],
       };

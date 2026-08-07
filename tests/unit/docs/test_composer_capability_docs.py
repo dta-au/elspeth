@@ -104,11 +104,11 @@ def test_runbook_uses_plan_05_epoch_and_schema_numbers() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
 
-    # Current release values: the live session epoch, guided schema 10,
+    # Current release values: the live session epoch, guided schema 11,
     # Landscape 30. Bound to the constant so the doc cannot drift behind a bump.
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
     assert "Landscape epoch 30" in current_cutover
-    assert "guided schema 10" in runbook
+    assert "guided schema 11" in current_cutover
 
     # The recreation/rollback record reference must name the live session epoch,
     # not the stale session epoch-30 the header-bump left behind (elspeth
