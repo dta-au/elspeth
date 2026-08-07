@@ -39,7 +39,7 @@ measurement. Where they differ on anything else, it is **stochastic variation**
 | ⚠️ | g08 row_union A/B | 1 failed, 1 cwf, 1 completed, 1 compose-422 | **3/3 `completed`** — all three via REPAIR | A supersedes B, but green is reached by self-correction — see below |
 | ☀️ | g09 four LLM nodes | `completed` 15/18 | not sampled | See row-count note |
 | ☀️ | g10 LLM → fixed mapper | `completed` | not sampled | Stable |
-| ⛈ | g11 llm source | **`failed`** | **`failed`** — sink write, 0-byte artifact | **Reproducible. Mechanism known** |
+| ⛈ | g11 llm source | **`failed`** | **`failed`** — multiline diverted, 0-byte artifact | **Root cause settled, fix merged `1ec1c5b72`. Unverified on stage — see below** |
 
 Two footnotes that are not weather but matter:
 
@@ -58,18 +58,40 @@ Two footnotes that are not weather but matter:
 
 ## The three that decide the demo
 
-### 1. g11 — reproducible failure, mechanism known ⛈
+### 1. g11 — root cause settled, fix merged, unverified on stage ⛈
 
-Both runs fail. Mine has the mechanism: the llm **source** works (reads its row
-in 4.5s), content safety passes, and then the **text sink fails** — 0-byte
-artifact, `publication_performed: false`. The root cause of the write failure is
-**not yet known**; one CloudWatch query on run
-`badfc85f-5657-416e-9624-7cfe5caedcf5` should name it.
+**Updated later on 2026-08-07, after the fix landed.** What follows replaces
+this section's original reading, which named the wrong *category* of failure and
+sent the reader to a CloudWatch query that will find nothing.
 
-Worse for a demo than the failure itself: **nothing says why.** Token state says
-`failed` with `error_message: None`; the operations array says the *same node*
-`completed`; `failure_detail` is `null`; `discard_summary.stages[0].node_id` is
-`null`. If this breaks on stage you cannot narrate it.
+Both runs fail, the llm **source** works (reads its row in 4.5s), and content
+safety passes. But the text sink did not fail to write — it **diverted**. A
+0-byte artifact whose `content_hash` is `sha256(b"")` with
+`publication_performed: false` is the signature of a row the sink *declined*,
+not of a write that errored. The runtime behaved correctly and reported honestly
+at its own granularity.
+
+What it declined: the LLM produced **multiline** text, and `sink:text` writes one
+line per row. Nothing in the graph made that constraint visible at build time, so
+the composer authored a pipeline that could only ever divert.
+
+The fix is ADR-039's `TextFraming.UNCONSTRAINED` — a positive claim ("free text,
+framing not statically decidable"), distinct from `UNKNOWN` (abstention), which
+is what makes a generative producer gateable at all. Merged to `release/0.7.2`
+as `1ec1c5b72` after a six-seat panel review.
+
+**Do not read that as green.** Of the three defence layers — planner prompt,
+build gate, runtime diversion — the build gate **abstains on g11's actual
+topology**, because the intervening transform declares nothing and the edge is
+therefore advisory rather than refused. What defends this specific graph is the
+planner prompt, which is stochastic. The deterministic half covers the failure
+*class*; g11's own shape stays unverified until it is driven live. Report it as
+"0/N re-runs reproduced", never as fixed.
+
+The diagnosability half — token state `failed` with `error_message: None` while
+the operations array called the same node `completed` — was fixed separately the
+same day under `elspeth-9595abb7b0`: diverted rows now disclose the sink's own
+reason rather than an opaque effect hash.
 
 Note this graph could not run at all before today — `source:llm` was
 unauthorised (now fixed, `905613641`). It is a **new** capability with **one**
@@ -106,8 +128,8 @@ demo-blocker` is the live version of this table.
 | # | Ticket | Why it blocks |
 |---|---|---|
 | 1 | `elspeth-d1602e4b90` | **g05 regression.** Was green 6/6 in round 5, `failed` in the swarm run, unsampled at the round-6 pin. Diagnose first — one drive answers it, and it may be an envelope death rather than a graph defect |
-| 2 | `elspeth-9595abb7b0` | **g11 sink failure is undiagnosable.** Two surfaces contradict each other; if anything fails on stage you cannot explain it. Fix the diagnosability even if the root cause turns out trivial |
-| 3 | `elspeth-afdf55a17c` (P1) | **g11 sink write fails** — 0-byte artifact, run failed. The only reproducible red in the corpus, on the newest capability, with one sample. Reproduced independently by the swarm run on a different envelope, so it is not envelope-dependent |
+| 2 | `elspeth-9595abb7b0` | **FIXED 2026-08-07** — diverted rows now disclose the sink's own reason instead of an opaque effect hash. Remains on this list only until a live run confirms it on stage |
+| 3 | `elspeth-afdf55a17c` (P1) | **Root cause settled, fix merged `1ec1c5b72`; still blocks.** The sink *diverted* multiline text rather than failing to write. The build gate abstains on g11's actual topology, so the deterministic fix covers the class and not this graph — closure needs a live re-run reported as "0/N reproduced", not the merge |
 | 4 | `elspeth-85f3cc3022` | **g03 authors invalid pipelines sometimes.** Stochastic failure in a demo graph. The narrow fix is cheap: make the composer `preview_pipeline` before declaring done — it already does this on g11 and g08 |
 
 ### Fix if the demo touches it
@@ -143,7 +165,12 @@ The Sydney stack's **cleanup deadline is 2026-08-09**, so this window is
 closing. In priority order:
 
 1. **Drive g05 once.** It is the only untriaged red and the cheapest answer.
-2. **One CloudWatch query** for the g11 sink cause.
+2. **Drive g11 as many times as the window allows.** ~~One CloudWatch query for
+   the g11 sink cause~~ — superseded: the cause was settled by reading the code
+   (the sink diverted multiline text; the runtime was correct), so that query
+   would find nothing. What is owed now is *evidence*, because the build gate
+   abstains on this graph's shape and only the stochastic planner prompt defends
+   it. Each clean drive is one sample: 0/10 ⇒ ≤30% residual, 0/20 ⇒ ≤15%.
 3. **Drive g03 ×3.** Establish whether the invalid coalesce is a coin flip or
    an edge case; that single number decides whether g03 belongs in a demo.
 4. **Drive g09 once** and check the 15/18.
