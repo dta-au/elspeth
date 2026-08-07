@@ -1204,6 +1204,15 @@ _SINK_ADMITS_ALL = """        fields:
         - 'description: str'
 """
 
+# The same admitting sink with ONE type flipped against the source's id: int.
+_SINK_ADMITS_ALL_WRONG_TYPE = """        fields:
+        - 'id: str'
+        - 'product: str'
+        - 'price: int'
+        - 'category: str'
+        - 'description: str'
+"""
+
 # A locked TRANSFORM consumer: mode: fixed makes its input extra='forbid', so
 # it rejects the phantom-guaranteed fields exactly as a locked sink does.
 _LOCKED_TRANSFORM = """- name: lock_it
@@ -1359,6 +1368,42 @@ class TestUnionCoalesceGuaranteedExtras:
         (TestDualViolationSinkDiagnosisPrecedence's model-required pin).
         """
         _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
+
+    @pytest.mark.xfail(
+        reason=(
+            "Type-axis residue of elspeth-7d68b04878, tracked as elspeth-85e8afa2f5: a "
+            "forgiven field's ANCESTOR TYPE is not consulted. The source types id as int and "
+            "this sink demands id: str; with under-declared branches the missing arm forgives "
+            "id on presence alone, the build is GREEN, and every row dies typed at the sink "
+            "preflight (audited FAILED, not silent). The declared control alongside proves the "
+            "same pipeline with fully-declared branches IS rejected with a type mismatch — the "
+            "verdict must not depend on how much a branch declared. Closing needs an "
+            "ancestor-type walk (check when knowable, forgive when not); none exists yet "
+            "(get_effective_producer_schema_config resolves through gates only, and the "
+            "guarantee walk carries names without types by design)."
+        ),
+        strict=True,
+    )
+    def test_forgiven_field_with_conflicting_ancestor_type_is_rejected(self) -> None:
+        """Should fail at build with a type mismatch; today it builds green."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError):
+            _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE)
+
+    def test_declared_branches_expose_the_conflicting_type(self) -> None:
+        """The A/B control for the xfail above: declaration restores the verdict.
+
+        Fully-declared branches put id: int on the merged schema, so the sink
+        demanding id: str is rejected by the type-mismatch arm — which the
+        guarantee channel never overrides (a declared field is never
+        forgiven). Guards the declared path against any drift while
+        elspeth-85e8afa2f5 stays open.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError, match="Type mismatches"):
+            _build_coalesce_graph(branch_schema=_BRANCH_FULLY_DECLARED, sink_fields=_SINK_ADMITS_ALL_WRONG_TYPE)
 
     def test_select_only_field_mapper_clears_the_rejection(self) -> None:
         """The rejection message's remedy 3 must actually clear the rejection.
@@ -1565,8 +1610,17 @@ class TestDualViolationSinkDiagnosisPrecedence:
         (elspeth-7d68b04878) this must KEEP failing: a guarantee-aware arm
         may only forgive fields the graph proves present, and nothing proves
         mandatory_flag. Pinned now so that fix cannot over-widen unnoticed.
+
+        The eligibility precondition rides a green sibling (the flipped-xfail
+        shape, which builds precisely because forgiveness IS live there): if a
+        future fixture edit ever made mandatory_flag guaranteed, this asserts
+        the drift loudly instead of leaving only a less-diagnostic regex miss.
         """
         from elspeth.core.dag.models import EdgeContractError
+
+        green = _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
+        coalesce_id = next(n.node_id for n in green.get_nodes() if n.node_type.value == "coalesce")
+        assert "mandatory_flag" not in schema_validation.get_effective_guaranteed_fields(green, coalesce_id)
 
         with pytest.raises(EdgeContractError, match="Missing fields: mandatory_flag"):
             _build_coalesce_graph(sink_fields=_SINK_REQUIRES_UNPRODUCED)
@@ -1590,7 +1644,7 @@ transforms:
 - name: shorten
   plugin: truncate
   input: raw
-  on_success: output
+  on_success: {shorten_out}
   on_error: discard
   options:
     fields:
@@ -1600,7 +1654,7 @@ transforms:
       mode: flexible
       fields:
       - 'description: str'
-
+{extra_transforms}
 sinks:
   output:
     plugin: json
@@ -1612,13 +1666,52 @@ sinks:
         mode: {sink_mode}
 {sink_fields}"""
 
+# The linear source declares three fields, so "admits all" is a 3-field lock here.
+_SINK_ADMITS_ALL_LINEAR = """        fields:
+        - 'id: int'
+        - 'product: str'
+        - 'description: str'
+"""
 
-def _build_linear_pass_through_graph(*, sink_mode: str = "fixed", sink_fields: str = _SINK_ADMITS_DESCRIPTION) -> ExecutionGraph:
+# A locked TRANSFORM consumer whose own typed model REQUIRES every field the
+# pass-through forwards — the non-sink calling context of the missing arm.
+_LOCKED_TRANSFORM_REQUIRES_ALL_LINEAR = """- name: lock_it
+  plugin: truncate
+  input: mid
+  on_success: output
+  on_error: discard
+  options:
+    fields:
+      description: 10
+    suffix: "..."
+    schema:
+      mode: fixed
+      fields:
+      - 'id: int'
+      - 'product: str'
+      - 'description: str'
+"""
+
+
+def _build_linear_pass_through_graph(
+    *,
+    sink_mode: str = "fixed",
+    sink_fields: str = _SINK_ADMITS_DESCRIPTION,
+    shorten_out: str = "output",
+    extra_transforms: str = "",
+) -> ExecutionGraph:
     """Build source -> under-declaring pass-through transform -> sink. No coalesce."""
     from elspeth.cli_helpers import instantiate_plugins_from_config
     from elspeth.core.config import load_settings_from_yaml_string
 
-    settings = load_settings_from_yaml_string(_LINEAR_PASS_THROUGH_PIPELINE.format(sink_mode=sink_mode, sink_fields=sink_fields))
+    settings = load_settings_from_yaml_string(
+        _LINEAR_PASS_THROUGH_PIPELINE.format(
+            sink_mode=sink_mode,
+            sink_fields=sink_fields,
+            shorten_out=shorten_out,
+            extra_transforms=extra_transforms,
+        )
+    )
     plugins = instantiate_plugins_from_config(settings)
     return ExecutionGraph.from_plugin_instances(
         sources=plugins.sources,
@@ -1662,17 +1755,55 @@ class TestTypedPassThroughGuaranteedExtras:
         """False-reject guard: the same producer is fine when nothing is locked."""
         _build_linear_pass_through_graph(sink_mode="observed", sink_fields="")
 
+    def test_requiring_sink_covered_by_guarantees_builds(self) -> None:
+        """The missing-arm forgiveness on the LINEAR shape (elspeth-7d68b04878).
+
+        This class's parity claim, pinned for the MISSING direction too: the
+        sink requires id/product/description, the pass-through declares only
+        description, and the guarantee walk proves the rest arrive. Resolution
+        here runs through an ordinary transform's flexible schema, not
+        build_coalesce_schema's union merge — so a regression confined to
+        either resolution path cannot hide behind the other one's green
+        (the coalesce twin is TestUnionCoalesceGuaranteedExtras.
+        test_sink_admitting_every_guaranteed_field_builds).
+        """
+        _build_linear_pass_through_graph(sink_fields=_SINK_ADMITS_ALL_LINEAR)
+
+    def test_requiring_locked_transform_consumer_is_forgiven_by_guarantees(self) -> None:
+        """The forgiveness must thread to non-SINK consumers too.
+
+        A sink is exactly the consumer Phase 1 exempts from its own
+        missing-fields check (elspeth-3283f2eaec), so every sink-shaped pin in
+        this arc exercises check_compatibility as the ONLY missing gate. A
+        TRANSFORM consumer arrives with Phase 1 already run — but Phase 1
+        reads option-level requirement declarations, while this consumer's
+        requirement lives in its typed model alone, so Phase 2's
+        producer_guaranteed threading is still what admits the build. Without
+        this test the non-sink calling context had zero coverage.
+        """
+        _build_linear_pass_through_graph(
+            shorten_out="mid",
+            extra_transforms=_LOCKED_TRANSFORM_REQUIRES_ALL_LINEAR,
+            sink_fields=_SINK_ADMITS_ALL_LINEAR,
+        )
+
 
 class TestReductiveProducerExtrasFirewall:
     """A producer that forbids extras cannot emit what it merely guarantees.
 
     The guaranteed-extras check rests on "a guarantee means every row WILL
     carry the field", which holds only for a guarantee about OUTPUT. A
-    REDUCTIVE producer's guarantee channel can describe fields it CONSUMES:
-    batch_stats declares `value` while emitting count/sum. Its output
-    contract is `mode: fixed` (extra='forbid'), so its rows are exactly its
-    declared fields — the guaranteed-but-undeclared name provably never
-    reaches the consumer and cannot kill a row there.
+    REDUCTIVE producer's guarantee channel can describe fields it CONSUMES —
+    the batch_stats hazard: consuming `value` while emitting count/sum. Note
+    the fixture is defence in depth for the decoupled-channel POPULATION, not
+    a shape today's batch_stats itself produces: the real plugin (like every
+    in-tree reductive plugin) publishes a `mode: observed` output config with
+    guarantees recomputed to its emitted set, and observed producers bypass
+    check_compatibility entirely. Direct-constructed graphs — the 45
+    direct-SchemaConfig sites — can put a consumed-field guarantee on a FIXED
+    output, and that is the shape pinned here: rows are exactly the declared
+    fields, so the guaranteed-but-undeclared name provably never reaches the
+    consumer and cannot kill a row there.
 
     That extras firewall is the discriminator between this shape and the one
     the check exists for: a union coalesce's merged schema is `mode:

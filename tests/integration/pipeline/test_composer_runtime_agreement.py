@@ -379,10 +379,13 @@ where the architectural fix landed:
   consumer can leave the sink still requiring a field nothing provides, a false
   repair signal to an LLM authoring loop — so the raise site now accumulates
   the sink required-fields verdict instead of pre-empting it. The advertised
-  repair "declare the extras on the consumer" is likewise incomplete on its
-  own: widening the SINK alone fails the same edge with "Missing fields",
-  because the coalesce types its ``fields`` from the branches. Both advertised
-  repairs are pinned as executable controls below, so the advice cannot rot.
+  repair "declare the extras on the consumer" USED to be incomplete on its
+  own — widening the SINK alone failed the same edge with "Missing fields",
+  because the coalesce types its ``fields`` from the branches — until
+  ``elspeth-7d68b04878`` made the missing arm guarantee-aware; the sink-only
+  widening now builds, trading build-time type checks on the widened fields
+  for per-row preflight checks. The repairs are pinned as executable controls
+  below, so the advice cannot rot.
 
   A third pass (``48873f8dc``) was needed for SOUNDNESS, and it is the same
   lesson as the scope note below. The check rests on "a guarantee means every
@@ -5764,10 +5767,12 @@ _SHAPE19_SOURCE_SCHEMA = {
 _SHAPE19_BRANCH_SCHEMA = {"mode": "flexible", "fields": ["description: str"]}
 _SHAPE19_LOCKED_SINK_SCHEMA = {"mode": "fixed", "fields": ["description: str"]}
 # Repair 1 from the rejection's own remedy list: declare the extras on the
-# consumer AND on the branches that type the coalesce. Declaring them on the
-# sink alone fails the SAME edge with "Missing fields" instead — the trap
-# df50ea3c3 rewrote the remedy text to name, pinned here so the advertised
-# repair is known to actually produce a green build.
+# consumer, ideally also on the branches that type the coalesce. Declaring
+# them on the sink alone USED to fail the same edge with "Missing fields" —
+# the dead end df50ea3c3 rewrote the remedy text to name — until
+# elspeth-7d68b04878 made the missing arm guarantee-aware; now the sink-only
+# widening builds too (pinned below), with build-time TYPE checking of the
+# widened fields available only when the branches declare them.
 _SHAPE19_FULL_SCHEMA = {
     "mode": "fixed",
     "fields": ["id: str", "product: str", "price: float", "category: str", "description: str"],
@@ -6123,11 +6128,11 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
         """Positive control AND remedy 1: the check must not block a runnable pipeline.
 
         Identical topology; the branches and the sink both declare the full
-        set. Note that widening the SINK ALONE is not the repair — it fails the
-        same edge with "Missing fields", because the coalesce types its own
-        ``fields`` from the branches. That trap is why ``df50ea3c3`` rewrote
-        the remedy text to say "declare them on those branches too", and this
-        test is what keeps that advice true.
+        set. This is the STRONG form of remedy 1: with the branches declaring
+        the fields, the merged schema types them and the sink edge gets full
+        build-time type checking. The sink-only widening (next test) builds
+        since ``elspeth-7d68b04878``, but leaves those fields' types checked
+        only per-row at the sink preflight.
         """
         csv_path, output_path = self._paths(tmp_path)
 
@@ -6145,6 +6150,46 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
                 output_path=output_path,
                 sink_schema=_SHAPE19_FULL_SCHEMA,
                 branch_schema=_SHAPE19_FULL_SCHEMA,
+            )
+        )
+        graph.validate_edge_compatibility()
+
+    def test_widening_the_sink_alone_builds_green_on_both_surfaces(self, tmp_path: Path) -> None:
+        """The sink-only widening: FULL sink, branches still under-declared.
+
+        Until ``elspeth-7d68b04878`` this exact combination was the dead end
+        the remedy text warned about — the runtime rejected it with "Missing
+        fields" while the composer validated it green, a live disagreement in
+        the runtime's false-reject direction. The guarantee-aware missing arm
+        closed it: presence of the widened fields is proven by the guarantee
+        walk (the source types them and the pass-through branches forward
+        them), so BOTH surfaces now build. Pinned per this file's discipline:
+        the combination the fix made green is the combination a regression
+        would silently flip back.
+
+        Scope note: this pins the runnable, type-matching population (the sink
+        redeclares the source's own types). What it deliberately does NOT
+        claim is build-time type checking of the widened fields — those types
+        are checked per-row at the sink preflight, the known type-axis residue
+        tracked as the guarantee-typed-ancestor follow-up to
+        elspeth-7d68b04878.
+        """
+        csv_path, output_path = self._paths(tmp_path)
+
+        composer_result = self._composer_state(
+            csv_path=csv_path,
+            output_path=output_path,
+            sink_schema=_SHAPE19_FULL_SCHEMA,
+            branch_schema=_SHAPE19_BRANCH_SCHEMA,
+        ).validate()
+        assert composer_result.is_valid, composer_result.errors
+
+        graph = self._build_runtime_graph_from_settings(
+            self._runtime_settings(
+                csv_path=csv_path,
+                output_path=output_path,
+                sink_schema=_SHAPE19_FULL_SCHEMA,
+                branch_schema=_SHAPE19_BRANCH_SCHEMA,
             )
         )
         graph.validate_edge_compatibility()

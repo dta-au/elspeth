@@ -402,3 +402,24 @@ class TestCheckCompatibilityGuaranteeChannel:
         assert result.compatible is False
         assert result.missing_fields == ()
         assert result.type_mismatches and result.type_mismatches[0][0] == "x"
+
+    def test_mixed_forgiven_and_genuinely_missing_names_only_the_gap(self) -> None:
+        """One forgiven field plus one true gap on the same consumer.
+
+        The motivating repair loop depends on this: the verdict must name
+        exactly the field the author can act on, not resurrect the forgiven
+        one alongside it.
+        """
+
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="allow")
+
+            y: str
+
+        class Consumer(PluginSchema):
+            x: int
+            z: str
+
+        result = check_compatibility(Producer, Consumer, producer_guaranteed=frozenset({"x"}))
+        assert result.compatible is False
+        assert result.missing_fields == ("z",)

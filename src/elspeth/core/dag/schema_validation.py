@@ -237,15 +237,22 @@ def validate_single_edge(
         return  # Observed schemas bypass static type validation
 
     # Rule 2: Full compatibility check (missing fields, type mismatches, extra
-    # fields). The guarantee walk rides along so the missing arm can forgive a
-    # consumer-required field the graph proves present even though the producer
-    # never typed it (elspeth-7d68b04878) — check_compatibility itself gates
-    # the forgiveness on the producer's extras firewall.
-    result = check_compatibility(
-        producer_schema,
-        consumer_schema,
-        producer_guaranteed=get_effective_guaranteed_fields(graph, from_node_id),
-    )
+    # fields), then let the guarantee channel appeal a missing-only loss: the
+    # missing arm forgives a consumer-required field the graph proves present
+    # even though the producer never typed it (elspeth-7d68b04878), with
+    # check_compatibility itself gating the forgiveness on the producer's
+    # extras firewall. The walk runs only on edges that would otherwise fail —
+    # on a passing edge its only product would be discarded (the cheap-guard
+    # discipline validate_typed_producer_guaranteed_extras states), and
+    # forgiveness touches no arm but the missing one, so the re-check is
+    # verdict-identical to passing the walk eagerly.
+    result = check_compatibility(producer_schema, consumer_schema)
+    if not result.compatible and result.missing_fields:
+        result = check_compatibility(
+            producer_schema,
+            consumer_schema,
+            producer_guaranteed=get_effective_guaranteed_fields(graph, from_node_id),
+        )
     if not result.compatible:
         # Raise the structured subclass so downstream layers (composer
         # runtime preflight error formatter at
@@ -428,9 +435,9 @@ def _validate_locked_consumer_guaranteed_extras(
         f"\n"
         f"Fix: Either:\n"
         f"  1. Add the extra field(s) to the consumer's schema.fields if it should accept them "
-        f"— and when the producer TYPES its own fields (a union coalesce merges its branches' "
-        f"declared schemas), declare them on those branches too, or this edge fails instead "
-        f"with 'Missing fields', or\n"
+        f"— their presence is proven by the guarantee, and declaring them on the producing "
+        f"branches too restores build-time TYPE checking for them (left undeclared there, "
+        f"their types are checked only per-row at the consumer preflight), or\n"
         f"  2. Relax the consumer schema to mode: flexible WITHOUT declaring the extra fields, "
         f"so it admits them as undeclared, or\n"
         f"  3. Insert a field_mapper with select_only: true to drop the extras before this consumer"

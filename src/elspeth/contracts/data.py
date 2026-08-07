@@ -216,11 +216,22 @@ def check_compatibility(
     missing — reporting it was a false reject of runnable pipelines
     (elspeth-7d68b04878). Two deliberate limits keep the forgiveness sound:
 
-    - It applies only when the producer ADMITS undeclared fields
-      (``extra='allow'``). A producer that forbids extras emits exactly its
-      declared fields, so a guarantee naming anything else describes what it
-      CONSUMED, not what arrives — the same extras-firewall discriminator the
-      guaranteed-extras check uses — and the field stays missing.
+    - It applies only when the producer's CONTRACT admits undeclared fields
+      (``extra='allow'``). A ``forbid`` producer's rows are exactly its
+      declared fields (emission-side strict validation rejects extras), so a
+      guarantee naming anything else describes what it CONSUMED, not what
+      arrives — the same extras-firewall discriminator the guaranteed-extras
+      check uses — and the field stays missing. ``ignore`` is held to the
+      same verdict on deliberately conservative grounds: its runtime today
+      forwards undeclared fields (emission-side validation is check-only, the
+      row dict is never filtered), but that is an implementation detail of
+      the executor, not a contract, so no forgiveness is built on it. The
+      reject side of this gate is sound by construction; the FORGIVE side is
+      an inventory fact about current node kinds (today's reductive plugins
+      all publish ``mode: observed`` outputs, which bypass this function
+      entirely). A future reductive plugin emitting a FLEXIBLE output schema
+      alongside a consumed-field guarantee would reopen the hole here —
+      re-derive this argument before adding one.
     - The guarantee channel carries names without types, so a forgiven field's
       type is checked per-row at the consumer preflight rather than here —
       the standard the dynamic/observed bypass paths already set, where no
@@ -248,6 +259,8 @@ def check_compatibility(
 
     # The extras firewall, missing-arm direction: only a producer that admits
     # undeclared fields can deliver a guaranteed-but-undeclared one.
+    # NOTE: We control all schemas via PluginSchema base class which sets model_config["extra"].
+    # Direct access is correct per Tier 1 trust model - missing key would be our bug.
     producer_admits_undeclared = producer_schema.model_config["extra"] == "allow"
 
     missing: list[str] = []
