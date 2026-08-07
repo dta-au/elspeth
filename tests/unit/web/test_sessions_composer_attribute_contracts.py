@@ -69,7 +69,7 @@ def _attribute_probes(repo_root: Path) -> set[_AttributeProbe]:
 
 
 def test_sessions_and_composer_use_explicit_attribute_contracts() -> None:
-    """Only the two ADR-032 LiteLLM admission boundaries may use ``getattr``."""
+    """Only the ADR-032 LiteLLM admission boundaries may use ``getattr``."""
 
     repo_root = Path(__file__).resolve().parents[3]
     expected = {
@@ -127,6 +127,8 @@ def test_sessions_and_composer_use_explicit_attribute_contracts() -> None:
             "getattr",
             "arguments",
         ),
+        _AttributeProbe("src/elspeth/web/composer/service.py", "_call_llm", "getattr", "content"),
+        _AttributeProbe("src/elspeth/web/composer/service.py", "_call_llm", "getattr", "tool_calls"),
         _AttributeProbe("src/elspeth/web/composer/tool_batch.py", "_admit_tool_batch", "getattr", "id"),
         _AttributeProbe("src/elspeth/web/composer/tool_batch.py", "_admit_tool_batch", "getattr", "function"),
         _AttributeProbe("src/elspeth/web/composer/tool_batch.py", "_admit_tool_batch", "getattr", "name"),
