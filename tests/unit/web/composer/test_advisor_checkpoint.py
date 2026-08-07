@@ -36,6 +36,11 @@ from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.no_tool_policy import (
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL,
+    is_pending_interpretation_handoff,
+)
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import (
     _ADVISOR_UNAVAILABLE_USER_DETAIL,
@@ -51,7 +56,14 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
+from elspeth.web.execution.schemas import (
+    CHECK_ADVISOR_SIGNOFF,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
+from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -2104,6 +2116,7 @@ async def drive_try_terminate(
     llm_messages: list[dict[str, object]] | None = None,
     repair_turns_used: int = 0,
     runtime_preflight_valid: bool = True,
+    runtime_preflight_result: ValidationResult | None = None,
     message: str = "rate how cool the pages are",
     deadline: float | None = None,
     recorder: BufferingRecorder | None = None,
@@ -2133,33 +2146,34 @@ async def drive_try_terminate(
     # preflight-repair gate runs BEFORE it and would intercept a preflight-invalid
     # state. These tests exercise the ADVISOR, so stub the runtime preflight valid
     # to establish that precondition (the preflight gate is covered separately).
-    service._runtime_preflight = (
-        (
-            lambda candidate, user_id=None, session_id=None: ValidationResult(
-                is_valid=True,
-                checks=[],
-                errors=[],
-                readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
-            )
+    # ``runtime_preflight_result`` supplies a specific shape instead — the
+    # pending-interpretation-handoff result the repair gate deliberately passes
+    # through is neither of the two the boolean can express.
+    if runtime_preflight_result is not None:
+        stubbed_preflight = runtime_preflight_result
+    elif runtime_preflight_valid:
+        stubbed_preflight = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         )
-        if runtime_preflight_valid
-        else (
-            lambda candidate, user_id=None, session_id=None: ValidationResult(
-                is_valid=False,
-                checks=[],
-                errors=[
-                    ValidationError(
-                        component_id="rate",
-                        component_type="transform",
-                        message="node 'rate' requires field 'url' which no upstream emits",
-                        suggestion=None,
-                        error_code=None,
-                    )
-                ],
-                readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
-            )
+    else:
+        stubbed_preflight = ValidationResult(
+            is_valid=False,
+            checks=[],
+            errors=[
+                ValidationError(
+                    component_id="rate",
+                    component_type="transform",
+                    message="node 'rate' requires field 'url' which no upstream emits",
+                    suggestion=None,
+                    error_code=None,
+                )
+            ],
+            readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
         )
-    )
+    service._runtime_preflight = lambda candidate, user_id=None, session_id=None: stubbed_preflight
     # elspeth-2306940c70: a terminal END-gate block persists a durable
     # withheld-turn disclosure, so the gate needs a sessions service and a
     # UUID-shaped session id even in this advisor-focused harness.
@@ -2589,6 +2603,100 @@ async def test_end_gate_keeps_preflight_header_when_validation_is_red(make_servi
     assert outcome.result.runtime_preflight.readiness.execution_ready is False
     assert _PREFLIGHT_NOTICE_HEADER in outcome.result.message
     assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in outcome.result.message
+
+
+def _pending_handoff_preflight() -> ValidationResult:
+    """The truncated-ledger shape ``review_interpretations`` produces at stage 10.
+
+    ``is_valid=False`` with authoring valid and a resolvable review card
+    outstanding. ``_attempt_preflight_repair`` passes this shape through
+    deliberately, so it reaches the END gate exactly as written here.
+    """
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=True,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="rate",
+                    component_type="transform",
+                    detail="vague_term review pending for transform 'rate': cool",
+                )
+            ],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_end_gate_preserves_pending_handoff_shape(make_service, clean_runnable_state):
+    """elspeth-66717f0c99: the third preflight shape, at the gate's own level.
+
+    Sibling of the R2-F14 scope guard above. A pending-interpretation-handoff
+    preflight is neither green nor genuinely red: replacing it with the
+    all-red advisor shape destroys the resolvable-card signal and states
+    falsely that the build failed validation. The verdict is recorded
+    ADDITIVELY instead — the advisor check is appended, readiness is untouched.
+
+    This suite deliberately does not import the CLEAN autouse stub, so the
+    mechanism stays pinned here even if the universal-qualification suite's
+    fixtures change again.
+    """
+    from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=2,  # repair budget exhausted -> the preflight gate cannot intercept
+        runtime_preflight_result=_pending_handoff_preflight(),
+    )
+
+    assert outcome.action == "return"
+    preflight = outcome.result.runtime_preflight
+    assert is_pending_interpretation_handoff(preflight)
+    assert [blocker.code for blocker in preflight.readiness.blockers] == [INTERPRETATION_REVIEW_PENDING_CODE]
+    assert preflight.readiness.authoring_valid is True
+    assert preflight.readiness.completion_ready is True
+    assert [check.name for check in preflight.checks if not check.passed] == [CHECK_ADVISOR_SIGNOFF]
+    assert _PREFLIGHT_NOTICE_HEADER not in outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE in outcome.result.message
+    # The appended check's detail is read beside a readiness block asserting
+    # completion_ready=True, so it must not claim the turn cannot be completed.
+    detail = next(check.detail for check in preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
+    assert detail.startswith(_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL)
+    assert "cannot mark this turn complete" not in detail
+    assert _ADVISOR_UNAVAILABLE_USER_DETAIL in detail  # the reason class still names itself
+
+
+def test_pending_handoff_note_mints_trusted_chrome() -> None:
+    """Sibling of ``test_signoff_pending_note_mints_trusted_chrome``.
+
+    Both other branches of ``_advisor_blocked_result`` publish a canonical
+    suffix; a third that does not renders backend copy as ordinary
+    (unattributed) assistant text.
+    """
+    from elspeth.web.composer.no_tool_policy import (
+        TrustedSystemNoticeSegment,
+        compose_advisor_pending_handoff_message,
+        visible_message_segments,
+    )
+
+    raw = "Done — the pipeline is ready."
+    content = compose_advisor_pending_handoff_message(raw)
+    segments = visible_message_segments(content=content, raw_content=raw)
+
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
 
 
 @pytest.mark.asyncio

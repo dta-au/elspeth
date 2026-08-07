@@ -351,6 +351,8 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
 _compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
+_compose_advisor_pending_handoff_message = _no_tool_policy.compose_advisor_pending_handoff_message
+_advisor_signoff_pending_handoff_wording = _no_tool_policy.advisor_signoff_pending_handoff_wording
 _ADVISOR_SIGNOFF_PENDING_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
@@ -970,6 +972,19 @@ def _replace_advisor_repair_public_result(
             raw_assistant_content=None,
         )
     if _is_pending_interpretation_handoff(runtime_result):
+        if any(check.name == CHECK_ADVISOR_SIGNOFF and not check.passed for check in runtime_result.checks):
+            # elspeth-66717f0c99: reachable only since the END gate began
+            # PRESERVING this shape instead of replacing it with the all-red
+            # advisor result. The review card is genuinely pending, but the
+            # advisory review did not clear either, so "ready for the required
+            # review" would name the review as the only remaining step — the
+            # same over-claim elspeth-5a372d3267 closed for the masked-
+            # revalidation case.
+            return replace(
+                result,
+                message=_compose_advisor_pending_handoff_message(""),
+                raw_assistant_content="",
+            )
         if outstanding_findings is not None:
             # elspeth-5a372d3267: the strict ledger stopped at
             # interpretation_review, so "ready for the required review" is
@@ -6471,12 +6486,16 @@ class ComposerServiceImpl:
         is threaded with ``repair_turns_used`` plus the persisted ids so the
         route handler can persist composer_meta uniformly.
 
-        Two shapes are chosen solely from deterministic runtime validation:
+        Three shapes are chosen solely from deterministic runtime validation:
 
-        * a red or absent preflight remains fully red under the runtime-
-          preflight header;
         * a green preflight preserves ``is_valid``, checks, errors, authoring
-          validity, and execution readiness, withholding only completion.
+          validity, and execution readiness, withholding only completion;
+        * a pending-interpretation handoff is preserved WHOLE — the advisor
+          verdict is appended as a failed check and nothing is withheld, so
+          the resolvable review card the operator can act on survives
+          (elspeth-66717f0c99);
+        * any other red or absent preflight remains fully red under the
+          runtime-preflight header.
 
         The provider's findings and the primary model's terminal prose remain
         internal. Every public field is synthesized from fixed backend copy —
@@ -6496,6 +6515,17 @@ class ComposerServiceImpl:
                 findings_backend_authored=verdict.findings_backend_authored,
             )
             augmented = _compose_advisor_signoff_pending_message("")
+        elif runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+            # Matches the discriminator EXACTLY, not merely ``not is_valid``:
+            # preservation is owed to the resolvable review card, not to every
+            # invalid preflight.
+            runtime_result = _advisor_signoff_pending_handoff_validation(
+                runtime_preflight,
+                reason=reason,
+                findings=verdict.findings_text,
+                findings_backend_authored=verdict.findings_backend_authored,
+            )
+            augmented = _compose_advisor_pending_handoff_message("")
         else:
             runtime_result = _advisor_signoff_blocked_validation(
                 reason=reason,
@@ -8421,5 +8451,62 @@ def _advisor_signoff_pending_validation(
                     ),
                 ],
             ),
+        }
+    )
+
+
+def _advisor_signoff_pending_handoff_validation(
+    base: ValidationResult,
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+) -> ValidationResult:
+    """Record the advisor verdict ADDITIVELY on a resolvable pending handoff.
+
+    elspeth-66717f0c99. The pending-interpretation-handoff shape is the third
+    thing the END gate's preflight can be, and it is the one the other two
+    builders get wrong: ``_advisor_signoff_blocked_validation`` replaces it
+    with an all-red result whose only blocker is the advisor's, destroying the
+    ``interpretation_review_pending`` blocker that tells every consumer a
+    RESOLVABLE review card is waiting — and telling the operator the build
+    failed validation, which is false, because authoring validated.
+
+    So the base is carried through and only the failed ``advisor_signoff``
+    check is appended. Readiness is untouched, deliberately including
+    ``completion_ready=True``: it is the load-bearing axis of BOTH
+    ``is_pending_interpretation_handoff`` and ``ComposerResult``'s own pending
+    carve-out, so withholding it would reproduce the defect one level down —
+    every discriminator consumer would revert to seeing plain red. The turn is
+    not thereby announced complete: it is deferred to a user-action boundary,
+    ``execution_ready`` stays False so execute()'s gate still blocks, and a
+    fresh advisor pass runs on the next compose request.
+
+    No advisor BLOCKER is appended for the same reason. The verdict's audit
+    evidence rides the appended check plus the withheld-prose disclosure the
+    gate has already persisted.
+
+    The check detail comes from ``_advisor_signoff_pending_handoff_wording``
+    rather than the shared ``_advisor_signoff_blocked_wording``, whose text
+    asserts completion is withheld — a claim this result's own readiness
+    contradicts.
+    """
+    detail = _advisor_signoff_pending_handoff_wording(
+        reason=reason,
+        findings=findings,
+        findings_backend_authored=findings_backend_authored,
+    )
+    return base.model_copy(
+        update={
+            "checks": [
+                *base.checks,
+                ValidationCheck(
+                    name=_ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+            ],
         }
     )

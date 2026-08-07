@@ -80,6 +80,40 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 
+# elspeth-66717f0c99: the third preflight shape the END advisor gate can hold —
+# a resolvable pending-interpretation handoff. It is neither green (so
+# ``_ADVISOR_SIGNOFF_PENDING_NOTICE`` is wrong: completion is NOT withheld
+# there, the review card is what the turn is deferred to) nor genuinely red (so
+# ``_PREFLIGHT_NOTICE_HEADER`` is wrong: authoring validated). This notice
+# names BOTH outstanding facts. It deliberately does not say the review is the
+# only remaining step — ``_advisor_blocked_result`` is sync and cannot run the
+# masked re-validation that would establish that (elspeth-5a372d3267) — and it
+# interpolates nothing, so the whole suffix is fixed operator-authored prose.
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
+    "A required interpretation review is pending, and the completion advisory review did not clear "
+    "after the available attempts. Resolve the pending review cards; validation and the advisory "
+    "review both run again on the next request."
+)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = (
+    _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
+)
+
+# The check-detail counterpart of that notice. ``_advisor_signoff_blocked_wording``
+# says completion is withheld / cannot be marked complete — true on both
+# surfaces it serves, FALSE on the preserved pending handoff, whose
+# ``completion_ready`` stays True. A check detail is a diagnostic rather than a
+# readiness claim, but it is a surfaced field, so the contradiction is dropped
+# here too: same reason classes, same findings rule, no completion claim.
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FLAGGED_DETAIL: Final = (
+    "The evidence-scoped completion advisory review flagged this build and did not clear after the "
+    "available attempts. The pending interpretation review remains resolvable; the advisory review "
+    "runs again on the next request."
+)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL: Final = (
+    "The evidence-scoped completion advisory review could not be obtained. The pending interpretation "
+    "review remains resolvable; the advisory review runs again on the next request."
+)
+
 # Primary-model prose produced after hidden advisor findings entered its
 # context is not an operator transcript.  The model may quote, paraphrase, or
 # rebut those findings even after the pipeline is repaired and the next
@@ -410,6 +444,8 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return empty_with_blocker
     if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
+    if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
     if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
         return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
     preflight_with_diagnostic = _split_wrapped_diagnostic(
@@ -537,6 +573,44 @@ def compose_advisor_signoff_pending_message(content: str) -> str:
     if not content:
         return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
     return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
+
+
+def compose_advisor_pending_handoff_message(content: str) -> str:
+    """Build the user-facing message for a pending handoff the advisor did not clear.
+
+    Neither sibling wording fits: the preflight header would claim validation
+    failed on a build whose authoring passed, and the sign-off-pending notice
+    would claim completion is withheld on a result that keeps
+    ``completion_ready`` (elspeth-66717f0c99). Fixed prose, no interpolated
+    diagnostic — the advisor's own wording rides the appended failed
+    ``advisor_signoff`` check instead of this surface.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
+
+
+def advisor_signoff_pending_handoff_wording(*, reason: str, findings: str, findings_backend_authored: bool = False) -> str:
+    """Return the appended check's detail for a PRESERVED pending handoff.
+
+    Deliberately not ``_advisor_signoff_blocked_wording``: that pair is shared
+    by the two surfaces that genuinely withhold completion, and this one does
+    not (elspeth-66717f0c99). The reason classes and the findings rule are
+    identical to it — a flagged reason carries ``findings`` only when it is the
+    backend-authored pre-scan string that names the triggering key/field
+    (elspeth-cd9af8e61d), so raw advisor-MODEL findings stay withheld (R2-F13),
+    and the could-not-be-obtained reasons always carry it because there it is
+    the fixed backend classification naming the class in plain language.
+
+    Returns the detail alone, not a (detail, suggestion) pair: the preserved
+    shape appends no blocker and no error, so there is no surface to carry a
+    suggestion.
+    """
+    if reason in {"flagged_final_pass", "flagged_no_repair"}:
+        if findings_backend_authored and findings:
+            return f"{_ADVISOR_SIGNOFF_PENDING_HANDOFF_FLAGGED_DETAIL} {findings}"
+        return _ADVISOR_SIGNOFF_PENDING_HANDOFF_FLAGGED_DETAIL
+    return f"{_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL} {findings}"
 
 
 def _strip_quoted_text(message: str) -> tuple[str, bool, bool]:

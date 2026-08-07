@@ -42,11 +42,13 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.web.catalog.schemas import PluginSummary
 from elspeth.web.composer import service as service_module
-from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
-from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.composer.no_tool_policy import _PREFLIGHT_NOTICE_HEADER, is_pending_interpretation_handoff
+from elspeth.web.composer.service import AdvisorCheckpointVerdict, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import (
+    ADVISOR_SIGNOFF_BLOCKED_CODE,
+    CHECK_ADVISOR_SIGNOFF,
     ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
@@ -66,6 +68,12 @@ from ._helpers import (
 
 _HANDOFF_SUFFIX = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
 _QUALIFIED_MARKER = "must be fixed before this pipeline can run"
+_PENDING_HANDOFF_MARKER = "A required interpretation review is pending"
+# Both phrases the SHARED blocked-wording emits; neither is true of a preserved
+# pending handoff, whose readiness keeps completion_ready.
+_WITHHELD_COMPLETION_CLAIM = "Composer completion is withheld"
+_CANNOT_COMPLETE_CLAIM = "cannot mark this turn complete"
+_PENDING_HANDOFF_DETAIL_MARKER = "The pending interpretation review remains resolvable"
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +235,27 @@ class _ScriptedLLM:
         return self._responses.pop(0)
 
 
+class _RecordingAdvisor:
+    """Instance-level ``_run_advisor_checkpoint`` replacement with a call log.
+
+    Bound as an instance attribute, so it receives no ``self`` — the recorded
+    ``phase``/``pass_index`` are the instrument guard that distinguishes a test
+    that actually drove the END gate from one whose turn ended earlier.
+    """
+
+    def __init__(self, verdict: AdvisorCheckpointVerdict) -> None:
+        self._verdict = verdict
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, *_args: Any, **kwargs: Any) -> AdvisorCheckpointVerdict:
+        self.calls.append({"phase": kwargs.get("phase"), "pass_index": kwargs.get("pass_index")})
+        return self._verdict
+
+    @property
+    def end_passes(self) -> list[int | None]:
+        return [call["pass_index"] for call in self.calls if call["phase"] == "end"]
+
+
 def _set_pipeline_without_interpretation_sites() -> dict[str, Any]:
     """A ``set_pipeline`` payload whose state enumerates ZERO interpretation sites.
 
@@ -370,9 +399,20 @@ async def _run_no_tool_turn(
     fake: _RecordingValidatePipeline,
     max_composition_turns: int,
     prose: str = "All set — I mapped the text field across.",
+    advisor: Any | None = None,
 ) -> Any:
-    """Drive one mutation turn followed by a no-tool terminal turn."""
+    """Drive one mutation turn followed by a no-tool terminal turn.
+
+    ``advisor`` overrides the END-gate checkpoint for this composer only. The
+    module-wide ``_stub_advisor_end_gate_clean`` autouse fixture patches the
+    CLASS, so every test here would otherwise see a CLEAN verdict and the
+    advisor terminal-block path — the one no-tool terminal that bypasses the
+    shared finalize tail — could never be reached. Assigning the INSTANCE
+    attribute is the override mechanism that fixture's docstring sanctions.
+    """
     composer = _build_composer(tmp_path, sessions_service, max_composition_turns=max_composition_turns)
+    if advisor is not None:
+        composer._run_advisor_checkpoint = advisor
     session_id = await _seed_session(sessions_service)
     monkeypatch.setattr(service_module, "validate_pipeline", fake)
     llm = _ScriptedLLM(
@@ -488,6 +528,13 @@ class TestSuffixIsAppendedExactlyOnce:
     ever overlap the suffix lands TWICE, and
     ``_enforce_augmentation_prefix_invariant`` still passes — a doubled suffix
     keeps the model's prose as a strict prefix — so nothing else would catch it.
+
+    Scope: these two scenarios never call ``request_interpretation_review``, so
+    they never enter the staged-handoff branch — the only path that can
+    actually overlap the shared tail. That third path is pinned by
+    ``test_staged_handoff_branch_appends_exactly_one_suffix`` in
+    ``test_compose_loop_interpretation_review_dispatch.py``; do not read these
+    two as covering it.
     """
 
     @pytest.mark.asyncio
@@ -507,3 +554,130 @@ class TestSuffixIsAppendedExactlyOnce:
         result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1)
 
         assert result.assistant_message.count(_HANDOFF_SUFFIX) == 1
+
+
+class TestAdvisorBlockedTerminalPreservesPendingHandoff:
+    """elspeth-66717f0c99 — the advisor terminal block must MERGE, not REPLACE.
+
+    ``_advisor_blocked_result`` chose between exactly two shapes: carry a GREEN
+    preflight through (R2-F14) or publish the fully-red advisor shape. The
+    resolvable pending-interpretation-handoff preflight has ``is_valid=False``,
+    so it fell to the red side: the ``interpretation_review_pending`` blocker,
+    ``authoring_valid`` and ``completion_ready`` were all destroyed, the
+    operator was told the build failed validation (false — authoring is valid),
+    and was never told a resolvable review card was waiting.
+
+    Nothing caught it because this file's autouse ``_stub_advisor_end_gate_clean``
+    patches the class, so no test here could ever observe a non-CLEAN verdict —
+    and the advisor terminal return is the ONE no-tool terminal path that
+    bypasses ``_surface_and_finalize_no_tools`` entirely.
+    """
+
+    @staticmethod
+    def _assert_pending_shape_survived(result: Any) -> None:
+        preflight = result.runtime_preflight
+        assert preflight is not None
+        assert is_pending_interpretation_handoff(preflight)
+        assert [blocker.code for blocker in preflight.readiness.blockers] == [INTERPRETATION_REVIEW_PENDING_CODE]
+        # The replace mutation forces both of these False; reverting
+        # merge -> replace fails here first.
+        assert preflight.readiness.authoring_valid is True
+        assert preflight.readiness.completion_ready is True
+        assert preflight.readiness.execution_ready is False
+        # A mutation that preserves the preflight but DROPS the advisor verdict
+        # passes every assertion above and fails this one.
+        assert [check.name for check in preflight.checks if not check.passed] == [CHECK_ADVISOR_SIGNOFF]
+        # The detail is a surfaced field read beside a readiness block that
+        # says completion_ready=True, so it must not assert the opposite.
+        # Reverting to the shared ``_advisor_signoff_blocked_wording`` fails here.
+        detail = next(check.detail for check in preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
+        assert _WITHHELD_COMPLETION_CLAIM not in detail
+        assert _CANNOT_COMPLETE_CLAIM not in detail
+        assert _PENDING_HANDOFF_DETAIL_MARKER in detail
+        assert _PENDING_HANDOFF_MARKER in result.assistant_message
+        assert _PREFLIGHT_NOTICE_HEADER not in result.assistant_message
+        # The gate returns before the shared finalize tail, so the tail's own
+        # announcement must not also appear — a future refactor that routes this
+        # branch through the tail would double-announce silently.
+        assert _HANDOFF_SUFFIX not in result.assistant_message
+
+    @pytest.mark.asyncio
+    async def test_flagged_terminal_block_preserves_pending_handoff_via_b4d3(
+        self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The B-4D-3 budget-exhaustion finalize (``allow_repair_continue=False``)."""
+        advisor = _RecordingAdvisor(AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: terminal flag"))
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
+        result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1, advisor=advisor)
+
+        assert advisor.end_passes, f"the END gate must have run: {advisor.calls}"
+        self._assert_pending_shape_survived(result)
+
+    @pytest.mark.asyncio
+    async def test_flagged_last_pass_preserves_pending_handoff_via_clean_tail(
+        self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DEFAULT terminal path — ``_try_terminate_no_tools``.
+
+        FLAGGED on pass 1 injects the advisor repair turn, the scripted LLM
+        replies no-tool again, and pass 2 is the last budgeted pass
+        (``composer_advisor_checkpoint_max_passes`` defaults to 2). A fix
+        applied inside the B-4D-3 branch rather than inside
+        ``_advisor_blocked_result`` passes the first test and fails this one.
+        """
+        advisor = _RecordingAdvisor(AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: terminal flag"))
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
+        result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=15, advisor=advisor)
+
+        assert advisor.end_passes == [1, 2], f"both END passes must have run: {advisor.calls}"
+        self._assert_pending_shape_survived(result)
+
+    @pytest.mark.asyncio
+    async def test_unavailable_advisor_preserves_pending_handoff(
+        self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reason-independence: the merge keys on the PREFLIGHT shape.
+
+        A fix scoped to the ``flagged_*`` reasons only would fail here.
+        """
+        advisor = _RecordingAdvisor(
+            AdvisorCheckpointVerdict(
+                ok=False, blocking=False, findings_text="advisor model was unavailable after retry", failure_class="unavailable"
+            )
+        )
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_valid_result())
+        result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1, advisor=advisor)
+
+        assert advisor.end_passes, f"the END gate must have run: {advisor.calls}"
+        self._assert_pending_shape_survived(result)
+        # The could-not-be-obtained reasons always carry ``findings`` — it is
+        # the fixed backend classification naming the class, not advisor-model
+        # prose — so the pending-specific wording must not have dropped it.
+        detail = next(check.detail for check in result.runtime_preflight.checks if check.name == CHECK_ADVISOR_SIGNOFF)
+        assert "advisor model was unavailable after retry" in detail
+        assert detail.startswith("The evidence-scoped completion advisory review could not be obtained.")
+
+    @pytest.mark.asyncio
+    async def test_structural_red_still_fully_red_under_flagged_advisor(
+        self, tmp_path: Path, sessions_service: SessionServiceImpl, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Scope fence: preservation is scoped to the pending-handoff shape ONLY.
+
+        Replacing ``_is_pending_interpretation_handoff(...)`` with
+        ``not runtime_preflight.is_valid`` would widen preservation to every
+        invalid preflight and fail here.
+        """
+        advisor = _RecordingAdvisor(AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: terminal flag"))
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_structural_failure_result())
+        result = await _run_no_tool_turn(tmp_path, sessions_service, monkeypatch, fake=fake, max_composition_turns=1, advisor=advisor)
+
+        assert advisor.end_passes, f"the END gate must have run: {advisor.calls}"
+        preflight = result.runtime_preflight
+        assert preflight is not None
+        assert preflight.is_valid is False
+        assert [blocker.code for blocker in preflight.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
+        assert preflight.readiness.authoring_valid is False
+        assert preflight.readiness.execution_ready is False
+        assert preflight.readiness.completion_ready is False
+        assert _PREFLIGHT_NOTICE_HEADER in result.assistant_message
+        assert _PENDING_HANDOFF_MARKER not in result.assistant_message
