@@ -967,19 +967,29 @@ class TestLockedConsumerGuaranteedExtras:
             graph.validate_edge_compatibility()
 
     def test_multi_input_gate_into_a_nested_coalesce_still_builds(self) -> None:
-        """The whole-graph sweep must skip correlated barriers, as its host did.
-
-        ``validate_single_edge`` returns for a COALESCE/ROW_UNION consumer
-        BEFORE Phase 2, so it never resolves those producers' schemas. Hoisting
-        the extras check into a whole-graph pass inherited every guard between
-        that function's entry and the old call site — and dropping this one is
-        not inert, because ``get_effective_producer_schema`` itself raises on a
-        gate with mixed observed/explicit branches.
+        """No validation walk may resolve a mixed-schema gate for a barrier consumer.
 
         A ``nested`` merge has no cross-branch schema constraint at all (each
         branch is keyed separately in the output), so this topology is
-        legitimate and built cleanly before the hoist. Without the skip it
-        raises "Gate 'gate' has mixed observed/explicit schemas".
+        legitimate and must build cleanly. The hazard it guards is that
+        ``get_effective_producer_schema`` RAISES on a gate with mixed
+        observed/explicit branches, so any pass that resolves this producer
+        rejects a buildable graph.
+
+        WHAT THIS CAN AND CANNOT PIN — read before "verifying" it by mutation.
+        An earlier version of this docstring claimed that deleting the
+        COALESCE/ROW_UNION skip in ``validate_typed_producer_guaranteed_extras``
+        makes the graph raise "Gate 'gate' has mixed observed/explicit schemas".
+        That was true when written and is FALSE now: ``df50ea3c3`` moved the
+        cheap consumer-schema guard AHEAD of the producer resolution, and a
+        COALESCE node's ``input_schema`` is ``None``, so the loop now ``continue``s
+        before it can reach the raiser. That one line is currently SUBSUMED.
+
+        What this test does still catch, and why it earns its place: REORDERING
+        the guards so the producer resolves eagerly (raises), and removing the
+        matching host skip in ``validate_single_edge`` (also raises). It pins the
+        OUTCOME — this graph builds — which is the property that actually
+        matters and which survives whichever guard happens to deliver it.
         """
         from elspeth.contracts import PluginSchema
 
