@@ -290,6 +290,99 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_trust_mode", "flipped_trust_mode"),
+    [("auto_commit", "explicit_approve"), ("explicit_approve", "auto_commit")],
+    ids=["downgrade-mid-plan", "upgrade-mid-plan"],
+)
+async def test_trust_mode_change_during_planning_revokes_auto_commit_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_trust_mode: str,
+    flipped_trust_mode: str,
+) -> None:
+    """A preference flip while the planner is in a provider call requires review.
+
+    Regression for elspeth-01d4c6e683: trust authority was snapshotted before
+    the provider call, so a user switching auto_commit -> explicit_approve
+    mid-plan still had the in-flight plan committed automatically. Auto-commit
+    now requires the pre-plan snapshot AND the preference at staging time to
+    both be auto_commit; any mismatch lands the proposal on the review path.
+    """
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("planner-user", "Planner", "local")
+    await sessions.update_composer_preferences(
+        session.id,
+        trust_mode=initial_trust_mode,  # type: ignore[arg-type]
+        density_default="high",
+        actor="test",
+    )
+    user_message = await sessions.add_message(
+        session.id,
+        "user",
+        "Build a CSV to JSONL pipeline.",
+        writer_principal="route_user_message",
+    )
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_boot_probe_enabled=False,
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+    )
+    monkeypatch.setattr(
+        ComposerServiceImpl,
+        "_compute_availability",
+        lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+    )
+    composer = ComposerServiceImpl.for_trained_operator(
+        create_catalog_service(),
+        settings,
+        sessions_service=sessions,
+        session_engine=engine,
+    )
+
+    async def completion(**kwargs: Any) -> _Response:
+        # The preference flip lands while the provider call is in flight —
+        # after the planner snapshotted preferences, before staging.
+        await sessions.update_composer_preferences(
+            session.id,
+            trust_mode=flipped_trust_mode,  # type: ignore[arg-type]
+            density_default="high",
+            actor="test",
+        )
+        return _terminal_response(tmp_path, str(session.id))
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+    result = await composer.compose(
+        "Build a CSV to JSONL pipeline.",
+        [],
+        _empty_state(),
+        session_id=str(session.id),
+        current_state_id=None,
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    # Either direction of mismatch must land on the review path: the
+    # proposal is staged as pending and no commit intent is granted.
+    proposals = await sessions.list_composition_proposals(session.id, status="pending")
+    assert len(proposals) == 1
+    assert result.pipeline_commit_intent is None
+    assert "for your review" in result.message
+
+
+@pytest.mark.asyncio
 async def test_referential_empty_build_projects_authoritative_prior_user_requests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

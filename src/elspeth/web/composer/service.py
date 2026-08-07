@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
-    from elspeth.web.sessions.protocol import GuidedOperationFence, SessionServiceProtocol
+    from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, GuidedOperationFence, SessionServiceProtocol
     from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
 import structlog
@@ -3518,10 +3518,19 @@ class ComposerServiceImpl:
         current_state_id: UUID | None,
         user_message_id: UUID,
         user_id: str | None,
-        trust_mode: Literal["auto_commit", "explicit_approve"],
+        preferences: ComposerSessionPreferencesRecord,
         recorder: BufferingRecorder,
     ) -> ComposerResult:
-        """Persist planner evidence, then create one reviewable proposal row."""
+        """Persist planner evidence, then create one reviewable proposal row.
+
+        ``preferences`` is the snapshot taken before planning started. Because
+        the planner spends unbounded wall-clock time in provider calls, trust
+        authority is re-read here — after every provider call has completed —
+        and auto-commit is granted only when the snapshot and the current
+        preference both say ``auto_commit``. A downgrade to
+        ``explicit_approve`` mid-plan therefore always lands the proposal on
+        the review path (elspeth-01d4c6e683).
+        """
 
         await self._persist_pipeline_planner_audit(
             session_id=session_id,
@@ -3541,6 +3550,8 @@ class ComposerServiceImpl:
             redacted_arguments=redacted_arguments,
         )
         sessions = self._require_sessions_service()
+        current_preferences = await sessions.get_composer_preferences(session_id)
+        auto_commit_authorized = preferences.trust_mode == "auto_commit" and current_preferences.trust_mode == "auto_commit"
         row, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
             sessions.create_pipeline_composition_proposal(
                 session_id=session_id,
@@ -3557,7 +3568,7 @@ class ComposerServiceImpl:
             )
         )
         if deferred is not None:
-            if trust_mode == "auto_commit":
+            if auto_commit_authorized:
                 await _await_pipeline_staging_write_with_deferred_cancellation(
                     sessions.reject_pipeline_composition_proposal(
                         session_id=session_id,
@@ -3571,7 +3582,7 @@ class ComposerServiceImpl:
                     deferred=deferred,
                 )
             raise deferred
-        intent = PipelineCommitIntent(proposal_id=row.id, draft_hash=plan.proposal.draft_hash) if trust_mode == "auto_commit" else None
+        intent = PipelineCommitIntent(proposal_id=row.id, draft_hash=plan.proposal.draft_hash) if auto_commit_authorized else None
         message = (
             "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
             if intent is not None
@@ -3796,7 +3807,7 @@ class ComposerServiceImpl:
             current_state_id=state_uuid,
             user_message_id=message_uuid,
             user_id=user_id,
-            trust_mode=preferences.trust_mode,
+            preferences=preferences,
             recorder=recorder,
         )
 
