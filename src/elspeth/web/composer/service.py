@@ -3482,30 +3482,44 @@ class ComposerServiceImpl:
         llm_calls: tuple[ComposerLLMCall, ...],
         invocations: tuple[ComposerToolInvocation, ...],
     ) -> None:
-        """Make planner LLM/discovery evidence durable before proposal authority."""
+        """Make planner LLM/discovery evidence durable before proposal authority.
+
+        The whole evidence set — every LLM call and every discovery
+        invocation of one planning attempt — is one cohort and settles in
+        a single ``add_messages_atomic`` transaction (elspeth-90231248dc).
+        A mid-write failure or cancellation therefore leaves the evidence
+        either fully durable or cleanly absent, never a partial cohort
+        that reads as the complete planning record.
+        """
+
+        from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
         sessions = self._require_sessions_service()
+        drafts: list[AuditMessageDraft] = []
+        for call in llm_calls:
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit",
+                    content=llm_call_audit_summary(call),
+                    tool_calls=(llm_call_audit_envelope(call),),
+                )
+            )
+        for invocation in invocations:
+            content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+            drafts.append(
+                AuditMessageDraft(
+                    role="audit",
+                    content=content,
+                    tool_calls=(envelope,),
+                )
+            )
         try:
-            for call in llm_calls:
-                content = llm_call_audit_summary(call)
-                await sessions.add_message(
-                    session_id,
-                    "audit",
-                    content,
-                    tool_calls=[llm_call_audit_envelope(call)],
-                    composition_state_id=current_state_id,
-                    writer_principal="compose_loop",
-                )
-            for invocation in invocations:
-                content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
-                await sessions.add_message(
-                    session_id,
-                    "audit",
-                    content,
-                    tool_calls=[envelope],
-                    composition_state_id=current_state_id,
-                    writer_principal="compose_loop",
-                )
+            await sessions.add_messages_atomic(
+                session_id,
+                tuple(drafts),
+                composition_state_id=current_state_id,
+                writer_principal="compose_loop",
+            )
         except SQLAlchemyError as exc:
             raise AuditIntegrityError("pipeline planner audit persistence failed before proposal creation") from exc
 

@@ -8,9 +8,11 @@ worker via ``_run_sync``.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import Any
 
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import ChatMessageRole, CompositionStateData
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +84,29 @@ class StatePayload:
 
     data: CompositionStateData
     derived_from_state_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuditMessageDraft:
+    """One row of an audit cohort for ``SessionServiceImpl.add_messages_atomic``.
+
+    A cohort is one logical unit of audit evidence (the LLM-call sidecars
+    of one compose request, the tool-invocation breadcrumbs of one turn,
+    one planner evidence set) that must become durable together or not at
+    all (elspeth-90231248dc). Rows share the caller-supplied
+    ``writer_principal`` and ``composition_state_id``; per-row fields are
+    only the ones that legitimately vary inside one cohort.
+
+    ``tool_call_id`` / ``parent_assistant_id`` must satisfy the same
+    role biconditional CHECKs as ``add_message``: set exactly when
+    ``role="tool"``, ``None`` otherwise.
+    """
+
+    role: ChatMessageRole
+    content: str
+    tool_calls: tuple[Mapping[str, Any], ...] | None = None
+    tool_call_id: str | None = None
+    parent_assistant_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

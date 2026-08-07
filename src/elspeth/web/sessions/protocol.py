@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
     from elspeth.web.composer.pipeline_planner import PipelinePlanResult
     from elspeth.web.composer.pipeline_proposal import PipelineProposal
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
 ChatMessageRole = Literal["user", "assistant", "system", "tool", "audit"]
 ComposerTrustMode = Literal["explicit_approve", "auto_commit"]
@@ -2924,6 +2925,23 @@ class SessionServiceProtocol(Protocol):
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
     ) -> ChatMessageRecord: ...
+
+    async def add_messages_atomic(
+        self,
+        session_id: UUID,
+        drafts: Sequence[AuditMessageDraft],
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        composition_state_id: UUID | None = None,
+    ) -> None:
+        """Persist one audit cohort all-or-nothing (elspeth-90231248dc).
+
+        Implementations MUST commit every draft in a single transaction
+        under the session write lock with a contiguous sequence block —
+        a mid-cohort failure must leave zero rows durable, never a
+        prefix. An empty ``drafts`` sequence is a no-op.
+        """
+        ...
 
     async def add_run_diagnostics_audit_message(
         self,

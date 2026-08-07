@@ -87,7 +87,7 @@ from elspeth.web.interpretation_state import (
     source_name_from_component_id,
     validate_pipeline_decision_node_semantics,
 )
-from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, StatePayload
+from elspeth.web.sessions._persist_payload import AuditMessageDraft, AuditOutcome, RedactedToolRow, StatePayload
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.guided_audit import (
     bind_guided_failure_audit_rows,
@@ -8158,6 +8158,82 @@ class SessionServiceImpl:
             tool_call_id=tool_call_id,
             parent_assistant_id=parent_assistant_id,
         )
+
+    async def add_messages_atomic(
+        self,
+        session_id: UUID,
+        drafts: Sequence[AuditMessageDraft],
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        composition_state_id: UUID | None = None,
+    ) -> None:
+        """Persist one audit cohort in a single transaction (elspeth-90231248dc).
+
+        Sibling of :meth:`add_message` for the composer's buffered audit
+        cohorts (LLM-call sidecars, tool-invocation breadcrumbs, planner
+        evidence). The per-row loop the route helpers previously ran —
+        one ``add_message`` transaction per record — could fail after any
+        prefix, leaving a partial sidecar set that reads as a complete
+        record; with no stable per-record identity a retry can neither
+        recognise nor complete the missing suffix. This method removes
+        the partial state instead: the whole cohort commits in one
+        transaction, under one held session write lock and one contiguous
+        sequence-number block, or none of it does.
+
+        Cancellation safety comes from
+        ``_run_sync_with_post_commit_projection``: the sync worker is
+        drained through a mid-flight ``CancelledError``, so the cohort is
+        either fully durable or untouched — never a cancelled prefix.
+
+        An empty ``drafts`` sequence is a no-op (the compose loop drains
+        conditionally; an empty cohort must not bump ``updated_at``).
+        """
+        if not drafts:
+            return
+        now = self._now()
+        sid = str(session_id)
+        csid = str(composition_state_id) if composition_state_id else None
+
+        def _sync() -> None:
+            with self._session_process_locked_begin(sid) as conn:
+                if csid is not None:
+                    _assert_state_in_session(
+                        conn,
+                        state_id=csid,
+                        expected_session_id=sid,
+                        caller="add_messages_atomic",
+                    )
+                with self._session_write_lock(conn, sid):
+                    base_seq = self._reserve_sequence_range(conn, sid, count=len(drafts))
+                    for offset, draft in enumerate(drafts):
+                        self._insert_chat_message(
+                            conn,
+                            session_id=sid,
+                            role=draft.role,
+                            content=draft.content,
+                            raw_content=None,
+                            # Same deep_thaw rationale as add_message: the
+                            # envelopes may carry MappingProxyType / tuple
+                            # shapes from frozen-dataclass round-trips.
+                            tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
+                            sequence_no=base_seq + offset,
+                            writer_principal=writer_principal,
+                            composition_state_id=csid,
+                            tool_call_id=draft.tool_call_id,
+                            parent_assistant_id=draft.parent_assistant_id,
+                            created_at=now,
+                        )
+                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+
+        def _project(_result: None) -> None:
+            for draft in drafts:
+                record_settled_composer_audit_message(
+                    role=draft.role,
+                    writer_principal=writer_principal,
+                    tool_calls=draft.tool_calls,
+                )
+
+        await self._run_sync_with_post_commit_projection(_sync, project=_project)
 
     async def add_run_diagnostics_audit_message(
         self,

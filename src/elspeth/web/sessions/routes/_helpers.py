@@ -151,6 +151,7 @@ from elspeth.web.sessions._guided_step_chat import (
     resolve_step_2_sink_chat_with_auto_drop,
     solve_step_chat_with_auto_drop,
 )
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.audit_story_models import RunAuditStoryResponse
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryService
 from elspeth.web.sessions.converters import state_from_record as _state_from_record
@@ -1515,55 +1516,68 @@ async def _persist_tool_invocations(
       tool-trail is observable on read-back via per-message ``tool_calls``
       count vs. ``ComposerResult.tool_invocations`` length.
     """
-    persisted_pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+    if not tool_invocations:
+        return ()
+    role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+    drafts: list[AuditMessageDraft] = []
+    pipeline_bindings: list[PipelineDispatchAuditBinding] = []
     for invocation in tool_invocations:
         content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
-        role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
-        try:
-            await service.add_message(
-                session_id,
-                role,
-                content,
-                tool_calls=[envelope],
-                composition_state_id=composition_state_id,
-                writer_principal="compose_loop",
+        drafts.append(
+            AuditMessageDraft(
+                role=role,
+                content=content,
+                tool_calls=(envelope,),
                 tool_call_id=invocation.tool_call_id if role == "tool" else None,
-                parent_assistant_id=parent_assistant_id if role == "tool" else None,
+                parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
             )
-            if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
-                persisted_pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
-        except SQLAlchemyError as save_err:
-            if plugin_crash_pending:
-                # Unwind path: a primary failure is already in flight.
-                # Counting + slog preserves audibility without masking
-                # the original exception.
-                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                    1,
-                    {"helper": "tool_invocations"},
-                )
-                slog.error(
-                    "composer_tool_invocation_persist_failed_during_unwind",
-                    session_id=str(session_id),
-                    tool_call_id=invocation.tool_call_id,
-                    tool_name=invocation.tool_name,
-                    exc_class=type(save_err).__name__,
-                )
-                continue
-            # Success-path Tier-1 violation: the assistant row succeeded
-            # but the audit-companion tool row failed. The audit trail
-            # would assert "this tool was called" without the row that
-            # proves what it returned. Crash with the chained cause so
-            # the operator sees the full diagnostic.
-            _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+        )
+        if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+            pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+    try:
+        # One transaction for the whole invocation cohort
+        # (elspeth-90231248dc): a mid-cohort failure durably persists
+        # nothing, so a later drain of the same buffer can never
+        # duplicate an already-committed prefix.
+        await service.add_messages_atomic(
+            session_id,
+            tuple(drafts),
+            composition_state_id=composition_state_id,
+            writer_principal="compose_loop",
+        )
+    except SQLAlchemyError as save_err:
+        if plugin_crash_pending:
+            # Unwind path: a primary failure is already in flight.
+            # Counting + slog preserves audibility without masking
+            # the original exception.
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
                 1,
                 {"helper": "tool_invocations"},
             )
-            raise AuditIntegrityError(
-                f"composer_tool_invocation_persist_failed: audit insert "
-                f"failed for session_id={session_id!r} after assistant row "
-                f"was persisted — Tier-1 audit corruption (no recovery)"
-            ) from save_err
-    return tuple(persisted_pipeline_bindings)
+            slog.error(
+                "composer_tool_invocation_persist_failed_during_unwind",
+                session_id=str(session_id),
+                invocations=len(tool_invocations),
+                tool_names=[invocation.tool_name for invocation in tool_invocations],
+                exc_class=type(save_err).__name__,
+            )
+            # Nothing became durable, so no binding may claim otherwise.
+            return ()
+        # Success-path Tier-1 violation: the assistant row succeeded
+        # but the audit-companion tool rows failed. The audit trail
+        # would assert "these tools were called" without the rows that
+        # prove what they returned. Crash with the chained cause so
+        # the operator sees the full diagnostic.
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "tool_invocations"},
+        )
+        raise AuditIntegrityError(
+            f"composer_tool_invocation_persist_failed: audit insert "
+            f"failed for session_id={session_id!r} after assistant row "
+            f"was persisted — Tier-1 audit corruption (no recovery)"
+        ) from save_err
+    return tuple(pipeline_bindings)
 
 
 def _llm_calls_from_exception(exc: BaseException) -> tuple[ComposerLLMCall, ...]:
@@ -1598,41 +1612,52 @@ async def _persist_llm_calls(
     the compose loop; the run-diagnostics route uses
     :func:`_persist_run_diagnostics_llm_calls` instead, which writes
     under a durably re-proven run authority (elspeth-0fcf68d50f).
+
+    The cohort settles atomically via ``add_messages_atomic``
+    (elspeth-90231248dc): one transaction for every buffered call, so a
+    mid-cohort failure leaves zero sidecars rather than a partial prefix
+    that reads as a complete record.
     """
-    for call in llm_calls:
-        content = llm_call_audit_summary(call)
-        try:
-            await service.add_message(
-                session_id,
-                "audit",
-                content,
-                tool_calls=[llm_call_audit_envelope(call)],
-                composition_state_id=composition_state_id,
-                writer_principal="compose_loop",
-            )
-        except SQLAlchemyError as save_err:
-            if plugin_crash_pending:
-                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                    1,
-                    {"helper": "llm_calls"},
-                )
-                slog.error(
-                    "composer_llm_call_persist_failed_during_unwind",
-                    session_id=str(session_id),
-                    model_requested=call.model_requested,
-                    status=call.status.value,
-                    exc_class=type(save_err).__name__,
-                )
-                continue
-            _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+    if not llm_calls:
+        return
+    drafts = tuple(
+        AuditMessageDraft(
+            role="audit",
+            content=llm_call_audit_summary(call),
+            tool_calls=(llm_call_audit_envelope(call),),
+        )
+        for call in llm_calls
+    )
+    try:
+        await service.add_messages_atomic(
+            session_id,
+            drafts,
+            composition_state_id=composition_state_id,
+            writer_principal="compose_loop",
+        )
+    except SQLAlchemyError as save_err:
+        if plugin_crash_pending:
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
                 1,
                 {"helper": "llm_calls"},
             )
-            raise AuditIntegrityError(
-                f"composer_llm_call_persist_failed: audit insert failed for "
-                f"session_id={session_id!r} on success path — Tier-1 audit "
-                f"corruption (no recovery)"
-            ) from save_err
+            slog.error(
+                "composer_llm_call_persist_failed_during_unwind",
+                session_id=str(session_id),
+                calls=len(llm_calls),
+                model_requested=llm_calls[0].model_requested,
+                exc_class=type(save_err).__name__,
+            )
+            return
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "llm_calls"},
+        )
+        raise AuditIntegrityError(
+            f"composer_llm_call_persist_failed: audit insert failed for "
+            f"session_id={session_id!r} on success path — Tier-1 audit "
+            f"corruption (no recovery)"
+        ) from save_err
 
 
 async def _persist_run_diagnostics_llm_calls(

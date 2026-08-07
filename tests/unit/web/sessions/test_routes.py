@@ -4523,26 +4523,84 @@ class TestMessageRoutes:
         app.state.composer_service = composer
         client = TestClient(app, raise_server_exceptions=False)
 
-        original_add_message = service.add_message
+        # The sidecar cohort persists through ``add_messages_atomic``
+        # (elspeth-90231248dc); inject at the row-insert layer so the
+        # failure fires inside whatever transaction shape the persister
+        # uses. LLM-call audit sidecars are the rows whose envelope kind
+        # is ``llm_call_audit`` — the assistant row (no such envelope)
+        # commits first, which is the precondition for the Tier-1
+        # corruption the helper guards against.
+        original_insert = service._insert_chat_message
 
-        async def flaky_add_message(*args: Any, **kwargs: Any) -> ChatMessageRecord:
-            role = args[1]
+        def flaky_insert(conn: Any, **kwargs: Any) -> str:
             tool_calls = kwargs.get("tool_calls")
-            # LLM-call audit sidecars persist with role="audit" — trigger
-            # only on that specific insert so the assistant row succeeds
-            # first (which is the precondition for the Tier-1 corruption
-            # the helper now guards against).
-            if role == "audit" and tool_calls and tool_calls[0].get("_kind") == "llm_call_audit":
+            if tool_calls and isinstance(tool_calls[0], Mapping) and tool_calls[0].get("_kind") == "llm_call_audit":
                 raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
-            return await original_add_message(*args, **kwargs)
+            return original_insert(conn, **kwargs)
 
-        service.add_message = flaky_add_message  # type: ignore[method-assign]
+        service._insert_chat_message = flaky_insert  # type: ignore[method-assign]
 
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = uuid.UUID(resp.json()["id"])
         send_resp = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build it"})
 
         assert send_resp.status_code == 500
+
+    def test_send_message_llm_sidecar_cohort_settles_atomically(self, tmp_path) -> None:
+        """A mid-cohort sidecar failure must leave ZERO LLM-call sidecars durable.
+
+        elspeth-90231248dc: per-call sidecar transactions meant a failure
+        after any prefix left the assistant plus a PARTIAL sidecar set
+        durable, with no idempotency identity to complete the missing
+        suffix on retry. The cohort must settle all-or-nothing: when the
+        second of two sidecar inserts fails, the first must roll back with
+        it — the audit trail then honestly shows "no LLM-call evidence
+        persisted" alongside the Tier-1 500, instead of a prefix that
+        reads as a complete record.
+        """
+        app, service = _make_app(tmp_path)
+        composer = SimpleNamespace()
+        composer.surface_pending_interpretation_reviews = AsyncMock(
+            spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+        )
+        composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            return_value=ComposerResult(
+                message="Assistant still saved.",
+                state=_EMPTY_STATE,
+                llm_calls=(
+                    _llm_call(provider_request_id="chatcmpl-cohort-1"),
+                    _llm_call(provider_request_id="chatcmpl-cohort-2"),
+                ),
+            ),
+        )
+        app.state.composer_service = composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        # Inject the failure at the row-insert layer (below whichever
+        # transaction shape the persister uses) so this test pins the
+        # cohort atomicity CONTRACT, not the helper's call pattern.
+        original_insert = service._insert_chat_message
+        llm_audit_inserts = {"count": 0}
+
+        def flaky_insert(conn: Any, **kwargs: Any) -> str:
+            tool_calls = kwargs.get("tool_calls")
+            if tool_calls and isinstance(tool_calls[0], Mapping) and tool_calls[0].get("_kind") == "llm_call_audit":
+                llm_audit_inserts["count"] += 1
+                if llm_audit_inserts["count"] == 2:
+                    raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
+            return original_insert(conn, **kwargs)
+
+        service._insert_chat_message = flaky_insert  # type: ignore[method-assign]
+
+        resp = client.post("/api/sessions", json={"title": "Chat"})
+        session_id = uuid.UUID(resp.json()["id"])
+        send_resp = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build it"})
+
+        assert send_resp.status_code == 500
+        assert llm_audit_inserts["count"] == 2, "the injected failure must have fired on the second sidecar"
+        messages = asyncio.run(service.get_messages(session_id, limit=None))
+        assert _llm_call_audit_rows(messages) == [], "a partial sidecar prefix survived the failed cohort"
 
     def test_send_message_tool_invocation_persistence_failure_raises_on_success_path(self, tmp_path) -> None:
         """Symmetric to the LLM-call audit Tier-1 test.
@@ -4556,14 +4614,24 @@ class TestMessageRoutes:
         the pre-fix "fail-soft" expectation; see the LLM-call sibling
         test above for the full doctrine link.
         """
+        import hashlib
+
         app, service = _make_app(tmp_path)
+        # Hashes must be the REAL sha256 of the canonical payloads:
+        # ``redacted_tool_invocation_content_and_envelope`` verifies them
+        # and raises AuditIntegrityError BEFORE any DB write on a
+        # mismatch. The previous ``"0" * 64`` placeholders made this test
+        # 500 on that pre-write verification, so the injected persist
+        # failure below never actually fired (wrong-reason pass).
+        arguments_canonical = "{}"
+        result_canonical = '{"ok":true}'
         invocation = ComposerToolInvocation(
             tool_call_id="call_test_001",
             tool_name="preview_pipeline",
-            arguments_canonical="{}",
-            arguments_hash="0" * 64,
-            result_canonical='{"ok":true}',
-            result_hash="1" * 64,
+            arguments_canonical=arguments_canonical,
+            arguments_hash=hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest(),
+            result_canonical=result_canonical,
+            result_hash=hashlib.sha256(result_canonical.encode("utf-8")).hexdigest(),
             status=ComposerToolStatus.SUCCESS,
             error_class=None,
             error_message=None,
@@ -4589,16 +4657,18 @@ class TestMessageRoutes:
         app.state.composer_service = composer
         client = TestClient(app, raise_server_exceptions=False)
 
-        original_add_message = service.add_message
+        # Inject at the row-insert layer (the cohort now persists through
+        # ``add_messages_atomic``, elspeth-90231248dc): the tool
+        # breadcrumb is the row carrying an ``_kind="audit"`` envelope.
+        original_insert = service._insert_chat_message
 
-        async def flaky_add_message(*args: Any, **kwargs: Any) -> ChatMessageRecord:
-            role = args[1]
+        def flaky_insert(conn: Any, **kwargs: Any) -> str:
             tool_calls = kwargs.get("tool_calls")
-            if role == "tool" and tool_calls and tool_calls[0].get("_kind") == "audit":
+            if kwargs.get("role") == "tool" and tool_calls and isinstance(tool_calls[0], Mapping) and tool_calls[0].get("_kind") == "audit":
                 raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
-            return await original_add_message(*args, **kwargs)
+            return original_insert(conn, **kwargs)
 
-        service.add_message = flaky_add_message  # type: ignore[method-assign]
+        service._insert_chat_message = flaky_insert  # type: ignore[method-assign]
 
         resp = client.post("/api/sessions", json={"title": "Chat"})
         session_id = uuid.UUID(resp.json()["id"])

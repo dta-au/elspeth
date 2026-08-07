@@ -1485,7 +1485,7 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     # ------ tests/unit/web/sessions/test_routes.py — OperationalError canaries ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_routes.py",
-        enclosing_symbol="TestMessageRoutes.test_send_message_llm_call_persistence_failure_raises_on_success_path.flaky_add_message",
+        enclosing_symbol="TestMessageRoutes.test_send_message_llm_call_persistence_failure_raises_on_success_path.flaky_insert",
         table="chat_messages",
         operation="raw_string_in_OperationalError",
         purpose=(
@@ -1493,19 +1493,35 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "statement string carries 'INSERT INTO chat_messages' to make "
             "the simulated failure look like a real DB write error; the "
             "test asserts the success-path helper raises AuditIntegrityError "
-            "(500) rather than swallowing the failure. Not an executed query"
+            "(500) rather than swallowing the failure. Injection moved to "
+            "_insert_chat_message when the sidecar cohort became atomic "
+            "(elspeth-90231248dc). Not an executed query"
         ),
     ),
     ReviewedWriter(
         path="tests/unit/web/sessions/test_routes.py",
-        enclosing_symbol="TestMessageRoutes.test_send_message_tool_invocation_persistence_failure_raises_on_success_path.flaky_add_message",
+        enclosing_symbol="TestMessageRoutes.test_send_message_llm_sidecar_cohort_settles_atomically.flaky_insert",
+        table="chat_messages",
+        operation="raw_string_in_OperationalError",
+        purpose=(
+            "Cohort-atomicity canary (elspeth-90231248dc): OperationalError "
+            "statement string simulates a mid-cohort chat_messages INSERT "
+            "failure on the second LLM-call sidecar; the test asserts zero "
+            "sidecars survive (no partial prefix). Not an executed query"
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_routes.py",
+        enclosing_symbol="TestMessageRoutes.test_send_message_tool_invocation_persistence_failure_raises_on_success_path.flaky_insert",
         table="chat_messages",
         operation="raw_string_in_OperationalError",
         purpose=(
             "Symmetric to the LLM-call Tier-1 canary above. Statement string "
             "is the OperationalError param to simulate a real chat_messages "
             "INSERT failure; the test asserts the success-path tool-invocation "
-            "helper raises AuditIntegrityError (500). Not an executed query"
+            "helper raises AuditIntegrityError (500). Injection moved to "
+            "_insert_chat_message when the invocation cohort became atomic "
+            "(elspeth-90231248dc). Not an executed query"
         ),
     ),
     ReviewedWriter(

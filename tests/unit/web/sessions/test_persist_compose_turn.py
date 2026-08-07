@@ -1021,6 +1021,89 @@ async def test_add_message_rejects_unknown_writer_principal(service):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
+async def test_add_messages_atomic_persists_cohort_in_one_sequence_block(service):
+    """All drafts land with contiguous sequence numbers and one updated_at bump."""
+    from uuid import uuid4 as _uuid4
+
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+
+    await service.add_messages_atomic(
+        session_uuid,
+        (
+            AuditMessageDraft(role="audit", content="a", tool_calls=({"_kind": "llm_call_audit"},)),
+            AuditMessageDraft(role="audit", content="b", tool_calls=({"_kind": "llm_call_audit"},)),
+            AuditMessageDraft(role="audit", content="c", tool_calls=({"_kind": "audit"},)),
+        ),
+        writer_principal="compose_loop",
+    )
+
+    messages = await service.get_messages(session_uuid, limit=None)
+    assert [m.content for m in messages] == ["a", "b", "c"]
+    sequence_numbers = [m.sequence_no for m in messages]
+    assert sequence_numbers == list(range(sequence_numbers[0], sequence_numbers[0] + 3))
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_mid_cohort_failure_persists_nothing(service, monkeypatch):
+    """elspeth-90231248dc: a failure on any draft rolls back the whole cohort."""
+    from uuid import uuid4 as _uuid4
+
+    from sqlalchemy.exc import OperationalError
+
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+
+    original_insert = service._insert_chat_message
+    calls = {"count": 0}
+
+    def flaky_insert(conn, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))  # noqa: TRY003
+        return original_insert(conn, **kwargs)
+
+    monkeypatch.setattr(service, "_insert_chat_message", flaky_insert)
+
+    with pytest.raises(OperationalError):
+        await service.add_messages_atomic(
+            session_uuid,
+            (
+                AuditMessageDraft(role="audit", content="first"),
+                AuditMessageDraft(role="audit", content="second"),
+            ),
+            writer_principal="compose_loop",
+        )
+
+    assert calls["count"] == 2
+    assert await service.get_messages(session_uuid, limit=None) == []
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_empty_cohort_is_a_noop(service):
+    """An empty drafts sequence writes nothing and bumps nothing."""
+    from uuid import uuid4 as _uuid4
+
+    session_uuid = _uuid4()
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_uuid))
+        before = conn.execute(text(f"SELECT updated_at FROM sessions WHERE id='{session_uuid}'")).scalar_one()
+
+    await service.add_messages_atomic(session_uuid, (), writer_principal="compose_loop")
+
+    assert await service.get_messages(session_uuid, limit=None) == []
+    with service._engine.begin() as conn:
+        after = conn.execute(text(f"SELECT updated_at FROM sessions WHERE id='{session_uuid}'")).scalar_one()
+    assert after == before
+
+
 def test_persist_compose_turn_happy_path(service):
     from elspeth.web.sessions._persist_payload import (
         RedactedToolRow,
