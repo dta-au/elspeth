@@ -80,13 +80,22 @@ framing not statically decidable"), distinct from `UNKNOWN` (abstention), which
 is what makes a generative producer gateable at all. Merged to `release/0.7.2`
 as `1ec1c5b72` after a six-seat panel review.
 
-**Do not read that as green.** Of the three defence layers — planner prompt,
-build gate, runtime diversion — the build gate **abstains on g11's actual
-topology**, because the intervening transform declares nothing and the edge is
-therefore advisory rather than refused. What defends this specific graph is the
-planner prompt, which is stochastic. The deterministic half covers the failure
-*class*; g11's own shape stays unverified until it is driven live. Report it as
-"0/N re-runs reproduced", never as fixed.
+**Do not read that as green**, for two separate reasons.
+
+First, **two of the three defence layers are Composer-only.** Both the planner
+prompt and the build gate live under `web/composer/`; nothing in `core/dag` or
+`engine/` consumes them. A hand-authored YAML pipeline gets only the runtime
+diversion. That does not affect the demo — g11 is Composer-authored — but it
+bounds what the fix buys in general, and it is worth knowing if anyone asks
+whether the two authoring surfaces are equally protected. They are not.
+
+Second, of those three layers the build gate **abstains on g11's actual
+topology**: the intervening transform declares nothing, facts are deliberately
+never propagated *through* a transform, so the sink edge grades against an empty
+declaration and comes out advisory rather than refused. What defends this
+specific graph is therefore the planner prompt, which is stochastic. The
+deterministic half covers the failure *class*; g11's own shape stays unverified
+until it is driven live. Report it as "0/N re-runs reproduced", never as fixed.
 
 The diagnosability half — token state `failed` with `error_message: None` while
 the operations array called the same node `completed` — was fixed separately the
