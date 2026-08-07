@@ -113,6 +113,16 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
 
 ### Critical fixes
 
+- **Commit-disclosure correction (audit trail):** two 2026-08-07 commits
+  carry production fixes their subjects do not mention, an artifact of
+  concurrent agents staging broadly on a shared checkout. `6106365b9`
+  ("test(value_transform): …") also lands `_edge_field_type_conflict` in
+  `web/composer/state.py` — the whole of elspeth-f2eb8fef9f, the Stage-1
+  edge field-type conflict check. `2b4bbeb29` ("fix(composer): record the
+  preflight verdict…") also lands the Stage-2 accumulate-both-verdicts fix
+  in `core/dag/schema_validation.py` plus its integration test. Both fixes
+  are real and independently verified; this entry restores their
+  discoverability for `git log`/`blame` readers.
 - **Blob deletion cleanup remains retryable after metadata commit** — the
   session store retains the exact staged tombstone until its unlink and parent
   directory fsync both succeed, allowing direct and failed-fork cleanup to
