@@ -51,6 +51,11 @@ def build_coalesce_schema(
 
     field_definitions: dict[str, Any] = {}
     for fd in schema_config.fields:
+        # Unguarded on purpose. Every FieldDefinition.parse path checks
+        # SUPPORTED_TYPES membership before construction and set(FIELD_TYPE_MAP)
+        # == SUPPORTED_TYPES (pinned by the vocabulary-parity test), so only a
+        # hand-constructed FieldDefinition can miss — a code bug that must stay a
+        # 500, not an authoring error routed into the repairable channel.
         python_type = FIELD_TYPE_MAP[fd.field_type]
         # Pydantic type must include None if the field can ever be None at runtime.
         # This happens when:

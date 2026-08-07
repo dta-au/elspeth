@@ -7,7 +7,7 @@ from dataclasses import replace
 import pytest
 import yaml
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, PipelineLoweringError
 from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
@@ -18,7 +18,13 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
-from elspeth.web.composer.yaml_generator import generate_pipeline_dict, generate_public_pipeline_dict, generate_public_yaml, generate_yaml
+from elspeth.web.composer.yaml_generator import (
+    _generate_pipeline_dict,
+    generate_pipeline_dict,
+    generate_public_pipeline_dict,
+    generate_public_yaml,
+    generate_yaml,
+)
 from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY, SOURCE_AUTHORING_KEY
 
@@ -1763,3 +1769,108 @@ class TestGuidedTerminalProofDirectionSplit:
 
         with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
             derive_guided_blob_refs_for_admission_proof(state)
+
+
+class TestConditionalKeyGuards:
+    """Conditionally-emitted node keys are read through a guarded accessor.
+
+    ``to_dict()`` emits ``condition``/``routes``/``branches``/``policy``/``merge``
+    only when the NodeSpec field is not None, so a Stage-1-invalid state reaching
+    the generator used to die on a bare ``KeyError`` naming only the key. The
+    accessor raises ``PipelineLoweringError`` naming the node and the field, which
+    the ``validate_pipeline`` seam converts into a red verdict the author can act
+    on. The message keeps Stage 1's phrasing so the composer repair hints route.
+    """
+
+    def test_gate_missing_condition_raises_typed_lowering_error(self) -> None:
+        base = _make_gate_pipeline()
+        state = replace(base, nodes=(replace(base.nodes[0], condition=None),))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "quality_check" in str(exc_info.value)
+        assert "condition" in str(exc_info.value)
+
+    def test_gate_missing_routes_raises_typed_lowering_error(self) -> None:
+        base = _make_gate_pipeline()
+        state = replace(base, nodes=(replace(base.nodes[0], routes=None),))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "quality_check" in str(exc_info.value)
+        assert "routes" in str(exc_info.value)
+        # Exactly the typed class — a blanket rewrite back to bare ValueError
+        # would re-widen the seam's catch to every builtin ValueError.
+        assert type(exc_info.value) is PipelineLoweringError
+
+    def test_row_union_missing_branches_raises_typed_lowering_error(self) -> None:
+        base = _make_row_union_pipeline()
+        state = replace(base, nodes=(base.nodes[0], replace(base.nodes[1], branches=None), base.nodes[2]))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "variants" in str(exc_info.value)
+        assert "branches" in str(exc_info.value)
+
+    def test_coalesce_missing_branches_raises_typed_lowering_error(self) -> None:
+        base = _make_fork_coalesce_pipeline()
+        state = replace(base, nodes=(base.nodes[0], replace(base.nodes[1], branches=None)))
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            generate_yaml(state)
+
+        assert "merge_point" in str(exc_info.value)
+        assert "branches" in str(exc_info.value)
+
+    @pytest.mark.parametrize("field_name", ["merge", "policy"])
+    def test_injected_state_dict_missing_coalesce_default_raises_typed_lowering_error(self, field_name: str) -> None:
+        """The injected-state_dict entry point is the only path that can omit these.
+
+        ``NodeSpec.__post_init__`` records the runtime defaults for merge and
+        policy, so no NodeSpec-constructed state reaches these two guards.
+        Defaulting here instead of raising would reopen the drift that
+        normalisation closed — a second default site is a second thing to drift.
+        """
+        state = _make_fork_coalesce_pipeline()
+        state_dict = state.to_dict()
+        coalesce = next(node for node in state_dict["nodes"] if node["node_type"] == "coalesce")
+        del coalesce[field_name]
+
+        with pytest.raises(PipelineLoweringError) as exc_info:
+            _generate_pipeline_dict(state, omit_source_paths=False, state_dict=state_dict)
+
+        assert "merge_point" in str(exc_info.value)
+        assert field_name in str(exc_info.value)
+
+    def test_nodespec_path_cannot_produce_missing_merge_or_policy(self) -> None:
+        """The construction boundary that keeps those two guards unreachable from real states.
+
+        If either normalisation is removed, the corresponding generator guard
+        becomes the only defence and this test says so.
+        """
+        node = NodeSpec(
+            id="merge_point",
+            node_type="coalesce",
+            plugin=None,
+            input="join",
+            on_success="main_output",
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=("path_a", "path_b"),
+            policy=None,
+            merge=None,
+        )
+
+        assert node.merge == "union"
+        assert node.policy == "require_all"
+
+    def test_pipeline_lowering_error_is_a_value_error(self) -> None:
+        """Compatibility contract the non-validation lowering callers depend on."""
+        assert issubclass(PipelineLoweringError, ValueError)
+        assert not issubclass(PipelineLoweringError, KeyError)

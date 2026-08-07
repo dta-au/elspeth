@@ -951,6 +951,31 @@ class AuditIntegrityError(Exception):
         self.failed_turn = failed_turn
 
 
+# TIER-2: Authoring-state lowering defect — the composition state cannot be lowered to
+# runtime YAML because a required field is absent or contradicts its node contract. No
+# audit mutation has begun; the author can repair the state and retry.
+class PipelineLoweringError(ValueError):
+    """Raised when a composition state cannot be lowered to runtime pipeline YAML.
+
+    This names one half of a family split at the lowering layer:
+
+    - **Authoring-state defects** (this class): the state itself is malformed —
+      a gate without a condition, a coalesce without a policy, a transform whose
+      ``on_error`` was never defaulted at the mutation boundary. The
+      ``validate_pipeline`` seam converts these into red validation verdicts so the
+      author (human or LLM) gets a repairable signal instead of a 500.
+    - **Code invariants** (``RuntimeError``, ``AuditIntegrityError``, and friends):
+      the lowering code or its inputs violate an invariant ELSPETH owns — node-type
+      lowering drift, a non-dict YAML document, a hand-constructed contract type.
+      These must keep escaping as 500s; converting them would misroute a bug into
+      the author-repairable channel.
+
+    Subclassing ``ValueError`` keeps existing ``except ValueError`` handlers on the
+    non-validation lowering paths (export, MCP, shareable reviews) behaving as
+    before, while letting the validation seam catch exactly this type.
+    """
+
+
 # TIER-2: Multi-worker lease coordination signal — the worker's lease was reaped
 # by a peer (lease expired AND peer-reaper succeeded), so this worker no longer
 # owns the row. The audit trail is intact (the peer-recovered row is a new

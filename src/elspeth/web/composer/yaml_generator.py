@@ -6,10 +6,13 @@ Uses yaml.dump() with sort_keys=True for determinism.
 Layer: L3 (application).
 
 Trust model: state_dict comes from CompositionState.to_dict() — our own
-serialization of our own frozen dataclasses. Fields are either always
-present (direct access) or conditionally present based on node_type
-(check with ``in``). Never use .get() — a missing field is a bug in
-to_dict(), not an expected absence.
+serialization of our own frozen dataclasses. Always-present fields are read
+directly. Fields to_dict() emits only when set fall in two groups: genuinely
+optional ones (``fork_to``, ``trigger``, ``timeout_seconds``) are checked with
+``in``, and ones the node_type makes mandatory (``condition``, ``routes``,
+``branches``, ``policy``, ``merge``) are read through ``_require_node_key``,
+which raises PipelineLoweringError naming the node and the field. Never use
+.get() with a default — a fabricated value is a silently wrong pipeline.
 
 Web-specific metadata keys (e.g., blob_ref for file provenance tracking)
 are filtered from options before YAML generation. These are UI-layer
@@ -32,7 +35,7 @@ from typing import Any, TypedDict, cast
 
 import yaml
 
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, PipelineLoweringError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.guided_blob_refs import (
@@ -90,6 +93,18 @@ def _has_blob_binding(options: dict[str, Any]) -> bool:
 )
 def _has_bind_source_mode(options: dict[str, Any]) -> bool:
     return options.get("mode") == "bind_source"
+
+
+def _require_node_key(node: dict[str, Any], key: str, node_kind: str) -> Any:
+    """Read a node field that ``node_type`` makes mandatory, or refuse to lower.
+
+    The message repeats Stage 1's phrasing verbatim so the composer repair hints
+    (tools/generation.py) match it and the authoring LLM gets the same guidance
+    whichever layer caught the defect.
+    """
+    if key not in node:
+        raise PipelineLoweringError(f"{node_kind} '{node['id']}' is missing required field '{key}'.")
+    return node[key]
 
 
 def _strip_web_metadata(options: dict[str, Any], *, omit_source_paths: bool = False) -> dict[str, Any]:
@@ -160,7 +175,7 @@ def _generate_pipeline_dict(
     for node in state_dict["nodes"]:
         node_type = node["node_type"]
         if node_type not in COMPOSER_NODE_TYPES:
-            raise ValueError(f"Unknown node_type '{node_type}' for node '{node['id']}'.")
+            raise PipelineLoweringError(f"Unknown node_type '{node_type}' for node '{node['id']}'.")
 
     sources = state_dict["sources"]
     if sources:
@@ -179,7 +194,7 @@ def _generate_pipeline_dict(
         for queue in queues:
             contract_error = queue_node_contract_error(queue)
             if contract_error is not None:
-                raise ValueError(contract_error)
+                raise PipelineLoweringError(contract_error)
             queue_entry: dict[str, Any] = {}
             description = queue.options.get("description")
             if isinstance(description, str):
@@ -193,7 +208,7 @@ def _generate_pipeline_dict(
         doc["transforms"] = []
         for t in transforms:
             if t["on_error"] is None:
-                raise ValueError(
+                raise PipelineLoweringError(
                     f"Transform '{t['id']}' has on_error=None — "
                     f"upsert_node must default this at the mutation boundary, "
                     f"not leave it for the YAML generator to fabricate"
@@ -210,8 +225,8 @@ def _generate_pipeline_dict(
             doc["transforms"].append(entry)
 
     # Gates — condition and routes are conditionally present (only on gates).
-    # to_dict() emits them when not None. Since we filtered to gates,
-    # they must be present — access directly.
+    # to_dict() emits them when not None, so a Stage-1-invalid state can reach
+    # here with either absent; the guarded accessor refuses to lower it.
     gates = [n for n in state_dict["nodes"] if n["node_type"] == "gate"]
     if gates:
         doc["gates"] = []
@@ -219,8 +234,8 @@ def _generate_pipeline_dict(
             entry = {
                 "name": g["id"],
                 "input": g["input"],
-                "condition": g["condition"],
-                "routes": g["routes"],
+                "condition": _require_node_key(g, "condition", "Gate"),
+                "routes": _require_node_key(g, "routes", "Gate"),
             }
             if g["on_error"] is not None:
                 entry["on_error"] = g["on_error"]
@@ -238,7 +253,7 @@ def _generate_pipeline_dict(
         for row_union in row_unions:
             entry = {
                 "name": row_union["id"],
-                "branches": row_union["branches"],
+                "branches": _require_node_key(row_union, "branches", "row_union"),
                 "on_success": row_union["on_success"],
             }
             if "timeout_seconds" in row_union:
@@ -251,7 +266,7 @@ def _generate_pipeline_dict(
         doc["aggregations"] = []
         for a in aggregations:
             if a["on_error"] is None:
-                raise ValueError(
+                raise PipelineLoweringError(
                     f"Aggregation '{a['id']}' has on_error=None — "
                     f"upsert_node must default this at the mutation boundary, "
                     f"not leave it for the YAML generator to fabricate"
@@ -277,17 +292,20 @@ def _generate_pipeline_dict(
                 entry["options"] = _strip_web_metadata(dict(a["options"]))
             doc["aggregations"].append(entry)
 
-    # Coalesce — branches, policy, merge are conditionally present.
-    # Since we filtered to coalesces, they must be present.
+    # Coalesce — branches, policy, merge are conditionally present. Where the
+    # runtime has a default, NodeSpec.__post_init__ already records it, so an
+    # absence here proves a state_dict that never crossed that boundary. Raise
+    # rather than default a second time: a second default site is exactly the
+    # drift normalising at one construction boundary was meant to close.
     coalesces = [n for n in state_dict["nodes"] if n["node_type"] == "coalesce"]
     if coalesces:
         doc["coalesce"] = []
         for c in coalesces:
             entry = {
                 "name": c["id"],
-                "branches": c["branches"],
-                "policy": c["policy"],
-                "merge": c["merge"],
+                "branches": _require_node_key(c, "branches", "Coalesce"),
+                "policy": _require_node_key(c, "policy", "Coalesce"),
+                "merge": _require_node_key(c, "merge", "Coalesce"),
             }
             if c["on_success"] is not None:
                 entry["on_success"] = c["on_success"]
