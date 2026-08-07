@@ -1257,15 +1257,25 @@ class TestStdioServerConstruction:
         passed = {check["name"] for check in preflight["checks"] if check["passed"]}
         assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= passed
 
+    @pytest.mark.parametrize(
+        ("label", "sink_path"),
+        [("traversal", "outputs/../../evil.csv"), ("absolute", "/etc/elspeth-evil.csv")],
+    )
     @pytest.mark.asyncio
     async def test_stdio_construction_publishes_runtime_rejection(
         self,
         tmp_path: Path,
         data_dir: Path,
+        label: str,
+        sink_path: str,
     ) -> None:
-        """A runtime-only rejection must flip the published verdict."""
-        # Stage 1 accepts this path; only the runtime allowlist rejects it.
-        data = await self._preview_with_sink_path(tmp_path, data_dir, "reject", "outputs/../../evil.csv")
+        """Escaping data_dir must flip the published verdict — the security-not-weakened pin.
+
+        The synthetic session id scopes paths; it must not admit them. Both
+        escape forms have to stay rejected under it.
+        """
+        # Stage 1 accepts these paths; only the runtime allowlist rejects them.
+        data = await self._preview_with_sink_path(tmp_path, data_dir, label, sink_path)
 
         assert data["authoring_validation"]["is_valid"] is True
         preflight = data["runtime_preflight"]
@@ -1273,7 +1283,9 @@ class TestStdioServerConstruction:
         assert preflight["is_valid"] is False
         # Named, because a sink path resolving outside data_dir is not
         # automatically a rejection — ``resolve_sink_data_path`` adopts a
-        # non-UUID second segment under the caller's own outputs directory.
+        # non-UUID second segment under the caller's own outputs directory,
+        # so ``outputs/deadbeef1234/x.csv`` validates TRUE. A verdict-only
+        # assertion here would pass for the wrong reason.
         assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
         assert data["is_valid"] is False
 
