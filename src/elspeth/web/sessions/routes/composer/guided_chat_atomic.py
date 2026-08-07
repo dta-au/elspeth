@@ -74,6 +74,7 @@ from elspeth.web.sessions.protocol import (
     GuidedResponseDescriptor,
     GuidedStateOperationCommand,
     PreparedGuidedJsonPayload,
+    SessionRecord,
     SessionServiceProtocol,
     guided_json_payload_id,
 )
@@ -878,9 +879,15 @@ async def post_guided_chat_schema8(
     body: GuidedChatRequest,
     request: Request,
     user: UserIdentity,
+    owned_session: SessionRecord,
     provider_runner: ProviderRunner,
 ) -> GuidedChatResponse:
-    """Reserve, run, and atomically settle one schema-8 guided Chat turn."""
+    """Reserve, run, and atomically settle one schema-8 guided Chat turn.
+
+    ``owned_session`` is the ownership-verified session record from the
+    route wrapper; the sink-admission path namespace derives from its id,
+    never from raw route input (elspeth-ef92db3e16).
+    """
 
     from . import guided as guided_route
 
@@ -1512,11 +1519,40 @@ async def post_guided_chat_schema8(
                                 catalog=catalog,
                                 shield_available=shield_available,
                                 new_stable_id=uuid4(),
+                                data_dir=str(request.app.state.settings.data_dir),
+                                session_id=str(owned_session.id),
                                 source_inspection_facts=source_inspection_facts,
                                 sink_prefill_options=sink_prefill_options,
                                 sink_prefill_name=sink_prefill_name,
                             )
                             transition_succeeded = True
+                        except HTTPException as admission_exc:
+                            # Deployment sink admission rejected the
+                            # LLM-authored options (elspeth-ef92db3e16) — the
+                            # same 400 the manual form POST returns. Chat has
+                            # no 400 channel, so degrade to the safe
+                            # not-applied response with the admission reason
+                            # and keep the wizard authoritative.
+                            admission_detail = (
+                                admission_exc.detail
+                                if isinstance(admission_exc.detail, str)
+                                else "The proposed output settings are not allowed here."
+                            )
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply those output settings, so I didn't change your pipeline. "
+                                        f"{admission_detail} "
+                                        "Adjust the values in the wizard form and submit there."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="SinkAdmissionRejected",
+                                ),
+                                deferred_disposition_message,
+                            )
+                            next_turn = current_turn
+                            prepared_next = planned_current
                         except (PluginConfigError, InvariantError, TypeError, ValueError):
                             chat_result = _with_pair_disposition(
                                 StepChatResult(
@@ -1566,6 +1602,7 @@ async def post_guided_chat_schema8(
                             else "not_applied"
                             if chat_result.error_class
                             in {
+                                "SinkAdmissionRejected",
                                 "StepTransitionRejected",
                                 "ComponentRevisionNotApplied",
                                 "InlineSourceNotApplied",

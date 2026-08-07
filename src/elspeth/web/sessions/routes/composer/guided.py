@@ -2448,11 +2448,34 @@ def _schema8_answer_and_project_next(
     catalog: PolicyCatalogView,
     shield_available: bool,
     new_stable_id: UUID,
+    data_dir: str,
+    session_id: str,
     source_inspection_facts: SourceInspectionFacts | None = None,
     sink_prefill_options: Mapping[str, Any] | None = None,
     sink_prefill_name: str | None = None,
     fallback_blob_inspection: SourceInspectionFacts | None = None,
 ) -> tuple[CompositionState, PreparedGuidedJsonPayload, Turn | None, PreparedGuidedJsonPayload | None]:
+    """Answer the current guided turn and project the successor turn.
+
+    ``data_dir`` / ``session_id`` carry the deployment sink-admission
+    context (elspeth-ef92db3e16): every entry path that can answer a
+    Step-2 sink schema form — the manual form POST, its settlement
+    replay, and chat-authored transitions — flows through this function,
+    so the deployment-aware admission runs here rather than in any one
+    HTTP preflight. ``session_id`` must come from the ownership-verified
+    session record, not raw route input (the path-namespace rule pinned
+    by ``test_respond_sink_preflight_uses_owned_session_record_for_path_namespace``).
+    """
+    if body.control_signal != ControlSignal.EXIT_TO_FREEFORM.value and (
+        guided.step is GuidedStep.STEP_2_SINK and current_turn["type"] == TurnType.SCHEMA_FORM.value
+    ):
+        _, held_sink_plugin = _schema8_form_target(guided, source=False)
+        _schema8_require_runnable_sink_form(
+            body,
+            plugin=held_sink_plugin,
+            data_dir=data_dir,
+            session_id=session_id,
+        )
     if body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value:
         _schema8_only_response_fields(body, "control_signal")
         response_payload: Mapping[str, Any] = {"control_signal": ControlSignal.EXIT_TO_FREEFORM.value}
@@ -3116,15 +3139,11 @@ async def post_guided_respond(
                     session_id,
                     observed_guided,
                 )
-        elif observed_guided.step is GuidedStep.STEP_2_SINK and current_turn["type"] == TurnType.SCHEMA_FORM.value:
-            _, held_sink_plugin = _schema8_form_target(observed_guided, source=False)
-            _schema8_require_runnable_sink_form(
-                body,
-                plugin=held_sink_plugin,
-                data_dir=str(request.app.state.settings.data_dir),
-                session_id=str(owned_session.id),
-            )
         try:
+            # Deployment sink admission now runs inside
+            # _schema8_answer_and_project_next (elspeth-ef92db3e16), so this
+            # projection rejects a non-runnable sink form with the same 400
+            # the removed standalone preflight raised here.
             projected_state, _planned_response, _next_turn, _prepared_next = _schema8_answer_and_project_next(
                 observed_state,
                 prospective,
@@ -3133,6 +3152,8 @@ async def post_guided_respond(
                 catalog=catalog,
                 shield_available=shield_available,
                 new_stable_id=attempt_stable_id,
+                data_dir=str(request.app.state.settings.data_dir),
+                session_id=str(owned_session.id),
                 source_inspection_facts=inspection_facts,
                 fallback_blob_inspection=fallback_blob_inspection,
             )
@@ -4653,6 +4674,8 @@ async def post_guided_respond(
                                 catalog=catalog,
                                 shield_available=shield_available,
                                 new_stable_id=attempt_stable_id,
+                                data_dir=str(request.app.state.settings.data_dir),
+                                session_id=str(owned_session.id),
                                 source_inspection_facts=attempt_inspection_facts,
                                 fallback_blob_inspection=attempt_fallback_blob_inspection,
                             )
@@ -5184,7 +5207,7 @@ async def post_guided_chat(
 ) -> GuidedChatResponse:
     """Settle one current schema-8 Step-1/Step-2 chat operation atomically."""
 
-    await _verify_session_ownership(session_id, user, request)
+    owned_session = await _verify_session_ownership(session_id, user, request)
     from .guided_chat_atomic import post_guided_chat_schema8
 
     return await post_guided_chat_schema8(
@@ -5192,6 +5215,7 @@ async def post_guided_chat(
         body=body,
         request=request,
         user=user,
+        owned_session=owned_session,
         provider_runner=_run_guided_chat_provider_attempt,
     )
 

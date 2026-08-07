@@ -531,6 +531,8 @@ def test_schema8_projected_next_turn_validates_before_history(monkeypatch) -> No
             catalog=cast(Any, object()),
             shield_available=False,
             new_stable_id=uuid4(),
+            data_dir="/unused-step1-single-select",
+            session_id="unused-step1-single-select",
         )
 
 

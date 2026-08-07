@@ -1369,6 +1369,135 @@ def test_invalid_sink_prefill_never_reaches_operator_logs(
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
 
 
+def _sink_form_answer_provider(options: dict[str, object]):
+    """Provider whose resolution answers the sink schema form with ``options``."""
+
+    async def provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        sink = SinkResolved(
+            outputs=(
+                SinkOutputResolved(
+                    name="result",
+                    plugin="json",
+                    options=options,
+                    required_fields=(),
+                    schema_mode="observed",
+                    on_write_failure="discard",
+                ),
+            )
+        )
+        return Step2SinkResolvedResult(
+            chat=StepChatResult(
+                assistant_message="I filled in the JSON sink settings.",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            sink=sink,
+            deferred_action=None,
+        )
+
+    return provider
+
+
+def _drive_chat_to_sink_schema_form(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    options: dict[str, object],
+) -> tuple[str, dict]:
+    """Create a session, reach the Step-2 sink schema form via chat."""
+    session_id = _create_session(client)
+    sink_state = _Step2Journey()._drive_to_step_2_single_select(client, session_id)
+    sink_turn = sink_state["next_turn"]
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _sink_form_answer_provider(options),
+        raising=False,
+    )
+    select_chat = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(sink_turn, message="Save the results to a JSON file."),
+    )
+    assert select_chat.status_code == 200, select_chat.json()
+    form_turn = select_chat.json()["next_turn"]
+    assert form_turn["type"] == "schema_form"
+    return session_id, form_turn
+
+
+def test_chat_sink_form_answer_rejects_path_outside_allowed_directories(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chat-driven sink form answers pass the manual form's deployment
+    admission (elspeth-ef92db3e16): an LLM-authored absolute output path
+    outside the deployment's allowed sink directories must degrade to a
+    safe not-applied response instead of entering reviewed authority.
+    """
+    disallowed = {
+        "path": "/etc/elspeth-admission-canary.json",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
+    session_id, form_turn = _drive_chat_to_sink_schema_form(composer_test_client, monkeypatch, disallowed)
+
+    form_chat = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(form_turn, message="Yes, apply those settings."),
+    )
+
+    assert form_chat.status_code == 200, form_chat.json()
+    body = form_chat.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    # The rejected options were NOT applied: the form turn is re-presented,
+    # the intent never advances past its form phase, and nothing reaches
+    # reviewed authority. (The disallowed path legitimately appears as the
+    # form's PREFILL and in the degrade message's verbatim explanation —
+    # both pre-review surfaces whose only route into applied authority is
+    # this admission-guarded transition.)
+    assert body["next_turn"]["type"] == "schema_form"
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    guided_after = record.composer_meta["guided_session"]
+    intent = next(iter(guided_after["pending_output_intents"].values()))
+    assert intent["phase"] == "plugin_options"
+    assert guided_after["reviewed_outputs"] == {}
+
+
+def test_chat_sink_form_answer_requires_explicit_collision_policy(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parity with the manual form: a file-sink answer missing an explicit
+    collision policy is rejected at the same admission boundary, so an
+    under-specified LLM option set cannot become a reviewed fact that
+    planning later dies on (elspeth-ef92db3e16).
+    """
+    underspecified = {
+        "path": "results.json",
+        "schema": {"mode": "observed"},
+    }
+    session_id, form_turn = _drive_chat_to_sink_schema_form(composer_test_client, monkeypatch, underspecified)
+
+    form_chat = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(form_turn, message="Yes, apply those settings."),
+    )
+
+    assert form_chat.status_code == 200, form_chat.json()
+    body = form_chat.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert body["next_turn"]["type"] == "schema_form"
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    guided_after = record.composer_meta["guided_session"]
+    intent = next(iter(guided_after["pending_output_intents"].values()))
+    assert intent["phase"] == "plugin_options"
+    assert guided_after["reviewed_outputs"] == {}
+
+
 def test_inline_source_defers_to_existing_ready_uploaded_blob(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
