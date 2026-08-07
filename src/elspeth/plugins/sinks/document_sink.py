@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3087c4ee89af132e"
+    source_file_hash: str | None = "sha256:c51c758692a1be69"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -189,29 +189,6 @@ class DocumentSink(BaseSink):
         )
         self.input_schema = self._schema_class
         self.declared_required_fields = self._schema_config.get_effective_required_fields() | {self._field}
-        # Rows handed to this output, keyed by effect id, for the run named by
-        # _delivery_run_id. Keyed rather than summed so that re-preparing one
-        # effect — which happens whenever a RESERVED effect's prepare raises
-        # and re-enters — overwrites its entry instead of inflating the total.
-        self._delivery_run_id: str | None = None
-        self._delivered_by_effect: dict[str, int] = {}
-
-    def _record_delivery(self, *, run_id: str, effect_id: str, member_count: int) -> int:
-        """Tally rows delivered to this output and return the running total.
-
-        The tally spans every effect this sink instance prepares for ``run_id``
-        and resets when a new run reaches the instance. One instance serves the
-        whole flush loop of a run context, so in a single-worker run — the
-        ordinary case — the total is the run's true row count. Effects claimed
-        by a different worker have their own instance and are not counted here,
-        which is why the caller treats this as a lower bound rather than as the
-        run's whole delivery.
-        """
-        if self._delivery_run_id != run_id:
-            self._delivery_run_id = run_id
-            self._delivered_by_effect = {}
-        self._delivered_by_effect[effect_id] = member_count
-        return sum(self._delivered_by_effect.values())
 
     def inspect_effect(
         self,
@@ -231,6 +208,7 @@ class DocumentSink(BaseSink):
         request: SinkEffectPrepareRequest,
         ctx: RestrictedSinkEffectContext,
     ) -> SinkEffectPlan:
+        del ctx
         if type(request.effect_input) is not SinkEffectPipelineMembersInput:
             raise TypeError("DocumentSink effects require pipeline member input")
         members = request.effect_input.members
@@ -242,44 +220,31 @@ class DocumentSink(BaseSink):
         # this output, not about this effect alone: two single-row effects put
         # two members in the snapshot and must not publish either.
         emitted_members = tuple(request.effect_input.target_snapshot_members)
-        delivered = self._record_delivery(run_id=ctx.run_id, effect_id=request.effect_id, member_count=len(members))
-        # One sink can produce several effects per run — the flush loop groups
-        # pending tokens by outcome (engine/orchestrator/sink_flush.py) and runs
-        # once per drain — so neither available count sees every row on its own:
-        #   * the cumulative snapshot carries accepted predecessor members, from
-        #     any worker, but silently drops diverted ones (_target_snapshot_members
-        #     in engine/executors/sink_effects.py skips prepared_disposition
-        #     "diverted"). A run whose earlier effects all diverted therefore
-        #     hands this effect a snapshot indistinguishable from a fresh
-        #     single-row run;
-        #   * the per-run tally counts every member this instance was handed,
-        #     diverted or not, and so closes exactly that blind spot.
-        # Both are lower bounds on the run's true delivery, and requiring BOTH to
-        # equal one is what makes the rule hold however rows are BATCHED into
-        # effects — [2] then [1], [1] then [2] and [3] as one effect all refuse
-        # to publish, because the tally sees the diverted rows the snapshot drops.
-        #
-        # SCOPE, precisely: that argument covers one sink INSTANCE. It does not
-        # generalise, and calling it "fail-closed" without qualification would be
-        # wrong — a row invisible to BOTH counts leaves both reading one while the
-        # true delivery is larger, and this publishes. That is reachable only
-        # across instances: the tally is per-instance in-memory state, so rows
-        # another instance diverted are in neither its snapshot (dropped) nor this
-        # tally (foreign). No local signal survives to detect it — a diverted row
-        # leaves nothing in the shared snapshot to notice.
-        #
-        # What keeps that unreachable today is supports_resume = False plus the
-        # CLI's pre-database resume refusal, i.e. an invariant enforced OUTSIDE
-        # this file. test_one_value_rule_depends_on_this_sink_never_resuming pins
-        # that coupling; do not flip supports_resume without making the tally
-        # durable first (elspeth-694f771c69).
+        # The snapshot alone cannot carry the one-value decision: it silently
+        # drops diverted members (_target_snapshot_members in
+        # engine/executors/sink_effects.py skips prepared_disposition
+        # "diverted" so a cumulative rebuild never republishes rejected rows),
+        # which leaves a run whose earlier effects all diverted looking
+        # indistinguishable from a fresh single-row run. The delivered count
+        # is the durable complement: every member of every FINALIZED effect
+        # in this target's stream, diverted included, plus the current
+        # partition — derived from the effect store by the coordinator, so it
+        # is idempotent under re-prepare and survives instance and worker
+        # boundaries alike (elspeth-694f771c69; a per-instance in-memory
+        # tally previously stood in for it and held only within one
+        # instance). That durability is what makes the rule fail-closed
+        # UNQUALIFIED: however rows are batched into effects — [2] then [1],
+        # [1] then [2], [3] as one effect, or a fresh instance preparing the
+        # later effect — a delivery larger than one is visible here and
+        # refuses to publish.
+        delivered = request.effect_input.target_delivered_member_count
         publishable = len(emitted_members) == 1 and delivered == 1
-        # The tightest lower bound on rows delivered to this output: the two
-        # counts see different rows, so the larger is the closer of the two.
-        # Reporting len(emitted_members) alone under-counted every run whose
-        # earlier effects diverted — a [2] then [2] run said "2 rows" for a
-        # delivery of four.
-        row_count_seen = max(len(emitted_members), delivered)
+        # The count includes diverted rows the snapshot cannot show, so it is
+        # the run's true delivery to this output as far as any effect has
+        # recorded it. Reporting len(emitted_members) instead under-counted
+        # every run whose earlier effects diverted — a [2] then [2] run said
+        # "2 rows" for a delivery of four.
+        row_count_seen = delivered
 
         accepted: list[int] = []
         payload: bytes | None = None

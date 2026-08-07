@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import update
 
-from elspeth.contracts import CallType, NodeStateStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts import CallType, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
@@ -28,6 +28,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
     SinkEffectMember,
+    SinkEffectMemberCandidate,
     SinkEffectPipelineMembersInput,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
@@ -37,7 +38,7 @@ from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_finalization import SinkEffectFinalizationMember
-from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity
+from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectAttemptRequest, SinkEffectAttemptResult
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import node_states_table, sink_effect_attempts_table
@@ -51,7 +52,9 @@ from elspeth.engine.executors.sink_effects import (
 )
 from elspeth.plugins.sinks import _local_file_effects as local_effects
 from elspeth.plugins.sinks.csv_sink import CSVSink
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from elspeth.plugins.sinks.document_sink import DocumentSink
+from tests.fixtures.base_classes import inject_write_failure
+from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
 from tests.fixtures.stores import MockPayloadStore
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
@@ -290,7 +293,7 @@ def _execution_request(run_id: str, sink_id: str, members: tuple[object, ...]) -
     )
     return SinkEffectExecutionRequest(
         reservation=reservation,
-        effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members),
+        effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members, len(identity.members)),
         finalization_members=tuple(
             SinkEffectFinalizationMember(
                 ordinal=member.ordinal,
@@ -501,6 +504,82 @@ def test_predecessor_snapshot_excludes_diverted_members() -> None:
         # cumulative successor must publish only the accepted predecessor
         # member plus its own current member.
         assert target.published_rows == [[{"ordinal": 0}, {"ordinal": 2}]]
+    finally:
+        db.close()
+
+
+def _document_pipeline_members(
+    factory: RecorderFactory,
+    values: tuple[str, ...],
+) -> tuple[str, str, tuple[SinkEffectMember, ...]]:
+    """`_pipeline_members`, but rows carry a document field so a real
+    DocumentSink can be driven through the coordinator."""
+    run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
+    sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="sink")
+    candidates: list[SinkEffectMemberCandidate] = []
+    for ordinal, value in enumerate(values):
+        payload = {"announcement_text": value}
+        row = factory.data_flow.create_row(
+            run_id=run.run_id,
+            source_node_id=source_id,
+            row_index=ordinal,
+            data=payload,
+            source_row_index=ordinal,
+            ingest_sequence=ordinal,
+        )
+        token = factory.data_flow.create_token(row.row_id)
+        factory.execution.begin_node_state(
+            token_id=token.token_id,
+            node_id=sink_id,
+            run_id=run.run_id,
+            step_index=0,
+            input_data=payload,
+        )
+        candidates.append(SinkEffectMemberCandidate(token_id=token.token_id, row=payload))
+    return run.run_id, sink_id, resolve_sink_effect_members(factory, candidates)
+
+
+def test_document_one_value_rule_refuses_across_sink_instances(tmp_path: Path) -> None:
+    """A FRESH sink instance must still see the whole run's delivery (elspeth-694f771c69).
+
+    Instance A's two rows both divert under the one-value rule, so they are
+    durably recorded but deliberately dropped from the cumulative snapshot —
+    and absent from anything instance B holds in memory. Every count B can
+    see locally reads one, yet the run truly delivered three rows to this
+    output, so publishing a lone-row document would report success while
+    silently discarding two-thirds of the delivery. The delivery count must
+    be a durable fact of the target's effect stream, not of the instance.
+    """
+    db = make_landscape_db()
+    try:
+        payload_store = MockPayloadStore()
+        factory = make_factory(db, payload_store=payload_store)
+        run_id, sink_id, members = _document_pipeline_members(factory, ("alpha", "beta", "gamma"))
+        target = tmp_path / "announcement.txt"
+        config = {
+            "path": str(target),
+            "field": "announcement_text",
+            "schema": {"mode": "observed"},
+        }
+
+        instance_a = inject_write_failure(DocumentSink(config))
+        first = SinkEffectCoordinator(factory=factory, worker_id="worker-a").execute(
+            _execution_request(run_id, sink_id, members[:2]), instance_a
+        )
+        first_durable = factory.execution.sink_effects.get_members(first.effect.effect_id)
+        assert [member.prepared_disposition for member in first_durable] == ["diverted", "diverted"]
+        assert not target.exists()
+
+        instance_b = inject_write_failure(DocumentSink(config))
+        successor_factory = make_factory(db, payload_store=payload_store)
+        second = SinkEffectCoordinator(factory=successor_factory, worker_id="worker-b").execute(
+            _execution_request(run_id, sink_id, members[2:]), instance_b
+        )
+
+        second_durable = successor_factory.execution.sink_effects.get_members(second.effect.effect_id)
+        assert [member.prepared_disposition for member in second_durable] == ["diverted"]
+        assert not target.exists(), "a run that delivered three rows must never publish a lone-row document"
     finally:
         db.close()
 
@@ -1028,6 +1107,7 @@ def test_fresh_executor_retry_publishes_once(seam: SinkEffectExecutionSeam) -> N
         effect_input = SinkEffectPipelineMembersInput(
             members=identity.members,
             target_snapshot_members=identity.members,
+            target_delivered_member_count=len(identity.members),
         )
         request = SinkEffectExecutionRequest(
             reservation=reservation,
@@ -1090,7 +1170,7 @@ def test_unknown_reconciliation_never_commits() -> None:
         )
         request = SinkEffectExecutionRequest(
             reservation=_pipeline_request(run_id, sink_id, identity.members),
-            effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members),
+            effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members, len(identity.members)),
             finalization_members=(
                 SinkEffectFinalizationMember(
                     ordinal=0,

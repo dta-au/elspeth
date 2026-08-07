@@ -141,7 +141,7 @@ def _drive_s3_acceptance_effect(
         payload_hash=_sha256(canonical_json(row).encode("utf-8")),
         row=row,
     )
-    effect_input = SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,))
+    effect_input = SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,), target_delivered_member_count=1)
     context = RestrictedSinkEffectContext(
         run_id=_S3AcceptanceContext.run_id,
         run_started_at=datetime(2026, 7, 16, tzinfo=UTC),

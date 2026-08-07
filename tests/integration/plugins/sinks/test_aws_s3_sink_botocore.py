@@ -63,7 +63,9 @@ def _prepare(
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=current, target_snapshot_members=snapshot),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=current, target_snapshot_members=snapshot, target_delivered_member_count=len(snapshot)
+            ),
             inspection=inspection,
         ),
         _CTX,
@@ -267,7 +269,9 @@ def test_real_botocore_stubber_reaffirms_identical_content_and_rejects_true_coll
             colliding_sink.prepare_effect(
                 SinkEffectPrepareRequest(
                     effect_id="e" * 64,
-                    effect_input=SinkEffectPipelineMembersInput(members=(colliding_member,), target_snapshot_members=(colliding_member,)),
+                    effect_input=SinkEffectPipelineMembersInput(
+                        members=(colliding_member,), target_snapshot_members=(colliding_member,), target_delivered_member_count=1
+                    ),
                     inspection=inspection,
                 ),
                 _CTX,

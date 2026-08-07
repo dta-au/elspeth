@@ -342,7 +342,7 @@ def test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods(
         ),
         (SinkEffectInspectionRequest, ("effect_id", "target", "predecessor_descriptor", "input_kind")),
         (SinkEffectInspection, ("mode", "reference", "evidence")),
-        (SinkEffectPipelineMembersInput, ("members", "target_snapshot_members")),
+        (SinkEffectPipelineMembersInput, ("members", "target_snapshot_members", "target_delivered_member_count")),
         (AuditExportSnapshotChunkInput, ("ordinal", "content_ref", "content_hash", "size_bytes", "record_count")),
         (
             AuditExportSignedManifestInput,
@@ -660,6 +660,7 @@ def test_prepare_and_commit_ordinals_are_immutable_unique_and_disjoint() -> None
     pipeline_input = SinkEffectPipelineMembersInput(
         members=[_member(0), _member(1)],
         target_snapshot_members=[_member(0), _member(1)],
+        target_delivered_member_count=2,
     )
     request = SinkEffectPrepareRequest(
         effect_id="effect-1",
@@ -684,6 +685,7 @@ def test_prepare_and_commit_ordinals_are_immutable_unique_and_disjoint() -> None
         SinkEffectPipelineMembersInput(
             members=(_member(0), _member(0)),
             target_snapshot_members=(),
+            target_delivered_member_count=2,
         )
     with pytest.raises(ValueError, match="non-negative"):
         SinkEffectCommitResult(
@@ -713,21 +715,50 @@ def test_prepare_member_ordinals_must_be_dense_and_ordered(
         SinkEffectPipelineMembersInput(
             members=members,
             target_snapshot_members=(),
+            target_delivered_member_count=2,
         )
 
 
 def test_pipeline_input_requires_nonempty_current_members_and_dense_snapshot_members() -> None:
     with pytest.raises(ValueError, match="members must be non-empty"):
-        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=())
+        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=(), target_delivered_member_count=0)
     with pytest.raises(ValueError, match="dense and ordered"):
         SinkEffectPipelineMembersInput(
             members=(_member(0),),
             target_snapshot_members=(_member(0), _member(2)),
+            target_delivered_member_count=2,
         )
 
 
+def test_pipeline_input_delivered_count_is_int_and_covers_the_snapshot() -> None:
+    """The delivered count is the durable superset of the snapshot: the
+    snapshot is the delivered set minus diverted members, so a count below
+    the snapshot length is a construction bug, not a data state
+    (elspeth-694f771c69)."""
+    with pytest.raises(TypeError, match="target_delivered_member_count must be int"):
+        SinkEffectPipelineMembersInput(
+            members=(_member(0),),
+            target_snapshot_members=(_member(0),),
+            target_delivered_member_count=True,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="target_delivered_member_count must be >="):
+        SinkEffectPipelineMembersInput(
+            members=(_member(0),),
+            target_snapshot_members=(_member(0),),
+            target_delivered_member_count=0,
+        )
+    accepted = SinkEffectPipelineMembersInput(
+        members=(_member(0),),
+        target_snapshot_members=(_member(0),),
+        # Larger than the snapshot is the load-bearing case: diverted stream
+        # members are counted but never appear in the snapshot.
+        target_delivered_member_count=3,
+    )
+    assert accepted.target_delivered_member_count == 3
+
+
 def test_prepare_request_is_a_single_closed_union_with_derived_kind_and_plan_match() -> None:
-    pipeline = SinkEffectPipelineMembersInput(members=(_member(0),), target_snapshot_members=())
+    pipeline = SinkEffectPipelineMembersInput(members=(_member(0),), target_snapshot_members=(), target_delivered_member_count=1)
     request = SinkEffectPrepareRequest(effect_id="effect-1", effect_input=pipeline, inspection=_inspection())
     assert request.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS
     assert "input_kind" not in {field.name for field in fields(request)}

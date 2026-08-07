@@ -116,7 +116,7 @@ def test_response_lost_member_is_reconciled_and_only_missing_members_are_committ
         )
         request = SinkEffectExecutionRequest(
             reservation=reservation,
-            effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members),
+            effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members, len(identity.members)),
             finalization_members=tuple(
                 SinkEffectFinalizationMember(
                     ordinal=member.ordinal,

@@ -131,7 +131,7 @@ def _build_request(factory, run_id: str, source_id: str, sink_id: str) -> SinkEf
     )
     return SinkEffectExecutionRequest(
         reservation=reservation,
-        effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members),
+        effect_input=SinkEffectPipelineMembersInput(identity.members, identity.members, len(identity.members)),
         finalization_members=tuple(
             SinkEffectFinalizationMember(
                 ordinal=member.ordinal,

@@ -776,6 +776,10 @@ class SinkExecutor:
                 effect_input=SinkEffectPipelineMembersInput(
                     members=identity.members,
                     target_snapshot_members=identity.members,
+                    # Placeholder like the snapshot beside it: the coordinator
+                    # re-derives both from durable records per effect
+                    # (_request_for_effect) before any sink sees them.
+                    target_delivered_member_count=len(identity.members),
                 ),
                 finalization_members=finalization_members,
             ),
@@ -1102,7 +1106,11 @@ class SinkExecutor:
         ).execute_with_lease_wait(
             SinkEffectExecutionRequest(
                 reservation=reservation,
-                effect_input=SinkEffectPipelineMembersInput(members=identity.members, target_snapshot_members=identity.members),
+                effect_input=SinkEffectPipelineMembersInput(
+                    members=identity.members,
+                    target_snapshot_members=identity.members,
+                    target_delivered_member_count=len(identity.members),
+                ),
                 finalization_members=finalization_members,
             ),
             failsink,  # type: ignore[arg-type]

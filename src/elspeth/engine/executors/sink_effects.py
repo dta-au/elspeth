@@ -868,15 +868,17 @@ class SinkEffectCoordinator:
             )
             current_finalization.append(replace(finalization, ordinal=durable.ordinal))
         members = tuple(current_members)
+        snapshot, delivered_count = self._target_snapshot_members(
+            effect,
+            members,
+            known_members=caller_by_token,
+        )
         return SinkEffectExecutionRequest(
             reservation=request.reservation,
             effect_input=SinkEffectPipelineMembersInput(
                 members=members,
-                target_snapshot_members=self._target_snapshot_members(
-                    effect,
-                    members,
-                    known_members=caller_by_token,
-                ),
+                target_snapshot_members=snapshot,
+                target_delivered_member_count=delivered_count,
             ),
             finalization_members=tuple(current_finalization),
         )
@@ -887,7 +889,7 @@ class SinkEffectCoordinator:
         current_members: tuple[SinkEffectMember, ...],
         *,
         known_members: Mapping[str, SinkEffectMember],
-    ) -> tuple[SinkEffectMember, ...]:
+    ) -> tuple[tuple[SinkEffectMember, ...], int]:
         chain: list[SinkEffect] = []
         predecessor_id = effect.predecessor_effect_id
         seen = {effect.effect_id}
@@ -903,8 +905,17 @@ class SinkEffectCoordinator:
         chain.reverse()
 
         snapshot: list[SinkEffectMember] = []
+        # Delivery counts every chain member BEFORE the disposition filter:
+        # a diverted member reached this output even though it never reached
+        # the target, and dropping it from the count is exactly what made an
+        # all-diverted predecessor indistinguishable from a fresh run
+        # (elspeth-694f771c69). Predecessors are all FINALIZED — the walk
+        # above raises SinkEffectPredecessorPending otherwise — so the count
+        # is complete for the stream, whichever workers prepared it.
+        delivered_count = len(current_members)
         for predecessor in chain:
             for durable in self._effects.get_members(predecessor.effect_id):
+                delivered_count += 1
                 # Diverted members never reached the target: replaying them in
                 # a cumulative successor would republish rejected rows as if
                 # they were immutable predecessor content.
@@ -923,7 +934,7 @@ class SinkEffectCoordinator:
                 snapshot.append(replace(member, ordinal=len(snapshot)))
         current_start = len(snapshot)
         snapshot.extend(replace(member, ordinal=current_start + ordinal) for ordinal, member in enumerate(current_members))
-        return tuple(snapshot)
+        return tuple(snapshot), delivered_count
 
     def _persist_pipeline_member_payloads(self, effect_input: object) -> None:
         if not isinstance(effect_input, SinkEffectPipelineMembersInput):

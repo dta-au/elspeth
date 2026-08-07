@@ -906,7 +906,7 @@ class TestDataverseMemberEffects:
             _effect_member(index, {"email": key, "name": name})
             for index, (key, name) in enumerate((("a", "Alice"), ("b", "Bob"), ("c", "Carol")))
         )
-        effect_input = SinkEffectPipelineMembersInput(members, members)
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
         ctx = _restricted_effect_context()
         inspection = sink.inspect_effect(
             SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None),
@@ -940,7 +940,7 @@ class TestDataverseMemberEffects:
         sink = inject_write_failure(DataverseSink(_config()))
         sink._client = client  # type: ignore[assignment]
         member = _effect_member(0, {"email": "a", "name": "Alice"})
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _restricted_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="a" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="a" * 64, effect_input=effect_input, inspection=inspection), ctx)

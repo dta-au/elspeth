@@ -84,6 +84,7 @@ def _prepare(
     rows: list[dict[str, object]],
     predecessor=None,
     predecessor_rows: list[dict[str, object]] | None = None,
+    delivered: int | None = None,
 ):
     members = tuple(_member(index, row) for index, row in enumerate(rows))
     if predecessor_rows:
@@ -100,7 +101,16 @@ def _prepare(
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=snapshot),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members,
+                target_snapshot_members=snapshot,
+                # The coordinator derives this from the durable stream; with no
+                # diverted predecessors it equals the snapshot length, which is
+                # what these single-instance cases model. Cross-instance cases
+                # pass ``delivered`` to model a stream with diverted members
+                # the snapshot cannot show.
+                target_delivered_member_count=len(snapshot) if delivered is None else delivered,
+            ),
             inspection=inspection,
         ),
         _CTX,
@@ -161,31 +171,37 @@ def test_document_sink_is_not_resumable_and_refuses_resume_configuration(tmp_pat
         sink.configure_for_resume()
 
 
-def test_one_value_rule_depends_on_this_sink_never_resuming(tmp_path: Path) -> None:
-    """The one-value rule's safety rests on an invariant enforced in ANOTHER file.
+def test_one_value_rule_is_durable_across_sink_instances(tmp_path: Path) -> None:
+    """A FRESH instance must refuse when the stream already delivered rows.
 
-    ``prepare_effect`` decides publication from the cumulative snapshot AND a
-    per-INSTANCE in-memory tally. That pair is only a sound "exactly one" test
-    within one instance: a row another instance diverted is in neither the
-    snapshot (diverted members are dropped) nor this tally (foreign instance),
-    so both read one while the run delivered more — and it publishes
-    (elspeth-694f771c69).
-
-    Nothing local can detect that; what keeps it unreachable is that a second
-    instance for one run cannot arise, because resume is refused. Those two
-    facts live in different files with nothing tying them together, so this test
-    is the tie: if ``supports_resume`` is ever flipped, THIS fails and names the
-    tally as the reason, rather than the cross-instance publish surfacing later
-    as silent partial output.
+    The cumulative snapshot deliberately drops diverted members, so after an
+    all-diverted earlier effect a later effect's snapshot is indistinguishable
+    from a fresh single-row run. The durable ``target_delivered_member_count``
+    — every member of every finalized effect in the target's stream, diverted
+    included — is what the rule reads instead, so it holds across instance and
+    worker boundaries with no in-memory state at all (elspeth-694f771c69).
+    This models the cross-instance repro at the unit level: one current
+    member, a one-member snapshot, and a stream that has already seen two
+    diverted rows. Both signals a pre-fix instance consulted read one; the
+    durable count reads three and refuses. The end-to-end version, driven
+    through the coordinator against the real effect store with two sink
+    instances, is test_document_one_value_rule_refuses_across_sink_instances
+    in tests/unit/engine/test_sink_effect_executor.py.
     """
     sink = _sink(tmp_path / "out.txt")
 
-    assert sink.supports_resume is False, (
-        "DocumentSink's per-instance delivery tally is not durable, so a resumed run could "
-        "publish a lone-row document while reporting success — make the tally durable "
-        "(elspeth-694f771c69) before enabling resume."
+    plan = _prepare(
+        sink,
+        effect_id="bb" * 32,
+        rows=[{"announcement_text": "the lone visible row"}],
+        delivered=3,
     )
-    assert sink._delivered_by_effect == {}, "the tally is per-instance in-memory state, which is the whole problem"
+
+    assert plan.safe_evidence["accepted_ordinals"] == ()
+    assert plan.safe_evidence["diverted_ordinals"] == (0,)
+    (diversion,) = sink._get_diversions()
+    assert "received 3 rows" in diversion.reason
+    assert not (tmp_path / "out.txt").exists()
 
 
 @pytest.mark.parametrize("purpose", list(SinkEffectExecutionPurpose))
@@ -277,7 +293,7 @@ def test_an_effect_is_never_issued_for_zero_rows() -> None:
     published case) or two or more (the refused case).
     """
     with pytest.raises(ValueError, match="members must be non-empty"):
-        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=())
+        SinkEffectPipelineMembersInput(members=(), target_snapshot_members=(), target_delivered_member_count=0)
 
 
 def test_a_rejected_single_value_publishes_no_file_at_all(tmp_path: Path) -> None:
@@ -372,8 +388,9 @@ def test_a_diverted_first_effect_cannot_let_a_later_single_row_publish(tmp_path:
     "diverted", and ``_predecessor_descriptor`` walks back past a plan that
     performed no publication — so the second effect is handed a snapshot of
     length one and no predecessor descriptor, which is byte-for-byte what a
-    legitimate single-row run looks like. Only the per-run tally tells them
-    apart, and a three-row run must refuse whichever way it is batched.
+    legitimate single-row run looks like. Only the durable delivered count —
+    which the coordinator derives with the diverted members INCLUDED — tells
+    them apart, and a three-row run must refuse whichever way it is batched.
     """
     target = tmp_path / "out.txt"
     sink = _sink(target)
@@ -383,8 +400,9 @@ def test_a_diverted_first_effect_cannot_let_a_later_single_row_publish(tmp_path:
     assert not target.exists()
 
     # Exactly what the coordinator hands the second effect: the diverted
-    # members are gone from the snapshot, so it carries only this row.
-    second = _prepare(sink, effect_id="e2" * 32, rows=[{"announcement_text": "three"}])
+    # members are gone from the snapshot, so it carries only this row — but
+    # the delivered count still carries all three.
+    second = _prepare(sink, effect_id="e2" * 32, rows=[{"announcement_text": "three"}], delivered=3)
 
     assert second.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
     assert second.safe_evidence["accepted_ordinals"] == ()
@@ -423,12 +441,13 @@ def test_a_later_effect_cannot_retract_the_document_the_first_effect_published(t
     assert target.read_bytes() == b"published"
 
 
-def test_re_preparing_one_effect_does_not_inflate_the_run_tally(tmp_path: Path) -> None:
+def test_re_preparing_one_effect_does_not_inflate_the_run_count(tmp_path: Path) -> None:
     """A prepare that raised leaves its effect RESERVED and re-enters.
 
-    The tally is keyed by effect id precisely so that replay overwrites rather
-    than accumulates — otherwise a retried single-row effect would count as two
-    and refuse to publish the run's only value.
+    The delivered count is DERIVED from durable member records each time the
+    coordinator builds the request — never accumulated in the sink — so replay
+    is idempotent by construction; otherwise a retried single-row effect would
+    count as two and refuse to publish the run's only value.
     """
     target = tmp_path / "out.txt"
     sink = _sink(target)
@@ -449,7 +468,7 @@ def test_the_diversion_reason_counts_rows_earlier_effects_already_diverted(tmp_p
     sink = _sink(tmp_path / "out.txt")
 
     _prepare(sink, effect_id="eb" * 32, rows=[{"announcement_text": "a"}, {"announcement_text": "b"}])
-    _prepare(sink, effect_id="ec" * 32, rows=[{"announcement_text": "c"}, {"announcement_text": "d"}])
+    _prepare(sink, effect_id="ec" * 32, rows=[{"announcement_text": "c"}, {"announcement_text": "d"}], delivered=4)
 
     reasons = [diversion.reason for diversion in sink._get_diversions()]
     assert "received 2 rows" in reasons[0]
@@ -457,8 +476,9 @@ def test_the_diversion_reason_counts_rows_earlier_effects_already_diverted(tmp_p
     assert "received 4 rows" in reasons[-1]
 
 
-def test_a_fresh_run_on_the_same_instance_starts_a_new_tally(tmp_path: Path) -> None:
-    """The tally is a per-run fact, so a later run's single value still publishes."""
+def test_a_fresh_run_on_the_same_instance_publishes_its_single_value(tmp_path: Path) -> None:
+    """Delivery is a per-run fact of the effect stream, and the sink holds no
+    cross-run state at all, so a later run's single value still publishes."""
     target = tmp_path / "out.txt"
     sink = _sink(target)
 
@@ -473,7 +493,9 @@ def test_a_fresh_run_on_the_same_instance_starts_a_new_tally(tmp_path: Path) -> 
     plan = sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id="ee" * 32,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         later_run,

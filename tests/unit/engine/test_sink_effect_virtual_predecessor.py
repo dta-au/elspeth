@@ -272,6 +272,7 @@ def test_reaffirmed_genesis_preserves_predecessor_authority_for_changed_successo
         seed_input = SinkEffectPipelineMembersInput(
             members=members[:1],
             target_snapshot_members=members[:1],
+            target_delivered_member_count=1,
         )
         seed_plan = seed_sink.prepare_effect(
             SinkEffectPrepareRequest(

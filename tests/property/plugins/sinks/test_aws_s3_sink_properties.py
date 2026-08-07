@@ -78,7 +78,9 @@ def _effect_body(rows: list[dict[str, Any]], format_name: str) -> tuple[bytes, t
     plan = sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         _CTX,

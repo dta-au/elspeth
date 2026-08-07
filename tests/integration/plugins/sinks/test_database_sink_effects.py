@@ -86,7 +86,9 @@ def _prepare(sink: DatabaseSink, rows: tuple[dict[str, object], ...], *, effect_
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         _CTX,
@@ -182,7 +184,9 @@ def test_owned_database_inspection_evidence_requires_every_consumed_field(tmp_pa
         sink.prepare_effect(
             SinkEffectPrepareRequest(
                 effect_id=effect_id,
-                effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+                effect_input=SinkEffectPipelineMembersInput(
+                    members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+                ),
                 inspection=divergent,
             ),
             _CTX,

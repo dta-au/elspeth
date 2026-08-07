@@ -92,7 +92,9 @@ def test_postgres_marker_rows_and_result_partition_commit_atomically(postgres_ur
     plan = sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id="d" * 64,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         _CTX,

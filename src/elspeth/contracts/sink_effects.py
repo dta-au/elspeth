@@ -686,12 +686,28 @@ class SinkEffectIdentity:
 class SinkEffectPipelineMembersInput:
     members: Sequence[SinkEffectMember]
     target_snapshot_members: Sequence[SinkEffectMember]
+    # Every member ever handed to this target's effect stream — diverted
+    # members INCLUDED — plus the current partition. The snapshot cannot carry
+    # this: it deliberately drops diverted members so a cumulative rebuild
+    # never republishes rejected rows, which leaves it indistinguishable from
+    # a fresh single-row run after an all-diverted predecessor. A sink whose
+    # rule quantifies over the whole run's delivery (DocumentSink's one-value
+    # rule) must read THIS count, not the snapshot length, or the rule holds
+    # only within one sink instance (elspeth-694f771c69).
+    target_delivered_member_count: int
 
     def __post_init__(self) -> None:
         members = _freeze_member_sequence(self.members, "members")
         if not members:
             raise ValueError("members must be non-empty")
         target_snapshot_members = _freeze_member_sequence(self.target_snapshot_members, "target_snapshot_members")
+        if type(self.target_delivered_member_count) is not int:
+            raise TypeError("target_delivered_member_count must be int")
+        if self.target_delivered_member_count < len(target_snapshot_members):
+            raise ValueError(
+                "target_delivered_member_count must be >= len(target_snapshot_members): "
+                "the snapshot is the delivered set minus diverted members, never more"
+            )
         object.__setattr__(self, "members", tuple(members))
         object.__setattr__(self, "target_snapshot_members", tuple(target_snapshot_members))
 

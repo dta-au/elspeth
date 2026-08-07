@@ -85,6 +85,7 @@ def _prepare(
             effect_input=SinkEffectPipelineMembersInput(
                 members=current,
                 target_snapshot_members=target_snapshot,
+                target_delivered_member_count=len(target_snapshot),
             ),
             inspection=inspection,
         ),
@@ -534,7 +535,9 @@ def test_azure_prepare_missing_owned_inspection_evidence_raises() -> None:
         sink.prepare_effect(
             SinkEffectPrepareRequest(
                 effect_id="d1" * 32,
-                effect_input=SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,)),
+                effect_input=SinkEffectPipelineMembersInput(
+                    members=(member,), target_snapshot_members=(member,), target_delivered_member_count=1
+                ),
                 inspection=corrupt_inspection,
             ),
             _CTX,
@@ -880,7 +883,7 @@ def test_restage_rebuilds_missing_stage_for_commit(factory: Any, tmp_path: Any, 
     stage = Path(str(plan.safe_evidence["staging_path"]))
     stage.unlink()
 
-    effect_input = SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,))
+    effect_input = SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,), target_delivered_member_count=1)
     sink.restage_effect(plan, effect_input, _CTX)
 
     assert stage.is_file()
@@ -901,7 +904,11 @@ def test_restage_leaves_present_stage_untouched(tmp_path: Any, monkeypatch: pyte
     original = stage.read_bytes()
 
     tampered = _member(0, {"id": 2})
-    sink.restage_effect(plan, SinkEffectPipelineMembersInput(members=(tampered,), target_snapshot_members=(tampered,)), _CTX)
+    sink.restage_effect(
+        plan,
+        SinkEffectPipelineMembersInput(members=(tampered,), target_snapshot_members=(tampered,), target_delivered_member_count=1),
+        _CTX,
+    )
 
     assert stage.read_bytes() == original
 
@@ -919,7 +926,11 @@ def test_restage_fails_closed_on_divergent_rederivation(tmp_path: Any, monkeypat
 
     tampered = _member(0, {"id": 2})
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="diverges from the durable plan"):
-        sink.restage_effect(plan, SinkEffectPipelineMembersInput(members=(tampered,), target_snapshot_members=(tampered,)), _CTX)
+        sink.restage_effect(
+            plan,
+            SinkEffectPipelineMembersInput(members=(tampered,), target_snapshot_members=(tampered,), target_delivered_member_count=1),
+            _CTX,
+        )
 
     assert not stage.exists()
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="body is unavailable"):
@@ -940,7 +951,11 @@ def test_restage_fails_closed_on_divergent_partition(tmp_path: Any, monkeypatch:
 
     oversize = _member(0, {"id": "x" * 100})
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="partition diverges"):
-        sink.restage_effect(plan, SinkEffectPipelineMembersInput(members=(oversize,), target_snapshot_members=(oversize,)), _CTX)
+        sink.restage_effect(
+            plan,
+            SinkEffectPipelineMembersInput(members=(oversize,), target_snapshot_members=(oversize,), target_delivered_member_count=1),
+            _CTX,
+        )
     assert not stage.exists()
 
 

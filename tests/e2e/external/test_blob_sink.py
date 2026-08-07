@@ -93,7 +93,9 @@ def _prepare_effect(
     return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
-            effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+            effect_input=SinkEffectPipelineMembersInput(
+                members=members, target_snapshot_members=members, target_delivered_member_count=len(members)
+            ),
             inspection=inspection,
         ),
         ctx,

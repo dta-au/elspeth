@@ -407,7 +407,7 @@ class TestChromaMemberEffects:
                 )
             )
         )
-        effect_input = SinkEffectPipelineMembersInput(members, members)
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -437,7 +437,7 @@ class TestChromaMemberEffects:
             {"doc_id": "d2", "text": "two", "topic": "beta"},
         )
         members = tuple(_chroma_effect_member(index, row) for index, row in enumerate(rows))
-        effect_input = SinkEffectPipelineMembersInput(members, members)
+        effect_input = SinkEffectPipelineMembersInput(members, members, len(members))
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -499,7 +499,7 @@ class TestChromaMemberEffects:
         )
         sink._collection = collection  # type: ignore[assignment]
         member = _chroma_effect_member(0, row)
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -514,7 +514,7 @@ class TestChromaMemberEffects:
         sink = ChromaSink(_make_config())
         sink._collection = collection  # type: ignore[assignment]
         member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -543,7 +543,7 @@ class TestChromaMemberEffects:
         sink = ChromaSink(_make_config())
         sink._collection = ResultCollection()  # type: ignore[assignment]
         member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
@@ -569,7 +569,7 @@ class TestChromaMemberEffects:
         sink = ChromaSink(_make_config())
         sink._collection = ResultCollection()  # type: ignore[assignment]
         member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
-        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,), 1)
         ctx = _chroma_effect_context()
         inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
         plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
