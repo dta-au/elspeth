@@ -17,6 +17,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import execute_tool
+from elspeth.web.execution.schemas import ValidationCheck, ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
@@ -149,6 +150,21 @@ def _state_with_blob_source(
     return result.updated_state
 
 
+def _passing_runtime_preflight(_state: CompositionState) -> ValidationResult:
+    """Hold Stage 2 constant so Stage 3 is the only stage moving the verdict.
+
+    ``preview_pipeline`` fails closed when no preflight is wired, which would
+    make every case in this file red for a reason that has nothing to do with
+    the proof diagnostics it exists to pin.
+    """
+    return ValidationResult(
+        is_valid=True,
+        checks=[ValidationCheck(name="settings_load", passed=True, detail="Settings loaded.", affected_nodes=(), outcome_code=None)],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+
 def _preview_data(engine: Engine, session_id: str, state: CompositionState) -> dict[str, Any]:
     catalog = _catalog()
     result = execute_tool(
@@ -159,6 +175,7 @@ def _preview_data(engine: Engine, session_id: str, state: CompositionState) -> d
         plugin_snapshot=catalog.snapshot,
         session_engine=engine,
         session_id=session_id,
+        runtime_preflight=_passing_runtime_preflight,
     )
     assert result.success is True, result.data
     return result.data

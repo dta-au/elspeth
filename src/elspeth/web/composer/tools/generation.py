@@ -46,6 +46,7 @@ from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
     SourceSpec,
+    ValidationEntryDict,
     _source_options_have_schema,
     _validate_gate_expression,
 )
@@ -2693,6 +2694,33 @@ def compute_proof_diagnostics(
     return diagnostics
 
 
+def _runtime_preflight_not_run_error() -> ValidationEntryDict:
+    """Build the marker naming an un-run Stage 2 in a preview's error channel.
+
+    A fresh dict per call: the entry is handed to the caller inside
+    ``data["errors"]``, so a shared module constant would let one consumer's
+    mutation leak into every later preview.
+
+    Deliberately NOT registered in ``_CLOSED_VALIDATION_ERROR_CODES`` — that
+    tuple is a claim about the codes the planner's redacted repair feedback
+    can carry, and this marker is not on that path. Its own message therefore
+    has to carry the repair.
+    """
+    return ValidationEntryDict(
+        component="pipeline",
+        message=(
+            "The runtime preflight stage did not run for this preview, so this pipeline has not been "
+            "checked against the real engine at all (path allowlist, plugin instantiation, graph "
+            "structure, schema compatibility, secret refs, policy gates). is_valid is false because no "
+            "verdict on those checks exists, not because one of them failed. This is a server wiring "
+            "omission, not a defect in the pipeline: do not rewrite the pipeline to try to clear it — "
+            "report that preview_pipeline returned runtime_preflight_not_run."
+        ),
+        severity="high",
+        error_code="runtime_preflight_not_run",
+    )
+
+
 def _execute_preview_pipeline(
     args: dict[str, Any],
     state: CompositionState,
@@ -2705,6 +2733,10 @@ def _execute_preview_pipeline(
     (Stage 3 — operator-input-aware proof against the observed source
     blob). The presence of any blocking ``proof_diagnostics`` entry means
     ``is_valid=False`` even when authoring + runtime checks pass.
+
+    An un-run stage never rides the success side: with no runtime callback
+    wired, ``is_valid`` is false and ``errors`` carries an explicit
+    ``runtime_preflight_not_run`` entry naming the stage that did not run.
     """
     validation = context.catalog.validate_composition_state(state).validation
     _AUTHORING_VALIDATION_COUNTER.add(
@@ -2722,14 +2754,28 @@ def _execute_preview_pipeline(
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 
     is_valid = validation.is_valid
+    summary_errors = authoring_payload["errors"]
     if runtime_result is not None:
         is_valid = is_valid and runtime_result.is_valid
+    else:
+        # Both live callers wire Stage 2 unconditionally for preview — the
+        # operator channel precomputes it per call (tool_batch.py) and the
+        # stdio MCP server wires it at construction (d53fbee91) — so this
+        # branch is a pure wiring-omission tripwire. An un-run stage must not
+        # ride the success side of the conjunct: fail closed and name the
+        # stage, because ``runtime_preflight: null`` alone cannot tell a
+        # caller "not computed" apart from "nothing to report".
+        is_valid = False
+        # A fresh list, never an in-place append: this list object IS
+        # ``authoring_payload["errors"]``, which the summary also embeds as
+        # ``authoring_validation`` — Stage 1's own report must stay Stage-1-true.
+        summary_errors = [*summary_errors, _runtime_preflight_not_run_error()]
     if has_blocking_proof:
         is_valid = False
 
     summary: dict[str, Any] = {
         "is_valid": is_valid,
-        "errors": authoring_payload["errors"],
+        "errors": summary_errors,
         "warnings": authoring_payload["warnings"],
         "suggestions": authoring_payload["suggestions"],
         "edge_contracts": authoring_payload["edge_contracts"],

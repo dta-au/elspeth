@@ -124,6 +124,26 @@ class _SecretServiceDouble:
         self.has_ref = _SyncCallRecorder(False)
 
 
+@pytest.fixture
+def passing_runtime_preflight() -> _SyncCallRecorder:
+    """A wired Stage-2 runtime preflight that passes.
+
+    ``preview_pipeline`` fails closed when no preflight callback is wired
+    (an un-run stage may not ride the success side), so a test that wants
+    a preview to publish ``is_valid: True`` must wire one. Deliberately
+    NOT autouse: a blanket always-passing stub would hide exactly the
+    un-run-stage state this guard exists to expose.
+    """
+    return _SyncCallRecorder(
+        ValidationResult(
+            is_valid=True,
+            checks=[ValidationCheck(name="settings_load", passed=True, detail="Settings loaded.", affected_nodes=(), outcome_code=None)],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        )
+    )
+
+
 def _empty_state() -> CompositionState:
     return CompositionState(
         source=None,
@@ -12108,6 +12128,33 @@ class TestGetPluginAssistance:
 # ---------------------------------------------------------------------------
 
 
+def _stage1_valid_preview_state() -> CompositionState:
+    """A csv -> csv pipeline that Stage 1 accepts and Stage 3 leaves inert.
+
+    Both proof-stage inputs are non-blob paths, so the only stage that can
+    move the published verdict is the runtime preflight.
+    """
+    return (
+        _empty_state()
+        .with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="main",
+                options={"path": "/data/blobs/test-session/input.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        )
+        .with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": "/data/outputs/test-session/out.csv", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+        )
+    )
+
+
 class TestPreviewPipeline:
     def test_preview_empty_pipeline(self) -> None:
         state = _empty_state()
@@ -12163,7 +12210,7 @@ class TestPreviewPipeline:
         assert result.data["node_count"] == 1
         assert result.data["output_count"] == 1
 
-    def test_preview_pipeline_includes_edge_contracts(self) -> None:
+    def test_preview_pipeline_includes_edge_contracts(self, passing_runtime_preflight: _SyncCallRecorder) -> None:
         """preview_pipeline includes raw edge contract evidence from validation."""
         state = _empty_state()
         catalog = _mock_catalog()
@@ -12208,7 +12255,7 @@ class TestPreviewPipeline:
             catalog,
         )
 
-        result = execute_tool("preview_pipeline", {}, r3.updated_state, catalog)
+        result = execute_tool("preview_pipeline", {}, r3.updated_state, catalog, runtime_preflight=passing_runtime_preflight)
 
         assert result.success is True
         assert "edge_contracts" in result.data
@@ -12730,25 +12777,7 @@ class TestPreviewPipeline:
         assert _pipeline_state_default_source(result.data)["has_schema_config"] is True
 
     def test_preview_pipeline_surfaces_runtime_preflight_failure(self) -> None:
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="main",
-                    options={"path": "/data/blobs/test-session/input.csv", "schema": {"mode": "observed"}},
-                    on_validation_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/test-session/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
+        state = _stage1_valid_preview_state()
         catalog = _mock_catalog()
         runtime_preflight = _SyncCallRecorder(
             ValidationResult(
@@ -12793,25 +12822,7 @@ class TestPreviewPipeline:
         runtime_preflight.assert_called_once_with(state)
 
     def test_preview_pipeline_without_runtime_preflight_preserves_authoring_validation(self) -> None:
-        state = (
-            _empty_state()
-            .with_source(
-                SourceSpec(
-                    plugin="csv",
-                    on_success="main",
-                    options={"path": "/data/blobs/test-session/input.csv", "schema": {"mode": "observed"}},
-                    on_validation_failure="discard",
-                )
-            )
-            .with_output(
-                OutputSpec(
-                    name="main",
-                    plugin="csv",
-                    options={"path": "/data/outputs/test-session/out.csv", "schema": {"mode": "observed"}},
-                    on_write_failure="discard",
-                )
-            )
-        )
+        state = _stage1_valid_preview_state()
 
         result = execute_tool(
             "preview_pipeline",
@@ -12826,7 +12837,114 @@ class TestPreviewPipeline:
         assert result.runtime_preflight is None
         assert result.data["authoring_validation"]["is_valid"] is True
         assert result.data["runtime_preflight"] is None
-        assert result.data["is_valid"] is True
+        assert result.data["is_valid"] is False
+
+    def test_preview_pipeline_absent_runtime_preflight_fails_closed(self) -> None:
+        """An un-run Stage 2 may not ride the success side of the conjunct.
+
+        Mutation caught: restoring the silent-drop conjunct
+        (``if runtime_result is not None: is_valid = is_valid and ...``)
+        republishes a bare ``true`` for a pipeline nothing ran the runtime
+        checks against, and the marker disappears.
+        """
+        state = _stage1_valid_preview_state()
+
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            _mock_catalog(),
+            data_dir="/data",
+            runtime_preflight=None,
+        )
+
+        assert result.success is True
+        assert result.data["authoring_validation"]["is_valid"] is True
+        assert result.data["is_valid"] is False
+        assert result.data["runtime_preflight"] is None
+
+        markers = [entry for entry in result.data["errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
+        assert len(markers) == 1, result.data["errors"]
+        assert markers[0]["severity"] == "high"
+        assert "did not run" in markers[0]["message"]
+
+        # Stage 1's own report stays Stage-1-true: the marker is appended to
+        # the summary's error channel, never into the authoring payload the
+        # summary embeds (the two lists would alias without a fresh copy).
+        authoring_codes = [entry.get("error_code") for entry in result.data["authoring_validation"]["errors"]]
+        assert "runtime_preflight_not_run" not in authoring_codes
+
+    def test_preview_pipeline_runtime_conjunct_three_directions(
+        self,
+        passing_runtime_preflight: _SyncCallRecorder,
+    ) -> None:
+        """Wired-pass, wired-fail, and absent must stay three distinct verdicts.
+
+        Mutation caught: any future 'unification' that folds the absent case
+        into either wired semantics — e.g.
+        ``is_valid and (runtime_result is None or runtime_result.is_valid)``
+        (absent collapses into pass) or dropping the marker while keeping
+        ``is_valid=False`` (absent collapses into wired-fail, indistinguishable
+        from a real runtime rejection) — breaks at least one arm loudly.
+        """
+        state = _stage1_valid_preview_state()
+        failing_preflight = _SyncCallRecorder(
+            ValidationResult(
+                is_valid=False,
+                checks=[
+                    ValidationCheck(
+                        name="path_allowlist",
+                        passed=False,
+                        detail="Path traversal blocked: sink 'main'",
+                        affected_nodes=(),
+                        outcome_code=None,
+                    )
+                ],
+                errors=[
+                    ValidationError(
+                        component_id="main",
+                        component_type="sink",
+                        message="Path traversal blocked: sink 'main'",
+                        suggestion="Write inside the configured data directory.",
+                        error_code=None,
+                    )
+                ],
+                readiness=ValidationReadiness(authoring_valid=True, execution_ready=False, completion_ready=False, blockers=[]),
+            )
+        )
+
+        def preview(runtime_preflight: _SyncCallRecorder | None) -> dict[str, Any]:
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                data_dir="/data",
+                runtime_preflight=runtime_preflight,
+            )
+            assert result.success is True
+            return result.data
+
+        wired_pass = preview(passing_runtime_preflight)
+        wired_fail = preview(failing_preflight)
+        absent = preview(None)
+
+        def marker_codes(data: dict[str, Any]) -> list[str]:
+            return [entry.get("error_code") for entry in data["errors"] if entry.get("error_code") == "runtime_preflight_not_run"]
+
+        assert wired_pass["is_valid"] is True
+        assert wired_pass["runtime_preflight"] is not None
+        assert wired_pass["runtime_preflight"]["is_valid"] is True
+        assert marker_codes(wired_pass) == []
+
+        assert wired_fail["is_valid"] is False
+        assert wired_fail["runtime_preflight"] is not None
+        assert wired_fail["runtime_preflight"]["is_valid"] is False
+        assert marker_codes(wired_fail) == []
+
+        assert absent["is_valid"] is False
+        assert absent["runtime_preflight"] is None
+        assert marker_codes(absent) == ["runtime_preflight_not_run"]
 
 
 class TestPrevalidatePluginOptions:
