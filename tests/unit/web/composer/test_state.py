@@ -6074,7 +6074,18 @@ class TestSchemaContractValidation:
         assert any(e.severity == "high" for e in wrapper_errors)
 
     def test_coalesce_producer_emits_skip_warning(self) -> None:
-        """Coalesce producers stay unresolved until runtime validation."""
+        """A NON-UNION coalesce producer stays unresolved until runtime validation.
+
+        ``_make_coalesce`` builds ``merge="nested"``, so this now pins the
+        deliberate scope boundary of elspeth-ae83a6b60c rather than a blanket
+        coalesce abstention: a UNION coalesce resolves through the guarantee
+        walk (``TestUnionCoalesceGuaranteeExtras``), while nested keys the
+        merged schema by branch name and select forwards one branch's raw
+        schema — semantics the propagation vote does not mirror, so abstaining
+        with this advisory is the correct answer for them. Do not "fix" this
+        test by widening the union gate; that would invent top-level guarantees
+        and reject pipelines the runtime runs.
+        """
         state = self._empty_state()
         state = state.with_source(
             self._make_source(
@@ -7397,15 +7408,22 @@ class TestPassThroughComposerParity:
         result = state.validate()
 
         # Engine-legal fork chains route branches through a coalesce (or a
-        # sink-named branch); preview deliberately defers coalesce-fed sink
-        # contracts to the runtime validator with an explicit skip warning
-        # rather than fabricating a contract row. The previous assertion
-        # (a satisfied contract at output:main) was reachable only in a
-        # fork-into-transform-into-sink shape the engine rejects at pre-run
-        # ("fork branch with no destination").
+        # sink-named branch), and the guarantee walk now RESOLVES a union
+        # coalesce instead of deferring to the runtime validator
+        # (elspeth-ae83a6b60c): its merged guarantee is the same one the DAG
+        # builder stamps, so the contract row is computed rather than
+        # fabricated and the skip warning would now be a false "not yet
+        # checked" signal. This test therefore pins the end-to-end inheritance
+        # it is named for — source guarantees, through the fork gate, through
+        # the pass-through, through the merge, to the sink's requirement —
+        # which the previous no-contract-row assertion could not see.
         assert result.is_valid, result.errors
-        assert any("coalesce" in w.message.lower() and "skipped" in w.message.lower() for w in result.warnings)
-        assert not any(ec.to_id == "output:main" for ec in result.edge_contracts)
+        assert not any("coalesce" in w.message.lower() and "skipped" in w.message.lower() for w in result.warnings)
+        contract = next(ec for ec in result.edge_contracts if ec.to_id == "output:main")
+        assert contract.from_id == "rejoin"
+        assert set(contract.producer_guarantees) == {"id", "body"}
+        assert contract.consumer_requires == ("body",)
+        assert contract.satisfied is True
 
     def test_preview_fails_closed_when_known_pass_through_constructor_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Probe failure on a known pass-through plugin → Stage 1 rejects pipeline.
@@ -9461,6 +9479,461 @@ class TestCompositionStateRowUnion:
         assert detail is not None
         assert detail.consumer == "after_union"
         assert detail.missing_fields == ("treatment_tag",)
+
+
+class TestUnionCoalesceGuaranteeExtras:
+    """Rule A/B must see a union coalesce's MERGED guarantees (elspeth-ae83a6b60c).
+
+    The composer half of agreement Shape 19. Stage 1 abstained at EVERY
+    coalesce, at three separate sites, so a union coalesce's merged guarantee
+    set was invisible to the extras rules while the runtime rejected the
+    identical pipeline at build time
+    (``validate_typed_producer_guaranteed_extras``). Composer green, ``elspeth
+    run`` red — and because Stage 1 emitted no error, the authoring loop had
+    nothing to repair against.
+
+    Deliberately the coalesce mirror of ``TestCompositionStateRowUnion``'s
+    locked-input tests, down to the llm-arm fixtures: the row_union half of
+    the same walk was closed first (elspeth-9d13900064 / elspeth-41bcaa882e),
+    so the two classes diverging is itself a signal.
+
+    The merged set is NOT computed here. It comes from the composer's existing
+    coalesce accumulation in ``_producer_entry_propagation_vote``, which calls
+    the runtime's own ``merge_guaranteed_fields`` — the same function the DAG
+    builder stamps a coalesce's guarantees with. Both surfaces therefore read
+    one implementation, and the tests below pin the mirror rather than a
+    re-derivation of it.
+    """
+
+    def _source(self, *, schema: dict[str, Any] | None = None) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success="fork_in",
+            options={"schema": schema or {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+
+    def _fork_gate(self) -> NodeSpec:
+        return NodeSpec(
+            id="fork_rows",
+            node_type="gate",
+            plugin=None,
+            input="fork_in",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("control_branch", "treatment_branch"),
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _llm(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        response_field: str = "verdict",
+    ) -> NodeSpec:
+        """An llm arm guaranteeing its provenance trio, as in the row_union class.
+
+        ``llm`` guarantees ``<response_field>`` plus the ``_usage``/``_model``
+        side-fields, which are row data rather than audit-only provenance and
+        so reach a downstream consumer's input contract. Using the same arm
+        plugin as the row_union tests keeps the two guarantee sets comparable.
+        """
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="llm",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Judge this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": response_field,
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _passthrough(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        """A TERMINAL union coalesce: no ``on_success``, consumed by NAME.
+
+        Terminal is not incidental. ``coalesce_on_success_must_be_sink``
+        rejects a coalesce routed into a transform, so the runtime-legal shape
+        for a coalesce feeding a non-sink consumer is a terminal barrier whose
+        id IS the connection the consumer reads (the same shape
+        ``test_coalesce_producer_emits_skip_warning`` uses). Wiring
+        ``on_success`` at a transform instead would trip that unrelated rule
+        and the probe would prove nothing.
+        """
+        defaults: dict[str, Any] = {
+            "id": "variant_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            # Serialized adapter placeholder: the first branch connection.
+            "input": "control_done",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": {
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            "policy": "require_all",
+            "merge": "union",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _output(self, *, options: dict[str, Any] | None = None) -> OutputSpec:
+        return OutputSpec(
+            name="output",
+            plugin="json",
+            options=options or {"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def _state(
+        self,
+        *,
+        coalesce: NodeSpec | None = None,
+        arms: tuple[NodeSpec, ...] | None = None,
+        tail: NodeSpec | None = None,
+        extra_nodes: tuple[NodeSpec, ...] = (),
+        output_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        return CompositionState(
+            source=self._source(),
+            nodes=(
+                self._fork_gate(),
+                *(
+                    arms
+                    or (
+                        self._llm("control", "control_branch", "control_done"),
+                        self._llm("treatment", "treatment_branch", "treatment_done"),
+                    )
+                ),
+                coalesce or self._coalesce(),
+                *((tail,) if tail is not None else (self._passthrough("after_merge", "variant_merge", "output"),)),
+                *extra_nodes,
+            ),
+            edges=(),
+            outputs=(self._output(options=output_options),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _locked(self, fields: list[str]) -> dict[str, Any]:
+        return {"schema": {"mode": "fixed", "fields": fields}}
+
+    def test_terminal_union_coalesce_into_locked_transform_reports_locked_input_extras(self) -> None:
+        """Rule A through the walk-back escape and the emit profile (sites 1 + 2).
+
+        Both llm arms guarantee the same trio, so the require_all union merge
+        is that trio, and the locked consumer admits only the response field.
+        The two extras are the ones the runtime names in its own
+        ``EdgeContractError`` on the equivalent graph.
+
+        Reverting the walk-back escape alone restores the unconditional
+        coalesce abstention and this goes green; reverting the emit-profile
+        branch alone ALSO goes green, because the walk-back then resolves the
+        coalesce but ``_effective_producer_vote`` answers with the coalesce
+        node's own (empty) declared set and Rule A finds no extras. Neither
+        site is sufficient by itself.
+        """
+        state = self._state(
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            )
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_merge"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_merge"
+        assert detail.consumer == "after_merge"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+        # The abstention advisory is the pre-fix signal; a resolved coalesce
+        # must stop emitting it, or the authoring loop is told the edge was
+        # deferred while an error names it.
+        assert not [
+            warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message
+        ], result.warnings
+
+    def test_definite_emits_traverse_union_coalesce_behind_pass_through(self) -> None:
+        """Rule B through ``_connection_definite_emits`` (site 3) in isolation.
+
+        The locked SINK's direct producer is the pass-through relay, so the
+        walk-back and the emit profile never see the coalesce at all — only
+        the definite-arrivals walk crosses it, because the relay declares
+        ``passes_through_input=True`` with an extras-allowing contract and so
+        propagates upstream arrivals. Reverting site 3 alone leaves the relay
+        contributing its own emits only, and this goes green.
+
+        The relay must declare its OWN ``guaranteed_fields``, which is what
+        isolates site 3. Without them ``_producer_emit_profile`` has no
+        computed set to prefer and falls back to the relay's inherited vote —
+        which already resolves the coalesce through the propagation vote's
+        long-standing coalesce branch — so the test would pass pre-fix and pin
+        nothing. ``flexible`` keeps the relay extras-allowing, so it
+        propagates rather than firewalling arrivals off.
+        """
+        state = self._state(
+            tail=self._passthrough(
+                "pt_mid",
+                "variant_merge",
+                "output",
+                options={"schema": {"mode": "flexible", "fields": ["verdict: str"], "guaranteed_fields": ["verdict"]}},
+            ),
+            output_options=self._locked(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.consumer == "output:output"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_best_effort_union_coalesce_intersects_branch_guarantees(self) -> None:
+        """The require_all discriminator, both halves, on ONE pipeline shape.
+
+        ``merge_guaranteed_fields`` unions branch guarantees under
+        ``require_all`` (every branch always arrives, so any branch's
+        guarantee survives) and INTERSECTS otherwise (a branch may be lost).
+        The arms here guarantee disjoint trios, so the intersection is empty:
+        under ``best_effort`` there is no field the coalesce can promise, and
+        reporting extras would be a FALSE RED against a runtime that also
+        intersects.
+
+        Mutating the composer branch to always union fails the best_effort
+        half; to always intersect fails the require_all half.
+        """
+        arms = (
+            self._llm("control", "control_branch", "control_done", response_field="verdict"),
+            self._llm("treatment", "treatment_branch", "treatment_done", response_field="tone"),
+        )
+        tail = self._passthrough(
+            "after_merge",
+            "variant_merge",
+            "output",
+            options=self._locked(["verdict: str", "verdict_model: str", "verdict_usage: any"]),
+        )
+
+        require_all = self._state(arms=arms, coalesce=self._coalesce(policy="require_all"), tail=tail).validate()
+
+        entry = next(error for error in require_all.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("tone", "tone_model", "tone_usage")
+
+        best_effort = self._state(arms=arms, coalesce=self._coalesce(policy="best_effort"), tail=tail).validate()
+
+        assert not [error for error in best_effort.errors if error.error_code == "locked_input_extras"], best_effort.errors
+
+    @pytest.mark.parametrize("merge", ["nested", "select"])
+    def test_non_union_coalesce_keeps_the_skip_warning(self, merge: str) -> None:
+        """The ``merge == "union"`` scope gate, in the shape that would trip it.
+
+        Only ``union`` merges branch guarantees into top-level fields, so only
+        union is the population where a coalesce's guarantees can exceed its
+        declared ones. ``nested`` keys the merged schema BY BRANCH NAME and
+        ``select`` forwards one branch's raw schema; the propagation vote
+        mirrors neither, so extending these rules to them would invent
+        guarantees and false-red. Deleting the gate makes this pipeline gain
+        the union's top-level trio and report extras the runtime does not.
+
+        The abstention plus its advisory is the correct answer here — the
+        runtime validator remains authoritative for these merges.
+        """
+        overrides: dict[str, Any] = {"merge": merge}
+        if merge == "select":
+            overrides["options"] = {"select_branch": "control_branch"}
+        state = self._state(
+            coalesce=self._coalesce(**overrides),
+            tail=self._passthrough(
+                "after_merge",
+                "variant_merge",
+                "output",
+                options=self._locked(["verdict: str"]),
+            ),
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
+        assert [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
+            result.warnings
+        )
+
+    def test_unparseable_branch_options_abstain_instead_of_crashing_validate(self) -> None:
+        """A branch parsed for the FIRST time here is Tier-3 input, not our bug.
+
+        The Rule A/B call sites deliberately let a ValueError from the emit
+        profile crash, because THEIR producer was already parsed earlier in the
+        same iteration — a fault there would be a non-determinism bug in our own
+        code and masking it would hide it. A coalesce BRANCH is the other case:
+        the seam walks branch nodes the consumer's own iteration never touched,
+        so a malformed schema block there is ordinary recoverable external input
+        and must abstain, exactly as ``_arm_emit_profile`` does.
+
+        The node ORDER is load-bearing and this test is worthless without it.
+        ``treatment`` is placed AFTER the locked consumer, so the walk reaches
+        its malformed options before that node's own iteration has parsed them.
+        With the branch first, the ValueError never fires inside the seam and
+        the test would pass vacuously — which is why the skip warning is
+        asserted positively rather than merely asserting no crash: the warning
+        only appears when the seam actually abstained.
+
+        The malformed value must break the PRODUCER-side parse the seam walks:
+        a non-mapping ``schema`` block, which ``parse_raw_schema_config``
+        rejects with "schema config must be a mapping". A malformed
+        ``required_input_fields`` does NOT work here — that is a consumer-side
+        parse the guarantee vote never reads, so the seam resolves normally and
+        the extras error still fires. The branch's own node iteration still
+        reports the malformed block against the right owner
+        (``contract_config_invalid``), which is why abstaining here loses no
+        diagnosis.
+        """
+        malformed_branch = self._passthrough(
+            "treatment",
+            "treatment_branch",
+            "treatment_done",
+            options={"schema": "observed"},
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._fork_gate(),
+                self._llm("control", "control_branch", "control_done"),
+                self._coalesce(),
+                self._passthrough("after_merge", "variant_merge", "output", options=self._locked(["verdict: str"])),
+                # AFTER the consumer: see the docstring's order note.
+                malformed_branch,
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert not [error for error in result.errors if error.error_code == "locked_input_extras"], result.errors
+        assert [warning for warning in result.warnings if "Contract check skipped" in warning.message and "coalesce" in warning.message], (
+            result.warnings
+        )
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_draft_cycle_through_a_fan_in_barrier_returns_a_verdict(self, barrier_type: str) -> None:
+        """A cyclic draft must produce a verdict, never ``RecursionError``.
+
+        Drafts are not DAG-checked at Stage 1, so a half-wired composition can
+        route a barrier's own output back into one of its branches. The
+        guarantee vote's coalesce and row_union arms recursed on branch
+        connections with no visited-node guard — only queues had one — and
+        resolving a union coalesce at the walk-back widened the trigger
+        surface: every locked consumer behind a coalesce now votes. Unbounded
+        recursion here is a /validate 500, not a rejection.
+
+        Both barrier kinds are covered because the guard is one shared
+        ``visited_fan_in_ids`` set: the coalesce case is the one this fix made
+        reachable, the row_union case was already reachable through
+        pass-through inheritance, and a guard that covered only the newly
+        reachable half would leave its sibling recursing.
+
+        ``spin`` must be a pass-through: only a pass-through transform's vote
+        walks to its own input, so only that closes the cycle through the
+        guarantee channel. Reverting the guard raises ``RecursionError`` from
+        BOTH parameters — the check that they reach the vote at all rather than
+        being turned back by an earlier pass.
+        """
+        arms = (
+            self._llm("control", "control_branch", "control_done"),
+            self._passthrough("treatment", "treatment_branch", "treatment_mid"),
+        )
+        # ``spin`` reads the barrier's output and republishes it as the branch
+        # connection the barrier itself consumes — the cycle.
+        spin = self._passthrough("spin", "variant_merge", "treatment_done", options=self._locked(["verdict: str"]))
+        if barrier_type == "coalesce":
+            state = self._state(arms=arms, tail=spin)
+        else:
+            state = self._state(
+                arms=arms,
+                coalesce=NodeSpec(
+                    id="variant_merge",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={
+                        "control_branch": "control_done",
+                        "treatment_branch": "treatment_done",
+                    },
+                    policy=None,
+                    merge=None,
+                ),
+                tail=self._passthrough("spin", "union_out", "treatment_done", options=self._locked(["verdict: str"])),
+            )
+
+        result = state.validate()
+
+        assert result is not None
+        assert isinstance(result.is_valid, bool)
 
 
 class TestPassThroughArrivalExtras:

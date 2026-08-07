@@ -2335,11 +2335,14 @@ def _check_schema_contracts(
     ) -> ProducerEntry | None:
         """Schema-specific walk-back with coalesce/fork warning emission.
 
-        Differs from ``ProducerResolver.walk_to_real_producer`` in two
-        ways: it traverses structural producers to emit skip-with-warning
-        entries (the resolver returns or abstains silently), and it stops at
-        coalesce/row_union boundaries because branch-aware schema-contract
-        propagation is out of scope here.
+        Differs from ``ProducerResolver.walk_to_real_producer`` in two ways: it
+        traverses structural producers to emit skip-with-warning entries (the
+        resolver returns or abstains silently), and it stops at a fan-in
+        boundary whose branches it cannot resolve into one sound guarantee.
+        Each fan-in kind now has a participation escape hatch — queue and
+        row_union return the branch intersection, a union coalesce returns the
+        builder's own merge — so the abstention is a statement about THIS
+        composition rather than about the node kind.
         """
         visited_connections: set[str] = set()
         current_producer = producer
@@ -2351,6 +2354,20 @@ def _check_schema_contracts(
             if producer_node is None:
                 return None
             if producer_node.node_type == "coalesce":
+                # Engine parity (elspeth-ae83a6b60c), the third sibling of the
+                # queue and row_union rules below: a UNION coalesce's merged
+                # guarantee is exactly what the DAG builder stamps on it, so
+                # the contract check proceeds against the coalesce as producer
+                # (the guarantee parsers resolve it through
+                # ``_producer_entry_propagation_vote``). Abstaining here
+                # unconditionally is what made every union-coalesce pipeline
+                # validate green while the runtime build rejected it, with no
+                # error for the authoring loop to repair against. Non-union
+                # merges and a non-participating vote keep the honest "not yet
+                # checked" warning — see ``_union_coalesce_merged_guarantees``
+                # for why the union gate is the whole population.
+                if _union_coalesce_merged_guarantees(current_producer) is not None:
+                    return current_producer
                 warnings.append(
                     _warn(
                         f"node:{producer_node.id}",
@@ -2372,7 +2389,7 @@ def _check_schema_contracts(
                 # the skip warning stays the honest "not yet checked" signal.
                 queue_participates, _queue_fields = _producer_entry_propagation_vote(
                     current_producer,
-                    visited_queue_ids=frozenset(),
+                    visited_fan_in_ids=frozenset(),
                 )
                 if queue_participates:
                     return current_producer
@@ -2399,7 +2416,7 @@ def _check_schema_contracts(
                 # "not yet checked" signal.
                 union_participates, _union_fields = _producer_entry_propagation_vote(
                     current_producer,
-                    visited_queue_ids=frozenset(),
+                    visited_fan_in_ids=frozenset(),
                 )
                 if union_participates:
                     return current_producer
@@ -2574,7 +2591,7 @@ def _check_schema_contracts(
     def _effective_producer_vote(
         producer: ProducerEntry,
         *,
-        visited_queue_ids: frozenset[str] = frozenset(),
+        visited_fan_in_ids: frozenset[str] = frozenset(),
     ) -> tuple[bool, frozenset[str]]:
         """Return (participates, guarantees) for preview propagation.
 
@@ -2681,7 +2698,7 @@ def _check_schema_contracts(
             base = output_schema_config.get_effective_guaranteed_fields() if output_schema_config is not None else frozenset()
             inherited_participates, inherited_fields = _connection_propagation_vote(
                 producer_node.input,
-                visited_queue_ids=visited_queue_ids,
+                visited_fan_in_ids=visited_fan_in_ids,
             )
             # ADR-009 §Clause 1: share the aggregation rule with graph.py.
             # Composer's producer-graph is single-upstream at this level
@@ -2959,7 +2976,7 @@ def _check_schema_contracts(
     def _connection_propagation_vote(
         connection_name: str,
         *,
-        visited_queue_ids: frozenset[str] = frozenset(),
+        visited_fan_in_ids: frozenset[str] = frozenset(),
     ) -> tuple[bool, frozenset[str]]:
         """Resolve a connection's propagation vote across structural nodes.
 
@@ -2978,28 +2995,35 @@ def _check_schema_contracts(
         producer = resolver.find_producer_for(connection_name)
         if producer is None:
             return False, frozenset()
-        return _producer_entry_propagation_vote(producer, visited_queue_ids=visited_queue_ids)
+        return _producer_entry_propagation_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
     def _producer_entry_propagation_vote(
         producer: ProducerEntry,
         *,
-        visited_queue_ids: frozenset[str],
+        visited_fan_in_ids: frozenset[str],
     ) -> tuple[bool, frozenset[str]]:
         """Structural dispatch for one producer entry's propagation vote.
 
         Factored out of ``_connection_propagation_vote`` because queue fan-in
         arms are several producers publishing the SAME connection (the queue
         id), so an arm's vote must be resolved per-entry, not per-connection.
-        ``visited_queue_ids`` terminates routing loops back into a queue —
-        drafts are not DAG-checked at Stage 1, and a revisited queue votes
-        conservative abstention instead of recursing unboundedly.
+
+        ``visited_fan_in_ids`` terminates routing loops back into a fan-in node
+        — drafts are not DAG-checked at Stage 1, so a composition can route a
+        barrier's own output back into one of its branches, and a revisited
+        barrier votes conservative abstention instead of recursing unboundedly
+        into a /validate 500. All three fan-in kinds share ONE set because node
+        ids are unique across kinds, so a kind can only ever turn back its own
+        revisit; the guard therefore fires on cycles alone and never abstains
+        on an acyclic diamond. Sibling branches each recurse with their own
+        ``| {id}`` value, so they cannot mask each other.
         """
         if is_source_producer_id(producer.producer_id):
-            return _effective_producer_vote(producer, visited_queue_ids=visited_queue_ids)
+            return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
 
         producer_node = node_by_id[producer.producer_id]
         if producer_node.node_type == "gate":
-            return _connection_propagation_vote(producer_node.input, visited_queue_ids=visited_queue_ids)
+            return _connection_propagation_vote(producer_node.input, visited_fan_in_ids=visited_fan_in_ids)
 
         if producer_node.node_type == "queue":
             # Engine parity (83a53388a / elspeth-5a372d3267, mirrored here for
@@ -3012,13 +3036,13 @@ def _check_schema_contracts(
             # promoting a single arm's guarantee to the interleaved stream
             # would over-claim — the elspeth-a5b86149d4 hazard this branch
             # previously abstained over entirely.
-            if producer_node.id in visited_queue_ids:
+            if producer_node.id in visited_fan_in_ids:
                 return False, frozenset()
             arm_entries = resolver.queue_predecessors(producer_node.id)
             if not arm_entries:
                 return False, frozenset()
             arm_votes = [
-                _producer_entry_propagation_vote(arm, visited_queue_ids=visited_queue_ids | {producer_node.id}) for arm in arm_entries
+                _producer_entry_propagation_vote(arm, visited_fan_in_ids=visited_fan_in_ids | {producer_node.id}) for arm in arm_entries
             ]
             if all(arm_participates for arm_participates, _ in arm_votes):
                 return True, frozenset.intersection(*[arm_fields for _, arm_fields in arm_votes])
@@ -3033,18 +3057,21 @@ def _check_schema_contracts(
             # still must not invent guarantees from a SINGLE branch:
             # released rows arrive from exactly one branch, so
             # ``compose_propagation``'s abstainer-skip would over-claim.
+            if producer_node.id in visited_fan_in_ids:
+                return False, frozenset()
             branch_connections = _coalesce_branch_connections(producer_node.branches)
             if not branch_connections:
                 return False, frozenset()
             branch_votes = [
-                _connection_propagation_vote(connection, visited_queue_ids=visited_queue_ids) for connection in branch_connections
+                _connection_propagation_vote(connection, visited_fan_in_ids=visited_fan_in_ids | {producer_node.id})
+                for connection in branch_connections
             ]
             if all(branch_participates for branch_participates, _ in branch_votes):
                 return True, frozenset.intersection(*[branch_fields for _, branch_fields in branch_votes])
             return False, frozenset()
 
         if producer_node.node_type == "coalesce":
-            if not producer_node.branches:
+            if not producer_node.branches or producer_node.id in visited_fan_in_ids:
                 return False, frozenset()
 
             branch_schemas: dict[str, SchemaConfig] = {}
@@ -3055,7 +3082,7 @@ def _check_schema_contracts(
             ):
                 branch_participates, branch_guarantees = _connection_propagation_vote(
                     branch_connection,
-                    visited_queue_ids=visited_queue_ids,
+                    visited_fan_in_ids=visited_fan_in_ids | {producer_node.id},
                 )
                 if not branch_participates:
                     continue
@@ -3074,7 +3101,60 @@ def _check_schema_contracts(
             )
             return True, frozenset(merged or ())
 
-        return _effective_producer_vote(producer, visited_queue_ids=visited_queue_ids)
+        return _effective_producer_vote(producer, visited_fan_in_ids=visited_fan_in_ids)
+
+    def _union_coalesce_merged_guarantees(producer: ProducerEntry) -> frozenset[str] | None:
+        """Return a union coalesce's merged guarantee set, or None to abstain.
+
+        The one seam the three coalesce sites below consult, so a union
+        coalesce stops being opaque to Rule A/B (elspeth-ae83a6b60c: Stage 1
+        abstained at every coalesce while the runtime rejected the identical
+        pipeline at build, leaving the authoring loop no error to repair).
+
+        It computes nothing itself. The merge lives in
+        ``_producer_entry_propagation_vote``'s coalesce branch, which calls the
+        runtime's own ``merge_guaranteed_fields`` on propagation-walked branch
+        votes — the same function, on the same shape of branch schemas, that
+        the DAG builder stamps the coalesce's guarantees with
+        (``core/dag/builder.py``, ``guarantee_branch_schemas``) and that
+        ``validate_typed_producer_guaranteed_extras``
+        (``core/dag/schema_validation.py``) then enforces. The two surfaces
+        read ONE implementation instead of two mirrors free to drift.
+
+        None means "Composer knows nothing here", and every caller keeps its
+        pre-existing abstention on it. Three causes:
+
+        * Not a union merge. ``select`` forwards one branch's raw schema and
+          ``nested`` keys the merged schema BY BRANCH NAME; the vote mirrors
+          neither, so treating them as union would invent top-level guarantees
+          and red-line pipelines the runtime runs. ``__post_init__`` defaults
+          an unset ``merge`` to "union", so this gate cannot miss a coalesce
+          that merely omitted the field.
+        * The vote abstained — an unresolvable branch, or a routing cycle the
+          fan-in guard turned back.
+        * A branch node's contract options do not parse. The Rule A/B call
+          sites deliberately let a ValueError crash, because THEIR producer was
+          already parsed in the same iteration and a fault there would be a
+          non-determinism bug in our own code. A coalesce BRANCH is the other
+          case: it may sit later in ``nodes`` than the consumer under check and
+          be parsed here for the first time, which is ordinary recoverable
+          external input, reported against its real owner by that node's own
+          iteration. So this abstains for the same reason
+          ``_arm_emit_profile`` does rather than crashing /validate.
+
+        No extras-firewall mirror is needed for the union population:
+        ``merge_union_fields`` returns observed or flexible mode and never
+        fixed, so a union coalesce's merged schema always allows extras and the
+        runtime's firewall skip can never exclude the edge.
+        """
+        producer_node = resolver.get_node(producer.producer_id)
+        if producer_node is None or producer_node.node_type != "coalesce" or producer_node.merge != "union":
+            return None
+        try:
+            participates, merged = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
+        except ValueError:
+            return None
+        return merged if participates else None
 
     def _format_fields(fields: frozenset[str]) -> str:
         return ", ".join(sorted(fields)) if fields else "(none)"
@@ -3158,6 +3238,24 @@ def _check_schema_contracts(
             # into the dedicated boundary path, this profile must answer with
             # the same arm-emit union that path computes.
             return _row_union_definite_emits(producer_node, visited_connections=frozenset()), False
+        if producer_node.node_type == "coalesce":
+            # Must precede the ``plugin is None`` fallback below: a coalesce has
+            # no plugin, so ordering this after it would return the coalesce
+            # node's own (empty) declared set and leave this branch dead code —
+            # which is precisely the state that made the walk-back escape above
+            # insufficient on its own. ``propagates_upstream=False`` because the
+            # vote has already folded in every branch arrival; unioning the
+            # coalesce's input arrivals on top would re-report one branch's
+            # fields as if they arrived on every row.
+            #
+            # Runtime mirror: ``core/dag/builder.py`` stamps this same merge on
+            # the coalesce via ``merge_guaranteed_fields``, and
+            # ``validate_typed_producer_guaranteed_extras``
+            # (``core/dag/schema_validation.py``) enforces it against the
+            # consumer — the check this profile feeds Rule A/B.
+            merged = _union_coalesce_merged_guarantees(producer)
+            if merged is not None:
+                return merged, False
         if producer_node.plugin is None:
             return _effective_producer_guarantees(producer), False
         if producer_node.node_type not in {"transform", "aggregation"}:
@@ -3265,13 +3363,23 @@ def _check_schema_contracts(
                 producer_node,
                 visited_connections=visited_connections | {connection_name},
             )
+        if producer_node.node_type == "coalesce":
+            # A union coalesce's merged guarantee DOES definitely arrive, so it
+            # must be contributed here — this is the arm that carries it across
+            # an intervening extras-allowing pass-through, where the walk-back
+            # and the emit profile never see the coalesce at all. Ordered before
+            # the opaque arm below, which would otherwise swallow it.
+            merged = _union_coalesce_merged_guarantees(producer)
+            if merged is not None:
+                return merged
         if producer_node.node_type in ("queue", "coalesce"):
             # Opaque to Composer preview: a queue publishes an observed schema
-            # and never merges its predecessors' guarantees, and a coalesce's
-            # merged output is strategy-specific. Contributing nothing keeps
-            # the lower bound honest. Extending the extras rule to a queue
-            # producer is a drop-in branch here, left to the track that owns
-            # queue contract semantics.
+            # and never merges its predecessors' guarantees, and a NON-UNION
+            # coalesce's merged output is strategy-specific (``select`` forwards
+            # one branch's raw schema, ``nested`` keys fields by branch name).
+            # Contributing nothing keeps the lower bound honest. Extending the
+            # extras rule to a queue producer is a drop-in branch here, left to
+            # the track that owns queue contract semantics.
             return frozenset()
         emit_set, propagates_upstream = _arm_emit_profile(producer)
         if not propagates_upstream:
@@ -3304,6 +3412,13 @@ def _check_schema_contracts(
         producer has no row_union behind it — including when the presence walk
         abstained at some other boundary (coalesce, queue, routing loop) that
         tells Composer nothing about emitted fields.
+
+        A coalesce needs no sibling of this walker, which is why
+        elspeth-ae83a6b60c left it alone: a PARTICIPATING union coalesce no
+        longer abstains upstream of here, so it reaches Rule A/B through the
+        ordinary resolved-producer path, and an abstaining one has an empty
+        guarantee merge on the runtime side too — abstention there is parity,
+        not a hole.
         """
         visited_connections: frozenset[str] = frozenset()
         current_producer = producer
@@ -3474,7 +3589,7 @@ def _check_schema_contracts(
         producer: ProducerEntry,
     ) -> tuple[frozenset[str] | None, ValidationEntry | None]:
         try:
-            _participates, guarantees = _producer_entry_propagation_vote(producer, visited_queue_ids=frozenset())
+            _participates, guarantees = _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset())
             return guarantees, None
         except ValueError as exc:
             return None, _err(_producer_owner(producer), f"Invalid contract config: {exc}", "high", "contract_config_invalid")
@@ -3496,7 +3611,7 @@ def _check_schema_contracts(
         ``_effective_producer_vote`` unchanged.
         """
         try:
-            return _producer_entry_propagation_vote(producer, visited_queue_ids=frozenset()), None
+            return _producer_entry_propagation_vote(producer, visited_fan_in_ids=frozenset()), None
         except ValueError as exc:
             return None, _err(_producer_owner(producer), f"Invalid contract config: {exc}", "high", "contract_config_invalid")
 

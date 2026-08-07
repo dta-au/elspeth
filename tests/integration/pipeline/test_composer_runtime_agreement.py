@@ -345,8 +345,9 @@ where the architectural fix landed:
   exemption).
 
 * Shape 19 — a producer's GUARANTEE channel against a locked consumer, most
-  visibly at a union coalesce (``elspeth-1451ff385f``, filed off the composer
-  audit that also produced ``elspeth-ae83a6b60c``). A fork gate fed a
+  visibly at a union coalesce (``elspeth-1451ff385f`` for the runtime half,
+  ``elspeth-ae83a6b60c`` for the composer half; both filed off the same
+  composer audit). A fork gate fed a
   pass-through transform on each branch, each declaring only the field it
   rewrites, merging at ``merge: union`` into a ``mode: fixed`` sink admitting
   that one field. The build was GREEN and every row died at the sink's input
@@ -411,31 +412,54 @@ where the architectural fix landed:
   is most LIKELY, because the builder decouples the two channels structurally
   there rather than leaving it to an author's under-declaration.
 
-  The COMPOSER gap has the OPPOSITE scope, and conflating the two would
-  misdirect the fix. Stage 1 already rejects the linear shape via Rule B
+  The COMPOSER gap had the OPPOSITE scope, and conflating the two would have
+  misdirected its fix. Stage 1 already rejected the linear shape via Rule B
   (``sink_locked_extras``): ``_producer_emit_profile`` resolves a pass-through
-  transform and unions in its upstream definite arrivals. It abstains ONLY at a
+  transform and unions in its upstream definite arrivals. It abstained ONLY at a
   coalesce, at three separate sites in ``web/composer/state.py`` — the
   walk-back's unconditional coalesce stop (which, unlike its ``queue`` and
   ``row_union`` siblings, never received a participation-vote escape hatch),
-  the boundary re-resolve that handles ``row_union`` only, and
+  ``_producer_emit_profile`` having no coalesce branch, and
   ``_connection_definite_emits`` returning the empty set for coalesce, a marked
   extension point rather than an oversight. Measured, not inferred: the
-  identical graph with a ``row_union`` substituted for the coalesce DOES report
+  identical graph with a ``row_union`` substituted for the coalesce DID report
   ``locked_input_extras`` naming the same phantom set.
 
-  This therefore remains a documented runtime-only gap — the second category in
-  this file's header — with the runtime authoritative and rejecting, and the
-  composer permissive. Measured on ``CompositionState.validate()``: it returns
-  ``is_valid=True`` with zero errors, and its only related output is the medium
-  advisory "Contract check skipped ... runtime validator will check this edge".
-  What the mutation envelope in turn surfaces to the compose loop was NOT
-  measured here; the Shape 18 precedent (a clean ``set_pipeline`` leaving the
-  loop with nothing to repair from) is the reason to expect it matters. Closing
-  the composer half is tracked in ``elspeth-ae83a6b60c``. Pinned by
-  ``TestComposerRuntimeCoalesceGuaranteedExtrasAgreement`` here (the
-  cross-surface divergence, both repair controls, and the no-coalesce scope
-  boundary), with runtime-layer coverage in
+  The composer half is now CLOSED (``elspeth-ae83a6b60c``), so this is a
+  first-category agreement shape rather than a runtime-only gap. All three
+  sites consult ONE new seam, ``_union_coalesce_merged_guarantees``, which
+  returns the guarantee vote's existing
+  ``merge_guaranteed_fields`` merge — the same function the builder
+  stamps the coalesce with, so the two surfaces read one implementation instead
+  of two mirrors free to drift. Two scope decisions are load-bearing. The seam
+  is gated on ``merge == "union"``: only union merges branch guarantees into
+  top-level fields, so ``nested`` (keys by branch name) and ``select``
+  (forwards one branch's raw schema) keep abstaining with the "runtime
+  validator will check this edge" advisory, and widening the gate would invent
+  guarantees and false-red. And the ticket's own prescription — compose the
+  emit set from the branches as ``_row_union_definite_emits`` does — was
+  REFUTED: a branch-emit union over-claims under non-``require_all`` policies
+  and over-predicts against the runtime gate under ``require_all``. The
+  guarantee channel, not the emit channel, is the mirror.
+  ``_producer_entry_row_union_boundary`` needed no coalesce sibling: a
+  participating union coalesce now resolves through the ordinary path, and an
+  abstaining one has an empty guarantee merge on the runtime side too.
+
+  Landing it also forced a latent recursion guard. The guarantee vote's
+  coalesce and row_union arms recursed on branch connections with no
+  visited-node set (only queues had one), and resolving a union coalesce at the
+  walk-back widened the trigger surface — a draft cycle through a barrier is a
+  ``RecursionError`` out of /validate, not a rejection. ``visited_queue_ids``
+  is now ``visited_fan_in_ids`` and all three fan-in kinds share it; ids are
+  unique across kinds, so the guard fires on cycles alone.
+
+  Pinned by ``TestComposerRuntimeCoalesceGuaranteedExtrasAgreement`` here (the
+  value-to-value cross-surface agreement, both repair controls, and the
+  no-coalesce scope boundary), with composer-layer coverage in
+  ``tests/unit/web/composer/test_state.py``
+  (``TestUnionCoalesceGuaranteeExtras``: per-site mutation isolation, the
+  ``require_all``/``best_effort`` discriminator, the nested/select scope gate,
+  and the cyclic-draft guard) and runtime-layer coverage in
   ``tests/unit/core/dag/test_graph_validation.py``
   (``TestUnionCoalesceGuaranteedExtras`` and ``TestTypedPassThroughGuaranteedExtras``).
 
@@ -1746,7 +1770,20 @@ class TestComposerRuntimeAgreement:
         assert len(composer_errors) == 1, composer_result.errors
         assert "observed" in composer_errors[0].message.lower()
         assert "explicit" in composer_errors[0].message.lower()
-        assert not any(contract.to_id == "output:main" for contract in composer_result.edge_contracts)
+        # A contract row for the coalesce-fed sink is now EXPECTED: the
+        # guarantee walk resolves a union coalesce (elspeth-ae83a6b60c) rather
+        # than abstaining, so the row is COMPUTED from the branch votes, not
+        # fabricated. The mode-mixed rejection above is the verdict and is
+        # unaffected — the row is disclosure alongside it, and the pipeline is
+        # red either way.
+        #
+        # The alternative was considered and rejected: gating the walk-back
+        # escape on the branches not being mode-mixed (via
+        # ``_known_connection_schema_mode``) would suppress the row, at the cost
+        # of a second mode-mixed predicate in the guarantee walk, and buys no
+        # parity — ``coalesce_schema_mode_mixed`` already reds this pipeline.
+        contract = next(contract for contract in composer_result.edge_contracts if contract.to_id == "output:main")
+        assert contract.from_id == "merge_results"
 
         config = ElspethSettings(
             sources={
@@ -5730,7 +5767,7 @@ _SHAPE19_FLEXIBLE_SINK_SCHEMA = {"mode": "flexible", "fields": ["description: st
 
 
 class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
-    """Shape 19 — a coalesce's GUARANTEES vs a locked consumer: runtime-only.
+    """Shape 19 — a coalesce's GUARANTEES vs a locked consumer: both surfaces.
 
     ``elspeth-1451ff385f`` in plugin-neutral form: a fork gate feeds a
     pass-through transform on each branch, each declaring ONLY the field it
@@ -5741,13 +5778,16 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
     schema GUARANTEES category/id/price/product while DECLARING description
     alone — and every row dies at the sink's input preflight.
 
-    This is a documented runtime-only gap, the second category in this file's
-    header. The runtime is authoritative and rejects at build
-    (``validate_typed_producer_guaranteed_extras``, landed across ``5d0c54522``
-    → ``df50ea3c3`` remedies → ``48873f8dc`` extras-firewall soundness);
-    composer Stage 1 stays permissive and returns ``is_valid=True``, emitting
-    only its advisory "runtime validator will check this edge" warning. The
-    composer half is tracked in ``elspeth-ae83a6b60c`` and is NOT closed here.
+    This shape was a documented runtime-only gap (the second category in this
+    file's header) until ``elspeth-ae83a6b60c`` closed the composer half; it is
+    now a first-category AGREEMENT shape and the first test asserts the two
+    surfaces' rejected field sets EQUAL rather than asserting the divergence.
+    The runtime rejects at build via
+    ``validate_typed_producer_guaranteed_extras`` (landed across ``5d0c54522``
+    → ``df50ea3c3`` remedies → ``48873f8dc`` extras-firewall soundness), and
+    composer Stage 1 now rejects the same edge because its walk-back,
+    emit-profile and definite-arrivals sites consult the guarantee vote's
+    ``merge_guaranteed_fields`` merge — the same function the builder stamps.
 
     The last test is the scope boundary and is the reason this shape is
     recorded as coalesce-shaped on the composer side. The RUNTIME defect is
@@ -5762,27 +5802,52 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
     "generalises" the composer rule, this test says the general case already
     worked and the coalesce was the hole.
 
-    Bug-verification protocol (mandatory per this file's header): the shape is
-    pinned on ``core/dag/schema_validation.py::validate_typed_producer_guaranteed_extras``,
+    Bug-verification protocol, RUNTIME half (mandatory per this file's header):
+    the runtime leg is pinned on
+    ``core/dag/schema_validation.py::validate_typed_producer_guaranteed_extras``,
     called as the final pass of ``validate_edge_compatibility``. Neutering it
     (equivalent to a ``return`` before its edge loop) restores the pre-fix
     behaviour and fails exactly ONE of these four tests,
-    ``test_runtime_rejects_coalesce_guaranteed_extras_while_composer_stays_permissive``,
-    with ``Failed: DID NOT RAISE <class 'elspeth.core.dag.models.EdgeContractError'>``.
-    The COMPOSER half of that same test still passes under the mutation — the
-    ``is_valid`` and skip-warning assertions all hold — which is precisely the
-    validate-green/runtime-red divergence this shape records, and is the
-    evidence that the pre-fix pipeline was green on BOTH surfaces. The two
-    repair controls and the no-coalesce boundary test also still pass, as they
-    must: none of them depends on the new pass.
+    ``test_composer_and_runtime_reject_the_same_guaranteed_extras``, with
+    ``Failed: DID NOT RAISE <class 'elspeth.core.dag.models.EdgeContractError'>``.
+    The COMPOSER half of that same test still passes under the mutation, which
+    is now the evidence that the two legs are INDEPENDENT — the composer
+    rejection is not derived from the runtime's, so the equality assertion at
+    the end compares two separately-computed sets. The two repair controls and
+    the no-coalesce boundary test also still pass, as they must: none of them
+    depends on the runtime pass.
 
-    Verified 2026-08-07 by ``monkeypatch.setattr`` on the module attribute
-    rather than by editing the file, because a concurrent session held the
-    working tree; the call site is a module-global reference inside
-    ``validate_edge_compatibility``, so patching the module attribute
-    reproduces the pre-fix behaviour faithfully. Per this file's METHOD NOTE
-    the marker ``validate_typed_producer_guaranteed_extras(graph)`` was
-    asserted unique (``grep -c`` = 1) before mutating.
+    Re-verified 2026-08-07 after the composer half landed, by
+    ``monkeypatch``-equivalent assignment to the module attribute rather than by
+    editing the file (a concurrent session held the working tree). The call site
+    is a module-global reference inside ``validate_edge_compatibility`` in
+    ``schema_validation.py`` — NOT in ``graph.py``, where the same-named method
+    merely delegates; patching ``graph.py``'s namespace silently no-ops and all
+    four tests pass, which is a false clean. Per this file's METHOD NOTE the
+    marker ``validate_typed_producer_guaranteed_extras(graph)`` was asserted
+    unique (``grep -c`` = 1 in ``schema_validation.py``) before mutating.
+
+    Bug-verification protocol, COMPOSER half (elspeth-ae83a6b60c): the composer
+    leg is pinned on the walk-back escape in
+    ``web/composer/state.py::_walk_producer_entry_to_real_producer``'s coalesce
+    branch (``if _union_coalesce_merged_guarantees(current_producer) is not
+    None: return current_producer``). Deleting those two lines restores the
+    unconditional abstention and fails exactly ONE of these four tests, the
+    same ``test_composer_and_runtime_reject_the_same_guaranteed_extras``, at
+    ``assert not composer_result.is_valid`` with::
+
+        E       assert not True
+        E        +  where True = ValidationSummary(is_valid=True, errors=(),
+                    warnings=(ValidationEntry(component='node:fork_gate',
+                    message="Contract ch...)).is_valid
+
+    Verified 2026-08-07 by editing the file and restoring it within a single
+    scoped test invocation: the site is a closure-local branch, so no module
+    attribute exists to patch. The other three tests still passed under the
+    mutation, and the RUNTIME leg of the failing test was never reached.
+    Composer-side unit coverage of the same fix — including per-site mutations
+    proving each of the three sites is independently necessary — lives in
+    ``tests/unit/web/composer/test_state.py::TestUnionCoalesceGuaranteeExtras``.
     """
 
     def _empty_state(self) -> CompositionState:
@@ -5974,14 +6039,25 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
         )
 
-    def test_runtime_rejects_coalesce_guaranteed_extras_while_composer_stays_permissive(self, tmp_path: Path) -> None:
-        """The documented gap: runtime authoritative and red, composer green.
+    def test_composer_and_runtime_reject_the_same_guaranteed_extras(self, tmp_path: Path) -> None:
+        """Both surfaces red, on the SAME phantom set, compared value-to-value.
 
-        The composer's own warning names the deferral ("runtime validator will
-        check this edge"), so this test pins BOTH halves of the handoff: that
-        Stage 1 abstains with that advisory, and that the validator it defers
-        to does in fact reject. Before ``5d0c54522`` the second half was false
-        and the build was green on both surfaces.
+        The rewrite of ``test_runtime_rejects_coalesce_guaranteed_extras_while_
+        composer_stays_permissive``, which pinned the divergence itself: Stage 1
+        abstaining with its "runtime validator will check this edge" advisory
+        while the runtime rejected. That gap closed in ``elspeth-ae83a6b60c``,
+        so the assertion that recorded it would now pin the defect.
+
+        The comparison is deliberately value-to-value rather than two
+        independent literals. Composer's ``sink_locked_extras`` extras tuple is
+        asserted EQUAL to the runtime ``EdgeContractError``'s
+        ``compatibility_result.extra_fields`` computed from the identical
+        pipeline in this same test, so the two cannot drift apart silently:
+        no-oping any of the three composer coalesce sites leaves composer green
+        against a red runtime, and changing ``merge_guaranteed_fields``
+        semantics on one surface without the other mismatches the sets. The
+        literal is asserted too, so a change that moves BOTH surfaces the same
+        wrong way is still caught.
         """
         csv_path, output_path = self._paths(tmp_path)
 
@@ -5991,13 +6067,16 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
             sink_schema=_SHAPE19_LOCKED_SINK_SCHEMA,
         ).validate()
 
-        assert composer_result.is_valid, composer_result.errors
-        assert not [error for error in composer_result.errors if error.error_code == "sink_locked_extras"]
-        # Same abstention idiom TestComposerRuntimeQueueGuaranteeAgreement uses
-        # for the queue walk, asserted in the POSITIVE direction: here the
-        # composer genuinely does skip, and the warning is the only signal the
-        # authoring loop gets.
-        assert [
+        assert not composer_result.is_valid
+        composer_entry = next(error for error in composer_result.errors if error.error_code == "sink_locked_extras")
+        assert composer_entry.component == "output:main"
+        composer_contract = composer_entry.contract
+        assert composer_contract is not None
+        assert composer_contract.producer == "merge_results"
+        # The deferral advisory must be GONE: a resolved coalesce that also
+        # raises an error cannot keep telling the authoring loop the edge was
+        # left to the runtime.
+        assert not [
             warning.message
             for warning in composer_result.warnings
             if "Contract check skipped" in warning.message and "coalesce" in warning.message
@@ -6022,6 +6101,13 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
         message = str(error)
         assert "locked (mode: fixed)" in message
         assert "description" in message
+
+        # The agreement itself. Composer reaches this set through
+        # ``_producer_entry_propagation_vote``'s ``merge_guaranteed_fields``
+        # call; the runtime reaches it through the builder's stamp of the same
+        # function, enforced by ``validate_typed_producer_guaranteed_extras``.
+        # One implementation, two surfaces, asserted equal.
+        assert composer_contract.extra_fields == error.compatibility_result.extra_fields
 
     def test_repair_one_declaring_the_extras_on_branches_and_sink_builds_green(self, tmp_path: Path) -> None:
         """Positive control AND remedy 1: the check must not block a runnable pipeline.
@@ -6086,13 +6172,17 @@ class TestComposerRuntimeCoalesceGuaranteedExtrasAgreement:
         declaring a narrower schema than it forwards, feeding a locked
         consumer — on a linear pipeline. The runtime defect was identical here
         (pinned by ``TestTypedPassThroughGuaranteedExtras``, ``cf550d674``),
-        but the composer ALREADY rejects this shape via Rule B, because
+        but the composer ALREADY rejected this shape via Rule B, because
         ``_producer_emit_profile`` resolves the pass-through and unions in its
-        upstream definite arrivals. So Shape 19's composer half is not "Rule B
-        is missing", it is "Rule B abstains at a coalesce" — three abstention
+        upstream definite arrivals. So Shape 19's composer half was never "Rule
+        B is missing", it was "Rule B abstains at a coalesce" — three abstention
         sites in ``web/composer/state.py`` (the walk-back's unconditional
-        coalesce stop, the row_union-only boundary re-resolve, and
-        ``_connection_definite_emits`` returning the empty set for coalesce).
+        coalesce stop, ``_producer_emit_profile`` having no coalesce branch, and
+        ``_connection_definite_emits`` returning the empty set for coalesce),
+        all three closed in ``elspeth-ae83a6b60c``. This test keeps that
+        diagnosis honest: it passed BEFORE the composer fix and must keep
+        passing after, so a future "generalisation" of the composer rule cannot
+        claim credit for the linear case, which always worked.
         """
         import yaml
 
