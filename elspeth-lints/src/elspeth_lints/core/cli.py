@@ -312,7 +312,14 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     check = subparsers.add_parser("check", help="Run static-analysis rules")
-    check.add_argument("--rules", default="nothing", help="Comma-separated rule ids, or 'nothing' for the empty skeleton run")
+    check.add_argument(
+        "--rules",
+        default=None,
+        help=(
+            "Rule selection, required: 'all' for every registered rule, a comma-separated "
+            "list of rule ids, or 'nothing' for the empty skeleton run"
+        ),
+    )
     check.add_argument("--rule-set", choices=("static", "full"), default="static")
     check.add_argument("--format", choices=("text", "json", "sarif", "github"), default="text")
     check.add_argument("--root", type=Path, default=Path.cwd())
@@ -1257,6 +1264,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
+    if args.rules is None:
+        # An unselected rule set used to fall through to the empty-findings
+        # emit below, so `check` exited 0 having evaluated nothing — a green
+        # that certified any tree. Refuse instead: silence here is
+        # indistinguishable from a clean result.
+        sys.stderr.write(
+            "check requires an explicit --rules selection: 'all' for every registered "
+            "rule, a comma-separated list of rule ids, or 'nothing' for the empty "
+            "skeleton run\n"
+        )
+        return 2
     requested_tokens = _parse_rules(args.rules)
     if not requested_tokens:
         return _emit_findings([], output_format=args.format, rules=[])
@@ -1339,7 +1357,9 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     return _emit_findings(findings, output_format=args.format, rules=selected_rules)
 
 
-def _parse_rules(raw: str) -> tuple[str, ...]:
+def _parse_rules(raw: str | None) -> tuple[str, ...]:
+    if raw is None:
+        return ()
     rules = tuple(part.strip() for part in raw.split(",") if part.strip())
     if rules == ("nothing",):
         return ()
@@ -1350,7 +1370,9 @@ def _expand_rule_tokens(tokens: tuple[str, ...], available: set[str]) -> tuple[s
     expanded: list[str] = []
     unknown: list[str] = []
     for token in tokens:
-        if token.endswith("/*"):
+        if token == "all":
+            expanded.extend(sorted(available))
+        elif token.endswith("/*"):
             prefix = token[:-2].replace("/", ".")
             matches = sorted(rule_id for rule_id in available if rule_id.startswith(f"{prefix}."))
             if matches:

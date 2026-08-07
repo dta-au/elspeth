@@ -23,6 +23,31 @@ def test_cli_accepts_empty_rule_set(tmp_path: Path, capsys: pytest.CaptureFixtur
     assert captured.err == ""
 
 
+def test_cli_refuses_to_run_check_without_an_explicit_rule_selection(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Omitting --rules must fail loudly, never exit 0 having run nothing.
+
+    A ``check`` that silently selects no rules is indistinguishable from a
+    clean tree, so the documented gate command would certify anything.
+    """
+    from elspeth_lints.core.cli import main
+
+    exit_code = main(["check", "--root", str(tmp_path)])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "--rules" in captured.err
+    assert captured.out == ""
+
+
+def test_cli_rules_all_token_selects_every_registered_rule() -> None:
+    """``--rules all`` is the affordance for running the whole registered set."""
+    from elspeth_lints.core.cli import _expand_rule_tokens
+
+    available = {"composer.catch_order", "immutability.freeze_guards"}
+
+    assert set(_expand_rule_tokens(("all",), available)) == available
+
+
 def test_cli_honors_empty_rule_set_without_optional_rule_dependencies(tmp_path: Path) -> None:
     """A standalone install can run an empty check without optional rule imports."""
     env = _standalone_lints_env_without_runtime_packages(tmp_path)
