@@ -99,6 +99,38 @@ def test_build_set_pipeline_candidate_constructs_without_publishing(tmp_path: Pa
     assert state == _empty_state()
 
 
+def test_omitted_on_error_defaults_to_discard_for_transform_and_aggregation_but_not_gate(
+    tmp_path: Path,
+) -> None:
+    """Pin the ``on_error`` defaulting expression at the set_pipeline boundary.
+
+    ``build_set_pipeline_candidate`` defaults an omitted ``on_error`` to
+    ``"discard"`` for exactly the node families the YAML generator refuses to
+    lower without one (transform, aggregation), and for no other family — a
+    gate's omitted ``on_error`` stays ``None`` (fail-fast, not discard).
+    Nothing else pinned this expression: every other node dict in this module
+    supplies ``on_error`` explicitly. Deleting the default, narrowing the
+    tuple to transform-only, or widening it to gates each fails one arm.
+    """
+    transform_args = _linear_args(tmp_path)
+    del transform_args["nodes"][0]["on_error"]
+    candidate = build_set_pipeline_candidate(transform_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+
+    aggregation_args = _aggregation_args(tmp_path)
+    del aggregation_args["nodes"][0]["on_error"]
+    candidate = build_set_pipeline_candidate(aggregation_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error == "discard"
+
+    gate_args = _gate_args(tmp_path)
+    assert "on_error" not in gate_args["nodes"][0]
+    candidate = build_set_pipeline_candidate(gate_args, _empty_state(), _trained_context(data_dir=tmp_path))
+    assert candidate.acceptable is True
+    assert candidate.result.updated_state.nodes[0].on_error is None
+
+
 def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path: Path) -> None:
     """elspeth-e89e6bf47a: a candidate with valid source/outputs whose llm node
     omits ``provider`` is rejected with ``plugin_options_invalid`` alone — not

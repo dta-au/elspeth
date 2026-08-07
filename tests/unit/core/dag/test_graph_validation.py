@@ -1322,11 +1322,16 @@ class TestUnionCoalesceGuaranteedExtras:
         """False-reject guard for the NEW check: phantoms + a consumer that admits extras.
 
         Same under-declared branches as the defect test, so the coalesce
-        guarantees four fields it never declares and the new pass DOES
-        evaluate this edge. A `mode: flexible` consumer is `extra='allow'`,
-        so no row can die at its preflight and the check must decline. This
-        is the shape that would break if the check ever stopped consulting
-        the consumer's extras policy.
+        guarantees four fields it never declares. Since df50ea3c3 the new
+        pass DECLINES this edge at its consumer-extras-policy guard
+        (schema_validation.py, ``extra != "forbid"`` -> continue) before ever
+        resolving the producer; the helper's own decline is the second,
+        now-unreached arm. A `mode: flexible` consumer is `extra='allow'`,
+        so no row can die at its preflight and the pass must stay silent.
+        This test goes red only if BOTH arms stop consulting the consumer's
+        extras policy — it is a guard on the outcome, not on which arm
+        delivers it (verified by instrumentation: the helper is never
+        invoked on this edge).
         """
         _build_coalesce_graph(sink_mode="flexible")
 

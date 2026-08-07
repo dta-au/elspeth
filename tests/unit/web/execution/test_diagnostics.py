@@ -1325,3 +1325,19 @@ def test_diagnostics_discards_bounded_by_preview_limit_with_honest_total(tmp_pat
         assert len(diagnostics.discards) == 2
     finally:
         db.close()
+
+
+def test_diversion_error_types_mirror_the_sink_executor_anchors() -> None:
+    """Pin the hand-mirrored diversion vocabulary to the sink executor's anchors.
+
+    ``_DIVERSION_ERROR_TYPES`` excludes diverted rows from failed-operation
+    correlation, and it duplicates the ``exception_type`` literals SinkExecutor
+    writes at its discard and failsink anchors (engine/executors/sink.py) with
+    no shared constant. The sink side is pinned against live runs by
+    tests/integration/test_sink_discard_reason_disclosure.py; this closes the
+    loop from the consumer side, so renaming either anchor breaks a test
+    instead of silently un-excluding diversions from correlation.
+    """
+    from elspeth.web.execution.diagnostics import _DIVERSION_ERROR_TYPES
+
+    assert _DIVERSION_ERROR_TYPES == frozenset({"SinkDiscard", "SinkDiversion"})
