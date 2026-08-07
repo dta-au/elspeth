@@ -1078,6 +1078,76 @@ def test_persist_compose_turn_happy_path(service):
         assert states[0].provenance == "tool_call"
 
 
+def test_persist_compose_turn_rederives_predecessor_lineage(service):
+    """Regression for elspeth-7536e5d919: compose-created state revisions
+    were persisted with ``derived_from_state_id=None`` verbatim, recording
+    every audited mutation as an independent root. The primitive must fill
+    lineage under the held session write lock: the first inserted revision
+    derives from the pre-turn session head, each subsequent revision from
+    the one inserted just before it.
+    """
+    from elspeth.web.sessions._persist_payload import (
+        RedactedToolRow,
+        StatePayload,
+    )
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id="s_lineage")
+
+    def _state_row(tool_call_id: str) -> RedactedToolRow:
+        return RedactedToolRow(
+            tool_call_id=tool_call_id,
+            content='{"ok": true}',
+            composition_state_payload=StatePayload(
+                data=CompositionStateData(),
+                derived_from_state_id=None,
+            ),
+        )
+
+    # Turn 1: two state-advancing tool calls in one turn, empty session.
+    service.persist_compose_turn(
+        session_id="s_lineage",
+        assistant_content="turn 1",
+        redacted_assistant_tool_calls=(
+            {"id": "tc_1", "function": {"name": "set_source"}},
+            {"id": "tc_2", "function": {"name": "upsert_node"}},
+        ),
+        redacted_tool_rows=(_state_row("tc_1"), _state_row("tc_2")),
+        parent_composition_state_id=None,
+        expected_current_state_id=None,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+
+    with service._engine.begin() as conn:
+        states = conn.execute(
+            text("SELECT id, version, derived_from_state_id FROM composition_states WHERE session_id='s_lineage' ORDER BY version")
+        ).fetchall()
+    assert [s.version for s in states] == [1, 2]
+    # First revision of an empty session is a genuine root; the second
+    # derives from the first even though both were inserted in one turn.
+    assert states[0].derived_from_state_id is None
+    assert states[1].derived_from_state_id == states[0].id
+
+    # Turn 2: the next turn's revision derives from the persisted head —
+    # the "original current state" seen by that turn.
+    service.persist_compose_turn(
+        session_id="s_lineage",
+        assistant_content="turn 2",
+        redacted_assistant_tool_calls=({"id": "tc_3", "function": {"name": "upsert_node"}},),
+        redacted_tool_rows=(_state_row("tc_3"),),
+        parent_composition_state_id=states[1].id,
+        expected_current_state_id=states[1].id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=False,
+    )
+
+    with service._engine.begin() as conn:
+        turn2 = conn.execute(text("SELECT derived_from_state_id FROM composition_states WHERE session_id='s_lineage' AND version=3")).one()
+    assert turn2.derived_from_state_id == states[1].id
+
+
 def test_persist_compose_turn_zero_tool_rows(service):
     """W10a (Phase 1 plan-review synthesis): a turn with
     ``redacted_tool_rows=()`` and ``redacted_assistant_tool_calls=()``

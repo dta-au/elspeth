@@ -5312,10 +5312,22 @@ class SessionServiceImpl:
                     for offset, tool_row in enumerate(redacted_tool_rows, start=1):
                         state_id: str | None = None
                         if tool_row.composition_state_payload is not None:
+                            payload = tool_row.composition_state_payload
+                            if payload.derived_from_state_id is None:
+                                # Re-derive lineage under the held session
+                                # write lock (spec §5.7.1): the async loop
+                                # cannot know predecessor ids for rows not
+                                # yet allocated, so it leaves lineage None
+                                # and this primitive fills in the verified
+                                # session head — the pre-turn state for the
+                                # first insert, then each previously
+                                # inserted revision of this turn
+                                # (elspeth-7536e5d919).
+                                payload = replace(payload, derived_from_state_id=current_state_id)
                             state_id = self._insert_composition_state(
                                 conn,
                                 session_id=session_id,
-                                payload=tool_row.composition_state_payload,
+                                payload=payload,
                                 provenance="tool_call",
                                 created_at=now,
                             )
