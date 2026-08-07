@@ -1403,6 +1403,65 @@ def test_persist_compose_turn_rejects_stale_expected_current_state(service):
     assert latest == current_state_id
 
 
+def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(service):
+    """A stale-state conflict on the crash-unwind path must NOT raise.
+
+    When ``plugin_crash_pending=True`` the caller holds a captured plugin
+    crash with possible partial effects. Raising ``StaleComposeStateError``
+    here would replace that non-retryable primary failure with a misleading
+    retryable stale-state response (elspeth-45f72a949c). The disposition
+    must mirror the ``OperationalError`` unwind arm: record the audit
+    failure and return ``AuditOutcome(unwind_audit_failed=True)`` so the
+    driver re-raises the captured crash.
+    """
+    from elspeth.web.sessions._persist_payload import StatePayload
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id="s_stale_unwind")
+        with service._session_write_lock(conn, "s_stale_unwind"):
+            stale_state_id = service._insert_composition_state(
+                conn,
+                session_id="s_stale_unwind",
+                payload=StatePayload(
+                    data=CompositionStateData(),
+                    derived_from_state_id=None,
+                ),
+                provenance="session_seed",
+            )
+            current_state_id = service._insert_composition_state(
+                conn,
+                session_id="s_stale_unwind",
+                payload=StatePayload(
+                    data=CompositionStateData(),
+                    derived_from_state_id=stale_state_id,
+                ),
+                provenance="session_seed",
+            )
+
+    outcome = service.persist_compose_turn(
+        session_id="s_stale_unwind",
+        assistant_content="crash unwind",
+        redacted_assistant_tool_calls=(),
+        redacted_tool_rows=(),
+        parent_composition_state_id=stale_state_id,
+        expected_current_state_id=stale_state_id,
+        writer_principal="compose_loop",
+        plugin_crash_pending=True,
+    )
+
+    assert outcome.unwind_audit_failed is True
+    assert outcome.assistant_id is None
+
+    with service._engine.begin() as conn:
+        rows = conn.execute(text("SELECT role FROM chat_messages WHERE session_id='s_stale_unwind'")).fetchall()
+        latest = conn.execute(
+            text("SELECT id FROM composition_states WHERE session_id='s_stale_unwind' ORDER BY version DESC LIMIT 1")
+        ).scalar_one()
+    assert rows == []
+    assert latest == current_state_id
+
+
 def test_persist_compose_turn_accepts_matching_expected_current_state(service):
     from elspeth.web.sessions._persist_payload import StatePayload
     from elspeth.web.sessions.protocol import CompositionStateData

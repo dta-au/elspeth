@@ -5352,6 +5352,42 @@ class SessionServiceImpl:
                     unwind_audit_failed=False,
                     current_state_id=current_state_id,
                 )
+        except StaleComposeStateError as stale_exc:
+            # StaleComposeStateError disposition (elspeth-45f72a949c):
+            # the step-4 stale-state guard fired — a concurrent writer
+            # advanced the session's composition state while this turn
+            # was in flight. Nothing was inserted (the guard runs before
+            # the sequence reservation) and the transaction rolled back.
+            #
+            # Disposition is asymmetric on ``plugin_crash_pending``,
+            # mirroring the ``OperationalError`` arm below:
+            #
+            # 1. ``plugin_crash_pending=True`` — the caller is unwinding
+            #    a captured plugin crash with possible partial effects.
+            #    Letting the stale-state conflict propagate would replace
+            #    that non-retryable primary failure with a misleading
+            #    retryable "session changed" response, telling the user
+            #    to retry a turn whose plugin already crashed mid-effect.
+            #    Record the stale audit outcome (counter + slog — the
+            #    secondary reconciliation context) and return
+            #    ``AuditOutcome(unwind_audit_failed=True)`` so the caller
+            #    re-raises the captured plugin crash as primary.
+            #
+            # 2. ``plugin_crash_pending=False`` — no crash in flight;
+            #    the stale-state conflict IS the primary outcome and
+            #    stays a retryable conflict for the route layer.
+            if plugin_crash_pending:
+                self._telemetry.tool_row_persist_failed_during_unwind_total.add(1)
+                self._log.warning(
+                    "stale_state_during_tool_failure_unwind",
+                    session_id=session_id,
+                    audit_exc_class=type(stale_exc).__name__,
+                )
+                return AuditOutcome(
+                    assistant_id=None,
+                    unwind_audit_failed=True,
+                )
+            raise
         except IntegrityError:
             self._telemetry.tool_row_integrity_violation_total.add(1)
             raise
