@@ -5,6 +5,8 @@ import pytest
 from hypothesis import given
 from hypothesis.strategies import characters, text
 
+from elspeth.contracts.plugin_semantics import TextFraming
+from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
 from elspeth.plugins.transforms.web_scrape_extraction import extract_content
 
 
@@ -144,3 +146,38 @@ def test_html2text_deterministic_across_instances():
     result2 = h2.handle(html)
 
     assert result1 == result2, "html2text not deterministic across instances!"
+
+
+@given(text(alphabet=characters(blacklist_characters="<>&"), min_size=1, max_size=200))
+def test_compact_declaration_is_true_of_what_extraction_actually_emits(content: str):
+    """The COMPACT claim must be TRUE, not merely intended.
+
+    web_scrape DECLARES ``TextFraming.COMPACT`` whenever ``text_separator``
+    carries no CR/LF, and since ADR-039 ``sink:text`` READS that declaration and
+    grades the edge SATISFIED at build time — then diverts any row containing CR
+    or LF at runtime. So a COMPACT declaration that is not literally true
+    reproduces elspeth-afdf55a17c's own zero-byte outcome with a green
+    certification on top, which is strictly worse than the abstention it
+    replaced.
+
+    The gap this closes: ``strip=True`` trims only the EDGES of each DOM text
+    node, so a record separator INSIDE one node survived — and pretty-printed
+    HTML puts them there routinely.
+
+    This binds the two halves together, driving the REAL declaration builder and
+    the REAL extractor from one config. Pinning that the declaration merely
+    exists, or that the composer edge grades SATISFIED, would not catch a lie.
+    """
+    html = f"<html><body><p>{content}</p><div>More content</div></body></html>"
+
+    for separator in (" ", "\t", " | ", "\r", "\n", "\r\n"):
+        declared = _build_web_scrape_output_semantics(
+            content_field="content", format="text", text_separator=separator
+        ).fields[0]
+        emitted = extract_content(html, format="text", text_separator=separator)
+
+        if declared.text_framing is TextFraming.COMPACT:
+            assert "\r" not in emitted and "\n" not in emitted, (
+                f"COMPACT declared for separator {separator!r}, but extraction emitted a "
+                f"record separator sink:text would divert on: {emitted!r}"
+            )

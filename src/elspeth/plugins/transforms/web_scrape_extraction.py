@@ -62,7 +62,24 @@ def extract_content(
             return h.handle(cleaned_html)
 
         elif format == "text":
-            return soup.get_text(separator=text_separator, strip=True)
+            text = soup.get_text(separator=text_separator, strip=True)
+            if "\n" not in text_separator and "\r" not in text_separator:
+                # ``strip=True`` trims only the EDGES of each DOM text node, so a
+                # record separator INSIDE one node survives — and pretty-printed
+                # HTML puts them there routinely. A caller who chose a separator
+                # with no CR/LF asked for a single-line join, and web_scrape
+                # DECLARES ``TextFraming.COMPACT`` for exactly this case. Leaving
+                # the newline in makes that declaration false at its source, which
+                # a downstream ``sink:text`` then grades SATISFIED before diverting
+                # the row at runtime (elspeth-afdf55a17c's own failure mode, with a
+                # green certification on top). Normalise on the sink's exact rule —
+                # CR or LF, not every Unicode line boundary — so the claim is true.
+                segments = (
+                    segment.strip()
+                    for segment in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+                )
+                text = text_separator.join(segment for segment in segments if segment)
+            return text
 
         else:
             raise ValueError(f"Unknown format: {format}")

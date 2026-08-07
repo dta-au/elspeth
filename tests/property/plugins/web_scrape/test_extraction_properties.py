@@ -273,8 +273,18 @@ def test_extract_content_text_no_html_tags(content: str):
     assert "<body>" not in result
     assert "<p>" not in result
     assert "<div>" not in result
-    # Original content should be present (possibly with whitespace changes)
-    assert content in result or content.strip() in result
+    # Original content should be present, modulo whitespace normalisation — which
+    # this docstring always intended but the old assertion could not express: it
+    # tolerated only EDGE stripping, via an `or content.strip()` escape hatch.
+    # In COMPACT mode (a text_separator carrying no CR/LF) extraction now collapses
+    # record separators INSIDE a DOM text node into the separator, because that is
+    # what makes the declared TextFraming.COMPACT true rather than merely intended
+    # (elspeth-afdf55a17c). Compare on collapsed whitespace so the property pins
+    # what extraction actually guarantees: every content CHARACTER survives.
+    def _collapse(value: str) -> str:
+        return " ".join(value.split())
+
+    assert _collapse(content) in _collapse(result)
 
 
 # ============================================================================

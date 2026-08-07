@@ -366,7 +366,13 @@ def _build_web_scrape_output_semantics(
         fact_code = "web_scrape.content.raw_html"
     elif format == "text":
         kind = ContentKind.PLAIN_TEXT
-        if "\n" in text_separator:
+        # CR as well as LF: ``sink:text`` diverts on either ("Text values cannot
+        # contain CR or LF record separators", text_sink.py), so a separator
+        # carrying only CR would otherwise declare COMPACT and still divert.
+        # ``extract_content`` normalises intra-node CR/LF away on exactly this
+        # condition, which is what makes the COMPACT claim true rather than
+        # merely intended.
+        if "\n" in text_separator or "\r" in text_separator:
             framing = TextFraming.NEWLINE_FRAMED
             fact_code = "web_scrape.content.newline_framed_text"
         else:
@@ -469,7 +475,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:50aea2d29af38434"
+    source_file_hash: str | None = "sha256:7745fbb544235ad6"
     config_model = WebScrapeConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
