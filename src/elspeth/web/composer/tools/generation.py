@@ -732,6 +732,28 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
+        r"guided_route_target_unknown",
+        "A routing destination (source/node on_success, node on_error, or edge to_node) names neither a declared "
+        "output, a node id, a connection another node consumes, nor 'discard'. The reviewed-output binder cannot "
+        "prove what you meant — it will not guess a sink for you. The rejection's 'connectivity' facts name the "
+        "exact mismatch in YOUR rejected candidate: 'dangling_references' are the values that matched nothing; "
+        "'declared_sinks' and 'consumable_connections' are the only valid destinations.",
+        "Re-emit with every dangling reference replaced by one of the connectivity facts' declared_sinks or "
+        "consumable_connections, copied exactly — a route meant for the sink must byte-for-byte match your own "
+        "outputs[].sink_name so the binder can rename it with the output. Change nothing else.",
+    ),
+    (
+        r"guided_output_alias_collision",
+        "Output aliasing is ambiguous: two outputs[] entries share one sink_name, an entry reuses another reviewed "
+        "output's name, or an alias is also a node id or connection name in the same candidate. References to such "
+        "a name cannot be attributed to one sink, so the reviewed-output binder rejects instead of rewriting "
+        "routes onto the wrong destination. The rejection's 'connectivity' facts list the offending names as "
+        "'colliding_aliases'.",
+        "Re-emit with a unique sink_name per outputs[] entry, distinct from every node id and connection name, "
+        "and wire each route to the matching alias. Do not reuse a name from 'colliding_aliases' for more than "
+        "one purpose.",
+    ),
+    (
         r"gate_on_error_unknown_sink",
         "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
         "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "

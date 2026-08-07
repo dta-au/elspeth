@@ -53,6 +53,7 @@ from elspeth.web.composer.capability_skill import (
 )
 from elspeth.web.composer.discovery_cache import pydantic_default, serialize_tool_result
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
+from elspeth.web.composer.guided.planning import GuidedCandidateBindingRejected
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     attach_llm_calls,
@@ -1734,6 +1735,45 @@ def _deferred_intent_claim_feedback() -> _DeferredIntentClaimFeedback:
     }
 
 
+def _binding_rejection_feedback(
+    rejection: GuidedCandidateBindingRejected,
+    *,
+    repeated_fingerprint: bool,
+) -> Mapping[str, Any]:
+    """Project one typed binder rejection into closed repair feedback.
+
+    Mirrors ``_allowlisted_candidate_feedback``'s entry shape: the closed
+    code, the catalogue ``(explanation, suggested_fix)`` when registered, and
+    the rejection's own ``connectivity`` facts — which the binder already
+    restricted to planner-authored strings and reviewed sink names, the same
+    custody class as ``route_destination_facts`` (elspeth-572c642dbf). No raw
+    exception message crosses: the entry is built solely from the closed code
+    and the structured facts.
+    """
+    entry: dict[str, Any] = {
+        "component": "pipeline",
+        "severity": "high",
+        "error_code": rejection.error_code,
+        "error_class": "ValidationError",
+    }
+    guidance = explain_validation_code(rejection.error_code)
+    if guidance is not None:
+        entry["explanation"], entry["suggested_fix"] = guidance
+    if rejection.connectivity:
+        entry["connectivity"] = dict(rejection.connectivity)
+    feedback: dict[str, Any] = {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [entry],
+        },
+        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+    }
+    if repeated_fingerprint:
+        feedback["repeat_notice"] = _REPEAT_NOTICE
+    return feedback
+
+
 def _canonical_schema_feedback() -> dict[str, Any]:
     return {
         "success": False,
@@ -2965,11 +3005,18 @@ async def _plan_pipeline_inner(
                             raise
                         # The reviewed-authority binder rejected the shape the
                         # planner authored — repairable in one budgeted turn,
-                        # never a 500. The sourceless case is already answered
-                        # above with its own code; the residue (an empty
-                        # ``sources`` map, an invented component name) reaches
-                        # here and gets the canonical schema complaint.
-                        terminal_feedback = _canonical_schema_feedback()
+                        # never a 500. Typed rejections carry their closed
+                        # code and custody-safe connectivity facts
+                        # (elspeth-572c642dbf); the residue (an empty
+                        # ``sources`` map, an invented component name) gets
+                        # the canonical schema complaint.
+                        if type(exc) is GuidedCandidateBindingRejected:
+                            binding_fingerprint = (("pipeline", exc.error_code),)
+                            repeated_binding_fingerprint = binding_fingerprint in seen_rejection_fingerprints
+                            seen_rejection_fingerprints.add(binding_fingerprint)
+                            terminal_feedback = _binding_rejection_feedback(exc, repeated_fingerprint=repeated_binding_fingerprint)
+                        else:
+                            terminal_feedback = _canonical_schema_feedback()
                     except Exception:
                         if is_hatch_turn:
                             assert hatch_error is not None

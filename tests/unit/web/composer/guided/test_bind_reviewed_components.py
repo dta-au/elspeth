@@ -16,6 +16,7 @@ import pytest
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided import planning as guided_planning
 from elspeth.web.composer.guided.planning import (
+    GuidedCandidateBindingRejected,
     GuidedCorrectionTarget,
     GuidedRevisionAuthority,
     bind_guided_reviewed_components,
@@ -230,12 +231,17 @@ def test_candidate_state_defaults_missing_edge_label() -> None:
     assert state.edges[0].label is None
 
 
-def test_bind_resolves_dangling_sink_reference_to_single_reviewed_output() -> None:
+def test_bind_rejects_unproven_dangling_sink_reference_with_repair_facts() -> None:
     # Planner slip observed live: outputs and edges correctly use the reviewed
     # name, but one stale invented name ('csv_rows') survives in on_success.
-    # With exactly one reviewed output the reference is unambiguous — resolve
-    # it structurally instead of letting validation reject a repair the
-    # planner cannot see through the closed feedback.
+    # The rename map is empty, so nothing proves 'csv_rows' aliases the sink —
+    # the binder must NOT guess (elspeth-572c642dbf: the old unknown->sink
+    # rewrite converted invalid plans into valid-but-different pipelines).
+    # Instead it rejects with the facts a one-turn repair needs: the dangling
+    # value the planner authored plus the valid destination vocabulary.
+    # Validation cannot carry those facts here: the binder always rewrites
+    # source/output CONFIG, so source-attributed entries project config-masked
+    # (no connectivity facts) and the repair would be blind.
     pipeline = {
         "sources": {
             "source": {
@@ -252,9 +258,210 @@ def test_bind_resolves_dangling_sink_reference_to_single_reviewed_output() -> No
         ],
     }
 
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity == {
+        "dangling_references": ["csv_rows"],
+        "declared_sinks": ["output"],
+        "consumable_connections": [],
+    }
+
+
+def test_bind_rejects_unknown_edge_destination() -> None:
+    # Only the destination can be a sink reference; a to_node outside every
+    # known target is the edge twin of the dangling on_success above.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [{"id": "e1", "from_node": "source", "to_node": "nowhere", "edge_type": "on_success"}],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity["dangling_references"] == ["nowhere"]
+
+
+def test_bind_leaves_unknown_edge_origin_for_validation() -> None:
+    # A dangling from_node has no sink resolution — it is never a sink
+    # reference, so the binder neither rewrites nor rejects it; validation
+    # owns that defect with its own node-attributed (disclosed) code.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [{"id": "e1", "from_node": "ghost", "to_node": "output", "edge_type": "on_success"}],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
     bound = bind_guided_reviewed_components(pipeline, _guided())
 
-    assert bound["sources"]["source"]["on_success"] == "output"
+    assert bound["edges"] == [{"id": "e1", "from_node": "ghost", "to_node": "output", "edge_type": "on_success"}]
+
+
+OUTPUT_B_ID = "44444444-4444-4444-8444-444444444444"
+
+
+def _guided_two_outputs() -> GuidedSession:
+    base = _guided()
+    return GuidedSession(
+        step=base.step,
+        source_order=base.source_order,
+        reviewed_sources=dict(base.reviewed_sources),
+        output_order=(OUTPUT_ID, OUTPUT_B_ID),
+        reviewed_outputs={
+            OUTPUT_ID: base.reviewed_outputs[OUTPUT_ID],
+            OUTPUT_B_ID: SinkOutputResolved(
+                name="quarantine",
+                plugin="json",
+                options={"path": "outputs/quarantine.json"},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        },
+    )
+
+
+def _two_output_candidate(first_alias: str, second_alias: str) -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "triage",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "triage",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "triage",
+                "on_success": first_alias,
+                "on_error": second_alias,
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": first_alias, "plugin": "json", "options": {}, "on_write_failure": "discard"},
+            {"sink_name": second_alias, "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+
+def test_bind_multi_output_distinct_aliases_rewrite_each_reference() -> None:
+    # The legal multi-output shape: each candidate output records its own
+    # alias, and every reference follows its alias to the matching reviewed
+    # name — no collapse onto one sink (elspeth-572c642dbf).
+    bound = bind_guided_reviewed_components(_two_output_candidate("main_out", "spill_out"), _guided_two_outputs())
+
+    assert [output["sink_name"] for output in bound["outputs"]] == ["output", "quarantine"]
+    node = bound["nodes"][0]
+    assert node["on_success"] == "output"
+    assert node["on_error"] == "quarantine"
+
+
+def test_bind_rejects_duplicate_output_aliases_before_any_rewrite() -> None:
+    # Two candidate outputs sharing one alias made the old dict last-write-
+    # wins: every 'result' reference silently retargeted the SECOND reviewed
+    # sink (elspeth-572c642dbf). Ambiguous aliasing must be a typed repairable
+    # rejection, never a rewrite.
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(_two_output_candidate("result", "result"), _guided_two_outputs())
+
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+    assert raised.value.error_code == "guided_output_alias_collision"
+    assert raised.value.connectivity == {"colliding_aliases": ["result"]}
+
+
+def test_bind_rejects_alias_reusing_a_sibling_reviewed_output_name() -> None:
+    # Candidate output 0 aliases itself as reviewed output 1's NAME: the
+    # rename map would rewrite references legitimately targeting output 1
+    # onto output 0 — indistinguishable intents, so reject.
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(_two_output_candidate("quarantine", "errors_out"), _guided_two_outputs())
+
+    assert raised.value.error_code == "guided_output_alias_collision"
+    assert raised.value.connectivity == {"colliding_aliases": ["quarantine"]}
+
+
+def test_bind_rejects_alias_colliding_with_node_or_connection_names() -> None:
+    # An alias that is also a node id (or a consumed connection) makes the
+    # rename pass rewrite topology references that never meant the sink.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "clean",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "clean",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "clean",
+                "on_success": "clean_rows",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "clean", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    assert raised.value.error_code == "guided_output_alias_collision"
+    assert raised.value.connectivity == {"colliding_aliases": ["clean"]}
+
+
+def test_bind_rejects_dangling_reference_in_multi_output_candidate() -> None:
+    # Multi-output candidates get the same unknown-target rejection as the
+    # single-output case — previously they slid through to validation, whose
+    # source-attributed entries project config-masked (blind repair).
+    pipeline = _two_output_candidate("main_out", "spill_out")
+    pipeline["sources"]["source"]["on_success"] = "stale_rows"  # type: ignore[index]
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided_two_outputs())
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity == {
+        "dangling_references": ["stale_rows"],
+        "declared_sinks": ["output", "quarantine"],
+        "consumable_connections": ["triage"],
+    }
 
 
 def test_bind_leaves_unknown_gate_route_targets_for_validation() -> None:

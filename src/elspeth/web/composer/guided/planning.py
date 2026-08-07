@@ -793,12 +793,63 @@ def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, 
     return tuple(sorted(names))
 
 
+class GuidedCandidateBindingRejected(AuditIntegrityError):
+    """Typed repairable candidate-shape rejection from the reviewed-component binder.
+
+    Carries the closed ``error_code`` and the custody-safe ``connectivity``
+    facts the planner loop projects into one budgeted repair turn
+    (elspeth-572c642dbf). Every fact value is either a string the planner
+    itself authored in the rejected candidate (aliases, node ids, connection
+    names) or a reviewed sink name — the structural repair vocabulary the
+    route-destination facts already disclose. The message keeps the
+    ``guided planner candidate`` prefix so a catch path that does not know
+    this type still classifies it as repairable, never a terminal 500.
+    """
+
+    def __init__(self, message: str, *, error_code: str, connectivity: Mapping[str, JsonValue]) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.connectivity: dict[str, JsonValue] = dict(connectivity)
+
+
+def _candidate_topology_reference_names(bound: Mapping[str, Any]) -> tuple[set[str], set[str], set[str]]:
+    """Collect the candidate's node ids, consumed connections, and branch values.
+
+    Coalesce/row_union ``branches`` VALUES are consumption sites too: each
+    names the connection a branch transform publishes via ``on_success`` and
+    the join consumes. Those names appear in no node's ``input`` and are not
+    node ids, so without them every legal fork->coalesce candidate's
+    intermediate connections would read as dangling (guided session 1f7241de,
+    2026-07-22, four identical ``coalesce_branch_unreachable`` rejections
+    manufactured by the binder's own rewrite).
+    """
+    node_ids: set[str] = set()
+    connection_names: set[str] = set()
+    branch_connection_names: set[str] = set()
+    topology_nodes = bound.get("nodes")
+    if isinstance(topology_nodes, list):
+        for topology_node in topology_nodes:
+            if not isinstance(topology_node, dict):
+                continue
+            for key, into in (("id", node_ids), ("input", connection_names)):
+                value = topology_node.get(key)
+                if type(value) is str and value:
+                    into.add(value)
+            branches = topology_node.get("branches")
+            if isinstance(branches, dict):
+                branch_connection_names.update(value for value in branches.values() if type(value) is str)
+            elif isinstance(branches, list):
+                branch_connection_names.update(value for value in branches if type(value) is str)
+    return node_ids, connection_names, branch_connection_names
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
     *,
     predecessor: CompositionState | None = None,
     correction_target: GuidedCorrectionTarget | None = None,
+    enforce_route_targets: bool = True,
 ) -> GuidedBoundPipeline:
     """Replace provider-authored component configuration with reviewed authority.
 
@@ -860,6 +911,37 @@ def bind_guided_reviewed_components(
     # and rewrite every reference so the topology stays wired.
     if len(raw_outputs) != len(expected_output_names) or any(type(item) is not dict for item in raw_outputs):
         raise AuditIntegrityError("guided planner candidate outputs differ from reviewed authority")
+    node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
+    # Alias integrity BEFORE any rewrite (elspeth-572c642dbf): the rename map
+    # below rewrites every reference matching an alias, so an alias shared by
+    # two outputs (last-write-wins), reusing a sibling reviewed output's name,
+    # or shadowing a node id / consumed connection / branch value would
+    # retarget references that never meant that sink — silently converting an
+    # invalid plan into a valid but semantically different pipeline. Ambiguous
+    # aliasing is the planner's authoring slip: reject it as one typed
+    # repairable candidate rejection instead of guessing.
+    seen_aliases: set[str] = set()
+    colliding_aliases: set[str] = set()
+    topology_reference_names = node_ids | connection_names | branch_connection_names
+    for index, stable_id in enumerate(guided.output_order):
+        candidate = raw_outputs[index]
+        assert type(candidate) is dict
+        candidate_name = candidate.get("sink_name", candidate.get("name"))
+        if type(candidate_name) is not str:
+            continue
+        if candidate_name in seen_aliases:
+            colliding_aliases.add(candidate_name)
+        seen_aliases.add(candidate_name)
+        if candidate_name == guided.reviewed_outputs[stable_id].name:
+            continue
+        if candidate_name in expected_output_names or candidate_name in topology_reference_names:
+            colliding_aliases.add(candidate_name)
+    if colliding_aliases:
+        raise GuidedCandidateBindingRejected(
+            "guided planner candidate output aliases collide with sibling outputs or topology names",
+            error_code="guided_output_alias_collision",
+            connectivity={"colliding_aliases": cast(JsonValue, sorted(colliding_aliases))},
+        )
     output_rename: dict[str, str] = {}
     rebound_outputs: list[GuidedBoundOutput] = []
     for index, stable_id in enumerate(guided.output_order):
@@ -922,72 +1004,6 @@ def bind_guided_reviewed_components(
                     if topology_edge.get(endpoint_key) in output_rename:
                         topology_edge[endpoint_key] = output_rename[topology_edge[endpoint_key]]
 
-    # Resolve residual dangling sink references. Observed planner slip: the
-    # outputs and edges use the reviewed name correctly, but one stale invented
-    # name survives in a routing field — the rename map is then empty and the
-    # rewrite above never runs, yet the candidate is doomed at validation with
-    # feedback the planner cannot act on. With exactly ONE reviewed output the
-    # dangling reference is unambiguous; resolve it structurally. Multi-output
-    # topologies stay untouched — ambiguity belongs to validation.
-    if len(expected_output_names) == 1:
-        only_output = expected_output_names[0]
-        topology_nodes = bound.get("nodes")
-        node_ids = {node.get("id") for node in topology_nodes if isinstance(node, dict)} if isinstance(topology_nodes, list) else set()
-        connection_names = (
-            {node.get("input") for node in topology_nodes if isinstance(node, dict)} if isinstance(topology_nodes, list) else set()
-        )
-        # Coalesce branch VALUES are consumption sites too: each names the
-        # connection a branch transform publishes via ``on_success`` and the
-        # coalesce consumes. Those names appear in no node's ``input`` and are
-        # not node ids, so without them here every legal fork->coalesce
-        # candidate's intermediate connections read as dangling and the
-        # rewrite below re-targets the branch transforms at the reviewed sink
-        # — manufacturing the exact ``coalesce_branch_unreachable`` rejection
-        # (with sink-lure facts blaming the planner for the binder's own
-        # rewrite) on every attempt including the escape hatch (guided
-        # session 1f7241de, 2026-07-22, four identical rejections).
-        branch_connection_names: set[str] = set()
-        if isinstance(topology_nodes, list):
-            for topology_node in topology_nodes:
-                if not isinstance(topology_node, dict):
-                    continue
-                branches = topology_node.get("branches")
-                if isinstance(branches, dict):
-                    branch_connection_names.update(value for value in branches.values() if type(value) is str)
-                elif isinstance(branches, list):
-                    branch_connection_names.update(value for value in branches if type(value) is str)
-        # "discard" is the legal drop-route sentinel, not a reference.
-        known_targets = set(expected_output_names) | node_ids | connection_names | branch_connection_names | {"discard"}
-
-        def _resolve_dangling(member: dict[str, JsonValue], key: str) -> None:
-            value = member.get(key)
-            if type(value) is str and value and value not in known_targets:
-                member[key] = only_output
-
-        for member in bound["sources"].values():
-            _resolve_dangling(cast(dict[str, JsonValue], member), "on_success")
-        if isinstance(topology_nodes, list):
-            for topology_node in topology_nodes:
-                if isinstance(topology_node, dict):
-                    for key in ("on_success", "on_error"):
-                        if topology_node.get(key) is not None:
-                            _resolve_dangling(topology_node, key)
-                    # Gate routes{}/fork_to[] deliberately stay out of this
-                    # inference: a value outside known_targets is ambiguous
-                    # there (stale sink name vs. not-yet-consumed connection,
-                    # e.g. a predecessor route whose consumer the candidate
-                    # does not carry), and the amend/correction flows restore
-                    # predecessor authority by diff — a binder rewrite would
-                    # read as a planner contract violation (the 1f7241de
-                    # failure class). The RENAME map above still retargets
-                    # them exactly; residual ambiguity belongs to validation.
-        topology_edges = bound.get("edges")
-        if isinstance(topology_edges, list):
-            for topology_edge in topology_edges:
-                if isinstance(topology_edge, dict):
-                    # Only the destination can be a sink; a dangling from_node
-                    # has no unambiguous resolution and stays for validation.
-                    _resolve_dangling(topology_edge, "to_node")
     if predecessor is not None and correction_target is not None:
         raw_nodes = bound.get("nodes")
         if type(raw_nodes) is not list:
@@ -1029,6 +1045,70 @@ def bind_guided_reviewed_components(
                 else:
                     private_options.pop(key, None)
             candidate_node["options"] = private_options
+    # Residual dangling sink references. Observed planner slip: the outputs
+    # and edges use the reviewed name correctly, but one stale invented name
+    # survives in a routing field — the rename map is then empty and the
+    # rewrite above never runs. Only an explicitly recorded candidate-output
+    # alias is provably the sink (elspeth-572c642dbf); the old unknown->sink
+    # rewrite could not distinguish a stale alias from a misspelled
+    # intermediate connection or an omitted consumer, so it converted invalid
+    # plans into valid but semantically different pipelines. Reject instead,
+    # carrying the facts a one-turn repair needs. Validation cannot own this
+    # rejection: the binder always rewrites source/output CONFIG, so
+    # source-attributed validation entries project config-masked — no
+    # connectivity facts — and the repair would be blind.
+    #
+    # Enforcement is scoped to the PLAIN planning flow, where the model owns
+    # the full topology it authored. The correction flow withholds unselected
+    # nodes' structural behavior from the provider — its restoration can
+    # legitimately leave a restored node's on_success unconsumed while the
+    # selected node's rewiring is adjudicated downstream — and the prose
+    # revision binder (amend/replace) opts out to run its own authority
+    # adjudication and closed repair dispositions on the bound result.
+    #
+    # Gate routes{}/fork_to[] deliberately stay out of the check: a value
+    # outside known_targets is ambiguous there (stale sink name vs. a
+    # not-yet-consumed connection, e.g. a predecessor route whose consumer
+    # the candidate does not carry — the 1f7241de failure class). The RENAME
+    # map above still retargets them exactly; residual routes/fork_to
+    # ambiguity belongs to validation. A dangling edge from_node likewise
+    # stays: it is never a sink reference. "discard" is the legal drop-route
+    # sentinel, not a reference.
+    if not enforce_route_targets or predecessor is not None:
+        return cast(GuidedBoundPipeline, bound)
+    node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
+    known_targets = set(expected_output_names) | node_ids | connection_names | branch_connection_names | {"discard"}
+    dangling_references: set[str] = set()
+
+    def _collect_dangling(member: Mapping[str, Any], key: str) -> None:
+        value = member.get(key)
+        if type(value) is str and value and value not in known_targets:
+            dangling_references.add(value)
+
+    for member in bound["sources"].values():
+        _collect_dangling(cast(dict[str, JsonValue], member), "on_success")
+    topology_nodes = bound.get("nodes")
+    if isinstance(topology_nodes, list):
+        for topology_node in topology_nodes:
+            if isinstance(topology_node, dict):
+                for key in ("on_success", "on_error"):
+                    if topology_node.get(key) is not None:
+                        _collect_dangling(topology_node, key)
+    topology_edges = bound.get("edges")
+    if isinstance(topology_edges, list):
+        for topology_edge in topology_edges:
+            if isinstance(topology_edge, dict):
+                _collect_dangling(topology_edge, "to_node")
+    if dangling_references:
+        raise GuidedCandidateBindingRejected(
+            "guided planner candidate routing references unknown destinations",
+            error_code="guided_route_target_unknown",
+            connectivity={
+                "dangling_references": cast(JsonValue, sorted(dangling_references)),
+                "declared_sinks": cast(JsonValue, sorted(expected_output_names)),
+                "consumable_connections": cast(JsonValue, sorted(connection_names | branch_connection_names)),
+            },
+        )
     return cast(GuidedBoundPipeline, bound)
 
 
@@ -1055,7 +1135,7 @@ def bind_guided_prose_revision_candidate(
 
     if type(authority) is not GuidedRevisionAuthority:
         raise TypeError("authority must be an exact GuidedRevisionAuthority")
-    bound = bind_guided_reviewed_components(pipeline, guided)
+    bound = bind_guided_reviewed_components(pipeline, guided, enforce_route_targets=False)
     if authority.mode == "replace":
         return GuidedRevisionBindingResult(pipeline=bound, rejection_code=None)
 
@@ -1835,6 +1915,7 @@ def verified_remaining_deferred_intents(
 
 
 __all__ = [
+    "GuidedCandidateBindingRejected",
     "GuidedCorrectionTarget",
     "GuidedRevisionAuthority",
     "GuidedRevisionBindingResult",

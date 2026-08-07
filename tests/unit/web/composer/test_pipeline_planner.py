@@ -35,7 +35,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
-from elspeth.web.composer.guided.planning import guided_redacted_current_state_context
+from elspeth.web.composer.guided.planning import GuidedCandidateBindingRejected, guided_redacted_current_state_context
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
@@ -3876,6 +3876,122 @@ async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
     assert proposal.proposal.repair_count == 1
     assert len(attempts) == 2
     assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
+
+
+def _binding_rejection() -> GuidedCandidateBindingRejected:
+    return GuidedCandidateBindingRejected(
+        "guided planner candidate routing references unknown destinations",
+        error_code="guided_route_target_unknown",
+        connectivity={
+            "dangling_references": ["csv_rows"],
+            "declared_sinks": ["output"],
+            "consumable_connections": [],
+        },
+    )
+
+
+def _binding_rejection_expected_feedback() -> dict[str, Any]:
+    explanation, suggested_fix = explain_validation_code("guided_route_target_unknown") or ("", "")
+    assert explanation and suggested_fix  # the catalogue entry is part of the contract
+    return {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": "pipeline",
+                    "severity": "high",
+                    "error_code": "guided_route_target_unknown",
+                    "error_class": "ValidationError",
+                    "explanation": explanation,
+                    "suggested_fix": suggested_fix,
+                    "connectivity": {
+                        "dangling_references": ["csv_rows"],
+                        "declared_sinks": ["output"],
+                        "consumable_connections": [],
+                    },
+                }
+            ],
+        },
+        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_typed_binding_rejection_gets_coded_repair_with_connectivity_facts(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A typed binder rejection repairs with its code and facts, not a bare schema complaint.
+
+    elspeth-572c642dbf: the binder stopped silently rewriting ambiguous or
+    unproven sink aliases and rejects instead. That rejection must reach the
+    planner as ONE budgeted repair turn carrying the closed code, the
+    catalogue guidance, and the custody-safe connectivity facts — the generic
+    canonical-schema fallback names neither the dangling value nor any valid
+    destination, which is exactly the blindness that exhausted repair budgets
+    before (elspeth-5904b1683a).
+    """
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise _binding_rejection()
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert len(attempts) == 2
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _binding_rejection_expected_feedback()
+
+
+@pytest.mark.asyncio
+async def test_repeated_typed_binding_rejection_draws_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """An identical typed rejection re-fired on the next attempt is named as a repeat."""
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) <= 2:
+            raise _binding_rejection()
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert first == _binding_rejection_expected_feedback()
+    assert second == {**_binding_rejection_expected_feedback(), "repeat_notice": _REPEAT_NOTICE}
 
 
 @pytest.mark.asyncio
