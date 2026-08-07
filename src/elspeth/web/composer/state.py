@@ -14,7 +14,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import Any, Literal, NotRequired, Self, TypedDict
+from typing import Any, Final, Literal, NotRequired, Self, TypedDict
 
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
@@ -45,6 +45,7 @@ from elspeth.core.config import (
     _MAX_NODE_NAME_LENGTH,
     _RESERVED_EDGE_LABELS,
     _VALID_NODE_NAME_RE,
+    CoalesceSettings,
     TriggerConfig,
     _validate_connection_or_sink_name,
     _validate_max_length,
@@ -72,6 +73,12 @@ _FORK_ROUTE_TARGET = "fork"
 # optional operator-facing description (elspeth-a5b86149d4). Nothing else may
 # ride in a queue node's options.
 _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
+# Read from the runtime model rather than copied as literals: these values exist
+# so the two surfaces cannot disagree about what an omitted coalesce field
+# means, and a copied literal would drift silently the day CoalesceSettings
+# changes its default — the exact drift the normalisation is here to prevent.
+_COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
+_COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
 
 
 def validate_composer_source_name(source_name: str) -> None:
@@ -181,7 +188,9 @@ class NodeSpec:
         routes: Gate route mapping. None for non-gates.
         fork_to: Fork destinations for fork gates. None for non-fork nodes.
         branches: Branch inputs for coalesce/row_union nodes. None otherwise.
-        policy: Coalesce policy. None for non-coalesce nodes.
+        policy: Coalesce arrival policy, defaulted to "require_all" when a
+            coalesce omits it so composer state carries the policy the runtime
+            will actually run. None for non-coalesce nodes.
         merge: Coalesce merge strategy, defaulted to "union" when a coalesce
             omits it so composer state carries the strategy the runtime will
             actually run. None for non-coalesce nodes.
@@ -210,19 +219,26 @@ class NodeSpec:
     timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        # ``CoalesceSettings.merge`` DEFAULTS to "union" (core/config.py), so a
-        # coalesce authored without the optional field is a union merge at run
-        # time. Carrying None into composer state made every union rule — which
-        # gates on ``merge == "union"`` — read the node as "not a union" and
-        # skip it, so a type-incompatible merge validated green and died at the
-        # DAG build. Normalising HERE rather than at each gate is the point: it
-        # is the one construction boundary every path routes through
-        # (``from_dict``, ``upsert_node``, ``set_pipeline``, ``replace``), so a
-        # third union rule added later cannot inherit the hole. This defaults
-        # the field, it never requires it — the runtime accepts an unset merge,
-        # and Stage 1 must not be stricter than the runtime.
+        # ``CoalesceSettings`` DEFAULTS both optional coalesce fields —
+        # ``merge`` to "union", ``policy`` to "require_all" (core/config.py) —
+        # so a coalesce authored without them is a require_all union merge at
+        # run time. Carrying None into composer state made every union rule —
+        # which gates on ``merge == "union"`` — read the node as "not a union"
+        # and skip it, so a type-incompatible merge validated green and died at
+        # the DAG build; the same None on ``policy`` made Stage 1 REJECT a
+        # pipeline the runtime accepts and runs (elspeth-deb2f5ed93) and made
+        # the require_all-keyed call sites — ``merge_union_field_flags`` and
+        # ``merge_guaranteed_fields`` — read the node as "not require_all".
+        # Normalising HERE rather than at each gate is the point: it is the one
+        # construction boundary every path routes through (``from_dict``,
+        # ``upsert_node``, ``set_pipeline``, ``replace``), so a third union rule
+        # added later cannot inherit the hole. This defaults the fields, it
+        # never requires them — the runtime accepts both unset, and Stage 1 must
+        # not be stricter than the runtime.
         if self.node_type == "coalesce" and self.merge is None:
-            object.__setattr__(self, "merge", "union")
+            object.__setattr__(self, "merge", _COALESCE_RUNTIME_MERGE_DEFAULT)
+        if self.node_type == "coalesce" and self.policy is None:
+            object.__setattr__(self, "policy", _COALESCE_RUNTIME_POLICY_DEFAULT)
         # Do NOT extend this normalisation to ``on_error`` by analogy. The shapes
         # look identical and the remedies are inverted. ``merge`` has a runtime
         # DEFAULT to mirror (``CoalesceSettings.merge = "union"``), so defaulting
@@ -4731,20 +4747,13 @@ class CompositionState:
                             "coalesce_missing_branches",
                         )
                     )
-                if node.policy is None:
-                    errors.append(
-                        _err(
-                            f"node:{node.id}",
-                            f"Coalesce '{node.id}' is missing required field 'policy'.",
-                            "high",
-                            "coalesce_missing_policy",
-                        )
-                    )
                 # Mirror the engine's closed vocabularies (core/config.py
                 # CoalesceSettings) at composition time: a committed value
                 # outside them passes composer validation but fails engine
-                # pre-run validation — valid-but-not-runnable.
-                elif node.policy not in ("require_all", "quorum", "best_effort", "first"):
+                # pre-run validation — valid-but-not-runnable. An UNSET policy
+                # is not one of those values: ``__post_init__`` has already
+                # normalised it to the runtime's own default.
+                if node.policy not in ("require_all", "quorum", "best_effort", "first"):
                     errors.append(
                         _err(
                             f"node:{node.id}",

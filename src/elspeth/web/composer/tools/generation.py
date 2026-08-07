@@ -667,13 +667,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Either set the coalesce on_success to a sink name from outputs[] (the connectivity facts' declared_sinks) exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
     ),
     (
-        r"coalesce_missing_policy|Coalesce '(.+)' is missing required field 'policy'",
-        "A coalesce node must declare how it settles branches.",
-        "Set policy='require_all' (wait for every branch) and merge='union' (combine branch fields into one row); branches maps "
-        "each fork branch name to the connection ARRIVING at the coalesce — the branch's last transform on_success (e.g. "
-        "branches={'branch_a': 'a_done', 'branch_b': 'b_done'}), or the fork branch name itself only when that branch has no transforms.",
-    ),
-    (
         r"coalesce_missing_branches|Coalesce '(.+)' is missing required field 'branches'",
         "A coalesce node must name the branch connections it rejoins.",
         "Set branches to a mapping of fork branch name -> the connection ARRIVING at the coalesce: the branch's last transform "
@@ -980,7 +973,6 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
 _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "unknown_node_type",
     "coalesce_on_success_must_be_sink",
-    "coalesce_missing_policy",
     "coalesce_missing_branches",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",

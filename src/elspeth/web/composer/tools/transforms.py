@@ -241,7 +241,10 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
                 "real input and releases the original rows without merging fields."
             ),
         },
-        "policy": {"type": ["string", "null"], "description": "Merge trigger policy (coalesce only)."},
+        "policy": {
+            "type": ["string", "null"],
+            "description": "Arrival policy (coalesce only). Omitting it means 'require_all', the runtime default — every branch must arrive.",
+        },
         "merge": {
             "type": ["string", "null"],
             "description": "Field merge strategy (coalesce only). Omitting it means 'union', the runtime default — union's schema rules are enforced either way.",

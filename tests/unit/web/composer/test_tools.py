@@ -11212,7 +11212,7 @@ class TestExplainValidationError:
             assert "error_code" in result.data["suggested_fix"]
             # The catalogue itself rides along so the model can route next turn.
             assert "unknown_node_type" in result.data["suggested_fix"]
-            assert "coalesce_missing_policy" in result.data["known_codes"]
+            assert "coalesce_missing_branches" in result.data["known_codes"]
 
     def test_fuzzy_routes_closed_code_embedded_in_noise(self) -> None:
         """A closed code buried in noise (any case) resolves to its guidance."""
@@ -11220,13 +11220,13 @@ class TestExplainValidationError:
         catalog = _mock_catalog()
         result = execute_tool(
             "explain_validation_error",
-            {"error_text": "node:merge_branches COALESCE_MISSING_POLICY"},
+            {"error_text": "node:merge_branches COALESCE_MISSING_BRANCHES"},
             state,
             catalog,
         )
         assert result.success is True
-        assert result.data["error_code"] == "coalesce_missing_policy"
-        assert "policy=" in result.data["suggested_fix"] and "merge=" in result.data["suggested_fix"]
+        assert result.data["error_code"] == "coalesce_missing_branches"
+        assert "branches" in result.data["suggested_fix"] and "policy=" in result.data["suggested_fix"]
 
     def test_explains_path_violation(self) -> None:
         state = _empty_state()
@@ -11402,13 +11402,22 @@ class TestExplainValidationCode:
         assert "sink" in explanation.lower()
         assert "sink" in fix.lower()
 
-    def test_coalesce_missing_policy_names_policy_and_merge(self) -> None:
+    def test_coalesce_policy_invalid_names_the_closed_vocabulary(self) -> None:
+        """The surviving coalesce-policy code carries the whole repair.
+
+        ``coalesce_missing_policy`` was retired with its emission
+        (elspeth-deb2f5ed93) — an unset policy is the runtime's default, not a
+        defect — so this entry is now the only route from a policy rejection to
+        the engine's four legal values.
+        """
         from elspeth.web.composer.tools.generation import explain_validation_code
 
-        resolved = explain_validation_code("coalesce_missing_policy")
+        resolved = explain_validation_code("coalesce_policy_invalid")
         assert resolved is not None
         _explanation, fix = resolved
-        assert "policy=" in fix and "merge=" in fix
+        for policy in ("require_all", "quorum", "best_effort", "first"):
+            assert policy in fix
+        assert "merge" in fix
 
     def test_gate_on_error_unknown_sink_teaches_node_level_policy(self) -> None:
         from elspeth.web.composer.tools.generation import explain_validation_code
@@ -16962,12 +16971,12 @@ class TestExplainStructuralNodeShapeCodes:
         assert result.success is True
         assert "sink" in result.data["suggested_fix"]
 
-    def test_explains_coalesce_missing_policy(self) -> None:
+    def test_explains_coalesce_policy_invalid(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
         result = execute_tool(
             "explain_validation_error",
-            {"error_text": "coalesce_missing_policy"},
+            {"error_text": "coalesce_policy_invalid"},
             state,
             catalog,
         )

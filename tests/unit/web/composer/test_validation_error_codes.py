@@ -850,7 +850,7 @@ class TestCoalesceReachabilityFacts:
             component="node:merge",
             message="anything",
             severity="high",
-            error_code="coalesce_missing_policy",
+            error_code="coalesce_missing_branches",
         )
         result = ToolResult(
             success=False,

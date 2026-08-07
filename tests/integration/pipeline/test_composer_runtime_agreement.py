@@ -439,6 +439,34 @@ where the architectural fix landed:
   ``tests/unit/core/dag/test_graph_validation.py``
   (``TestUnionCoalesceGuaranteedExtras`` and ``TestTypedPassThroughGuaranteedExtras``).
 
+* Shape 20 — unset coalesce policy (validate RED / runtime GREEN, the INVERSE
+  divergence category; ``elspeth-deb2f5ed93``). ``CoalesceSettings.policy``
+  DEFAULTS to ``"require_all"`` (``core/config.py:963``) and the production
+  loader accepts a policy-less coalesce, while Stage 1 rejected the same state
+  with ``coalesce_missing_policy`` — the one violation in the 10-rule
+  required-field sweep against the placement rule (Stage 1 models the runtime's
+  treatment; it never invents one). Closed by extending
+  ``NodeSpec.__post_init__`` normalisation (the ``aa963bafe`` merge precedent)
+  to ``policy``, reading ``CoalesceSettings.model_fields["policy"].default`` so
+  the surfaces cannot drift, and RETIRING ``coalesce_missing_policy`` from the
+  emitted and closed-code vocabularies.
+
+  What is actually closed: the over-rejection for NodeSpec-constructed state;
+  the require_all-keyed Stage-1 consumers misreading ``None`` (the union-flag
+  and guarantee-merge call sites); the latent ``KeyError('policy')`` at
+  ``yaml_generator.py:289`` on the ``to_dict`` route. The injected
+  ``state_dict`` route bypasses ``NodeSpec`` and remains open, as for ``merge``
+  (``elspeth-5581fcb76f``).
+
+  NOT a menu-drift closure: the retired code's repair hint prescribed exactly
+  ``policy='require_all'`` — the runtime default — so the ticket's substitution
+  mechanism was refuted at source; the four-policy menu belongs to
+  ``coalesce_policy_invalid``, which still guards the closed vocabulary. No
+  advisory replaces the error: the normalised value is disclosed in the
+  exported YAML and the ``upsert_node`` tool schema, mirroring merge's
+  disclosure. Pinned by
+  ``TestComposerRuntimeCoalescePolicyDefaultAgreement``.
+
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
@@ -5347,6 +5375,211 @@ class TestComposerRuntimeCoalesceUnionTypeAgreement:
                 )
             )
             graph.validate_edge_compatibility()
+
+
+class TestComposerRuntimeCoalescePolicyDefaultAgreement:
+    """Shape 20 — an omitted coalesce policy means ``require_all`` on both surfaces.
+
+    The INVERSE of every other shape in this registry: the runtime was the
+    permissive surface and composer Stage 1 the over-strict one, rejecting a
+    policy-less coalesce with ``coalesce_missing_policy`` while
+    ``CoalesceSettings.policy`` defaults it to ``"require_all"`` and the
+    production loader runs it. Stage 1's job is to model the runtime's
+    treatment of an authored pipeline, so a rule that blocks a RUNNABLE
+    pipeline is worse than the permissiveness the mirrors usually replace.
+
+    The discriminating assertion is the STRIPPED yaml, not the composer's
+    normalised value: comparing that value against
+    ``CoalesceSettings.model_fields["policy"].default`` would be tautological,
+    since the normalisation reads the same introspection. Feeding the loader a
+    document with no ``policy`` key exercises pydantic's default APPLICATION,
+    which is the only half that catches "the runtime default changed and the
+    composer did not follow".
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the policy arm of ``NodeSpec.__post_init__`` in
+    ``web/composer/state.py``. The normalisation cannot be deleted line-by-line
+    (that leaves an empty ``if`` body), so per the Shape 14 precedent its
+    condition was mutated to ``if False:``. Per this file's METHOD NOTE the
+    marker was asserted unique first: the file holds two near-identical
+    normalisation conditions, one per coalesce field, and ``grep -c 'if
+    self.node_type == "coalesce" and self.policy is None:'`` returned exactly
+    1. Under that mutation ``test_both_accept_unset_policy_as_require_all``
+    fails at its COMPOSER half with ``AssertionError: assert False`` on
+    ``composer_result.is_valid``, the summary carrying
+    ``ValidationEntry(component='node:merge_results', message="Coalesce
+    'merge_results' policy None is not a valid policy. …",
+    error_code='coalesce_policy_invalid')``. That code, rather than the retired
+    ``coalesce_missing_policy``, is the post-fix shape of the same divergence
+    and is worth recording: the ``elif`` that used to shield the vocabulary
+    guard from ``None`` is now a plain ``if``, so an un-normalised policy does
+    not slip through silently — it is rejected by the surviving guard, and the
+    runtime half of this test still parses the stripped YAML green.
+    ``test_both_reject_a_policy_outside_the_closed_vocabulary`` PASSES under the
+    mutation, as a negative control on an explicitly-set policy must — it does
+    not depend on the normalisation and is not evidence for it. The composer
+    unit pins fail under the same mutation:
+    ``test_unset_coalesce_policy_normalizes_to_the_runtime_default`` (``assert
+    None == 'require_all'``), ``test_unset_coalesce_policy_stays_valid``, and
+    ``test_unset_coalesce_policy_survives_yaml_generation``
+    (``KeyError: 'policy'``). Verified by manual revert on 2026-08-07;
+    restored.
+    """
+
+    def _empty_state(self) -> CompositionState:
+        return CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _paths(self, tmp_path: Path) -> tuple[Path, Path]:
+        csv_path = tmp_path / "input.csv"
+        csv_path.write_text("id,price\n1,2\n", encoding="utf-8")
+        return csv_path, tmp_path / "out.csv"
+
+    def _composer_state(self, *, csv_path: Path, output_path: Path, policy: str | None) -> CompositionState:
+        schema = {"mode": "fixed", "fields": ["id: int", "price: int"]}
+        state = self._empty_state()
+        state = state.with_source(
+            SourceSpec(
+                plugin="csv",
+                on_success="gate_in",
+                options={"path": str(csv_path), "schema": schema},
+                on_validation_failure="discard",
+            )
+        )
+        state = state.with_node(
+            NodeSpec(
+                id="fork_gate",
+                node_type="gate",
+                plugin=None,
+                input="gate_in",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_label", "branch_price"),
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+        for node_id, branch_connection, done_connection in (
+            ("t_label", "branch_label", "label_done"),
+            ("t_price", "branch_price", "price_done"),
+        ):
+            state = state.with_node(
+                NodeSpec(
+                    id=node_id,
+                    node_type="transform",
+                    plugin="value_transform",
+                    input=branch_connection,
+                    on_success=done_connection,
+                    on_error="discard",
+                    options={"schema": schema, "operations": [{"target": "price", "expression": "row['price']"}]},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+        state = state.with_node(
+            NodeSpec(
+                id="merge_results",
+                node_type="coalesce",
+                plugin=None,
+                input="label_done",
+                on_success="main",
+                on_error=None,
+                options={},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_label": "label_done", "branch_price": "price_done"},
+                policy=policy,
+                merge="union",
+            )
+        )
+        state = state.with_output(
+            OutputSpec(
+                name="main",
+                plugin="csv",
+                options={"path": str(output_path), "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+        )
+        for edge_id, from_node, to_node, edge_type, label in (
+            ("e1", "source", "fork_gate", "on_success", None),
+            ("e2", "fork_gate", "t_label", "fork", "branch_label"),
+            ("e3", "fork_gate", "t_price", "fork", "branch_price"),
+            ("e4", "t_label", "merge_results", "on_success", None),
+            ("e5", "t_price", "merge_results", "on_success", None),
+        ):
+            state = state.with_edge(EdgeSpec(id=edge_id, from_node=from_node, to_node=to_node, edge_type=edge_type, label=label))
+        return state
+
+    def _build_runtime_graph_for_settings(self, settings: ElspethSettings) -> ExecutionGraph:
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
+        )
+
+    def _strip_policy_line(self, generated_yaml: str) -> str:
+        """Drop the emitted ``policy:`` line so the loader must apply its own default."""
+        lines = generated_yaml.splitlines()
+        kept = [line for line in lines if line.strip() != "policy: require_all"]
+        assert len(kept) == len(lines) - 1, generated_yaml
+        return "\n".join(kept) + "\n"
+
+    def test_both_accept_unset_policy_as_require_all(self, tmp_path: Path) -> None:
+        """Composer green on an unset policy, and the loader parses the same value."""
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        csv_path, output_path = self._paths(tmp_path)
+        state = self._composer_state(csv_path=csv_path, output_path=output_path, policy=None)
+
+        composer_result = state.validate()
+        assert composer_result.is_valid, composer_result.errors
+        coalesce_node = next(node for node in state.nodes if node.id == "merge_results")
+
+        generated_yaml = composer_yaml_generator.generate_yaml(state)
+        # The disclosure channel that replaces the retired error: the author
+        # reads the arrival semantics they got off the exported settings.
+        assert "policy: require_all" in generated_yaml
+
+        settings = load_settings_from_yaml_string(self._strip_policy_line(generated_yaml))
+        assert settings.coalesce is not None
+        assert settings.coalesce[0].policy == coalesce_node.policy
+
+        graph = self._build_runtime_graph_for_settings(settings)
+        graph.validate_edge_compatibility()
+
+    def test_both_reject_a_policy_outside_the_closed_vocabulary(self, tmp_path: Path) -> None:
+        """Negative control: retiring the missing-policy code did not open the vocabulary."""
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        csv_path, output_path = self._paths(tmp_path)
+        state = self._composer_state(csv_path=csv_path, output_path=output_path, policy="require_all_branches")
+
+        composer_result = state.validate()
+        assert not composer_result.is_valid
+        assert any(error.error_code == "coalesce_policy_invalid" for error in composer_result.errors)
+
+        with pytest.raises(ValidationError):
+            load_settings_from_yaml_string(composer_yaml_generator.generate_yaml(state))
 
 
 class TestComposerRuntimeQueueGuaranteeAgreement:

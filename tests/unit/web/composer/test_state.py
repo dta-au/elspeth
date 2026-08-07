@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT, FAILSINK_ELIGIBLE_SINK_PLUGINS
+from elspeth.core.config import CoalesceSettings
 from elspeth.plugins.infrastructure.templates import TemplateError
 from elspeth.web.composer.state import (
     CompositionState,
@@ -3635,6 +3636,7 @@ class TestSchemaContractValidation:
         source_schema: dict[str, Any],
         transformed_branch_schema: dict[str, Any],
         merge: str | None = "union",
+        policy: str | None = "require_all",
         branch_order: tuple[str, str] = ("path_a", "path_b"),
         branch_plugin: str = "value_transform",
     ) -> CompositionState:
@@ -3689,7 +3691,7 @@ class TestSchemaContractValidation:
                 routes=None,
                 fork_to=None,
                 branches={branch_name: branch_connections[branch_name] for branch_name in branch_order},
-                policy="require_all",
+                policy=policy,
                 merge=merge,
             )
         )
@@ -5390,6 +5392,87 @@ class TestSchemaContractValidation:
         node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
         assert node_dict["merge"] == "union"
         assert "merge: union" in generate_yaml(state)
+
+    def test_unset_coalesce_policy_normalizes_to_the_runtime_default(self) -> None:
+        """An omitted ``policy`` becomes the runtime's own default, read from the model.
+
+        The equality is against ``CoalesceSettings.model_fields["policy"]``
+        rather than the literal ``"require_all"`` deliberately: the value of
+        normalising is that the two surfaces cannot disagree about what an
+        omitted field means, so if the runtime ever changes its default this
+        test tracks it instead of pinning a stale copy.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        coalesce = next(node for node in state.nodes if node.id == "merge_results")
+        assert coalesce.policy == CoalesceSettings.model_fields["policy"].default
+        # Non-coalesce nodes keep None: ``policy`` is forbidden on them, and the
+        # splice canonical-transform check reads it as a disqualifier.
+        assert next(node for node in state.nodes if node.id == "fork_gate").policy is None
+
+    def test_unset_coalesce_policy_stays_valid(self) -> None:
+        """The runtime runs a policy-less coalesce as require_all, so Stage 1 must accept it.
+
+        ``CoalesceSettings.policy`` DEFAULTS to ``"require_all"``, and the
+        production loader parses a policy-less coalesce without complaint.
+        Stage 1 nonetheless emitted ``coalesce_missing_policy``
+        (elspeth-deb2f5ed93) — a validate-red/runtime-green divergence, the
+        inverse of the shapes this surface usually carries, and the one
+        violation of the placement rule that Stage 1 models the runtime's
+        treatment rather than inventing one.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_invalid_coalesce_policy_still_rejected(self) -> None:
+        """Retiring the missing-policy code must not weaken the closed-vocabulary guard.
+
+        The two checks shared an ``if``/``elif`` chain, so deleting the first
+        arm restructures the second. A committed value outside the runtime's
+        vocabulary is still valid-but-not-runnable and must still be rejected.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy="require_all_branches",
+        )
+
+        result = state.validate()
+
+        entries = [error for error in result.errors if error.error_code == "coalesce_policy_invalid"]
+        assert len(entries) == 1, result.errors
+        assert entries[0].component == "node:merge_results"
+
+    def test_unset_coalesce_policy_survives_yaml_generation(self) -> None:
+        """The normalised value must be byte-visible in the exported YAML.
+
+        This is the whole disclosure channel: no advisory replaces the retired
+        error, so ``policy: require_all`` in the generated settings is what
+        tells an author which arrival semantics they got. It also pins the
+        normalisation's PLACEMENT — ``to_dict`` bypasses ``validate()``
+        entirely, so a fix applied inside ``validate()`` would leave this red,
+        exactly as the same seam did for ``merge``.
+        """
+        state = self._make_coalesce_schema_mode_state(
+            source_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            transformed_branch_schema={"mode": "fixed", "fields": ["id: int", "value: int"]},
+            policy=None,
+        )
+
+        node_dict = next(node for node in state.to_dict()["nodes"] if node["id"] == "merge_results")
+        assert node_dict["policy"] == "require_all"
+        assert "policy: require_all" in generate_yaml(state)
 
     def test_union_type_rule_applies_to_a_coalesce_with_merge_unset(self) -> None:
         """The type mirror must fire on the runtime's default merge, not only the declared one.
@@ -7900,8 +7983,9 @@ def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
     for expected in (
         ("node:t_bad", "transform_missing_on_success"),
         ("node:t_bad", "transform_missing_on_error"),
+        # ``branches`` has NO runtime default, so it stays required; ``policy``
+        # is absent from this list because it HAS one (elspeth-deb2f5ed93).
         ("node:c_bad", "coalesce_missing_branches"),
-        ("node:c_bad", "coalesce_missing_policy"),
         ("node:g_bad", "gate_missing_condition"),
         ("node:g_bad", "gate_missing_routes"),
         ("node:g_half", "gate_route_labels_mismatch"),
