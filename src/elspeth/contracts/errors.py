@@ -951,9 +951,7 @@ class AuditIntegrityError(Exception):
         self.failed_turn = failed_turn
 
 
-# TIER-2: Authoring-state lowering defect — the composition state cannot be lowered to
-# runtime YAML because a required field is absent or contradicts its node contract. No
-# audit mutation has begun; the author can repair the state and retry.
+# TIER-2: Authoring-state lowering defect — the state is malformed, no audit mutation has begun, and the author can repair and retry.
 class PipelineLoweringError(ValueError):
     """Raised when a composition state cannot be lowered to runtime pipeline YAML.
 
