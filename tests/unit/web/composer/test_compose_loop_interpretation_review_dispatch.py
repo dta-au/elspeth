@@ -52,6 +52,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.no_tool_policy import is_pending_interpretation_handoff
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.service import (
@@ -91,6 +92,13 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
+
+# The backend-authored handoff suffix, byte-identical to the one composed in
+# ``elspeth.web.composer.service`` (and mirrored in
+# test_no_tool_finalize_universal_qualification.py). The bare form is a strict
+# prefix of the validation-qualified variant, so counting it catches a double
+# append in either rendering.
+_HANDOFF_SUFFIX = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
 
 # ---------------------------------------------------------------------------
 # Lightweight fake LLM that emits a single request_interpretation_review call.
@@ -1082,6 +1090,93 @@ async def test_successful_interpretation_review_returns_user_handoff_without_ext
     pt_events = [e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
     assert len(pt_events) == 1
     assert pt_events[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+@pytest.mark.asyncio
+async def test_staged_handoff_branch_appends_exactly_one_suffix(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """The staged-handoff branch and the shared tail must not both append the suffix.
+
+    Two sites can author the handoff suffix, and their conditions must stay
+    mutually exclusive: the residual append inside the staged-handoff branch of
+    ``_classify_and_budget_turn`` (reached via
+    ``_tool_batch_staged_terminal_interpretation_review_handoff``), and the
+    shared tail in ``_surface_and_finalize_no_tools``, which appends whenever
+    the preflight carries the pending-handoff shape. Commit e4fae9948 narrowed
+    the branch condition to ``preflight is None or is_valid`` precisely so the
+    two cannot both fire; reverting that narrowing (re-adding
+    ``or _is_pending_interpretation_handoff(result.runtime_preflight)``) emits
+    the suffix twice.
+
+    The existing ``TestSuffixIsAppendedExactlyOnce`` cases in
+    test_no_tool_finalize_universal_qualification.py structurally cannot see
+    that regression: none of their scenarios calls
+    ``request_interpretation_review``, so none enters the staged-handoff branch
+    at all. Reaching it needs this module's harness — the real
+    ``validate_pipeline`` over a pending-interpretation ``set_pipeline`` payload,
+    followed by a successful terminal review call — so the count assertion lives
+    here.
+    """
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Staged handoff appends one suffix",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content="Surfacing the review card now.",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+            _fake_text_response("Done — interpretation review is pending."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # Instrument guards: the review call must have succeeded and terminated the
+    # batch (that is what routes finalization through the staged-handoff branch),
+    # and the preflight must carry the pending-handoff shape (the overlap
+    # condition under which a reverted narrowing double-appends). Without these,
+    # a harness that stopped reaching the branch would pass vacuously.
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+    assert [inv.status.value for inv in result.tool_invocations] == ["success", "success"]
+    assert result.runtime_preflight is not None
+    assert is_pending_interpretation_handoff(result.runtime_preflight)
+
+    assert result.assistant_message.count(_HANDOFF_SUFFIX) == 1, result.assistant_message
 
 
 @pytest.mark.asyncio
