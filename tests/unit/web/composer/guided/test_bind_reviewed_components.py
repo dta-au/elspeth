@@ -706,6 +706,31 @@ def test_bind_rejects_selected_node_identity_replacement() -> None:
         )
 
 
+@pytest.mark.parametrize("malformed_options", ["not-a-dict", None, ["mapping"], 7], ids=["str", "missing", "list", "int"])
+def test_bind_rejects_malformed_selected_node_options_as_repairable_candidate_shape(malformed_options: object) -> None:
+    """Regression for elspeth-d923304d18 residue: a selected node whose
+    options are not a dict is a provider authoring slip. The raise must carry
+    the ``guided planner candidate`` prefix so the planner loop answers it
+    with one budgeted repair turn instead of terminalizing the guided
+    operation.
+    """
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    if malformed_options is None:
+        del candidate["nodes"][2]["options"]
+    else:
+        candidate["nodes"][2]["options"] = malformed_options
+
+    with pytest.raises(AuditIntegrityError) as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=predecessor,
+            correction_target=_format_node_correction_target(),
+        )
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+
+
 def test_bind_rejects_selected_gate_replaced_with_passthrough_transform() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()

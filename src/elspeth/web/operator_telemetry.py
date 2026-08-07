@@ -54,6 +54,11 @@ AWS_OPERATOR_PIPELINE_METRIC_NAMES: frozenset[str] = frozenset(
 # its authenticated exposition remains backwards-compatible.
 SAFE_CLOUDWATCH_METRIC_ATTRIBUTES: frozenset[str] = frozenset(
     {
+        # Preflight verdict split (elspeth-ca0bd5d4ef): closed vocab
+        # (valid|invalid|pending_review), bool, and an int the repair loop
+        # caps at _MAX_REPAIR_TURNS — all bounded, so the CloudWatch lane
+        # may carry them alongside the unconditional Prometheus reader.
+        "budget_exhausted",
         "cap_type",
         "completion_path",
         "completion_verb",
@@ -67,11 +72,13 @@ SAFE_CLOUDWATCH_METRIC_ATTRIBUTES: frozenset[str] = frozenset(
         "outcome",
         "probe_status",
         "reason",
+        "repair_turns_used",
         "result",
         "source",
         "status",
         "surface",
         "to_mode",
+        "verdict",
     }
 )
 

@@ -1011,7 +1011,12 @@ def bind_guided_reviewed_components(
                 continue
             candidate_node = raw_nodes[position]
             if type(candidate_node) is not dict or type(candidate_node.get("options")) is not dict:
-                raise AuditIntegrityError("guided planner selected node options are malformed")
+                # Message must carry the "guided planner candidate" prefix:
+                # the planner loop repairs (rather than terminalizes) binder
+                # AuditIntegrityErrors by that prefix, and a model emitting
+                # the selected node without an options dict is an authoring
+                # slip, not an integrity breach (elspeth-d923304d18).
+                raise AuditIntegrityError("guided planner candidate selected node options are malformed")
             if candidate_node.get("node_type") != private_node.get("node_type") or candidate_node.get("plugin") != private_node.get(
                 "plugin"
             ):

@@ -92,6 +92,10 @@ def test_cloudwatch_metric_dimensions_exclude_unbounded_identity_and_content() -
 
     assert SAFE_CLOUDWATCH_METRIC_ATTRIBUTES.isdisjoint(forbidden)
     assert {"reason", "operation", "status", "surface"} <= SAFE_CLOUDWATCH_METRIC_ATTRIBUTES
+    # Preflight verdict split (elspeth-ca0bd5d4ef): the three bounded
+    # attributes must survive the CloudWatch strip so the verdict series is
+    # readable on the AWS OTLP lane, not only via Prometheus.
+    assert {"verdict", "budget_exhausted", "repair_turns_used"} <= SAFE_CLOUDWATCH_METRIC_ATTRIBUTES
 
 
 @pytest.mark.parametrize(
