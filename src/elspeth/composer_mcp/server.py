@@ -17,6 +17,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict, cast
@@ -44,6 +45,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import build_canonicalization_sentinel
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -63,12 +65,14 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_composition_dict,
     generate_public_yaml,
 )
+from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightCoordinator,
     RuntimePreflightFailure,
     RuntimePreflightKey,
 )
 from elspeth.web.execution.schemas import ValidationResult
+from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 __all__ = ["create_server", "main"]
@@ -621,8 +625,9 @@ def _dispatch_session_tool(
 def create_server(
     catalog: CatalogService,
     scratch_dir: Path,
-    runtime_preflight: McpRuntimePreflight | None = None,
-    runtime_preflight_settings_hash: str | None = None,
+    *,
+    runtime_preflight: McpRuntimePreflight | None,
+    runtime_preflight_settings_hash: str | None,
     runtime_preflight_timeout_seconds: float = 5.0,
     runtime_preflight_coordinator: RuntimePreflightCoordinator | None = None,
     session_scope_provider: SessionScopeProvider | None = None,
@@ -633,9 +638,11 @@ def create_server(
     Args:
         catalog: Plugin catalog for discovery tools.
         scratch_dir: Directory for session persistence.
-        runtime_preflight: Optional async callable for runtime-equivalent preflight.
-            When provided with runtime_preflight_settings_hash, preview_pipeline
-            will include runtime validation results.
+        runtime_preflight: Async callable for runtime-equivalent preflight, or
+            an explicit None. Keyword-required and without a default: an
+            omitted preflight degrades preview_pipeline into publishing
+            is_valid on authoring checks alone, so every caller must take a
+            visible position rather than inherit one.
         runtime_preflight_settings_hash: Hash of settings relevant to runtime
             validation. Required when runtime_preflight is configured.
         runtime_preflight_timeout_seconds: Per-call timeout for runtime preflight.
@@ -950,9 +957,67 @@ def create_server(
     return server
 
 
-async def run_server(catalog: CatalogService, scratch_dir: Path) -> None:
+@dataclass(frozen=True)
+class _StdioValidationSettings:
+    """The ValidationSettings surface a stdio process can honestly supply."""
+
+    data_dir: Path
+
+
+def _build_stdio_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> Server:
+    """Build the stdio server with a runtime-equivalent preflight wired in.
+
+    Factored out of ``run_server`` so the construction the shipped transport
+    uses is the construction under test.
+    """
+    settings = _StdioValidationSettings(data_dir=data_dir)
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    # A validation-internal path-scoping token, NOT an identity. Three
+    # constraints make it necessary, and none of them are visible at the call
+    # below:
+    #
+    # 1. ``allowed_sink_directories`` / ``allowed_source_directories``
+    #    (web/paths.py) return ``()`` for ``session_id=None`` BY DESIGN — that
+    #    is web tenancy, where a caller without a session owns no directory.
+    #    Passing None here rejects every pipeline that reads or writes a local
+    #    file, and publishes it as an honest-looking ``is_valid: false``.
+    # 2. A single-user stdio process has no tenancy boundary to enforce and no
+    #    session identity to borrow, so it scopes itself once per process.
+    #    Threading the live MCP session id back in does NOT work: it is None
+    #    for any unsaved composition, which is the common case.
+    # 3. Nothing the user keeps carries it — ``generate_public_yaml`` takes no
+    #    session_id and emits authored paths verbatim.
+    #
+    # Traversal out of ``data_dir`` is still rejected; this widens no boundary.
+    session_id = uuid.uuid4().hex[:12]
+
+    async def stdio_runtime_preflight(state: CompositionState) -> ValidationResult:
+        return await asyncio.to_thread(
+            validate_pipeline,
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            secret_service=None,
+            session_id=session_id,
+        )
+
+    return create_server(
+        catalog,
+        scratch_dir,
+        runtime_preflight=stdio_runtime_preflight,
+        # Both extras change the verdict for one data_dir, so both belong in
+        # the key: a coordinator shared with an in-process web server would
+        # otherwise serve its policy-filtered verdict for our snapshot.
+        runtime_preflight_settings_hash=f"{runtime_preflight_settings_hash(settings)}:{plugin_snapshot.snapshot_hash}:{session_id}",
+    )
+
+
+async def run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
     """Run the MCP server with stdio transport."""
-    server = create_server(catalog, scratch_dir)
+    server = _build_stdio_server(catalog, scratch_dir, data_dir)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
@@ -1051,6 +1116,14 @@ def main() -> None:
         default=Path(".composer-scratch"),
         help="Directory for session persistence (default: .composer-scratch)",
     )
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path("data"),
+        help=(
+            "Root for runtime preflight path checks (default: data). preview_pipeline reports source and sink paths that resolve outside this directory as invalid."
+        ),
+    )
     args = parser.parse_args()
 
     # Lazy import to avoid pulling in the full catalog at module level.
@@ -1060,4 +1133,4 @@ def main() -> None:
 
     import asyncio
 
-    asyncio.run(run_server(catalog, args.scratch_dir))
+    asyncio.run(run_server(catalog, args.scratch_dir, args.data_dir))

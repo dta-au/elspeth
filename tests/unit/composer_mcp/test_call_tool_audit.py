@@ -114,7 +114,7 @@ async def test_success_path_records_before_return() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         await _call_handler(server.request_handlers, "new_session", {"name": "AuditTest"})
     assert len(probe.invocations) == 1
     inv = probe.invocations[0]
@@ -133,7 +133,7 @@ async def test_arg_error_path_records_before_return() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
     assert response.root.isError is True
     assert "session_id" in response.root.content[0].text
@@ -153,7 +153,7 @@ async def test_composer_tool_schema_validation_is_enforced_without_audit_hash() 
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(
             server.request_handlers,
             "get_pipeline_state",
@@ -173,7 +173,7 @@ async def test_schema_invalid_collision_violation_records_arg_error_before_handl
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         with patch("elspeth.composer_mcp.server.execute_tool") as mock_execute:
             response = await _call_handler(
                 server.request_handlers,
@@ -245,7 +245,7 @@ async def test_new_session_rejects_non_string_name_as_arg_error(bad_name: object
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "new_session", {"name": bad_name})
         session_files = list(scratch.glob("*.json"))
 
@@ -269,7 +269,7 @@ async def test_arg_error_payload_recorded_for_audit_replay() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
     assert response.root.isError is True
     inv = probe.invocations[0]
@@ -299,7 +299,7 @@ async def test_reflectively_corrupted_tool_argument_error_is_safe_in_mcp_and_aud
     catalog = create_catalog_service()
     with tempfile.TemporaryDirectory() as td:
         probe = _ProbeRecorder()
-        server = create_server(catalog, Path(td), recorder=probe)
+        server = create_server(catalog, Path(td), recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         with patch("elspeth.composer_mcp.server._dispatch_tool", side_effect=exc):
             response = await _call_handler(server.request_handlers, "load_session", {"session_id": "bad"})
 
@@ -322,7 +322,7 @@ async def test_argument_canonicalization_failure_records_arg_error() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(
             server.request_handlers,
             "set_source",
@@ -368,7 +368,7 @@ async def test_malformed_mutation_args_before_collision_check_record_arg_error(
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(server.request_handlers, tool_name, arguments)
 
     assert len(probe.invocations) == 1
@@ -382,7 +382,7 @@ async def test_patch_output_options_missing_patch_records_arg_error_after_existi
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         seeded = await _call_handler(server.request_handlers, "set_output", _valid_csv_output_args())
         response = await _call_handler(server.request_handlers, "patch_output_options", {"sink_name": "main"})
 
@@ -399,7 +399,7 @@ async def test_set_pipeline_output_without_options_preserves_collision_control_e
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         response = await _call_handler(
             server.request_handlers,
             "set_pipeline",
@@ -437,7 +437,7 @@ async def test_audit_records_in_order_across_session() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         await _call_handler(server.request_handlers, "new_session", {"name": "T"})
         await _call_handler(server.request_handlers, "list_sessions", {})
         await _call_handler(server.request_handlers, "load_session", {"session_id": "NOT_HEX"})
@@ -483,7 +483,7 @@ async def test_plugin_crash_path_records_before_reraise() -> None:
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         # Patch the dispatcher seam to raise a plain RuntimeError —
         # the canonical "plugin bug" shape per CLAUDE.md "Plugin
         # Ownership". Anything other than ToolArgumentError /
@@ -534,7 +534,7 @@ async def test_bare_dispatch_value_error_is_plugin_crash_not_arg_error() -> None
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
         with patch(
             "elspeth.composer_mcp.server._dispatch_tool",
             side_effect=ValueError("synthetic internal bug"),
@@ -566,7 +566,7 @@ async def test_response_json_serialization_failure_is_plugin_crash_not_success()
     with tempfile.TemporaryDirectory() as td:
         scratch = Path(td)
         probe = _ProbeRecorder()
-        server = create_server(catalog, scratch, recorder=probe)
+        server = create_server(catalog, scratch, recorder=probe, runtime_preflight=None, runtime_preflight_settings_hash=None)
 
         bad_result = {
             "success": True,
@@ -733,7 +733,7 @@ async def test_delete_session_persists_deletion_audit_record() -> None:
         # Use the production JsonlEventRecorder so we can verify the file state.
         # We need the same session_id_ref as create_server, but create_server
         # makes it internally. Instead, drive the API and confirm cleanup.
-        server = create_server(catalog, scratch)  # default JsonlEventRecorder
+        server = create_server(catalog, scratch, runtime_preflight=None, runtime_preflight_settings_hash=None)  # default JsonlEventRecorder
         # Create + save + delete.
         r = await _call_handler(server.request_handlers, "new_session", {"name": "X"})
         import json as _json

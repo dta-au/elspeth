@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import yaml
 
-from elspeth.composer_mcp.server import _build_tool_defs, _dispatch_tool, create_server
+from elspeth.composer_mcp.server import _build_stdio_server, _build_tool_defs, _dispatch_tool, create_server
 from elspeth.composer_mcp.session import SessionCheckout, SessionManager
 from elspeth.contracts.composer_audit import ComposerToolRecorder
 from elspeth.web.catalog.protocol import CatalogService
@@ -255,7 +255,9 @@ class TestDispatchTool:
     @pytest.mark.asyncio
     async def test_live_session_manager_token_authorizes_save_after_mutation(self, scratch_dir: Path) -> None:
         recorder = MagicMock(spec_set=ComposerToolRecorder)
-        server = create_server(_mock_catalog(), scratch_dir, recorder=recorder)
+        server = create_server(
+            _mock_catalog(), scratch_dir, recorder=recorder, runtime_preflight=None, runtime_preflight_settings_hash=None
+        )
         created = await _call_handler(server.request_handlers, "new_session", {"name": "CAS"})  # type: ignore[misc]
         created_payload = json.loads(created.root.content[0].text)
         session_id = created_payload["data"]["session_id"]
@@ -301,7 +303,7 @@ class TestDispatchTool:
 
     @pytest.mark.asyncio
     async def test_live_save_to_non_active_session_conflicts_and_preserves_sessions(self, scratch_dir: Path) -> None:
-        server = create_server(_mock_catalog(), scratch_dir)
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
         created_a = await _call_handler(server.request_handlers, "new_session", {"name": "A"})  # type: ignore[misc]
         session_a = json.loads(created_a.root.content[0].text)["data"]["session_id"]
         created_b = await _call_handler(server.request_handlers, "new_session", {"name": "B"})  # type: ignore[misc]
@@ -330,7 +332,7 @@ class TestDispatchTool:
 
     @pytest.mark.asyncio
     async def test_delete_clears_active_checkout_authority(self, scratch_dir: Path) -> None:
-        server = create_server(_mock_catalog(), scratch_dir)
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
         created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
         created_payload = json.loads(created.root.content[0].text)
         session_id = created_payload["data"]["session_id"]
@@ -383,7 +385,7 @@ class TestDispatchTool:
                 raise RuntimeError("delete tombstone recorder failure")
 
         monkeypatch.setattr(JsonlEventRecorder, "record", record_then_fail_delete)
-        server = create_server(_mock_catalog(), scratch_dir)
+        server = create_server(_mock_catalog(), scratch_dir, runtime_preflight=None, runtime_preflight_settings_hash=None)
         created = await _call_handler(server.request_handlers, "new_session", {"name": "deleted"})  # type: ignore[misc]
         created_payload = json.loads(created.root.content[0].text)
         session_id = created_payload["data"]["session_id"]
@@ -1183,3 +1185,131 @@ class TestRowUnionExposure:
         upsert = next(tool for tool in definitions if tool["name"] == "upsert_node")
         assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
         assert upsert["parameters"]["properties"]["timeout_seconds"]["exclusiveMinimum"] == 0
+
+
+_STDIO_SOURCE_ARGS = {
+    "plugin": "null",
+    "on_success": "main",
+    "options": {"schema": {"mode": "observed"}},
+    "on_validation_failure": "discard",
+}
+
+
+def _stdio_output_args(path: str) -> dict[str, Any]:
+    return {
+        "sink_name": "main",
+        "plugin": "csv",
+        "options": {
+            "path": path,
+            "schema": {"mode": "observed"},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        },
+        "on_write_failure": "discard",
+    }
+
+
+class TestStdioServerConstruction:
+    """The construction ``run_server`` actually uses must run stage 2.
+
+    These drive ``_build_stdio_server`` rather than a parallel test-only
+    wiring: if the runtime preflight is ever dropped from the stdio
+    construction again, ``runtime_preflight`` comes back null here.
+    """
+
+    @pytest.fixture()
+    def data_dir(self, tmp_path: Path) -> Path:
+        d = tmp_path / "data"
+        d.mkdir()
+        return d
+
+    async def _preview_with_sink_path(self, tmp_path: Path, data_dir: Path, label: str, path: str) -> dict[str, Any]:
+        from elspeth.web.dependencies import create_catalog_service
+
+        scratch = tmp_path / f"scratch-{label}"
+        scratch.mkdir()
+        server = _build_stdio_server(create_catalog_service(), scratch, data_dir)
+        handlers = server.request_handlers
+        for tool, arguments in (("set_source", _STDIO_SOURCE_ARGS), ("set_output", _stdio_output_args(path))):
+            mutated = await _call_handler(handlers, tool, arguments)  # type: ignore[misc]
+            assert json.loads(mutated.root.content[0].text)["success"] is True, f"{tool} failed"
+        preview = await _call_handler(handlers, "preview_pipeline", {})  # type: ignore[misc]
+        payload = json.loads(preview.root.content[0].text)
+        assert payload["success"] is True
+        return payload["data"]
+
+    @pytest.mark.asyncio
+    async def test_stdio_construction_publishes_valid_pipeline_with_runtime_preflight(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+    ) -> None:
+        """Green control: the stdio data_dir wiring must not reject legitimate pipelines."""
+        data = await self._preview_with_sink_path(tmp_path, data_dir, "green", "outputs/out.csv")
+
+        preflight = data["runtime_preflight"]
+        assert preflight is not None, "stage 2 never ran — the stdio construction dropped the preflight"
+        assert preflight["is_valid"] is True
+        assert data["is_valid"] is True
+        # The costly checks are asserted present-and-passed rather than
+        # inferred from an absence of failures: a stub preflight returning an
+        # empty check list would otherwise satisfy every assertion above.
+        passed = {check["name"] for check in preflight["checks"] if check["passed"]}
+        assert {"path_allowlist", "plugin_instantiation", "graph_structure", "schema_compatibility"} <= passed
+
+    @pytest.mark.asyncio
+    async def test_stdio_construction_publishes_runtime_rejection(
+        self,
+        tmp_path: Path,
+        data_dir: Path,
+    ) -> None:
+        """A runtime-only rejection must flip the published verdict."""
+        # Stage 1 accepts this path; only the runtime allowlist rejects it.
+        data = await self._preview_with_sink_path(tmp_path, data_dir, "reject", "outputs/../../evil.csv")
+
+        assert data["authoring_validation"]["is_valid"] is True
+        preflight = data["runtime_preflight"]
+        assert preflight is not None
+        assert preflight["is_valid"] is False
+        # Named, because a sink path resolving outside data_dir is not
+        # automatically a rejection — ``resolve_sink_data_path`` adopts a
+        # non-UUID second segment under the caller's own outputs directory.
+        assert "path_allowlist" in {check["name"] for check in preflight["checks"] if not check["passed"]}
+        assert data["is_valid"] is False
+
+    def test_create_server_requires_an_explicit_runtime_preflight(self, tmp_path: Path) -> None:
+        """Re-adding the silent default is itself the mutation being caught."""
+        import elspeth.composer_mcp as composer_mcp_package
+
+        with pytest.raises(TypeError):
+            create_server(_mock_catalog(), tmp_path)  # type: ignore[call-arg]
+        # The package re-export forwards *args/**kwargs; the guard must not be
+        # laundered by the passthrough.
+        with pytest.raises(TypeError):
+            composer_mcp_package.create_server(_mock_catalog(), tmp_path)
+
+    def _main_run_server_args(self, monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list[tuple[Path, Path]]:
+        from elspeth.composer_mcp import server as server_module
+
+        received: list[tuple[Path, Path]] = []
+
+        async def capture_run_server(catalog: CatalogService, scratch_dir: Path, data_dir: Path) -> None:
+            received.append((scratch_dir, data_dir))
+
+        monkeypatch.setattr(server_module, "run_server", capture_run_server)
+        monkeypatch.setattr(server_module, "_install_parent_death_signal_workaround", lambda: None)
+        monkeypatch.setattr("elspeth.web.dependencies.create_catalog_service", _mock_catalog)
+        monkeypatch.setattr("sys.argv", ["elspeth-composer", *argv])
+        server_module.main()
+        return received
+
+    def test_main_threads_data_dir_into_run_server(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """--data-dir must reach the preflight, not merely be parsed."""
+        received = self._main_run_server_args(monkeypatch, ["--scratch-dir", str(tmp_path / "s"), "--data-dir", str(tmp_path / "d")])
+
+        assert received == [(tmp_path / "s", tmp_path / "d")]
+
+    def test_main_defaults_data_dir_to_web_parity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        received = self._main_run_server_args(monkeypatch, [])
+
+        assert [data_dir for _scratch, data_dir in received] == [Path("data")]
