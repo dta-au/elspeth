@@ -28,6 +28,7 @@ from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
+from elspeth.web.composer import yaml_generator as yaml_generator_module
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -5865,6 +5866,25 @@ class TestEdgeContractFailureFormatting:
         suggestion = _build_edge_contract_suggestion(exc)
         # Flexible mode is the canonical fix for extra-field rejection.
         assert "'flexible'" in suggestion
+        # "'flexible'" alone is vacuous for the extras branch — an unconditional
+        # bullet carries it too, so deleting the branch would not fail this test.
+        # The clause below is emitted only by the extras branch.
+        assert "so it accepts the producer's extra fields" in suggestion
+
+    def test_combined_missing_and_extras_suggestion_renders_both_bullets(self) -> None:
+        """The per-category bullets are additive, not a first-match chain.
+
+        A consumer can over-declare required fields AND forbid the producer's
+        extras at once; collapsing the if-chain to elif would silently drop the
+        second repair, leaving the model to fix half the edge and retry.
+        """
+        exc = self._make_edge_error(
+            missing_fields=("content",),
+            extra_fields=("debug_field",),
+        )
+        suggestion = _build_edge_contract_suggestion(exc)
+        assert "Drop the missing required fields" in suggestion
+        assert "so it accepts the producer's extra fields" in suggestion
 
     # ── All issue categories ─────────────────────────────────────────────
 
@@ -6089,3 +6109,291 @@ class TestPluginPolicySuggestions:
         assert result.is_valid is False
         assert result.errors[0].error_code == "plugin_not_enabled"
         assert result.errors[0].suggestion == _DEFAULT_PLUGIN_POLICY_SUGGESTION
+
+
+class TestValidatePipelineStateShapeMaterialization:
+    """A rehydrated state that cannot be lowered to YAML is a verdict, not a 500.
+
+    ``CompositionState.from_dict`` accepts persisted sessions whose node shapes
+    Stage 1 would reject, and ``_validate_pipeline_impl`` runs no Stage-1 pass
+    before materialization — so every rehydrate consumer (tutorial, sessions,
+    proposals, guided chat, execute) could reach ``generate_yaml`` with a state
+    it refuses to lower. Those refusals are authoring defects and belong in the
+    ledger; a genuine bug inside the generator must still surface as a 500.
+    """
+
+    @staticmethod
+    def _base_state_dict(source_path: str) -> dict[str, Any]:
+        """A fully valid minimal pipeline in persisted-session (to_dict) shape."""
+        return {
+            "version": 1,
+            "sources": {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "transform_in",
+                    "options": {"path": source_path, "schema": {"mode": "observed"}},
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "test_node",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "transform_in",
+                    "on_success": "primary",
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "operations": [{"target": "total", "expression": "row['a'] + row['b']"}],
+                    },
+                }
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "name": "primary",
+                    "plugin": "csv",
+                    "options": {"path": "outputs/out.csv", "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            ],
+            "metadata": {"name": "State Shape Pipeline", "description": ""},
+        }
+
+    @pytest.fixture
+    def state_dict_and_settings(self, tmp_path: Path) -> tuple[dict[str, Any], WebSettings]:
+        blob_dir = tmp_path / "blobs" / "test-session"
+        blob_dir.mkdir(parents=True)
+        source_csv = blob_dir / "in.csv"
+        source_csv.write_text("a,b\n1,2\n")
+        return self._base_state_dict(str(source_csv)), _make_settings(data_dir=str(tmp_path))
+
+    def test_state_shape_base_state_is_green_control(
+        self,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+    ) -> None:
+        """Probe validity: the shared base validates green with every check executed.
+
+        Without this, a base that goes red for an unrelated reason turns the
+        poisoned-shape tests below into dirty probes that assert nothing.
+        """
+        state_dict, settings = state_dict_and_settings
+
+        result = validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, yaml_generator_module)
+
+        assert result.is_valid is True
+        assert all(check.passed for check in result.checks)
+        assert _check(result, "schema_compatibility").passed is True
+
+    # Each shape poisons exactly ONE field on the green base above. Every one is
+    # accepted by CompositionState.from_dict — that is the persistence vector.
+
+    @staticmethod
+    def _poison_gate_condition(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "g1",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "results",
+                "on_success": None,
+                "on_error": None,
+                "options": {},
+                "routes": {"true": "sink_in"},
+            }
+        )
+
+    @staticmethod
+    def _poison_gate_routes(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "g1",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "results",
+                "on_success": None,
+                "on_error": None,
+                "options": {},
+                "condition": "row['a'] > 0",
+            }
+        )
+
+    @staticmethod
+    def _poison_coalesce_branches(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "c1",
+                "node_type": "coalesce",
+                "plugin": None,
+                "input": "results",
+                "on_success": "sink_in",
+                "on_error": None,
+                "options": {},
+                "policy": "first_win",
+                "merge": "union",
+            }
+        )
+
+    @staticmethod
+    def _poison_row_union_branches(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "r1",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "results",
+                "on_success": "sink_in",
+                "on_error": None,
+                "options": {},
+            }
+        )
+
+    @staticmethod
+    def _poison_transform_on_error(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"][0]["on_error"] = None
+
+    @staticmethod
+    def _poison_aggregation_on_error(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "agg1",
+                "node_type": "aggregation",
+                "plugin": "batch_stats",
+                "input": "results",
+                "on_success": "sink_in",
+                "on_error": None,
+                "options": {},
+            }
+        )
+
+    @staticmethod
+    def _poison_unknown_node_type(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "x1",
+                "node_type": "flux_capacitor",
+                "plugin": None,
+                "input": "results",
+                "on_success": "sink_in",
+                "on_error": None,
+                "options": {},
+            }
+        )
+
+    @staticmethod
+    def _poison_queue_input(state_dict: dict[str, Any]) -> None:
+        state_dict["nodes"].append(
+            {
+                "id": "q1",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "not_q1",
+                "on_success": None,
+                "on_error": None,
+                "options": {},
+            }
+        )
+
+    @pytest.mark.parametrize(
+        "poison_name",
+        [
+            "_poison_gate_condition",
+            "_poison_gate_routes",
+            "_poison_coalesce_branches",
+            "_poison_row_union_branches",
+            "_poison_transform_on_error",
+            "_poison_aggregation_on_error",
+            "_poison_unknown_node_type",
+            "_poison_queue_input",
+        ],
+    )
+    def test_rehydrated_state_shape_defect_is_red_verdict_not_crash(
+        self,
+        poison_name: str,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+    ) -> None:
+        state_dict, settings = state_dict_and_settings
+        getattr(self, poison_name)(state_dict)
+
+        result = validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, yaml_generator_module)
+
+        assert result.is_valid is False
+        _assert_complete_failure_ledger(result, "blob_inline_refs")
+        assert [error.error_code for error in result.errors] == ["state_shape_materialization"]
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            RuntimeError("lowering drift simulated"),
+            KeyError("condition"),
+            ValueError("not a lowering error"),
+        ],
+        ids=["runtime_error", "bare_key_error", "bare_value_error"],
+    )
+    def test_generator_internal_error_still_propagates_as_500(
+        self,
+        exc: Exception,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+    ) -> None:
+        """Catch tightness: only the typed lowering error becomes a verdict.
+
+        Widening the seam back to ``(KeyError, ValueError)`` — or to
+        ``Exception`` — would convert a genuine generator bug into a red verdict
+        the author is told to repair, and the misclassification would be
+        indistinguishable from a real authoring defect in the ledger.
+        """
+        state_dict, settings = state_dict_and_settings
+
+        class _RaisingYamlGenerator:
+            def generate_yaml(self, state: CompositionState) -> str:
+                raise exc
+
+        with pytest.raises(type(exc)):
+            validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, _RaisingYamlGenerator())
+
+    def test_rehydrated_coalesce_missing_merge_and_policy_are_normalized_not_crashed(
+        self,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+    ) -> None:
+        """The two members fixed at the construction boundary, not at the seam.
+
+        ``NodeSpec.__post_init__`` records the runtime defaults for merge and
+        policy, so materialization must PASS — asserting only "no crash" would
+        let the seam mask the regression as a red verdict if either default were
+        ever removed.
+        """
+        state_dict, settings = state_dict_and_settings
+        state_dict["nodes"].append(
+            {
+                "id": "c1",
+                "node_type": "coalesce",
+                "plugin": None,
+                "input": "results",
+                "on_success": "sink_in",
+                "on_error": None,
+                "options": {},
+                "branches": {"b1": "results"},
+            }
+        )
+
+        result = validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, yaml_generator_module)
+
+        assert _check(result, "blob_inline_refs").passed is True
+        assert [error.error_code for error in result.errors] != ["state_shape_materialization"]
+
+    def test_state_shape_failure_detail_carries_guard_message(
+        self,
+        state_dict_and_settings: tuple[dict[str, Any], WebSettings],
+    ) -> None:
+        """The verdict is only useful if it names what to repair."""
+        state_dict, settings = state_dict_and_settings
+        self._poison_transform_on_error(state_dict)
+
+        result = validate_pipeline_for_web_principal(CompositionState.from_dict(state_dict), settings, yaml_generator_module)
+
+        message = result.errors[0].message
+        assert "test_node" in message
+        assert "on_error" in message
+        assert "test_node" in _check(result, "blob_inline_refs").detail
+        assert result.errors[0].suggestion

@@ -16,6 +16,7 @@ import yaml
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
+from elspeth.contracts.errors import PipelineLoweringError
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
     BLOB_INLINE_PER_REF_BYTE_CAP,
@@ -152,8 +153,45 @@ def materialize_validation_yaml(
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
     load_yaml: Callable[[str], object],
 ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Generate the exact runtime YAML and validate inline-blob metadata."""
-    pipeline_yaml = yaml_generator.generate_yaml(interpretation.materialized_state)
+    """Generate the exact runtime YAML and validate inline-blob metadata.
+
+    A state shape the generator refuses to lower (``PipelineLoweringError``) is an
+    authoring defect reachable from any rehydrated session, so it becomes a red
+    verdict here rather than a 500. Note the failure lands on
+    ``CHECK_BLOB_INLINE_REFS``: the ledger requires a failure to occupy the next
+    canonical core check, and materialization's canonical slot is that one — so
+    the check NAME is positional, and ``error_code`` is what distinguishes a
+    state-shape refusal from an actual blob problem.
+
+    Only that typed error converts. ``resolve_runtime_yaml_paths`` and the
+    non-dict check below stay outside the guard, and anything else the generator
+    raises is a bug in code ELSPETH owns, which must keep escaping.
+    """
+    try:
+        pipeline_yaml = yaml_generator.generate_yaml(interpretation.materialized_state)
+    except PipelineLoweringError as exc:
+        detail = f"Pipeline state cannot be materialized to runtime YAML: {exc}"
+        return PhaseFailure(
+            passed_checks=(),
+            failed_check=ValidationCheck(
+                name=CHECK_BLOB_INLINE_REFS,
+                passed=False,
+                detail=detail,
+                affected_nodes=(),
+                outcome_code=None,
+            ),
+            errors=(
+                ValidationError(
+                    component_id=None,
+                    component_type=None,
+                    message=detail,
+                    suggestion="Repair the named node so the field is set — patch it with upsert_node/patch_node_options, or remove the node if it is no longer part of the pipeline.",
+                    error_code="state_shape_materialization",
+                ),
+            ),
+            readiness=_blocked_readiness(code="state_shape_materialization", detail=detail),
+            semantic_contracts=interpretation.authored.semantic_contracts,
+        )
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(data_dir), session_id=session_id)
 
     if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
