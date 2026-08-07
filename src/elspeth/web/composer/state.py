@@ -4329,9 +4329,13 @@ def _check_schema_contracts(
     # block is authored config: its SYNTAX is checkable with no topology
     # context whatsoever, so it must not depend on who reads it.
     #
-    # Deduped by owner against the lazy parsers above: where a contract
-    # comparison did reach the declaration, it has already reported, and one
-    # authoring defect owes exactly one error.
+    # Deduped by OWNER against the lazy parsers above: where a contract
+    # comparison already reported contract_config_invalid for an owner, the
+    # sweep stays silent for that owner entirely. One owner therefore owes at
+    # most one contract-config error per pass — a node carrying both a bad
+    # required_input_fields and a bad schema block reports only the first
+    # defect reached; the second surfaces on the following pass once the
+    # first is fixed.
     schema_config_reported = {error.component for error in errors if error.error_code == "contract_config_invalid"}
 
     def _sweep_schema_syntax(owner: str, options: Mapping[str, Any], *, node_type: str | None = None) -> None:

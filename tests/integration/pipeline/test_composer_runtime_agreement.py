@@ -495,6 +495,16 @@ Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
 session/run id, the closing issue, and the test class that pins it.
 
+Amending on close (mandatory — ADR-040 §6): a fix that closes a shape must
+rewrite that shape's entry to record what is ACTUALLY closed, never a bare
+"closed". Name the construction paths the fix covers and the routes that
+remain open (e.g. "closed for NodeSpec-constructed state; the injected
+``state_dict`` route remains open"), and the test class that pins the
+closure. The same applies when a later change partially invalidates an
+entry: amend it in the commit that lands the change — a stale entry misreads
+as an open divergence, and Shape 18 was stale two ways before 97e2e3416.
+Shape 20 is the worked example of a closing amendment.
+
 Bug verification protocol (mandatory for new shapes):
 ``test_agreement_aggregation_run_counts_construct_completed_data`` (Shape 7)
 is the canonical example. Before declaring a new agreement test landed,
