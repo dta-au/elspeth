@@ -642,6 +642,26 @@ class TestDocumentSinkSemanticRequirement:
         assert TextFraming.NOT_TEXT not in requirement.accepted_text_framings
         assert requirement.accepted_value_types == frozenset({SemanticValueType.STR})
 
+    def test_web_scrape_raw_archival_edge_is_satisfied(self, tmp_path: Path) -> None:
+        """``web_scrape(raw) -> document`` — archive this page's HTML to a file.
+
+        A correct, useful pipeline: this sink writes the fetched str verbatim.
+        It graded CONFLICT while raw falsely declared NOT_TEXT for a str of
+        HTML (elspeth-24c04df25f); the repair is at the producer — raw claims
+        UNCONSTRAINED — and this pins the composition, not just the sets, so
+        the edge cannot silently regress from either side.
+        """
+        from elspeth.contracts.plugin_semantics import SemanticOutcome, compare_semantic
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+
+        facts = _build_web_scrape_output_semantics(
+            content_field="announcement_text",
+            format="raw",
+            text_separator="\n",
+        ).fields[0]
+
+        assert compare_semantic(facts, self._requirement(tmp_path / "page.html")) is SemanticOutcome.SATISFIED
+
     def test_content_kind_is_deliberately_unconstrained(self, tmp_path: Path) -> None:
         """Non-empty here would defeat the sink's own purpose.
 

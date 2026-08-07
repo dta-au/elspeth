@@ -245,7 +245,10 @@ class TestLineExplodeInputSemanticRequirements:
         # The generative producer (llm) — the composition g11 needed.
         assert compare_semantic(_facts(TextFraming.UNCONSTRAINED), req) is SemanticOutcome.SATISFIED
         # Genuinely-wrong producers stay blocked under the relaxed policy,
-        # because CONFLICT short-circuits ahead of UNKNOWN.
+        # because CONFLICT short-circuits ahead of UNKNOWN. (No shipped
+        # producer declares NOT_TEXT today — web_scrape's raw html claims
+        # UNCONSTRAINED, elspeth-24c04df25f — so that arm pins the vocabulary
+        # member, not a live composition.)
         assert compare_semantic(_facts(TextFraming.COMPACT, ContentKind.PLAIN_TEXT), req) is SemanticOutcome.CONFLICT
         assert compare_semantic(_facts(TextFraming.NOT_TEXT, ContentKind.HTML_RAW), req) is SemanticOutcome.CONFLICT
         # Line-bearing producers unchanged.

@@ -101,6 +101,13 @@ class TextFraming(StrEnum):
     generative producer must still be gateable. Declare ``UNCONSTRAINED`` only
     where the value genuinely is unbounded free text — using it as a shortcut
     for "I did not look" re-creates the abstention it exists to replace.
+
+    ``NOT_TEXT`` is likewise a positive CLAIM, and the strongest one: the
+    value is not text at all, so no line operation and no text encoding
+    applies to it. It is not a softer "please do not line-split this" — a str
+    of markup is text with an UNCONSTRAINED framing, not NOT_TEXT. Declaring
+    NOT_TEXT for a value that is in fact a str falsely CONFLICTs every
+    verbatim text consumer (elspeth-24c04df25f).
     """
 
     UNKNOWN = "unknown"

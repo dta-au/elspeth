@@ -155,14 +155,17 @@ def _build_line_explode_input_requirements(
             # line boundaries are, not what the text MEANS, so content_kind is
             # deliberately unconstrained (the shape json_explode already uses).
             # Every producer this requirement should block conflicts on framing
-            # alone — web_scrape raw html declares NOT_TEXT, its compact text
-            # declares COMPACT — so constraining content_kind blocked nothing
-            # extra, while downgrading to UNKNOWN every producer that declares
+            # alone — web_scrape's compact text declares COMPACT — so
+            # constraining content_kind blocked nothing extra, while
+            # downgrading to UNKNOWN every producer that declares
             # framing but honestly abstains on kind (an LLM: prose or markdown
             # is not statically decidable). It was also wrong in one real case:
             # JSON_STRUCTURED + NEWLINE_FRAMED is JSONL, and splitting JSONL
             # into one object per row is correct rather than a defect. NOT_TEXT
-            # remains the member that carries "no line operations on this".
+            # — a positive claim that the value is not text at all — stays
+            # excluded; note web_scrape's raw html is NOT that (it declares
+            # UNCONSTRAINED, elspeth-24c04df25f), and splitting fetched text
+            # into line rows is as legitimate as splitting generated text.
             FieldSemanticRequirement(
                 field_name=source_field,
                 accepted_content_kinds=frozenset(),
@@ -293,7 +296,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8046aff02b3c3bf8"
+    source_file_hash: str | None = "sha256:b229c212e97ec3c4"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "

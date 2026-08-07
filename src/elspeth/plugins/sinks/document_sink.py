@@ -112,7 +112,7 @@ class DocumentSink(BaseSink):
     name = "document"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cedc9f147d7ed95b"
+    source_file_hash: str | None = "sha256:3087c4ee89af132e"
     config_model = DocumentSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -404,9 +404,16 @@ class DocumentSink(BaseSink):
         do: ``llm -> document`` must be SATISFIED at authoring time, in the
         same breath as ``llm -> text`` becomes a CONFLICT (ADR-039).
 
-        NOT_TEXT is excluded: this sink encodes a ``str``, so a producer that
-        positively claims a non-text value is a real contradiction, and
-        ``accepted_value_types={STR}`` says the same thing on the other axis.
+        NOT_TEXT is excluded: it is the one framing that positively claims the
+        value is not text at all, and a sink that encodes a ``str`` can do
+        nothing with such a value. ``accepted_value_types={STR}`` is NOT the
+        same claim on another axis — the two exclusions catch different
+        failure shapes. A producer declaring NOT_TEXT while abstaining on
+        value_type would pass the value-type check at WARN; the framing
+        CONFLICT still blocks it. A non-str producer that abstains on framing
+        conflicts on value_type instead. Only a self-contradictory declaration
+        (NOT_TEXT plus STR) trips both, and declaring that pairing is a
+        producer defect, not a sink question (elspeth-24c04df25f).
 
         ``accepted_content_kinds`` is DELIBERATELY empty — "dimension
         unconstrained" as a decision, not as an omission. A verbatim writer has

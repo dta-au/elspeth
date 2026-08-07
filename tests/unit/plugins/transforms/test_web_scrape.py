@@ -1685,13 +1685,45 @@ class TestWebScrapeOutputSemantics:
         assert facts.content_kind is ContentKind.MARKDOWN
         assert facts.text_framing is TextFraming.LINE_COMPATIBLE
 
-    def test_raw_declares_html_raw_not_text(self):
+    def test_raw_declares_html_raw_with_unconstrained_framing(self):
+        """The raw value is the fetched page verbatim: a str whose framing is
+        whatever the server sent, which no configuration settles. That is the
+        UNCONSTRAINED claim by definition. NOT_TEXT — a positive claim that the
+        value is not text at all — was false of a str of HTML, and it made
+        ``raw -> document`` (archive this page to a file) a false authoring
+        CONFLICT (elspeth-24c04df25f)."""
         from elspeth.contracts.plugin_semantics import ContentKind, TextFraming
 
         ws = self._build(format="raw")
         facts = next(f for f in ws.output_semantics().fields if f.field_name == "content")
         assert facts.content_kind is ContentKind.HTML_RAW
-        assert facts.text_framing is TextFraming.NOT_TEXT
+        assert facts.text_framing is TextFraming.UNCONSTRAINED
+
+    def test_raw_framing_grades_the_framing_constrained_consumers_correctly(self):
+        """The three consumers that constrain framing, graded against raw's claim.
+
+        ``raw -> text`` must stay refused — a fetched page carries newlines and
+        TextSink diverts on CR/LF, so {COMPACT} correctly excludes it. But
+        ``raw -> line_explode`` is legitimate: splitting arbitrary fetched text
+        into line rows is the same operation as splitting generated text, which
+        line_explode exists to bless. (``raw -> document`` is pinned from the
+        sink's side in test_document_sink.py.)
+        """
+        from elspeth.contracts.plugin_semantics import SemanticOutcome, compare_semantic
+        from elspeth.plugins.transforms.line_explode import _build_line_explode_input_requirements
+        from elspeth.plugins.transforms.web_scrape import _build_web_scrape_output_semantics
+
+        facts = _build_web_scrape_output_semantics(content_field="content", format="raw", text_separator="\n").fields[0]
+
+        from elspeth.plugins.sinks.text_sink import TextSink
+
+        text_requirement = (
+            TextSink({"path": "/tmp/lines.txt", "field": "content", "schema": {"mode": "observed"}}).input_semantic_requirements().fields[0]
+        )
+        line_explode_requirement = _build_line_explode_input_requirements(source_field="content").fields[0]
+
+        assert compare_semantic(facts, text_requirement) is SemanticOutcome.CONFLICT
+        assert compare_semantic(facts, line_explode_requirement) is SemanticOutcome.SATISFIED
 
     def test_custom_content_field_changes_semantic_field_name(self):
         ws = self._build(format="text", text_separator="\n", content_field="body")

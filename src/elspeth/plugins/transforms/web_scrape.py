@@ -362,7 +362,14 @@ def _build_web_scrape_output_semantics(
         fact_code = "web_scrape.content.markdown"
     elif format == "raw":
         kind = ContentKind.HTML_RAW
-        framing = TextFraming.NOT_TEXT
+        # UNCONSTRAINED, not NOT_TEXT: the raw value is the fetched page
+        # verbatim — a str whose framing is whatever the server sent, which no
+        # configuration settles. That is the UNCONSTRAINED claim by definition.
+        # NOT_TEXT positively claims the value is not text at all, which was
+        # false of a str of HTML and made ``raw -> document`` (archive this
+        # page to a file) a false authoring CONFLICT (elspeth-24c04df25f).
+        # HTML_RAW on the kind axis already says what the text IS.
+        framing = TextFraming.UNCONSTRAINED
         fact_code = "web_scrape.content.raw_html"
     elif format == "text":
         kind = ContentKind.PLAIN_TEXT
@@ -475,7 +482,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7745fbb544235ad6"
+    source_file_hash: str | None = "sha256:44971bb32d63fd3a"
     config_model = WebScrapeConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
