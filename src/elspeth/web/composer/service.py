@@ -4808,11 +4808,31 @@ class ComposerServiceImpl:
                 outstanding_findings=outstanding_findings,
             )
 
-        if runtime_result is not None and not runtime_result.is_valid:
+        if runtime_result is not None and not runtime_result.is_valid and not _state_is_structurally_empty(result.state):
             # Red verdict published to the operator (elspeth-ca0bd5d4ef). The
             # pending-handoff shape returned above is excluded on purpose: it is
             # a user-action boundary, not a validator objection, and counting it
             # here would answer a different question than the one asked.
+            #
+            # Structurally empty states are excluded for the same reason, and
+            # the exclusion MIRRORS the repair loop's own guard rather than
+            # naming a finalize branch (elspeth-ebdea1112b).
+            # ``_attempt_preflight_repair`` returns False on an
+            # empty state unconditionally, so an empty-state finalize can never
+            # have spent repair budget — the constraint is invisible from here
+            # because it lives in a different method, which is exactly why this
+            # keys on ``_state_is_structurally_empty`` and not on the branch
+            # that produced the verdict. Every such finalize lands at
+            # ``repair_turns_used=0``, so counting them only dilutes the
+            # numerator of "was the budget already spent when the objection
+            # reached the operator".
+            #
+            # This deliberately covers BOTH empty-state shapes: the red
+            # SYNTHESIZED by the no-mutation empty-state augmentation (nothing
+            # ever validated), and the ``preflight_invalid_empty_state_``
+            # ``augmentation`` branch, which carries a REAL validator objection.
+            # The second is excluded knowingly: the repair guard does not
+            # distinguish them either, so neither could have consumed a turn.
             _PREFLIGHT_INVALID_FINALIZE_COUNTER.add(
                 1,
                 {

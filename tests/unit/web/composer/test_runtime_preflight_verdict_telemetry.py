@@ -28,7 +28,9 @@ import pytest
 
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.service import ComposerServiceImpl, _preflight_verdict
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 
 from ._helpers import _empty_state, _make_settings, _mock_catalog
@@ -163,8 +165,11 @@ class TestPreflightInvalidFinalizeTelemetry:
         monkeypatch: pytest.MonkeyPatch,
         *,
         strict: ValidationResult,
+        last_runtime_preflight: ValidationResult | None,
         repair_turns_used: int,
-    ) -> list[tuple[int, dict[str, Any]]]:
+        state: CompositionState | None = None,
+        message: str = "build it",
+    ) -> tuple[list[tuple[int, dict[str, Any]]], ComposerResult]:
         counter = _FakeCounter()
         monkeypatch.setattr(service_module, "_PREFLIGHT_INVALID_FINALIZE_COUNTER", counter)
         monkeypatch.setattr(
@@ -181,29 +186,33 @@ class TestPreflightInvalidFinalizeTelemetry:
             content = "Here is what I attempted."
 
         # session_id=None makes the PT auto-surfacer and the orphan gate no-ops,
-        # isolating the finalize tail. last_runtime_preflight carries the verdict
-        # because the state did not mutate this turn.
-        await service._surface_and_finalize_no_tools(
+        # isolating the finalize tail. ``last_runtime_preflight`` is passed
+        # SEPARATELY from ``strict`` rather than reusing it: the empty-state
+        # cases below need "no preflight ever ran this turn" (None) while the
+        # patched validator still has to return something, and collapsing the
+        # two would make that shape unreachable.
+        result = await service._surface_and_finalize_no_tools(
             assistant_message=_AssistantMessage(),
-            state=_non_empty_state(),
+            state=_non_empty_state() if state is None else state,
             session_id=None,
             current_state_id=None,
             progress=None,
             recorder=BufferingRecorder(),
             initial_version=1,
             user_id="alice",
-            last_runtime_preflight=strict,
+            last_runtime_preflight=last_runtime_preflight,
             runtime_preflight_cache=service._new_runtime_preflight_cache(),
             session_scope="session:test",
-            message="build it",
+            message=message,
             mutation_success_seen=False,
             repair_turns_used=repair_turns_used,
         )
-        return counter.emitted
+        return counter.emitted, result
 
     @pytest.mark.anyio
     async def test_red_verdict_with_budget_left(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        emitted = await self._finalize(tmp_path, monkeypatch, strict=_structural_failure_result(), repair_turns_used=0)
+        red = _structural_failure_result()
+        emitted, _result = await self._finalize(tmp_path, monkeypatch, strict=red, last_runtime_preflight=red, repair_turns_used=0)
         assert emitted == [(1, {"budget_exhausted": False, "repair_turns_used": 0})]
 
     @pytest.mark.anyio
@@ -211,22 +220,89 @@ class TestPreflightInvalidFinalizeTelemetry:
         """The question this metric exists to answer: the model never received
         the actionable objection, because the shared repair budget was already
         spent by the time the preflight went red."""
-        emitted = await self._finalize(
+        red = _structural_failure_result()
+        emitted, _result = await self._finalize(
             tmp_path,
             monkeypatch,
-            strict=_structural_failure_result(),
+            strict=red,
+            last_runtime_preflight=red,
             repair_turns_used=service_module._MAX_REPAIR_TURNS,
         )
         assert emitted == [(1, {"budget_exhausted": True, "repair_turns_used": service_module._MAX_REPAIR_TURNS})]
 
     @pytest.mark.anyio
     async def test_green_verdict_emits_nothing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        emitted = await self._finalize(tmp_path, monkeypatch, strict=_valid_result(), repair_turns_used=0)
+        green = _valid_result()
+        emitted, _result = await self._finalize(tmp_path, monkeypatch, strict=green, last_runtime_preflight=green, repair_turns_used=0)
         assert emitted == []
 
     @pytest.mark.anyio
     async def test_pending_handoff_is_not_a_red_finalize(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """A user-action boundary is not a validator objection. Counting it here
         would answer a different question than the one asked."""
-        emitted = await self._finalize(tmp_path, monkeypatch, strict=_handoff_result(), repair_turns_used=0)
+        handoff = _handoff_result()
+        emitted, _result = await self._finalize(tmp_path, monkeypatch, strict=handoff, last_runtime_preflight=handoff, repair_turns_used=0)
+        assert emitted == []
+
+    @pytest.mark.anyio
+    async def test_synthesized_empty_state_red_does_not_count_as_an_invalid_finalize(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The counter's numerator must not be diluted by a red nothing could
+        have repaired (elspeth-ebdea1112b).
+
+        No preflight ran this turn at all — ``last_runtime_preflight`` is None
+        and the state never mutated. The only red in play is the one
+        ``no_tool_finalize`` SYNTHESIZES for the no-mutation empty-state
+        augmentation branch, and it arrives at ``repair_turns_used=0`` BY
+        CONSTRUCTION: ``_attempt_preflight_repair`` returns False
+        on a structurally empty state, so the repair loop can never have spent
+        budget on this turn. Counting it answers "how often does the composer
+        finalize on an empty pipeline", not "was the budget already spent when
+        the objection reached the operator".
+        """
+        emitted, result = await self._finalize(
+            tmp_path,
+            monkeypatch,
+            strict=_valid_result(),
+            last_runtime_preflight=None,
+            state=_empty_state(),
+            message="build me a pipeline",  # carries a build action
+            repair_turns_used=0,
+        )
+        # Anti-vacuity: a red really was published to the operator on this
+        # turn. Without this the test would also pass if the augmentation
+        # branch stopped synthesizing a verdict altogether.
+        assert result.runtime_preflight is not None
+        assert not result.runtime_preflight.is_valid
+        assert emitted == []
+
+    @pytest.mark.anyio
+    async def test_real_red_on_an_empty_state_does_not_count_either(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The deliberate half of the exclusion (elspeth-ebdea1112b).
+
+        Here the red is a GENUINE validator objection carried in on
+        ``last_runtime_preflight``, and finalize takes the
+        ``preflight_invalid_empty_state_augmentation`` branch. It is excluded
+        anyway, and not by accident: the repair loop's empty-state guard is
+        unconditional, so this finalize could not have spent budget either. The
+        exclusion is keyed on the same predicate as that guard precisely so the
+        two cannot drift.
+
+        The message deliberately carries no build action, which is what routes
+        an empty state past the no-mutation augmentation branch to this one.
+        """
+        red = _structural_failure_result()
+        emitted, result = await self._finalize(
+            tmp_path,
+            monkeypatch,
+            strict=red,
+            last_runtime_preflight=red,
+            state=_empty_state(),
+            message="why is it still red?",
+            repair_turns_used=0,
+        )
+        # Identity, not just is_valid: proves the published verdict is the real
+        # objection and not the synthesized one from the branch above.
+        assert result.runtime_preflight is red
         assert emitted == []
