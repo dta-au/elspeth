@@ -31,6 +31,19 @@ _MAX_ALLOWLIST_YAML_BYTES = 5 * 1024 * 1024
 _MIN_AUDIT_ANCHOR_ALNUM_CHARS = 2
 
 
+class JudgeMetadataKeyUnavailableError(ValueError):
+    """Raised when judge-metadata verification is requested without the signing key.
+
+    This is an operator-configuration fault, not a defect in the tree under
+    scan, so the CLI renders it as a remedy and an exit code rather than an
+    unhandled traceback. It stays fail-closed: the run still refuses, because
+    downgrading verification is a deliberate act the operator opts into via
+    ``ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE``, never something the CLI
+    decides on its own. Subclasses ``ValueError`` so the existing handlers in
+    the diagnose/sign paths keep treating it exactly as before.
+    """
+
+
 class DanglingAllowlistEntry(ValueError):
     """Raised when a judge-gated allow_hits entry's bound source file no longer exists.
 
@@ -786,7 +799,7 @@ def _judge_metadata_hmac_key() -> bytes:
     """Load the deployment-held key used to sign judge metadata."""
     raw = os.environ.get(_JUDGE_METADATA_SIGNATURE_ENV_VAR)
     if raw is None or raw == "":
-        raise ValueError(
+        raise JudgeMetadataKeyUnavailableError(
             f"{_JUDGE_METADATA_SIGNATURE_ENV_VAR} is required to verify or write "
             "judge_metadata_signature for post-judge allowlist entries. This key "
             "must be held outside the allowlist YAML; without it, verdict metadata "

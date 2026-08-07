@@ -48,6 +48,63 @@ def test_cli_rules_all_token_selects_every_registered_rule() -> None:
     assert set(_expand_rule_tokens(("all",), available)) == available
 
 
+def test_cli_reports_a_missing_judge_key_as_an_operator_error_not_a_traceback(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A keyless run must fail closed with a remedy, not an unhandled stack trace.
+
+    The gate still refuses to run — verification is never downgraded on the
+    CLI's own initiative — but the operator is told which env var restores it.
+    """
+    import argparse
+    from collections.abc import Iterable
+
+    from elspeth_lints.core.allowlist import JudgeMetadataKeyUnavailableError
+    from elspeth_lints.core.cli import _run_check
+    from elspeth_lints.core.protocols import Category, Finding, RuleContext, RuleMetadata, RuleScope, Severity
+    from elspeth_lints.core.registry import RuleRegistry
+
+    class KeylessRule:
+        id = "demo.keyless"
+        scope = RuleScope.WHOLE_REPO
+        metadata = RuleMetadata(
+            id=id,
+            name="Keyless",
+            description="Raises the operator-configuration error.",
+            severity=Severity.ERROR,
+            category=Category.MANIFEST,
+            cwe=(),
+            scope=scope,
+            path_filter=r".*\.py$",
+            examples_violation_count=1,
+            examples_clean_count=1,
+        )
+
+        def analyze(self, tree: ast.AST, file_path: Path, context: RuleContext) -> Iterable[Finding]:
+            del tree, file_path, context
+            raise JudgeMetadataKeyUnavailableError("ELSPETH_JUDGE_METADATA_HMAC_KEY is required to verify judge metadata.")
+
+    registry = RuleRegistry()
+    registry.register(KeylessRule())
+
+    exit_code = _run_check(
+        argparse.Namespace(
+            rules="demo.keyless",
+            rule_set="static",
+            format="text",
+            root=tmp_path,
+            repo_root=None,
+            allowlist_dir=None,
+            files=[],
+        ),
+        registry=registry,
+    )
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "ELSPETH_JUDGE_METADATA_HMAC_KEY" in captured.err
+    assert "ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE" in captured.err
+    assert "Traceback" not in captured.err
+
+
 def test_cli_honors_empty_rule_set_without_optional_rule_dependencies(tmp_path: Path) -> None:
     """A standalone install can run an empty check without optional rule imports."""
     env = _standalone_lints_env_without_runtime_packages(tmp_path)

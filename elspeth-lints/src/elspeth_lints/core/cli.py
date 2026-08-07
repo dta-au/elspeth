@@ -16,7 +16,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from elspeth_lints.core.allowlist import AuditReviewVerdict, JudgeVerdict, is_substantive_audit_anchor
+from elspeth_lints.core.allowlist import (
+    _JUDGE_METADATA_SIGNATURE_ENV_VAR,
+    _JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR,
+    _JUDGE_METADATA_SIGNATURE_VERIFY_SHAPE_ONLY_WHEN_KEY_MISSING,
+    AuditReviewVerdict,
+    JudgeMetadataKeyUnavailableError,
+    JudgeVerdict,
+    is_substantive_audit_anchor,
+)
 from elspeth_lints.core.ast_walker import (
     ParsedPythonFile,
     PythonFileReadError,
@@ -1317,7 +1325,21 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
                 diagnostic_paths.add(item.path)
 
     for rule in whole_repo_rules:
-        findings.extend(rule.analyze(empty_tree, args.root, context))
+        try:
+            findings.extend(rule.analyze(empty_tree, args.root, context))
+        except JudgeMetadataKeyUnavailableError as exc:
+            # Operator configuration, not a defect in the scanned tree. Still
+            # fail-closed — the run refuses rather than verifying less — but
+            # name the remedy instead of surfacing a traceback.
+            sys.stderr.write(
+                f"{rule.id}: {exc}\n"
+                f"Set {_JUDGE_METADATA_SIGNATURE_ENV_VAR} to verify judge metadata, or set "
+                f"{_JUDGE_METADATA_SIGNATURE_VERIFY_MODE_ENV_VAR}="
+                f"{_JUDGE_METADATA_SIGNATURE_VERIFY_SHAPE_ONLY_WHEN_KEY_MISSING} to accept shape-only "
+                "verification, which CANNOT detect forged or tampered judge metadata and must be "
+                "re-verified in a trusted context before any merge is authoritative.\n"
+            )
+            return 2
 
     if incremental_rules:
         explicit_files = tuple(args.files or ())

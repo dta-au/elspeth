@@ -1755,3 +1755,17 @@ def test_v1_entry_still_crashes_on_whole_file_byte_drift(tmp_path: Path, monkeyp
     src_path.write_text("# changed content\n", encoding="utf-8")
     with pytest.raises(ValueError, match="file_fingerprint mismatch"):
         load_allowlist(allowlist, valid_rule_ids=set(), source_root=source_root)
+
+
+def test_missing_judge_metadata_key_raises_the_named_operator_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing signing key is an operator-configuration fault, not an anonymous ValueError.
+
+    The CLI converts this named type into an exit code with a remedy; it must
+    stay fail-closed — verification is never silently downgraded.
+    """
+    from elspeth_lints.core.allowlist import JudgeMetadataKeyUnavailableError, _judge_metadata_hmac_key
+
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+
+    with pytest.raises(JudgeMetadataKeyUnavailableError, match="ELSPETH_JUDGE_METADATA_HMAC_KEY"):
+        _judge_metadata_hmac_key()
