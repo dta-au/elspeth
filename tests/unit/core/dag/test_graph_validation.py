@@ -1423,6 +1423,155 @@ class TestUnionCoalesceGuaranteedExtras:
         assert result.extra_fields == ("category", "id", "price", "product")
 
 
+# Branches that declare nothing: the coalesce's effective schema resolves to
+# DYNAMIC (None), so the sink edge takes validate_single_edge's bypass arm —
+# the path where _validate_locked_consumer_guaranteed_extras itself must
+# assemble the verdict.
+_BRANCH_OBSERVED = """    schema:
+      mode: observed"""
+
+# A locked sink that ALSO requires a field nothing upstream produces.
+_SINK_REQUIRES_UNPRODUCED = """        fields:
+        - 'description: str'
+        - 'mandatory_flag: str'
+"""
+
+# The elspeth-3283f2eaec split: optional in the pydantic model (str?), required
+# at option level (required_fields). check_compatibility's missing arm reads
+# only model-required fields, so the requirement is invisible to it and
+# validate_sink_required_fields owns the verdict.
+_SINK_REQUIRES_UNPRODUCED_OPTION_LEVEL = """        fields:
+        - 'description: str'
+        - 'mandatory_flag: str?'
+        required_fields:
+        - mandatory_flag
+"""
+
+
+class TestDualViolationSinkDiagnosisPrecedence:
+    """One edge violating BOTH rules must lead with the sink-required diagnosis.
+
+    A coalesce that guarantees phantom extras against a locked sink can, on the
+    same edge, fail to guarantee a field the sink requires. Reporting extras
+    alone proposes "insert a field_mapper with select_only: true" — a repair
+    that leaves the sink still requiring a field nothing provides, a FALSE
+    repair signal to an LLM authoring loop (elspeth-6465c8bba7). The two paths
+    resolve it differently and each needs its own pin:
+
+    * BYPASS path (observed/dynamic producer): the helper fires from inside the
+      per-edge loop, BEFORE validate_sink_required_fields can run, so it
+      ACCUMULATES — it consults the sink rule's single owner
+      (_sink_required_missing_fields) and assembles one verdict carrying both
+      halves, sink half first.
+    * TYPED path: the helper fires from validate_typed_producer_guaranteed_extras,
+      deliberately ordered LAST, so the sink sweep raises first and ordering
+      alone settles precedence.
+
+    Until these tests, the accumulate arm had zero coverage: no test reached a
+    sink whose declared_required_fields exceeded its upstream guarantees.
+    """
+
+    def test_bypass_path_reports_both_violations_in_one_verdict(self) -> None:
+        """The accumulate arm: sink half leads, extras half follows, one raise.
+
+        The eligibility precondition is asserted on a green sibling (flexible
+        sink, so the locked-extras guard declines): observed branches leave the
+        coalesce's effective producer schema DYNAMIC (None), which is what
+        routes the failing sibling through validate_single_edge's first bypass
+        arm rather than check_compatibility, and the guarantee channel really
+        carries the five source fields. Without that proof this test could
+        silently start exercising the typed path instead (the decoration trap).
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        green = _build_coalesce_graph(branch_schema=_BRANCH_OBSERVED, sink_mode="flexible")
+        coalesce_id = next(n.node_id for n in green.get_nodes() if n.node_type.value == "coalesce")
+        effective = schema_validation.get_effective_producer_schema(green, coalesce_id, _cache={})
+        assert effective is None
+        assert schema_validation.get_effective_guaranteed_fields(green, coalesce_id) == frozenset(
+            {"id", "product", "price", "category", "description"}
+        )
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(branch_schema=_BRANCH_OBSERVED, sink_fields=_SINK_REQUIRES_UNPRODUCED)
+
+        message = str(exc_info.value)
+        sink_half = message.find("requires fields ['mandatory_flag']")
+        extras_half = message.find("Extra fields rejected by consumer input contract")
+        assert sink_half != -1 and extras_half != -1
+        assert sink_half < extras_half, "the actionable sink diagnosis must lead"
+        assert "BOTH must be repaired" in message
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.missing_fields == ("mandatory_flag",)
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_bypass_path_extras_only_carries_no_sink_verdict(self) -> None:
+        """The accumulate arm must not invent a sink violation that is not there.
+
+        Same bypass topology, but the sink's only required field (description —
+        compact 'name: type' declarations are required by default) IS
+        guaranteed, so _sink_required_missing_fields is empty and the verdict
+        must be the plain extras report with nothing accumulated.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(branch_schema=_BRANCH_OBSERVED)
+
+        message = str(exc_info.value)
+        assert "BOTH must be repaired" not in message
+        assert "does not guarantee them" not in message
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.missing_fields == ()
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_typed_path_sink_sweep_outranks_the_final_pass_extras(self) -> None:
+        """Ordering discipline on the typed path: the sink sweep raises first.
+
+        Under-declared FLEXIBLE branches give the coalesce a typed merged
+        schema, so this edge is validate_typed_producer_guaranteed_extras
+        territory — and that pass runs after validate_sink_required_fields
+        precisely so a graph tripping both keeps the pre-existing sink error.
+        The requirement is option-level (model-optional), so
+        check_compatibility's missing arm cannot pre-empt the sweep either.
+
+        The exception TYPE is the eligibility discriminator: had this shape
+        taken the bypass path, the helper would raise EdgeContractError with
+        the combined message; had check_compatibility owned it, the message
+        would be its 'Missing fields' form. A plain GraphValidationError with
+        the sink wording proves the sweep fired.
+        """
+        from elspeth.core.dag.models import EdgeContractError, GraphValidationError
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_coalesce_graph(sink_fields=_SINK_REQUIRES_UNPRODUCED_OPTION_LEVEL)
+
+        assert not isinstance(exc_info.value, EdgeContractError)
+        message = str(exc_info.value)
+        assert "requires fields ['mandatory_flag']" in message
+        assert "does not guarantee them" in message
+        assert "Extra fields rejected" not in message
+
+    def test_typed_path_model_required_is_owned_by_the_missing_arm(self) -> None:
+        """A model-required unproduced field is check_compatibility's verdict.
+
+        The same shape with mandatory_flag required IN THE MODEL is a true
+        reject owned by the missing arm — the field is absent from the
+        guarantee channel too, so when that arm becomes guarantee-aware
+        (elspeth-7d68b04878) this must KEEP failing: a guarantee-aware arm
+        may only forgive fields the graph proves present, and nothing proves
+        mandatory_flag. Pinned now so that fix cannot over-widen unnoticed.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError, match="Missing fields: mandatory_flag"):
+            _build_coalesce_graph(sink_fields=_SINK_REQUIRES_UNPRODUCED)
+
+
 _LINEAR_PASS_THROUGH_PIPELINE = """sources:
   primary:
     plugin: csv
