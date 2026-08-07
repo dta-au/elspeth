@@ -1345,19 +1345,19 @@ class TestUnionCoalesceGuaranteedExtras:
         """
         _build_coalesce_graph(sink_mode="flexible")
 
-    @pytest.mark.xfail(
-        reason=(
-            "Inverse defect, deliberately out of scope for elspeth-1451ff385f: "
-            "check_compatibility's MISSING-fields arm reads the declared channel only, "
-            "the mirror of the extras-arm defect this class fixes. The coalesce declares "
-            "['description'], so a sink admitting every GUARANTEED field is rejected with "
-            "'Missing fields' even though the rows carry them and the pipeline runs. "
-            "Pinned so the asymmetry is visible in the suite, not only in the ticket."
-        ),
-        strict=True,
-    )
-    def test_sink_admitting_every_guaranteed_field_is_wrongly_rejected(self) -> None:
-        """The remedy the rejection message used to propose first — a false reject."""
+    def test_sink_admitting_every_guaranteed_field_builds(self) -> None:
+        """The missing arm now reads the guarantee channel (elspeth-7d68b04878).
+
+        Formerly a strict xfail pinning the inverse defect: the coalesce
+        declares ['description'], so a sink admitting every GUARANTEED field
+        was rejected with 'Missing fields' even though the rows carry them and
+        the pipeline runs — which made the extras rejection's first remedy
+        ("add the extra fields to the consumer") a dead end. The forgiveness
+        is firewall-gated: a producer that FORBIDS extras keeps its missing
+        verdict (TestReductiveProducerExtrasFirewall's missing-arm sibling),
+        and a required field the guarantee does not cover keeps failing
+        (TestDualViolationSinkDiagnosisPrecedence's model-required pin).
+        """
         _build_coalesce_graph(sink_fields=_SINK_ADMITS_ALL)
 
     def test_select_only_field_mapper_clears_the_rejection(self) -> None:
@@ -1686,13 +1686,15 @@ class TestReductiveProducerExtrasFirewall:
     """
 
     @staticmethod
-    def _reductive_graph() -> ExecutionGraph:
+    def _reductive_graph(*, sink_fields: list[str] | None = None) -> ExecutionGraph:
         from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 
         consumed = SchemaConfig.from_dict({"mode": "fixed", "fields": ["value: float"]})
         emitted = SchemaConfig.from_dict({"mode": "fixed", "fields": ["count: int", "sum: float"]})
+        sink = SchemaConfig.from_dict({"mode": "fixed", "fields": sink_fields or ["count: int", "sum: float"]})
         consumed_model = create_schema_from_config(consumed, "Consumed", allow_coercion=False)
         emitted_model = create_schema_from_config(emitted, "Emitted", allow_coercion=False)
+        sink_model = create_schema_from_config(sink, "SinkInput", allow_coercion=False)
 
         graph = ExecutionGraph()
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv", output_schema=consumed_model)
@@ -1705,7 +1707,7 @@ class TestReductiveProducerExtrasFirewall:
             # The guarantee channel describes what it CONSUMES, not emits.
             config={"schema": {"mode": "fixed", "fields": ["value: float"]}},
         )
-        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", input_schema=emitted_model)
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="csv", input_schema=sink_model)
         graph.add_edge("source", "agg", label="continue")
         graph.add_edge("agg", "sink", label="continue")
         return graph
@@ -1721,3 +1723,21 @@ class TestReductiveProducerExtrasFirewall:
         assert "value" not in graph.get_node_info("agg").output_schema.model_fields
 
         graph.validate_edge_compatibility()
+
+    def test_reductive_producer_guarantee_does_not_satisfy_a_requiring_consumer(self) -> None:
+        """The firewall's missing-arm direction (elspeth-7d68b04878).
+
+        Same producer, but the sink now REQUIRES the guaranteed-but-never-
+        emitted field. The guarantee-aware missing arm may forgive a required
+        field only when the producer ADMITS undeclared fields; this producer
+        is mode: fixed, so `value` provably never arrives and the missing
+        verdict must stand. The sink also declares count/sum, so the verdict
+        rides on the missing arm alone — the extras arm has nothing to reject
+        and cannot mask an over-forgiving missing arm.
+        """
+        from elspeth.core.dag.models import EdgeContractError
+
+        graph = self._reductive_graph(sink_fields=["count: int", "sum: float", "value: float"])
+
+        with pytest.raises(EdgeContractError, match="Missing fields: value"):
+            graph.validate_edge_compatibility()

@@ -193,6 +193,8 @@ def _check_field_constraints(
 def check_compatibility(
     producer_schema: type[PluginSchema],
     consumer_schema: type[PluginSchema],
+    *,
+    producer_guaranteed: frozenset[str] = frozenset(),
 ) -> CompatibilityResult:
     """Check if producer output is compatible with consumer input.
 
@@ -207,9 +209,30 @@ def check_compatibility(
     - If consumer has extra="forbid", producer must not have extra fields
     - If consumer has strict=True, no type coercion is allowed (int->float rejected)
 
+    ``producer_guaranteed`` carries the OTHER knowledge channel: fields the
+    graph proves present on every row even though the producer never typed
+    them (an under-declaring pass-through, a union coalesce merging
+    under-declared branches). A consumer-required field found there is not
+    missing — reporting it was a false reject of runnable pipelines
+    (elspeth-7d68b04878). Two deliberate limits keep the forgiveness sound:
+
+    - It applies only when the producer ADMITS undeclared fields
+      (``extra='allow'``). A producer that forbids extras emits exactly its
+      declared fields, so a guarantee naming anything else describes what it
+      CONSUMED, not what arrives — the same extras-firewall discriminator the
+      guaranteed-extras check uses — and the field stays missing.
+    - The guarantee channel carries names without types, so a forgiven field's
+      type is checked per-row at the consumer preflight rather than here —
+      the standard the dynamic/observed bypass paths already set, where no
+      build-time type check runs at all. A field the producer DOES declare is
+      never forgiven: the type-mismatch arm keeps its verdict.
+
     Args:
         producer_schema: Output schema of upstream plugin
         consumer_schema: Input schema of downstream plugin
+        producer_guaranteed: Fields the graph proves the producer delivers;
+            empty when the caller has no graph context (pairwise structural
+            checks, direct API use), which preserves the declared-only verdict
 
     Returns:
         CompatibilityResult indicating compatibility and any issues
@@ -223,6 +246,10 @@ def check_compatibility(
     # Direct access is correct per Tier 1 trust model - missing key would be our bug.
     consumer_strict = consumer_schema.model_config["strict"]
 
+    # The extras firewall, missing-arm direction: only a producer that admits
+    # undeclared fields can deliver a guaranteed-but-undeclared one.
+    producer_admits_undeclared = producer_schema.model_config["extra"] == "allow"
+
     missing: list[str] = []
     mismatches: list[tuple[str, str, str]] = []
     constraint_mismatches: list[tuple[str, str]] = []
@@ -232,8 +259,8 @@ def check_compatibility(
         is_required = consumer_field.is_required()
 
         if field_name not in producer_fields:
-            # Missing field - only a problem if required
-            if is_required:
+            # Missing field - only a problem if required and not proven present
+            if is_required and not (producer_admits_undeclared and field_name in producer_guaranteed):
                 missing.append(field_name)
         else:
             producer_field = producer_fields[field_name]

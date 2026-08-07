@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Annotated, Optional
 
 import pytest
-from pydantic import Field, ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 
 from elspeth.contracts.data import (
     PluginSchema,
@@ -317,3 +317,88 @@ class TestCheckCompatibilityConstraints:
         # int -> float coercion is allowed (consumer_strict=False by default),
         # and int values are always finite, so no constraint issue.
         assert result.compatible is True
+
+
+class TestCheckCompatibilityGuaranteeChannel:
+    """The missing arm reads producer_guaranteed (elspeth-7d68b04878).
+
+    A producer's promises travel in two channels: its typed model_fields and
+    the graph-walked guarantee set. A consumer-required field the guarantee
+    proves present is not missing merely because the producer never typed it —
+    but the forgiveness is firewall-gated: only a producer that ADMITS
+    undeclared fields (extra='allow') can deliver one. Both non-allow values
+    are pinned because the discriminator is equality with 'allow', not
+    inequality with 'forbid' — the base PluginSchema default is 'ignore',
+    which strips undeclared fields just as terminally.
+    """
+
+    @staticmethod
+    def _requiring_consumer() -> type[PluginSchema]:
+        class Consumer(PluginSchema):
+            x: int
+
+        return Consumer
+
+    def test_guaranteed_field_is_not_missing_when_producer_admits_undeclared(self) -> None:
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="allow")
+
+            y: str
+
+        result = check_compatibility(Producer, self._requiring_consumer(), producer_guaranteed=frozenset({"x"}))
+        assert result.compatible is True
+        assert result.missing_fields == ()
+
+    def test_forbidding_producer_keeps_the_missing_verdict(self) -> None:
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="forbid")
+
+            y: str
+
+        result = check_compatibility(Producer, self._requiring_consumer(), producer_guaranteed=frozenset({"x"}))
+        assert result.compatible is False
+        assert result.missing_fields == ("x",)
+
+    def test_ignoring_producer_keeps_the_missing_verdict(self) -> None:
+        class Producer(PluginSchema):
+            y: str
+
+        assert Producer.model_config["extra"] == "ignore"
+        result = check_compatibility(Producer, self._requiring_consumer(), producer_guaranteed=frozenset({"x"}))
+        assert result.compatible is False
+        assert result.missing_fields == ("x",)
+
+    def test_unguaranteed_field_stays_missing(self) -> None:
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="allow")
+
+            y: str
+
+        result = check_compatibility(Producer, self._requiring_consumer(), producer_guaranteed=frozenset({"y"}))
+        assert result.compatible is False
+        assert result.missing_fields == ("x",)
+
+    def test_default_argument_preserves_the_declared_only_verdict(self) -> None:
+        """Callers without graph context (pairwise checks, direct API) are unchanged."""
+
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="allow")
+
+            y: str
+
+        result = check_compatibility(Producer, self._requiring_consumer())
+        assert result.compatible is False
+        assert result.missing_fields == ("x",)
+
+    def test_declared_field_is_never_forgiven_by_a_guarantee(self) -> None:
+        """The guarantee carries names without types; a typed conflict stands."""
+
+        class Producer(PluginSchema):
+            model_config = ConfigDict(extra="allow")
+
+            x: str
+
+        result = check_compatibility(Producer, self._requiring_consumer(), producer_guaranteed=frozenset({"x"}))
+        assert result.compatible is False
+        assert result.missing_fields == ()
+        assert result.type_mismatches and result.type_mismatches[0][0] == "x"

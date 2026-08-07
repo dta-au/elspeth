@@ -236,8 +236,16 @@ def validate_single_edge(
         )
         return  # Observed schemas bypass static type validation
 
-    # Rule 2: Full compatibility check (missing fields, type mismatches, extra fields)
-    result = check_compatibility(producer_schema, consumer_schema)
+    # Rule 2: Full compatibility check (missing fields, type mismatches, extra
+    # fields). The guarantee walk rides along so the missing arm can forgive a
+    # consumer-required field the graph proves present even though the producer
+    # never typed it (elspeth-7d68b04878) — check_compatibility itself gates
+    # the forgiveness on the producer's extras firewall.
+    result = check_compatibility(
+        producer_schema,
+        consumer_schema,
+        producer_guaranteed=get_effective_guaranteed_fields(graph, from_node_id),
+    )
     if not result.compatible:
         # Raise the structured subclass so downstream layers (composer
         # runtime preflight error formatter at
