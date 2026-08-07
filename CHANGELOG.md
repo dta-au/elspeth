@@ -163,6 +163,20 @@ secret-reference regexes promoted to public `PROFILE_ALIAS_PATTERN` and
   supply a field nothing guarantees, so the author — often an LLM authoring
   loop — was handed a repair that leaves the graph invalid. Both verdicts are
   now accumulated into one error carrying both field sets.
+- **A locked consumer narrower than what its upstream provably delivers is now
+  a build-time error** — a `mode: fixed` schema admits exactly its declared
+  fields, and edge validation now checks that lock against every field the
+  graph proves the producer delivers (`guaranteed_fields`), not only against
+  the fields the producer's own schema declares. Pipelines that previously
+  validated green and then killed every row at the consumer's input preflight
+  — a pass-through transform forwarding more than it declares, or a union
+  coalesce merging under-declared branches — are rejected at build with both
+  field lists, and the Web Composer reports the same verdict at authoring time
+  (its guarantee walk now sees through union coalesces instead of abstaining).
+  Narrowing a wide stream on purpose needs a projection, not a schema edit:
+  insert a `field_mapper` with `select_only: true` ahead of the locked
+  consumer — declaring fewer fields on the consumer cannot drop fields an
+  upstream guarantees will arrive.
 
 ## 0.7.1 - 2026-07-23 (Recoverable effects and Composer proposal-validation coverage)
 
