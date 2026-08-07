@@ -654,6 +654,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/state.py:CompositionState.to_dict:return"
   - "src/elspeth/web/composer/yaml_generator.py:_source_entry:source"
   - "src/elspeth/web/composer/yaml_generator.py:_source_entry:return"
+  # Reads a serialized node dict from the same CompositionState shape as
+  # _source_entry:source above. Which fields are mandatory depends on the
+  # node's own node_type — that is why the helper takes the key as an
+  # argument — so no single TypedDict can express the contract it enforces.
+  - "src/elspeth/web/composer/yaml_generator.py:_require_node_key:node"
   # Web execution path-rewrite helper operates on raw YAML-parsed config dicts.
   # Pre-existing helper brushed by G4 (ADR-025) migration neighbouring lines;
   # the rewrite shape will become typed when CompositionStateRecord migrates
