@@ -752,29 +752,68 @@ def _blob_creation_provenance(content: str, context: ToolContext) -> _BlobCreati
     )
 
 
-def _state_source_blob_refs(state: CompositionState) -> frozenset[str]:
-    """Blob refs bound to any pipeline source root."""
-    refs: set[str] = set()
+def _state_options_reference_blob(
+    options: Mapping[str, Any],
+    blob_id: str,
+    storage_path: str,
+    *,
+    owner: str,
+) -> bool:
+    """Recursively inspect one component's options for references to a blob.
+
+    Recognizes every composer-authored blob vocabulary: ``blob_ref`` values
+    (top-level source bindings and nested inline-content markers), and
+    ``path``/``file`` values equal to either the blob's canonical
+    ``storage_path`` or its ``blob:<uuid>`` sentinel.  Frozen state options
+    are Mapping/tuple shaped, hence the structural checks here rather than
+    the exact ``dict``/``list`` checks the DB-side walker uses.
+
+    A present-but-non-str ``blob_ref`` cannot arise from any valid authoring
+    path (the canonical writers always record ``blob["id"]``); it is a
+    corruption of the audited CompositionState.  Silently treating it as
+    "not bound" would let update/delete mutate a blob that is in fact bound,
+    defeating the guard — so escalate rather than suppress.
+    """
+    for key, value in options.items():
+        if key == "blob_ref":
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise AuditIntegrityError(f"{owner} has a non-str blob_ref ({type(value).__name__}); CompositionState integrity anomaly")
+            if value == blob_id:
+                return True
+        elif key in ("path", "file") and isinstance(value, str):
+            if value == storage_path or value == f"blob:{blob_id}":
+                return True
+        elif isinstance(value, Mapping):
+            if _state_options_reference_blob(value, blob_id, storage_path, owner=owner):
+                return True
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, Mapping) and _state_options_reference_blob(item, blob_id, storage_path, owner=owner):
+                    return True
+    return False
+
+
+def _state_references_blob(state: CompositionState, blob_id: str, storage_path: str) -> bool:
+    """Whether the current composition references a blob anywhere.
+
+    Walks every source, node, and output option tree — the same coverage
+    ``_composition_references_blob`` applies to an active run's persisted
+    pipeline dict, applied here to the live authored state so update/delete
+    cannot invalidate an accepted composition through a nested reference the
+    old top-level-source check never saw (elspeth-b3feba9a7c).
+    """
     for source_name, source in state.sources.items():
-        if "blob_ref" not in source.options:
-            continue
-        blob_ref = source.options["blob_ref"]
-        if not isinstance(blob_ref, str):
-            # The canonical writer sets blob_ref exclusively from
-            # authoritative blob metadata as blob["id"] (a str) in
-            # sources.py::_resolve_source_blob, and every caller-injection
-            # path is rejected (_reject_manual_source_blob_ref, the
-            # patch_source_options blob_ref guard). A present-but-non-str
-            # blob_ref therefore cannot arise from any valid authoring path:
-            # it is a corruption of the audited CompositionState. Silently
-            # treating it as "not bound" would let _execute_update_blob mutate
-            # a blob that is in fact bound to a pipeline source, defeating the
-            # binding guard — so escalate rather than suppress.
-            raise AuditIntegrityError(
-                f"Source '{source_name}' has a non-str blob_ref ({type(blob_ref).__name__}); CompositionState integrity anomaly"
-            )
-        refs.add(blob_ref)
-    return frozenset(refs)
+        if _state_options_reference_blob(source.options, blob_id, storage_path, owner=f"Source '{source_name}'"):
+            return True
+    for node in state.nodes:
+        if _state_options_reference_blob(node.options, blob_id, storage_path, owner=f"Node '{node.id}'"):
+            return True
+    for output in state.outputs:
+        if _state_options_reference_blob(output.options, blob_id, storage_path, owner=f"Output '{output.name}'"):
+            return True
+    return False
 
 
 def _blob_storage_path(data_dir: str, session_id: str, blob_id: str, filename: str) -> Path:
@@ -1305,11 +1344,6 @@ def _execute_update_blob(
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
     content = validated.content
-    if blob_id in _state_source_blob_refs(state):
-        return _failure_result(
-            state,
-            f"Blob '{blob_id}' is currently bound as a pipeline source; create a new blob and rebind the source instead.",
-        )
     provenance = _blob_creation_provenance(content, context)
     provenance_message_id = _blob_provenance_message_id(context.user_message_id)
 
@@ -1383,6 +1417,32 @@ def _execute_update_blob(
                     # own sidecar — os.replace below would otherwise
                     # silently overwrite an unresolved journal.
                     reconcile_blob_storage_versions(storage_path, expected_hash=blob["content_hash"])
+                    # Composition-reference guard: any blob the current
+                    # composition references anywhere (top-level source
+                    # binding, nested inline marker, node/output option,
+                    # raw path or blob:<uuid> sentinel) is immutable until
+                    # unbound — mutating it would silently invalidate the
+                    # accepted composition's pinned hashes and review
+                    # evidence (elspeth-b3feba9a7c).
+                    if _state_references_blob(state, blob_id, blob["storage_path"]):
+                        raise _BlobUpdateBlockedByRetentionGuard(
+                            f"Blob '{blob_id}' is referenced by the current composition and cannot be updated; "
+                            "create a new blob and rebind instead."
+                        )
+                    # Pending-proposal retention guard — parity with
+                    # delete_blob: a staged proposal's reviewed blob
+                    # dependencies must survive unchanged until the
+                    # proposal reaches a terminal state.
+                    retaining_proposal_id = pending_proposal_reference_id(
+                        conn,
+                        session_id=session_id,
+                        blob_id=blob_id,
+                        exclude_proposal_id=context.executing_proposal_id,
+                    )
+                    if retaining_proposal_id is not None:
+                        raise _BlobUpdateBlockedByRetentionGuard(
+                            f"Blob '{blob_id}' is referenced by pending proposal '{retaining_proposal_id}' and cannot be updated."
+                        )
                     fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
                     if fork_operation_id is not None:
                         raise _BlobUpdateBlockedByRetentionGuard(
@@ -1715,6 +1775,15 @@ def _execute_delete_blob_locked(
             # this deletion — a stale pre-update sidecar or unresolved
             # tombstone must resolve to the committed version first.
             reconcile_blob_storage_versions(storage_path, expected_hash=blob["content_hash"])
+            # Composition-reference guard: a blob the current composition
+            # references anywhere cannot be deleted until every reference
+            # is removed — a successful delete would leave the accepted
+            # composition pointing at missing bytes (elspeth-b3feba9a7c).
+            if _state_references_blob(state, blob_id, blob["storage_path"]):
+                return _failure_result(
+                    state,
+                    f"Blob '{blob_id}' is referenced by the current composition and cannot be deleted; unbind it first.",
+                )
             fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
             if fork_operation_id is not None:
                 return _failure_result(

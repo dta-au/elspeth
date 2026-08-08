@@ -2774,6 +2774,11 @@ class ToolContext:
         reviewed_source_authority: Private session-bound reviewed source
             authority. Generic/manual callers leave this unset and therefore
             remain subject to the normal fail-closed custody checks.
+        executing_proposal_id: The pending proposal this dispatch is
+            executing (proposal-accept replay). The blob retention guard
+            excludes exactly this proposal so an update_blob proposal can
+            be accepted without being blocked by its own retention edge;
+            every OTHER pending proposal still blocks.
         _interpretation_requirements_are_internal: Private server-owned
             allowance for revalidating a proposal that already crossed the
             public compact-shell admission boundary. Public tool arguments
@@ -2800,6 +2805,7 @@ class ToolContext:
     composer_skill_hash: str | None = None
     tool_arguments_hash: str | None = None
     reviewed_source_authority: ReviewedSourceAuthority | None = None
+    executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
 
 

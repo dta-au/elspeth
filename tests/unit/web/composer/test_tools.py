@@ -14360,7 +14360,7 @@ class TestUpdateBlobActiveRunGuard:
         )
 
         assert result.success is False
-        assert "source" in result.data["error"].lower()
+        assert "referenced by the current composition" in result.data["error"]
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
@@ -17737,3 +17737,199 @@ class TestUpdateBlobSidecarCommitFailure:
         assert list(storage_path.parent.iterdir()) == [storage_path], (
             f"sidecar/tempfile debris left after rollback: {list(storage_path.parent.iterdir())}"
         )
+
+
+class TestBlobCompositionReferenceGuards:
+    """update/delete must refuse any blob the composition references anywhere.
+
+    The update guard previously consulted only top-level source ``blob_ref``
+    values (``_state_source_blob_refs``) and delete had no current-composition
+    guard at all, so nested inline markers (``wire_blob_inline_ref``), node and
+    output references, raw-path bindings, and ``blob:<uuid>`` sentinels could
+    all be mutated or deleted behind an accepted composition
+    (elspeth-b3feba9a7c).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        import hashlib
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import blobs_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        self.engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(self.engine)
+
+        self.session_id = str(uuid4())
+        self.blob_id = str(uuid4())
+        now = datetime.now(UTC)
+
+        storage_dir = tmp_path / "blobs" / self.session_id
+        storage_dir.mkdir(parents=True)
+        self.storage_path = storage_dir / f"{self.blob_id}_data.csv"
+        self.content = b"reference-guard-bytes"
+        self.content_sha = hashlib.sha256(self.content).hexdigest()
+        self.storage_path.write_bytes(self.content)
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=self.session_id,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Reference guards",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=self.blob_id,
+                    session_id=self.session_id,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(self.content),
+                    content_hash=self.content_sha,
+                    storage_path=str(self.storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+    def _marker(self) -> dict[str, Any]:
+        return {"blob_ref": self.blob_id, "mode": "inline_content", "sha256": self.content_sha}
+
+    def _node(self, options: Mapping[str, Any]) -> NodeSpec:
+        return NodeSpec(
+            id="enrich",
+            node_type="transform",
+            plugin="passthrough",
+            input="rows",
+            on_success="result",
+            on_error="discard",
+            options=options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _state_with_source_options(self, options: Mapping[str, Any]) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(plugin="csv", on_success="rows", options=options, on_validation_failure="discard"),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _update(self, state: CompositionState) -> Any:
+        return execute_tool(
+            "update_blob",
+            {"blob_id": self.blob_id, "content": "mutated-content"},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+            **_verbatim_blob_context(self.engine, self.session_id, "mutated-content"),
+        )
+
+    def _delete(self, state: CompositionState) -> Any:
+        return execute_tool(
+            "delete_blob",
+            {"blob_id": self.blob_id},
+            state,
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+    def _assert_denied(self, result: Any, operation: str) -> None:
+        assert result.success is False, f"{operation} succeeded against a composition-referenced blob: {result.data}"
+        assert self.storage_path.read_bytes() == self.content, f"{operation} mutated the referenced blob's bytes"
+
+    def test_update_denied_for_nested_source_inline_marker(self) -> None:
+        state = self._state_with_source_options({"path": "rows.csv", "queries": self._marker()})
+        self._assert_denied(self._update(state), "update_blob")
+
+    def test_update_denied_for_nested_node_inline_marker_in_list(self) -> None:
+        state = replace(_empty_state(), nodes=(self._node({"prompts": [self._marker()]}),))
+        self._assert_denied(self._update(state), "update_blob")
+
+    def test_update_denied_for_nested_output_inline_marker(self) -> None:
+        state = replace(
+            _empty_state(),
+            outputs=(OutputSpec(name="result", plugin="json", options={"template": self._marker()}, on_write_failure="discard"),),
+        )
+        self._assert_denied(self._update(state), "update_blob")
+
+    def test_update_denied_for_raw_storage_path_binding(self) -> None:
+        state = self._state_with_source_options({"path": str(self.storage_path)})
+        self._assert_denied(self._update(state), "update_blob")
+
+    def test_update_denied_for_blob_path_sentinel(self) -> None:
+        state = self._state_with_source_options({"path": f"blob:{self.blob_id}"})
+        self._assert_denied(self._update(state), "update_blob")
+
+    def test_update_allowed_for_unreferenced_blob(self) -> None:
+        state = self._state_with_source_options({"path": "unrelated.csv"})
+        result = self._update(state)
+        assert result.success is True, f"update of an unreferenced blob must succeed: {result.data}"
+
+    def test_update_denied_while_pending_proposal_references_blob(self) -> None:
+        """update must honour the same pending-proposal retention edge delete does."""
+        from datetime import UTC, datetime
+        from uuid import uuid4 as _uuid4
+
+        from elspeth.web.sessions.models import composition_proposals_table
+
+        with self.engine.begin() as conn:
+            arguments = {"source": {"plugin": "csv", "options": {"path": f"blob:{self.blob_id}"}}}
+            conn.execute(
+                composition_proposals_table.insert().values(
+                    id=str(_uuid4()),
+                    session_id=self.session_id,
+                    tool_call_id=f"call-{_uuid4()}",
+                    tool_name="set_pipeline",
+                    status="pending",
+                    summary="pending sentinel proposal",
+                    rationale="retention guard test",
+                    affects=["source"],
+                    arguments_json=arguments,
+                    arguments_redacted_json=arguments,
+                    created_at=datetime.now(UTC),
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        self._assert_denied(self._update(_empty_state()), "update_blob")
+
+    def test_delete_denied_for_nested_node_inline_marker(self) -> None:
+        state = replace(_empty_state(), nodes=(self._node({"prompts": [self._marker()]}),))
+        result = self._delete(state)
+        assert result.success is False, f"delete_blob succeeded against a composition-referenced blob: {result.data}"
+        assert self.storage_path.exists(), "delete_blob removed the referenced blob's bytes"
+
+    def test_delete_denied_for_top_level_source_blob_ref(self) -> None:
+        state = self._state_with_source_options({"path": str(self.storage_path), "blob_ref": self.blob_id})
+        result = self._delete(state)
+        assert result.success is False, f"delete_blob succeeded against the current source's backing blob: {result.data}"
+        assert self.storage_path.exists()
+
+    def test_delete_allowed_once_unreferenced(self) -> None:
+        result = self._delete(_empty_state())
+        assert result.success is True, f"delete of an unreferenced blob must succeed: {result.data}"
+        assert not self.storage_path.exists()

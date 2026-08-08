@@ -589,6 +589,7 @@ def execute_tool(
     composer_skill_hash: str | None = None,
     tool_arguments_hash: str | None = None,
     reviewed_source_authority: ReviewedSourceAuthority | None = None,
+    executing_proposal_id: str | None = None,
     validate_arguments: bool = False,
     require_data_dir_for_paths: bool = False,
     raise_schema_argument_errors: bool = False,
@@ -723,6 +724,7 @@ def execute_tool(
         composer_skill_hash=composer_skill_hash,
         tool_arguments_hash=tool_arguments_hash,
         reviewed_source_authority=reviewed_source_authority,
+        executing_proposal_id=executing_proposal_id,
         _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
     )
 
