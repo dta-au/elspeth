@@ -2200,6 +2200,21 @@ def _schema8_schema_authority(
     return SchemaFormAuthority(knobs=knobs, model_validated_options=model_validated, server_options=server_options)
 
 
+class SinkAdmissionRejectedError(HTTPException):
+    """Deployment sink admission rejected the submitted options (400).
+
+    A nominal type (ADR-032) so the guided chat path can catch exactly this
+    rejection and settle it as a degraded not-applied turn: any other
+    HTTPException transiting the shared transition helper (e.g. the 409
+    dict-detail stage guards) must propagate as an operation failure, not be
+    mislabelled a sink admission rejection. The manual form POST is
+    unaffected — FastAPI renders the subclass as the same 400.
+    """
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(status_code=400, detail=detail)
+
+
 def _schema8_require_runnable_sink_form(
     body: GuidedRespondRequest,
     *,
@@ -2231,7 +2246,7 @@ def _schema8_require_runnable_sink_form(
     try:
         options = canonical_sink_local_paths(edited["options"])
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Output path is not allowed: {exc}") from exc
+        raise SinkAdmissionRejectedError(f"Output path is not allowed: {exc}") from exc
     allowed = allowed_sink_directories(data_dir, session_id=session_id)
     for key in SINK_LOCAL_PATH_OPTION_KEYS:
         value = options.get(key)
@@ -2239,16 +2254,13 @@ def _schema8_require_runnable_sink_form(
             continue
         resolved = resolve_sink_data_path(value, data_dir, session_id=session_id)
         if not any(resolved.is_relative_to(directory) for directory in allowed):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Output option {key!r}: {value!r} is outside this deployment's allowed output locations. "
-                    "Use a relative path like 'results.json' — it is written inside the managed outputs directory."
-                ),
+            raise SinkAdmissionRejectedError(
+                f"Output option {key!r}: {value!r} is outside this deployment's allowed output locations. "
+                "Use a relative path like 'results.json' — it is written inside the managed outputs directory."
             )
     collision_error = validate_composer_file_sink_collision_policy(plugin, options, require_explicit=True)
     if collision_error is not None:
-        raise HTTPException(status_code=400, detail=collision_error)
+        raise SinkAdmissionRejectedError(collision_error)
 
 
 def _schema8_transition(

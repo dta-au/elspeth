@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import func, select, text
 
@@ -952,6 +953,70 @@ def test_post_provider_transition_rejection_persists_one_llm_audit(
     assert response.status_code == 500
     assert response.json()["detail"]["failure_code"] == "integrity_error"
     _assert_one_llm_failure_audit(composer_test_client, session_id, marker=marker)
+
+
+def test_non_admission_http_exception_fails_closed_instead_of_settling_as_admission_rejection(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 409 stage guard transiting the shared transition helper is not a sink
+    admission rejection: it must fail the operation closed, never settle as a
+    token-consuming 200 labelled SinkAdmissionRejected."""
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    marker = "chat-non-admission-http"
+
+    async def audited_provider(**kwargs: object) -> GuidedChatProviderOutcome:
+        _record_test_llm_call(kwargs["recorder"], marker=marker)
+        return await _resolved_source_provider()
+
+    def reject_transition(*_args: object, **_kwargs: object) -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "guided_respond_stage_unsupported",
+                "detail": "Schema-8 RESPOND is not available for step_3_transforms.",
+            },
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", audited_provider, raising=False)
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", reject_transition)
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(turn),
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["failure_code"] == "operation_failed"
+    _assert_one_llm_failure_audit(composer_test_client, session_id, marker=marker)
+
+
+def test_sink_admission_rejection_settles_as_degraded_turn_with_reason(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The typed sink-admission rejection still settles as the safe not-applied
+    200 with the admission reason in the assistant message."""
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    reason = "Output option 'path': '/etc/passwd' is outside this deployment's allowed output locations."
+
+    def reject_transition(*_args: object, **_kwargs: object) -> None:
+        raise guided_route.SinkAdmissionRejectedError(reason)
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _resolved_source_provider, raising=False)
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", reject_transition)
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(turn),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert reason in body["assistant_message"]
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert body["next_turn"]["turn_token"] == turn["turn_token"]
 
 
 def test_settlement_failure_rolls_back_chat_state_but_persists_failure_evidence_and_replays_typed_failure(

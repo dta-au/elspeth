@@ -1526,18 +1526,18 @@ async def post_guided_chat_schema8(
                                 sink_prefill_name=sink_prefill_name,
                             )
                             transition_succeeded = True
-                        except HTTPException as admission_exc:
+                        except guided_route.SinkAdmissionRejectedError as admission_exc:
                             # Deployment sink admission rejected the
                             # LLM-authored options (elspeth-ef92db3e16) — the
                             # same 400 the manual form POST returns. Chat has
                             # no 400 channel, so degrade to the safe
                             # not-applied response with the admission reason
-                            # and keep the wizard authoritative.
-                            admission_detail = (
-                                admission_exc.detail
-                                if isinstance(admission_exc.detail, str)
-                                else "The proposed output settings are not allowed here."
-                            )
+                            # and keep the wizard authoritative. Only the
+                            # typed admission rejection settles here: any
+                            # other HTTPException (e.g. the 409 dict-detail
+                            # stage guards) propagates as an operation
+                            # failure.
+                            admission_detail = admission_exc.detail
                             chat_result = _with_pair_disposition(
                                 StepChatResult(
                                     assistant_message=(
