@@ -489,7 +489,12 @@
      override (elspeth-49dd290c7a). */
   grid-template-columns: minmax(0, 1fr) var(--siderail-width);
   grid-template-areas: "chat siderail";
-  height: 100%;
+  /* Floor the shell at a usable canvas (elspeth-7aa9787996, WCAG 1.4.10):
+     at 400%-zoom-equivalent heights (320x256) the viewport-pinned shell
+     squeezed the conversation to ~0. Below 420px of available height the
+     shell keeps this canvas and .app-main scrolls it; at normal heights
+     max() resolves to 100% and nothing changes. */
+  height: max(100%, 420px);
   min-width: 640px;
   overflow: hidden;
 }
@@ -516,7 +521,11 @@
 @media (max-width: 960px) {
   .app-layout {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: minmax(0, 1fr) auto;
+    /* The 320px chat floor keeps the conversation + composer usable when
+       the wrapped header and stacked rail would otherwise squeeze the 1fr
+       track toward zero (measured 32px at 320x256, 85px at 375x667 before
+       the floor). Overflow beyond the viewport scrolls via .app-main. */
+    grid-template-rows: minmax(320px, 1fr) auto;
     grid-template-areas:
       "chat"
       "siderail";

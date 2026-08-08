@@ -79,6 +79,12 @@
   flex: 1;
   min-height: 0;
   position: relative;
+  /* Short-viewport scroll path (elspeth-7aa9787996, WCAG 1.4.10): the shell
+     below (.app-layout) floors itself at a usable canvas height, so when the
+     viewport is shorter than that floor the overflow must scroll here — with
+     body{overflow:hidden} there is no other vertical scroll path. On tall
+     viewports the layout is exactly 100% and this never engages. */
+  overflow-y: auto;
 }
 
 /* ---------------------------------------------------------------------------
