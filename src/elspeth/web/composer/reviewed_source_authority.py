@@ -168,12 +168,12 @@ def resolve_reviewed_source_authority(
     # would silently auto-authorize unreviewed bytes (elspeth-b3feba9a7c).
     for stable_id, blob_id in source_blob_ids.items():
         live_hash = verified_hash_by_blob_id[blob_id]
-        recorded_prefix = reviewed_hash_prefixes.get(stable_id)
+        recorded_prefix = reviewed_hash_prefixes[stable_id] if stable_id in reviewed_hash_prefixes else None
         if recorded_prefix is not None and not live_hash.startswith(recorded_prefix):
             raise AuditIntegrityError(
                 "reviewed blob authority no longer matches the reviewed content; the blob changed after review and requires re-review"
             )
-        pinned_hash = authoring_hashes.get(stable_id)
+        pinned_hash = authoring_hashes[stable_id] if stable_id in authoring_hashes else None
         if pinned_hash is not None and pinned_hash != live_hash:
             raise AuditIntegrityError(
                 "reviewed source authoring content_hash no longer matches the live blob; the blob changed after review and requires re-review"
