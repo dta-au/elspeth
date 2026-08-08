@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import threading
 import uuid
 from datetime import UTC, datetime
 
@@ -22,6 +24,7 @@ from elspeth.web.execution.schemas import (
     RunStatusResponse,
 )
 from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.locking import locked_session_transaction
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composer_completion_events_table,
@@ -2242,3 +2245,76 @@ class TestGuidedFailureCohortPoisonPill:
                 "hello",
                 writer_principal="route_user_message",
             )
+
+
+class TestCreateRunSessionLockDomain:
+    """Run admission must share the same-session custody lock domain.
+
+    ``_execute_update_blob`` / ``_execute_delete_blob`` evaluate their
+    active-run guards inside ``locked_session_transaction`` and rely on run
+    admission being mutually exclusive with that lock: if ``create_run``
+    commits through a bare ``engine.begin()`` instead, the blob mutation and
+    the run INSERT can each pass their guards concurrently (the PostgreSQL
+    advisory lock never blocks the unlocked INSERT), letting a run capture a
+    blob mid-mutation (elspeth-3d1d1fcb6c).
+    """
+
+    def test_create_run_waits_for_session_custody_lock(self, tmp_path) -> None:
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+        service = SessionServiceImpl(
+            engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test"),
+        )
+        session = asyncio.run(service.create_session("alice", "Lock domain", "local"))
+        state = asyncio.run(
+            service.save_composition_state(
+                session.id,
+                CompositionStateData(is_valid=True),
+                provenance="session_seed",
+            )
+        )
+
+        lock_held = threading.Event()
+        release = threading.Event()
+        run_created = threading.Event()
+        failures: list[BaseException] = []
+
+        def hold_custody_lock() -> None:
+            try:
+                with locked_session_transaction(engine, str(session.id)):
+                    lock_held.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("custody lock holder was never released")
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+                lock_held.set()
+
+        def admit_run() -> None:
+            try:
+                asyncio.run(service.create_run(session.id, state.id))
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+            finally:
+                run_created.set()
+
+        holder = threading.Thread(target=hold_custody_lock, name="custody-lock-holder")
+        holder.start()
+        assert lock_held.wait(timeout=5)
+        runner = threading.Thread(target=admit_run, name="run-admitter")
+        runner.start()
+        try:
+            assert not run_created.wait(timeout=1.0), (
+                "create_run committed while the session custody lock was held; run admission escaped the blob/run lock domain"
+            )
+        finally:
+            release.set()
+            holder.join(timeout=10)
+            runner.join(timeout=10)
+
+        assert run_created.wait(timeout=10)
+        assert failures == []
+        active = asyncio.run(service.get_active_run(session.id))
+        assert active is not None
+        assert active.status == "pending"

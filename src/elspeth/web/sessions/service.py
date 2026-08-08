@@ -9082,6 +9082,15 @@ class SessionServiceImpl:
         (at most one row with status IN ('pending','running') per session_id).
         The SELECT is an early-out optimization; the index is the real guard.
         Raises RunAlreadyActiveError if a pending or running run exists.
+
+        Run admission is part of the same-session custody lock domain: the
+        blob update/delete active-run guards evaluate inside
+        ``locked_session_transaction`` and are only sound if this INSERT is
+        mutually exclusive with that lock. A bare ``engine.begin()`` here
+        would let PostgreSQL admit a run concurrently with an in-flight blob
+        mutation (both sides passing their guards) — SQLite masks the hole
+        only because its ``engine.begin()`` issues ``BEGIN IMMEDIATE``
+        (elspeth-3d1d1fcb6c).
         """
         run_id = uuid.uuid4()
         now = self._now()
@@ -9089,7 +9098,7 @@ class SessionServiceImpl:
         state_sid = str(state_id)
 
         def _sync() -> None:
-            with self._engine.begin() as conn:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 _assert_state_in_session(
                     conn,
                     state_id=state_sid,
