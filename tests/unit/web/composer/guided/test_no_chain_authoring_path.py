@@ -143,6 +143,10 @@ def test_reachable_surfaces_share_one_lock_assuming_commit_boundary() -> None:
     assert _call_count(freeform_route, "settle_auto_commit_intent") == 1
     assert _call_count(freeform_route, "settle_pipeline_proposal_under_compose_lock") == 0
     assert _call_count(auto_commit_adapter, "settle_pipeline_proposal_under_compose_lock") == 1
+    # The revocation fallback is not silent: the adapter durably records the
+    # blocked auto-commit (auto_commit.revoked proposal event) exactly once
+    # before returning the review-path outcome.
+    assert _call_count(auto_commit_adapter, "record_auto_commit_revocation") == 1
     assert _call_count(guided_route, "prepare_pipeline_proposal_commit") == 1
     assert _call_count(guided_route, "accept_guided_pipeline_proposal") == 1
 

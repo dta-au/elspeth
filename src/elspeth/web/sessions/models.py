@@ -226,7 +226,16 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        elspeth-ea80e34fdc). Pre-release delete-and-recreate policy for
 #        stale session databases (sessions.db only — auth.db is never
 #        touched).
-SESSION_SCHEMA_EPOCH = 46
+#   47 -> ``proposal_events.event_type`` closed enum gains
+#        ``auto_commit.revoked`` so an auto-commit blocked by the settlement
+#        trust-mode recheck (elspeth-01d4c6e683) leaves a durable audit row
+#        instead of silently falling back to the review path — without it
+#        the trail showed a successful dispatch against a still-pending
+#        proposal with nothing recording the block. SQLite cannot ALTER a
+#        CHECK constraint in place, so pre-release policy remains delete-
+#        and-recreate for stale session databases (sessions.db only —
+#        auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 47
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -1027,7 +1036,7 @@ proposal_events_table = Table(
     Column("payload", JSON, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
     CheckConstraint(
-        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed')",
+        "event_type IN ('proposal.created', 'proposal.accepted', 'proposal.rejected', 'trust_mode.changed', 'auto_commit.revoked')",
         name="ck_proposal_events_type",
     ),
 )

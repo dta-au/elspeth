@@ -196,9 +196,9 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_46() -> None:
-    # 44: guided_operations.failure_code gains planner_repair_exhausted (elspeth-5904b1683a).
-    assert SESSION_SCHEMA_EPOCH == 46
+def test_current_session_schema_epoch_is_47() -> None:
+    # 47: proposal_events.event_type gains auto_commit.revoked (elspeth-01d4c6e683 audit trail).
+    assert SESSION_SCHEMA_EPOCH == 47
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

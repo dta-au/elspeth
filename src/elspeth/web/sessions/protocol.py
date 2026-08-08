@@ -75,6 +75,13 @@ ProposalEventType = Literal[
     "proposal.accepted",
     "proposal.rejected",
     "trust_mode.changed",
+    # Non-terminal: the proposal stays pending. Records an auto-commit
+    # blocked by the settlement-boundary trust-mode recheck
+    # (elspeth-01d4c6e683) — the dispatch tool row persists BEFORE the
+    # settlement transaction, so without this event a mid-turn trust-mode
+    # downgrade left the trail showing a successful dispatch against a
+    # still-pending proposal with nothing recording the block.
+    "auto_commit.revoked",
 ]
 GuidedOperationKind = Literal[
     "guided_start",
@@ -2788,6 +2795,16 @@ class SessionServiceProtocol(Protocol):
         transition_assistant: TransitionAssistantDraft | None = None,
         required_trust_mode: ComposerTrustMode | None = None,
     ) -> PipelineProposalSettlementResult: ...
+
+    async def record_auto_commit_revocation(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        required_trust_mode: str,
+        current_trust_mode: str,
+        actor: str,
+    ) -> ProposalEventRecord: ...
 
     async def get_pipeline_dispatch_recovery(
         self,

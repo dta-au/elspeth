@@ -45,11 +45,11 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_46(engine) -> None:
-    # 44: guided_operations.failure_code gains planner_repair_exhausted (elspeth-5904b1683a).
-    assert SESSION_SCHEMA_EPOCH == 46
+def test_blob_inline_resolutions_schema_epoch_is_47(engine) -> None:
+    # 47: proposal_events.event_type gains auto_commit.revoked (elspeth-01d4c6e683 audit trail).
+    assert SESSION_SCHEMA_EPOCH == 47
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 46
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 47
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

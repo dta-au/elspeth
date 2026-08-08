@@ -134,6 +134,7 @@ from elspeth.web.sessions.proposal_blob_refs import validate_proposal_blob_refer
 from elspeth.web.sessions.protocol import (
     AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST,
     AUDIT_GRADE_VIEW_WRITER_PRINCIPAL,
+    COMPOSER_TRUST_MODE_VALUES,
     GUIDED_FAILURE_AUDIT_LINEAGE_KEY,
     GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GUIDED_OPERATION_KIND_VALUES,
@@ -6511,6 +6512,55 @@ class SessionServiceImpl:
                 {"surface": result.proposal.pipeline_metadata.surface, "result": "accepted"},
             )
         return result
+
+    async def record_auto_commit_revocation(
+        self,
+        *,
+        session_id: UUID,
+        proposal_id: UUID,
+        required_trust_mode: str,
+        current_trust_mode: str,
+        actor: str,
+    ) -> ProposalEventRecord:
+        """Durably record an auto-commit blocked at the settlement boundary.
+
+        The dispatch tool row persists BEFORE the settlement transaction, so
+        when ``settle_pipeline_composition_proposal`` raises
+        ``TrustModeAutoCommitRevokedError`` and the turn falls back to the
+        review path, the trail otherwise shows a successful ``set_pipeline``
+        dispatch against a still-pending proposal with nothing recording the
+        block (elspeth-01d4c6e683). Written in its own transaction — the
+        settlement transaction that detected the mismatch already rolled
+        back, by design. Non-terminal: the proposal stays pending.
+        """
+        for name, value in (("required_trust_mode", required_trust_mode), ("current_trust_mode", current_trust_mode)):
+            if value not in COMPOSER_TRUST_MODE_VALUES:
+                raise ValueError(f"{name} must be one of {sorted(COMPOSER_TRUST_MODE_VALUES)!r}; got {value!r}")
+        now = self._now()
+        sid = str(session_id)
+        pid = str(proposal_id)
+        event_id = str(uuid.uuid4())
+
+        def _sync() -> ProposalEventRecord:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                conn.execute(
+                    insert(proposal_events_table).values(
+                        id=event_id,
+                        session_id=sid,
+                        proposal_id=pid,
+                        event_type="auto_commit.revoked",
+                        actor=actor,
+                        payload={
+                            "required_trust_mode": required_trust_mode,
+                            "current_trust_mode": current_trust_mode,
+                        },
+                        created_at=now,
+                    )
+                )
+                row = conn.execute(select(proposal_events_table).where(proposal_events_table.c.id == event_id)).one()
+                return _proposal_event_record_from_row(row)
+
+        return cast(ProposalEventRecord, await self._run_sync(_sync))
 
     async def get_pipeline_dispatch_recovery(
         self,

@@ -465,6 +465,80 @@ async def test_settlement_required_trust_mode_fails_closed_when_revoked(service:
 
 
 @pytest.mark.asyncio
+async def test_auto_commit_revocation_leaves_a_durable_proposal_event(service: SessionServiceImpl) -> None:
+    """The blocked auto-commit is itself audit-recorded, not silently rewritten.
+
+    The dispatch tool row persists BEFORE the settlement transaction, so the
+    revocation rollback alone leaves a trail showing a successful
+    ``set_pipeline`` dispatch against a still-pending proposal with nothing
+    recording the block. ``record_auto_commit_revocation`` (called by
+    ``settle_auto_commit_intent`` on ``TrustModeAutoCommitRevokedError``)
+    writes the non-terminal ``auto_commit.revoked`` event carrying the trust
+    facts; the proposal stays pending and reviewable.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)  # trust_mode="explicit_approve"
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    with pytest.raises(TrustModeAutoCommitRevokedError) as raised:
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+
+    event = await service.record_auto_commit_revocation(
+        session_id=session_id,
+        proposal_id=row.id,
+        required_trust_mode=raised.value.required,
+        current_trust_mode=raised.value.current,
+        actor="user:alice",
+    )
+
+    assert event.event_type == "auto_commit.revoked"
+    assert event.proposal_id == row.id
+    assert event.actor == "user:alice"
+    assert dict(event.payload) == {
+        "required_trust_mode": "auto_commit",
+        "current_trust_mode": "explicit_approve",
+    }
+    events = await service.list_proposal_events(session_id)
+    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
+
+    # Non-terminal: the recorded block does not strand the proposal —
+    # manual review approval of the same proposal still succeeds.
+    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_auto_commit_revocation_rejects_unknown_trust_mode_vocabulary(service: SessionServiceImpl) -> None:
+    # Offensive guard: the payload mirrors the sessions.trust_mode CHECK
+    # vocabulary; a value outside it is a programmer error, not a row.
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+
+    with pytest.raises(ValueError, match="required_trust_mode"):
+        await service.record_auto_commit_revocation(
+            session_id=session_id,
+            proposal_id=row.id,
+            required_trust_mode="guided",
+            current_trust_mode="explicit_approve",
+            actor="user:alice",
+        )
+    with pytest.raises(ValueError, match="current_trust_mode"):
+        await service.record_auto_commit_revocation(
+            session_id=session_id,
+            proposal_id=row.id,
+            required_trust_mode="auto_commit",
+            current_trust_mode="freeform",
+            actor="user:alice",
+        )
+    assert [item.event_type for item in await service.list_proposal_events(session_id)] == ["proposal.created"]
+
+
+@pytest.mark.asyncio
 async def test_settlement_required_trust_mode_commits_when_authority_holds(service: SessionServiceImpl) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
