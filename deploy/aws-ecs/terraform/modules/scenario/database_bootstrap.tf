@@ -1,6 +1,7 @@
 locals {
   database_bootstrap_script = <<-PY
     import os
+    import re
     from urllib.parse import urlsplit, urlunsplit
 
     import psycopg
@@ -20,6 +21,21 @@ locals {
         os.environ["ELSPETH_DB_LANDSCAPE_DATABASE"],
     ]
 
+    identifier_pattern = re.compile(r"[a-z_][a-z0-9_]{0,62}\Z")
+    if (
+        identifier_pattern.fullmatch(schema_role) is None
+        or identifier_pattern.fullmatch(runtime_role) is None
+        or any(type(database) is not str or identifier_pattern.fullmatch(database) is None for database in databases)
+    ):
+        raise SystemExit("database_bootstrap_identifier_invalid")
+
+    def row_exists(row: object) -> bool:
+        if row is None:
+            return False
+        if type(row) is not tuple or row != (1,):
+            raise SystemExit("database_bootstrap_dbapi_row_invalid")
+        return True
+
     # Fail closed before any DDL: the loop below unconditionally rewrites
     # ownership of every named database, so a name colliding with the
     # cluster's administrative databases (or the admin connection's own
@@ -28,7 +44,7 @@ locals {
     admin_database = urlsplit(admin_url).path.lstrip("/").lower() or "postgres"
     for database in databases:
         if database.lower() in reserved_databases or database.lower() == admin_database:
-            raise SystemExit(f"database_bootstrap_reserved_database_name:{database}")
+            raise SystemExit("database_bootstrap_reserved_database_name")
     if len({database.lower() for database in databases}) != len(databases):
         raise SystemExit("database_bootstrap_duplicate_database_names")
 
@@ -37,10 +53,18 @@ locals {
         return urlunsplit((parsed.scheme, parsed.netloc, f"/{database}", parsed.query, ""))
 
     with psycopg.connect(admin_url, autocommit=True) as connection:
-        admin_role = connection.execute("SELECT current_user").fetchone()[0]
+        admin_role_row = connection.execute("SELECT current_user").fetchone()
+        if (
+            type(admin_role_row) is not tuple
+            or len(admin_role_row) != 1
+            or type(admin_role_row[0]) is not str
+            or identifier_pattern.fullmatch(admin_role_row[0]) is None
+        ):
+            raise SystemExit("database_bootstrap_dbapi_row_invalid")
+        admin_role = admin_role_row[0]
         for role, password in ((schema_role, schema_password), (runtime_role, runtime_password)):
-            exists = connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone()
-            if exists:
+            exists = row_exists(connection.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)).fetchone())
+            if exists is True:
                 connection.execute(
                     sql.SQL("ALTER ROLE {} WITH LOGIN PASSWORD {}")
                     .format(sql.Identifier(role), sql.Literal(password))
@@ -57,8 +81,8 @@ locals {
             )
         )
         for database in databases:
-            exists = connection.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,)).fetchone()
-            if not exists:
+            exists = row_exists(connection.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database,)).fetchone())
+            if exists is False:
                 connection.execute(
                     sql.SQL("CREATE DATABASE {} OWNER {}").format(
                         sql.Identifier(database),
@@ -161,6 +185,7 @@ resource "terraform_data" "database_bootstrap" {
     aws_rds_cluster_instance.database.id,
     aws_ecs_task_definition.database_bootstrap.arn,
     aws_secretsmanager_secret_version.bootstrap.version_id,
+    filesha256("${path.module}/../../scripts/validate-ecs-run-task.py"),
   ]
 
   depends_on = [
@@ -176,7 +201,7 @@ resource "terraform_data" "database_bootstrap" {
       work=$(mktemp -d -p /tmp elspeth-database-bootstrap.XXXXXX)
       chmod 700 "$work"
       trap 'rm -rf -- "$work"' EXIT
-      if ! task_arn=$(aws ecs run-task \
+      if ! aws ecs run-task \
         --profile "$AWS_PROFILE" \
         --region "$AWS_REGION" \
         --cluster "$ECS_CLUSTER" \
@@ -184,17 +209,22 @@ resource "terraform_data" "database_bootstrap" {
         --launch-type FARGATE \
         --network-configuration "$NETWORK_CONFIGURATION" \
         --count 1 \
-        --query 'tasks[0].taskArn' \
-        --output text 2>"$work/run.err"); then
+        --output json >"$work/run.json" 2>"$work/run.err"; then
         printf '%s\n' database_bootstrap_run_failed >&2
         sed -e 's/^/  aws: /' "$work/run.err" >&2 || true
         exit 1
       fi
-      test -n "$task_arn" && test "$task_arn" != None || {
-        printf '%s\n' database_bootstrap_task_missing >&2
-        sed -e 's/^/  aws: /' "$work/run.err" >&2 || true
+      if ! task_arn=$(python3 "$RUN_TASK_VALIDATOR" \
+        --partition "$AWS_PARTITION" \
+        --account-id "$AWS_ACCOUNT_ID" \
+        --region "$AWS_REGION" \
+        --cluster "$ECS_CLUSTER" \
+        --task-definition "$TASK_DEFINITION" \
+        <"$work/run.json" 2>"$work/validate.err"); then
+        printf '%s\n' database_bootstrap_task_invalid >&2
+        sed -e 's/^/  validator: /' "$work/validate.err" >&2 || true
         exit 1
-      }
+      fi
       if ! aws ecs wait tasks-stopped \
         --profile "$AWS_PROFILE" \
         --region "$AWS_REGION" \
@@ -232,11 +262,14 @@ resource "terraform_data" "database_bootstrap" {
 
     environment = {
       AWS_PAGER             = ""
+      AWS_PARTITION         = "aws"
+      AWS_ACCOUNT_ID        = var.aws_account_id
       AWS_PROFILE           = var.aws_profile
       AWS_REGION            = var.aws_region
       ECS_CLUSTER           = aws_ecs_cluster.scenario.name
       TASK_DEFINITION       = aws_ecs_task_definition.database_bootstrap.arn
       NETWORK_CONFIGURATION = local.database_bootstrap_network_configuration
+      RUN_TASK_VALIDATOR    = abspath("${path.module}/../../scripts/validate-ecs-run-task.py")
     }
   }
 }

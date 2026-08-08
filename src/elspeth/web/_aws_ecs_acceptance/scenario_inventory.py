@@ -13,8 +13,8 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailPr
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 
 from .contracts import (
-    _SCENARIO_VALUE_FIELDS,
     _SHA256_PATTERN,
+    SCENARIO_VALUE_FIELDS,
     AcceptanceCheckError,
     _sha256,
     _task_definition_family,
@@ -38,7 +38,7 @@ _DIGEST_PINNED_CONTAINER_IMAGE_PATTERN = re.compile(
     r"(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)+@sha256:[0-9a-f]{64}\Z"
 )
 
-_ORPHAN_INVENTORY_FIELDS = frozenset(
+ORPHAN_INVENTORY_FIELDS = frozenset(
     {
         "tag_key",
         "cleanup_owner",
@@ -67,6 +67,7 @@ _ORPHAN_INVENTORY_FIELDS = frozenset(
         "expected_retained_trace_ids",
     }
 )
+_ORPHAN_INVENTORY_FIELDS = ORPHAN_INVENTORY_FIELDS
 _ORPHAN_MAX_ITEMS = 10_000
 _PROVIDER_GENERATED_SCENARIO_FIELDS = frozenset(
     {
@@ -674,7 +675,7 @@ def _validate_scenario_inventory(
     ):
         raise AcceptanceCheckError("scenario_inventory_binding")
     values = payload["values"]
-    if not isinstance(values, dict) or set(values) != _SCENARIO_VALUE_FIELDS:
+    if not isinstance(values, dict) or set(values) != SCENARIO_VALUE_FIELDS:
         raise AcceptanceCheckError("scenario_inventory_schema")
     for value in values.values():
         if type(value) is not str or len(value) > 16 * 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):

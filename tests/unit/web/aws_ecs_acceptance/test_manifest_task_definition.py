@@ -49,24 +49,7 @@ _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "retries": 6,
     "startPeriod": 30,
 }
-_PUBLISHED_WEB_ENTRYPOINT = (
-    "/bin/sh",
-    "-ceu",
-    (
-        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
-        "family=$(python -c 'import json,sys,urllib.request; "
-        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
-        "revision=$(python -c 'import json,sys,urllib.request; "
-        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
-        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
-        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
-        'case "$1" in\n'
-        '  web|doctor) set -- elspeth "$@" ;;\n'
-        "esac\n"
-        'exec "$@"\n'
-    ),
-    "--",
-)
+_PUBLISHED_WEB_ENTRYPOINT = task_definition.PUBLISHED_WEB_ENTRYPOINT
 
 
 def test_manifest_and_task_definition_modules_exist() -> None:
@@ -161,6 +144,7 @@ def _task_definition_policy_payload(
             {"name": "ELSPETH_ACCEPTANCE_CANDIDATE_SHA", "value": inventory["candidate_sha"]},
             {"name": "ELSPETH_ACCEPTANCE_SCENARIO_ID", "value": "A"},
             {"name": "ELSPETH_ACCEPTANCE_S3_BUCKET", "value": values["ELSPETH_TEST_S3_BUCKET"]},
+            {"name": "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID", "value": inventory["aws_account_id"]},
             {
                 "name": "ELSPETH_ACCEPTANCE_S3_PREFIX",
                 "value": f"{acceptance.scenario_resource_namespace(acceptance_run_id, 'A')}/{acceptance_run_id}",

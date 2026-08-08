@@ -459,6 +459,7 @@ locals {
   ]
 
   runtime_environment = concat(local.policy_environment, [
+    { name = "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID", value = var.aws_account_id },
     { name = "ELSPETH_WEB__HOST", value = "0.0.0.0" },
     { name = "ELSPETH_WEB__PORT", value = "8451" },
     { name = "ELSPETH_WEB__DEPLOYMENT_TARGET", value = "aws-ecs" },

@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import cast
 
@@ -64,17 +65,37 @@ _CLOUDWATCH_AGENT_COMMAND = (
     'exec "$AGENT" -config "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml" '
     '-otelconfig "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"'
 )
-_CLOUDWATCH_AGENT_HEALTH_CHECK = {
-    "command": [
+
+
+@dataclass(frozen=True, slots=True)
+class CloudWatchAgentHealthCheck:
+    """Typed authority for the tracked ECS sidecar health check."""
+
+    command: tuple[str, ...]
+    interval_seconds: int
+    timeout_seconds: int
+    retries: int
+    start_period_seconds: int
+
+
+CLOUDWATCH_AGENT_HEALTH_CHECK = CloudWatchAgentHealthCheck(
+    command=(
         "CMD",
         "python",
         "-c",
         "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
-    ],
-    "interval": 10,
-    "timeout": 5,
-    "retries": 6,
-    "startPeriod": 30,
+    ),
+    interval_seconds=10,
+    timeout_seconds=5,
+    retries=6,
+    start_period_seconds=30,
+)
+_CLOUDWATCH_AGENT_HEALTH_CHECK = {
+    "command": list(CLOUDWATCH_AGENT_HEALTH_CHECK.command),
+    "interval": CLOUDWATCH_AGENT_HEALTH_CHECK.interval_seconds,
+    "timeout": CLOUDWATCH_AGENT_HEALTH_CHECK.timeout_seconds,
+    "retries": CLOUDWATCH_AGENT_HEALTH_CHECK.retries,
+    "startPeriod": CLOUDWATCH_AGENT_HEALTH_CHECK.start_period_seconds,
 }
 _CLOUDWATCH_AGENT_ENV_NAMES = frozenset(
     {
@@ -84,15 +105,13 @@ _CLOUDWATCH_AGENT_ENV_NAMES = frozenset(
         "ELSPETH_CW_AGENT_OTEL_YAML_SHA256",
     }
 )
-_PUBLISHED_WEB_ENTRYPOINT = (
+PUBLISHED_WEB_ENTRYPOINT = (
     "/bin/sh",
     "-ceu",
     (
-        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
-        "family=$(python -c 'import json,sys,urllib.request; "
-        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
-        "revision=$(python -c 'import json,sys,urllib.request; "
-        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
+        "identity=$(python -m elspeth.web._aws_ecs_acceptance.ecs_metadata)\n"
+        "family=${identity% *}\n"
+        "revision=${identity#* }\n"
         'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
         'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
         'case "$1" in\n'
@@ -102,7 +121,9 @@ _PUBLISHED_WEB_ENTRYPOINT = (
     ),
     "--",
 )
+_PUBLISHED_WEB_ENTRYPOINT = PUBLISHED_WEB_ENTRYPOINT
 _PUBLISHED_WEB_COMMAND = ("web", "--host", "0.0.0.0", "--port", "8451")
+PUBLISHED_WEB_CONTAINER_USER = "1654:1654"
 
 
 def _plaintext_task_definition_secret(name: str) -> bool:
@@ -320,7 +341,7 @@ def validate_task_definition_policy_binding(
         if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
             raise AcceptanceCheckError("task_definition_policy_binding")
     if expected_user is not None and (
-        expected_user != "1654:1654"
+        expected_user != PUBLISHED_WEB_CONTAINER_USER
         or container.get("user") != expected_user
         or container.get("entryPoint") != ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
     ):
@@ -404,6 +425,7 @@ def validate_task_definition_policy_binding(
         "ELSPETH_ACCEPTANCE_SCENARIO_ID": scenario_id,
         "ELSPETH_ACCEPTANCE_S3_BUCKET": cast(str, values["ELSPETH_TEST_S3_BUCKET"]),
         "ELSPETH_ACCEPTANCE_S3_PREFIX": f"{scenario_resource_namespace(acceptance_run_id, scenario_id)}/{acceptance_run_id}",
+        "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID": cast(str, account_id),
     }
     if secret_names.intersection((*protected_names, *expected_runtime)):
         raise AcceptanceCheckError("task_definition_policy_binding")

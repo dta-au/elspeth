@@ -115,6 +115,28 @@
       }
     },
     {
+      "Sid": "StopRunScenarioTasks",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:StopTask"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_a_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
       "Sid": "ReadScenarioSecretValues",
       "Effect": "Allow",
       "Action": [

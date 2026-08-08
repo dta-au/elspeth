@@ -13,9 +13,9 @@ resource "aws_ecs_cluster" "scenario" {
 
 locals {
   ecs_identity_wrapper = <<-SHELL
-    metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"
-    family=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])' "$metadata_url")
-    revision=$(python -c 'import json,sys,urllib.request; print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])' "$metadata_url")
+    identity=$(python -m elspeth.web._aws_ecs_acceptance.ecs_metadata)
+    family=$${identity% *}
+    revision=$${identity#* }
     export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"
     export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"
     case "$1" in
@@ -188,10 +188,14 @@ locals {
     readonlyRootFilesystem = true
     entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
     command                = ["doctor", "aws-ecs", "--init-schema", "--json"]
-    environment            = local.runtime_environment
-    secrets                = local.schema_owner_secrets
-    mountPoints            = local.mount_points
-    logConfiguration       = local.doctor_log_configuration
+    environment = [
+      for item in local.runtime_environment :
+      item.name == "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY" ?
+      merge(item, { value = local.schema_init_doctor_family }) : item
+    ]
+    secrets          = local.schema_owner_secrets
+    mountPoints      = local.mount_points
+    logConfiguration = local.doctor_log_configuration
   }
 
   runtime_doctor_container = {
@@ -201,10 +205,14 @@ locals {
     readonlyRootFilesystem = true
     entryPoint             = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
     command                = ["doctor", "aws-ecs", "--json"]
-    environment            = local.runtime_environment
-    secrets                = local.runtime_secrets
-    mountPoints            = local.mount_points
-    logConfiguration       = local.doctor_log_configuration
+    environment = [
+      for item in local.runtime_environment :
+      item.name == "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY" ?
+      merge(item, { value = local.runtime_doctor_family }) : item
+    ]
+    secrets          = local.runtime_secrets
+    mountPoints      = local.mount_points
+    logConfiguration = local.doctor_log_configuration
   }
 
   payload_container = {
@@ -250,8 +258,12 @@ locals {
   })
 
   rollback_doctor_container = merge(local.runtime_doctor_container, {
-    image       = terraform_data.rollback_image_provenance.output
-    environment = local.rollback_environment
+    image = terraform_data.rollback_image_provenance.output
+    environment = [
+      for item in local.rollback_environment :
+      item.name == "ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY" ?
+      merge(item, { value = local.rollback_doctor_family }) : item
+    ]
   })
 }
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 import itertools
 import json
 import os
@@ -79,6 +78,7 @@ EXPECTED_FILES = {
     "scenario-b/outputs.tf",
     "scenario-b/variables.tf",
     "scenario-b/versions.tf",
+    "scripts/validate-ecs-run-task.py",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml",
 }
@@ -98,23 +98,28 @@ def _source_files(root: Path = PACKAGE) -> list[Path]:
     committed: a new package file an author forgot to `git add` is still
     caught, while operator inputs are correctly out of scope.
     """
-    listing = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "."],
-        cwd=root,
-        capture_output=True,
-        check=True,
-        text=True,
-    )
-    return [
+    if (REPO_ROOT / ".git").exists():
+        listing = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "."],
+            cwd=root,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        candidates = (root / name for name in listing.stdout.split("\0") if name)
+    else:
+        # A source archive has no Git metadata and, by construction, contains
+        # only tracked files. Walking it is therefore the exact shipped set,
+        # not the ignored-operator-input hazard described above.
+        candidates = root.rglob("*")
+    return sorted(
         path
-        for name in listing.stdout.split("\0")
-        if name
-        for path in (root / name,)
+        for path in candidates
         if path.is_file()
         and ".terraform" not in path.relative_to(root).parts
         and not path.name.endswith((".tfstate", ".tfplan"))
         and ".tfstate." not in path.name
-    ]
+    )
 
 
 def _text(relative: str) -> str:
@@ -315,6 +320,34 @@ def test_database_bootstrap_waits_for_network_and_execution_role_policies() -> N
         "aws_iam_role_policy.execution_secrets",
     ):
         assert dependency in resource.group("body")
+
+
+def test_database_bootstrap_admits_full_run_task_json_before_using_the_task_arn() -> None:
+    bootstrap = _text("modules/scenario/database_bootstrap.tf")
+
+    assert '--output json >"$work/run.json"' in bootstrap
+    assert "--query 'tasks[0].taskArn'" not in bootstrap
+    assert 'python3 "$RUN_TASK_VALIDATOR"' in bootstrap
+    assert '<"$work/run.json"' in bootstrap
+    assert 'RUN_TASK_VALIDATOR    = abspath("${path.module}/../../scripts/validate-ecs-run-task.py")' in bootstrap
+    assert 'filesha256("${path.module}/../../scripts/validate-ecs-run-task.py")' in bootstrap
+    assert "AWS_ACCOUNT_ID        = var.aws_account_id" in bootstrap
+    assert 'AWS_PARTITION         = "aws"' in bootstrap
+    assert 'test -n "$task_arn"' not in bootstrap
+
+
+def test_ecs_identity_wrapper_delegates_to_the_strict_metadata_boundary() -> None:
+    ecs = _text("modules/scenario/ecs.tf")
+    locals_text = _text("modules/scenario/locals.tf")
+    wrapper = ecs[ecs.index("ecs_identity_wrapper = <<-SHELL") : ecs.index("  SHELL", ecs.index("ecs_identity_wrapper"))]
+
+    assert "python -m elspeth.web._aws_ecs_acceptance.ecs_metadata" in wrapper
+    assert "urllib.request" not in wrapper
+    assert "$${identity% *}" in wrapper
+    assert "$${identity#* }" in wrapper
+    assert 'name = "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID", value = var.aws_account_id' in locals_text
+    for family in ("schema_init_doctor_family", "runtime_doctor_family", "rollback_doctor_family"):
+        assert f"value = local.{family}" in ecs
 
 
 def test_container_insights_performance_log_group_is_terraform_owned() -> None:
@@ -1278,8 +1311,8 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
             "orphan_sweep",
         }
     )
-    assert _hcl_map_keys(outputs, "scenario_values") == scenario_inventory._SCENARIO_VALUE_FIELDS
-    assert _hcl_map_keys(outputs, "scenario_orphan_sweep") == scenario_inventory._ORPHAN_INVENTORY_FIELDS
+    assert _hcl_map_keys(outputs, "scenario_values") == scenario_inventory.SCENARIO_VALUE_FIELDS
+    assert _hcl_map_keys(outputs, "scenario_orphan_sweep") == scenario_inventory.ORPHAN_INVENTORY_FIELDS
     assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v7"', resolved_output)
     assert re.search(r"acceptance_run_id\s+=\s+var\.run_id", resolved_output)
     assert re.search(r'tag_key\s+=\s+"ACCEPTANCE_RUN_ID"', outputs)
@@ -1417,6 +1450,16 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert run_tasks["Condition"]["ArnLike"]["ecs:cluster"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-*",
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-*",
+    ]
+    stop_tasks = statements["StopRunScenarioTasks"]
+    assert stop_tasks["Action"] == ["ecs:StopTask"]
+    assert stop_tasks["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-a-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-b-0123456789abcdefabcd-cluster/*",
+    ]
+    assert stop_tasks["Condition"]["ArnEquals"]["ecs:cluster"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
     ]
     assert statements["ReadScenarioSecretValues"]["Action"] == ["secretsmanager:GetSecretValue"]
     assert statements["ReadScenarioSecretValues"]["Resource"] == [
@@ -1656,38 +1699,69 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
 
 
 @pytest.fixture(scope="module")
-def initialized_scenario_a() -> Path:
-    """Make ``terraform test`` runnable in any checkout, not just an initialised one.
+def initialized_terraform_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Validate an isolated copy of every Terraform root from shipped files.
 
-    ``terraform test`` requires the working directory to be initialised so the
-    local ``../modules/scenario`` reference resolves, and ``.terraform/`` is
-    untracked. A fresh ``git worktree`` or a clean CI checkout therefore has
-    none, and the command fails with "This module is not yet installed" — a
-    setup failure wearing the costume of a contract failure. Initialising here
-    keeps the assertion real instead of skipping past it.
+    The copy excludes every pre-existing ``.terraform`` directory and ignored
+    operator input. All three roots must initialise from their checked-in lock
+    files and validate before the native Scenario A contracts run unfiltered.
 
-    ``-backend=false`` is deliberate: the scenario root declares a partial S3
-    backend, and a contract test must never reach for remote state or
-    credentials.
+    ``-backend=false`` is deliberate: scenario roots declare partial S3
+    backends, and a contract test must never reach for remote state or AWS
+    credentials. ``-lockfile=readonly`` prevents a test from repairing drift.
     """
-    directory = PACKAGE / "scenario-a"
-    _require_terraform("the native mock-plan contract cannot be exercised")
-    if not (directory / ".terraform").is_dir():
+    _require_terraform("the clean Terraform package contract cannot be exercised")
+    isolated = tmp_path_factory.mktemp("aws-ecs-terraform") / "terraform"
+    for source in _source_files():
+        destination = isolated / source.relative_to(PACKAGE)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    formatted = subprocess.run(
+        ["terraform", f"-chdir={isolated}", "fmt", "-check", "-recursive"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert formatted.returncode == 0, "terraform fmt -check failed:\n" + formatted.stdout + formatted.stderr
+
+    for root_name in ("bootstrap", "scenario-a", "scenario-b"):
+        directory = isolated / root_name
         result = subprocess.run(
-            ["terraform", f"-chdir={directory}", "init", "-backend=false", "-input=false", "-no-color"],
+            [
+                "terraform",
+                f"-chdir={directory}",
+                "init",
+                "-backend=false",
+                "-input=false",
+                "-lockfile=readonly",
+                "-no-color",
+            ],
             check=False,
             capture_output=True,
             text=True,
             timeout=300,
         )
-        assert result.returncode == 0, "terraform init failed:\n" + result.stdout + result.stderr
-    return directory
+        assert result.returncode == 0, f"terraform init failed for {root_name}:\n" + result.stdout + result.stderr
+        validated = subprocess.run(
+            ["terraform", f"-chdir={directory}", "validate", "-no-color"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert validated.returncode == 0, f"terraform validate failed for {root_name}:\n" + validated.stdout + validated.stderr
+    return isolated
 
 
-def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs(initialized_scenario_a: Path) -> None:
-    native_test = PACKAGE / "scenario-a" / "codeblind.tftest.hcl"
-    assert native_test.is_file()
-    content = native_test.read_text(encoding="utf-8")
+def test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs(initialized_terraform_package: Path) -> None:
+    scenario_a = initialized_terraform_package / "scenario-a"
+    codeblind_test = scenario_a / "codeblind.tftest.hcl"
+    web_policy_test = scenario_a / "web_policy.tftest.hcl"
+    assert codeblind_test.is_file()
+    assert web_policy_test.is_file()
+    content = codeblind_test.read_text(encoding="utf-8")
     for provider in ("aws", "random", "tls"):
         assert f'mock_provider "{provider}"' in content
     assert 'alias = "iam_lifecycle"' in content
@@ -1704,13 +1778,15 @@ def test_scenario_a_native_mock_plan_uses_only_documented_minimal_inputs(initial
         assert forbidden not in content
 
     result = subprocess.run(
-        ["terraform", f"-chdir={initialized_scenario_a}", "test", "-filter=codeblind.tftest.hcl", "-no-color"],
+        ["terraform", f"-chdir={scenario_a}", "test", "-no-color"],
         check=False,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "codeblind.tftest.hcl" in result.stdout
+    assert "web_policy.tftest.hcl" in result.stdout
     assert "Success!" in result.stdout
 
 
@@ -1780,10 +1856,15 @@ def test_cloudwatch_agent_sidecar_exactly_matches_runtime_admission_constants() 
     command_line = next(line for line in module_locals.splitlines() if line.strip().startswith("cw_agent_command"))
     assert json.loads(command_line.split("=", 1)[1].strip()) == task_definition._CLOUDWATCH_AGENT_COMMAND
 
-    expected_health = task_definition._CLOUDWATCH_AGENT_HEALTH_CHECK
-    assert json.dumps(expected_health["command"][1]) in sidecar
-    for name in ("interval", "timeout", "retries", "startPeriod"):
-        assert re.search(rf"\b{name}\s*=\s*{expected_health[name]}\b", sidecar)
+    expected_health = task_definition.CLOUDWATCH_AGENT_HEALTH_CHECK
+    assert json.dumps(expected_health.command[1]) in sidecar
+    for name, value in (
+        ("interval", expected_health.interval_seconds),
+        ("timeout", expected_health.timeout_seconds),
+        ("retries", expected_health.retries),
+        ("startPeriod", expected_health.start_period_seconds),
+    ):
+        assert re.search(rf"\b{name}\s*=\s*{value}\b", sidecar)
 
     assert "cw_agent_config_json_sha256 = sha256(local.cw_agent_json)" in module_locals
     assert "cw_agent_otel_yaml_sha256   = sha256(local.cw_agent_otel)" in module_locals
@@ -1811,9 +1892,9 @@ def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands(
     schema_container = ecs[ecs.index("schema_init_doctor_container = {") : ecs.index("runtime_doctor_container = {")]
     runtime_container = ecs[ecs.index("runtime_doctor_container = {") : ecs.index("payload_container = {")]
     assert 'command                = ["doctor", "aws-ecs", "--init-schema", "--json"]' in schema_container
-    assert "secrets                = local.schema_owner_secrets" in schema_container
+    assert re.search(r"\bsecrets\s*=\s*local\.schema_owner_secrets\b", schema_container)
     assert 'command                = ["doctor", "aws-ecs", "--json"]' in runtime_container
-    assert "secrets                = local.runtime_secrets" in runtime_container
+    assert re.search(r"\bsecrets\s*=\s*local\.runtime_secrets\b", runtime_container)
     assert 'resource "aws_ecs_task_definition" "schema_init_doctor"' in ecs
     assert 'resource "aws_ecs_task_definition" "runtime_doctor"' in ecs
     assert "DOCTOR_TASK_DEFINITION                          = aws_ecs_task_definition.runtime_doctor.arn" in outputs
@@ -1837,10 +1918,7 @@ def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands(
 
 
 def test_acceptance_verifier_containers_use_the_live_published_identity() -> None:
-    validator_source = inspect.getsource(task_definition.validate_task_definition_policy_binding)
-    published_user_match = re.search(r'expected_user\s*!=\s*"([^"]+)"', validator_source)
-    assert published_user_match is not None
-    published_user = published_user_match.group(1)
+    published_user = task_definition.PUBLISHED_WEB_CONTAINER_USER
 
     ecs = _text("modules/scenario/ecs.tf")
     payload = ecs[ecs.index("payload_container = {") : ecs.index("local_auth_container = {")]
