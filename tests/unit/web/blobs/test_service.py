@@ -5196,3 +5196,100 @@ class TestRowToRecordTierOneGuards:
         row = self._fake_link_row(direction="inout", blob_id="not-a-uuid")
         with pytest.raises(AuditIntegrityError, match=r"Tier 1: blob_run_links\.direction"):
             blob_service._row_to_link_record(row)
+
+
+class TestReadBlobContentCustodyLock:
+    """Content reads must serialize with the same-session custody lock.
+
+    Blob mutation swaps/tombstones the storage file inside its custody
+    transaction before commit; an unlocked reader can pair one version's
+    row with another version's bytes and escalate a false-positive
+    ``BlobIntegrityError`` / ``BlobContentMissingError``
+    (elspeth-3d1d1fcb6c).  The observable contract: a content read must
+    block while the session custody lock is held.
+    """
+
+    def test_read_blob_content_waits_for_session_custody_lock(self, tmp_path) -> None:
+        from elspeth.web.sessions.locking import locked_session_transaction
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+        service = BlobServiceImpl(engine, tmp_path)
+
+        sid = str(uuid4())
+        blob_id = str(uuid4())
+        now = datetime.now(UTC)
+        content = b"custody-locked-bytes"
+        storage_dir = tmp_path / "blobs" / sid
+        storage_dir.mkdir(parents=True)
+        storage_path = storage_dir / f"{blob_id}_data.csv"
+        storage_path.write_bytes(content)
+        with engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=sid,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Custody lock",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=blob_id,
+                    session_id=sid,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(content),
+                    content_hash=hashlib.sha256(content).hexdigest(),
+                    storage_path=str(storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+        lock_held = threading.Event()
+        release = threading.Event()
+        read_done = threading.Event()
+        results: list[bytes] = []
+        failures: list[BaseException] = []
+
+        def hold_custody_lock() -> None:
+            try:
+                with locked_session_transaction(engine, sid):
+                    lock_held.set()
+                    if not release.wait(timeout=10):
+                        raise TimeoutError("custody lock holder was never released")
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+                lock_held.set()
+
+        def reader() -> None:
+            try:
+                results.append(asyncio.run(service.read_blob_content(UUID(blob_id))))
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                failures.append(exc)
+            finally:
+                read_done.set()
+
+        holder = threading.Thread(target=hold_custody_lock, name="custody-lock-holder")
+        holder.start()
+        assert lock_held.wait(timeout=5)
+        reader_thread = threading.Thread(target=reader, name="blob-reader")
+        reader_thread.start()
+        try:
+            assert not read_done.wait(timeout=1.0), (
+                "read_blob_content returned while the session custody lock was held; "
+                "an unlocked reader can pair one blob version's row with another version's bytes"
+            )
+        finally:
+            release.set()
+            holder.join(timeout=10)
+            reader_thread.join(timeout=10)
+
+        assert read_done.wait(timeout=10)
+        assert failures == []
+        assert results == [content]

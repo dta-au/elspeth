@@ -15311,21 +15311,21 @@ class TestPreviewProofStep:
                 ),
             ),
         )
-        original_sync_get_blob = generation_module._sync_get_blob
+        original_locked_read = generation_module._locked_read_ready_blob
         original_read_bytes = Path.read_bytes
         metadata_reads: list[str] = []
         content_reads: list[Path] = []
 
-        def counted_sync_get_blob(engine: Any, blob_id: str, session_id: str) -> Any:
+        def counted_locked_read(engine: Any, session_id: str, blob_id: str) -> Any:
             metadata_reads.append(blob_id)
-            return original_sync_get_blob(engine, blob_id, session_id)
+            return original_locked_read(engine, session_id, blob_id)
 
         def counted_read_bytes(path: Path) -> bytes:
             content_reads.append(path)
             return original_read_bytes(path)
 
         with (
-            patch.object(generation_module, "_sync_get_blob", side_effect=counted_sync_get_blob),
+            patch.object(generation_module, "_locked_read_ready_blob", side_effect=counted_locked_read),
             patch.object(Path, "read_bytes", counted_read_bytes),
         ):
             result = execute_tool(
@@ -17220,3 +17220,145 @@ class TestExplainDanglingDestinations:
         assert "gate" in result.data["explanation"].lower()
         assert "upsert_node" in result.data["suggested_fix"]
         assert "discard" in result.data["suggested_fix"]
+
+
+class TestGetBlobContentReaderMixedVersion:
+    """Readers must never pair one blob version's row with another's bytes.
+
+    ``_execute_update_blob`` swaps the storage file (``os.replace``) INSIDE
+    its DB transaction, before commit.  A reader that fetches the blob row
+    and the storage bytes without entering the same-session custody lock can
+    therefore pair the old committed row (old content_hash) with the new
+    bytes — escalating a false-positive ``BlobIntegrityError`` for a blob
+    that was never corrupted (elspeth-3d1d1fcb6c).
+    """
+
+    def test_reader_between_swap_and_commit_sees_one_complete_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import hashlib
+        import os as stdlib_os
+        import threading as stdlib_threading
+        import time
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import blobs_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+        initialize_session_schema(engine)
+
+        session_id = f"reader-mixed-version-{uuid4()}"
+        blob_id = str(uuid4())
+        now = datetime.now(UTC)
+        storage_dir = tmp_path / "blobs" / session_id
+        storage_dir.mkdir(parents=True)
+        storage_path = storage_dir / f"{blob_id}_data.csv"
+        old_content = b"old-content"
+        storage_path.write_bytes(old_content)
+
+        with engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=session_id,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Reader serialisation",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=blob_id,
+                    session_id=session_id,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(old_content),
+                    content_hash=hashlib.sha256(old_content).hexdigest(),
+                    storage_path=str(storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+        update_context = _verbatim_blob_context(engine, session_id, "new-content")
+
+        swapped = stdlib_threading.Event()
+        release_update = stdlib_threading.Event()
+        real_replace = stdlib_os.replace
+
+        def pausing_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+            real_replace(src, dst, *args, **kwargs)
+            if Path(dst) == storage_path:
+                # The storage file now holds the NEW bytes while the update
+                # transaction (old row) has not committed yet.  Hold the
+                # window open so the reader thread can attempt its read.
+                swapped.set()
+                if not release_update.wait(timeout=10):
+                    raise TimeoutError("update thread was never released from the swap window")
+
+        monkeypatch.setattr("os.replace", pausing_replace)
+
+        update_results: list[Any] = []
+        update_failures: list[BaseException] = []
+
+        def updater() -> None:
+            try:
+                update_results.append(
+                    execute_tool(
+                        "update_blob",
+                        {"blob_id": blob_id, "content": "new-content"},
+                        _empty_state(),
+                        _mock_catalog(),
+                        session_engine=engine,
+                        session_id=session_id,
+                        **update_context,
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - failure diagnostics
+                update_failures.append(exc)
+
+        reader_results: list[Any] = []
+        reader_failures: list[BaseException] = []
+
+        def reader() -> None:
+            try:
+                reader_results.append(
+                    execute_tool(
+                        "get_blob_content",
+                        {"blob_id": blob_id},
+                        _empty_state(),
+                        _mock_catalog(),
+                        session_engine=engine,
+                        session_id=session_id,
+                    )
+                )
+            except BaseException as exc:
+                reader_failures.append(exc)
+
+        update_thread = stdlib_threading.Thread(target=updater, name="blob-updater", daemon=True)
+        update_thread.start()
+        assert swapped.wait(timeout=5), "update never reached its file swap"
+
+        reader_thread = stdlib_threading.Thread(target=reader, name="blob-reader", daemon=True)
+        reader_thread.start()
+        # Give the reader time to attempt its read inside the swap window.
+        # A correctly-serialised reader blocks on the session custody lock
+        # here; an unserialised reader pairs the old row with the new bytes.
+        time.sleep(0.5)
+        release_update.set()
+        update_thread.join(timeout=10)
+        reader_thread.join(timeout=10)
+        assert not update_thread.is_alive() and not reader_thread.is_alive()
+
+        assert update_failures == [], f"update_blob raised: {update_failures}"
+        assert update_results and update_results[0].success is True
+        assert reader_failures == [], (
+            f"get_blob_content escalated during the update swap/commit window: {reader_failures}; "
+            "the reader paired one version's row with another version's bytes"
+        )
+        assert reader_results and reader_results[0].success is True
+        assert reader_results[0].data["content"] == "new-content"

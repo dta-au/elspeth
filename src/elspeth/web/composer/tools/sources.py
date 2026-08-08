@@ -65,10 +65,10 @@ from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
     _blob_id_uuid_validation_error,
     _blob_row_to_tool_dict,
+    _locked_read_ready_blob,
     _PreparedBlobCreate,
     _sync_get_blob,
     _verify_blob_content_hash,
-    _verify_blob_content_integrity,
 )
 from elspeth.web.composer.tools.declarations import (
     ToolDeclaration,
@@ -430,11 +430,26 @@ def _resolve_source_blob(
         **_source_authoring_options(creation_modality, blob["content_hash"]),
     }
     if SOURCE_AUTHORING_KEY in merged_options:
-        storage_path = Path(blob["storage_path"])
-        if not storage_path.exists():
+        # Row + bytes must be observed as ONE version under the session
+        # custody lock: an unlocked read racing update_blob's in-transaction
+        # file swap pairs the stale committed hash with the new bytes and
+        # escalates a false BlobIntegrityError (elspeth-3d1d1fcb6c).
+        fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob_id)
+        if fresh_blob is None:
+            return _failure_result(state, f"Blob '{blob_id}' not found.")
+        if fresh_blob["status"] != "ready":
+            return _failure_result(state, f"Blob is not ready (status: {fresh_blob['status']}).")
+        if data is None:
             return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
-        data = storage_path.read_bytes()
-        _verify_blob_content_integrity(blob, data)
+        if fresh_blob["content_hash"] != blob["content_hash"]:
+            # A full update committed between the metadata fetch that pinned
+            # ``merged_options`` (content_hash / authoring metadata) and this
+            # locked read.  Binding would author a source whose pinned hash
+            # disagrees with its reviewed content — fail recoverably instead.
+            return _failure_result(
+                state,
+                f"Blob '{blob_id}' content changed while binding the source; retry the tool call.",
+            )
         try:
             content = data.decode("utf-8")
         except UnicodeDecodeError as exc:

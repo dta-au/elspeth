@@ -1808,6 +1808,60 @@ def _verify_blob_content_hash(blob: BlobToolRecord, actual_hash: str) -> None:
         raise BlobIntegrityError(blob_id, expected=stored_hash, actual=actual_hash)
 
 
+def _locked_read_ready_blob(
+    session_engine: Engine,
+    session_id: str,
+    blob_id: str,
+) -> tuple[BlobToolRecord | None, bytes | None]:
+    """Fetch a blob row and its storage bytes as ONE version.
+
+    ``_execute_update_blob`` swaps the storage file inside its DB
+    transaction (before commit), and ``_execute_delete_blob`` tombstones it
+    before its DELETE commits.  A reader that fetches the row and the bytes
+    without entering the same-session custody lock can therefore pair one
+    version's metadata with another version's bytes — escalating a
+    false-positive ``BlobIntegrityError`` for a blob that was never
+    corrupted (elspeth-3d1d1fcb6c).  Every composer read of blob content
+    MUST go through this helper (or hold ``locked_session_transaction``
+    itself) so row + bytes are observed atomically with respect to blob
+    mutation and run admission.
+
+    Returns:
+        ``(None, None)`` — no such blob in this session.
+        ``(record, None)`` — blob exists but is not ``ready``, or its
+        storage file is missing; the caller derives its failure message
+        from ``record["status"]`` / the ``None`` data.
+        ``(record, data)`` — one complete, hash-verified version.
+
+    Integrity escalations (``BlobIntegrityError`` / ``AuditIntegrityError``)
+    propagate: under the custody lock a hash mismatch can no longer be a
+    benign race — it is genuine corruption.
+    """
+    with locked_session_transaction(session_engine, session_id) as conn:
+        # Read on the transaction's own connection: opening a second
+        # connection here breaks StaticPool/in-memory engines (same
+        # connection, already in a transaction) and is pointless — the
+        # lock, not the connection, provides the version guarantee.
+        row = conn.execute(
+            select(blobs_table).where(
+                blobs_table.c.id == blob_id,
+                blobs_table.c.session_id == session_id,
+            )
+        ).first()
+        if row is None:
+            return None, None
+        record = _blob_row_to_tool_dict(row)
+        if record["status"] != "ready":
+            return record, None
+        storage_path = Path(record["storage_path"])
+        try:
+            data = storage_path.read_bytes()
+        except FileNotFoundError:
+            return record, None
+        _verify_blob_content_integrity(record, data)
+        return record, data
+
+
 def _execute_get_blob_content(
     arguments: dict[str, Any],
     state: CompositionState,
@@ -1853,11 +1907,14 @@ def _execute_get_blob_content(
     blob_id_error = _blob_id_uuid_validation_error(blob_id)
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
-    blob = _sync_get_blob(session_engine, blob_id, session_id)
+    # Guards 1 + 2 (lifecycle, integrity) run inside the same-session
+    # custody lock so the row and the bytes are one version — a read
+    # racing update/delete must block rather than pair the old committed
+    # hash with freshly-swapped bytes (elspeth-3d1d1fcb6c).
+    blob, data = _locked_read_ready_blob(session_engine, session_id, blob_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
 
-    # Guard 1 — lifecycle.  Pending/error blobs are not readable.
     blob_status = blob["status"]
     if blob_status != "ready":
         return _failure_result(
@@ -1865,15 +1922,8 @@ def _execute_get_blob_content(
             f"Blob '{blob_id}' is not readable — status is '{blob_status}', expected 'ready'.",
         )
 
-    storage_path = Path(blob["storage_path"])
-    if not storage_path.exists():
+    if data is None:
         return _failure_result(state, f"Blob storage file missing for '{blob_id}'.")
-
-    data = storage_path.read_bytes()
-
-    # Guard 2 — integrity.  Shared helper: NULL stored_hash escalates
-    # via AuditIntegrityError, mismatch via BlobIntegrityError.
-    _verify_blob_content_integrity(blob, data)
 
     # Guard 3 — decode safety.  Non-UTF-8 bytes are a Tier-3 external
     # input condition (the operator supplied content in an encoding we

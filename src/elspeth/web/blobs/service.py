@@ -62,6 +62,7 @@ from elspeth.web.blobs.protocol import (
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import (
     acquire_session_advisory_xact_lock,
+    locked_session_transaction,
     postgres_session_advisory_lock,
     sqlite_process_session_lock,
 )
@@ -1829,6 +1830,32 @@ class BlobServiceImpl:
 
         await self._run_sync(_sync)
 
+    @contextmanager
+    def _locked_blob_row_for_read(self, blob_id_str: str) -> Iterator[Row[Any]]:
+        """Yield one blob row observed under its session custody lock.
+
+        Blob mutation swaps/tombstones the storage file inside its custody
+        transaction, before commit.  A reader that fetches the row and the
+        bytes without entering the same-session lock can pair one version's
+        metadata with another version's bytes — escalating a false-positive
+        ``BlobIntegrityError`` (or ``BlobContentMissingError``) for a blob
+        that was never corrupted (elspeth-3d1d1fcb6c).  Every content read
+        MUST perform its file I/O and hash verification inside this context.
+
+        The unlocked ``session_id`` lookup is routing only: a blob is never
+        rebound across sessions, and the row is re-read authoritatively
+        under the lock.
+        """
+        with self._engine.connect() as lookup_conn:
+            session_id = lookup_conn.execute(select(blobs_table.c.session_id).where(blobs_table.c.id == blob_id_str)).scalar_one_or_none()
+        if session_id is None:
+            raise BlobNotFoundError(blob_id_str)
+        with locked_session_transaction(self._engine, session_id) as conn:
+            row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
+            if row is None:
+                raise BlobNotFoundError(blob_id_str)
+            yield row
+
     async def read_blob_content(self, blob_id: UUID) -> bytes:
         """Read the raw content of a blob.
 
@@ -1843,15 +1870,15 @@ class BlobServiceImpl:
            ``content_hash``. Missing bytes or hash mismatch indicate
            filesystem corruption, silent data loss, tampering, or a
            write-path bug — all Tier 1 anomalies.
+
+        Both guards evaluate inside the same-session custody lock
+        (``_locked_blob_row_for_read``) so the row and the bytes are one
+        version with respect to concurrent update/delete.
         """
         blob_id_str = str(blob_id)
 
         def _sync() -> bytes:
-            with self._engine.connect() as conn:
-                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if row is None:
-                    raise BlobNotFoundError(blob_id_str)
-
+            with self._locked_blob_row_for_read(blob_id_str) as row:
                 # Lifecycle guard — only ready blobs have finalized content
                 if row.status != "ready":
                     raise BlobStateError(
@@ -1912,11 +1939,7 @@ class BlobServiceImpl:
         blob_id_str = str(blob_id)
 
         def _sync() -> tuple[bytes, str, int]:
-            with self._engine.connect() as conn:
-                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if row is None:
-                    raise BlobNotFoundError(blob_id_str)
-
+            with self._locked_blob_row_for_read(blob_id_str) as row:
                 # Lifecycle guard — only ready blobs have finalized content
                 if row.status != "ready":
                     raise BlobStateError(
@@ -1978,11 +2001,7 @@ class BlobServiceImpl:
         blob_id_str = str(blob_id)
 
         def _sync() -> tuple[bytes, bool]:
-            with self._engine.connect() as conn:
-                row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
-                if row is None:
-                    raise BlobNotFoundError(blob_id_str)
-
+            with self._locked_blob_row_for_read(blob_id_str) as row:
                 if row.status != "ready":
                     raise BlobStateError(
                         blob_id_str,

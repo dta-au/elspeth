@@ -63,7 +63,7 @@ from elspeth.web.composer.tools._common import (
 )
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
-    _sync_get_blob,
+    _locked_read_ready_blob,
     _verify_blob_content_integrity,
 )
 from elspeth.web.composer.tools.declarations import (
@@ -2647,16 +2647,17 @@ def compute_proof_diagnostics(
             return []
 
         def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
-            metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
+            # Row + bytes observed as ONE version under the session custody
+            # lock — an unlocked read racing update_blob's in-transaction
+            # file swap would escalate a false BlobIntegrityError
+            # (elspeth-3d1d1fcb6c).
+            metadata, content = _locked_read_ready_blob(session_engine, session_id, resolved_blob_id)
             if metadata is None:
                 return None
-            if metadata["status"] != "ready":
+            if content is None:
+                # Not ready, or storage file missing — metadata-only
+                # resolution; downstream emits the matching diagnostic.
                 return ResolvedProofBlob(metadata=metadata)
-            storage_path = Path(metadata["storage_path"])
-            if not storage_path.exists():
-                return ResolvedProofBlob(metadata=metadata)
-            content = storage_path.read_bytes()
-            _verify_blob_content_integrity(metadata, content)
             stored_hash = metadata["content_hash"]
             if stored_hash is None:
                 raise AuditIntegrityError("ready proof blob has null content_hash")
