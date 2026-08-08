@@ -822,3 +822,57 @@ describe("muted text on every panel surface (elspeth-dae08efdc9)", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Rendered markdown anchors (elspeth-05fef62901, 2026-08-09).
+// MarkdownRenderer emits <a> via SafeLink with no class, and no stylesheet
+// rule targeted anchors at all, so Chromium's UA default (rgb(0,0,238))
+// measured ~1.18:1 against the dark assistant bubble. The .markdown-body a
+// rule must deliver --color-link plus a non-color affordance (underline);
+// contrast is gated over the composed bubble tints, not just the page
+// background, because the bubbles are rgba() washes over --color-bg.
+// ---------------------------------------------------------------------------
+
+describe("rendered markdown links (elspeth-05fef62901)", () => {
+  const themes: Array<"dark" | "light"> = ["dark", "light"];
+
+  function markdownAnchorRule(): string {
+    const match = /\.markdown-body a\s*\{([^}]*)\}/.exec(appCss);
+    if (!match) {
+      throw new Error("No .markdown-body a rule found in the stylesheet barrel");
+    }
+    return match[1];
+  }
+
+  it("delivers the link token and an underline to rendered markdown anchors", () => {
+    const rule = markdownAnchorRule();
+    expect(rule).toContain("var(--color-link)");
+    expect(rule).toContain("underline");
+  });
+
+  it("keeps the link token at AA over every chat bubble tint in both themes", () => {
+    const bubbleTints = [
+      "--color-bubble-user",
+      "--color-bubble-assistant",
+      "--color-bubble-system",
+    ];
+    for (const theme of themes) {
+      const link = resolveHex(theme, "--color-link");
+      for (const tint of bubbleTints) {
+        const bg = resolveTintOver(theme, tint, "--color-bg");
+        expect(
+          contrastRatio(link, bg),
+          `link on ${tint} (${theme})`,
+        ).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+  });
+
+  it("keeps anchors covered by the global keyboard focus ring", () => {
+    // Anchors rely on base.css's global :focus-visible reset for their focus
+    // treatment — guard it so a reset refactor cannot silently strip it.
+    expect(appCss).toMatch(
+      /^:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--color-focus-ring\)/m,
+    );
+  });
+});

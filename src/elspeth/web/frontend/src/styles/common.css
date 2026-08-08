@@ -114,6 +114,17 @@
   margin: 0;
 }
 
+/* Anchors need an explicit rule: MarkdownRenderer's SafeLink emits bare <a>
+   elements, and without this the UA default (rgb(0,0,238)) renders nearly
+   invisible on the dark assistant bubble (~1.18:1). Underline is the
+   non-color affordance; the focus ring comes from base.css :focus-visible.
+   Contrast over every bubble tint is gated by colorContrast.test.ts. */
+.markdown-body a {
+  color: var(--color-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .markdown-body table {
   border-collapse: collapse;
   margin: var(--space-sm) 0;
