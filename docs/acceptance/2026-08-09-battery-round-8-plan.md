@@ -1,6 +1,6 @@
 # Battery round 8 — plan and coverage declaration
 
-Pin **`4976bdfce`**, 22 commits past round 7's `51d3d26c9`. The stack is the
+Pin **`230fd9dfd`**, 23 commits past round 7's `51d3d26c9`. The stack is the
 round-7 cold install (run `700e19d5-7894-4087-9a04-25aca8047b26`, cleanup
 deadline 2026-08-12); round 8 rolls the image only, it does not reinstall.
 
@@ -13,23 +13,23 @@ than passed.
 
 ## 1. Known state of the pin
 
-`pytest tests/` at this pin was run in the build worktree with `PYTHONPATH`
-pinned to it (`elspeth.__file__` verified inside the worktree) and returned
-**2 failed, 38605 passed, 81 skipped, 1 xfailed** in 17m26s. Both failures are
-already tracked as `elspeth-62a5aa4da8` (P1, `fixing`) — there is no third,
-unexplained failure, which is what makes the pin usable:
+The pin moved during preparation. At the **earlier** pin `4976bdfce`,
+`pytest tests/` returned **2 failed, 38605 passed, 81 skipped, 1 xfailed**
+(17m26s), both failures tracked as `elspeth-62a5aa4da8` (P1) and bisected to
+`7201beeb7`:
 
 - `tests/unit/web/test_sessions_composer_attribute_contracts.py::test_sessions_and_composer_use_explicit_attribute_contracts`
 - `tests/unit/elspeth_lints/test_masquerade_gate.py::test_live_tree_has_zero_unbaselined_findings`
 
-Bisected to `7201beeb7`, which introduced a `_content_hash_memo` getattr probe
-in `web/composer/pipeline_proposal.py` with no attribute-contract entry or
-ledger adjudication.
+`230fd9dfd` ("rewrite the 7201beeb7 getattr sites to direct access") is the fix
+for exactly those two. The round-8 pin therefore also **verifies
+`elspeth-62a5aa4da8`** — a ticket that was not on the round's target list an
+hour ago. The gate is being re-run at the new pin; the report records that
+result, not the old one.
 
-**Both are static-analysis gates over the source tree.** Neither executes in
-the deployed container, so neither can influence live battery behaviour. The
-round proceeds, and any arm-A failure must NOT be attributed to them — but the
-pin is not clean, and the report must say so.
+Both failures were static-analysis gates over the source tree, so neither could
+have influenced live battery behaviour either way. The rule stands regardless:
+no arm-A failure may be attributed to them.
 
 Two of the round's targets, `elspeth-15c72686f2` and `elspeth-ac85b0ab0e`, are
 in status `fixing`, not `verifying`, and both have review-followup commits
@@ -102,7 +102,7 @@ these.
 |---|---|
 | `elspeth-1d24bb0d96` | Needs a run whose Landscape store is **missing**. Reaching it means deleting a store on the live stack — destructive fault injection on shared state. **Refused.** Verify by unit test and code reading |
 | `elspeth-045ad8de9d` | Only fires on a `database_bootstrap` **failure**. The stack is already installed; reaching it costs a full teardown + fault-injected reinstall. Not worth the spend |
-| `elspeth-8363555f05` | `0ce0a0cf1` is a **frontend-only** change (`frontend/src`). No HTTP driver can reach it; it needs a browser session |
+| `elspeth-8363555f05` | `0ce0a0cf1` touches only `frontend/src/stores/executionStore.ts` and its test — client-side dispatch state. No HTTP driver reaches it. It is reachable by a **browser** probe, which this round does not build; if it is wanted, that is a scoped follow-up, not an arm-A result |
 | `elspeth-9595abb7b0` | Needs a sink diversion to actually occur. `elspeth-afdf55a17c` closed at 0/3 reproduced, so the natural path is gone. If arm A produces no diversion, this stays NOT EXERCISED for a second round |
 | guided cluster | Arm D dropped. **UNMEASURED**, not "no regression" |
 
