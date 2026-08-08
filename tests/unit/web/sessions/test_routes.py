@@ -55,6 +55,7 @@ from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.schemas import (
     RunAccounting,
     RunAccountingIntegrity,
@@ -2723,7 +2724,7 @@ class TestSessionCRUDRoutes:
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
-            lambda settings, run_ids: {str(run.id): _fanout_accounting()},
+            lambda settings, run_ids: RunAccountingBatch(accounting={str(run.id): _fanout_accounting()}),
             raising=False,
         )
 
@@ -2737,6 +2738,67 @@ class TestSessionCRUDRoutes:
         assert "rows_failed" not in payload
         assert payload["accounting"]["source"]["rows_processed"] == 1
         assert payload["accounting"]["tokens"]["succeeded"] == 9323
+
+    @pytest.mark.asyncio
+    async def test_session_run_list_isolates_corrupt_run_and_renders_healthy_runs(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One corrupt run renders with an explicit corruption marker; healthy siblings keep accounting (elspeth-d5578ccd98)."""
+        from elspeth.web.execution.schemas import RunAccountingCorruption
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+
+        create_resp = client.post("/api/sessions", json={"title": "Mixed Batch"})
+        session_id = uuid.UUID(create_resp.json()["id"])
+
+        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        good_run = await service.create_run(session_id, state.id)
+        await service.update_run_status(good_run.id, "running")
+        await service.update_run_status(
+            good_run.id,
+            "completed",
+            landscape_run_id=f"lscp-good-{good_run.id}",
+            rows_processed=1,
+            rows_succeeded=9323,
+        )
+        bad_run = await service.create_run(session_id, state.id)
+        await service.update_run_status(bad_run.id, "running")
+        await service.update_run_status(
+            bad_run.id,
+            "completed",
+            landscape_run_id=f"lscp-bad-{bad_run.id}",
+            rows_processed=1,
+            rows_succeeded=1,
+        )
+
+        corruption = RunAccountingCorruption(
+            landscape_run_id=f"lscp-bad-{bad_run.id}",
+            violations=["1 token(s) with duplicate completed terminal outcomes"],
+        )
+        monkeypatch.setattr(
+            "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
+            lambda settings, run_ids: RunAccountingBatch(
+                accounting={f"lscp-good-{good_run.id}": _fanout_accounting()},
+                corrupt={f"lscp-bad-{bad_run.id}": corruption},
+            ),
+            raising=False,
+        )
+
+        runs_resp = client.get(f"/api/sessions/{session_id}/runs")
+
+        assert runs_resp.status_code == 200
+        payload_by_id = {entry["id"]: entry for entry in runs_resp.json()}
+        assert set(payload_by_id) == {str(good_run.id), str(bad_run.id)}
+        good_payload = payload_by_id[str(good_run.id)]
+        assert good_payload["accounting"]["tokens"]["succeeded"] == 9323
+        assert good_payload["accounting_corruption"] is None
+        bad_payload = payload_by_id[str(bad_run.id)]
+        assert bad_payload["accounting"] is None
+        assert bad_payload["accounting_corruption"]["landscape_run_id"] == f"lscp-bad-{bad_run.id}"
+        assert bad_payload["accounting_corruption"]["violations"] == ["1 token(s) with duplicate completed terminal outcomes"]
 
     @pytest.mark.asyncio
     async def test_session_run_list_fails_closed_when_completed_accounting_missing(
@@ -2767,7 +2829,7 @@ class TestSessionCRUDRoutes:
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
-            lambda settings, run_ids: {},
+            lambda settings, run_ids: RunAccountingBatch(),
             raising=False,
         )
         monkeypatch.setattr(
@@ -2809,7 +2871,7 @@ class TestSessionCRUDRoutes:
 
         monkeypatch.setattr(
             "elspeth.web.sessions.routes.runs.load_run_accounting_for_settings",
-            lambda settings, run_ids: {str(run.id): _open_completed_accounting()},
+            lambda settings, run_ids: RunAccountingBatch(accounting={str(run.id): _open_completed_accounting()}),
             raising=False,
         )
         monkeypatch.setattr(

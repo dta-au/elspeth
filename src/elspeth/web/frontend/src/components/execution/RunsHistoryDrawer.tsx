@@ -312,6 +312,20 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
                   <StatusBadge status={run.status}>
                     {run.status.replace(/_/g, " ")}
                   </StatusBadge>
+                  {/* Explicit per-run audit-integrity failure
+                      (elspeth-d5578ccd98): the backend ships this marker
+                      INSTEAD of accounting when the run's recorded token
+                      outcomes fail canonical validation. Text marker, not
+                      colour-only, matching the a11y stance above. */}
+                  {run.accounting_corruption ? (
+                    <span
+                      className="runs-history-item-corruption"
+                      role="alert"
+                      title={run.accounting_corruption.violations.join("\n")}
+                    >
+                      ⚠ audit accounting corrupt
+                    </span>
+                  ) : null}
                   {/* REST-backed Cancel for live runs (elspeth-90db33baac):
                       works without the in-memory activeRunId/WebSocket that
                       gates ProgressView's Cancel, so a run stays cancellable

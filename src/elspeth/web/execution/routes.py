@@ -593,15 +593,26 @@ async def _load_run_status_snapshot_with_accounting(
     accounting = None
     if run_record.landscape_run_id and run_record.status in RUN_STATUS_TERMINAL_VALUES:
         try:
-            accounting_by_run_id = await run_sync_in_worker(
+            accounting_batch = await run_sync_in_worker(
                 load_run_accounting_for_settings,
                 app.state.settings,
                 (run_record.landscape_run_id,),
             )
         except ValueError as exc:
             raise _RunStatusIntegrityError(str(exc)) from exc
-        if run_record.landscape_run_id in accounting_by_run_id:
-            accounting = accounting_by_run_id[run_record.landscape_run_id]
+        corruption = accounting_batch.corrupt.get(run_record.landscape_run_id)
+        if corruption is not None:
+            # Single-run surface: the explicit integrity status IS the
+            # structured per-run error envelope. The loader no longer raises,
+            # so the corruption marker must be converted here — silently
+            # dropping accounting would present the corrupt run as a run
+            # with no projection at all (elspeth-d5578ccd98).
+            raise _RunStatusIntegrityError(
+                f"Landscape accounting for run {run_record.landscape_run_id!r} failed integrity validation: "
+                + "; ".join(corruption.violations)
+            )
+        if run_record.landscape_run_id in accounting_batch.accounting:
+            accounting = accounting_batch.accounting[run_record.landscape_run_id]
 
     try:
         status = await service.get_status(run_id, accounting=accounting, run_record=run_record)

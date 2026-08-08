@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS
 from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
@@ -23,6 +24,30 @@ from elspeth.web.execution.accounting import (
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _NOW = datetime(2026, 5, 6, tzinfo=UTC)
+
+# Synthetic evidence values satisfying the ADR-019 pair-field constraints for
+# seeded outcomes. ``_legal_evidence_fields`` derives the per-pair legal shape
+# from the SAME canonical table the accounting read model validates against,
+# so seeds stay legal as the constraint table evolves.
+_SYNTHETIC_EVIDENCE: dict[str, str] = {
+    "sink_name": "sink-out",
+    "batch_id": "batch-1",
+    "fork_group_id": "fork-1",
+    "join_group_id": "join-1",
+    "expand_group_id": "expand-1",
+    "error_hash": "e" * 16,
+}
+
+
+def _legal_evidence_fields(outcome: TerminalOutcome | None, path: TerminalPath) -> dict[str, str | None]:
+    constraints = _TERMINAL_PAIR_FIELD_CONSTRAINTS[(outcome, path)]
+    fields: dict[str, str | None] = dict.fromkeys(_SYNTHETIC_EVIDENCE)
+    for name in constraints.required:
+        fields[name] = _SYNTHETIC_EVIDENCE[name]
+    for name, value in constraints.exact.items():
+        assert isinstance(value, str)
+        fields[name] = value
+    return fields
 
 
 @dataclass(frozen=True)
@@ -81,7 +106,10 @@ def _insert_completed_outcomes(
     token_ids: list[str],
     outcome: TerminalOutcome,
     path: TerminalPath,
+    **field_overrides: str | None,
 ) -> None:
+    fields = _legal_evidence_fields(outcome, path)
+    fields.update(field_overrides)
     with db.write_connection() as conn:
         conn.execute(
             token_outcomes_table.insert(),
@@ -94,14 +122,9 @@ def _insert_completed_outcomes(
                     "path": path.value,
                     "completed": 1,
                     "recorded_at": _NOW,
-                    "sink_name": None,
-                    "batch_id": None,
-                    "fork_group_id": None,
-                    "join_group_id": None,
-                    "expand_group_id": None,
-                    "error_hash": None,
                     "context_json": None,
                     "expected_branches_json": None,
+                    **fields,
                 }
                 for token_id in token_ids
             ],
@@ -116,25 +139,32 @@ def _insert_outcome(
     outcome: TerminalOutcome | None,
     path: TerminalPath,
     completed: int,
+    outcome_value: str | None = None,
+    **field_overrides: str | None,
 ) -> None:
+    # Evidence auto-fill applies to completed rows only: the accounting read
+    # model enforces pair-field evidence for completed outcomes (what closure
+    # trusts), while a non-completed BUFFERED row's batch linkage is FK-bound
+    # to a real batches row this fixture does not build.
+    fields = (
+        _legal_evidence_fields(outcome, path)
+        if completed == 1 and (outcome, path) in _TERMINAL_PAIR_FIELD_CONSTRAINTS
+        else dict.fromkeys(_SYNTHETIC_EVIDENCE)
+    )
+    fields.update(field_overrides)
     with db.write_connection() as conn:
         conn.execute(
             token_outcomes_table.insert().values(
                 outcome_id=f"outcome-{token_id}-{path.value}-{completed}",
                 run_id=run_id,
                 token_id=token_id,
-                outcome=outcome.value if outcome is not None else None,
+                outcome=outcome_value if outcome_value is not None else (outcome.value if outcome is not None else None),
                 path=path.value,
                 completed=completed,
                 recorded_at=_NOW,
-                sink_name=None,
-                batch_id=None,
-                fork_group_id=None,
-                join_group_id=None,
-                expand_group_id=None,
-                error_hash=None,
                 context_json=None,
                 expected_branches_json=None,
+                **fields,
             )
         )
 
@@ -402,8 +432,10 @@ def test_batch_loader_returns_accounting_for_requested_runs() -> None:
         _setup_run_with_row(db, run_id="run-b", row_id="row-b")
         _insert_tokens(db, run_id="run-b", row_id="row-b", token_ids=["token-b"])
 
-        accounting = load_run_accounting_map_from_db(db, ("run-b", "run-a", "run-a"))
+        batch = load_run_accounting_map_from_db(db, ("run-b", "run-a", "run-a"))
+        accounting = batch.accounting
 
+        assert batch.corrupt == {}
         assert tuple(accounting) == ("run-a", "run-b")
         assert accounting["run-a"].integrity.closure == "closed"
         assert accounting["run-a"].tokens.succeeded == 1
@@ -418,7 +450,8 @@ def test_batch_loader_does_not_fabricate_absent_landscape_runs() -> None:
     try:
         _setup_empty_run(db, run_id="empty-run")
 
-        accounting = load_run_accounting_map_from_db(db, ("missing-run", "empty-run"))
+        batch = load_run_accounting_map_from_db(db, ("missing-run", "empty-run"))
+        accounting = batch.accounting
 
         assert set(accounting) == {"empty-run"}
         assert accounting["empty-run"].source.rows_processed == 0
@@ -431,7 +464,10 @@ def test_batch_loader_does_not_fabricate_absent_landscape_runs() -> None:
 def test_settings_loader_returns_empty_for_missing_sqlite_database(tmp_path: Path) -> None:
     settings = _SettingsFake(landscape_url=f"sqlite:///{tmp_path / 'missing-audit.db'}")
 
-    assert load_run_accounting_for_settings(settings, ("run-1", None)) == {}
+    batch = load_run_accounting_for_settings(settings, ("run-1", None))
+
+    assert batch.accounting == {}
+    assert batch.corrupt == {}
 
 
 def test_routing_subset_classification_counts_completed_terminal_pairs() -> None:
@@ -540,6 +576,216 @@ def test_duplicate_completed_outcomes_raise_clear_integrity_error() -> None:
 
         with pytest.raises(ValueError, match="duplicate completed terminal outcomes"):
             load_run_accounting_from_db(db, landscape_run_id="run-6")
+    finally:
+        db.close()
+
+
+def test_corrupt_run_is_isolated_and_healthy_runs_remain_available() -> None:
+    """One corrupt run must not hide accounting for healthy runs in the same batch (elspeth-d5578ccd98)."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-good", row_id="row-good")
+        _insert_tokens(db, run_id="run-good", row_id="row-good", token_ids=["token-good"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-good",
+            token_ids=["token-good"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
+
+        _setup_run_with_row(db, run_id="run-bad", row_id="row-bad")
+        _insert_tokens(db, run_id="run-bad", row_id="row-bad", token_ids=["dup-token"])
+        with db.write_connection() as conn:
+            conn.execute(text("DROP INDEX ix_token_outcomes_terminal_unique"))
+        _insert_completed_outcomes(
+            db,
+            run_id="run-bad",
+            token_ids=["dup-token"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
+        _insert_completed_outcomes(
+            db,
+            run_id="run-bad",
+            token_ids=["dup-token"],
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-good", "run-bad"))
+
+        assert set(batch.accounting) == {"run-good"}
+        assert batch.accounting["run-good"].integrity.closure == "closed"
+        assert set(batch.corrupt) == {"run-bad"}
+        corruption = batch.corrupt["run-bad"]
+        assert corruption.landscape_run_id == "run-bad"
+        assert any("duplicate completed terminal outcomes" in violation for violation in corruption.violations)
+    finally:
+        db.close()
+
+
+def test_unknown_outcome_enum_marks_run_corrupt_not_closed() -> None:
+    """A count-complete run with a non-canonical outcome string must not read 'closed'."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-enum")
+        _insert_tokens(db, run_id="run-enum", row_id="row-1", token_ids=["token-1"])
+        _insert_outcome(
+            db,
+            run_id="run-enum",
+            token_id="token-1",
+            outcome=None,
+            outcome_value="banana",
+            path=TerminalPath.DEFAULT_FLOW,
+            completed=1,
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-enum",))
+
+        assert batch.accounting == {}
+        assert set(batch.corrupt) == {"run-enum"}
+        assert any("banana" in violation for violation in batch.corrupt["run-enum"].violations)
+    finally:
+        db.close()
+
+
+def test_illegal_terminal_pair_marks_run_corrupt() -> None:
+    """(FAILURE, DEFAULT_FLOW) is not a legal ADR-019 pair and must fail per-run integrity."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-pair")
+        _insert_tokens(db, run_id="run-pair", row_id="row-1", token_ids=["token-1"])
+        _insert_outcome(
+            db,
+            run_id="run-pair",
+            token_id="token-1",
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.DEFAULT_FLOW,
+            completed=1,
+            sink_name="sink-out",
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-pair",))
+
+        assert batch.accounting == {}
+        assert any("not a legal" in violation for violation in batch.corrupt["run-pair"].violations)
+    finally:
+        db.close()
+
+
+def test_missing_required_evidence_marks_run_corrupt() -> None:
+    """(SUCCESS, DEFAULT_FLOW) requires sink_name; NULL evidence must fail per-run integrity."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-evidence")
+        _insert_tokens(db, run_id="run-evidence", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-evidence",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            sink_name=None,
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-evidence",))
+
+        assert batch.accounting == {}
+        assert any("sink_name" in violation for violation in batch.corrupt["run-evidence"].violations)
+    finally:
+        db.close()
+
+
+def test_forbidden_evidence_marks_run_corrupt() -> None:
+    """(SUCCESS, GATE_DISCARDED) forbids discriminator fields; a stray sink_name must fail."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-forbidden")
+        _insert_tokens(db, run_id="run-forbidden", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-forbidden",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.GATE_DISCARDED,
+            sink_name="sink-out",
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-forbidden",))
+
+        assert batch.accounting == {}
+        assert any("forbids sink_name" in violation for violation in batch.corrupt["run-forbidden"].violations)
+    finally:
+        db.close()
+
+
+def test_exact_evidence_violation_marks_run_corrupt() -> None:
+    """(FAILURE, SINK_DISCARDED) requires the discard sink sentinel as sink_name."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-exact")
+        _insert_tokens(db, run_id="run-exact", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-exact",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.SINK_DISCARDED,
+            sink_name="some-other-sink",
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-exact",))
+
+        assert batch.accounting == {}
+        assert any("sink_name" in violation for violation in batch.corrupt["run-exact"].violations)
+    finally:
+        db.close()
+
+
+def test_completed_with_null_outcome_marks_run_corrupt() -> None:
+    """completed=1 with outcome NULL violates the ADR-019 XOR invariant."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-xor")
+        _insert_tokens(db, run_id="run-xor", row_id="row-1", token_ids=["token-1"])
+        _insert_outcome(
+            db,
+            run_id="run-xor",
+            token_id="token-1",
+            outcome=None,
+            path=TerminalPath.DEFAULT_FLOW,
+            completed=1,
+            sink_name="sink-out",
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-xor",))
+
+        assert batch.accounting == {}
+        assert set(batch.corrupt) == {"run-xor"}
+    finally:
+        db.close()
+
+
+def test_not_completed_with_outcome_marks_run_corrupt() -> None:
+    """completed=0 with a non-NULL outcome violates the ADR-019 XOR invariant."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-xor2")
+        _insert_tokens(db, run_id="run-xor2", row_id="row-1", token_ids=["token-1"])
+        _insert_outcome(
+            db,
+            run_id="run-xor2",
+            token_id="token-1",
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.BUFFERED,
+            completed=0,
+        )
+
+        batch = load_run_accounting_map_from_db(db, ("run-xor2",))
+
+        assert batch.accounting == {}
+        assert set(batch.corrupt) == {"run-xor2"}
     finally:
         db.close()
 

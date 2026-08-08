@@ -674,6 +674,18 @@ export interface RunAccounting {
   integrity: RunAccountingIntegrity;
 }
 
+/**
+ * Explicit per-run accounting integrity failure
+ * (``RunAccountingCorruption`` at ``web/execution/schemas.py``,
+ * elspeth-d5578ccd98). Carried INSTEAD of ``accounting`` when the run's
+ * recorded token outcomes fail canonical audit validation — the run is
+ * visible, and visibly corrupt, rather than hiding the whole history.
+ */
+export interface RunAccountingCorruption {
+  landscape_run_id: string;
+  violations: string[];
+}
+
 /** An execution run.
  *
  * Mirrors ``RunStatusResponse`` / ``RunResultsResponse`` at
@@ -688,6 +700,9 @@ export interface Run {
   status: RunStatus;
   cancel_requested?: boolean;
   accounting: RunAccounting | null;
+  /** Present (session-list surface) when accounting failed canonical audit
+   * validation; mutually exclusive with `accounting`. */
+  accounting_corruption?: RunAccountingCorruption | null;
   error: string | null;
   started_at: string;
   finished_at: string | null;

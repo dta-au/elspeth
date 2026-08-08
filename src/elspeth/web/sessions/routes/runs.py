@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
+from elspeth.web.execution.schemas import RunAccounting, RunAccountingCorruption
+
 from ._helpers import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     UUID,
@@ -44,10 +48,11 @@ def register_run_routes(router: APIRouter) -> None:
         terminal_landscape_run_ids = tuple(
             run.landscape_run_id for run in runs if run.status in SESSION_TERMINAL_RUN_STATUS_VALUES and run.landscape_run_id is not None
         )
-        accounting_by_run_id = {}
+        accounting_by_run_id: Mapping[str, RunAccounting] = {}
+        corruption_by_run_id: Mapping[str, RunAccountingCorruption] = {}
         if terminal_landscape_run_ids:
             try:
-                accounting_by_run_id = await run_sync_in_worker(
+                accounting_batch = await run_sync_in_worker(
                     load_run_accounting_for_settings,
                     request.app.state.settings,
                     terminal_landscape_run_ids,
@@ -58,6 +63,12 @@ def register_run_routes(router: APIRouter) -> None:
                     landscape_run_ids=terminal_landscape_run_ids,
                     error=str(exc),
                 ) from exc
+            accounting_by_run_id = accounting_batch.accounting
+            # Per-run isolation (elspeth-d5578ccd98): corrupt runs render in
+            # the list with an explicit corruption marker instead of
+            # accounting; before this split one corrupt historical run made
+            # the whole session history 500, hiding every healthy run.
+            corruption_by_run_id = accounting_batch.corrupt
         discard_summaries = {}
         if terminal_landscape_run_ids:
             discard_summaries = await run_sync_in_worker(
@@ -82,9 +93,17 @@ def register_run_routes(router: APIRouter) -> None:
             if run.landscape_run_id is not None and run.landscape_run_id in discard_summaries:
                 discard_summary = discard_summaries[run.landscape_run_id]
             accounting = None
+            accounting_corruption = None
             if run.landscape_run_id is not None and run.landscape_run_id in accounting_by_run_id:
                 accounting = accounting_by_run_id[run.landscape_run_id]
-            _validate_run_status_accounting_for_list(run, accounting)
+            if run.landscape_run_id is not None and run.landscape_run_id in corruption_by_run_id:
+                accounting_corruption = corruption_by_run_id[run.landscape_run_id]
+            if accounting_corruption is None:
+                # The status/accounting contract presumes trustworthy
+                # accounting; a corrupt run replaces it with the explicit
+                # corruption marker, which RunResponse's own validator pins
+                # as mutually exclusive with accounting.
+                _validate_run_status_accounting_for_list(run, accounting)
             # RunResponse construction runs the accounting/discard-summary
             # reconciliation validator (elspeth-43f52d69a4) — the list helper
             # above never sees discard_summary, so a contradiction fires HERE
@@ -96,6 +115,7 @@ def register_run_routes(router: APIRouter) -> None:
                     session_id=str(run.session_id),
                     status=run.status,
                     accounting=accounting,
+                    accounting_corruption=accounting_corruption,
                     error=run.error,
                     started_at=run.started_at,
                     finished_at=run.finished_at,

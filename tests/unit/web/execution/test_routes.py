@@ -27,6 +27,7 @@ from starlette.routing import Route
 
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.protocol import ComposerService
+from elspeth.web.execution.accounting import RunAccountingBatch
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.schemas import (
@@ -1039,7 +1040,7 @@ class TestRunDiagnosticsEndpoint:
 
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_accounting_for_settings",
-            lambda settings, run_ids: {str(run_id): accounting},
+            lambda settings, run_ids: RunAccountingBatch(accounting={str(run_id): accounting}),
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
@@ -1113,7 +1114,7 @@ class TestRunDiagnosticsEndpoint:
         )
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_accounting_for_settings",
-            lambda settings, run_ids: {str(run_id): accounting},
+            lambda settings, run_ids: RunAccountingBatch(accounting={str(run_id): accounting}),
         )
 
         transport = ASGITransport(app=app, raise_app_exceptions=False)
@@ -2641,7 +2642,7 @@ class TestRunStatusEndpoint:
         app.state.session_service.get_run = AsyncMock(spec=SessionServiceProtocol.get_run, return_value=failed_record)
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_accounting_for_settings",
-            lambda settings, run_ids: {"land-failed": accounting},
+            lambda settings, run_ids: RunAccountingBatch(accounting={"land-failed": accounting}),
         )
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -2653,6 +2654,57 @@ class TestRunStatusEndpoint:
         assert body["accounting"]["source"]["rows_processed"] == 2
         assert body["accounting"]["tokens"]["failed"] == 1
         assert svc.get_status.call_args.kwargs["accounting"] == accounting
+
+    @pytest.mark.asyncio
+    async def test_corrupt_run_accounting_returns_structured_integrity_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A corrupt run's polling response is an explicit integrity error naming the violations (elspeth-d5578ccd98)."""
+        from elspeth.web.execution.schemas import RunAccountingCorruption
+
+        run_id = uuid4()
+        record = RunRecord(
+            id=run_id,
+            session_id=uuid4(),
+            state_id=uuid4(),
+            status="completed",
+            started_at=datetime.now(tz=UTC),
+            finished_at=datetime.now(tz=UTC),
+            rows_processed=1,
+            rows_succeeded=1,
+            rows_failed=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            rows_quarantined=0,
+            error=None,
+            landscape_run_id="land-corrupt",
+            pipeline_yaml=None,
+        )
+        svc = _execution_service()
+        svc.get_status = AsyncMock(spec=ExecutionService.get_status)
+        app = _create_test_app(execution_service=svc)
+        app.state.session_service.get_run = AsyncMock(spec=SessionServiceProtocol.get_run, return_value=record)
+        monkeypatch.setattr(
+            "elspeth.web.execution.routes.load_run_accounting_for_settings",
+            lambda settings, run_ids: RunAccountingBatch(
+                corrupt={
+                    "land-corrupt": RunAccountingCorruption(
+                        landscape_run_id="land-corrupt",
+                        violations=["2 token(s) with duplicate completed terminal outcomes"],
+                    )
+                }
+            ),
+        )
+
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/api/runs/{run_id}")
+
+        assert resp.status_code == 500
+        detail = resp.json()["detail"]
+        assert detail["code"] == "run_integrity_error"
+        assert "duplicate completed terminal outcomes" in detail["error"]
+        # The corrupt run never reaches status construction with fabricated
+        # or partial accounting.
+        svc.get_status.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_status_returns_200(self) -> None:
@@ -2909,7 +2961,7 @@ class TestResultsEndpoint:
         app.state.session_service.get_run = AsyncMock(spec=SessionServiceProtocol.get_run, return_value=failed_record)
         monkeypatch.setattr(
             "elspeth.web.execution.routes.load_run_accounting_for_settings",
-            lambda settings, run_ids: {"land-results-failed": accounting},
+            lambda settings, run_ids: RunAccountingBatch(accounting={"land-results-failed": accounting}),
         )
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:

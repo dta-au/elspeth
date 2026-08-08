@@ -434,6 +434,25 @@ class RunAccountingIntegrity(_StrictResponse):
     duplicate_terminal_outcomes: int = Field(ge=0)
 
 
+class RunAccountingCorruption(_StrictResponse):
+    """Explicit per-run integrity failure for the accounting projection.
+
+    Carried INSTEAD of :class:`RunAccounting` when a run's recorded token
+    outcomes violate the canonical ADR-019 contract (unknown enum value,
+    illegal (outcome, path) pair, missing/forbidden pair evidence, duplicate
+    completed outcomes, or an ADR-038 decided-and-abandoned contradiction).
+    A corrupt run can never satisfy closure — it ships no accounting at all,
+    only this marker — and it must not hide accounting for healthy runs in
+    the same batch (elspeth-d5578ccd98).
+
+    ``violations`` is bounded, audit-safe text: enum member names, column
+    names, and counts only — never row payloads.
+    """
+
+    landscape_run_id: str
+    violations: list[str] = Field(min_length=1)
+
+
 class RunAccounting(_StrictResponse):
     """Explicit run accounting split by unit of account."""
 

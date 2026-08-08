@@ -24,7 +24,12 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, m
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
 from elspeth.contracts.tool_calls import PROVIDER_TOOL_CALL_ID_MAX_LENGTH
 from elspeth.web.composer.guided.protocol import GUIDED_MAX_COMPONENTS_PER_KIND
-from elspeth.web.execution.schemas import DiscardSummary, RunAccounting, check_discard_summary_reconciliation
+from elspeth.web.execution.schemas import (
+    DiscardSummary,
+    RunAccounting,
+    RunAccountingCorruption,
+    check_discard_summary_reconciliation,
+)
 from elspeth.web.sessions.protocol import (
     ComposerDensityDefault,
     ComposerTrustMode,
@@ -435,6 +440,11 @@ class RunResponse(_StrictResponse):
     session_id: str
     status: SessionRunStatus
     accounting: RunAccounting | None = None
+    # Explicit per-run integrity failure (elspeth-d5578ccd98): when the run's
+    # recorded token outcomes fail canonical validation, the list surface
+    # ships this marker INSTEAD of accounting so the corrupt run stays
+    # visible — and visibly corrupt — while healthy runs keep theirs.
+    accounting_corruption: RunAccountingCorruption | None = None
     error: str | None = None
     started_at: datetime
     finished_at: datetime | None = None
@@ -451,6 +461,10 @@ class RunResponse(_StrictResponse):
         (elspeth-43f52d69a4).
         """
         check_discard_summary_reconciliation(self.accounting, self.discard_summary)
+        if self.accounting_corruption is not None and self.accounting is not None:
+            # The corruption marker exists to REPLACE accounting; carrying
+            # both would let a corrupt run present validated-looking numbers.
+            raise ValueError("accounting_corruption and accounting are mutually exclusive")
         return self
 
 

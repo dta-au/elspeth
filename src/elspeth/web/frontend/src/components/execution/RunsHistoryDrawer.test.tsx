@@ -120,6 +120,37 @@ describe("RunsHistoryDrawer", () => {
     expect(screen.getByText(/r2/)).toBeInTheDocument();
   });
 
+  it("marks a run whose accounting failed audit validation, without hiding its siblings", () => {
+    // elspeth-d5578ccd98: the backend ships accounting_corruption INSTEAD of
+    // accounting for a corrupt run; the list must render the run with an
+    // explicit marker while healthy runs stay ordinary.
+    useExecutionStore.setState({
+      runs: [
+        { id: "r1", status: "completed" } as never,
+        {
+          id: "r2",
+          status: "completed",
+          accounting: null,
+          accounting_corruption: {
+            landscape_run_id: "land-r2",
+            violations: ["2 token(s) with duplicate completed terminal outcomes"],
+          },
+        } as never,
+      ],
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+
+    const marker = screen.getByText("⚠ audit accounting corrupt");
+    expect(marker).toBeInTheDocument();
+    expect(marker).toHaveAttribute(
+      "title",
+      "2 token(s) with duplicate completed terminal outcomes",
+    );
+    expect(screen.getAllByText("⚠ audit accounting corrupt")).toHaveLength(1);
+    expect(screen.getByText(/r1/)).toBeInTheDocument();
+  });
+
   it("labels runs by stable ordinal and local start time, newest first", () => {
     const firstId = "c5f713ed-3bef-40d1-adda-7669d573efad";
     const secondId = "ec7f8f38-df73-4f55-ba8a-75c5c138733e";
