@@ -602,6 +602,58 @@ def _registered_blob_deletion_stage(
     return _StagedBlobDeletion(storage=storage, tombstone=tombstone)
 
 
+def blob_pre_update_sidecar(storage: Path) -> Path:
+    """Deterministic sidecar path holding a blob's pre-update bytes.
+
+    ``_execute_update_blob`` parks the prior bytes here across its
+    swap+commit window so a crash anywhere inside that window leaves the
+    filesystem one rename away from the committed row state.  The dot
+    prefix keeps the sidecar out of listings that assume blob files are
+    exactly ``{blob_id}_*``, and the suffix deliberately does NOT match
+    the ``.{name}.*.tmp`` temp-artifact glob — the sidecar is a durable
+    journal, not a discardable tempfile.
+    """
+    return storage.with_name(f".{storage.name}.pre-update")
+
+
+def reconcile_blob_storage_versions(storage: Path, *, expected_hash: str | None) -> None:
+    """Restore ONE authoritative blob version from crash leftovers.
+
+    The committed row's ``content_hash`` is the arbiter.  Two journal
+    shapes can survive a crash:
+
+    * ``.{name}.pre-update`` — update's pre-swap bytes.  If the storage
+      file already matches the committed hash the update committed and the
+      sidecar is stale (purge it); if the sidecar matches, the update never
+      committed (restore it over whatever half-state the crash left).
+    * ``.{name}.delete-<hex>`` — delete's staged bytes.  A live row whose
+      storage file is missing but whose single tombstone matches the
+      committed hash is an uncommitted delete (restore it).
+
+    When neither candidate matches the committed hash nothing is touched —
+    the caller's integrity verification escalates, preserving the
+    fail-closed corruption contract.  MUST be called under the
+    same-session custody lock: reconciliation renames storage files and is
+    only safe while mutators and other readers are excluded.
+    """
+    if expected_hash is None:
+        return
+    sidecar = blob_pre_update_sidecar(storage)
+    if sidecar.exists():
+        if storage.exists() and content_hash(storage.read_bytes()) == expected_hash:
+            sidecar.unlink(missing_ok=True)
+            _fsync_parent_directory(storage.parent)
+        elif content_hash(sidecar.read_bytes()) == expected_hash:
+            os.replace(sidecar, storage)
+            _fsync_parent_directory(storage.parent)
+        return
+    if not storage.exists() and storage.parent.exists():
+        tombstones = sorted(storage.parent.glob(f".{storage.name}.delete-*"))
+        if len(tombstones) == 1 and content_hash(tombstones[0].read_bytes()) == expected_hash:
+            os.replace(tombstones[0], storage)
+            _fsync_parent_directory(storage.parent)
+
+
 def _validate_reusable_blob_row(
     row: Any,
     *,
@@ -1854,6 +1906,9 @@ class BlobServiceImpl:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id_str)).first()
             if row is None:
                 raise BlobNotFoundError(blob_id_str)
+            # Crash leftovers (pre-update sidecar / delete tombstone) heal
+            # to the committed version before any caller touches the file.
+            reconcile_blob_storage_versions(Path(row.storage_path), expected_hash=row.content_hash)
             yield row
 
     async def read_blob_content(self, blob_id: UUID) -> bytes:

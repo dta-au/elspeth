@@ -17362,3 +17362,378 @@ class TestGetBlobContentReaderMixedVersion:
         )
         assert reader_results and reader_results[0].success is True
         assert reader_results[0].data["content"] == "new-content"
+
+
+class TestBlobCrashStateReconciliation:
+    """Crash leftovers must reconcile to ONE authoritative blob version.
+
+    ``_execute_update_blob`` preserves the prior bytes at a deterministic
+    ``.{name}.pre-update`` sidecar across its swap+commit window, and
+    ``_execute_delete_blob`` stages bytes at a ``.{name}.delete-<hex>``
+    tombstone before its DELETE commits.  A crash inside either window
+    leaves the filesystem one rename away from the committed row state;
+    the committed ``content_hash`` is the arbiter.  Readers reconcile
+    under the custody lock instead of escalating a false
+    ``BlobIntegrityError`` / missing-file failure (elspeth-3d1d1fcb6c).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        import hashlib
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import blobs_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        self.engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(self.engine)
+
+        self.session_id = str(uuid4())
+        self.blob_id = str(uuid4())
+        self.data_dir = str(tmp_path)
+        now = datetime.now(UTC)
+
+        storage_dir = tmp_path / "blobs" / self.session_id
+        storage_dir.mkdir(parents=True)
+        self.storage_path = storage_dir / f"{self.blob_id}_data.csv"
+        self.old_content = b"authoritative-old"
+        self.old_hash = hashlib.sha256(self.old_content).hexdigest()
+        self.new_content = b"uncommitted-new"
+        self.storage_path.write_bytes(self.old_content)
+        self.sidecar_path = self.storage_path.with_name(f".{self.storage_path.name}.pre-update")
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=self.session_id,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Crash reconcile",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=self.blob_id,
+                    session_id=self.session_id,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(self.old_content),
+                    content_hash=self.old_hash,
+                    storage_path=str(self.storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+    def _read_content(self) -> Any:
+        return execute_tool(
+            "get_blob_content",
+            {"blob_id": self.blob_id},
+            _empty_state(),
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+        )
+
+    def test_update_crash_before_commit_restores_sidecar_version(self) -> None:
+        """storage=new bytes, sidecar=old bytes, row=old hash → old wins."""
+        self.storage_path.write_bytes(self.new_content)
+        self.sidecar_path.write_bytes(self.old_content)
+
+        result = self._read_content()
+
+        assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
+        assert result.data["content"] == self.old_content.decode()
+        assert self.storage_path.read_bytes() == self.old_content
+        assert not self.sidecar_path.exists(), "sidecar journal must be consumed by reconciliation"
+
+    def test_update_crash_between_renames_restores_sidecar_version(self) -> None:
+        """storage missing, sidecar=old bytes, row=old hash → old restored."""
+        self.storage_path.unlink()
+        self.sidecar_path.write_bytes(self.old_content)
+
+        result = self._read_content()
+
+        assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
+        assert result.data["content"] == self.old_content.decode()
+        assert self.storage_path.read_bytes() == self.old_content
+        assert not self.sidecar_path.exists()
+
+    def test_update_crash_after_commit_purges_stale_sidecar(self) -> None:
+        """storage matches the committed row → stale sidecar is purged."""
+        import hashlib
+
+        committed = b"committed-new"
+        self.storage_path.write_bytes(committed)
+        self.sidecar_path.write_bytes(self.old_content)
+        with self.engine.begin() as conn:
+            from elspeth.web.sessions.models import blobs_table
+
+            conn.execute(
+                blobs_table.update()
+                .where(blobs_table.c.id == self.blob_id)
+                .values(content_hash=hashlib.sha256(committed).hexdigest(), size_bytes=len(committed))
+            )
+
+        result = self._read_content()
+
+        assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
+        assert result.data["content"] == committed.decode()
+        assert self.storage_path.read_bytes() == committed
+        assert not self.sidecar_path.exists(), "stale sidecar must be purged once the committed bytes verify"
+
+    def test_delete_crash_before_commit_restores_tombstone_version(self) -> None:
+        """row live, storage missing, one matching tombstone → restored."""
+        tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'0' * 32}")
+        self.storage_path.rename(tombstone)
+
+        result = self._read_content()
+
+        assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
+        assert result.data["content"] == self.old_content.decode()
+        assert self.storage_path.read_bytes() == self.old_content
+        assert not tombstone.exists(), "delete tombstone must be consumed by reconciliation"
+
+    def test_genuine_corruption_still_escalates(self) -> None:
+        """No recoverable version matching the committed hash → escalate."""
+        from elspeth.web.blobs.protocol import BlobIntegrityError
+
+        self.storage_path.write_bytes(b"garbage-bytes")
+        self.sidecar_path.write_bytes(b"other-garbage")
+
+        with pytest.raises(BlobIntegrityError):
+            self._read_content()
+        assert self.sidecar_path.exists(), "corrupt sidecar must be left in place for manual reconciliation"
+
+
+class TestDeleteBlobDurableJournal:
+    """Composer delete must journal its staged deletion like the HTTP path.
+
+    ``BlobServiceImpl.delete_blob`` records the tombstone in
+    ``blob_deletion_cleanups_table`` inside the delete transaction so a
+    crash after commit is recoverable; the composer tool previously
+    tombstoned without any journal, stranding bytes at an unrecoverable
+    random-suffix path (elspeth-3d1d1fcb6c).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path: Path) -> None:
+        import hashlib
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import blobs_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        self.engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(self.engine)
+
+        self.session_id = str(uuid4())
+        self.blob_id = str(uuid4())
+        self.data_dir = str(tmp_path)
+        now = datetime.now(UTC)
+
+        storage_dir = tmp_path / "blobs" / self.session_id
+        storage_dir.mkdir(parents=True)
+        self.storage_path = storage_dir / f"{self.blob_id}_data.csv"
+        self.content = b"delete-journal-bytes"
+        self.storage_path.write_bytes(self.content)
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=self.session_id,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Delete journal",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=self.blob_id,
+                    session_id=self.session_id,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(self.content),
+                    content_hash=hashlib.sha256(self.content).hexdigest(),
+                    storage_path=str(self.storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+    def test_successful_delete_leaves_no_journal_or_tombstone_debris(self) -> None:
+        from elspeth.web.sessions.models import blob_deletion_cleanups_table
+
+        result = execute_tool(
+            "delete_blob",
+            {"blob_id": self.blob_id},
+            _empty_state(),
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+            data_dir=self.data_dir,
+        )
+
+        assert result.success is True, result.data
+        assert not self.storage_path.exists()
+        assert list(self.storage_path.parent.iterdir()) == [], "tombstone/journal debris left after successful delete"
+        with self.engine.begin() as conn:
+            remaining = conn.execute(select(blob_deletion_cleanups_table)).fetchall()
+        assert remaining == [], "journal row must be purged after the staged bytes are gone"
+
+    def test_delete_retry_finalizes_crash_after_commit_leftovers(self) -> None:
+        """Journal row + tombstone without a blobs row → retry completes the delete."""
+        from datetime import UTC, datetime
+
+        from elspeth.web.sessions.models import blob_deletion_cleanups_table, blobs_table
+
+        tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'a' * 32}")
+        self.storage_path.rename(tombstone)
+        with self.engine.begin() as conn:
+            conn.execute(
+                blob_deletion_cleanups_table.insert().values(
+                    blob_id=self.blob_id,
+                    session_id=self.session_id,
+                    storage_path=str(self.storage_path),
+                    tombstone_path=str(tombstone),
+                    created_at=datetime.now(UTC),
+                )
+            )
+            conn.execute(blobs_table.delete().where(blobs_table.c.id == self.blob_id))
+
+        result = execute_tool(
+            "delete_blob",
+            {"blob_id": self.blob_id},
+            _empty_state(),
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+            data_dir=self.data_dir,
+        )
+
+        assert result.success is True, f"retry after a crash-after-commit must finalize the deletion: {result.data}"
+        assert result.data == {"blob_id": self.blob_id, "deleted": True}
+        assert not tombstone.exists(), "staged bytes must be purged by the retry"
+        with self.engine.begin() as conn:
+            remaining = conn.execute(select(blob_deletion_cleanups_table)).fetchall()
+        assert remaining == [], "journal row must be retired by the retry"
+
+
+class TestUpdateBlobSidecarCommitFailure:
+    """A commit failure after the file swap must restore via the sidecar.
+
+    The update sequence parks the prior bytes at the deterministic
+    ``.{name}.pre-update`` sidecar, swaps the new bytes in, then commits.
+    When the transaction fails after the swap, the except-arm restores the
+    sidecar over storage_path in one atomic rename — storage must hold the
+    original bytes, and neither sidecar nor tempfile may remain.
+    """
+
+    def test_commit_failure_after_swap_restores_sidecar(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import contextlib
+        import hashlib
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from sqlalchemy.pool import StaticPool
+
+        from elspeth.web.composer.tools import blobs as blobs_module
+        from elspeth.web.sessions.engine import create_session_engine
+        from elspeth.web.sessions.models import blobs_table, sessions_table
+        from elspeth.web.sessions.schema import initialize_session_schema
+
+        engine = create_session_engine(
+            "sqlite:///:memory:",
+            poolclass=StaticPool,
+            connect_args={"check_same_thread": False},
+        )
+        initialize_session_schema(engine)
+
+        session_id = str(uuid4())
+        blob_id = str(uuid4())
+        now = datetime.now(UTC)
+        storage_dir = tmp_path / "blobs" / session_id
+        storage_dir.mkdir(parents=True)
+        storage_path = storage_dir / f"{blob_id}_data.csv"
+        original = b"pre-commit-original"
+        storage_path.write_bytes(original)
+        with engine.begin() as conn:
+            conn.execute(
+                sessions_table.insert().values(
+                    id=session_id,
+                    user_id="test-user",
+                    auth_provider_type="local",
+                    title="Sidecar commit failure",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            conn.execute(
+                blobs_table.insert().values(
+                    id=blob_id,
+                    session_id=session_id,
+                    filename="data.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(original),
+                    content_hash=hashlib.sha256(original).hexdigest(),
+                    storage_path=str(storage_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description=None,
+                    status="ready",
+                )
+            )
+
+        real_locked_txn = blobs_module.locked_session_transaction
+
+        @contextlib.contextmanager
+        def commit_failing_txn(txn_engine: Any, txn_session_id: str) -> Any:
+            with real_locked_txn(txn_engine, txn_session_id) as conn:
+                yield conn
+                # Raising after the handler body (both renames done) but
+                # before the with-block commit models a commit-time fault:
+                # engine.begin() rolls the transaction back.
+                raise RuntimeError("simulated commit failure")
+
+        monkeypatch.setattr(blobs_module, "locked_session_transaction", commit_failing_txn)
+
+        provenance_context = _verbatim_blob_context(engine, session_id, "replacement-bytes")
+        with pytest.raises(RuntimeError, match="simulated commit failure"):
+            execute_tool(
+                "update_blob",
+                {"blob_id": blob_id, "content": "replacement-bytes"},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=engine,
+                session_id=session_id,
+                **provenance_context,
+            )
+
+        assert storage_path.read_bytes() == original, "storage must be restored from the sidecar after a commit failure"
+        assert list(storage_path.parent.iterdir()) == [storage_path], (
+            f"sidecar/tempfile debris left after rollback: {list(storage_path.parent.iterdir())}"
+        )

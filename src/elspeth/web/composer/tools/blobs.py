@@ -23,6 +23,7 @@ helpers here resolve those names via their local module namespace.
 
 from __future__ import annotations
 
+import contextlib
 import hmac
 import os
 import sys
@@ -30,6 +31,7 @@ import tempfile
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypedDict, cast
 from uuid import UUID, uuid4
@@ -52,12 +54,19 @@ from elspeth.web.blobs.service import (
     _ACTIVE_RUN_COMPOSITION_COLUMNS,
     _active_run_pipeline_dict,
     _composition_references_blob,
+    _finalize_staged_blob_deletion,
     _guard_blob_row_literals,
     _in_progress_session_fork_operation_id,
     _lock_session_for_blob_quota,
     _persist_blob_content,
+    _registered_blob_deletion_stage,
     _remove_blob_temp_artifacts,
+    _restore_staged_blob_deletion,
+    _stage_blob_deletion,
+    _StagedBlobDeletion,
+    blob_pre_update_sidecar,
     content_hash,
+    reconcile_blob_storage_versions,
     sanitize_filename,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -84,7 +93,13 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 from elspeth.web.sessions.locking import locked_session_transaction
-from elspeth.web.sessions.models import blob_run_links_table, blobs_table, composition_states_table, runs_table
+from elspeth.web.sessions.models import (
+    blob_deletion_cleanups_table,
+    blob_run_links_table,
+    blobs_table,
+    composition_states_table,
+    runs_table,
+)
 from elspeth.web.sessions.proposal_blob_refs import pending_proposal_reference_id
 
 
@@ -1321,11 +1336,13 @@ def _execute_update_blob(
         file_hash = content_hash(content_bytes)
         new_size = len(content_bytes)
 
-        # Snapshot the prior bytes BEFORE any filesystem mutation so the
-        # post-replace divergence rollback (commit-failure window) can
-        # restore them.  read_bytes() precedes tempfile creation so a
-        # read-side OSError cannot orphan a tempfile.
-        old_content = storage_path.read_bytes()
+        # The prior bytes are preserved ON DISK at the deterministic
+        # pre-update sidecar (see the rename sequence inside the
+        # transaction) rather than snapshotted into memory: the sidecar
+        # doubles as the durable crash journal, so both the in-process
+        # rollback arms and post-crash reconciliation restore from the
+        # same artifact.
+        sidecar_path = blob_pre_update_sidecar(storage_path)
 
         # Write the NEW content to a sibling tempfile; ``os.replace``
         # swaps it in atomically only after the active-run guard, quota
@@ -1352,6 +1369,7 @@ def _execute_update_blob(
             suffix=".tmp",
         )
         tmp_path = Path(tmp_name)
+        old_preserved = False
         replaced = False
         cleanup_primary_result: ToolResult | None = None
         try:
@@ -1360,6 +1378,11 @@ def _execute_update_blob(
 
             try:
                 with locked_session_transaction(session_engine, session_id) as conn:
+                    # Heal crash leftovers (stale sidecar / delete tombstone)
+                    # under the custody lock before this update stages its
+                    # own sidecar — os.replace below would otherwise
+                    # silently overwrite an unresolved journal.
+                    reconcile_blob_storage_versions(storage_path, expected_hash=blob["content_hash"])
                     fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
                     if fork_operation_id is not None:
                         raise _BlobUpdateBlockedByRetentionGuard(
@@ -1468,18 +1491,23 @@ def _execute_update_blob(
                         .values(**update_values)
                     )
 
-                    # Atomic file swap — the final mutation before the
-                    # with-block commit.  If ``os.replace`` raises,
-                    # control exits the with-block via exception and
-                    # the DB transaction rolls back — neither the file
-                    # nor the DB row changes.  On success, control
-                    # returns to the with-block which then commits;
-                    # file and DB land in sync on the happy path.
+                    # Atomic two-rename swap — the final mutations before
+                    # the with-block commit.  The prior bytes are parked at
+                    # the deterministic pre-update sidecar FIRST, then the
+                    # new bytes swap in.  Every failure/crash point in this
+                    # window leaves the filesystem one rename away from the
+                    # committed row state:
                     #
-                    # The residual divergence window is narrow and
-                    # handled by the ``except Exception`` arm below:
-                    # (os.replace succeeded) ∧ (commit subsequently
-                    # failed).
+                    # * in-process exception → the except arms below
+                    #   restore the sidecar over storage_path;
+                    # * process crash (before/between/after the renames,
+                    #   or after commit before the sidecar is retired) →
+                    #   ``reconcile_blob_storage_versions`` restores or
+                    #   purges using the committed content_hash as the
+                    #   arbiter, under the same custody lock every reader
+                    #   and mutator holds.
+                    os.replace(storage_path, sidecar_path)
+                    old_preserved = True
                     os.replace(tmp_path, storage_path)
                     replaced = True
             except _BlobUpdateBlockedByRetentionGuard as blocked:
@@ -1491,18 +1519,19 @@ def _execute_update_blob(
                 cleanup_primary_result = _failure_result(state, blocked.user_message)
                 return cleanup_primary_result
             except _BlobQuotaExceededInTxn as quota_exc:
-                # Quota raised BEFORE ``os.replace`` ran; storage_path
-                # is unchanged.  If for any reason ``replaced`` is True
-                # here (defensive — current ordering raises before
-                # replace), restore old_content with add_note
+                # Quota raised BEFORE the rename pair ran; storage_path
+                # is unchanged.  If for any reason ``old_preserved`` is
+                # True here (defensive — current ordering raises before
+                # the renames), restore the sidecar with add_note
                 # discipline mirroring the DB-failure path so
                 # divergence is surfaced, not silenced.
-                if replaced:
+                if old_preserved:
                     try:
-                        storage_path.write_bytes(old_content)
+                        os.replace(sidecar_path, storage_path)
                     except OSError as rollback_exc:
                         quota_exc.add_note(
                             f"Rollback failed: could not restore prior content of {storage_path} "
+                            f"from pre-update sidecar {sidecar_path} "
                             f"({type(rollback_exc).__name__}: {rollback_exc}). "
                             f"Storage file and DB metadata for blob_id={blob_id!r} may now be "
                             f"inconsistent — the file may contain the new (uncommitted) bytes "
@@ -1511,7 +1540,7 @@ def _execute_update_blob(
                         )
                         raise RuntimeError(
                             f"Blob quota rollback diverged for {blob_id!r}: "
-                            f"{quota_exc.user_message}  Rollback write_bytes raised "
+                            f"{quota_exc.user_message}  Rollback os.replace raised "
                             f"{type(rollback_exc).__name__}: {rollback_exc}. "
                             f"storage_path {storage_path!s} contains the uncommitted "
                             f"new content while the DB row retains the prior "
@@ -1522,29 +1551,32 @@ def _execute_update_blob(
             except Exception as primary_exc:
                 # DB-layer fault (commit OSError, UPDATE I/O error,
                 # SQLAlchemy error) or ``os.replace`` fault.  If
-                # ``replaced`` is True, ``os.replace`` has already
-                # swapped the new bytes in and storage_path now
-                # diverges from the (un-committed or about-to-fail) DB
-                # row — restore from old_content.  Narrow the
-                # rollback-error handler to OSError per
-                # offensive-programming policy: programmer bugs
-                # (TypeError, AttributeError, AssertionError) must
-                # propagate so a broken rollback isn't silently
-                # downgraded to a note.  Catching ``Exception`` (not
-                # ``BaseException``) preserves KeyboardInterrupt /
-                # SystemExit — asserted by
-                # ``test_blob_rollback_does_not_catch_keyboard_interrupt``.
-                if replaced:
+                # ``old_preserved`` is True, the prior bytes sit at the
+                # sidecar and storage_path is either missing or holds
+                # the uncommitted new bytes — one rename restores the
+                # authoritative version.  Narrow the rollback-error
+                # handler to OSError per offensive-programming policy:
+                # programmer bugs (TypeError, AttributeError,
+                # AssertionError) must propagate so a broken rollback
+                # isn't silently downgraded to a note.  Catching
+                # ``Exception`` (not ``BaseException``) preserves
+                # KeyboardInterrupt / SystemExit — asserted by
+                # ``test_blob_rollback_does_not_catch_keyboard_interrupt``;
+                # a crash that skips this arm recovers via
+                # ``reconcile_blob_storage_versions`` on the next
+                # custody-locked read or mutation.
+                if old_preserved:
                     try:
-                        storage_path.write_bytes(old_content)
+                        os.replace(sidecar_path, storage_path)
                     except OSError as rollback_exc:
                         primary_exc.add_note(
                             f"Rollback failed: could not restore prior content of {storage_path} "
+                            f"from pre-update sidecar {sidecar_path} "
                             f"({type(rollback_exc).__name__}: {rollback_exc}). "
                             f"Storage file and DB metadata for blob_id={blob_id!r} may now be "
                             f"inconsistent — the file may contain the new (uncommitted) bytes "
                             f"while the DB row retains the prior size_bytes/content_hash. "
-                            f"Manual reconciliation required."
+                            f"The sidecar remains for custody-locked reconciliation."
                         )
                 raise
         finally:
@@ -1569,6 +1601,15 @@ def _execute_update_blob(
                     )
                 elif not replaced:
                     raise
+
+        # Retire the pre-update journal only after the transaction has
+        # committed.  An unlink failure is deliberately non-fatal: the
+        # committed bytes already verify against the committed hash, so
+        # the stale sidecar is purged by the next custody-locked
+        # reconciliation — raising here would turn a fully-committed
+        # update into a spurious error.
+        with contextlib.suppress(OSError):
+            sidecar_path.unlink(missing_ok=True)
 
         return _discovery_result(
             state,
@@ -1628,6 +1669,7 @@ def _execute_delete_blob(
             state=state,
             session_engine=session_engine,
             session_id=session_id,
+            data_dir=context.data_dir,
         )
 
 
@@ -1637,14 +1679,25 @@ def _execute_delete_blob_locked(
     state: CompositionState,
     session_engine: Engine,
     session_id: str,
+    data_dir: str | None,
 ) -> ToolResult:
     """Delete one blob while the caller holds its session blob lock."""
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
-        return _failure_result(state, f"Blob '{blob_id}' not found.")
+        # No live row — but a crash after a committed delete leaves its
+        # journal row and staged bytes behind.  Finalize those instead of
+        # reporting a spurious not-found (mirrors the retry semantics of
+        # ``BlobServiceImpl.delete_blob``).
+        return _finalize_journaled_blob_deletion(
+            blob_id=blob_id,
+            state=state,
+            session_engine=session_engine,
+            session_id=session_id,
+            data_dir=data_dir,
+        )
 
     storage_path = Path(blob["storage_path"])
-    tombstone_path: Path | None = None
+    stage: _StagedBlobDeletion | None = None
 
     try:
         with locked_session_transaction(session_engine, session_id) as conn:
@@ -1658,6 +1711,10 @@ def _execute_delete_blob_locked(
                 return _failure_result(state, f"Blob '{blob_id}' not found.")
             blob = _blob_row_to_tool_dict(locked_row)
             storage_path = Path(blob["storage_path"])
+            # Heal crash leftovers under the custody lock before staging
+            # this deletion — a stale pre-update sidecar or unresolved
+            # tombstone must resolve to the committed version first.
+            reconcile_blob_storage_versions(storage_path, expected_hash=blob["content_hash"])
             fork_operation_id = _in_progress_session_fork_operation_id(conn, session_id)
             if fork_operation_id is not None:
                 return _failure_result(
@@ -1720,42 +1777,98 @@ def _execute_delete_blob_locked(
                     f"Blob '{blob_id}' cannot be deleted while active run '{active_run.run_id}' references it.",
                 )
 
-            # Move the file to a tombstone path before the DB delete so a
-            # later SQL/commit failure can restore it atomically. This avoids
-            # leaving a live blobs row pointing at missing bytes.
-            if storage_path.exists():
-                tombstone_path = storage_path.with_name(f".{storage_path.name}.delete-{uuid4().hex}")
-                os.replace(storage_path, tombstone_path)
+            # Stage the bytes aside and journal the tombstone in the SAME
+            # transaction as the row delete — the durable journal
+            # ``BlobServiceImpl.delete_blob`` already keeps.  A crash after
+            # commit leaves the journal row + staged bytes for a later
+            # retry to finalize; a crash before commit rolls the journal
+            # back and the tombstone restores via
+            # ``reconcile_blob_storage_versions`` on the next
+            # custody-locked read or mutation.
+            stage = _stage_blob_deletion(storage_path)
+            conn.execute(
+                blob_deletion_cleanups_table.insert().values(
+                    blob_id=blob_id,
+                    session_id=session_id,
+                    storage_path=str(stage.storage),
+                    tombstone_path=str(stage.tombstone) if stage.tombstone is not None else None,
+                    created_at=datetime.now(UTC),
+                )
+            )
             _remove_blob_temp_artifacts(storage_path)
 
             # Delete record — include session_id filter for defence in depth
-            conn.execute(
+            deleted = conn.execute(
                 delete(blobs_table).where(
                     blobs_table.c.id == blob_id,
                     blobs_table.c.session_id == session_id,
                 )
             )
+            if deleted.rowcount != 1:
+                raise AuditIntegrityError(f"blob {blob_id} left session custody before its qualified delete completed")
     except Exception as primary_exc:
-        if tombstone_path is not None and tombstone_path.exists():
-            try:
-                os.replace(tombstone_path, storage_path)
-            except OSError as rollback_exc:
-                primary_exc.add_note(
-                    f"Rollback failed: could not restore deleted blob file {storage_path} from tombstone "
-                    f"{tombstone_path} ({type(rollback_exc).__name__}: {rollback_exc}). "
-                    f"Blob row and storage may now diverge; manual reconciliation required."
-                )
+        if stage is not None:
+            _restore_staged_blob_deletion(stage, primary_exc)
         raise
 
-    if tombstone_path is not None and tombstone_path.exists():
-        try:
-            tombstone_path.unlink()
-        except OSError as cleanup_exc:
-            raise RuntimeError(
-                f"Blob '{blob_id}' metadata was deleted but tombstone cleanup failed for {tombstone_path}: "
-                f"{type(cleanup_exc).__name__}: {cleanup_exc}"
-            ) from cleanup_exc
+    # Post-commit: purge the staged bytes durably, then retire the journal
+    # row.  If the purge raises, the journal row survives and a retry (or
+    # the HTTP delete path) completes the finalization later.
+    _finalize_staged_blob_deletion(stage)
+    _purge_blob_deletion_journal_row(session_engine, blob_id=blob_id, session_id=session_id)
 
+    return _discovery_result(state, {"blob_id": blob_id, "deleted": True})
+
+
+def _purge_blob_deletion_journal_row(session_engine: Engine, *, blob_id: str, session_id: str) -> None:
+    """Retire one durable deletion-journal row after its bytes are purged."""
+    with locked_session_transaction(session_engine, session_id) as conn:
+        purged = conn.execute(
+            delete(blob_deletion_cleanups_table).where(
+                blob_deletion_cleanups_table.c.blob_id == blob_id,
+                blob_deletion_cleanups_table.c.session_id == session_id,
+            )
+        )
+        if purged.rowcount != 1:
+            raise AuditIntegrityError(f"blob {blob_id} lost its durable deletion cleanup record before purge completion")
+
+
+def _finalize_journaled_blob_deletion(
+    *,
+    blob_id: str,
+    state: CompositionState,
+    session_engine: Engine,
+    session_id: str,
+    data_dir: str | None,
+) -> ToolResult:
+    """Complete a crash-interrupted delete whose journal row outlived commit.
+
+    Reached only when no live blobs row exists.  If no journal row exists
+    either, the blob genuinely does not exist and the ordinary not-found
+    failure is returned.  ``data_dir`` is required to validate that the
+    journaled paths stay inside this session's blob custody root
+    (``_registered_blob_deletion_stage``); without it the leftovers are
+    not touched.
+    """
+    if data_dir is None:
+        return _failure_result(state, f"Blob '{blob_id}' not found.")
+    with locked_session_transaction(session_engine, session_id) as conn:
+        cleanup_row = conn.execute(
+            select(blob_deletion_cleanups_table).where(
+                blob_deletion_cleanups_table.c.blob_id == blob_id,
+                blob_deletion_cleanups_table.c.session_id == session_id,
+            )
+        ).one_or_none()
+        if cleanup_row is None:
+            return _failure_result(state, f"Blob '{blob_id}' not found.")
+        stage = _registered_blob_deletion_stage(
+            cleanup_row,
+            data_dir=Path(data_dir).resolve(),
+            blob_id=blob_id,
+            session_id=session_id,
+        )
+    _finalize_staged_blob_deletion(stage)
+    _purge_blob_deletion_journal_row(session_engine, blob_id=blob_id, session_id=session_id)
     return _discovery_result(state, {"blob_id": blob_id, "deleted": True})
 
 
@@ -1854,6 +1967,10 @@ def _locked_read_ready_blob(
         if record["status"] != "ready":
             return record, None
         storage_path = Path(record["storage_path"])
+        # Crash leftovers (pre-update sidecar / delete tombstone) heal to
+        # the committed version before the read; genuine corruption still
+        # escalates through the verification below.
+        reconcile_blob_storage_versions(storage_path, expected_hash=record["content_hash"])
         try:
             data = storage_path.read_bytes()
         except FileNotFoundError:
