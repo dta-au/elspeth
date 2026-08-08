@@ -480,6 +480,18 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       });
       return null;
     }
+    // Settle the confirmation SYNCHRONOUSLY, before dispatch
+    // (elspeth-8363555f05). The ConfirmDialog is mounted solely off
+    // pendingFanoutGuard, so clearing it here closes the dialog atomically
+    // with the decision to run: a second Execute activation finds no guard
+    // and is a no-op instead of a duplicate dispatch, and no Cancel/Escape/
+    // backdrop affordance survives to read as a successful cancellation
+    // while the request is in flight. Waiting for execute() to clear the
+    // guard after its await left the dialog live for the whole network
+    // round-trip. If the acknowledged dispatch itself returns a fresh 428
+    // (rotated token), execute()'s catch re-arms the guard for a new
+    // explicit confirmation, so atomic settlement cannot dead-end a run.
+    set({ pendingFanoutGuard: null, pendingFanoutSessionId: null });
     return get().execute(pendingSessionId, {
       accepted: true,
       token: pendingGuard.ack_token,

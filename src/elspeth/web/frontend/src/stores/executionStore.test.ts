@@ -677,6 +677,100 @@ describe("executionStore fanout guard", () => {
       "This pipeline is no longer ready to run. Validate it again before executing.",
     );
   });
+
+  it("settles the guard synchronously at dispatch so the dialog closes atomically (elspeth-8363555f05)", async () => {
+    const { executePipeline } = await import("@/api/client");
+    let resolveDispatch: (value: { run_id: string }) => void = () => {};
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDispatch = resolve;
+          }),
+      );
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+
+    const confirmPromise = useExecutionStore.getState().confirmFanoutExecution();
+
+    // BEFORE the dispatch resolves: the guard is already settled, so the
+    // ConfirmDialog (mounted solely off pendingFanoutGuard) is gone — no
+    // second Execute activation, and no Cancel affordance that would read
+    // as a successful cancellation while the request is in flight.
+    const inFlight = useExecutionStore.getState();
+    expect(inFlight.pendingFanoutGuard).toBeNull();
+    expect(inFlight.pendingFanoutSessionId).toBeNull();
+
+    resolveDispatch({ run_id: "run-atomic" });
+    expect(await confirmPromise).toBe("run-atomic");
+    expect(useExecutionStore.getState().activeRunId).toBe("run-atomic");
+  });
+
+  it("makes a second confirmation during dispatch a no-op instead of a duplicate run", async () => {
+    const { executePipeline } = await import("@/api/client");
+    let resolveDispatch: (value: { run_id: string }) => void = () => {};
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveDispatch = resolve;
+          }),
+      );
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+
+    const first = useExecutionStore.getState().confirmFanoutExecution();
+    const second = useExecutionStore.getState().confirmFanoutExecution();
+
+    expect(await second).toBeNull();
+    resolveDispatch({ run_id: "run-once" });
+    expect(await first).toBe("run-once");
+    // 1 initial 428 + exactly 1 acknowledged dispatch — never a duplicate.
+    expect(executePipeline).toHaveBeenCalledTimes(2);
+  });
+
+  it("restores the guard when the acknowledged dispatch itself returns a fresh 428", async () => {
+    const { executePipeline } = await import("@/api/client");
+    const freshGuard = { ...guard, ack_token: "ack-rotated" };
+    (executePipeline as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: guard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: guard,
+      })
+      .mockRejectedValueOnce({
+        status: 428,
+        detail: freshGuard.summary,
+        error_type: "execution_fanout_ack_required",
+        fanout_guard: freshGuard,
+      });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    // Atomic settle must not dead-end a rotated token: the fresh guard
+    // re-arms the dialog for a new explicit confirmation.
+    expect(state.pendingFanoutGuard).toEqual(freshGuard);
+    expect(state.pendingFanoutSessionId).toBe("session-1");
+  });
 });
 
 describe("executionStore.cancel", () => {
