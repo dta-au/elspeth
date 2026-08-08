@@ -1,6 +1,6 @@
 """Governance harness for ADR-009 §Clause 4 — pass-through annotation invariants.
 
-Three tests here:
+Core tests here:
 
 - **Forward invariant** (`test_annotated_transforms_preserve_input_fields`):
   For every registered ``passes_through_input=True`` transform, runs
@@ -18,6 +18,13 @@ Three tests here:
 - **Skip-rate budget** (``test_harness_skip_rate_budget``): asserts
   ``skip_rate ≤ 25%`` across the annotated plugin set. Track 2 additions
   that slip the budget must implement ``probe_config()`` per the contract.
+
+The ``forwards_input_fields`` axis (elspeth-15c72686f2) gets the same
+two-direction treatment: ``test_forwarding_transforms_remove_only_what_they
+_declare`` truth-tests every declared removal set, and
+``test_undeclared_transforms_do_not_forward_unknown_fields`` catches the
+under-declaration direction — a transform that forwards a sentinel extra on
+every emission while declaring nothing.
 
 The harness uses ``pytest_generate_tests`` to parametrize over registered
 transforms at collection time — with a guard that crashes if the plugin
@@ -365,6 +372,119 @@ def test_non_pass_through_transforms_do_drop_fields(
             "if the transform is in fact pass-through, or (b) override "
             f"{_non_pass_through_cls.__name__}.backward_invariant_probe_rows() "
             "to return a shape that triggers the field-dropping code path."
+        )
+
+
+_FORWARDING_SENTINEL = "elspeth_probe_extra_ride_along"
+
+
+def _with_sentinel_field(probe: PipelineRow) -> PipelineRow:
+    """Return ``probe`` plus one unknown extra field no transform declares.
+
+    The sentinel models the elspeth-15c72686f2 defect vector: an upstream
+    producer's extra column (an llm's ``<response_field>_usage``) that the
+    transform under probe never heard of. A transform that forwards it is
+    forwarding unknown input fields.
+    """
+    from elspeth.contracts.schema_contract import FieldContract, SchemaContract
+
+    payload = probe.to_dict().copy()
+    payload[_FORWARDING_SENTINEL] = "ride-along"
+    fields = (
+        *probe.contract.fields,
+        FieldContract(
+            normalized_name=_FORWARDING_SENTINEL,
+            original_name=_FORWARDING_SENTINEL,
+            python_type=str,
+            required=True,
+            source="inferred",
+            nullable=False,
+        ),
+    )
+    contract = SchemaContract(mode="OBSERVED", fields=fields, locked=True)
+    return PipelineRow(payload, contract)
+
+
+def test_undeclared_transforms_do_not_forward_unknown_fields(
+    _non_pass_through_cls: type[BaseTransform],
+) -> None:
+    """Under-declaration guard for ``forwards_input_fields`` (elspeth-15c72686f2).
+
+    The truth-test below verifies every transform that DECLARES forwarding;
+    it skips everything that does not, so a future transform that forwards
+    the row while declaring nothing would silently recreate the original
+    defect class: both definite-emits walks stop at it, upstream extras
+    become invisible to the build-time firewall, and the graph is back to
+    "build green, every row dies at the locked sink". The commit that
+    introduced the declaration relied on a one-time manual audit of the
+    non-declaring transforms; this test makes that audit permanent.
+
+    Method: seed each probe row with a sentinel field no transform knows.
+    A fresh-dict transform (the batch_* family, report_assemble) never emits
+    it. If EVERY successful emission carries the sentinel, the transform
+    demonstrably forwards unknown input fields and must declare — either
+    ``forwards_input_fields=True`` (with its removals) or
+    ``passes_through_input=True`` if the stronger claim holds.
+    """
+    try:
+        transform = _probe_instantiate(_non_pass_through_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
+
+    if transform.forwards_input_fields:
+        pytest.skip(f"{_non_pass_through_cls.__name__} declares forwarding — verified by the removal truth-test.")
+
+    probe_count = 0
+    asserted_count = 0
+    sentinel_always_forwarded = True
+
+    @given(probe=probe_row())
+    @settings(
+        max_examples=_SWEEP_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    def _sweep(probe: PipelineRow) -> None:
+        nonlocal probe_count, asserted_count, sentinel_always_forwarded
+        probe_count += 1
+        probe_rows = transform.backward_invariant_probe_rows(_with_sentinel_field(probe))
+        # A probe hook that rebuilds its input rows without the sentinel
+        # cannot witness forwarding either way — do not count that emission.
+        if any(_FORWARDING_SENTINEL not in _observed_fields(input_row) for input_row in probe_rows):
+            return
+        result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            return
+        for emitted in _emitted_rows_from_result(result):
+            asserted_count += 1
+            if _FORWARDING_SENTINEL not in _observed_fields(emitted):
+                sentinel_always_forwarded = False
+                return
+
+    _sweep()
+
+    if probe_count < _SWEEP_MIN_PROBES:
+        pytest.fail(
+            f"{_non_pass_through_cls.__name__}: only {probe_count} probe rows "
+            f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
+            "is under-powered for this transform."
+        )
+
+    # No successful sentinel-carrying emission — no evidence either way. The
+    # all-probes-error case is already failed by the backward invariant above,
+    # so a silent pass here cannot hide a dead probe config.
+    if asserted_count == 0:
+        return
+
+    if sentinel_always_forwarded:
+        pytest.fail(
+            f"{_non_pass_through_cls.__name__} forwarded the unknown field "
+            f"{_FORWARDING_SENTINEL!r} on every successful emission "
+            f"({asserted_count} rows) but declares forwards_input_fields=False. "
+            "The definite-emits walks stop at undeclared transforms, so upstream "
+            "extras become invisible to the build-time firewall (elspeth-15c72686f2). "
+            "Declare forwards_input_fields=True with the removal set process() "
+            "actually removes — or passes_through_input=True if nothing is removed."
         )
 
 

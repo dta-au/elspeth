@@ -117,7 +117,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:efd187d449d5776f"
+    source_file_hash: str | None = "sha256:0ccde1199b11dc05"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -183,14 +183,15 @@ class FieldMapper(BaseTransform):
         # be named here — the whole declaration abstains rather than
         # under-state the removal set, which is the only direction that could
         # produce a FALSE build-time rejection of a working rename pipeline.
+        # Identity mappings are NOT exempt: {"First Name": "First Name"}
+        # still deletes the normalized key and writes the literal header key,
+        # so the removal is equally unnameable here.
         #
         # Deliberately WITHOUT `_build_field_mapper_output_schema_config`'s
         # `source in base_guaranteed` filter: that set is the node's own
         # AUTHORED guarantees, whereas this rule is applied to fields proven
         # present by the upstream walk, which the authored config never names.
-        self.forwards_input_fields = not cfg.select_only and not any(
-            source != target and self._is_unresolved_original_source(source) for source, target in cfg.mapping.items()
-        )
+        self.forwards_input_fields = not cfg.select_only and not any(self._is_unresolved_original_source(source) for source in cfg.mapping)
         # Empty unless forwarding: a removal set is a subtraction from what this
         # node forwards, so carrying one while forwarding nothing describes
         # nothing. NodeInfo rejects the pairing at graph construction rather
@@ -278,10 +279,11 @@ class FieldMapper(BaseTransform):
             output_fields = guaranteed_targets
         else:
             # Input fields minus removed sources plus new targets.
-            # A source is removed from output when it's renamed to a different target.
-            has_unresolved_original_removal = any(
-                source != target and self._is_unresolved_original_source(source) for source, target in cfg.mapping.items()
-            )
+            # A source is removed from output when it's renamed to a different
+            # target — or identity-mapped from an original header, which
+            # deletes the normalized key and rewrites the literal header key,
+            # removing a field this constructor cannot name.
+            has_unresolved_original_removal = any(self._is_unresolved_original_source(source) for source in cfg.mapping)
             if has_unresolved_original_removal:
                 passthrough_fields: set[str] = set()
             else:

@@ -23,7 +23,8 @@ from typing import Any
 
 import pytest
 
-from elspeth.core.config import SourceSettings, TransformSettings
+from elspeth.contracts.enums import NodeType
+from elspeth.core.config import GateSettings, RowUnionSettings, SourceSettings, TransformSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.guarantees import get_definite_emitted_fields, get_effective_guaranteed_fields
 from elspeth.core.dag.models import EdgeContractError
@@ -125,6 +126,8 @@ def _build_graph(
     transforms: list[WiredTransform],
     sink: Any,
     sink_name: str,
+    gates: list[GateSettings] | None = None,
+    row_union_settings: list[RowUnionSettings] | None = None,
 ) -> ExecutionGraph:
     return ExecutionGraph.from_plugin_instances(
         sources={"in": source_plugin},
@@ -134,8 +137,9 @@ def _build_graph(
         transforms=transforms,
         sinks={sink_name: sink},
         aggregations={},
-        gates=[],
+        gates=gates or [],
         coalesce_settings=[],
+        row_union_settings=row_union_settings or [],
     )
 
 
@@ -350,6 +354,147 @@ class TestDefiniteEmitsIsSeparateFromTheGuaranteeWalk:
             assert get_definite_emitted_fields(graph, node_id) >= get_effective_guaranteed_fields(graph, node_id)
 
 
+class TestExtrasSurviveRoutingNodes:
+    """Pure-routing nodes must not truncate the definite-emits walk.
+
+    A gate (and a row_union barrier) changes which rows travel an edge, never
+    which fields a row carries — the traversal rule the composer's
+    ``_connection_definite_emits`` already applies. The DAG walk used to stop
+    at these nodes (``forwards_input_fields`` is a transform-only
+    declaration), so one interposed gate reopened the exact
+    elspeth-15c72686f2 hole this file exists to close: build green, every row
+    dead at the locked sink's per-row preflight.
+    """
+
+    def _gate_graph(self, sink: Any) -> ExecutionGraph:
+        return _build_graph(
+            source_plugin=LLMSource(_llm_source_options()),
+            source_plugin_name="llm",
+            source_options=_llm_source_options(),
+            source_connection="brief",
+            transforms=[
+                _wired(
+                    LineExplode(_line_explode_options()),
+                    name="exploded",
+                    plugin_name="line_explode",
+                    input_conn="brief",
+                    on_success="exploded_rows",
+                    options=_line_explode_options(),
+                )
+            ],
+            gates=[
+                GateSettings(
+                    name="quality_gate",
+                    input="exploded_rows",
+                    condition="True",
+                    routes={"true": "sentence_rows", "false": "sentence_rows"},
+                )
+            ],
+            sink=sink,
+            sink_name="sentence_rows",
+        )
+
+    def test_gate_between_exploder_and_locked_sink_is_rejected(self) -> None:
+        """The reported graph with one gate interposed must still be rejected."""
+        with pytest.raises(EdgeContractError) as excinfo:
+            self._gate_graph(TextSink(_locked_text_sink_options()))
+        error = excinfo.value
+        assert error.compatibility_result is not None, f"not an extras rejection: {error}"
+        assert frozenset(error.compatibility_result.extra_fields) == _METADATA_EXTRAS
+
+    def test_definite_emits_walks_through_a_gate(self) -> None:
+        graph = self._gate_graph(
+            TextSink(
+                {
+                    "path": "outputs/o.txt",
+                    "field": "sentence",
+                    "schema": {"mode": "flexible", "fields": ["sentence: str"]},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                }
+            )
+        )
+        gate_node = next(n.node_id for n in graph.get_nodes() if n.node_type is NodeType.GATE)
+
+        assert get_definite_emitted_fields(graph, gate_node) == frozenset({"sentence"}) | _METADATA_EXTRAS
+        # Additivity must survive the traversal: a gate's definite emits may
+        # only ever widen the presence answer, never contradict it.
+        for node_id in graph._graph.nodes:
+            assert get_definite_emitted_fields(graph, node_id) >= get_effective_guaranteed_fields(graph, node_id)
+
+    def test_row_union_unions_arm_definite_emits_into_a_locked_sink_rejection(self) -> None:
+        """A field definitely arriving on ONE arm's rows definitely arrives.
+
+        Two exploder arms feed a row_union: the presence walk correctly
+        INTERSECTS arm guarantees ({sentence}), but the extras question is the
+        opposite polarity — the llm metadata rides every arm's rows, so the
+        locked sink downstream of the barrier is a definite per-row death.
+        This mirrors ``_row_union_definite_emits`` on the composer side. A
+        row_union may not release directly into a sink (v1 constraint), so a
+        second exploder consumes the released stream — which also pins that
+        the arm-union output keeps flowing through a downstream forwarding
+        transform's removal set (``sentence`` is consumed, the metadata is not).
+        """
+        explode_a = _line_explode_options()
+        explode_b = _line_explode_options()
+        clause_explode = {
+            "source_field": "sentence",
+            "output_field": "clause",
+            "include_index": False,
+            "schema": {"mode": "observed"},
+        }
+        with pytest.raises(EdgeContractError) as excinfo:
+            _build_graph(
+                source_plugin=LLMSource(_llm_source_options()),
+                source_plugin_name="llm",
+                source_options=_llm_source_options(),
+                source_connection="brief",
+                transforms=[
+                    _wired(
+                        LineExplode(explode_a),
+                        name="exploded_a",
+                        plugin_name="line_explode",
+                        input_conn="branch_a",
+                        on_success="a_out",
+                        options=explode_a,
+                    ),
+                    _wired(
+                        LineExplode(explode_b),
+                        name="exploded_b",
+                        plugin_name="line_explode",
+                        input_conn="branch_b",
+                        on_success="b_out",
+                        options=explode_b,
+                    ),
+                    _wired(
+                        LineExplode(clause_explode),
+                        name="clauses",
+                        plugin_name="line_explode",
+                        input_conn="union_out",
+                        on_success="clause_rows",
+                        options=clause_explode,
+                    ),
+                ],
+                gates=[
+                    GateSettings(
+                        name="variant_fork",
+                        input="brief",
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=["branch_a", "branch_b"],
+                    )
+                ],
+                row_union_settings=[
+                    RowUnionSettings(name="variant_union", branches={"branch_a": "a_out", "branch_b": "b_out"}, on_success="union_out"),
+                ],
+                sink=TextSink(_locked_text_sink_options(field="clause")),
+                sink_name="clause_rows",
+            )
+        error = excinfo.value
+        assert error.compatibility_result is not None, f"not an extras rejection: {error}"
+        assert frozenset(error.compatibility_result.extra_fields) == _METADATA_EXTRAS
+
+
 class TestForwardingParityAcrossTheDeclaringClass:
     """line_explode is one of four; the walk must not be exploder-specific."""
 
@@ -418,6 +563,152 @@ class TestForwardingParityAcrossTheDeclaringClass:
         )
 
 
+class TestForwardingRespectsTheNodesOwnExtrasFirewall:
+    """A forwarding node whose own output contract forbids extras stops the walk.
+
+    The composer computes ``propagates = forwards and not extras_firewall``
+    (``_producer_emit_profile``): a node with a ``mode: fixed`` output schema
+    emits EXACTLY its declared fields — rows either match that set or die at
+    the node's own preflight, never downstream of it — so unioning upstream
+    arrivals past it predicts fields that provably cannot arrive, and the two
+    authoring surfaces hand the same graph opposite verdicts. Hand-built
+    graph: the declaring plugins cannot author this shape (their schema option
+    feeds input and output alike), but the walk must hold for any NodeInfo
+    the public ``add_node`` surface can stamp.
+    """
+
+    def _firewalled_forwarder_graph(self) -> ExecutionGraph:
+        from elspeth.contracts.schema import SchemaConfig
+
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="mock_source",
+            output_schema_config=SchemaConfig.from_dict(
+                {"mode": "observed", "guaranteed_fields": ["announcement", "announcement_usage", "announcement_model"]}
+            ),
+        )
+        graph.add_node(
+            "firewalled",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="mock_forwarder",
+            output_schema_config=SchemaConfig.from_dict({"mode": "fixed", "fields": ["sentence: str"]}),
+            forwards_input_fields=True,
+            removed_input_fields=frozenset({"announcement"}),
+        )
+        graph.add_edge("src", "firewalled", label="continue")
+        return graph
+
+    def test_firewalled_forwarder_does_not_propagate_upstream_extras(self) -> None:
+        graph = self._firewalled_forwarder_graph()
+
+        assert get_definite_emitted_fields(graph, "firewalled") == frozenset({"sentence"})
+
+    def test_extras_allowing_forwarder_still_propagates(self) -> None:
+        """Control: relax only the firewall and the same graph propagates."""
+        from elspeth.contracts.schema import SchemaConfig
+
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="mock_source",
+            output_schema_config=SchemaConfig.from_dict(
+                {"mode": "observed", "guaranteed_fields": ["announcement", "announcement_usage", "announcement_model"]}
+            ),
+        )
+        graph.add_node(
+            "forwarder",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="mock_forwarder",
+            output_schema_config=SchemaConfig.from_dict({"mode": "flexible", "fields": ["sentence: str"]}),
+            forwards_input_fields=True,
+            removed_input_fields=frozenset({"announcement"}),
+        )
+        graph.add_edge("src", "forwarder", label="continue")
+
+        assert get_definite_emitted_fields(graph, "forwarder") == frozenset({"sentence", "announcement_usage", "announcement_model"})
+
+
+class TestDefiniteEmitsWalkIsLinear:
+    """Bulk validation must not re-walk ancestry once per node/edge.
+
+    ``walk_effective_guaranteed_fields``'s own docstring prescribes a shared
+    bulk-validation cache (the ``validate_sink_required_fields`` discipline);
+    the definite-emits walk consumes the presence answer at EVERY visited
+    node, so allocating a fresh presence cache per node makes build
+    validation quadratic in chain depth — once per edge on top of that when
+    each ``_validate_locked_consumer_guaranteed_extras`` call starts cold.
+    """
+
+    _CHAIN = 30
+
+    def _chain_graph(self) -> ExecutionGraph:
+        from elspeth.contracts.schema import SchemaConfig
+
+        graph = ExecutionGraph()
+        graph.add_node(
+            "src",
+            node_type=NodeType.SOURCE,
+            plugin_name="mock_source",
+            output_schema_config=SchemaConfig.from_dict({"mode": "observed", "guaranteed_fields": ["seed"]}),
+        )
+        previous = "src"
+        for index in range(self._CHAIN):
+            node_id = f"t{index}"
+            graph.add_node(
+                node_id,
+                node_type=NodeType.TRANSFORM,
+                plugin_name="mock_forwarder",
+                output_schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+                # Both flags: passes_through makes the PRESENCE vote recurse
+                # through the whole ancestry (the expensive walk), forwards
+                # makes the DEFINITE walk visit every node — the combination
+                # that exposes per-node presence re-walking as quadratic.
+                passes_through_input=True,
+                forwards_input_fields=True,
+            )
+            graph.add_edge(previous, node_id, label="continue")
+            previous = node_id
+        return graph
+
+    def test_one_walk_computes_each_presence_vote_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.core.dag import guarantees
+
+        graph = self._chain_graph()
+        real_vote = guarantees.walk_effective_guarantee_vote
+        misses = 0
+
+        def counting_vote(*args: Any, **kwargs: Any) -> Any:
+            nonlocal misses
+            node_id, cache = args[1], args[2]
+            if node_id not in cache:
+                misses += 1
+            return real_vote(*args, **kwargs)
+
+        monkeypatch.setattr(guarantees, "walk_effective_guarantee_vote", counting_vote)
+
+        assert get_definite_emitted_fields(graph, f"t{self._CHAIN - 1}") == frozenset({"seed"})
+        # Each of the CHAIN+1 nodes' votes computed at most twice (once is the
+        # target; the slack tolerates one wrapper layer) — quadratic re-walking
+        # would be ~CHAIN^2/2 ≈ 465 misses here.
+        assert misses <= 2 * (self._CHAIN + 1), f"presence walk recomputed: {misses} cache misses"
+
+    def test_bulk_callers_can_share_a_cache_across_edges(self) -> None:
+        from elspeth.core.dag import guarantees
+
+        graph = self._chain_graph()
+        caches = guarantees.DefiniteEmitsCaches()
+
+        first = guarantees.get_definite_emitted_fields(graph, f"t{self._CHAIN - 1}", caches=caches)
+        assert first == frozenset({"seed"})
+        # A second bulk query anywhere on the chain resolves entirely from the
+        # shared cache — the property the per-edge call sites rely on.
+        assert f"t{self._CHAIN // 2}" in caches.fields
+        assert guarantees.get_definite_emitted_fields(graph, f"t{self._CHAIN // 2}", caches=caches) == frozenset({"seed"})
+
+
 class TestForwardingDeclarationsMatchPluginBehaviour:
     """Unit-level pins on the four declarations the walk trusts."""
 
@@ -437,6 +728,27 @@ class TestForwardingDeclarationsMatchPluginBehaviour:
         transform = FieldMapper(
             {
                 "mapping": {"First Name": "given_name"},
+                "select_only": False,
+                "schema": {"mode": "observed"},
+            }
+        )
+
+        assert transform.forwards_input_fields is False
+
+    def test_field_mapper_abstains_on_an_identity_mapped_original_header(self) -> None:
+        """Identity mappings are not exempt from the original-header abstention.
+
+        ``{"First Name": "First Name"}`` looks like a no-op, but process()
+        resolves the source through the contract, deletes the NORMALIZED
+        ``first_name`` key, and writes the literal ``"First Name"`` key — so a
+        normalized input field is removed under a name only ``resolve_name``
+        knows at runtime. Declaring forwarding here under-states the removal
+        set, the one direction the design forbids (a FALSE build-time
+        rejection of a working pipeline).
+        """
+        transform = FieldMapper(
+            {
+                "mapping": {"First Name": "First Name"},
                 "select_only": False,
                 "schema": {"mode": "observed"},
             }

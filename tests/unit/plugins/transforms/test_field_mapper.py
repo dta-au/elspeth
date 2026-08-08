@@ -691,6 +691,30 @@ class TestOutputSchemaConfig:
         assert transform._output_schema_config.guaranteed_fields is not None
         assert frozenset(transform._output_schema_config.guaranteed_fields) == frozenset({"target", "kept"})
 
+    def test_identity_mapped_original_header_abstains_passthrough_guarantees(self) -> None:
+        """An identity-mapped original header renames a normalized field away.
+
+        ``{"Amount USD": "Amount USD"}`` deletes the normalized ``amount_usd``
+        key at runtime and writes the literal ``"Amount USD"`` key, so the
+        constructor cannot name the removed field. Claiming the upstream
+        guarantees as pass-through would promise ``amount_usd`` on rows that
+        no longer carry it — the abstain arm must cover identity mappings,
+        not only renames to a different target.
+        """
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "mapping": {"Amount USD": "Amount USD"},
+                "schema": {"mode": "observed", "guaranteed_fields": ["amount_usd", "kept"]},
+            }
+        )
+
+        assert transform._output_schema_config is not None
+        guarantees = frozenset(transform._output_schema_config.guaranteed_fields or ())
+        assert "amount_usd" not in guarantees
+        assert "kept" not in guarantees
+
     def test_guaranteed_fields_empty_mapping(self):
         from elspeth.plugins.transforms.field_mapper import FieldMapper
 

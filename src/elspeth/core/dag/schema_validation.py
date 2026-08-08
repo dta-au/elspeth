@@ -19,6 +19,7 @@ from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
+    DefiniteEmitsCaches,
     EffectiveGuaranteeVote,
     ResolvedGuaranteeType,
     get_definite_emitted_fields,
@@ -51,13 +52,17 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     # Schema resolution cache shared across all edge validations.
     # Eliminates redundant recursion through long gate chains (O(N^2) → O(N)).
     schema_cache: dict[str, type[PluginSchema] | None] = {}
+    # Definite-emits/presence caches shared the same way, for the same
+    # O(N^2) → O(N) reason — the locked-consumer extras check re-walks
+    # ancestry on every edge otherwise.
+    definite_emits_caches = DefiniteEmitsCaches()
 
     # Validate each edge (skip divert edges — quarantine/error data doesn't
     # conform to producer schemas because it failed validation or errored)
     for from_id, to_id, edge_data in graph._graph.edges(data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
-        validate_single_edge(graph, from_id, to_id, _schema_cache=schema_cache)
+        validate_single_edge(graph, from_id, to_id, _schema_cache=schema_cache, _definite_emits_caches=definite_emits_caches)
 
     # Validate all coalesce nodes (must have compatible schemas from all branches)
     coalesce_nodes = [node_id for node_id, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.COALESCE]
@@ -114,6 +119,7 @@ def validate_single_edge(
     to_node_id: str,
     *,
     _schema_cache: dict[str, type[PluginSchema] | None] | None = None,
+    _definite_emits_caches: DefiniteEmitsCaches | None = None,
 ) -> None:
     """Validate schema compatibility for a single edge.
 
@@ -130,6 +136,8 @@ def validate_single_edge(
         from_node_id: Source node ID
         to_node_id: Destination node ID
         _schema_cache: Shared memoization dict for schema resolution.
+        _definite_emits_caches: Shared memoization for the locked-consumer
+            definite-emits walk — same bulk-validation discipline.
 
     Raises:
         GraphValidationError: If schemas are incompatible or contracts violated
@@ -226,6 +234,7 @@ def validate_single_edge(
             to_node_id,
             producer_schema=producer_schema,
             consumer_schema=consumer_schema,
+            definite_emits_caches=_definite_emits_caches,
         )
         return  # Types unknowable on one side - compatible with anything
 
@@ -242,6 +251,7 @@ def validate_single_edge(
             to_node_id,
             producer_schema=producer_schema,
             consumer_schema=consumer_schema,
+            definite_emits_caches=_definite_emits_caches,
         )
         return  # Observed schemas bypass static type validation
 
@@ -328,6 +338,7 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
     # again, and get_effective_producer_schema recurses through gate chains
     # (the O(N^2) → O(N) note on the loop above applies identically here).
     schema_cache: dict[str, type[PluginSchema] | None] = {}
+    definite_emits_caches = DefiniteEmitsCaches()
     for from_id, to_id, edge_data in graph._graph.edges(data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
@@ -369,6 +380,7 @@ def validate_typed_producer_guaranteed_extras(graph: ExecutionGraph) -> None:
             to_id,
             producer_schema=producer_schema,
             consumer_schema=consumer_schema,
+            definite_emits_caches=definite_emits_caches,
         )
 
 
@@ -503,6 +515,7 @@ def _validate_locked_consumer_guaranteed_extras(
     *,
     producer_schema: type[PluginSchema] | None,
     consumer_schema: type[PluginSchema] | None,
+    definite_emits_caches: DefiniteEmitsCaches | None = None,
 ) -> None:
     """Build-time mirror of composer Rule A: guaranteed extras vs a locked input.
 
@@ -548,7 +561,7 @@ def _validate_locked_consumer_guaranteed_extras(
     # row died at the locked consumer's per-row preflight
     # (elspeth-15c72686f2). The walk is additive over the presence answer, so
     # every rejection this function made before it still fires, unchanged.
-    producer_guaranteed = get_definite_emitted_fields(graph, from_node_id)
+    producer_guaranteed = get_definite_emitted_fields(graph, from_node_id, definite_emits_caches)
     extras = producer_guaranteed - frozenset(consumer_schema.model_fields)
     if not extras:
         return

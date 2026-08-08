@@ -10,7 +10,7 @@ signatures.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from elspeth.contracts.enums import NodeType, RoutingMode
@@ -319,10 +319,29 @@ def walk_effective_guaranteed_fields(
     return result.fields
 
 
+@dataclass(slots=True)
+class DefiniteEmitsCaches:
+    """Shared memoization for bulk definite-emits queries.
+
+    One instance per validation pass, threaded through the per-edge call
+    sites the way ``validate_edge_schemas`` threads its ``schema_cache`` —
+    both walks this query composes are path-independent on a built DAG
+    (the ``resolve_guaranteed_field_type`` cache states the same soundness
+    argument), so sharing across edges is a pure dedup. ``fields`` memoizes
+    the definite-emits answer per node; ``presence_votes`` memoizes the
+    presence votes the walk consumes at every visited node, which is what
+    keeps one walk linear instead of re-walking ancestry per node.
+    """
+
+    fields: dict[str, frozenset[str]] = field(default_factory=dict)
+    presence_votes: dict[str, EffectiveGuaranteeVote] = field(default_factory=dict)
+
+
 def walk_definite_emitted_fields(
     graph: ExecutionGraph,
     node_id: str,
     cache: dict[str, frozenset[str]],
+    presence_cache: dict[str, EffectiveGuaranteeVote] | None = None,
 ) -> frozenset[str]:
     """Return fields that DEFINITELY arrive on ``node_id``'s output rows.
 
@@ -361,14 +380,54 @@ def walk_definite_emitted_fields(
     removals declares nothing and contributes only its own guarantees. That
     makes it sound to raise an error ON this set but never sound to clear a
     graph WITH it, the same asymmetry the composer's walk carries.
+
+    PURE-ROUTING nodes are traversed, not stopped at: a GATE changes which
+    rows travel an edge, never which fields a row carries, and a ROW_UNION
+    releases each arm's rows unchanged — so both union their live
+    predecessors' definite emits on top of their own answer, exactly as the
+    composer walk does (gates recursed at ``_connection_definite_emits``,
+    arms unioned at ``_row_union_definite_emits``). ``forwards_input_fields``
+    is a transform-only declaration, so without this arm one interposed gate
+    re-opened the elspeth-15c72686f2 hole on the YAML/DAG surface. QUEUE
+    stays at the presence answer — the composer deliberately leaves queue
+    producers opaque ("left to the track that owns queue contract
+    semantics"), and this walk mirrors that boundary.
     """
     if node_id in cache:
         return cache[node_id]
+    if presence_cache is None:
+        # One presence-vote cache per WALK, not per node: the walk consumes
+        # the presence answer at every node it visits, and votes are
+        # path-independent on a built DAG, so a fresh cache per node would
+        # re-walk shared ancestry quadratically (review finding on
+        # elspeth-15c72686f2's fix).
+        presence_cache = {}
 
     node_info = graph.get_node_info(node_id)
-    own_fields = walk_effective_guaranteed_fields(graph, node_id, {})
+    own_fields = walk_effective_guarantee_vote(graph, node_id, presence_cache).fields
 
-    if not node_info.forwards_input_fields:
+    if node_info.node_type in (NodeType.GATE, NodeType.ROW_UNION):
+        # Seed before recursing — same cycle posture as the forwarding arm.
+        cache[node_id] = own_fields
+        arriving: frozenset[str] = frozenset()
+        for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
+            if edge_data["mode"] == RoutingMode.DIVERT:
+                continue
+            arriving |= walk_definite_emitted_fields(graph, from_id, cache, presence_cache)
+        result = own_fields | arriving
+        cache[node_id] = result
+        return result
+
+    # The node's own EXTRAS FIREWALL gates forwarding, mirroring the
+    # composer's ``propagates = forwards and not extras_firewall``
+    # (``_producer_emit_profile``): an output contract that forbids extras
+    # emits EXACTLY its declared fields — rows either match that set or die
+    # at the node's own preflight, never downstream — so upstream arrivals
+    # provably do not survive past it and unioning them here would predict
+    # phantom extras (and hand the two authoring surfaces opposite verdicts
+    # on the same graph).
+    firewalled = node_info.output_schema_config is not None and not node_info.output_schema_config.allows_extra_fields
+    if not node_info.forwards_input_fields or firewalled:
         cache[node_id] = own_fields
         return own_fields
 
@@ -382,16 +441,28 @@ def walk_definite_emitted_fields(
     for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
         if edge_data["mode"] == RoutingMode.DIVERT:
             continue
-        forwarded |= walk_definite_emitted_fields(graph, from_id, cache)
+        forwarded |= walk_definite_emitted_fields(graph, from_id, cache, presence_cache)
 
     result = own_fields | (forwarded - node_info.removed_input_fields)
     cache[node_id] = result
     return result
 
 
-def get_definite_emitted_fields(graph: ExecutionGraph, node_id: str) -> frozenset[str]:
-    """Public entry point for ``walk_definite_emitted_fields`` with a fresh cache."""
-    return walk_definite_emitted_fields(graph, node_id, {})
+def get_definite_emitted_fields(
+    graph: ExecutionGraph,
+    node_id: str,
+    caches: DefiniteEmitsCaches | None = None,
+) -> frozenset[str]:
+    """Public entry point for ``walk_definite_emitted_fields``.
+
+    ``caches`` follows the ``validate_edge_schemas`` ``schema_cache``
+    discipline: bulk callers create one per validation pass and thread it
+    through their edge loop; one-shot callers omit it and get fresh caches
+    scoped to this call.
+    """
+    if caches is None:
+        caches = DefiniteEmitsCaches()
+    return walk_definite_emitted_fields(graph, node_id, caches.fields, caches.presence_votes)
 
 
 @dataclass(frozen=True, slots=True)
