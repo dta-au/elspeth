@@ -10601,3 +10601,59 @@ class TestForwardingTransformExtrasReachTheLockedSink:
         ).validate()
 
         assert [error.error_code for error in result.errors if error.error_code == "sink_locked_extras"] == []
+
+    def test_locked_transform_input_downstream_of_the_forwarder_trips_rule_a(self) -> None:
+        """Rule A (node-level) shares the edited union site with Rule B and must fire too.
+
+        The sink tests above exercise Rule B; this pins the locked TRANSFORM
+        consumer — a fixed-schema value_transform fed by the exploder — so the
+        node-level arm of the forwarding propagation cannot silently regress
+        while the sink arm stays green.
+        """
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                options=dict(self._LLM_SOURCE_OPTIONS),
+                on_success="brief",
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                self._explode("brief"),
+                NodeSpec(
+                    id="shout",
+                    node_type="transform",
+                    plugin="value_transform",
+                    input="sentence_rows",
+                    on_success="out_conn",
+                    on_error="discard",
+                    options={
+                        "operations": [{"field": "sentence", "operation": "uppercase"}],
+                        "schema": {"mode": "fixed", "fields": ["sentence: str"]},
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="out_conn",
+                    plugin="json",
+                    options={"path": "outputs/out.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:shout"
+        assert entry.contract is not None
+        assert entry.contract.extra_fields == ("announcement_model", "announcement_usage")

@@ -3392,6 +3392,10 @@ def _check_schema_contracts(
         emits union with everything definitely arriving at their input
         (elspeth-902fc354b2 — the runtime rejection this walk predicts fires
         on the ENTIRE arriving row, not on the nearest producer's own emits).
+        Transforms declaring ``forwards_input_fields`` traverse the same way
+        minus their ``removed_input_fields`` (elspeth-15c72686f2) — the
+        weaker declaration verified by the ADR-009 probe harness rather than
+        a runtime cross-check.
         """
         if connection_name in visited_connections:
             return frozenset()
