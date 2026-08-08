@@ -1448,6 +1448,21 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "arn:aws:s3:::elspeth-b-example/*",
     ]
     assert "acm:GetCertificate" in statements["ReadDiscovery"]["Action"]
+    assert {
+        "bedrock:GetInferenceProfile",
+        "bedrock:ListInferenceProfiles",
+    }.issubset(statements["ReadDiscovery"]["Action"])
+    create_vpc_children = statements["CreateChildrenOfRunTaggedVpc"]
+    assert create_vpc_children["Action"] == [
+        "ec2:CreateRouteTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateSubnet",
+    ]
+    assert create_vpc_children["Resource"] == "*"
+    assert create_vpc_children["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": values["run_id"],
+        "aws:RequestedRegion": values["aws_region"],
+    }
 
     assert "CreateRunScopedRolesWithBoundary" not in statements
     pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
@@ -1538,9 +1553,17 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "AuthorizeOnRunSecurityGroups",
         "CreateRunTaggedSecurityGroupRules",
         "ManageRunCognitoChildren",
+        "ManageRunEfsLifecycleConfiguration",
         "ManageRunEfsMountTargets",
         "ManageRunEventTargets",
     }.issubset(statements)
+    efs_lifecycle = statements["ManageRunEfsLifecycleConfiguration"]
+    assert efs_lifecycle["Action"] == ["elasticfilesystem:PutLifecycleConfiguration"]
+    assert efs_lifecycle["Resource"] == "arn:aws:elasticfilesystem:ap-southeast-1:123456789012:file-system/*"
+    assert efs_lifecycle["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": values["run_id"],
+        "aws:RequestedRegion": values["aws_region"],
+    }
     assert "repository/elspeth-*" not in template
     assert "arn:aws:s3:::elspeth-*" not in template
     readme = _text("README.md")

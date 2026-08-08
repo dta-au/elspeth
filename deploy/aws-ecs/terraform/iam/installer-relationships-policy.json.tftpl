@@ -158,6 +158,20 @@
       }
     },
     {
+      "Sid": "ManageRunEfsLifecycleConfiguration",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:PutLifecycleConfiguration"
+      ],
+      "Resource": "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
       "Sid": "ManageRunEventTargets",
       "Effect": "Allow",
       "Action": [
