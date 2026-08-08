@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import String, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import Connection, RowMapping
@@ -27,6 +27,14 @@ from elspeth.core.landscape.run_coordination_repository import fenced_leader_tra
 from elspeth.core.landscape.schema import coalesce_branch_losses_table
 
 logger = logging.getLogger(__name__)
+
+# The reason column is a bounded category token ("quarantined",
+# "error_routed", "max_retries_exceeded", ...). Derive the bound from the
+# schema so the two cannot drift.
+_reason_column_type = coalesce_branch_losses_table.c.reason.type
+if not isinstance(_reason_column_type, String) or _reason_column_type.length is None:
+    raise TypeError("coalesce_branch_losses.reason must be a bounded String column")
+_REASON_MAX_LENGTH: int = _reason_column_type.length
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,17 @@ def record_coalesce_branch_loss(
     Returns ``True`` if this call inserted the row, ``False`` if the row
     pre-existed.
     """
+    # Fail-closed length check BEFORE the INSERT (elspeth-74b795208f): SQLite
+    # does not enforce VARCHAR lengths, so an over-wide reason passes every
+    # local test and dies only on real PostgreSQL (StringDataRightTruncation)
+    # — the audit write killing the run it exists to explain. Deliberately do
+    # NOT echo the reason content: failure-path reasons can carry secrets.
+    if len(reason) > _REASON_MAX_LENGTH:
+        raise AuditIntegrityError(
+            f"Coalesce branch-loss reason is {len(reason)} chars but the reason column "
+            f"holds a category token of at most {_REASON_MAX_LENGTH}; producers must record "
+            "a bare token (e.g. 'quarantined') and carry detail via the token outcome's error hash."
+        )
     loss_id = f"loss_{generate_id()[:12]}"
     values = {
         "loss_id": loss_id,

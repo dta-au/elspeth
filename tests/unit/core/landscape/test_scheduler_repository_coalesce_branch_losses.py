@@ -172,6 +172,24 @@ class TestRecordCoalesceBranchLoss:
         assert len(rows) == 1
         assert rows[0]["reason"] == "failed", "the first durable record wins"
 
+    def test_overlong_reason_is_rejected_before_any_write(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """A reason wider than the String(64) column is refused on every dialect.
+
+        Regression guard for elspeth-74b795208f: SQLite does not enforce
+        VARCHAR lengths, so an over-wide reason passed the local suite and
+        killed the run only on real PostgreSQL (StringDataRightTruncation).
+        This guard makes SQLite fail exactly where PostgreSQL would. The
+        message must not echo the reason content — reasons on failure paths
+        can carry secrets.
+        """
+        overlong = "quarantined:" + "x" * 64
+        with pytest.raises(AuditIntegrityError, match="category token") as excinfo:
+            _record(db, reason=overlong)
+        assert overlong not in str(excinfo.value)
+        assert _loss_rows(db) == []
+        # At the boundary exactly: 64 chars must still record.
+        assert _record(db, reason="q" * 64) is True
+
     def test_rides_caller_transaction_rollback_loses_the_record(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """§E.5: the loss commits iff the caller's disposition commits."""
         with pytest.raises(RuntimeError, match="disposition failed"), begin_write(db.engine) as conn:

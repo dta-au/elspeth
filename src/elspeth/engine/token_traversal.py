@@ -308,11 +308,16 @@ class TokenTraversalEngine:
             # The QUARANTINED path tolerates an "unknown_error" fallback for
             # historical reasons; do NOT extend that fallback to ROUTED_ON_ERROR
             # below — see the offensive guard in the routed branch.
+            # The durable branch-loss reason is a bounded category token
+            # (coalesce_branch_losses.reason, String(64)); the failure detail
+            # travels as compute_error_hash(error_detail) on the token outcome,
+            # never inline — an unbounded repr overflows the column on
+            # PostgreSQL and the audit write kills the run (elspeth-74b795208f).
             error_detail = str(transform_result.reason) if transform_result.reason else "unknown_error"
             branch_loss_reason = (
                 "max_retries_exceeded"
                 if transform_result.reason is not None and transform_result.reason["reason"] == "retry_exhausted"
-                else f"quarantined:{error_detail}"
+                else "quarantined"
             )
             quarantine_error_hash = compute_error_hash(error_detail)
             self._processor._data_flow.record_token_outcome(
@@ -357,10 +362,10 @@ class TokenTraversalEngine:
                 "ROUTED_ON_ERROR requires transform_result.reason; refusing to "
                 "fabricate FailureInfo.message='unknown_error' for audit hashing"
             )
+        # Category token only (see the quarantine arm above): the detail rides
+        # the FailureInfo below, which the accumulator hashes onto the outcome.
         error_detail = str(transform_result.reason)
-        branch_loss_reason = (
-            "max_retries_exceeded" if transform_result.reason["reason"] == "retry_exhausted" else f"error_routed:{error_detail}"
-        )
+        branch_loss_reason = "max_retries_exceeded" if transform_result.reason["reason"] == "retry_exhausted" else "error_routed"
 
         sibling_results = self._processor._notify_barrier_of_lost_branch(
             current_token,
@@ -454,9 +459,11 @@ class TokenTraversalEngine:
             # NOTE: Do NOT record ROUTED outcome here - the token hasn't been written yet.
             # SinkExecutor.write() records the outcome AFTER sink durability is achieved.
             # Notify coalesce if this is a forked branch
+            # Category token only (String(64) audit column, elspeth-74b795208f):
+            # the sink name is durably recorded on the ROUTED token outcome.
             sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
-                f"gate_routed_to_sink:{outcome.sink_name}",
+                "gate_routed_to_sink",
                 child_items,
             )
             current_result = RowResult(
@@ -595,9 +602,12 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.FAILURE,
                     path=TerminalPath.GATE_ERROR_DISCARDED,
                 )
+            # Category token only (String(64) audit column, elspeth-74b795208f):
+            # exception class names are plugin-defined and unbounded; the
+            # failure detail is hashed onto the token outcome above.
             sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
-                f"gate_error_discarded:{failure.exception_type}",
+                "gate_error_discarded",
                 child_items,
             )
             current_result = RowResult(
@@ -613,9 +623,11 @@ class TokenTraversalEngine:
         error_sink = outcome.sink_name
         if error_sink is None:
             raise OrchestrationInvariantError("Gate DIVERT outcome requires a named error sink or discarded=True")
+        # Category token only (String(64) audit column, elspeth-74b795208f);
+        # the FailureInfo on the routed result carries the detail.
         sibling_results = self._processor._notify_barrier_of_lost_branch(
             current_token,
-            f"gate_error_routed:{failure.exception_type}",
+            "gate_error_routed",
             child_items,
         )
         current_result = RowResult(

@@ -713,6 +713,115 @@ class TestHandleTransformErrorStatus:
         assert outcome.result.sink_name == "error_sink"
         assert outcome.result.error is not None
 
+    def test_quarantine_branch_loss_reason_is_bounded_category_token(self) -> None:
+        """A quarantined branch records the bare 'quarantined' token, not the reason dict.
+
+        Regression for elspeth-74b795208f (battery round 7, Aurora): the
+        quarantine arm inlined the full reason-dict repr into the durable
+        branch-loss reason (``quarantined:{'reason': 'type_mismatch', ...}``,
+        150 chars), overflowing the String(64) category column. SQLite does
+        not enforce VARCHAR lengths, so only real PostgreSQL rejected the
+        INSERT — and the audit write killed the run it existed to explain.
+        The detail travels via compute_error_hash on the token outcome; the
+        column carries only the category token.
+        """
+        from elspeth.core.landscape.scheduler.branch_losses import record_coalesce_branch_loss
+
+        db, factory = _make_factory()
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+        )
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({"value": 1}),
+            branch_name="path_a",
+        )
+        _persist_token_for_scheduler(factory, token)
+        # The observed battery-round-7 payload: 138 chars of dict repr.
+        battery_reason = {
+            "reason": "type_mismatch",
+            "field": "price",
+            "expected": "int",
+            "actual": "float",
+            "message": "float 29.99 has fractional part",
+        }
+        transform_result = TransformResult.error(reason=battery_reason)
+
+        outcome = processor._handle_transform_error_status(
+            transform_result=transform_result,
+            current_token=token,
+            error_sink="discard",
+            child_items=[],
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        branch_loss = processor._pending_branch_losses.pop()
+        assert branch_loss.reason == "quarantined"
+        with db.write_connection() as conn:
+            assert record_coalesce_branch_loss(
+                conn,
+                run_id="test-run",
+                coalesce_name=branch_loss.coalesce_name,
+                row_id=branch_loss.row_id,
+                branch_name=branch_loss.branch_name,
+                token_id=branch_loss.token_id,
+                reason=branch_loss.reason,
+                recorded_by=branch_loss.recorded_by,
+                now=datetime.now(UTC),
+            )
+        [durable_loss] = factory.scheduler.list_coalesce_branch_losses(run_id="test-run")
+        assert durable_loss.reason == "quarantined"
+
+    def test_error_routed_branch_loss_reason_is_bounded_category_token(self) -> None:
+        """A routed error branch records the bare 'error_routed' token (elspeth-74b795208f).
+
+        Same defect class as the quarantine arm: the routed arm inlined the
+        reason-dict repr as ``error_routed:{...}``. The detail already rides
+        the RowResult's FailureInfo (hashed by the accumulator); the durable
+        branch-loss column carries only the category token.
+        """
+        _db, factory = _make_factory()
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+        )
+        token = TokenInfo(
+            row_id="row-1",
+            token_id="tok-1",
+            row_data=make_row({"value": 1}),
+            branch_name="path_a",
+        )
+        _persist_token_for_scheduler(factory, token)
+        battery_reason = {
+            "reason": "type_mismatch",
+            "field": "price",
+            "expected": "int",
+            "actual": "float",
+            "message": "float 29.99 has fractional part",
+        }
+        transform_result = TransformResult.error(reason=battery_reason)
+
+        outcome = processor._handle_transform_error_status(
+            transform_result=transform_result,
+            current_token=token,
+            error_sink="error_sink",
+            child_items=[],
+        )
+
+        assert isinstance(outcome, _TransformTerminal)
+        branch_loss = processor._pending_branch_losses.pop()
+        assert branch_loss.reason == "error_routed"
+        # The detail is preserved on the routed result, not in the reason column.
+        assert isinstance(outcome.result, RowResult)
+        assert outcome.result.error is not None
+        assert "type_mismatch" in outcome.result.error.message
+
     def test_route_without_reason_refuses_to_fabricate_audit_data(self) -> None:
         """A routed error with a falsy reason is refused rather than fabricating an error hash."""
         _db, factory = _make_factory()

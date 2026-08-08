@@ -9110,7 +9110,9 @@ class TestGateSinkRoutingNotifiesCoalesce:
 
         Before fix: gate sink routing returned immediately without notifying coalesce,
         causing sibling branches to remain held until timeout/end-of-source.
-        After fix: coalesce is notified with reason 'gate_routed_to_sink:<sink_name>'.
+        After fix: coalesce is notified with the category token 'gate_routed_to_sink'
+        (bare token per elspeth-74b795208f — the reason column is String(64) and the
+        sink name is durably recorded on the ROUTED token outcome instead).
         """
         _db, factory = _make_factory()
         ctx = make_context(landscape=factory.plugin_audit_writer())
@@ -9197,7 +9199,7 @@ class TestGateSinkRoutingNotifiesCoalesce:
             coalesce_name=CoalesceName("merge"),
             row_id="row-1",
             lost_branch="path_a",
-            reason="gate_routed_to_sink:error_sink",
+            reason="gate_routed_to_sink",
         )
 
     def test_gate_sink_route_with_coalesce_failure_returns_sibling_results(self) -> None:
