@@ -93,6 +93,20 @@ def _outputs_path(client: TestClient, filename: str) -> str:
     return str(outputs_dir / filename)
 
 
+def _session_outputs_path(client: TestClient, session_id: str, filename: str) -> str:
+    """Absolute path inside the session-owned outputs subtree.
+
+    The only absolute form the deployment sink admission accepts
+    (``allowed_sink_directories`` scopes writes to
+    ``data_dir/outputs/<session_id>``); the pool root returned by
+    ``_outputs_path`` is shared infrastructure and is rejected.
+    """
+    data_dir: Path = client.app.state.settings.data_dir
+    outputs_dir = data_dir / "outputs" / session_id
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    return str(outputs_dir / filename)
+
+
 def _seed_guided_session(client: TestClient, session_id: str) -> dict:
     """Read the live-start checkpoint and its authoritative Step-1 turn."""
     resp = client.get(f"/api/sessions/{session_id}/guided")
@@ -1892,9 +1906,10 @@ class TestStepChatProgressWiring:
         guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
         assert guided["guided_session"]["step"] == "step_2_sink", guided
 
-        # The sink path must remain within the session outputs directory for
-        # the pure transition validator to accept the proposal.
-        out_path = _outputs_path(composer_test_client, "chat_out.jsonl")
+        # The sink path must lie within the session-owned outputs subtree —
+        # the chat-time deployment admission (and the manual form POST's)
+        # rejects any other absolute path.
+        out_path = _session_outputs_path(composer_test_client, session_id, "chat_out.jsonl")
         resolve_sink_response = SimpleNamespace(
             choices=[
                 SimpleNamespace(

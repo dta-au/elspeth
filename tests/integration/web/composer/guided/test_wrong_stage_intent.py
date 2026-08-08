@@ -71,7 +71,7 @@ from tests.integration.web.composer.guided.test_respond import (
     _outputs_path as _respond_outputs_path,
 )
 from tests.integration.web.composer.guided.test_respond_schema8_atomic import _respond_operation_count
-from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session, _outputs_path
+from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -1452,7 +1452,7 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
     TestStepChatCrossStep._configure_csv_source(client, session_id)
     before = client.get(f"/api/sessions/{session_id}/guided").json()
     assert before["guided_session"]["step"] == "step_2_sink"
-    out_path = _outputs_path(client, "pair_out.jsonl")
+    out_path = _respond_outputs_path(client, session_id, "pair_out.jsonl")
     private_message = "Save results as jsonl, and later add the passthrough transform with secret-pair-needle."
     provider_calls = 0
 
@@ -1883,7 +1883,7 @@ def test_pair_with_rejected_transition_still_retains_and_says_so(
                 name="main",
                 plugin="json",
                 options={
-                    "path": _outputs_path(client, "pair_transition.jsonl"),
+                    "path": _respond_outputs_path(client, session_id, "pair_transition.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",

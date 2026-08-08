@@ -1422,9 +1422,48 @@ async def post_guided_chat_schema8(
                             )
                             sink_resolution = None
                         else:
-                            sink_prefill_name = resolved_output.name
-                            sink_prefill_options = dict(deep_thaw(resolved_output.options))
-                            sink_prefill_options["on_write_failure"] = resolved_output.on_write_failure
+                            candidate_prefill_options = dict(deep_thaw(resolved_output.options))
+                            candidate_prefill_options["on_write_failure"] = resolved_output.on_write_failure
+                            try:
+                                # Deployment sink admission must run before the
+                                # options become server-held prefill: the
+                                # SCHEMA_FORM chat lane gets this check inside
+                                # _schema8_answer_and_project_next, but this
+                                # SINGLE_SELECT lane answers a plugin-selection
+                                # turn, so without it an inadmissible option
+                                # set is staged and the rejection surfaces
+                                # only at the user's form POST as a 400
+                                # blaming their submission.
+                                guided_route._schema8_require_runnable_sink_options(
+                                    candidate_prefill_options,
+                                    plugin=resolved_output.plugin,
+                                    data_dir=str(request.app.state.settings.data_dir),
+                                    session_id=str(owned_session.id),
+                                )
+                            except guided_route.SinkAdmissionRejectedError as prefill_admission_exc:
+                                slog.warning(
+                                    "guided.step_2_sink_prefill_admission_rejected",
+                                    session_id=str(session_id),
+                                    user_id=user.user_id,
+                                    detail=prefill_admission_exc.detail,
+                                )
+                                chat_result = _with_pair_disposition(
+                                    StepChatResult(
+                                        assistant_message=(
+                                            "I couldn't apply those output settings, so I didn't change your pipeline. "
+                                            f"{prefill_admission_exc.detail} "
+                                            "Describe the output again and I'll rebuild it."
+                                        ),
+                                        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                        latency_ms=chat_result.latency_ms,
+                                        error_class="SinkAdmissionRejected",
+                                    ),
+                                    deferred_disposition_message,
+                                )
+                                sink_resolution = None
+                            else:
+                                sink_prefill_name = resolved_output.name
+                                sink_prefill_options = candidate_prefill_options
                     transition_body = _transition_request(
                         body=body,
                         guided=prospective,

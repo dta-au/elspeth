@@ -21,7 +21,12 @@ from elspeth.web.sessions._guided_step_chat import (
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
 from tests.integration.web.composer.guided import test_respond as guided_respond_tests
-from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session, _outputs_path
+from tests.integration.web.composer.guided.test_step_chat import (
+    TestStepChatCrossStep,
+    _create_session,
+    _outputs_path,
+    _session_outputs_path,
+)
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -163,7 +168,7 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
                 name="main",
                 plugin="json",
                 options={
-                    "path": _outputs_path(client, "chat-output.jsonl"),
+                    "path": _session_outputs_path(client, session_id, "chat-output.jsonl"),
                     "schema": {"mode": "observed"},
                     "mode": "write",
                     "collision_policy": "auto_increment",

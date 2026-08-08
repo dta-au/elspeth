@@ -1332,7 +1332,15 @@ async def _resolved_sink_provider(**_kwargs: object) -> GuidedChatProviderOutcom
             SinkOutputResolved(
                 name="result",
                 plugin="json",
-                options={"path": "out.json", "schema": {"mode": "observed"}},
+                # collision_policy/mode are part of the solver's file-sink
+                # contract and of the chat-time deployment admission the
+                # prefill lane now runs before staging.
+                options={
+                    "path": "out.json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "fail_if_exists",
+                },
                 required_fields=(),
                 schema_mode="observed",
                 on_write_failure="discard",
@@ -1485,6 +1493,92 @@ def test_invalid_sink_prefill_never_reaches_operator_logs(
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
 
 
+def test_inadmissible_sink_prefill_degrades_at_chat_time_instead_of_staging(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Chat-authored SINGLE_SELECT sink prefill runs the same deployment
+    admission as schema-form answers (elspeth-ef92db3e16 prefill lane): an
+    out-of-allowlist output path degrades at chat time with the admission
+    reason, instead of staging as server-held form prefill and surfacing
+    later at the user's form POST as a 400 blaming their submission.
+    """
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    sink_state = _Step2Journey()._drive_to_step_2_single_select(composer_test_client, session_id)
+    sink_turn = sink_state["next_turn"]
+    disallowed = {
+        "path": "/etc/elspeth-prefill-admission-canary.json",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _sink_form_answer_provider(disallowed),
+        raising=False,
+    )
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/chat",
+            json=_chat_body(sink_turn, message="Save the results to a JSON file."),
+        )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert "allowed output locations" in body["assistant_message"]
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    # Nothing was staged: the plugin-selection turn is re-presented under the
+    # same token and no output intent advanced to its options phase.
+    assert body["next_turn"]["type"] == "single_select"
+    assert body["next_turn"]["turn_token"] == sink_turn["turn_token"]
+    rejection = next(entry for entry in logs if entry["event"] == "guided.step_2_sink_prefill_admission_rejected")
+    assert "allowed output locations" in rejection["detail"]
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    guided_after = record.composer_meta["guided_session"]
+    assert all(intent["phase"] == "plugin_selection" for intent in guided_after["pending_output_intents"].values())
+    assert guided_after["reviewed_outputs"] == {}
+
+
+def test_underspecified_sink_prefill_degrades_at_chat_time_instead_of_staging(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file-sink prefill missing an explicit collision policy is rejected by
+    the same chat-time admission as the out-of-allowlist path, so the solver's
+    collision_policy/mode contract is backstopped for every other producer of
+    a sink resolution.
+    """
+    session_id = _create_session(composer_test_client)
+    sink_state = _Step2Journey()._drive_to_step_2_single_select(composer_test_client, session_id)
+    sink_turn = sink_state["next_turn"]
+    underspecified = {
+        "path": "results.json",
+        "schema": {"mode": "observed"},
+    }
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _sink_form_answer_provider(underspecified),
+        raising=False,
+    )
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(sink_turn, message="Save the results to a JSON file."),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert body["next_turn"]["type"] == "single_select"
+    assert body["next_turn"]["turn_token"] == sink_turn["turn_token"]
+
+
 def _sink_form_answer_provider(options: dict[str, object]):
     """Provider whose resolution answers the sink schema form with ``options``."""
 
@@ -1520,14 +1614,26 @@ def _drive_chat_to_sink_schema_form(
     monkeypatch: pytest.MonkeyPatch,
     options: dict[str, object],
 ) -> tuple[str, dict]:
-    """Create a session, reach the Step-2 sink schema form via chat."""
+    """Create a session, reach the Step-2 sink schema form via chat.
+
+    The plugin-selection step stages an admissible prefill — the SINGLE_SELECT
+    lane now runs the deployment admission before staging, so an inadmissible
+    ``options`` set can only be exercised as the *form answer*, which is what
+    the provider is swapped to before returning.
+    """
     session_id = _create_session(client)
     sink_state = _Step2Journey()._drive_to_step_2_single_select(client, session_id)
     sink_turn = sink_state["next_turn"]
+    admissible_prefill: dict[str, object] = {
+        "path": "results.json",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
     monkeypatch.setattr(
         guided_route,
         "_run_guided_chat_provider_attempt",
-        _sink_form_answer_provider(options),
+        _sink_form_answer_provider(admissible_prefill),
         raising=False,
     )
     select_chat = client.post(
@@ -1537,6 +1643,12 @@ def _drive_chat_to_sink_schema_form(
     assert select_chat.status_code == 200, select_chat.json()
     form_turn = select_chat.json()["next_turn"]
     assert form_turn["type"] == "schema_form"
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _sink_form_answer_provider(options),
+        raising=False,
+    )
     return session_id, form_turn
 
 
@@ -1568,10 +1680,9 @@ def test_chat_sink_form_answer_rejects_path_outside_allowed_directories(
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
     # The rejected options were NOT applied: the form turn is re-presented,
     # the intent never advances past its form phase, and nothing reaches
-    # reviewed authority. (The disallowed path legitimately appears as the
-    # form's PREFILL and in the degrade message's verbatim explanation —
-    # both pre-review surfaces whose only route into applied authority is
-    # this admission-guarded transition.)
+    # reviewed authority. (The disallowed path appears only in the degrade
+    # message's verbatim explanation — the staged prefill is admissible by
+    # construction, since the SINGLE_SELECT lane now admission-gates it.)
     assert body["next_turn"]["type"] == "schema_form"
     record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
     assert record is not None

@@ -2243,8 +2243,32 @@ def _schema8_require_runnable_sink_form(
         or not isinstance(edited["options"], Mapping)
     ):
         return  # closed-shape violations are the transition contract's to reject
+    _schema8_require_runnable_sink_options(
+        edited["options"],
+        plugin=plugin,
+        data_dir=data_dir,
+        session_id=session_id,
+    )
+
+
+def _schema8_require_runnable_sink_options(
+    submitted_options: Mapping[str, Any],
+    *,
+    plugin: str,
+    data_dir: str,
+    session_id: str,
+) -> None:
+    """Run the deployment sink admission on a bare plugin/options pair.
+
+    The core of :func:`_schema8_require_runnable_sink_form`, split out so the
+    chat SINGLE_SELECT prefill lane can admit LLM-authored options *before*
+    staging them as server-held form prefill — otherwise the rejection only
+    fires when the user later submits the form, as a 400 blaming their
+    submission instead of the chat-time degrade built for the schema-form
+    chat lane.
+    """
     try:
-        options = canonical_sink_local_paths(edited["options"])
+        options = canonical_sink_local_paths(submitted_options)
     except ValueError as exc:
         raise SinkAdmissionRejectedError(f"Output path is not allowed: {exc}") from exc
     allowed = allowed_sink_directories(data_dir, session_id=session_id)
