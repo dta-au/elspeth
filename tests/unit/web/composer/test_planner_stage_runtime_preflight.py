@@ -37,6 +37,8 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.core.canonical import stable_hash
+from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface
 from elspeth.web.composer.protocol import (
@@ -193,9 +195,9 @@ def _plan(candidate_state: CompositionState | None) -> PipelinePlanResult:
 
 def _service() -> ComposerServiceImpl:
     return ComposerServiceImpl(
-        catalog=MagicMock(),
+        catalog=MagicMock(spec=CatalogService),
         settings=_make_settings(),
-        plugin_snapshot_factory=MagicMock(),
+        plugin_snapshot_factory=MagicMock(spec=lambda _user_id: None),
         operator_profile_registry=MagicMock(spec=OperatorProfileRegistry),
     )
 
@@ -212,9 +214,9 @@ async def _stage(
     state = _empty_state()
 
     if isinstance(preflight, BaseException):
-        preflight_mock = AsyncMock(side_effect=preflight)
+        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, side_effect=preflight)
     else:
-        preflight_mock = AsyncMock(return_value=preflight)
+        preflight_mock = AsyncMock(spec=service._cached_runtime_preflight, return_value=preflight)
 
     with (
         patch.object(service, "_sessions_service", sessions),
@@ -229,7 +231,7 @@ async def _stage(
             user_message_id=uuid4(),
             user_id="user-1",
             preferences=_FakePreferences(trust_mode=trust_mode),
-            recorder=MagicMock(llm_calls=(), invocations=()),
+            recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
             plugin_snapshot=None,
         )
     return result, sessions
