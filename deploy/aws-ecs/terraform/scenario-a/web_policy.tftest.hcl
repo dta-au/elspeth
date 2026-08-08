@@ -65,8 +65,13 @@ run "unset_variables_render_the_shipped_policy" {
   command = plan
 
   assert {
-    condition     = output.resolved_inventory.values.ELSPETH_WEB__PLUGIN_ALLOWLIST == "[\"source:aws_s3\",\"source:csv\",\"source:json\",\"source:text\",\"sink:aws_s3\",\"sink:csv\",\"sink:json\",\"sink:text\",\"transform:aws_bedrock_content_safety\",\"transform:aws_bedrock_prompt_shield\",\"transform:aws_textract_document_analysis\",\"transform:field_mapper\",\"transform:llm\",\"transform:passthrough\",\"transform:web_scrape\"]"
-    error_message = "the default plugin allowlist must render exactly the shipped 15-plugin set, in order."
+    # Re-pinned 2026-08-09: the shipped default deliberately grew to 19 —
+    # source:llm (905613641, elspeth-ba6a8dff24), sink:document (476a32d46,
+    # elspeth-afdf55a17c), line_explode/report_assemble (61e019a81) — and this
+    # pin was not updated alongside. The Python-side pins in
+    # tests/unit/deployment/test_aws_ecs_terraform_package.py already agree.
+    condition     = output.resolved_inventory.values.ELSPETH_WEB__PLUGIN_ALLOWLIST == "[\"source:aws_s3\",\"source:csv\",\"source:json\",\"source:llm\",\"source:text\",\"sink:aws_s3\",\"sink:csv\",\"sink:document\",\"sink:json\",\"sink:text\",\"transform:aws_bedrock_content_safety\",\"transform:aws_bedrock_prompt_shield\",\"transform:aws_textract_document_analysis\",\"transform:field_mapper\",\"transform:line_explode\",\"transform:llm\",\"transform:passthrough\",\"transform:report_assemble\",\"transform:web_scrape\"]"
+    error_message = "the default plugin allowlist must render exactly the shipped 19-plugin set, in order."
   }
 
   assert {
