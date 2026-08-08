@@ -31,13 +31,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from elspeth.web.composer import no_tool_policy
 from elspeth.web.composer import service as service_module
 from elspeth.web.composer.no_tool_policy import (
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+    _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
+    _INTERPRETATION_REVIEW_HANDOFF_NOTICE,
+    _PREFLIGHT_NOTICE_HEADER,
+    AssistantTextSegment,
+    TrustedSystemNoticeSegment,
+    visible_message_segments,
 )
 from elspeth.web.composer.protocol import ComposerResult
 from elspeth.web.composer.service import (
     ComposerServiceImpl,
+    _announce_staged_review_handoff,
     _append_interpretation_review_handoff_message,
     _replace_advisor_repair_public_result,
 )
@@ -45,6 +53,7 @@ from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMet
 from elspeth.web.execution.schemas import (
     CHECK_ADVISOR_SIGNOFF,
     ValidationCheck,
+    ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
     ValidationResult,
@@ -226,6 +235,171 @@ class TestAppendHandoffMessage:
         )
         assert "must be fixed before this pipeline can run" in result.message
         assert "(none - dynamic schema)" in result.message
+
+    def test_bare_suffix_renders_as_trusted_chrome(self) -> None:
+        """elspeth-2ed41f0a4a R2: the disclosure is backend-authored, so it must render as chrome.
+
+        The suffix used to be a hand-assembled f-string joined with a bare
+        ``"\\n\\n"``, matching no arm of ``_canonical_trusted_suffix_segments``.
+        ``visible_message_segments`` therefore failed closed to ONE
+        ``AssistantTextSegment`` and the operator was shown ELSPETH's own
+        statement that a review was staged as if the model had said it.
+        """
+        prose = "Done — interpretation review is pending."
+        result = _append_interpretation_review_handoff_message(_handoff_composer_result(), prose)
+
+        assert visible_message_segments(content=result.message, raw_content=result.raw_assistant_content) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+        )
+
+    def test_qualified_suffix_keeps_validator_detail_untrusted(self) -> None:
+        prose = "Done — interpretation review is pending."
+        result = _append_interpretation_review_handoff_message(
+            _handoff_composer_result(),
+            prose,
+            outstanding_findings=_structural_failure_result(),
+        )
+
+        segments = visible_message_segments(content=result.message, raw_content=result.raw_assistant_content)
+        assert segments == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment("Cause: consumer requires ['llm_response'], producer guarantees (none - dynamic schema)"),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+
+class TestStagedReviewHandoffAnnouncement:
+    """elspeth-2ed41f0a4a R1: the staged-handoff branch spends ONE suffix.
+
+    ``_classify_and_budget_turn``'s staged-handoff branch announces a review
+    the TOOL BATCH staged whenever the shared finalize tail did not. On the
+    cross-turn arm (elspeth-ac85b0ab0e) the tail can meanwhile have appended a
+    preflight-failure suffix of its own, and the announcement used to stack on
+    top of it. Two concatenated canonical suffixes match no arm of
+    ``_canonical_trusted_suffix_segments``, so the operator lost the trusted
+    chrome on BOTH disclosures — and
+    ``_enforce_augmentation_prefix_invariant`` could not see it, because a
+    doubled suffix still leaves the prose a strict prefix.
+    """
+
+    def _prose(self) -> str:
+        return "Done — interpretation review is pending."
+
+    def _tail_augmented_red_result(self) -> ComposerResult:
+        """What the tail returns on the cross-turn red arm: prose + preflight suffix."""
+        runtime_result = _structural_failure_result()
+        prose = self._prose()
+        return ComposerResult(
+            message=service_module._compose_preflight_failure_message(prose, runtime_result=runtime_result),
+            state=_nonempty_state(),
+            runtime_preflight=runtime_result,
+            raw_assistant_content=prose,
+        )
+
+    def test_red_non_handoff_tail_yields_exactly_one_backend_suffix(self) -> None:
+        announced = _announce_staged_review_handoff(self._tail_augmented_red_result(), self._prose())
+
+        # One trusted separator means one backend suffix. Counting the notice
+        # alone would miss a stacked preflight suffix entirely.
+        assert announced.message.count(no_tool_policy._TRUSTED_NOTICE_SEPARATOR) == 1
+        assert announced.message.count(_INTERPRETATION_REVIEW_HANDOFF_NOTICE) == 1
+        assert _PREFLIGHT_NOTICE_HEADER not in announced.message
+
+    def test_red_non_handoff_tail_preserves_both_disclosures_as_chrome(self) -> None:
+        announced = _announce_staged_review_handoff(self._tail_augmented_red_result(), self._prose())
+
+        # Both facts survive: the staged card in the trusted header, and the
+        # validator's leading objection in the untrusted Cause: region.
+        assert visible_message_segments(content=announced.message, raw_content=announced.raw_assistant_content) == (
+            AssistantTextSegment(self._prose()),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment("Cause: consumer requires ['llm_response'], producer guarantees (none - dynamic schema)"),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+    def test_the_replaced_preflight_suffixes_suggestion_is_not_lost(self) -> None:
+        """Replacing the preflight suffix must not drop its repair suggestion.
+
+        ``_composer_persisted_validation`` projects preflight errors to
+        ``[error.message]``, so ``ValidationError.suggestion`` reaches no
+        structured surface — the prose suffix is the only place the operator
+        can see it. Dropping the tail's suffix without carrying the suggestion
+        across would therefore lose it outright.
+        """
+        runtime_result = _structural_failure_result().model_copy(
+            update={
+                "errors": [
+                    ValidationError(
+                        component_id="mapper",
+                        component_type="transform",
+                        message="consumer requires ['llm_response'], producer guarantees (none - dynamic schema)",
+                        suggestion="declare an output schema on the llm transform",
+                        error_code="graph_structure",
+                    )
+                ]
+            }
+        )
+        prose = self._prose()
+        tail_result = ComposerResult(
+            message=service_module._compose_preflight_failure_message(prose, runtime_result=runtime_result),
+            state=_nonempty_state(),
+            runtime_preflight=runtime_result,
+            raw_assistant_content=prose,
+        )
+        # Instrument guard: the suffix being replaced must actually have carried
+        # the suggestion, or this test cannot observe its loss.
+        assert "declare an output schema on the llm transform" in tail_result.message
+
+        announced = _announce_staged_review_handoff(tail_result, prose)
+
+        assert announced.message.count(no_tool_policy._TRUSTED_NOTICE_SEPARATOR) == 1
+        assert visible_message_segments(content=announced.message, raw_content=announced.raw_assistant_content) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment(
+                "Cause: consumer requires ['llm_response'], producer guarantees (none - dynamic schema)"
+                "\n\nSuggested fix: declare an output schema on the llm transform"
+            ),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+    def test_unaugmented_tail_still_gets_exactly_one_bare_notice(self) -> None:
+        """The complementary case: the tail appended nothing, so the notice rides the prose."""
+        prose = self._prose()
+        result = ComposerResult(
+            message=prose,
+            state=_nonempty_state(),
+            runtime_preflight=None,
+            raw_assistant_content=None,
+        )
+
+        announced = _announce_staged_review_handoff(result, prose)
+
+        assert announced.message.count(no_tool_policy._TRUSTED_NOTICE_SEPARATOR) == 1
+        assert visible_message_segments(content=announced.message, raw_content=announced.raw_assistant_content) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+        )
+
+    def test_green_tail_gets_the_bare_notice_not_the_qualified_one(self) -> None:
+        """A green recomputation carries no objection, so nothing may be interpolated."""
+        prose = self._prose()
+        result = ComposerResult(
+            message=prose,
+            state=_nonempty_state(),
+            runtime_preflight=_valid_result(),
+            raw_assistant_content=None,
+        )
+
+        announced = _announce_staged_review_handoff(result, prose)
+
+        assert _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER not in announced.message
+        assert visible_message_segments(content=announced.message, raw_content=announced.raw_assistant_content) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+        )
 
 
 class TestAdvisorRepairPublicResult:

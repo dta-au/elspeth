@@ -680,10 +680,25 @@ class PipelinePlanResult:
     # In-memory only — never persisted or projected; ``custody_result`` stays
     # "ready" because the proposal cannot settle without the blob settling.
     custody_preparation: PipelineCustodyPreparation | None = None
+    # The composition state this proposal WOULD produce, carried out so the
+    # staging announce can measure a runtime-equivalent preflight against the
+    # thing being proposed rather than against the (unmutated) current state
+    # (elspeth-2ed41f0a4a). In-memory only — never persisted, hashed, or
+    # projected; the draft hash covers the pipeline arguments, not this.
+    #
+    # Optional with a fail-closed default on purpose. A required field would
+    # ripple to ~28 construction sites across the suite, and the surfaces that
+    # do not set it (the in-loop set_pipeline proposal path in tool_batch.py)
+    # do not publish the planner announce at all. Absent therefore means
+    # "Stage 2 had nothing to measure", which the announce reports as
+    # not-run rather than as validated.
+    candidate_state: CompositionState | None = None
 
     def __post_init__(self) -> None:
         if type(self.proposal) is not PipelineProposal:
             raise TypeError("proposal must be an exact PipelineProposal")
+        if self.candidate_state is not None and type(self.candidate_state) is not CompositionState:
+            raise TypeError("candidate_state must be an exact CompositionState or None")
         if type(self.tool_call_id) is not str or not self.tool_call_id.strip():
             raise ValueError("tool_call_id must be a non-empty exact string")
         custody_result = cast(Any, self.custody_result)
@@ -2109,6 +2124,11 @@ async def _build_valid_pipeline_plan(
             ) from exc
 
     safe_pipeline: Mapping[str, Any] = pipeline
+    # The candidate state that corresponds to ``safe_pipeline``. Custody
+    # rewriting below replaces BOTH together — carrying the pre-custody state
+    # alongside a custody-rewritten pipeline would hand the staging announce a
+    # Stage-2 verdict for a pipeline that is not the one being proposed.
+    candidate_state = candidate.result.updated_state
     custody_result: PipelineCustodyResult = "not_required"
     custody_preparation: PipelineCustodyPreparation | None = None
     if candidate.prepared_inline_blob is not None:
@@ -2157,6 +2177,7 @@ async def _build_valid_pipeline_plan(
         )
         if repeated_coverage != covered_deferred_intent_ids:
             raise AuditIntegrityError("custody-safe pipeline changed deferred intent coverage")
+        candidate_state = safe_candidate.result.updated_state
         custody_result = "ready"
 
     return PipelinePlanResult(
@@ -2176,6 +2197,7 @@ async def _build_valid_pipeline_plan(
         model_version=model_version,
         provider=provider,
         custody_preparation=custody_preparation,
+        candidate_state=candidate_state,
     )
 
 

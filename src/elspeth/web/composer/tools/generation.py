@@ -2791,13 +2791,18 @@ def _execute_preview_pipeline(
     if runtime_result is not None:
         is_valid = is_valid and runtime_result.is_valid
     else:
-        # Both live callers wire Stage 2 unconditionally for preview — the
-        # operator channel precomputes it per call (tool_batch.py) and the
-        # stdio MCP server wires it at construction (d53fbee91) — so this
-        # branch is a pure wiring-omission tripwire. An un-run stage must not
-        # ride the success side of the conjunct: fail closed and name the
-        # stage, because ``runtime_preflight: null`` alone cannot tell a
-        # caller "not computed" apart from "nothing to report".
+        # Three live callers wire Stage 2 for preview: the operator channel
+        # precomputes it per call (tool_batch.py), the stdio MCP server wires
+        # it at construction (d53fbee91), and the planner precomputes it per
+        # request (service._planner_preview_preflight, elspeth-2ed41f0a4a).
+        # The planner is the one caller that can legitimately leave it unwired
+        # — it declines on a structurally empty pipeline (nothing to dry-run)
+        # and on a preflight that itself failed (a planner request must not die
+        # because Stage 2 broke) — so this branch is both that deliberate
+        # decline and a wiring-omission tripwire for the other two. Either way
+        # an un-run stage must not ride the success side of the conjunct: fail
+        # closed and name the stage, because ``runtime_preflight: null`` alone
+        # cannot tell a caller "not computed" apart from "nothing to report".
         is_valid = False
         # A fresh list, never an in-place append: this list object IS
         # ``authoring_payload["errors"]``, which the summary also embeds as

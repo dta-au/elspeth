@@ -53,8 +53,49 @@ class ComposerHistoryMessage(TypedDict):
 # fallback that lands a minted intent on the review path when auto-commit
 # authority is revoked at the settlement boundary (elspeth-01d4c6e683) —
 # a single source of truth so the two paths can never drift apart.
+#
+# The word "validated" is RESERVED for a green runtime-equivalent preflight
+# (elspeth-2ed41f0a4a). Both constants below once rode EVERY planner staging
+# outcome while the planner's Stage-2 slot was wired ``None`` everywhere, so
+# "validated" meant the Stage-1 authoring pass alone — a readiness claim
+# measured against the wrong validator, and on the auto-commit arm one that
+# became canonical state unreviewed. ``_stage_pipeline_plan`` now selects
+# among these four by the actual Stage-2 verdict, and only a green verdict may
+# reach the two that make the claim.
+#
+# The two non-green constants carry NO interpolated diagnostic: the findings
+# ride the structural ``ComposerResult.runtime_preflight`` field instead. That
+# keeps them bare constants rather than wrapped diagnostics, so they need no
+# ``_wrapped_diagnostic_template`` shape or trusted-suffix registration.
 PIPELINE_STAGED_AUTO_COMMIT_MESSAGE: Final[str] = "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
 PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = "I prepared and validated the requested pipeline for your review."
+# Staged over a RED Stage-2 verdict. Auto-commit is downgraded to review
+# rather than hard-failed (the Shape-14 report-don't-block posture): a human
+# still reads the proposal, and a preflight false-red must not destroy an
+# otherwise stageable plan. It must simply never commit unreviewed.
+PIPELINE_STAGED_REVIEW_FINDINGS_MESSAGE: Final[str] = (
+    "I prepared the requested pipeline and staged it for your review. Validation found issues that must be fixed before it can run."
+)
+# Staged when Stage 2 could not be measured at all — it raised, timed out, or
+# the plan carried no candidate state. Deliberately distinct from the findings
+# wording: "not confirmed runnable" is an absence of evidence, not a validator
+# objection, and collapsing the two would report a hole as a finding. Fails
+# closed — it never reads as validated and never auto-commits.
+PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
+    "I prepared the requested pipeline and staged it for your review. "
+    "ELSPETH could not complete validation, so it is not confirmed runnable."
+)
+# Staged over the pending-interpretation handoff shape. Held apart from the
+# findings wording because it is NOT a validator objection: the pipeline is
+# authoring-valid and completion-ready, and what stands between it and a run
+# is a review card only a human can resolve. Calling that "issues that must be
+# fixed" would send the operator hunting for a defect that does not exist.
+# It still blocks auto-commit — an unresolved review must not become canonical
+# state unreviewed.
+PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE: Final[str] = (
+    "I prepared the requested pipeline and staged it for your review. "
+    "It has interpretation review cards to resolve before it can run."
+)
 
 
 @dataclass(frozen=True, slots=True)

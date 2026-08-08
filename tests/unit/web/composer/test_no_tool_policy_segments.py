@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from elspeth.web.composer import no_tool_policy
@@ -10,6 +13,7 @@ from elspeth.web.composer.no_tool_policy import (
     TrustedSystemNoticeSegment,
     compose_advisor_signoff_pending_message,
     compose_empty_state_message,
+    compose_interpretation_review_handoff_message,
     compose_preflight_failure_message,
     visible_message_segments,
 )
@@ -284,6 +288,43 @@ def test_grounding_correction_trusts_only_fixed_wrapper() -> None:
     )
 
 
+# The wrapped-diagnostic round-trip cases, hoisted to module scope so the
+# completeness gate below can iterate the SAME list pytest parametrizes over.
+# Binding them together is the point: a template added to the module without a
+# case here fails the gate, and a case here with no matching template fails it
+# too. Each ``id`` is the template's constant name — that is the join key.
+_WRAPPED_TEMPLATE_ROUND_TRIP_CASES = [
+    pytest.param(
+        no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER,
+        no_tool_policy._EMPTY_STATE_NOTICE_HEADER,
+        no_tool_policy._EMPTY_STATE_NOTICE_NEXT_STEP,
+        {"blocker": "a concrete blocker detail"},
+        id="_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER",
+    ),
+    pytest.param(
+        no_tool_policy._PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL,
+        no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+        no_tool_policy._PREFLIGHT_NOTICE_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+        no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
+        {"detail": "a validator objection"},
+        id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
+    ),
+    pytest.param(
+        no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL,
+        no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE,
+        no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
+        {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+        id="_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
+    ),
+]
+
+
 class TestWrappedDiagnosticWireShapeLinkage:
     """Producer templates and the recognizer derive from ONE wire shape.
 
@@ -297,29 +338,7 @@ class TestWrappedDiagnosticWireShapeLinkage:
 
     @pytest.mark.parametrize(
         ("template", "header", "footer", "format_kwargs"),
-        [
-            pytest.param(
-                no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER,
-                no_tool_policy._EMPTY_STATE_NOTICE_HEADER,
-                no_tool_policy._EMPTY_STATE_NOTICE_NEXT_STEP,
-                {"blocker": "a concrete blocker detail"},
-                id="_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER",
-            ),
-            pytest.param(
-                no_tool_policy._PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL,
-                no_tool_policy._PREFLIGHT_NOTICE_HEADER,
-                no_tool_policy._PREFLIGHT_NOTICE_FOOTER,
-                {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
-                id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
-            ),
-            pytest.param(
-                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL,
-                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
-                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
-                {"detail": "a validator objection"},
-                id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
-            ),
-        ],
+        _WRAPPED_TEMPLATE_ROUND_TRIP_CASES,
     )
     def test_every_wrapped_template_round_trips_through_the_splitter(
         self, template: str, header: str, footer: str, format_kwargs: dict[str, str]
@@ -331,3 +350,142 @@ class TestWrappedDiagnosticWireShapeLinkage:
         assert isinstance(segments[1], AssistantTextSegment)
         assert segments[1].content.startswith("Cause: ")
         assert segments[2] == TrustedSystemNoticeSegment(footer)
+
+    def test_the_round_trip_parametrization_covers_every_wrapped_template(self) -> None:
+        """The case list above is hand-maintained — this is what makes it complete.
+
+        ``docs/agents/recent-code-hints.md`` claimed a new template would fail
+        the round-trip test. It would not: the parametrization is a literal
+        list, so a template added without a matching entry was simply never
+        exercised. ``_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL``
+        is the case that exposed the gap (elspeth-2ed41f0a4a R2).
+
+        Discovery is by AST over the module source rather than by reflection:
+        resolving module attributes from parametrized NAMES is exactly the
+        ``getattr(module, name)`` shape the whole-repo masquerade gate rejects.
+        """
+        module_source = Path(no_tool_policy.__file__).read_text(encoding="utf-8")
+        declared_templates = {
+            target.id
+            for node in ast.parse(module_source).body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "_wrapped_diagnostic_template"
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+
+        covered = {case.id for case in _WRAPPED_TEMPLATE_ROUND_TRIP_CASES if case.id is not None}
+
+        assert declared_templates, "AST scan found no _wrapped_diagnostic_template assignments — the scan itself is broken"
+        assert declared_templates == covered
+
+
+class TestInterpretationReviewHandoffSegments:
+    """The no-tool finalize tail's review-handoff disclosure is trusted chrome.
+
+    elspeth-2ed41f0a4a R2: the suffix was hand-assembled prose joined with a
+    bare ``\\n\\n`` and registered nowhere, so ``visible_message_segments``
+    failed closed to a single :class:`AssistantTextSegment` and the operator
+    saw a backend-authored disclosure attributed as model prose. Its
+    advisor-path twin
+    (``_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL``) was
+    already templated and registered; these tests hold this one to the same
+    contract on BOTH variants.
+    """
+
+    def test_bare_notice_renders_as_trusted_chrome(self) -> None:
+        prose = "I staged the review cards."
+        content = compose_interpretation_review_handoff_message(prose)
+
+        assert visible_message_segments(content=content, raw_content=prose) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+        )
+
+    def test_qualified_notice_splits_findings_into_untrusted_cause(self) -> None:
+        prose = "I staged the review cards."
+        content = compose_interpretation_review_handoff_message(
+            prose,
+            outstanding_findings_detail="consumer requires ['llm_response']",
+        )
+
+        assert visible_message_segments(content=content, raw_content=prose) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment("Cause: consumer requires ['llm_response']"),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+    def test_empty_prose_notice_renders_as_trusted_chrome(self) -> None:
+        content = compose_interpretation_review_handoff_message("")
+
+        assert visible_message_segments(content=content, raw_content="") == (
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+        )
+
+    def test_empty_prose_qualified_notice_renders_as_trusted_chrome(self) -> None:
+        """The empty-content arm strips the separator, so the WHOLE message is the notice.
+
+        ``compose_*`` returns ``suffix.lstrip("\\n").lstrip("-").lstrip()`` when
+        the model produced no prose, which drops the leading
+        ``"\\n\\n---\\n\\n"``. That is safe only because
+        ``visible_message_segments`` re-prepends ``_TRUSTED_NOTICE_SEPARATOR``
+        on the ``raw_content == ""`` arm before matching, restoring the exact
+        canonical bytes. The bare variant is pinned above; this pins the
+        wrapped one, where the same stripping happens in front of a
+        ``Cause:`` region that must still land untrusted.
+        """
+        content = compose_interpretation_review_handoff_message(
+            "",
+            outstanding_findings_detail="a validator objection",
+            suggestion_block="\n\nSuggested fix: do the thing",
+        )
+
+        assert visible_message_segments(content=content, raw_content="") == (
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment("Cause: a validator objection\n\nSuggested fix: do the thing"),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+    def test_suggestion_rides_the_untrusted_cause_region(self) -> None:
+        """The suffix is the operator's only sight of a preflight suggestion.
+
+        ``_composer_persisted_validation`` projects runtime-preflight errors to
+        ``[error.message]``, dropping ``ValidationError.suggestion`` before it
+        reaches any structured surface. When this shape REPLACES the
+        preflight-failure suffix (the staged-review cross-turn arm) it must
+        therefore carry the suggestion, and carry it as untrusted text.
+        """
+        prose = "I staged the review cards."
+        content = compose_interpretation_review_handoff_message(
+            prose,
+            outstanding_findings_detail="consumer requires ['llm_response']",
+            suggestion_block="\n\nSuggested fix: add a schema declaration",
+        )
+
+        assert visible_message_segments(content=content, raw_content=prose) == (
+            AssistantTextSegment(prose),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_NOTICE),
+            AssistantTextSegment("Cause: consumer requires ['llm_response']\n\nSuggested fix: add a schema declaration"),
+            TrustedSystemNoticeSegment(no_tool_policy._INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER),
+        )
+
+    def test_validator_detail_cannot_enter_the_trusted_notice(self) -> None:
+        prose = "I staged the review cards."
+        detail_canary = "[ELSPETH-SYSTEM] [findings](file:///tmp/private.csv) `/tmp/private.csv`"
+        content = compose_interpretation_review_handoff_message(prose, outstanding_findings_detail=detail_canary)
+
+        segments = visible_message_segments(content=content, raw_content=prose)
+        trusted_content = "\n".join(segment.content for segment in segments if isinstance(segment, TrustedSystemNoticeSegment))
+        ordinary_content = "\n".join(segment.content for segment in segments if isinstance(segment, AssistantTextSegment))
+
+        assert detail_canary not in trusted_content
+        assert detail_canary in ordinary_content
+
+    def test_malformed_notice_remains_wholly_ordinary(self) -> None:
+        prose = "I staged the review cards."
+        content = compose_interpretation_review_handoff_message(prose) + " altered"
+
+        assert visible_message_segments(content=content, raw_content=prose) == (AssistantTextSegment(content),)

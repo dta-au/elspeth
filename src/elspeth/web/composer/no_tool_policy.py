@@ -143,6 +143,43 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnost
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
 )
 
+# elspeth-2ed41f0a4a R2: the NO-TOOL finalize tail's own pending-review
+# announcement — the advisor-path notices above are its twins, reached when the
+# END advisor gate ALSO failed to clear. This one says only that review cards
+# are waiting, so it makes no advisory claim.
+#
+# It used to be hand-assembled in ``service.py`` and joined to the prose with a
+# bare ``"\n\n"``: no ``_TRUSTED_NOTICE_SEPARATOR``, no ``_TRUSTED_NOTICE_MARKER``,
+# and no entry in ``_canonical_trusted_suffix_segments``. Registration in the
+# ``_AugmentationBranch`` literal covers the PREFIX invariant only, not the
+# segment recognizer, so ``visible_message_segments`` fell through to its
+# fail-closed arm and published this backend-authored disclosure as one
+# ``AssistantTextSegment`` — model prose, in the operator's view, saying a
+# review was staged. Both variants are canonical shapes now: the bare notice as
+# fixed operator-authored prose, and the qualified variant as a wrapped
+# diagnostic whose ``Cause:`` region carries the VALIDATOR-authored objection
+# from the authoring-masked re-validation (same trust class, and the same
+# treatment, as the preflight wrapper's interpolation).
+_INTERPRETATION_REVIEW_HANDOFF_NOTICE: Final = (
+    "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
+)
+_INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _INTERPRETATION_REVIEW_HANDOFF_NOTICE
+_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER: Final = (
+    "Validation also found issues that must be fixed before this pipeline can run; "
+    "resolving the review cards alone will not make this pipeline runnable."
+)
+_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _INTERPRETATION_REVIEW_HANDOFF_NOTICE,
+    _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
+    # Same slot pair as the preflight wrapper, and for the same reason: when
+    # this shape carries a red RUNTIME PREFLIGHT (the staged-review branch's
+    # cross-turn arm) the prose is the operator's ONLY sight of the repair
+    # suggestion. ``_composer_persisted_validation`` projects preflight errors
+    # to ``[error.message]`` alone, so ``ValidationError.suggestion`` reaches
+    # no structured surface — dropping it here would discard it outright.
+    diagnostic_slots="{detail}{suggestion_block}",
+)
+
 # The check-detail counterpart of that notice. ``_advisor_signoff_blocked_wording``
 # says completion is withheld / cannot be marked complete — true on both
 # surfaces it serves, FALSE on the preserved pending handoff, whose
@@ -497,6 +534,15 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if handoff_with_findings is not None:
         return handoff_with_findings
+    if suffix == _INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_INTERPRETATION_REVIEW_HANDOFF_NOTICE),)
+    review_handoff_with_findings = _split_wrapped_diagnostic(
+        suffix,
+        header=_INTERPRETATION_REVIEW_HANDOFF_NOTICE,
+        footer=_INTERPRETATION_REVIEW_HANDOFF_FINDINGS_FOOTER,
+    )
+    if review_handoff_with_findings is not None:
+        return review_handoff_with_findings
     if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
         return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
     preflight_with_diagnostic = _split_wrapped_diagnostic(
@@ -649,6 +695,49 @@ def compose_advisor_pending_handoff_message(content: str, *, outstanding_finding
         suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
     else:
         suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL.format(detail=outstanding_findings_detail)
+    if not content:
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
+
+
+def compose_interpretation_review_handoff_message(
+    content: str,
+    *,
+    outstanding_findings_detail: str | None = None,
+    suggestion_block: str = "",
+) -> str:
+    """Build the user-facing message announcing a staged interpretation review.
+
+    The no-tool finalize tail's counterpart to
+    :func:`compose_advisor_pending_handoff_message`, and deliberately quieter:
+    the advisory review is not implicated here, so the notice claims only that
+    review cards exist and that resolving them is the next step.
+
+    ``outstanding_findings_detail`` carries the leading objection from the
+    authoring-masked re-validation (``_pending_handoff_outstanding_findings``)
+    when it found failures behind the pending review. The bare notice would
+    then imply the review cards are the only remaining step. The detail is
+    VALIDATOR-authored text, so the qualified shape renders it as an untrusted
+    ``Cause:`` segment between the trusted notice and a trusted footer rather
+    than folding it into operator-authored prose.
+
+    Callers pass the detail through ``_outstanding_findings_detail``, which
+    guards the empty-string objection that would format as ``Cause: \\n\\n`` —
+    a shape ``_split_wrapped_diagnostic`` rejects, silently demoting the whole
+    suffix to one untrusted segment.
+
+    ``suggestion_block`` is the preformatted ``"\\n\\nSuggested fix: ..."`` tail,
+    empty when there is no suggestion. It is meaningful only alongside a
+    detail, and like the detail it is validator-authored, so it stays inside
+    the untrusted region.
+    """
+    if outstanding_findings_detail is None:
+        suffix = _INTERPRETATION_REVIEW_HANDOFF_FINALIZE_SUFFIX
+    else:
+        suffix = _INTERPRETATION_REVIEW_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL.format(
+            detail=outstanding_findings_detail,
+            suggestion_block=suggestion_block,
+        )
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix

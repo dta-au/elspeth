@@ -46,6 +46,22 @@ sites against `config/cicd/masquerade_baseline.yaml`. Traps that have fired:
   masqueraders pass. Rewrite to direct access; if a test fake breaks, fix the
   FAKE to model the real contract (give it the attribute), never the
   production code to tolerate the fake.
+- Baseline entries bind a sorted `probe_shapes` fingerprint for every
+  occurrence, not only `(path, qualname, kind)` and a count. A one-for-one
+  rewrite (literal field to dynamic reflection, receiver/default change,
+  imported alias rebinding) deliberately fires `probe-shape-drift` even when
+  the key and count stay unchanged. Refresh with
+  `python -m elspeth_lints.rules.masquerade.seed_baseline`; it preserves an
+  existing classification/justification only when key, count, and shapes all
+  still match, and resets changed or genuinely new subjects to
+  `unadjudicated`. Do not hand-edit the fingerprints.
+- Probe classification resolves `builtins.getattr` / `builtins.hasattr` and
+  `inspect.getattr_static` through imports, lexical shadowing, reassignment,
+  comprehensions, possible-target control-flow joins, and deferred module
+  bindings. Abrupt-only paths do not pollute the reachable binding, but any
+  reachable builtin target is still inventoried. Aliasing a builtin is not an
+  escape hatch, and a rebound `@trust_boundary` source parameter no longer
+  receives boundary amnesty.
 
 ### 3. Trust-tier lint corpus (standing)
 
@@ -61,8 +77,28 @@ The wrapped-diagnostic producer templates and `_split_wrapped_diagnostic` in
 `src/elspeth/web/composer/no_tool_policy.py` derive from ONE
 `_wrapped_diagnostic_wire_shape` source, and a round-trip test pins every
 template. Do not hand-assemble a SEPARATOR/MARKER/header/footer suffix; add
-new templates through `_wrapped_diagnostic_template` or the round-trip test
-fails.
+new templates through `_wrapped_diagnostic_template`.
+
+Two corrections (2026-08-09, elspeth-2ed41f0a4a):
+
+- The round-trip test's case list is HAND-MAINTAINED. Until now a template
+  added without an entry was simply never exercised — the claim that it
+  "fails" was false. `test_the_round_trip_parametrization_covers_every_`
+  `wrapped_template` now AST-scans the module and fails when the list is
+  incomplete, so add your entry when you add a template.
+- Building the suffix through a template is only HALF the contract. A
+  backend-authored suffix must ALSO be registered in
+  `_canonical_trusted_suffix_segments` (with a matching
+  `_split_wrapped_diagnostic` arm). Registration in the `_AugmentationBranch`
+  literal governs the PREFIX invariant only, not the segment recognizer —
+  miss it and `visible_message_segments` fails closed to one
+  `AssistantTextSegment`, publishing your operator-facing notice as MODEL
+  PROSE. It is silent: `enforce_augmentation_prefix_invariant` still passes.
+- Corollary: exactly ONE backend suffix per message. Two concatenated
+  canonical suffixes match no recognizer arm, so stacking a second
+  announcement onto an already-augmented `ComposerResult.message` demotes
+  BOTH disclosures. Rebuild from `raw_assistant_content` and fold the other
+  fact into the single suffix's `Cause:` region instead.
 
 ### 5. Declared oracles pin OUTPUT bytes (standing)
 
@@ -79,6 +115,62 @@ what you touch, or run the full suite.
   slot; if you build a `to_dict` stand-in for hashing tests, give it
   `_content_hash_memo: str | None = None`. Do not reintroduce `getattr` here
   (that was elspeth-62a5aa4da8).
+- **2026-08-09 — advisor evidence has ONE derivation per surface**: in
+  `web/composer/service.py`, anything rendered to the advisor must also be
+  reachable by the deterministic injection pre-scan. Node control-flow fields
+  now derive from `_advisor_control_flow_fields` — `_render_node_control_flow`
+  publishes it and `_advisor_prompt_template_injection_finding` scans it. Add a
+  new control-flow field THERE, never as a fresh `if node.x is not None` branch
+  in the renderer; hand-enumerating the two consumers separately is what left
+  `trigger` rendered-but-unscanned (elspeth-eacfec09a6). Two rules that look
+  redundant but are not: the scan reads the COMPLETE value while the renderer
+  truncates (scan broader than render, pinned by a disagreement test — do not
+  "simplify" it to scan only what is rendered), and render-admission
+  (`_advisor_summary_renders_option_value`) is a SEPARATE predicate from
+  scan-shape (`_advisor_prose_shaped_option_value`) because the two consumers
+  need opposite failure directions (elspeth-c1b8b26d32). Render paths that
+  bypass the admission predicate entirely — e.g. `required_input_fields` via
+  the `[requires: ...]` segment — need their own scan arm.
+- **2026-08-09 — "validated" is reserved for a GREEN Stage-2 preflight**: the
+  planner staging announce (`protocol.PIPELINE_STAGED_*`) is now FIVE
+  constants, not two, selected in `service._stage_pipeline_plan` by the actual
+  runtime-preflight verdict over `PipelinePlanResult.candidate_state`
+  (elspeth-2ed41f0a4a). Only a green verdict may say "validated" or mint a
+  `PipelineCommitIntent`. If you add a staging surface, pick a constant by
+  verdict — do not reuse the green ones as generic staging copy.
+  - The non-green arms split on SHAPE, not on `is_valid`. A red verdict and a
+    pending-interpretation handoff are both `is_valid=False`, but only the
+    first is a validator objection; reporting a pending review card as
+    "issues that must be fixed" sends the operator hunting for a defect that
+    is not there. Use `_is_pending_interpretation_handoff`, and note its
+    blocker code is the lowercase `interpretation_review_pending` — import
+    `INTERPRETATION_REVIEW_PENDING_CODE` rather than hand-writing the string,
+    or your test fixture silently misses the arm it means to exercise.
+  - Catch ONLY `ComposerRuntimePreflightError` around
+    `_cached_runtime_preflight`. `RuntimePreflightCoordinator._capture` funnels
+    every `Exception` — timeouts included — into that single envelope, so an
+    `except TimeoutError` arm is dead code, and a test scripting a bare
+    `TimeoutError` exercises a path production cannot produce.
+    `asyncio.CancelledError` is a `BaseException`, escapes `_capture`, and must
+    keep propagating: broadening the catch turns a cancelled request into a
+    staged proposal carrying a verdict nobody waited for.
+  - The non-green arms set `raw_assistant_content=""` (the replacement shape)
+    because the `ComposerResult` field-pairing invariant requires it for any
+    failed preflight; the green arm keeps `None` or it would falsely imply
+    synthesis on a verbatim response.
+- **2026-08-09 — registered `pipeline_decision` user_terms need THREE arms**:
+  a new entry in `REGISTERED_PIPELINE_DECISION_USER_TERMS`
+  (`web/interpretation_state.py`) is not usable until it also has (a) a
+  binding arm in `validate_pipeline_decision_semantics` — a registered term
+  that falls through validates on ANY node and wedges later at the hash — and
+  (b) an arm in `pipeline_decision_artifact_hash` pinning exactly the material
+  the review adjudicates. Gates bind on `node_type == "gate"`, NOT plugin
+  (structural nodes have `plugin=None`). An exact-set test pins the closed
+  registry; doc listings render `sorted(REGISTERED_...)` dynamically — never
+  hardcode the set in prose. If the hash reads NodeSpec fields outside
+  `options`, add a to_dict/from_dict round-trip test (`fork_to` is tuple in
+  memory, list on the wire) so serializer changes cannot drift accepted
+  reviews (elspeth-c2c35e52ae).
 - **2026-08-09 — SQLAlchemy `Row`**: `.count` is the TUPLE METHOD, not a
   column. Access columns through `row._mapping` (elspeth-d5578ccd98 fallout,
   Lane B).
