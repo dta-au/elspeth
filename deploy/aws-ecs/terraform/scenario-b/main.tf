@@ -10,10 +10,10 @@ module "scenario" {
     aws.iam_lifecycle = aws.iam_lifecycle
   }
 
-  run_id               = var.run_id
-  scenario_id          = var.scenario_id
-  deployment_lifecycle = "upgrade"
-  llm_backend          = "bedrock"
+  run_id                             = var.run_id
+  scenario_id                        = var.scenario_id
+  deployment_lifecycle               = "upgrade"
+  llm_backend                        = "bedrock"
   candidate_sha                      = var.candidate_sha
   candidate_image                    = var.candidate_image
   candidate_ecr_repository           = var.candidate_ecr_repository
