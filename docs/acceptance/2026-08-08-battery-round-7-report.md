@@ -431,7 +431,13 @@ Anything not reached is listed as unsampled, never as passed.
   `elspeth-aed3b69cf0` (both clean ×3, but stochastic by nature).
 - **Do not close:** `elspeth-85f3cc3022` (split verdict),
   `elspeth-9595abb7b0` (not exercised).
-- **New, needs triage:** `elspeth-74b795208f`, `elspeth-15c72686f2` (both P1).
+- **New, needs triage:** `elspeth-74b795208f` (P1, *fixed* 2026-08-08),
+  `elspeth-15c72686f2` (P1, *in progress*), `elspeth-ac85b0ab0e` (P1,
+  demo-blocker — the `85f3cc3022` split-out), `elspeth-045ad8de9d` (P2).
+- **`elspeth-85f3cc3022` disposition:** with the residual split out, this
+  ticket now covers only the static-parity half, which round 7 **confirms**. It
+  can close on that once an operator accepts the `af62478df` evidence, with the
+  `demo-blocker` label carried forward by `elspeth-ac85b0ab0e`.
 - **Runbook fixes owed** to `elspeth-671a17d5c0`: fidelity findings **1–4**
   only. Findings 5–7 belong to `ops-local/` and the Terraform module, not the
   runbook.
@@ -442,10 +448,10 @@ The round produced more than the two P1s. These are deliberately listed rather
 than left implicit, because "two new defects" undersells what was found and a
 reader should not have to infer the rest from prose:
 
-| Finding | Where | Why not filed |
+| Finding | Where | Status |
 |---|---|---|
-| The composer terminates on a composition it has been **correctly told is invalid** | `elspeth-85f3cc3022` residual | Recommended as a **split-out**; it is a sharper defect than that ticket's original framing and should not inherit its history |
-| The `database_bootstrap` provisioner writes AWS CLI stderr into a dir its `trap … EXIT` deletes, so the failure path destroys the only evidence of the failure | `modules/scenario/database_bootstrap.tf` | **Should be filed.** Real diagnosability defect; cost this round a manual root-cause hunt |
+| The composer terminates on a composition it has been **correctly told is invalid** | `elspeth-85f3cc3022` residual | **FILED as `elspeth-ac85b0ab0e`** (P1, demo-blocker) — split out so it does not inherit `85f3cc3022`'s now-retired root cause |
+| The `database_bootstrap` provisioner writes AWS CLI stderr into a dir its `trap … EXIT` deletes, so the failure path destroys the only evidence of the failure | `modules/scenario/database_bootstrap.tf` | **FILED as `elspeth-045ad8de9d`** (P2) |
 | `on_write_failure: "discard"` does not cover the sink's own **input** contract — an input-preflight rejection fails the run rather than discarding | noted inside `elspeth-15c72686f2` | Needs a deliberate decision, not obviously a bug. Flagged in-ticket rather than filed separately |
 | Stale allowlist entry `allow_hits[159]` binds to deleted `web/composer/guided/steps.py`; the loader refuses it | `config/cicd/enforce_tier_model/web.yaml` | **Operator action** (remove + re-sign), not a code defect — the signing seam is operator-held |
 | Rounds 5 and 6 recorded a **vacuous** `elspeth-lints check: exit 0` | those two reports | Historical record correction; noted in §gates above |
