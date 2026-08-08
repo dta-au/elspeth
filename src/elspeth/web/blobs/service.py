@@ -661,6 +661,71 @@ def _acquire_blob_phase_lock(conn: Connection, session_id: str) -> None:
         acquire_session_advisory_xact_lock(conn, session_id)
 
 
+def _enforce_session_blob_quota(
+    conn: Connection,
+    session_id: str,
+    *,
+    additional_bytes: int,
+    max_storage_per_session: int,
+    exclude_blob_id: str | None = None,
+) -> None:
+    """Raise ``BlobQuotaExceededError`` if adding bytes would exceed the session ceiling.
+
+    Runs against the caller's connection inside the caller's transaction and
+    quota lock; it owns no locking or commit protocol of its own.
+    """
+    query = select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
+    if exclude_blob_id is not None:
+        query = query.where(blobs_table.c.id != exclude_blob_id)
+    current_total = conn.execute(query).scalar()
+    # COALESCE guarantees an exact int; bool/subclasses or any other type
+    # are Tier 1 anomalies. Explicit raise so the guard survives python -O.
+    if type(current_total) is not int:
+        raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
+    if current_total + additional_bytes > max_storage_per_session:
+        raise BlobQuotaExceededError(
+            session_id,
+            current_bytes=current_total,
+            limit_bytes=max_storage_per_session,
+        )
+
+
+def _insert_pending_blob_row(
+    conn: Connection,
+    *,
+    blob_id: str,
+    storage: Path,
+    expected: _ExpectedBlobFields,
+) -> None:
+    """Insert the pending custody row shared by the committed and inline-custody paths.
+
+    Runs against the caller's connection; any duplicate-id race handling
+    (``begin_nested`` / ``IntegrityError``) belongs to the caller.
+    """
+    conn.execute(
+        blobs_table.insert().values(
+            id=blob_id,
+            session_id=expected["session_id"],
+            filename=expected["filename"],
+            mime_type=expected["mime_type"],
+            size_bytes=expected["size_bytes"],
+            content_hash=expected["content_hash"],
+            storage_path=str(storage),
+            created_at=datetime.now(UTC),
+            created_by=expected["created_by"],
+            source_description=expected["source_description"],
+            status="pending",
+            creation_modality=expected["creation_modality"].value,
+            created_from_message_id=expected["created_from_message_id"],
+            creating_model_identifier=expected["creating_model_identifier"],
+            creating_model_version=expected["creating_model_version"],
+            creating_provider=expected["creating_provider"],
+            creating_composer_skill_hash=expected["creating_composer_skill_hash"],
+            creating_arguments_hash=expected["creating_arguments_hash"],
+        )
+    )
+
+
 def _reserve_pending_blob(
     *,
     engine: Engine,
@@ -685,41 +750,15 @@ def _reserve_pending_blob(
         )
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
         if row is None:
-            current_total = conn.execute(
-                select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
-            ).scalar()
-            if type(current_total) is not int:
-                raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
-            if current_total + expected["size_bytes"] > max_storage_per_session:
-                raise BlobQuotaExceededError(
-                    session_id,
-                    current_bytes=current_total,
-                    limit_bytes=max_storage_per_session,
-                )
+            _enforce_session_blob_quota(
+                conn,
+                session_id,
+                additional_bytes=expected["size_bytes"],
+                max_storage_per_session=max_storage_per_session,
+            )
             try:
                 with conn.begin_nested():
-                    conn.execute(
-                        blobs_table.insert().values(
-                            id=blob_id,
-                            session_id=session_id,
-                            filename=expected["filename"],
-                            mime_type=expected["mime_type"],
-                            size_bytes=expected["size_bytes"],
-                            content_hash=expected["content_hash"],
-                            storage_path=str(storage),
-                            created_at=datetime.now(UTC),
-                            created_by=expected["created_by"],
-                            source_description=expected["source_description"],
-                            status="pending",
-                            creation_modality=expected["creation_modality"].value,
-                            created_from_message_id=expected["created_from_message_id"],
-                            creating_model_identifier=expected["creating_model_identifier"],
-                            creating_model_version=expected["creating_model_version"],
-                            creating_provider=expected["creating_provider"],
-                            creating_composer_skill_hash=expected["creating_composer_skill_hash"],
-                            creating_arguments_hash=expected["creating_arguments_hash"],
-                        )
-                    )
+                    _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
             except IntegrityError as exc:
                 row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
                 if row is None:
@@ -1009,39 +1048,13 @@ def persist_inline_custody_blob_on_connection(
     )
     row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).first()
     if row is None:
-        current_total = conn.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == session_id)
-        ).scalar()
-        if type(current_total) is not int:
-            raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
-        if current_total + expected["size_bytes"] > max_storage_per_session:
-            raise BlobQuotaExceededError(
-                session_id,
-                current_bytes=current_total,
-                limit_bytes=max_storage_per_session,
-            )
-        conn.execute(
-            blobs_table.insert().values(
-                id=blob_id,
-                session_id=session_id,
-                filename=expected["filename"],
-                mime_type=expected["mime_type"],
-                size_bytes=expected["size_bytes"],
-                content_hash=expected["content_hash"],
-                storage_path=str(storage),
-                created_at=datetime.now(UTC),
-                created_by=expected["created_by"],
-                source_description=expected["source_description"],
-                status="pending",
-                creation_modality=expected["creation_modality"].value,
-                created_from_message_id=expected["created_from_message_id"],
-                creating_model_identifier=expected["creating_model_identifier"],
-                creating_model_version=expected["creating_model_version"],
-                creating_provider=expected["creating_provider"],
-                creating_composer_skill_hash=expected["creating_composer_skill_hash"],
-                creating_arguments_hash=expected["creating_arguments_hash"],
-            )
+        _enforce_session_blob_quota(
+            conn,
+            session_id,
+            additional_bytes=expected["size_bytes"],
+            max_storage_per_session=max_storage_per_session,
         )
+        _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
     _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
     _write_or_validate_reserved_blob(
@@ -1403,22 +1416,13 @@ class BlobServiceImpl:
         if status != "ready" or size_bytes is None or size_bytes <= 0:
             return
         _lock_session_for_blob_quota(conn, session_id_str)
-        current_total = conn.execute(
-            select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(
-                blobs_table.c.session_id == session_id_str,
-                blobs_table.c.id != blob_id_str,
-            )
-        ).scalar()
-        # COALESCE guarantees an exact int; bool/subclasses or any other type
-        # are Tier 1 anomalies. Explicit raise so the guard survives python -O.
-        if type(current_total) is not int:
-            raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current_total).__name__}, expected int")
-        if current_total + size_bytes > self._max_storage_per_session:
-            raise BlobQuotaExceededError(
-                session_id_str,
-                current_bytes=current_total,
-                limit_bytes=self._max_storage_per_session,
-            )
+        _enforce_session_blob_quota(
+            conn,
+            session_id_str,
+            additional_bytes=size_bytes,
+            max_storage_per_session=self._max_storage_per_session,
+            exclude_blob_id=blob_id_str,
+        )
 
     async def create_blob(
         self,
@@ -2271,17 +2275,16 @@ class BlobServiceImpl:
                         raise AuditIntegrityError(f"frozen fork source blob {entry.source_blob_id} changed status, hash, size, or custody")
                     source_records.append(self._row_to_record(row))
 
-                current = conn.execute(
-                    select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == target_session_id_str)
-                ).scalar()
-                if type(current) is not int:
-                    raise AuditIntegrityError(f"Tier 1: COALESCE(SUM) returned {type(current).__name__}, expected int")
                 missing_bytes = sum(entry.size_bytes for entry in plan if str(entry.target_blob_id) not in target_ids)
-                if missing_bytes > 0 and current + missing_bytes > self._max_storage_per_session:
-                    raise BlobQuotaExceededError(
+                # A plan that adds no new bytes deliberately skips the quota
+                # check: an already-materialized child stays valid even if the
+                # ceiling was lowered beneath its existing usage.
+                if missing_bytes > 0:
+                    _enforce_session_blob_quota(
+                        conn,
                         target_session_id_str,
-                        current_bytes=current,
-                        limit_bytes=self._max_storage_per_session,
+                        additional_bytes=missing_bytes,
+                        max_storage_per_session=self._max_storage_per_session,
                     )
                 return tuple(source_records)
 
