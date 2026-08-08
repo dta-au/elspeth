@@ -641,3 +641,83 @@ def test_create_hashes_and_seals_the_same_validated_mapping_snapshot() -> None:
 
     assert proposal.draft_hash == baseline.draft_hash
     assert deep_thaw(proposal.pipeline) == {"value": "safe"}
+
+
+class TestCompositionContentHashMemo:
+    """``composition_content_hash`` memoizes on the frozen instance (elspeth-ac85b0ab0e review).
+
+    Preflight identity keys rebuild the hash several times per composer turn;
+    without the memo each rebuild re-serializes the whole state via
+    ``to_dict``. The memo must never survive onto a modified copy — every
+    mutation constructor re-runs ``__init__``, which resets the slot.
+    """
+
+    @staticmethod
+    def _state():
+        from elspeth.web.composer.state import (
+            CompositionState,
+            OutputSpec,
+            PipelineMetadata,
+            SourceSpec,
+        )
+
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="main",
+                    plugin="csv",
+                    options={"path": "out.csv"},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_repeat_calls_serialize_once(self, monkeypatch) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+        from elspeth.web.composer.state import CompositionState
+
+        state = self._state()
+        calls = 0
+        real_to_dict = CompositionState.to_dict
+
+        def counting_to_dict(instance):
+            nonlocal calls
+            calls += 1
+            return real_to_dict(instance)
+
+        monkeypatch.setattr(CompositionState, "to_dict", counting_to_dict)
+        first = composition_content_hash(state)
+        second = composition_content_hash(state)
+        assert first == second
+        assert calls == 1
+
+    def test_mutated_copy_recomputes_and_differs(self) -> None:
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        state = self._state()
+        baseline = composition_content_hash(state)
+        renamed = state.with_metadata({"name": "renamed"})
+        assert composition_content_hash(renamed) != baseline
+
+    def test_version_only_copy_recomputes_to_the_same_content_hash(self) -> None:
+        """Version is excluded from content identity; the memo must not leak
+        a stale slot through ``replace`` either way."""
+        from dataclasses import replace
+
+        from elspeth.web.composer.pipeline_proposal import composition_content_hash
+
+        state = self._state()
+        baseline = composition_content_hash(state)
+        bumped = replace(state, version=state.version + 1)
+        assert bumped._content_hash_memo is None
+        assert composition_content_hash(bumped) == baseline

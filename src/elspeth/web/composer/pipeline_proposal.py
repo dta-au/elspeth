@@ -12,6 +12,7 @@ both would allow two different integrity meanings to share one draft concept.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -598,9 +599,19 @@ def composition_content_hash(state: CompositionState) -> str:
 
     Non-row-union content retains the historical preimage. Row-union branches
     use the Composer authority projection so authored order remains bound.
+
+    Memoized on the instance's ``_content_hash_memo`` slot: ``state`` is
+    frozen (content identity cannot change) and every mutation constructor
+    resets the slot via ``__init__``, so repeated key builds within a composer
+    turn collapse to an attribute read instead of a full ``to_dict``
+    serialization. The write is idempotent, so a concurrent duplicate compute
+    is merely wasted work, never a wrong answer.
     """
+    memo: str | None = getattr(state, "_content_hash_memo", None)
+    if memo is not None:
+        return memo
     state_d = state.to_dict()
-    return composer_authority_hash(
+    content_hash = composer_authority_hash(
         {
             "sources": state_d["sources"],
             "nodes": state_d["nodes"],
@@ -609,3 +620,8 @@ def composition_content_hash(state: CompositionState) -> str:
             "metadata": state_d["metadata"],
         }
     )
+    # Duck-typed stand-ins (test fakes) without the memo slot simply skip
+    # memoization; the hash itself is unaffected.
+    with contextlib.suppress(AttributeError):
+        object.__setattr__(state, "_content_hash_memo", content_hash)
+    return content_hash

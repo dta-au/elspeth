@@ -909,7 +909,13 @@ def _outstanding_findings_detail(outstanding_findings: ValidationResult | None) 
     if outstanding_findings is None:
         return None
     objection = _first_validation_objection(outstanding_findings)
-    return objection if objection is not None else "run validation for details."
+    # Truthiness, not ``is not None``: validator messages and check details are
+    # plain strings with no minimum length, and an empty-string objection would
+    # format the wrapped notice as ``Cause: \n\n`` — a shape
+    # ``_split_wrapped_diagnostic`` rejects (empty diagnostic), demoting the
+    # whole trusted suffix to one untrusted segment. Mirrors the ``if detail:``
+    # gate in ``compose_preflight_failure_message``.
+    return objection if objection else "run validation for details."
 
 
 def _append_interpretation_review_handoff_message(
@@ -1141,6 +1147,12 @@ class _ProofRepairOutcome:
 # return a non-runnable result — preventing both indefinite spin and fail-open
 # finalization when a model refuses to apply the suggested repair.
 _MAX_REPAIR_TURNS: Final[int] = 2
+# Bound on the cross-turn repair ledger (elspeth-ac85b0ab0e review): entries
+# record broken-state identities whose cross-turn repair campaign already ran,
+# so later prose-only turns over the same unchanged broken state finalize with
+# the honest red suffix instead of re-injecting hidden repair turns on every
+# message. Evicted FIFO; an evicted entry merely re-allows one repair campaign.
+_CROSS_TURN_REPAIR_LEDGER_MAX: Final[int] = 512
 _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
 _TRAINED_OPERATOR_COMPOSITION_ROOT = object()
 
@@ -1690,6 +1702,12 @@ class ComposerServiceImpl:
         self._advisor_provider = advisor_provider
         self._runtime_preflight_timeout_seconds = settings.composer_runtime_preflight_timeout_seconds
         self._runtime_preflight_coordinator = runtime_preflight_coordinator or RuntimePreflightCoordinator()
+        # Cross-turn repair ledger: broken-state identities (user scope +
+        # preflight key) whose cross-turn repair campaign has already been
+        # injected. Process-local and best-effort by design — suppression is a
+        # cost/UX bound, not a correctness gate; the finalize suffix stays
+        # honest either way. See ``_attempt_preflight_repair``.
+        self._cross_turn_repair_ledger: dict[tuple[str, RuntimePreflightKey], None] = {}
         self._availability = self._compute_availability()
         from elspeth.web.composer.redaction_telemetry import OtelRedactionTelemetry
         from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -2249,6 +2267,32 @@ class ComposerServiceImpl:
             llm_calls=llm_calls,
         ) from failure.original_exc
 
+    def _runtime_preflight_key(
+        self,
+        state: CompositionState,
+        *,
+        session_scope: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+        interpretation_tolerant: bool = False,
+    ) -> RuntimePreflightKey:
+        """Build the canonical preflight identity key for ``state``.
+
+        Single source for both the per-compose-call result cache and the
+        cross-turn repair ledger, so "same broken state" means the same thing
+        to both consumers: content identity plus the settings/plugin context
+        the preflight actually ran under.
+        """
+        settings_hash = runtime_preflight_settings_hash(self._settings)
+        if plugin_snapshot is not None:
+            settings_hash = f"{settings_hash}:{plugin_snapshot.snapshot_hash}"
+        return RuntimePreflightKey(
+            session_scope=session_scope,
+            state_version=state.version,
+            state_content_hash=composition_content_hash(state),
+            settings_hash=settings_hash,
+            interpretation_tolerant=interpretation_tolerant,
+        )
+
     async def _cached_runtime_preflight(
         self,
         state: CompositionState,
@@ -2261,15 +2305,12 @@ class ComposerServiceImpl:
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         interpretation_tolerant: bool = False,
+        deadline: float | None = None,
     ) -> ValidationResult:
-        settings_hash = runtime_preflight_settings_hash(self._settings)
-        if plugin_snapshot is not None:
-            settings_hash = f"{settings_hash}:{plugin_snapshot.snapshot_hash}"
-        key = RuntimePreflightKey(
+        key = self._runtime_preflight_key(
+            state,
             session_scope=session_scope,
-            state_version=state.version,
-            state_content_hash=composition_content_hash(state),
-            settings_hash=settings_hash,
+            plugin_snapshot=plugin_snapshot,
             interpretation_tolerant=interpretation_tolerant,
         )
         # A cache miss is the normal, expected state on the first preflight for
@@ -2293,9 +2334,17 @@ class ComposerServiceImpl:
                 else self._runtime_preflight
             )
             args = (state, user_id, session_id) if plugin_snapshot is None else (state, user_id, session_id, plugin_snapshot)
+            # ``deadline`` (event-loop clock, elspeth-ac85b0ab0e review) caps
+            # the worker timeout at the compose budget's remaining share so a
+            # last-chance turn cannot overrun its deadline by a full preflight
+            # timeout; expiry surfaces as the same TimeoutError -> cached
+            # RuntimePreflightFailure envelope a configured timeout produces.
+            timeout = self._runtime_preflight_timeout_seconds
+            if deadline is not None:
+                timeout = max(0.0, min(timeout, deadline - asyncio.get_running_loop().time()))
             return await asyncio.wait_for(
                 run_sync_in_worker(preflight, *args),
-                timeout=self._runtime_preflight_timeout_seconds,
+                timeout=timeout,
             )
 
         entry = await self._runtime_preflight_coordinator.run(key, worker)
@@ -2337,6 +2386,7 @@ class ComposerServiceImpl:
         session_scope: str,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        deadline: float | None = None,
     ) -> ValidationResult | None:
         """Verify a pending-review handoff before it is announced (elspeth-5a372d3267).
 
@@ -2368,18 +2418,22 @@ class ComposerServiceImpl:
             llm_calls=llm_calls,
             plugin_snapshot=plugin_snapshot,
             interpretation_tolerant=True,
+            deadline=deadline,
         )
+        # A pure handoff is confirmed by ``tolerant.is_valid`` — never by the
+        # tolerant result being handoff-shaped. Under
+        # ``allow_pending_placeholders=True`` the ``review_interpretations``
+        # stage materializes via ``materialize_state_for_authoring``, which
+        # returns a ``CompositionState`` unconditionally (it never returns
+        # ``InterpretationReviewPending``), so the
+        # ``INTERPRETATION_REVIEW_PENDING`` blocker — emitted only by that
+        # stage's pending branch — cannot appear in a tolerant result. Every
+        # pending-review site, including requirement-style ones such as an
+        # auto-staged llm_prompt_template review, is masked by that
+        # materialization; if this invariant is ever broken upstream, an
+        # invalid tolerant result here is still reported as outstanding
+        # findings rather than silently confirming the handoff.
         if tolerant.is_valid:
-            return None
-        if _is_pending_interpretation_handoff(tolerant):
-            # The authoring-masked pass masks placeholder-token sites, but
-            # requirement-style sites (e.g. an auto-staged llm_prompt_template
-            # review) legitimately survive it, so the tolerant result can
-            # itself be handoff-shaped. That result names only the pending
-            # review — it CONFIRMS the handoff claim rather than falsifying
-            # it, and reporting it as "outstanding findings" would point the
-            # repair loop and the announce surfaces at a blocker only the
-            # user can resolve (elspeth-ac85b0ab0e).
             return None
         return tolerant
 
@@ -2585,17 +2639,56 @@ class ComposerServiceImpl:
     ) -> ValidationResult | None:
         """This turn's deterministic runtime preflight, or ``None``.
 
-        Single source of the "reuse ``last_runtime_preflight``; recompute via
+        The "reuse ``last_runtime_preflight``; recompute via
         ``_cached_runtime_preflight`` only when the state mutated this turn"
-        rule, so every gate that consults the preflight observes the SAME
-        result. The per-turn cache (keyed on ``state.version``) makes repeated
-        calls within one turn free.
+        rule lives in :meth:`_reuse_or_recompute_runtime_preflight`, so every
+        gate that consults the preflight observes the SAME result. The
+        per-turn cache (keyed on ``state.version``) makes repeated calls
+        within one turn free.
 
         Returns ``None`` for a structurally empty pipeline (nothing to
         validate — the empty-state finalize branch owns that) and when no prior
         result exists for an unmutated state whose own Stage-1 record is
         clean. May raise ``ComposerRuntimePreflightError`` exactly as the
         finalize path does; every caller sits under the same shared handler.
+
+        Delegates the reuse/recompute/cross-turn rule itself to
+        :meth:`_reuse_or_recompute_runtime_preflight`; this wrapper adds only
+        the structurally-empty guard the repair and advisor gates want.
+        """
+        if _state_is_structurally_empty(state):
+            return None
+        return await self._reuse_or_recompute_runtime_preflight(
+            state=state,
+            user_id=user_id,
+            session_id=session_id,
+            last_runtime_preflight=last_runtime_preflight,
+            runtime_preflight_cache=runtime_preflight_cache,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            llm_calls=recorder.llm_calls,
+            plugin_snapshot=plugin_snapshot,
+        )
+
+    async def _reuse_or_recompute_runtime_preflight(
+        self,
+        *,
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str | None,
+        last_runtime_preflight: ValidationResult | None,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        llm_calls: tuple[ComposerLLMCall, ...],
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
+    ) -> ValidationResult | None:
+        """The ONE reuse/recompute/cross-turn preflight rule, shared verbatim.
+
+        Both consumers — :meth:`_turn_runtime_preflight` (repair and advisor
+        gates) and ``no_tool_finalize.finalize_no_tool_response`` — call THIS
+        method, so the gates and the eventual finalize observe the SAME
+        verdict by construction rather than by comment-enforced duplication.
 
         Cross-turn arm (elspeth-ac85b0ab0e): an unmutated state with no
         preview this turn used to return ``None`` — "unknown" — even when the
@@ -2611,9 +2704,14 @@ class ComposerServiceImpl:
         different question than the one this arm asks. A Stage-1-invisible
         runtime-only defect on an unmutated state remains ``None`` — it was
         surfaced on its mutation turn, where the preflight ran.
+
+        Recurrence bound: this arm re-fires on EVERY later prose-only turn
+        while a wired state stays broken — the verdict must stay fresh
+        (external facts such as an uploaded blob can change it), so the
+        dry-run is repaid per turn, but the repair-injection recurrence it
+        used to trigger is bounded by the cross-turn repair ledger in
+        :meth:`_attempt_preflight_repair`.
         """
-        if _state_is_structurally_empty(state):
-            return None
         if state.version > initial_version:
             return await self._cached_runtime_preflight(
                 state,
@@ -2622,7 +2720,7 @@ class ComposerServiceImpl:
                 cache=runtime_preflight_cache,
                 initial_version=initial_version,
                 session_scope=session_scope,
-                llm_calls=recorder.llm_calls,
+                llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
         if last_runtime_preflight is not None:
@@ -2635,7 +2733,7 @@ class ComposerServiceImpl:
                 cache=runtime_preflight_cache,
                 initial_version=initial_version,
                 session_scope=session_scope,
-                llm_calls=recorder.llm_calls,
+                llm_calls=llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
         return None
@@ -2670,9 +2768,12 @@ class ComposerServiceImpl:
         Returns True when a repair message was injected (the loop should
         ``continue``). Returns False when: the budget is exhausted; the state
         is structurally empty (nothing to fix — the empty-state finalize branch
-        owns that); the preflight is valid; or the failure is a VERIFIED
+        owns that); the preflight is valid; the failure is a VERIFIED
         pending interpretation handoff (owned by the interpretation/orphan
-        path).
+        path); or the cross-turn repair ledger already claimed this
+        broken-state identity on an earlier compose call (one repair campaign
+        per broken state — later prose-only turns surface the red suffix
+        without hidden repair turns).
 
         A handoff-shaped preflight is a truncated-ledger claim: the strict
         pass halts at ``review_interpretations`` before the graph/schema
@@ -2735,6 +2836,33 @@ class ComposerServiceImpl:
                 # remains, and only the user can resolve it.
                 return False
             runtime_result = outstanding_findings
+
+        if state.version == initial_version:
+            # Cross-turn repair ledger (bounding the cross-turn arm's
+            # recurrence axis): an unmutated turn reaching this point means a
+            # state made invalid on a PRIOR turn is still broken. Without the
+            # ledger, EVERY later prose-only message over that state would
+            # re-inject a full repair campaign — hidden model turns with
+            # mutation pressure the user never asked for. One campaign per
+            # broken-state identity: the first unmutated turn claims the key
+            # and repairs; later unmutated turns fall through to the finalize
+            # path, whose cross-turn arm still surfaces the honest red suffix.
+            # ``repair_turns_used > 0`` means THIS compose call already
+            # claimed the key on its first repair turn, so the in-call budget
+            # proceeds normally. Mutated-this-turn repairs
+            # (``state.version > initial_version``) are model-caused and stay
+            # unledgered. If the state is later broken again in an identical
+            # way (same content hash), the claimed key suppresses a second
+            # campaign — accepted: the red suffix still names the objection.
+            ledger_key = (
+                user_id or "",
+                self._runtime_preflight_key(state, session_scope=session_scope, plugin_snapshot=plugin_snapshot),
+            )
+            if repair_turns_used == 0 and ledger_key in self._cross_turn_repair_ledger:
+                return False
+            self._cross_turn_repair_ledger[ledger_key] = None
+            while len(self._cross_turn_repair_ledger) > _CROSS_TURN_REPAIR_LEDGER_MAX:
+                del self._cross_turn_repair_ledger[next(iter(self._cross_turn_repair_ledger))]
 
         llm_messages.append(
             {
@@ -4991,7 +5119,12 @@ class ComposerServiceImpl:
         runtime_preflight_cache: _RuntimePreflightCache,
         initial_version: int,
         session_scope: str,
-        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        # REQUIRED (no default): a ``None`` snapshot is not inert — the cache
+        # key omits the snapshot hash and the preflight rebuilds availability
+        # from ``user_id`` — so an omitting caller would silently pay a second
+        # preflight under a diverging plugin view. Both production sites hold
+        # a real snapshot; a caller without one must say ``None`` explicitly.
+        plugin_snapshot: PluginAvailabilitySnapshot | None,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
@@ -5074,24 +5207,6 @@ class ComposerServiceImpl:
         # with no sign-off at all.
         terminal_block = (verdict.blocking or not verdict.ok) and (is_last_pass or not allow_repair_continue)
         if terminal_block:
-            # elspeth-ac85b0ab0e: a handoff-shaped preflight is a truncated-
-            # ledger claim (the strict pass halts at review_interpretations),
-            # so before the blocked terminal PRESERVES that shape and tells
-            # the user to resolve the review cards, verify it — the masked
-            # re-validation surfaces any failures in the stages the strict
-            # ledger never reached, and the blocked notice must name them.
-            outstanding_findings: ValidationResult | None = None
-            if runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
-                outstanding_findings = await self._pending_handoff_outstanding_findings(
-                    state,
-                    user_id=user_id,
-                    session_id=session_id,
-                    cache=runtime_preflight_cache,
-                    initial_version=initial_version,
-                    session_scope=session_scope,
-                    llm_calls=recorder.llm_calls,
-                    plugin_snapshot=plugin_snapshot,
-                )
             orphan_result = await self._surface_pt_and_gate_orphans_or_none(
                 state=state,
                 session_id=session_id,
@@ -5111,6 +5226,39 @@ class ComposerServiceImpl:
                     ),
                     advisor_passes_delta=passes_delta,
                     advisor_review_state=review_state,
+                )
+            # elspeth-ac85b0ab0e: a handoff-shaped preflight is a truncated-
+            # ledger claim (the strict pass halts at review_interpretations),
+            # so before the blocked terminal PRESERVES that shape and tells
+            # the user to resolve the review cards, verify it — the masked
+            # re-validation surfaces any failures in the stages the strict
+            # ledger never reached, and the blocked notice must name them.
+            # Computed AFTER the orphan early-return above, which never reads
+            # it — verifying first would pay a full masked preflight only to
+            # discard it. ``_pending_handoff_outstanding_findings`` may raise
+            # ``ComposerRuntimePreflightError`` if the tolerant pass itself
+            # breaks; that propagates as the same preflight-infrastructure
+            # failure envelope the strict pass uses — an explicit failure is
+            # preferred over announcing a handoff this gate could not verify.
+            outstanding_findings: ValidationResult | None = None
+            if runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+                if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0:
+                    # The shared compose budget expired before the masked
+                    # re-validation could run — signal the phase owner (both
+                    # call sites map this to the convergence-timeout
+                    # envelope) instead of starting an engine dry-run the
+                    # deadline can no longer cover.
+                    raise _AdvisorCheckpointComposeDeadlineExpired
+                outstanding_findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                    deadline=deadline,
                 )
             # elspeth-2306940c70: the blocked result below withholds the
             # model's prose (raw_assistant_content=""), so this turn replays
@@ -6707,9 +6855,17 @@ class ComposerServiceImpl:
         persisted_assistant_message_id: str | None,
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
-        outstanding_findings: ValidationResult | None = None,
+        outstanding_findings: ValidationResult | None,
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
+
+        ``outstanding_findings`` is REQUIRED (no default): ``None`` here means
+        "verified pure handoff", and a defaulted parameter would let a future
+        terminal builder omit the verification entirely yet be indistinguishable
+        from one that ran it — re-emitting the bare review-only notice over a
+        state whose masked re-validation would have named a violation (the g03
+        defect, elspeth-ac85b0ab0e). Callers that did not verify must say so
+        explicitly.
 
         ``reason`` is ``"unavailable"`` (transport outage after bounded retry),
         ``"malformed"`` (the advisor was reachable but returned no usable

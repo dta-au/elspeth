@@ -40,28 +40,51 @@ _COMPOSER_AUDIT_INTEGRITY_VIOLATION_COUNTER = metrics.get_meter(__name__).create
 _TRUSTED_NOTICE_SEPARATOR: Final = "\n\n---\n\n"
 _TRUSTED_NOTICE_MARKER: Final = "[ELSPETH-SYSTEM] "
 
+
+def _wrapped_diagnostic_wire_shape(header: str, footer: str) -> tuple[str, str]:
+    """Single source of the trusted wrapped-diagnostic wire shape.
+
+    Returns the exact ``(prefix, postfix)`` pair that brackets the untrusted
+    diagnostic. Every producer template below and the recognizer
+    (``_split_wrapped_diagnostic``) derive from this one function, so a
+    producer can never emit a wrapped notice whose byte shape the recognizer
+    re-derives differently — that drift would demote the entire trusted
+    suffix to a single untrusted segment (fail-closed, but invisibly).
+    """
+    return (
+        _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + header + "\n\nCause: ",
+        "\n\n" + footer,
+    )
+
+
+def _wrapped_diagnostic_template(header: str, footer: str, *, diagnostic_slots: str = "{detail}") -> str:
+    """Producer-side ``str.format`` template for one wrapped-diagnostic shape.
+
+    ``diagnostic_slots`` is the format-slot text occupying the untrusted
+    diagnostic region between the trusted prefix and postfix.
+    """
+    prefix, postfix = _wrapped_diagnostic_wire_shape(header, footer)
+    return prefix + diagnostic_slots + postfix
+
+
 _EMPTY_STATE_NOTICE_HEADER: Final = "The pipeline is still empty — the composer did not complete a valid build this turn."
 _EMPTY_STATE_NOTICE_NEXT_STEP: Final = (
     "To continue: refine your request with more specifics, or reply telling the composer to retry with the plan it described above."
 )
 _EMPTY_STATE_NOTICE_BODY: Final = f"{_EMPTY_STATE_NOTICE_HEADER} {_EMPTY_STATE_NOTICE_NEXT_STEP}"
 _EMPTY_STATE_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _EMPTY_STATE_NOTICE_BODY
-_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = (
-    _TRUSTED_NOTICE_SEPARATOR
-    + _TRUSTED_NOTICE_MARKER
-    + _EMPTY_STATE_NOTICE_HEADER
-    + "\n\nCause: {blocker}\n\n"
-    + _EMPTY_STATE_NOTICE_NEXT_STEP
+_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER = _wrapped_diagnostic_template(
+    _EMPTY_STATE_NOTICE_HEADER,
+    _EMPTY_STATE_NOTICE_NEXT_STEP,
+    diagnostic_slots="{blocker}",
 )
 
 _PREFLIGHT_NOTICE_HEADER: Final = "Runtime preflight failed before this build could be marked complete."
 _PREFLIGHT_NOTICE_FOOTER: Final = "The composer's analysis above is preserved verbatim; the validator's objection is recorded here."
-_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = (
-    _TRUSTED_NOTICE_SEPARATOR
-    + _TRUSTED_NOTICE_MARKER
-    + _PREFLIGHT_NOTICE_HEADER
-    + "\n\nCause: {detail}{suggestion_block}\n\n"
-    + _PREFLIGHT_NOTICE_FOOTER
+_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _PREFLIGHT_NOTICE_HEADER,
+    _PREFLIGHT_NOTICE_FOOTER,
+    diagnostic_slots="{detail}{suggestion_block}",
 )
 _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
@@ -109,18 +132,15 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = (
 # (elspeth-5a372d3267) finds failures behind the handoff, this wrapped shape
 # names them: the fixed handoff notice as trusted header, the validator's
 # objection as an untrusted ``Cause:`` segment, and a fixed footer stating
-# the review alone will not make the pipeline runnable. Mirrors the
-# ``_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL`` wrapper so
-# ``_split_wrapped_diagnostic`` recognises it without a new splitter.
+# the review alone will not make the pipeline runnable. Built from the same
+# ``_wrapped_diagnostic_wire_shape`` that ``_split_wrapped_diagnostic``
+# consumes, so the recognizer accepts it by construction.
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER: Final = (
     "Resolving the review cards alone will not make this pipeline runnable — fix the validation failure above as well."
 )
-_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = (
-    _TRUSTED_NOTICE_SEPARATOR
-    + _TRUSTED_NOTICE_MARKER
-    + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
-    + "\n\nCause: {detail}\n\n"
-    + _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = _wrapped_diagnostic_template(
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
 )
 
 # The check-detail counterpart of that notice. ``_advisor_signoff_blocked_wording``
@@ -426,8 +446,7 @@ def _split_wrapped_diagnostic(
     footer: str,
 ) -> tuple[VisibleMessageSegment, ...] | None:
     """Split one exact fixed-wrapper shape without trusting its diagnostic."""
-    prefix = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + header + "\n\nCause: "
-    postfix = "\n\n" + footer
+    prefix, postfix = _wrapped_diagnostic_wire_shape(header, footer)
     if not suffix.startswith(prefix) or not suffix.endswith(postfix):
         return None
     diagnostic = suffix[len(prefix) : -len(postfix)]

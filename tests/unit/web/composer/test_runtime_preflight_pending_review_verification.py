@@ -464,3 +464,213 @@ class TestPendingHandoffOutstandingFindings:
         assert strict is not tolerant
         assert any(blocker.code == INTERPRETATION_REVIEW_PENDING_CODE for blocker in strict.readiness.blockers)
         assert all(blocker.code != INTERPRETATION_REVIEW_PENDING_CODE for blocker in tolerant.readiness.blockers)
+
+
+class TestOutstandingFindingsDetail:
+    """The objection-or-fallback rule must gate on truthiness, not ``is not None``.
+
+    Validator messages and check details are plain strings with no minimum
+    length; an empty-string objection formatted into the wrapped notice
+    produces ``Cause: \\n\\n`` — a shape ``_split_wrapped_diagnostic`` rejects,
+    demoting the entire trusted suffix to one untrusted segment.
+    """
+
+    def test_none_findings_mean_pure_handoff(self) -> None:
+        assert service_module._outstanding_findings_detail(None) is None
+
+    def test_leading_objection_passes_through(self) -> None:
+        detail = service_module._outstanding_findings_detail(_structural_failure_result())
+        assert detail == "consumer requires ['llm_response'], producer guarantees (none - dynamic schema)"
+
+    def test_empty_string_error_message_falls_back(self) -> None:
+        from elspeth.web.execution.schemas import ValidationError
+
+        result = _structural_failure_result().model_copy(
+            update={
+                "errors": [
+                    ValidationError(
+                        component_id="mapper",
+                        component_type="transform",
+                        message="",
+                        suggestion=None,
+                        error_code="graph_structure",
+                    )
+                ]
+            }
+        )
+        assert service_module._outstanding_findings_detail(result) == "run validation for details."
+
+    def test_empty_string_check_detail_falls_back(self) -> None:
+        result = _structural_failure_result().model_copy(
+            update={
+                "errors": [],
+                "checks": [ValidationCheck(name="graph_structure", passed=False, detail="", affected_nodes=(), outcome_code=None)],
+            }
+        )
+        assert service_module._outstanding_findings_detail(result) == "run validation for details."
+
+
+class TestTolerantHandoffShapeIsReported:
+    """A handoff-shaped TOLERANT result is structurally impossible today and must stay noisy.
+
+    Under ``allow_pending_placeholders=True`` the ``review_interpretations``
+    stage materializes via ``materialize_state_for_authoring``, which never
+    returns ``InterpretationReviewPending`` — so the
+    ``INTERPRETATION_REVIEW_PENDING`` blocker cannot appear in a tolerant
+    result, and a pure handoff is confirmed by ``tolerant.is_valid`` alone.
+    If that invariant is ever broken upstream, the verification must REPORT
+    the invalid tolerant result (fail-noisy) rather than silently confirm the
+    handoff on shape alone, which would revive the g03 bare-notice defect for
+    a population nobody verified.
+    """
+
+    @pytest.mark.anyio
+    async def test_handoff_shaped_tolerant_result_is_reported_not_confirmed(self, service, monkeypatch) -> None:
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_handoff_result())
+        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        findings = await service._pending_handoff_outstanding_findings(
+            _empty_state(),
+            user_id="user-1",
+            session_id=None,
+            cache=service._new_runtime_preflight_cache(),
+            initial_version=1,
+            session_scope="session:test",
+            plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+        )
+        assert findings is not None
+        assert not findings.is_valid
+
+    def test_tolerant_materialization_never_reports_pending(self) -> None:
+        """Pin the upstream invariant the confirm rule rests on: the authoring
+        materializer returns a state, never ``InterpretationReviewPending``."""
+        import inspect
+
+        from elspeth.web.interpretation_state import materialize_state_for_authoring
+
+        signature = inspect.signature(materialize_state_for_authoring)
+        assert signature.return_annotation == "CompositionState"
+
+
+class TestCrossTurnRepairLedger:
+    """One cross-turn repair campaign per broken-state identity (elspeth-ac85b0ab0e review).
+
+    Without the ledger, EVERY later prose-only message over a persistently
+    broken wired state re-injected a full hidden repair campaign — engine
+    dry-run plus up to ``_MAX_REPAIR_TURNS`` model turns with mutation
+    pressure the user never asked for, unbounded across turns.
+    """
+
+    async def _attempt_cross_turn(
+        self,
+        service: ComposerServiceImpl,
+        fake: _RecordingValidatePipeline,
+        monkeypatch,
+        snapshot: PluginAvailabilitySnapshot,
+        *,
+        repair_turns_used: int = 0,
+        cache=None,
+        version: int = 1,
+        state: CompositionState | None = None,
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        llm_messages: list[dict[str, Any]] = []
+        fired = await service._attempt_preflight_repair(
+            state=state if state is not None else _nonempty_state(version=version),
+            llm_messages=llm_messages,
+            user_id="user-1",
+            session_id=None,
+            last_runtime_preflight=None,
+            runtime_preflight_cache=cache if cache is not None else service._new_runtime_preflight_cache(),
+            initial_version=1,
+            session_scope="session:test",
+            recorder=SimpleNamespace(llm_calls=()),
+            repair_turns_used=repair_turns_used,
+            plugin_snapshot=snapshot,
+        )
+        return fired, llm_messages
+
+    @pytest.mark.anyio
+    async def test_second_compose_call_over_same_broken_state_is_suppressed(self, service, monkeypatch) -> None:
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        first_fired, first_messages = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot)
+        assert first_fired is True
+        assert len(first_messages) == 1
+        # A later compose call (fresh per-call cache, budget reset) over the
+        # SAME unchanged broken state: the campaign already ran, so the gate
+        # stands aside and the finalize path surfaces the red suffix instead.
+        second_fired, second_messages = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot)
+        assert second_fired is False
+        assert second_messages == []
+
+    @pytest.mark.anyio
+    async def test_in_call_second_repair_turn_still_fires(self, service, monkeypatch) -> None:
+        """The ledger bounds campaigns across compose calls, not the in-call budget."""
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        cache = service._new_runtime_preflight_cache()
+        first_fired, _ = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot, cache=cache)
+        assert first_fired is True
+        second_fired, second_messages = await self._attempt_cross_turn(
+            service, fake, monkeypatch, snapshot, repair_turns_used=1, cache=cache
+        )
+        assert second_fired is True
+        assert len(second_messages) == 1
+
+    @pytest.mark.anyio
+    async def test_mutated_turn_repairs_are_not_ledgered(self, service, monkeypatch) -> None:
+        """Model-caused breakage on a mutated turn keeps its repair chance every time."""
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        first_fired, _ = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot, version=2)
+        second_fired, second_messages = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot, version=2)
+        assert first_fired is True
+        assert second_fired is True
+        assert len(second_messages) == 1
+
+    @pytest.mark.anyio
+    async def test_changed_state_content_starts_a_fresh_campaign(self, service, monkeypatch) -> None:
+        fake = _RecordingValidatePipeline(strict=_structural_failure_result(), tolerant=_valid_result())
+        snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+        first_fired, _ = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot)
+        assert first_fired is True
+        renamed = _nonempty_state(version=1).with_metadata({"name": "renamed"})
+        changed = CompositionState(
+            source=renamed.sources["source"],
+            nodes=renamed.nodes,
+            edges=renamed.edges,
+            outputs=renamed.outputs,
+            metadata=renamed.metadata,
+            version=1,
+        )
+        fired, llm_messages = await self._attempt_cross_turn(service, fake, monkeypatch, snapshot, state=changed)
+        assert fired is True
+        assert len(llm_messages) == 1
+
+
+class TestPendingHandoffVerificationDeadline:
+    """The masked re-validation must respect the compose deadline (elspeth-ac85b0ab0e review).
+
+    The END-gate terminal awaits this verification on last-chance turns; an
+    uncapped worker timeout could overrun the compose deadline by the full
+    configured preflight timeout.
+    """
+
+    @pytest.mark.anyio
+    async def test_expired_deadline_fails_the_verification_promptly(self, service, monkeypatch) -> None:
+        import asyncio
+
+        fake = _RecordingValidatePipeline(strict=_handoff_result(), tolerant=_structural_failure_result())
+        monkeypatch.setattr(service_module, "validate_pipeline", fake)
+        expired = asyncio.get_running_loop().time() - 1.0
+        with pytest.raises(service_module.ComposerRuntimePreflightError):
+            await service._pending_handoff_outstanding_findings(
+                _empty_state(),
+                user_id="user-1",
+                session_id=None,
+                cache=service._new_runtime_preflight_cache(),
+                initial_version=1,
+                session_scope="session:test",
+                plugin_snapshot=MagicMock(spec=PluginAvailabilitySnapshot),
+                deadline=expired,
+            )

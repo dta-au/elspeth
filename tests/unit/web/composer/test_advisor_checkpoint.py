@@ -1468,6 +1468,7 @@ def test_advisor_blocked_result_surfaces_backend_prescan_finding(make_service, s
             errors=[],
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
+        outstanding_findings=None,
     )
 
     runtime_result = result.runtime_preflight
@@ -2426,6 +2427,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         runtime_preflight_cache=service._new_runtime_preflight_cache(),
         initial_version=1,
         session_scope="s1",
+        plugin_snapshot=None,
     )
 
     assert outcome.action == "return"
@@ -2489,6 +2491,7 @@ def test_advisor_blocked_result_replaces_echoed_assistant_prose_with_fixed_notic
             errors=[],
             readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
         ),
+        outstanding_findings=None,
     )
 
     assert result.message.endswith(_ADVISOR_SIGNOFF_PENDING_NOTICE)
@@ -3717,6 +3720,7 @@ async def test_end_gate_terminal_block_persists_withheld_disclosure_before_retur
         runtime_preflight_cache=service._new_runtime_preflight_cache(),
         initial_version=1,
         session_scope="s1",
+        plugin_snapshot=None,
     )
 
     assert outcome.action == "return"
@@ -3774,6 +3778,7 @@ async def test_end_gate_terminal_block_skips_disclosure_without_session(make_ser
         runtime_preflight_cache=service._new_runtime_preflight_cache(),
         initial_version=1,
         session_scope="s1",
+        plugin_snapshot=None,
     )
 
     assert outcome.action == "return"
@@ -3836,6 +3841,7 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
         runtime_preflight_cache=service._new_runtime_preflight_cache(),
         initial_version=1,
         session_scope="s1",
+        plugin_snapshot=None,
     )
     assert outcome.action == "return"
     result = outcome.result

@@ -4449,6 +4449,14 @@ class CompositionState:
     version: int
     guided_session: GuidedSession | None = None
     sources: Mapping[str, SourceSpec] = field(default_factory=dict)
+    # Write-once memo slot for ``pipeline_proposal.composition_content_hash``:
+    # the hash serializes the whole state, and preflight identity keys rebuild
+    # it several times per composer turn. Content is immutable per instance,
+    # and every mutation constructor (``replace``/``with_*``) re-runs
+    # ``__init__``, which resets the memo — so a stale hash can never survive
+    # onto a modified copy. Excluded from comparison and repr: it is derived
+    # state, not composition content.
+    _content_hash_memo: str | None = field(default=None, init=False, compare=False, repr=False)
 
     def __init__(
         self,
@@ -4474,6 +4482,7 @@ class CompositionState:
         object.__setattr__(self, "version", version)
         object.__setattr__(self, "guided_session", guided_session)
         object.__setattr__(self, "sources", source_map)
+        object.__setattr__(self, "_content_hash_memo", None)
         freeze_fields(self, "sources")
 
     # --- Mutation methods ---

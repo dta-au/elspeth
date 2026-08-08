@@ -281,3 +281,54 @@ def test_grounding_correction_trusts_only_fixed_wrapper() -> None:
             "Re-read the actual state via `get_pipeline_state` before making further claims about pipeline configuration."
         ),
     )
+
+
+class TestWrappedDiagnosticWireShapeLinkage:
+    """Producer templates and the recognizer derive from ONE wire shape.
+
+    Every ``str.format``-style wrapped-diagnostic template is built by
+    ``_wrapped_diagnostic_template`` from the same
+    ``_wrapped_diagnostic_wire_shape`` pair ``_split_wrapped_diagnostic``
+    consumes, so a spacing or delimiter edit can no longer land on one side
+    only — the historical failure mode silently demoted the entire trusted
+    suffix to a single untrusted segment.
+    """
+
+    @pytest.mark.parametrize(
+        ("template_name", "header_name", "footer_name", "format_kwargs"),
+        [
+            (
+                "_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER",
+                "_EMPTY_STATE_NOTICE_HEADER",
+                "_EMPTY_STATE_NOTICE_NEXT_STEP",
+                {"blocker": "a concrete blocker detail"},
+            ),
+            (
+                "_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
+                "_PREFLIGHT_NOTICE_HEADER",
+                "_PREFLIGHT_NOTICE_FOOTER",
+                {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+            ),
+            (
+                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
+                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE",
+                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER",
+                {"detail": "a validator objection"},
+            ),
+        ],
+    )
+    def test_every_wrapped_template_round_trips_through_the_splitter(
+        self, template_name: str, header_name: str, footer_name: str, format_kwargs: dict[str, str]
+    ) -> None:
+        from elspeth.web.composer import no_tool_policy
+
+        template = getattr(no_tool_policy, template_name)
+        header = getattr(no_tool_policy, header_name)
+        footer = getattr(no_tool_policy, footer_name)
+        suffix = template.format(**format_kwargs)
+        segments = no_tool_policy._split_wrapped_diagnostic(suffix, header=header, footer=footer)
+        assert segments is not None
+        assert segments[0] == TrustedSystemNoticeSegment(header)
+        assert isinstance(segments[1], AssistantTextSegment)
+        assert segments[1].content.startswith("Cause: ")
+        assert segments[2] == TrustedSystemNoticeSegment(footer)
