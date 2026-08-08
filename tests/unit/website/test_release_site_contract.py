@@ -6,6 +6,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
+from elspeth.web.composer.guided.state_machine import GUIDED_SESSION_SCHEMA_VERSION
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -148,7 +149,7 @@ def test_get_started_has_runnable_cli_and_complete_composer_paths() -> None:
     assert "ELSPETH_WEB__SECRET_KEY" in html
     assert "elspeth composer users add" in html and "--password" in html
     assert "SESSION_SCHEMA_EPOCH" in html and f"35 → {SESSION_SCHEMA_EPOCH}" in html
-    assert "guided schema remains at 10" in html
+    assert f"guided schema changes 10 → {GUIDED_SESSION_SCHEMA_VERSION}" in html
     assert "SQLITE_SCHEMA_EPOCH" in html and "29 → 30" in html
     assert "aws-ecs-deployment.md" in html
 

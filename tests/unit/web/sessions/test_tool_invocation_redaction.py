@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -15,6 +16,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 
@@ -39,6 +41,29 @@ class _CapturingSessionService:
         **kwargs: Any,
     ) -> None:
         self.messages.append(_CapturedMessage(session_id=session_id, role=role, content=content, kwargs=kwargs))
+
+    async def add_messages_atomic(
+        self,
+        session_id: UUID,
+        drafts: Sequence[AuditMessageDraft],
+        *,
+        writer_principal: str,
+        composition_state_id: UUID | None = None,
+    ) -> None:
+        # In-memory double: the cohort is trivially atomic, so record one
+        # captured message per draft with the same kwargs shape the old
+        # per-row add_message calls carried.
+        for draft in drafts:
+            await self.add_message(
+                session_id,
+                draft.role,
+                draft.content,
+                writer_principal=writer_principal,
+                tool_calls=draft.tool_calls,
+                composition_state_id=composition_state_id,
+                tool_call_id=draft.tool_call_id,
+                parent_assistant_id=draft.parent_assistant_id,
+            )
 
 
 def _hash_canonical(canonical: str) -> str:

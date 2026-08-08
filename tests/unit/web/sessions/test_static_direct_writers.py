@@ -1511,6 +1511,20 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         ),
     ),
     ReviewedWriter(
+        path="tests/unit/web/sessions/test_persist_compose_turn.py",
+        enclosing_symbol="test_add_messages_atomic_mid_cohort_failure_persists_nothing.flaky_insert",
+        table="chat_messages",
+        operation="raw_string_in_OperationalError",
+        purpose=(
+            "Cohort-atomicity canary (elspeth-90231248dc) at the service "
+            "layer: OperationalError statement string simulates a "
+            "chat_messages INSERT failure on the second draft inside "
+            "add_messages_atomic; the test asserts the whole cohort rolls "
+            "back (zero rows durable, no partial prefix). Not an executed "
+            "query"
+        ),
+    ),
+    ReviewedWriter(
         path="tests/unit/web/sessions/test_routes.py",
         enclosing_symbol="TestMessageRoutes.test_send_message_tool_invocation_persistence_failure_raises_on_success_path.flaky_insert",
         table="chat_messages",

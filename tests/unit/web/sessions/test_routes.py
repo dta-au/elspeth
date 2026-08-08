@@ -78,6 +78,7 @@ from elspeth.web.sessions._guided_step_chat import (
     Step1SourceResolvedResult,
     StepChatResult,
 )
+from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
@@ -450,6 +451,29 @@ class _ProgressRouteSessionService:
         )
         self.messages.append(message)
         return message
+
+    async def add_messages_atomic(
+        self,
+        session_id: uuid.UUID,
+        drafts: Sequence[AuditMessageDraft],
+        *,
+        writer_principal: str,
+        composition_state_id: uuid.UUID | None = None,
+    ) -> None:
+        # In-memory double: appending the cohort draft-by-draft is
+        # trivially atomic, mirroring the production single-transaction
+        # contract.
+        for draft in drafts:
+            await self.add_message(
+                session_id,
+                draft.role,
+                draft.content,
+                writer_principal=writer_principal,
+                tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
+                composition_state_id=composition_state_id,
+                tool_call_id=draft.tool_call_id,
+                parent_assistant_id=uuid.UUID(draft.parent_assistant_id) if draft.parent_assistant_id else None,
+            )
 
     async def add_message_with_transcript(
         self,

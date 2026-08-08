@@ -14,7 +14,7 @@ recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 45. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 46. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -34,8 +34,12 @@ repair exhaustion settles under its own honest classification instead of the
 provider-blaming invalid-response envelope. Epoch 45 moves web Textract
 authoring onto operator document profiles (ADR-036): sessions authored
 against the removed `bucket_field` projection or the old `deployment` alias
-no longer validate or replay.
-Guided checkpoints remain at schema 10 and Landscape
+no longer validate or replay. Epoch 46 makes no SQL-shape change; it advances
+in lockstep with the guided checkpoint schema cut from 10 to 11, whose
+`composer_meta` chat-history entries gain the occurrence-binding `turn_token`
+key so a guided Retry resubmits the exact persisted occurrence it answers
+instead of matching on content.
+Landscape
 `SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
 barrier attribution column to scheduler work items. ELSPETH does not migrate
 either predecessor database in place before 1.0. Archive or export required

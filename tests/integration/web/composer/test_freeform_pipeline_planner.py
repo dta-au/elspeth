@@ -794,10 +794,13 @@ async def test_planner_audit_failure_publishes_no_proposal_authority_or_state(
         return _terminal_response(tmp_path, str(session.id))
 
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+    # The planner audit cohort settles via add_messages_atomic
+    # (elspeth-90231248dc); failing it is what must abort before any
+    # proposal/authority/state row exists.
     monkeypatch.setattr(
         sessions,
-        "add_message",
-        AsyncMock(spec=sessions.add_message, side_effect=SQLAlchemyError("audit write failed")),
+        "add_messages_atomic",
+        AsyncMock(spec=sessions.add_messages_atomic, side_effect=SQLAlchemyError("audit write failed")),
     )
 
     with pytest.raises(AuditIntegrityError, match="audit persistence failed before proposal creation"):
