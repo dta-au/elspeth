@@ -171,8 +171,10 @@ def _task_definition_policy_payload(
         "taskDefinition": {
             "taskDefinitionArn": "arn:aws:ecs:ap-southeast-2:123456789012:task-definition/elspeth-web:17",
             "status": "ACTIVE",
-            "taskRoleArn": f"arn:aws:iam::123456789012:role/{inventory['orphan_sweep']['iam_role_names'][0]}",
-            "executionRoleArn": f"arn:aws:iam::123456789012:role/{inventory['orphan_sweep']['iam_role_names'][1]}",
+            "taskRoleArn": (f"arn:aws:iam::123456789012:role/elspeth/{acceptance_run_id}/{inventory['orphan_sweep']['iam_role_names'][0]}"),
+            "executionRoleArn": (
+                f"arn:aws:iam::123456789012:role/elspeth/{acceptance_run_id}/{inventory['orphan_sweep']['iam_role_names'][1]}"
+            ),
             "containerDefinitions": [
                 {
                     "name": container_name,
@@ -781,7 +783,7 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
         )
 
 
-def test_task_definition_policy_binding_accepts_terraform_pathed_role_arns(tmp_path: Path) -> None:
+def test_task_definition_policy_binding_accepts_exact_terraform_role_paths(tmp_path: Path) -> None:
     manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
     run_id = inventory["acceptance_run_id"]
     task_role_name, execution_role_name = inventory["orphan_sweep"]["iam_role_names"][:2]
@@ -801,8 +803,69 @@ def test_task_definition_policy_binding_accepts_terraform_pathed_role_arns(tmp_p
 
 
 @pytest.mark.parametrize(
+    ("task_definition_arn", "rewrite_partition"),
+    [
+        pytest.param(
+            "arn:aws:ecs:us-east-1:123456789012:task-definition/elspeth-web:17",
+            None,
+            id="foreign-region",
+        ),
+        pytest.param(
+            "arn:aws:ecs:ap-southeast-2:999999999999:task-definition/elspeth-web:17",
+            None,
+            id="foreign-account",
+        ),
+        pytest.param(
+            "arn:aws-cn:ecs:ap-southeast-2:123456789012:task-definition/elspeth-web:17",
+            "aws-cn",
+            id="partition-region-mismatch",
+        ),
+    ],
+)
+def test_task_definition_policy_binding_rejects_foreign_task_definition_identity(
+    tmp_path: Path,
+    task_definition_arn: str,
+    rewrite_partition: str | None,
+) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    task = payload["taskDefinition"]
+    task["taskDefinitionArn"] = task_definition_arn
+    if rewrite_partition is not None:
+        task["taskRoleArn"] = task["taskRoleArn"].replace("arn:aws:", f"arn:{rewrite_partition}:")
+        task["executionRoleArn"] = task["executionRoleArn"].replace("arn:aws:", f"arn:{rewrite_partition}:")
+        for secret in task["containerDefinitions"][0]["secrets"]:
+            secret["valueFrom"] = secret["valueFrom"].replace("arn:aws:", f"arn:{rewrite_partition}:")
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+def test_task_definition_policy_binding_rejects_foreign_account_on_exact_role_path(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    task = payload["taskDefinition"]
+    task["taskRoleArn"] = task["taskRoleArn"].replace("::123456789012:", "::999999999999:")
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+@pytest.mark.parametrize(
     "role_resource_template",
     [
+        pytest.param("role/{name}", id="missing-run-path"),
+        pytest.param("role/other/{run_id}/{name}", id="wrong-owner-path"),
+        pytest.param("role/elspeth/{run_id}/extra/{name}", id="extra-path-segment"),
+        pytest.param("role/elspeth/00000000-0000-4000-8000-000000000000/{name}", id="wrong-run-path"),
         pytest.param("role/elspeth//{name}", id="empty-path-segment"),
         pytest.param("user/elspeth/{run_id}/{name}", id="wrong-resource-type"),
         pytest.param("role/elspeth/{run_id}/", id="missing-role-name"),

@@ -12,6 +12,7 @@
         "s3:DeleteBucketPublicAccessBlock",
         "s3:DeleteBucketTagging",
         "s3:DeleteBucketWebsite",
+        "s3:ListBucket",
         "s3:ListBucketVersions",
         "s3:PutBucketOwnershipControls",
         "s3:PutBucketPolicy",
@@ -40,6 +41,41 @@
         "arn:aws:s3:::${scenario_a_bucket}/*",
         "arn:aws:s3:::${scenario_b_bucket}/*"
       ]
+    },
+    {
+      "Sid": "PushAndCleanElspethImages",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:BatchDeleteImage",
+        "ecr:BatchGetImage",
+        "ecr:CompleteLayerUpload",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:InitiateLayerUpload",
+        "ecr:PutImage",
+        "ecr:UploadLayerPart"
+      ],
+      "Resource": [
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
+      ]
+    },
+    {
+      "Sid": "TagNamedEcrRepositoriesOnCreate",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
     },
     {
       "Sid": "ManageRunEc2NetworkRelationships",
@@ -158,20 +194,6 @@
       }
     },
     {
-      "Sid": "ManageRunEfsLifecycleConfiguration",
-      "Effect": "Allow",
-      "Action": [
-        "elasticfilesystem:PutLifecycleConfiguration"
-      ],
-      "Resource": "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
-        }
-      }
-    },
-    {
       "Sid": "ManageRunEventTargets",
       "Effect": "Allow",
       "Action": [
@@ -179,8 +201,8 @@
         "events:RemoveTargets"
       ],
       "Resource": [
-        "arn:aws:events:${aws_region}:${aws_account_id}:rule/a-*",
-        "arn:aws:events:${aws_region}:${aws_account_id}:rule/b-*"
+        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_a_namespace}-*",
+        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_b_namespace}-*"
       ],
       "Condition": {
         "StringEquals": {

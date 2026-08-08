@@ -25,7 +25,7 @@ release-evidence controller, not a prerequisite for deploying Scenario A.
 The installation sequence is:
 
 1. prove both AWS profiles resolve to the intended account and Region;
-2. render and attach the package's three narrow installer policies and its
+2. render and attach the package's four narrow installer policies and its
    separate IAM-lifecycle policy;
 3. apply `bootstrap/` to create remote state, ECR, and the task-role boundary;
 4. build, publish by digest, and scan the application and monitoring images;
@@ -177,7 +177,7 @@ export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$com
 installer_substitutions='${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}'
 
 mkdir -p bootstrap/.terraform
-for policy in control-plane regional-resources relationships; do
+for policy in control-plane regional-resources relationships runtime-observation; do
   envsubst "$installer_substitutions" \
     < "iam/installer-${policy}-policy.json.tftpl" \
     > "bootstrap/.terraform/installer-${policy}-policy.json"
@@ -190,13 +190,13 @@ envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
 jq -e . bootstrap/.terraform/iam-lifecycle-policy.json >/dev/null
 ```
 
-Inspect all four JSON files. Attach the three
+Inspect all five JSON files. Attach the four
 `installer-*-policy.json` documents to the normal installer principal as
 separate customer-managed policies — their aggregate size exceeds IAM's
 inline-policy limit, so do not merge them — and attach
 `iam-lifecycle-policy.json` to the lifecycle principal through the account's
 trusted IAM administration path. Do not combine them into a wildcard
-administrator policy. Record all four policy ARNs in the operator change
+administrator policy. Record all five policy ARNs in the operator change
 record: these policies exist outside every Terraform state, so teardown
 detaches and deletes them by recorded ARN rather than by tag or state. The
 detailed authority split and its one account-level CloudWatch Logs
@@ -599,6 +599,10 @@ section states the required bundle digest, CA label, and
 ## 9. Enable and verify the service
 
 Inspect Terraform's generated command, then enable the service explicitly:
+Define `resolve_target_ecr_digest` and `verify_candidate_service` exactly as
+shown in the Terraform package README's source-free acceptance section; those
+helpers admit the ECR parent index, selected platform child, service, task, and
+container response shapes before comparing them.
 
 ```bash
 SERVICE_ENABLE_COMMAND="$(terraform -chdir=scenario-a output -raw service_enable_command)"
@@ -618,6 +622,18 @@ read -r DESIRED RUNNING PENDING < <(
     --output text
 )
 test "$DESIRED/$RUNNING/$PENDING" = 1/1/0
+
+INVENTORY=$(terraform -chdir=scenario-a output -json resolved_inventory)
+CANDIDATE_TASK_DEFINITION=$(printf '%s' "$INVENTORY" | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+TARGET_PLATFORM=$(printf '%s' "$INVENTORY" | jq -er '.values.TARGET_PLATFORM')
+CANDIDATE_IMAGE=$(aws ecs describe-task-definition \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].image | [0]' \
+  --output text)
+CANDIDATE_PLATFORM_DIGEST=$(resolve_target_ecr_digest "$CANDIDATE_IMAGE" "$TARGET_PLATFORM")
+verify_candidate_service "$ECS_CLUSTER" "$ECS_SERVICE" \
+  "$CANDIDATE_TASK_DEFINITION" "$CANDIDATE_IMAGE" "$CANDIDATE_PLATFORM_DIGEST"
 ```
 
 Verify the application and monitoring sidecar:
@@ -749,7 +765,21 @@ test "$(aws sts get-caller-identity \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
 
 ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
 NAMESPACE=$(terraform -chdir=scenario-a output -raw namespace)
+
+aws ecs update-service \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
+  --desired-count 0 >/dev/null
+aws ecs wait services-stable \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+aws ecs list-tasks \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" \
+  --desired-status RUNNING --output json \
+  | jq -e '.taskArns | length == 0'
 
 terraform -chdir=scenario-a plan -destroy \
   -var-file=../examples/scenario-a.tfvars \
@@ -1062,14 +1092,15 @@ terraform -chdir=scenario-a apply .terraform/scenario-a-adopt.tfplan
 ### Remove the Step 2 policies
 
 Both destroys ran under the Step 2 policies, and so did the task-definition
-sweep and the Container Insights cleanup — the sweep needs `ecs:List*` and
+sweep and the Container Insights cleanup — the sweep needs the exact
+`ecs:ListTaskDefinitionFamilies` and `ecs:ListTaskDefinitions` actions plus
 `ecs:DeregisterTaskDefinition`, the cleanup needs `logs:DeleteLogGroup`, and
 all three grants live in the policies about to be deleted. Those policies had
 to outlive every one of those steps, which is why this is the first point at
 which they can go.
 
-Only now, remove the four policies recorded in the operator change record:
-detach the three `installer-*` policies from the normal installer principal
+Only now, remove the five policies recorded in the operator change record:
+detach the four `installer-*` policies from the normal installer principal
 and delete them, and detach and delete the lifecycle policy through the
 account's trusted IAM administration path. Do not rely on the tag query below
 to find them — they were created outside Terraform and may carry no run tag.

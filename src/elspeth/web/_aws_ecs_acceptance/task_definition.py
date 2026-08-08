@@ -276,7 +276,8 @@ def validate_task_definition_policy_binding(
     task_definition_arn = task.get("taskDefinitionArn")
     task_definition_match = (
         re.fullmatch(
-            r"arn:(aws(?:-us-gov|-cn)?):ecs:[a-z0-9-]+:[0-9]{12}:task-definition/[A-Za-z0-9_-]+:[1-9][0-9]*",
+            r"arn:(aws(?:-us-gov|-cn)?):ecs:([a-z0-9-]+):([0-9]{12}):"
+            r"task-definition/[A-Za-z0-9_-]+:[1-9][0-9]*",
             task_definition_arn,
         )
         if type(task_definition_arn) is str
@@ -322,23 +323,34 @@ def validate_task_definition_policy_binding(
     aws = cast(Mapping[str, object], manifest["aws"])
     role_names = cast(list[str], orphan["iam_role_names"])
     account_id = aws["account_id"]
-    namespace = scenario_resource_namespace(cast(str, manifest["acceptance_run_id"]), scenario_id)
+    aws_region = aws["region"]
+    partition = task_definition_match.group(1)
+    task_definition_region = task_definition_match.group(2)
+    task_definition_account_id = task_definition_match.group(3)
+    if type(account_id) is not str or type(aws_region) is not str:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    if aws_region.startswith("cn-"):
+        expected_partition = "aws-cn"
+    elif aws_region.startswith("us-gov-"):
+        expected_partition = "aws-us-gov"
+    else:
+        expected_partition = "aws"
+    if task_definition_region != aws_region or task_definition_account_id != account_id or partition != expected_partition:
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+    namespace = scenario_resource_namespace(acceptance_run_id, scenario_id)
     expected_roles = {
         "taskRoleArn": f"{namespace}-task-role",
         "executionRoleArn": f"{namespace}-execution-role",
     }
-    role_arns = tuple(task.get(field) for field in expected_roles)
+    if any(field not in task for field in expected_roles):
+        raise AcceptanceCheckError("task_definition_policy_binding")
+    role_arns = tuple(task[field] for field in expected_roles)
     if role_arns[0] == role_arns[1]:
         raise AcceptanceCheckError("task_definition_policy_binding")
     for field, expected_name in expected_roles.items():
-        role_arn = task.get(field)
-        if type(role_arn) is not str or len(role_arn) > 2048:
-            raise AcceptanceCheckError("task_definition_policy_binding")
-        match = re.fullmatch(
-            r"arn:aws(?:-us-gov|-cn)?:iam::([0-9]{12}):role/(?:[A-Za-z0-9+=,.@_-]+/)*([A-Za-z0-9+=,.@_-]{1,64})",
-            role_arn,
-        )
-        if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
+        expected_role_arn = f"arn:{partition}:iam::{account_id}:role/elspeth/{acceptance_run_id}/{expected_name}"
+        if task[field] != expected_role_arn or expected_name not in role_names:
             raise AcceptanceCheckError("task_definition_policy_binding")
     if expected_user is not None and (
         expected_user != PUBLISHED_WEB_CONTAINER_USER
@@ -380,9 +392,6 @@ def validate_task_definition_policy_binding(
     if requires_openrouter:
         name, secret_suffix, json_key = _TASK_DEFINITION_OPENROUTER_SECRET_BINDING
         required_secret_bindings[name] = (f"{namespace}-{secret_suffix}", json_key, "", "")
-    aws_region = aws["region"]
-    assert task_definition_match is not None
-    partition = task_definition_match.group(1)
     for entry in secrets:
         if not isinstance(entry, Mapping) or set(entry) != {"name", "valueFrom"}:
             raise AcceptanceCheckError("task_definition_policy_binding")
@@ -390,8 +399,8 @@ def validate_task_definition_policy_binding(
         inventory_binding = _secrets_manager_inventory_binding(
             entry["valueFrom"],
             partition=partition,
-            region=cast(str, aws_region),
-            account_id=cast(str, account_id),
+            region=aws_region,
+            account_id=account_id,
         )
         if (
             type(name) is not str
@@ -416,7 +425,6 @@ def validate_task_definition_policy_binding(
         "ELSPETH_BEDROCK_LIVE_TEST_MODEL",
         "AWS_REGION",
     )
-    acceptance_run_id = cast(str, manifest["acceptance_run_id"])
     expected_runtime = {
         "ELSPETH_WEB__DATA_DIR": cast(str, values["ELSPETH_WEB__DATA_DIR"]),
         "ELSPETH_WEB__PAYLOAD_STORE_PATH": cast(str, values["ELSPETH_WEB__PAYLOAD_STORE_PATH"]),
@@ -425,7 +433,7 @@ def validate_task_definition_policy_binding(
         "ELSPETH_ACCEPTANCE_SCENARIO_ID": scenario_id,
         "ELSPETH_ACCEPTANCE_S3_BUCKET": cast(str, values["ELSPETH_TEST_S3_BUCKET"]),
         "ELSPETH_ACCEPTANCE_S3_PREFIX": f"{scenario_resource_namespace(acceptance_run_id, scenario_id)}/{acceptance_run_id}",
-        "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID": cast(str, account_id),
+        "ELSPETH_ACCEPTANCE_AWS_ACCOUNT_ID": account_id,
     }
     if secret_names.intersection((*protected_names, *expected_runtime)):
         raise AcceptanceCheckError("task_definition_policy_binding")

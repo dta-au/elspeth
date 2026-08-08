@@ -15,7 +15,6 @@
         "bedrock:ListInferenceProfiles",
         "bedrock:ListTagsForResource",
         "cloudwatch:DescribeAlarms",
-        "cloudwatch:GetDashboard",
         "cloudwatch:ListDashboards",
         "cloudwatch:ListMetrics",
         "cloudwatch:ListTagsForResource",
@@ -25,8 +24,9 @@
         "ecr:Describe*",
         "ecr:GetLifecyclePolicy",
         "ecr:List*",
-        "ecs:Describe*",
-        "ecs:List*",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTaskDefinitionFamilies",
+        "ecs:ListTaskDefinitions",
         "elasticfilesystem:Describe*",
         "elasticloadbalancing:Describe*",
         "events:DescribeRule",
@@ -34,7 +34,6 @@
         "iam:Get*",
         "iam:List*",
         "logs:Describe*",
-        "logs:GetLogEvents",
         "logs:List*",
         "rds:Describe*",
         "rds:ListTagsForResource",
@@ -48,36 +47,16 @@
         "s3:GetMetricsConfiguration",
         "s3:GetReplicationConfiguration",
         "s3:ListAllMyBuckets",
-        "s3:ListBucket",
         "secretsmanager:DescribeSecret",
         "secretsmanager:GetResourcePolicy",
         "secretsmanager:List*",
         "sns:GetTopicAttributes",
         "sns:List*",
         "sts:GetCallerIdentity",
-        "tag:GetResources",
-        "xray:Get*",
-        "xray:List*"
+        "xray:GetGroups",
+        "xray:GetSamplingRules"
       ],
       "Resource": "*"
-    },
-    {
-      "Sid": "PushAndCleanElspethImages",
-      "Effect": "Allow",
-      "Action": [
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:BatchDeleteImage",
-        "ecr:BatchGetImage",
-        "ecr:CompleteLayerUpload",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:InitiateLayerUpload",
-        "ecr:PutImage",
-        "ecr:UploadLayerPart"
-      ],
-      "Resource": [
-        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
-        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
-      ]
     },
     {
       "Sid": "AuthenticateForEcrPush",
@@ -99,14 +78,14 @@
         "ecs:RunTask"
       ],
       "Resource": [
-        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/a-*:*",
-        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/b-*:*"
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_a_namespace}-*:*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_b_namespace}-*:*"
       ],
       "Condition": {
         "ArnLike": {
           "ecs:cluster": [
-            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-a-*",
-            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-b-*"
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster"
           ]
         },
         "StringEquals": {
@@ -155,10 +134,10 @@
         "iam:PutRolePolicy"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -174,8 +153,8 @@
         "iam:DetachRolePolicy"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -193,10 +172,10 @@
         "iam:PassRole"
       ],
       "Resource": [
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -224,18 +203,6 @@
           ]
         }
       }
-    },
-    {
-      "Sid": "ManageRunDashboards",
-      "Effect": "Allow",
-      "Action": [
-        "cloudwatch:DeleteDashboards",
-        "cloudwatch:PutDashboard"
-      ],
-      "Resource": [
-        "arn:aws:cloudwatch::${aws_account_id}:dashboard/a-*",
-        "arn:aws:cloudwatch::${aws_account_id}:dashboard/b-*"
-      ]
     },
     {
       "Sid": "DedicatedAccountOnlyUntaggedMutations",

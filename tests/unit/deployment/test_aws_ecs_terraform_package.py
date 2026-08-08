@@ -54,6 +54,7 @@ EXPECTED_FILES = {
     "iam/installer-control-plane-policy.json.tftpl",
     "iam/installer-regional-resources-policy.json.tftpl",
     "iam/installer-relationships-policy.json.tftpl",
+    "iam/installer-runtime-observation-policy.json.tftpl",
     "iam/lifecycle-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
@@ -148,15 +149,116 @@ def _installer_policy_template_text() -> str:
     return "\n".join(path.read_text(encoding="utf-8") for path in sorted((PACKAGE / "iam").glob("installer*.json.tftpl")))
 
 
-def _render_installer_policy_documents() -> list[tuple[Path, str, dict[str, Any]]]:
+def _render_installer_policy_documents(
+    values: dict[str, str] | None = None,
+) -> list[tuple[Path, str, dict[str, Any]]]:
+    substitutions = _INSTALLER_POLICY_VALUES if values is None else values
     documents: list[tuple[Path, str, dict[str, Any]]] = []
     for path in sorted((PACKAGE / "iam").glob("installer*.json.tftpl")):
         rendered = path.read_text(encoding="utf-8")
-        for name, value in _INSTALLER_POLICY_VALUES.items():
+        for name, value in substitutions.items():
             rendered = rendered.replace(f"${{{name}}}", value)
         assert "${" not in rendered
         documents.append((path, rendered, json.loads(rendered)))
     return documents
+
+
+_ECR_REPOSITORY_VARIABLES = (
+    ("bootstrap/variables.tf", "ecr_repository"),
+    ("bootstrap/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("modules/scenario/variables.tf", "candidate_ecr_repository"),
+    ("modules/scenario/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("scenario-a/variables.tf", "candidate_ecr_repository"),
+    ("scenario-a/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("scenario-b/variables.tf", "candidate_ecr_repository"),
+    ("scenario-b/variables.tf", "cloudwatch_agent_ecr_repository"),
+)
+_ECR_REPOSITORY_PATTERN = r"^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$"
+
+
+def test_all_ecr_repository_inputs_enforce_the_same_aws_contract() -> None:
+    expected_condition = f'length(var.repository) <= 256 && can(regex("{_ECR_REPOSITORY_PATTERN}", var.repository))'
+
+    for relative, variable_name in _ECR_REPOSITORY_VARIABLES:
+        match = re.search(rf'variable "{variable_name}" \{{.*?\n\}}\n', _text(relative), re.DOTALL)
+        assert match is not None, f"{relative} no longer declares {variable_name}"
+        condition = re.search(r"^\s*condition\s+=\s+(?P<value>.+)$", match.group(0), re.MULTILINE)
+        assert condition is not None
+        normalized = condition.group("value").replace(f"var.{variable_name}", "var.repository")
+        assert normalized == expected_condition, f"{relative}:{variable_name} has drifted from the ECR repository contract"
+
+
+@pytest.mark.parametrize(
+    ("repository", "accepted"),
+    [
+        pytest.param("elspeth-" + ("a" * 248), True, id="maximum-length"),
+        pytest.param("elspeth-" + ("a" * 249), False, id="over-maximum-length"),
+        pytest.param("elspeth-app/agent_1", True, id="valid-segments"),
+        pytest.param("elspeth-app/", False, id="trailing-slash"),
+        pytest.param("elspeth-app//agent", False, id="empty-path-segment"),
+        pytest.param("elspeth-app..agent", False, id="consecutive-dot"),
+        pytest.param("elspeth-app._agent", False, id="mixed-separators"),
+        pytest.param("elspeth-App", False, id="uppercase"),
+    ],
+)
+def test_ecr_repository_validation_matches_aws_name_contract(tmp_path: Path, repository: str, accepted: bool) -> None:
+    _require_terraform("the ECR repository validator must execute")
+    variables = _text("bootstrap/variables.tf")
+    match = re.search(r'variable "ecr_repository" \{.*?\n\}\n', variables, re.DOTALL)
+    assert match is not None
+    (tmp_path / "main.tf").write_text(match.group(0), encoding="utf-8")
+    subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "init", "-backend=false", "-input=false", "-no-color"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    result = subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "plan", "-input=false", "-no-color", f"-var=ecr_repository={repository}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("bucket", "accepted"),
+    [
+        pytest.param("elspeth-" + ("a" * 55), True, id="maximum-length"),
+        pytest.param("elspeth-" + ("a" * 56), False, id="over-maximum-length"),
+        pytest.param("elspeth-state..bucket", False, id="adjacent-periods"),
+        pytest.param("elspeth-state-s3alias", False, id="access-point-alias-suffix"),
+        pytest.param("elspeth-state--ol-s3", False, id="object-lambda-alias-suffix"),
+        pytest.param("elspeth-state.mrap", False, id="multi-region-access-point-suffix"),
+        pytest.param("elspeth-state--x-s3", False, id="directory-bucket-suffix"),
+        pytest.param("elspeth-state--table-s3", False, id="table-bucket-suffix"),
+    ],
+)
+def test_backend_state_bucket_validation_enforces_s3_length_limit(tmp_path: Path, bucket: str, accepted: bool) -> None:
+    _require_terraform("the backend state bucket validator must execute")
+    variables = _text("bootstrap/variables.tf")
+    match = re.search(r'variable "backend_state_bucket" \{.*?\n\}\n', variables, re.DOTALL)
+    assert match is not None
+    assert "length(var.backend_state_bucket) <= 63" in match.group(0)
+    (tmp_path / "main.tf").write_text(match.group(0), encoding="utf-8")
+    subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "init", "-backend=false", "-input=false", "-no-color"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    result = subprocess.run(
+        ["terraform", f"-chdir={tmp_path}", "plan", "-input=false", "-no-color", f"-var=backend_state_bucket={bucket}"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert (result.returncode == 0) is accepted, result.stdout + result.stderr
 
 
 def test_scenario_a_https_ingress_is_explicit_and_never_world_open() -> None:
@@ -1085,6 +1187,82 @@ def test_every_image_is_proven_before_any_credentialed_task_definition() -> None
     assert "org.opencontainers.image.revision=$ELSPETH_RELEASE_SHA" in agent_dockerfile
 
 
+def test_application_image_contract_is_baked_verified_and_admitted() -> None:
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    workflow = (REPO_ROOT / ".github" / "workflows" / "build-push.yaml").read_text(encoding="utf-8")
+    provenance = _text("modules/scenario/image_provenance.tf")
+    readme = _text("README.md")
+    contract = "elspeth.aws-ecs.runtime.v1"
+
+    assert f'LABEL io.elspeth.aws-ecs-config-contract="{contract}"' in dockerfile
+    assert workflow.count('index .Config.Labels "io.elspeth.aws-ecs-config-contract"') == 2
+    assert workflow.count(f'= "{contract}"') >= 2
+    assert f'candidate_image_config_contract = "{contract}"' in provenance
+    assert 'variable "candidate_image_config_contract"' not in _text("modules/scenario/variables.tf")
+    assert provenance.count("io.elspeth.aws-ecs-config-contract") == 2
+    assert provenance.count("EXPECTED_CONFIG_CONTRACT") == 4
+    assert "candidate_image_config_contract_mismatch" in provenance
+    assert "rollback_image_config_contract_mismatch" in provenance
+
+    handoff_start = readme.index("### Promote the published candidate into bootstrap ECR")
+    handoff = readme[handoff_start : readme.index("## Backend inputs", handoff_start)]
+    verify = "cosign verify"
+    assert verify in handoff
+    assert "cosign version" in handoff
+    assert '--certificate-oidc-issuer "https://token.actions.githubusercontent.com"' in handoff
+    assert '--certificate-identity "https://github.com/johnm-dta/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG"' in handoff
+    assert "id-token: write" in workflow
+    assert 'run: cosign sign --yes "$IMAGE_DIGEST"' in workflow
+    assert 'GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"' in handoff
+    assert handoff.index('GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"') < handoff.index(verify)
+    assert handoff.index(verify) < handoff.index("docker buildx imagetools create")
+    assert "--insecure" not in handoff
+    assert "--key" not in handoff
+
+
+@pytest.mark.parametrize("observed_contract", ["", "elspeth.aws-ecs.runtime.v0"])
+def test_candidate_image_admission_rejects_missing_or_wrong_config_contract(observed_contract: str) -> None:
+    provenance = _text("modules/scenario/image_provenance.tf")
+    candidate = provenance[
+        provenance.index('resource "terraform_data" "candidate_image_provenance"') : provenance.index(
+            'resource "terraform_data" "rollback_image_provenance"'
+        )
+    ]
+    command_match = re.search(r"command\s*=\s*<<-SHELL\n(?P<body>.*?)\n\s*SHELL", candidate, re.DOTALL)
+    assert command_match is not None
+    harness = f"""
+aws() {{ printf '%s' password; }}
+docker() {{
+  case "$*" in
+    *org.opencontainers.image.revision*) printf '%s\\n' "$CANDIDATE_SHA" ;;
+    *io.elspeth.aws-ecs-config-contract*) printf '%s\\n' "$OBSERVED_CONFIG_CONTRACT" ;;
+    *) return 0 ;;
+  esac
+}}
+{command_match.group("body")}
+"""
+    result = subprocess.run(
+        ["bash", "-ceu", harness],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "AWS_ACCOUNT_ID": "123456789012",
+            "AWS_PROFILE": "acceptance",
+            "AWS_REGION": "ap-southeast-2",
+            "CANDIDATE_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth@sha256:" + "d" * 64,
+            "CANDIDATE_SHA": "a" * 40,
+            "EXPECTED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
+            "OBSERVED_CONFIG_CONTRACT": observed_contract,
+            "TARGET_PLATFORM": "linux/amd64",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "candidate_image_config_contract_mismatch" in result.stderr
+
+
 def test_repository_regexes_escape_dots_before_interpolation() -> None:
     for relative in (
         "modules/scenario/variables.tf",
@@ -1228,9 +1406,69 @@ def test_candidate_image_handoff_subshell_fails_before_emitting_an_unverified_re
     subshell_end = section.index("\n)\nunset GITHUB_TOKEN", subshell_start)
     subshell = section[subshell_start:subshell_end]
 
-    assert re.match(r"\(\n\s+set -e\n", subshell)
-    assert subshell.index("set -e") < subshell.index("docker login ghcr.io")
+    assert re.match(r"\(\n\s+set -Eeuo pipefail\n", subshell)
+    assert subshell.index("set -Eeuo pipefail") < subshell.index("docker login ghcr.io")
     assert subshell.index('test "$ECR_IMAGE_DIGEST" = "$GHCR_IMAGE_DIGEST"') < subshell.index("printf 'candidate_image")
+
+
+def test_candidate_image_handoff_proves_exact_selected_platform_child_digest() -> None:
+    readme = _text("README.md")
+    start = readme.index("### Promote the published candidate into bootstrap ECR")
+    section = readme[start : readme.index("## Backend inputs", start)]
+
+    for marker in (
+        "resolve_target_manifest_digest() (",
+        "linux/amd64|linux/arm64",
+        '.platform.os == "linux"',
+        ".platform.architecture == $architecture",
+        'GHCR_PLATFORM_DIGEST=$(resolve_target_manifest_digest "$GHCR_IMAGE" "$TARGET_PLATFORM")',
+        'ECR_PLATFORM_DIGEST=$(resolve_target_manifest_digest "$CANDIDATE_IMAGE" "$TARGET_PLATFORM")',
+        'test "$ECR_PLATFORM_DIGEST" = "$GHCR_PLATFORM_DIGEST"',
+        "candidate_platform_digest",
+    ):
+        assert marker in section
+
+
+def test_service_rollout_proof_binds_primary_task_and_platform_digest() -> None:
+    readme = _text("README.md")
+    source_free_start = readme.index("### Source-free post-enable acceptance")
+    source_free = readme[source_free_start : readme.index("## Immutable RDS trust-root admission", source_free_start)]
+
+    for marker in (
+        "resolve_target_ecr_digest() (",
+        "verify_candidate_service() (",
+        "TARGET_PLATFORM",
+        "candidate_platform_digest",
+        "(.services | length == 1)",
+        'select(.status == "PRIMARY")',
+        '.rolloutState == "COMPLETED"',
+        ".failedTasks == 0",
+        "(.tasks | length == 1)",
+        ".taskDefinitionArn == $candidate_task_definition",
+        ".imageDigest == $candidate_platform_digest",
+    ):
+        assert marker in source_free
+    assert source_free.count("verify_candidate_service ") >= 2
+    assert readme.count("verify_candidate_service ") >= 3
+
+
+def test_teardown_drains_each_applied_service_before_destroy() -> None:
+    readme = _text("README.md")
+    start = readme.index("## Outputs and teardown")
+    section = readme[start : readme.index("### Container Insights", start)]
+
+    for marker in (
+        "drain_scenario_service()",
+        "--desired-count 0",
+        "services-stable",
+        "--desired-status RUNNING",
+        ".taskArns | length == 0",
+        "drain_scenario_service scenario-b",
+        "drain_scenario_service scenario-a",
+    ):
+        assert marker in section
+    assert section.index("drain_scenario_service scenario-b") < section.index("terraform -chdir=scenario-b destroy")
+    assert section.index("drain_scenario_service scenario-a") < section.index("terraform -chdir=scenario-a destroy")
 
 
 def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:
@@ -1387,15 +1625,38 @@ def test_scenario_a_codeblind_inputs_have_no_acceptance_coordinator_dependencies
 
 
 def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit() -> None:
-    documents = _render_installer_policy_documents()
+    documents = _render_installer_policy_documents(
+        {
+            **_INSTALLER_POLICY_VALUES,
+            "backend_state_bucket": "elspeth-" + ("s" * 55),
+            "ecr_repository": "elspeth-" + ("a" * 248),
+            "cloudwatch_agent_ecr_repository": "elspeth-" + ("b" * 248),
+            "scenario_a_bucket": "elspeth-a-" + ("c" * 33),
+            "scenario_b_bucket": "elspeth-b-" + ("d" * 33),
+        }
+    )
     assert documents
 
-    rendered_sizes = {path.name: len(re.sub(r"\s+", "", rendered)) for path, rendered, _document in documents}
+    rendered_sizes = {path.name: len(json.dumps(document, separators=(",", ":"))) for path, _rendered, document in documents}
     assert all(size <= 6_144 for size in rendered_sizes.values()), rendered_sizes
-    assert len(documents) >= 3
+    assert len(documents) == 4
 
     statement_sids = [statement["Sid"] for _path, _rendered, document in documents for statement in document["Statement"]]
     assert len(statement_sids) == len(set(statement_sids))
+    tag_on_create = [
+        (path.name, statement)
+        for path, _rendered, document in documents
+        for statement in document["Statement"]
+        if statement["Sid"] == "TagNamedEcrRepositoriesOnCreate"
+    ]
+    assert len(tag_on_create) == 1
+    path_name, statement = tag_on_create[0]
+    assert path_name == "installer-relationships-policy.json.tftpl"
+    assert statement["Action"] == ["ecr:TagResource"]
+    assert statement["Condition"]["StringEquals"] == {
+        "aws:RequestTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
 
 
 def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
@@ -1444,12 +1705,12 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     run_tasks = statements["RunScenarioTasks"]
     assert run_tasks["Action"] == ["ecs:RunTask"]
     assert run_tasks["Resource"] == [
-        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-*:*",
-        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-0123456789abcdefabcd-*:*",
     ]
     assert run_tasks["Condition"]["ArnLike"]["ecs:cluster"] == [
-        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-*",
-        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
     ]
     stop_tasks = statements["StopRunScenarioTasks"]
     assert stop_tasks["Action"] == ["ecs:StopTask"]
@@ -1469,15 +1730,15 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
 
     dashboards = statements["ManageRunDashboards"]
     assert dashboards["Resource"] == [
-        "arn:aws:cloudwatch::123456789012:dashboard/a-*",
-        "arn:aws:cloudwatch::123456789012:dashboard/b-*",
+        "arn:aws:cloudwatch::123456789012:dashboard/a-0123456789abcdefabcd-elspeth-aws-operator-v1",
+        "arn:aws:cloudwatch::123456789012:dashboard/b-0123456789abcdefabcd-elspeth-aws-operator-v1",
     ]
-    assert {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"} == set(dashboards["Action"])
+    assert {"cloudwatch:GetDashboard", "cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"} == set(dashboards["Action"])
     assert not {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"}.intersection(
         statements["MutateRunTaggedRegionalResources"]["Action"]
     )
     named_buckets = statements["ManageElspethNamedBuckets"]
-    assert {"s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(named_buckets["Action"])
+    assert {"s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(named_buckets["Action"])
     assert named_buckets["Resource"] == [
         "arn:aws:s3:::elspeth-state-example",
         "arn:aws:s3:::elspeth-a-example",
@@ -1511,10 +1772,10 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     pass_role = statements["PassRunScopedRolesToEcsTasksOnly"]
     assert pass_role["Condition"] == {"StringEquals": {"iam:PassedToService": "ecs-tasks.amazonaws.com"}}
     assert pass_role["Resource"] == [
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-task-role",
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-task-role",
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
     ]
     iam_roles = _text("modules/scenario/iam_observability.tf")
     assert iam_roles.count('path                 = "/elspeth/${var.run_id}/"') == 2
@@ -1523,8 +1784,8 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     managed_attachment = statements["ManageKnownExecutionRoleAttachment"]
     assert set(managed_attachment["Action"]) == {"iam:AttachRolePolicy", "iam:DetachRolePolicy"}
     assert managed_attachment["Resource"] == [
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
-        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
     ]
     assert managed_attachment["Condition"]["ArnEquals"]["iam:PolicyARN"] == (
         "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
@@ -1612,11 +1873,70 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     readme = _text("README.md")
     for name in values:
         assert f"${{{name}}}" in readme
-    assert "three customer-managed policies" in readme
+    assert "four customer-managed policies" in readme
     assert "6,144" in readme
     assert "inline policies" in readme
     assert "dedicated empty account" in readme
     assert "not supported in a shared account" in readme
+
+
+def test_installer_discovery_and_named_mutations_use_exact_scenario_resources() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    discovery_actions = set(statements["ReadDiscovery"]["Action"])
+
+    assert "ecs:Describe*" not in discovery_actions
+    assert "ecs:List*" not in discovery_actions
+    assert {"ecs:ListTaskDefinitionFamilies", "ecs:ListTaskDefinitions"}.issubset(discovery_actions)
+    assert "logs:GetLogEvents" not in discovery_actions
+    assert "s3:ListBucket" not in discovery_actions
+    assert {action for action in discovery_actions if action.startswith("xray:")} == {
+        "xray:GetGroups",
+        "xray:GetSamplingRules",
+    }
+
+    assert statements["ReadScenarioEcsResources"]["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-a-0123456789abcdefabcd-cluster/acceptance-a-0123456789abcdefabcd-service",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-b-0123456789abcdefabcd-cluster/acceptance-b-0123456789abcdefabcd-service",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-a-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-b-0123456789abcdefabcd-cluster/*",
+    ]
+    assert statements["ReadRunLogs"]["Resource"] == [
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/a-0123456789abcdefabcd-*:log-stream:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/b-0123456789abcdefabcd-*:log-stream:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/containerinsights/acceptance-a-0123456789abcdefabcd-cluster/performance:log-stream:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/containerinsights/acceptance-b-0123456789abcdefabcd-cluster/performance:log-stream:*",
+    ]
+    assert statements["ManageRunScopedInlinePolicies"]["Resource"] == [
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
+    ]
+    assert statements["ManageRunDashboards"]["Resource"] == [
+        "arn:aws:cloudwatch::123456789012:dashboard/a-0123456789abcdefabcd-elspeth-aws-operator-v1",
+        "arn:aws:cloudwatch::123456789012:dashboard/b-0123456789abcdefabcd-elspeth-aws-operator-v1",
+    ]
+    assert statements["ManageRunEventTargets"]["Resource"] == [
+        "arn:aws:events:ap-southeast-1:123456789012:rule/a-0123456789abcdefabcd-*",
+        "arn:aws:events:ap-southeast-1:123456789012:rule/b-0123456789abcdefabcd-*",
+    ]
+    xray = statements["MutateRunTaggedXrayResources"]
+    assert {"xray:GetGroup", "xray:ListTagsForResource"}.issubset(xray["Action"])
+    assert xray["Resource"] == [
+        "arn:aws:xray:ap-southeast-1:123456789012:group/a-0123456789abcdefabcd-*/*",
+        "arn:aws:xray:ap-southeast-1:123456789012:group/b-0123456789abcdefabcd-*/*",
+        "arn:aws:xray:ap-southeast-1:123456789012:sampling-rule/a-0123456789abcdefabcd-*",
+        "arn:aws:xray:ap-southeast-1:123456789012:sampling-rule/b-0123456789abcdefabcd-*",
+    ]
+
+    for _path, rendered, _document in documents:
+        for generic_pattern in ("/a-*", "/b-*", "group/a-*", "group/b-*", "rule/a-*", "rule/b-*"):
+            assert generic_pattern not in rendered
 
 
 def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permissions() -> None:

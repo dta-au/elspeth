@@ -76,8 +76,8 @@ variable "candidate_ecr_repository" {
   description = "Exact application-image ECR repository created by the shared bootstrap."
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.candidate_ecr_repository))
-    error_message = "candidate_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
+    condition     = length(var.candidate_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.candidate_ecr_repository))
+    error_message = "candidate_ecr_repository must be the bootstrap-created elspeth-prefixed AWS ECR repository name and be at most 256 characters."
   }
 }
 
@@ -177,8 +177,8 @@ variable "cloudwatch_agent_ecr_repository" {
   description = "Exact CloudWatch-agent ECR repository created by the shared bootstrap."
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.cloudwatch_agent_ecr_repository))
-    error_message = "cloudwatch_agent_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
+    condition     = length(var.cloudwatch_agent_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.cloudwatch_agent_ecr_repository))
+    error_message = "cloudwatch_agent_ecr_repository must be the bootstrap-created elspeth-prefixed AWS ECR repository name and be at most 256 characters."
   }
 }
 

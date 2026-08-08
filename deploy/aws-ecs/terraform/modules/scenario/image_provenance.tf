@@ -1,14 +1,15 @@
+locals {
+  candidate_image_config_contract = "elspeth.aws-ecs.runtime.v1"
+}
+
 # ADMISSION TRUST MODEL (elspeth-9f7d336e1c residual): these checks prove
 # that the image the operator named is the image ECR serves (every
 # reference is a digest, and the pull is by that digest) and that its
 # self-declared org.opencontainers.image.revision label matches the SHA
-# the operator claims. They do NOT prove producer identity — the label is
-# writable by any builder, and CI's cosign signature is not verified on
-# the GHCR-to-ECR handoff — and they do NOT prove settings-contract
-# compatibility: a truthfully-labelled older image passes admission and
-# then fails every task at settings load. The supported pairing remains a
-# package and image cut from the same commit by the operator who supplies
-# both values; see README "Minimum image revision".
+# the operator claims, and that its declared settings contract matches this
+# package. Producer identity remains an operator handoff responsibility:
+# verify the CI cosign signature before copying the image into ECR; see README
+# "Minimum image revision".
 resource "terraform_data" "candidate_image_provenance" {
   input = var.candidate_image
 
@@ -17,6 +18,7 @@ resource "terraform_data" "candidate_image_provenance" {
     var.candidate_sha,
     var.candidate_ecr_repository,
     var.target_platform,
+    local.candidate_image_config_contract,
   ]
 
   provisioner "local-exec" {
@@ -39,6 +41,13 @@ resource "terraform_data" "candidate_image_provenance" {
         <"$work/ecr-password" \
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$CANDIDATE_IMAGE" >"$work/docker-pull.out"
+      config_contract=$(docker image inspect \
+        --format '{{ index .Config.Labels "io.elspeth.aws-ecs-config-contract" }}' \
+        "$CANDIDATE_IMAGE")
+      test "$config_contract" = "$EXPECTED_CONFIG_CONTRACT" || {
+        printf '%s\n' candidate_image_config_contract_mismatch >&2
+        exit 1
+      }
       revision=$(docker image inspect \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$CANDIDATE_IMAGE")
@@ -49,12 +58,13 @@ resource "terraform_data" "candidate_image_provenance" {
     SHELL
 
     environment = {
-      AWS_ACCOUNT_ID  = var.aws_account_id
-      AWS_PROFILE     = var.aws_profile
-      AWS_REGION      = var.aws_region
-      CANDIDATE_IMAGE = var.candidate_image
-      CANDIDATE_SHA   = var.candidate_sha
-      TARGET_PLATFORM = var.target_platform
+      AWS_ACCOUNT_ID           = var.aws_account_id
+      AWS_PROFILE              = var.aws_profile
+      AWS_REGION               = var.aws_region
+      CANDIDATE_IMAGE          = var.candidate_image
+      CANDIDATE_SHA            = var.candidate_sha
+      EXPECTED_CONFIG_CONTRACT = local.candidate_image_config_contract
+      TARGET_PLATFORM          = var.target_platform
     }
   }
 }
@@ -67,6 +77,7 @@ resource "terraform_data" "rollback_image_provenance" {
     var.rollback_baseline_sha,
     var.candidate_ecr_repository,
     var.target_platform,
+    local.candidate_image_config_contract,
   ]
 
   depends_on = [terraform_data.candidate_image_provenance]
@@ -91,6 +102,13 @@ resource "terraform_data" "rollback_image_provenance" {
         <"$work/ecr-password" \
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$ROLLBACK_IMAGE" >"$work/docker-pull.out"
+      config_contract=$(docker image inspect \
+        --format '{{ index .Config.Labels "io.elspeth.aws-ecs-config-contract" }}' \
+        "$ROLLBACK_IMAGE")
+      test "$config_contract" = "$EXPECTED_CONFIG_CONTRACT" || {
+        printf '%s\n' rollback_image_config_contract_mismatch >&2
+        exit 1
+      }
       revision=$(docker image inspect \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$ROLLBACK_IMAGE")
@@ -101,12 +119,13 @@ resource "terraform_data" "rollback_image_provenance" {
     SHELL
 
     environment = {
-      AWS_ACCOUNT_ID  = var.aws_account_id
-      AWS_PROFILE     = var.aws_profile
-      AWS_REGION      = var.aws_region
-      ROLLBACK_IMAGE  = var.rollback_baseline_image
-      ROLLBACK_SHA    = var.rollback_baseline_sha
-      TARGET_PLATFORM = var.target_platform
+      AWS_ACCOUNT_ID           = var.aws_account_id
+      AWS_PROFILE              = var.aws_profile
+      AWS_REGION               = var.aws_region
+      EXPECTED_CONFIG_CONTRACT = local.candidate_image_config_contract
+      ROLLBACK_IMAGE           = var.rollback_baseline_image
+      ROLLBACK_SHA             = var.rollback_baseline_sha
+      TARGET_PLATFORM          = var.target_platform
     }
   }
 }

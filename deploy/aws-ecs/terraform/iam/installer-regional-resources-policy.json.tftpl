@@ -211,17 +211,33 @@
       "Action": [
         "xray:DeleteGroup",
         "xray:DeleteSamplingRule",
+        "xray:GetGroup",
+        "xray:ListTagsForResource",
         "xray:TagResource",
         "xray:UntagResource",
         "xray:UpdateGroup",
         "xray:UpdateSamplingRule"
       ],
       "Resource": [
-        "arn:aws:xray:${aws_region}:${aws_account_id}:group/a-*/*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:group/b-*/*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/a-*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/b-*"
+        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_a_namespace}-*/*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_b_namespace}-*/*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_a_namespace}-*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_b_namespace}-*"
       ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageRunEfsLifecycleConfiguration",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:PutLifecycleConfiguration"
+      ],
+      "Resource": "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",

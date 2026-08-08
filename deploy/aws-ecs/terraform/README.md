@@ -74,6 +74,8 @@ trust it temporarily; this is not a production certificate strategy.
   region chosen by the operator.
 - AWS credentials available through both named SDK/CLI profiles.
 - A digest-pinned ELSPETH application image.
+- `cosign` for keyless verification of the published GHCR digest before its
+  transfer into the private ECR repository.
 - Two distinct `bedrock/...` provider IDs plus the exact inference-profile and
   foundation-model ARNs those IDs may invoke.
 - An active Bedrock model-access agreement for each chosen model id in the
@@ -139,21 +141,22 @@ commit. Concretely for 0.7.2: the image must include commit `a04021af6`
 (`ELSPETH_WEB__DEFAULT_LLM_PROFILE`); every image published before
 `v0.7.2-RC-300726` predates it and cannot boot under this package.
 
-Image admission at apply time is an operator-claim check, not provenance: it
-proves the digest the operator named is what ECR serves and that the image's
-self-declared revision label matches the SHA the operator supplied. It cannot
-prove the label is truthful or that the image satisfies this package's
-settings contract, so supply values only from the same-commit build you
-performed yourself.
+Image admission at apply time proves the digest the operator named is what ECR
+serves, the image's self-declared revision label matches the supplied SHA, and
+its `io.elspeth.aws-ecs-config-contract` label matches this package. Those
+labels remain builder-controlled claims; the GHCR-to-ECR handoff therefore
+verifies the workflow's keyless cosign signature before copying the immutable
+index. Supply the package, SHA, and image only from the verified release build.
 
 ### Installer policy and task-role boundary
 
 The package deliberately splits IAM authority across two principals:
 
-- The three customer-managed policies for the normal installer are:
+- The four customer-managed policies for the normal installer are:
   `iam/installer-control-plane-policy.json.tftpl`,
-  `iam/installer-regional-resources-policy.json.tftpl`, and
-  `iam/installer-relationships-policy.json.tftpl`. Together they separate
+  `iam/installer-regional-resources-policy.json.tftpl`,
+  `iam/installer-relationships-policy.json.tftpl`, and
+  `iam/installer-runtime-observation-policy.json.tftpl`. Together they separate
   discovery reads from mutations, limit named resources, manage only the known
   inline and managed role-policy bindings, and permit `iam:PassRole` only to
   `ecs-tasks.amazonaws.com`. They cannot create or delete the generated roles,
@@ -164,7 +167,7 @@ The package deliberately splits IAM authority across two principals:
   denies prevent it from adding role permissions, passing or assuming a role,
   or starting an ECS task.
 
-Render all three installer policies plus the lifecycle policy for one account,
+Render all four installer policies plus the lifecycle policy for one account,
 region, and run before attaching them to their respective principals:
 
 ```sh
@@ -190,12 +193,15 @@ envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ec
 envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
   < iam/installer-relationships-policy.json.tftpl \
   > bootstrap/.terraform/installer-relationships-policy.json
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+  < iam/installer-runtime-observation-policy.json.tftpl \
+  > bootstrap/.terraform/installer-runtime-observation-policy.json
 envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
   < iam/lifecycle-policy.json.tftpl \
   > bootstrap/.terraform/iam-lifecycle-policy.json
 ```
 
-Inspect the rendered JSON and attach all three installer documents as separate
+Inspect the rendered JSON and attach all four installer documents as separate
 customer-managed policies to the normal installer principal. Attach the
 lifecycle policy only to the lifecycle principal. Each rendered installer
 document must remain within IAM's 6,144-character customer-managed-policy
@@ -289,16 +295,18 @@ export GITHUB_TOKEN=REPLACE_WITH_GHCR_READ_TOKEN
 export GHCR_REPOSITORY=ghcr.io/REPLACE_WITH_OWNER/elspeth
 export GHCR_TAG=REPLACE_WITH_LITERAL_GIT_TAG
 export ECR_TRANSFER_TAG="candidate-${GHCR_TAG}"
+export TARGET_PLATFORM=REPLACE_WITH_linux_amd64_OR_linux_arm64
 
 ECR_REPOSITORY_URL=$(terraform -chdir=bootstrap output -raw ecr_repository_url)
 ECR_REPOSITORY=$(terraform -chdir=bootstrap output -raw ecr_repository)
 ECR_REGISTRY=${ECR_REPOSITORY_URL%%/*}
+cosign version
 
 transfer_work=$(mktemp -d -p /tmp elspeth-ghcr-to-ecr.XXXXXX)
 chmod 700 "$transfer_work"
 mkdir -m 700 "$transfer_work/docker-config"
 (
-  set -e
+  set -Eeuo pipefail
   export DOCKER_CONFIG="$transfer_work/docker-config"
   trap 'docker logout ghcr.io >/dev/null 2>&1 || true; docker logout "$ECR_REGISTRY" >/dev/null 2>&1 || true; rm -rf -- "$transfer_work"' EXIT
 
@@ -318,6 +326,33 @@ mkdir -m 700 "$transfer_work/docker-config"
     "$GHCR_REPOSITORY:$GHCR_TAG")
   printf '%s\n' "$GHCR_IMAGE_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
   GHCR_IMAGE="$GHCR_REPOSITORY@$GHCR_IMAGE_DIGEST"
+  cosign verify \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    --certificate-identity "https://github.com/johnm-dta/elspeth/.github/workflows/build-push.yaml@refs/tags/$GHCR_TAG" \
+    "$GHCR_IMAGE"
+
+  resolve_target_manifest_digest() (
+    set -Eeuo pipefail
+    image=$1
+    target_platform=$2
+    case "$target_platform" in
+      linux/amd64|linux/arm64) ;;
+      *) printf '%s\n' unsupported_target_platform >&2; exit 1 ;;
+    esac
+    architecture=${target_platform#linux/}
+    docker buildx imagetools inspect --raw "$image" \
+      | jq -er --arg architecture "$architecture" '
+          [.manifests[]
+            | select(
+                .platform.os == "linux"
+                and .platform.architecture == $architecture
+                and (.platform.variant // "") == ""
+              )]
+          | if length == 1 then .[0].digest else error("expected exactly one target-platform manifest") end
+        '
+  )
+  GHCR_PLATFORM_DIGEST=$(resolve_target_manifest_digest "$GHCR_IMAGE" "$TARGET_PLATFORM")
+  printf '%s\n' "$GHCR_PLATFORM_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
 
   docker buildx imagetools create \
     --tag "$ECR_REPOSITORY_URL:$ECR_TRANSFER_TAG" \
@@ -332,14 +367,21 @@ mkdir -m 700 "$transfer_work/docker-config"
   test "$ECR_IMAGE_DIGEST" = "$GHCR_IMAGE_DIGEST"
 
   CANDIDATE_IMAGE="$ECR_REPOSITORY_URL@$ECR_IMAGE_DIGEST"
+  ECR_PLATFORM_DIGEST=$(resolve_target_manifest_digest "$CANDIDATE_IMAGE" "$TARGET_PLATFORM")
+  printf '%s\n' "$ECR_PLATFORM_DIGEST" | grep -Eq '^sha256:[0-9a-f]{64}$'
+  test "$ECR_PLATFORM_DIGEST" = "$GHCR_PLATFORM_DIGEST"
   printf 'candidate_image = "%s"\n' "$CANDIDATE_IMAGE"
+  printf 'candidate_platform_digest = "%s"\n' "$ECR_PLATFORM_DIGEST"
 )
 unset GITHUB_TOKEN
 ```
 
 Copy the printed `candidate_image` assignment into the selected scenario
-tfvars. Do not substitute the GHCR reference: both scenario roots intentionally
-reject any candidate outside the bootstrap-created ECR repository.
+tfvars and retain `candidate_platform_digest` as rollout evidence. The former
+names the multi-platform parent index; ECS reports the selected child manifest
+in `imageDigest`. Do not substitute the GHCR reference: both scenario roots
+intentionally reject any candidate outside the bootstrap-created ECR
+repository.
 
 ## Backend inputs
 
@@ -441,6 +483,7 @@ ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
 ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
 PUBLIC_URL=$(terraform -chdir=scenario-a output -raw public_url)
 CANDIDATE_TASK_DEFINITION=$(printf '%s' "$INVENTORY" | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+TARGET_PLATFORM=$(printf '%s' "$INVENTORY" | jq -er '.values.TARGET_PLATFORM')
 TARGET_GROUP_ARN=$(printf '%s' "$INVENTORY" | jq -er '.values.TARGET_GROUP_ARN')
 CANDIDATE_IMAGE=$(aws ecs describe-task-definition \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -454,6 +497,98 @@ chmod 600 "$acceptance_dir/ca.pem"
 # grant that read rather than widening the mode.
 setfacl -m u:1654:r "$acceptance_dir/ca.pem"
 
+resolve_target_ecr_digest() (
+  set -Eeuo pipefail
+  candidate_image=$1
+  target_platform=$2
+  case "$target_platform" in
+    linux/amd64|linux/arm64) ;;
+    *) printf '%s\n' unsupported_target_platform >&2; exit 1 ;;
+  esac
+  architecture=${target_platform#linux/}
+  repository_with_digest=${candidate_image#*/}
+  repository=${repository_with_digest%@*}
+  parent_digest=${candidate_image##*@}
+  image_json=$(aws ecr batch-get-image \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --repository-name "$repository" \
+    --image-ids "imageDigest=$parent_digest" \
+    --accepted-media-types \
+      application/vnd.oci.image.index.v1+json \
+      application/vnd.docker.distribution.manifest.list.v2+json \
+    --output json)
+  digest=$(jq -er --arg parent_digest "$parent_digest" --arg architecture "$architecture" '
+    (.failures == []) as $no_failures
+    | (.images | if length == 1 then .[0] else error("expected one parent index") end) as $image
+    | if $no_failures and $image.imageId.imageDigest == $parent_digest then $image else error("parent digest mismatch") end
+    | .imageManifest
+    | fromjson
+    | [.manifests[]
+        | select(
+            .platform.os == "linux"
+            and .platform.architecture == $architecture
+            and (.platform.variant // "") == ""
+          )]
+    | if length == 1 then .[0].digest else error("expected exactly one target-platform manifest") end
+  ' <<<"$image_json")
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+  printf '%s\n' "$digest"
+)
+
+verify_candidate_service() (
+  set -Eeuo pipefail
+  cluster=$1
+  service=$2
+  candidate_task_definition=$3
+  candidate_image=$4
+  candidate_platform_digest=$5
+
+  service_json=$(aws ecs describe-services \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --services "$service" --output json)
+  jq -e --arg candidate_task_definition "$candidate_task_definition" '
+    (.failures == [])
+    and (.services | length == 1)
+    and (.services[0].desiredCount == 1)
+    and (.services[0].runningCount == 1)
+    and (.services[0].pendingCount == 0)
+    and ([.services[0].deployments[] | select(.status == "PRIMARY")] | length == 1)
+    and ([.services[0].deployments[] | select(.status == "PRIMARY")][0]
+      | .rolloutState == "COMPLETED"
+      and .taskDefinition == $candidate_task_definition
+      and .desiredCount == 1
+      and .runningCount == 1
+      and .pendingCount == 0
+      and .failedTasks == 0)
+  ' <<<"$service_json"
+
+  tasks_json=$(aws ecs list-tasks \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --service-name "$service" \
+    --desired-status RUNNING --output json)
+  jq -e '.taskArns | length == 1' <<<"$tasks_json"
+  task_arn=$(jq -er '.taskArns[0]' <<<"$tasks_json")
+  task_json=$(aws ecs describe-tasks \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --tasks "$task_arn" --output json)
+  jq -e \
+    --arg candidate_task_definition "$candidate_task_definition" \
+    --arg candidate_image "$candidate_image" \
+    --arg candidate_platform_digest "$candidate_platform_digest" '
+      (.failures == [])
+      and (.tasks | length == 1)
+      and (.tasks[0].lastStatus == "RUNNING")
+      and (.tasks[0].taskDefinitionArn == $candidate_task_definition)
+      and ([.tasks[0].containers[] | select(.name == "elspeth-web")] | length == 1)
+      and ([.tasks[0].containers[] | select(.name == "elspeth-web")][0]
+        | .lastStatus == "RUNNING"
+        and .image == $candidate_image
+        and .imageDigest == $candidate_platform_digest)
+    ' <<<"$task_json"
+)
+
+CANDIDATE_PLATFORM_DIGEST=$(resolve_target_ecr_digest "$CANDIDATE_IMAGE" "$TARGET_PLATFORM")
+
 aws ecs update-service \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" \
@@ -462,6 +597,8 @@ aws ecs update-service \
 aws ecs wait services-stable \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+verify_candidate_service "$ECS_CLUSTER" "$ECS_SERVICE" \
+  "$CANDIDATE_TASK_DEFINITION" "$CANDIDATE_IMAGE" "$CANDIDATE_PLATFORM_DIGEST"
 aws elbv2 describe-target-health \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --target-group-arn "$TARGET_GROUP_ARN" \
@@ -570,6 +707,8 @@ aws ecs update-service \
 aws ecs wait services-stable \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+verify_candidate_service "$ECS_CLUSTER" "$ECS_SERVICE" \
+  "$CANDIDATE_TASK_DEFINITION" "$CANDIDATE_IMAGE" "$CANDIDATE_PLATFORM_DIGEST"
 sed -i '/^ELSPETH_ACCEPTANCE_REGISTER=/d' "$acceptance_dir/acceptance.env"
 docker run --rm --entrypoint python \
   --env-file "$acceptance_dir/acceptance.env" \
@@ -994,11 +1133,22 @@ crash-loops. Apply and roll the service in one operation: run
 `terraform apply`, then immediately select the registered candidate task
 definition explicitly and deploy that revision:
 
+In a fresh shell, first define `resolve_target_ecr_digest` and
+`verify_candidate_service` exactly as shown in the source-free acceptance
+section.
+
 ```sh
-CANDIDATE_TASK_DEFINITION=$(terraform -chdir=scenario-a output -json resolved_inventory \
-  | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+INVENTORY=$(terraform -chdir=scenario-a output -json resolved_inventory)
+CANDIDATE_TASK_DEFINITION=$(printf '%s' "$INVENTORY" | jq -er '.values.CANDIDATE_TASK_DEFINITION')
+TARGET_PLATFORM=$(printf '%s' "$INVENTORY" | jq -er '.values.TARGET_PLATFORM')
 ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
 ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
+CANDIDATE_IMAGE=$(aws ecs describe-task-definition \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --task-definition "$CANDIDATE_TASK_DEFINITION" \
+  --query 'taskDefinition.containerDefinitions[?name==`elspeth-web`].image | [0]' \
+  --output text)
+CANDIDATE_PLATFORM_DIGEST=$(resolve_target_ecr_digest "$CANDIDATE_IMAGE" "$TARGET_PLATFORM")
 test -n "$CANDIDATE_TASK_DEFINITION"
 aws ecs update-service \
   --profile "$AWS_PROFILE" \
@@ -1025,13 +1175,8 @@ also describes a healthy old deployment:
 aws ecs wait services-stable \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
-deployed=$(aws ecs describe-services \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
-  --query 'services[0].deployments[?status==`PRIMARY`] | [0]' --output json)
-test "$(jq -r '.taskDefinition' <<<"$deployed")" = "$CANDIDATE_TASK_DEFINITION"
-test "$(jq -r '.rolloutState' <<<"$deployed")" = "COMPLETED"
-jq -e '.runningCount > 0' <<<"$deployed" >/dev/null
+verify_candidate_service "$ECS_CLUSTER" "$ECS_SERVICE" \
+  "$CANDIDATE_TASK_DEFINITION" "$CANDIDATE_IMAGE" "$CANDIDATE_PLATFORM_DIGEST"
 ```
 
 ## Scenario B
@@ -1081,16 +1226,41 @@ and a teardown reminder. These are intended to be useful without reading the
 Terraform source.
 
 For teardown, select the same backend config and exact workspace used for
-installation, verify both explicit AWS profiles, account, and region again,
-and run the ordinary full destroy:
+installation, verify both explicit AWS profiles, account, and region again.
+Drain each applied service and prove it has no running tasks before destroying
+its state:
 
 ```sh
+drain_scenario_service() {
+  scenario_dir=$1
+  cluster=$(terraform -chdir="$scenario_dir" output -raw cluster_name)
+  service=$(terraform -chdir="$scenario_dir" output -raw service_name)
+  aws ecs update-service \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --service "$service" --desired-count 0 >/dev/null
+  aws ecs wait services-stable \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --services "$service"
+  aws ecs list-tasks \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --cluster "$cluster" --service-name "$service" \
+    --desired-status RUNNING --output json \
+    | jq -e '.taskArns | length == 0'
+}
+
+if terraform -chdir=scenario-b state list | grep -qx 'module.scenario.aws_ecs_service.web'; then
+  drain_scenario_service scenario-b
+  terraform -chdir=scenario-b destroy \
+    -var-file=../examples/scenario-b.tfvars
+fi
+
+drain_scenario_service scenario-a
 terraform -chdir=scenario-a destroy \
   -var-file=../examples/scenario-a.tfvars
 ```
 
-Use `scenario-b` and its inputs for the B variant. Once every scenario state is
-empty, destroy bootstrap last with the same two profiles:
+Once every scenario state is empty, destroy bootstrap last with the same two
+profiles:
 
 ```sh
 terraform -chdir=bootstrap destroy \
@@ -1103,10 +1273,10 @@ lifecycle principal deletes each role. The lifecycle principal then deletes
 the custom boundary only during the final bootstrap destroy. Repeated apply
 and full `terraform destroy` commands remain the supported idempotent workflow.
 
-The three installer policies and the lifecycle policy attached before
+The four installer policies and the lifecycle policy attached before
 bootstrap live outside every Terraform state, so no destroy removes them.
 After the bootstrap destroy succeeds — both destroys still need those
-policies — detach and delete all four through the same paths used to attach
+policies — detach and delete all five through the same paths used to attach
 them.
 
 ### Container Insights log-group orphan on redeploy (R2-D3, elspeth-a229c247a1)

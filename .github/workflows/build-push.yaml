@@ -135,6 +135,7 @@ jobs:
             --tag "$LEAN_IMAGE" \
             .
           test "$(docker inspect --format '{{ index .Config.Labels "io.elspeth.install-extras" }}' "$LEAN_IMAGE")" = "$INSTALL_EXTRAS"
+          test "$(docker inspect --format '{{ index .Config.Labels "io.elspeth.aws-ecs-config-contract" }}' "$LEAN_IMAGE")" = "elspeth.aws-ecs.runtime.v1"
           docker run --rm --interactive --entrypoint python "$LEAN_IMAGE" - <<'PY'
           import psycopg
           import psycopg2
@@ -407,6 +408,7 @@ jobs:
             [[ -n "$image" ]] || continue
             docker pull "$image"
             test "$(docker inspect --format '{{ index .Config.Labels "io.elspeth.install-extras" }}' "$image")" = "all"
+            test "$(docker inspect --format '{{ index .Config.Labels "io.elspeth.aws-ecs-config-contract" }}' "$image")" = "elspeth.aws-ecs.runtime.v1"
             test "$(docker run --rm --entrypoint id "$image" -u)" = "1654"
             test "$(docker run --rm --entrypoint id "$image" -g)" = "1654"
             docker run --rm --entrypoint /bin/sh "$image" -c \

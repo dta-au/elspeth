@@ -45,8 +45,17 @@ variable "backend_state_bucket" {
   type = string
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.backend_state_bucket))
-    error_message = "backend_state_bucket must use the elspeth- prefix and a valid lowercase S3 bucket name."
+    condition = (
+      length(var.backend_state_bucket) <= 63
+      && !strcontains(var.backend_state_bucket, "..")
+      && !endswith(var.backend_state_bucket, "-s3alias")
+      && !endswith(var.backend_state_bucket, "--ol-s3")
+      && !endswith(var.backend_state_bucket, ".mrap")
+      && !endswith(var.backend_state_bucket, "--x-s3")
+      && !endswith(var.backend_state_bucket, "--table-s3")
+      && can(regex("^elspeth-[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.backend_state_bucket))
+    )
+    error_message = "backend_state_bucket must use the elspeth- prefix and AWS S3 general-purpose bucket grammar, including the 63-character limit and reserved-suffix exclusions."
   }
 }
 
@@ -54,8 +63,8 @@ variable "ecr_repository" {
   type = string
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.ecr_repository))
-    error_message = "ecr_repository must use the elspeth- prefix."
+    condition     = length(var.ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.ecr_repository))
+    error_message = "ecr_repository must use the elspeth- prefix and AWS ECR repository-name grammar, and be at most 256 characters."
   }
 }
 
@@ -63,8 +72,8 @@ variable "cloudwatch_agent_ecr_repository" {
   type = string
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.cloudwatch_agent_ecr_repository))
-    error_message = "cloudwatch_agent_ecr_repository must use the elspeth- prefix."
+    condition     = length(var.cloudwatch_agent_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.cloudwatch_agent_ecr_repository))
+    error_message = "cloudwatch_agent_ecr_repository must use the elspeth- prefix and AWS ECR repository-name grammar, and be at most 256 characters."
   }
 }
 
