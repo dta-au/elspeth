@@ -1153,9 +1153,11 @@ _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER = metrics.get_meter(__name__).cre
     "composer.audit.tool_row_persist_failed_during_unwind_total",
     unit="1",
     description=(
-        "Count of audit-row persist failures on the unwind path (a primary "
-        "failure was already in flight; this row failure is recorded but "
-        "does not raise so it cannot mask the primary exception)."
+        "Count of audit ROWS that failed to become durable on the unwind "
+        "path (a primary failure was already in flight; the failure is "
+        "recorded but does not raise so it cannot mask the primary "
+        "exception). Cohort persistence adds the cohort's row count per "
+        "failure, preserving the per-row unit of the loop it replaced."
     ),
 )
 
@@ -1550,9 +1552,13 @@ async def _persist_tool_invocations(
         if plugin_crash_pending:
             # Unwind path: a primary failure is already in flight.
             # Counting + slog preserves audibility without masking
-            # the original exception.
+            # the original exception. The counter unit is ROWS lost,
+            # not cohorts: the atomic cohort makes every buffered row
+            # non-durable at once, and dashboards calibrated to the
+            # per-row loop this replaced must keep reading evidence
+            # loss at the same magnitude.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                1,
+                len(tool_invocations),
                 {"helper": "tool_invocations"},
             )
             slog.error(
@@ -1638,15 +1644,19 @@ async def _persist_llm_calls(
         )
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations);
+            # the log lists the full cohort so a 12-call loss stays
+            # forensically distinct from a 1-call loss.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                1,
+                len(llm_calls),
                 {"helper": "llm_calls"},
             )
             slog.error(
                 "composer_llm_call_persist_failed_during_unwind",
                 session_id=str(session_id),
                 calls=len(llm_calls),
-                model_requested=llm_calls[0].model_requested,
+                models_requested=[call.model_requested for call in llm_calls],
+                statuses=[call.status.value for call in llm_calls],
                 exc_class=type(save_err).__name__,
             )
             return
@@ -1741,8 +1751,11 @@ async def _persist_turn_audit_cohort(
         )
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations):
+            # the whole turn — tool rows AND LLM sidecars — failed to
+            # become durable together.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                1,
+                len(tool_invocations) + len(llm_calls),
                 {"helper": "turn_audit_cohort"},
             )
             slog.error(
@@ -1751,6 +1764,7 @@ async def _persist_turn_audit_cohort(
                 invocations=len(tool_invocations),
                 tool_names=[invocation.tool_name for invocation in tool_invocations],
                 calls=len(llm_calls),
+                models_requested=[call.model_requested for call in llm_calls],
                 exc_class=type(save_err).__name__,
             )
             # Nothing became durable, so no binding may claim otherwise.
@@ -1807,22 +1821,26 @@ async def _persist_run_diagnostics_llm_calls(
         await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
     except RunDiagnosticsAuthorityLostError as lost:
         if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations).
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                1,
+                len(llm_calls),
                 {"helper": "run_diagnostics_llm_calls"},
             )
             slog.error(
                 "run_diagnostics_audit_authority_lost_during_unwind",
                 session_id=str(authority.session_id),
                 run_id=str(authority.run_id),
+                calls=len(llm_calls),
                 reason=lost.reason,
             )
             return
         raise
     except SQLAlchemyError as save_err:
         if plugin_crash_pending:
+            # Counter unit is ROWS lost (see _persist_tool_invocations);
+            # the log lists the full cohort, mirroring _persist_llm_calls.
             _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                1,
+                len(llm_calls),
                 {"helper": "run_diagnostics_llm_calls"},
             )
             slog.error(
@@ -1830,7 +1848,8 @@ async def _persist_run_diagnostics_llm_calls(
                 session_id=str(authority.session_id),
                 run_id=str(authority.run_id),
                 calls=len(llm_calls),
-                model_requested=llm_calls[0].model_requested,
+                models_requested=[call.model_requested for call in llm_calls],
+                statuses=[call.status.value for call in llm_calls],
                 exc_class=type(save_err).__name__,
             )
             return
