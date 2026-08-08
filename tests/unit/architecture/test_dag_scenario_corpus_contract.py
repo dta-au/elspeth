@@ -487,7 +487,17 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # same change but is not pinned in the manifest, so nothing else moved. Verified
 # mechanical by A/B: reverting that one token restores the previous digest
 # exactly, so no audit projection material other than the hash changed.
-EXPECTED_CASE_REGISTRY_SHA256 = "a46b42c7b777f1d652223a182bf6f40ac4dacf4b770d591c04dccfe769b2a0e0"
+# Rotated 2026-08-08 for elspeth-74b795208f (branch-loss reasons became bounded
+# category tokens): the six fork-coalesce-policies *-lost-c semantic
+# ``projection_sha256`` values moved because each merge context's
+# ``branches_lost.path_c`` changed from
+# "quarantined:{'reason': 'invalid_input', 'error': 'injected DAG corpus
+# branch loss'}" to the bare "quarantined" token. Verified mechanical by A/B:
+# swapping ONLY that value back to the old string inside each live semantic
+# projection reproduces every prior declared digest byte-exactly, so no other
+# projection material moved (each old digest asserted to be a single manifest
+# occurrence before the rewrite).
+EXPECTED_CASE_REGISTRY_SHA256 = "f906551fbc6f08238696cb566777f739c4aca90ae4879bc5477deaa0aede518e"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
