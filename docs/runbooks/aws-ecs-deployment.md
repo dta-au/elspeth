@@ -2258,8 +2258,7 @@ exporters:
     retain_initial_value_of_delta_metric: true
     resource_to_telemetry_conversion:
       enabled: true
-  awsxray/elspeth:
-    indexed_attributes: [run_id, status]
+  awsxray/elspeth: {}
 service:
   pipelines:
     metrics/elspeth:
@@ -2280,11 +2279,14 @@ scenario-owned `OPERATOR_METRICS_LOG_GROUP`, and extracts them into the
 `ELSPETH/Operator` CloudWatch namespace. `NoDimensionRollup` prevents the
 exporter from silently creating additional dimension sets, and retaining the
 first delta value preserves low-frequency acceptance and failure counters.
-The `awsxray` exporter sends traces to X-Ray and indexes only the bounded
-`run_id` and `status` lifecycle attributes that the acceptance query reads as
-annotations. Both exporters use the default AWS credential chain and therefore
-the ECS task role; neither accepts an endpoint, role override, profile, or
-static credential here.
+The `awsxray` exporter sends traces to X-Ray. With this tracked empty exporter
+configuration, X-Ray records ELSPETH's bounded `run_id` and `status` lifecycle
+attributes under each segment document's `metadata.default` object. The
+acceptance query reads that store and also accepts the legacy indexed
+`annotations` representation during compatibility transitions; if both are
+present they must agree exactly. Both exporters use the default AWS credential
+chain and therefore the ECS task role; neither accepts an endpoint, role
+override, profile, or static credential here.
 
 Production permits only these two supported exporters. The unsupported
 `awscloudwatch` collector exporter must not be used. Diagnostic `debug` output
@@ -3119,24 +3121,13 @@ if test "$ACTIVE_SCENARIO_ID" = A; then
 fi
 ```
 
-> **Known issue (elspeth-5824bd9546, elspeth-0a9d1e89a9):** the
-> `verify-operator-telemetry` check (both `positive` and `outage` phases)
-> currently fails deterministically because of two acceptance-checker
-> defects unrelated to telemetry delivery. `metric_observed()` treats
-> CloudWatch's normal not-yet-ingested `GetMetricData` response shape (one
-> result, `StatusCode: "Complete"`, empty `Values`/`Timestamps`) as fatal on
-> attempt 0 instead of retrying (elspeth-5824bd9546); `trace_observed()`
-> reads `document.get("annotations")`, but real X-Ray segment documents
-> store the run id and status under `metadata.default`, not a top-level
-> `annotations` key (elspeth-0a9d1e89a9). Until both close, qualifying
-> telemetry evidence is a direct CloudWatch `GetMetricData` query — using
-> each metric's complete, published dimension set; unlike `ListMetrics`,
-> `GetMetricData` requires the full dimension key, not a subset — for
-> `ELSPETH/Operator` `operator.acceptance.sentinel`, plus X-Ray trace
-> summaries bound to the run id. An `OperatorTelemetryAcceptanceError`
-> raised by either checker, with delivery independently proven by that
-> evidence, does not gate release admission. Keep running the check in
-> sequence above — do not remove it from the acceptance program.
+`verify-operator-telemetry` treats CloudWatch's normal not-yet-ingested
+`GetMetricData` result (`StatusCode: "Complete"` with aligned empty
+`Values`/`Timestamps`) as an absent signal and continues the bounded retry
+loop. It reads X-Ray lifecycle correlation from the tracked exporter's
+`metadata.default` representation, while retaining strict compatibility with
+legacy indexed annotations. Malformed shapes, duplicate JSON keys, and
+conflicting correlation stores remain fatal acceptance errors.
 
 The `verify-bedrock-guardrails` receipt must contain `plugin_policy` with the
 exact `target_llm` and the prompt-shield/content-safety entries in

@@ -524,6 +524,128 @@ def test_aws_operator_telemetry_queries_treat_absence_as_retryable_and_malformed
     assert "raw trace" not in str(raised.value)
 
 
+def test_aws_operator_telemetry_queries_treat_complete_empty_metric_as_retryable() -> None:
+    class CompleteEmptyCloudWatch:
+        def get_metric_data(self, **_kwargs: object) -> object:
+            return {
+                "MetricDataResults": [
+                    {
+                        "Id": "acceptance",
+                        "StatusCode": "Complete",
+                        "Timestamps": [],
+                        "Values": [],
+                    }
+                ]
+            }
+
+    queries = operator_telemetry.AWSOperatorTelemetryQueries(
+        cloudwatch=CompleteEmptyCloudWatch(),
+        xray=object(),
+        dimensions=(("service.name", "elspeth-web"),),
+        start_time=datetime(2026, 7, 14, 1, 0, tzinfo=UTC),
+        end_time=datetime(2026, 7, 14, 1, 5, tzinfo=UTC),
+    )
+
+    assert (
+        queries.metric_observed(
+            metric_name="operator.acceptance.sentinel",
+            sentinel_value=1,
+            acceptance_namespace="acceptance-run-a",
+        )
+        is False
+    )
+
+
+def test_aws_operator_telemetry_queries_read_trace_correlation_from_xray_metadata() -> None:
+    run_id = "landscape-run-internal"
+    trace_id = operator_telemetry.xray_trace_id(run_id, started_at=_TELEMETRY_STARTED_AT)
+
+    class XRay:
+        def batch_get_traces(self, **_kwargs: object) -> object:
+            return {
+                "Traces": [
+                    {
+                        "Id": trace_id,
+                        "Segments": [
+                            {
+                                "Document": json.dumps(
+                                    {
+                                        "name": "RunStarted",
+                                        "metadata": {"default": {"run_id": run_id}},
+                                    }
+                                )
+                            },
+                            {
+                                "Document": json.dumps(
+                                    {
+                                        "name": "RunFinished",
+                                        "metadata": {"default": {"run_id": run_id, "status": "completed"}},
+                                    }
+                                )
+                            },
+                        ],
+                    }
+                ],
+                "UnprocessedTraceIds": [],
+            }
+
+    queries = operator_telemetry.AWSOperatorTelemetryQueries(
+        cloudwatch=object(),
+        xray=XRay(),
+        dimensions=(("service.name", "elspeth-web"),),
+        start_time=datetime(2026, 7, 14, 1, 0, tzinfo=UTC),
+        end_time=datetime(2026, 7, 14, 1, 5, tzinfo=UTC),
+    )
+
+    assert queries.trace_observed(trace_name="RunStarted", run_id=run_id, started_at=_TELEMETRY_STARTED_AT) is True
+    assert queries.trace_observed(trace_name="RunFinished", run_id=run_id, started_at=_TELEMETRY_STARTED_AT) is True
+    assert queries.trace_terminal_status(run_id=run_id) == "completed"
+
+
+def test_xray_trace_boundary_rejects_conflicting_correlation_stores() -> None:
+    trace_id = operator_telemetry.xray_trace_id("run-a", started_at=_TELEMETRY_STARTED_AT)
+    raw = {
+        "Traces": [
+            {
+                "Id": trace_id,
+                "Segments": [
+                    {
+                        "Document": json.dumps(
+                            {
+                                "name": "RunStarted",
+                                "annotations": {"run_id": "run-a"},
+                                "metadata": {"default": {"run_id": "run-b"}},
+                            }
+                        )
+                    }
+                ],
+            }
+        ],
+        "UnprocessedTraceIds": [],
+    }
+
+    with pytest.raises(operator_telemetry.OperatorTelemetryAcceptanceError, match="X-Ray projection"):
+        operator_telemetry.AWSOperatorTelemetryQueries._trace_documents(
+            raw=raw,
+            expected_trace_id=trace_id,
+        )
+
+
+def test_xray_trace_boundary_rejects_duplicate_json_keys() -> None:
+    trace_id = operator_telemetry.xray_trace_id("run-a", started_at=_TELEMETRY_STARTED_AT)
+    document = '{"name":"RunStarted","metadata":{"default":{"run_id":"run-a","run_id":"run-b"}}}'
+    raw = {
+        "Traces": [{"Id": trace_id, "Segments": [{"Document": document}]}],
+        "UnprocessedTraceIds": [],
+    }
+
+    with pytest.raises(operator_telemetry.OperatorTelemetryAcceptanceError, match="X-Ray projection"):
+        operator_telemetry.AWSOperatorTelemetryQueries._trace_documents(
+            raw=raw,
+            expected_trace_id=trace_id,
+        )
+
+
 def test_verify_operator_telemetry_live_positive_uses_default_chain_clients_and_closed_receipt() -> None:
     sentinel = "fixed-non-content-sentinel"
     sentinel_value = int(hashlib.sha256(sentinel.encode()).hexdigest()[:12], 16)

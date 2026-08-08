@@ -22,6 +22,9 @@ RUNBOOK_INDEX = REPO_ROOT / "docs" / "runbooks" / "index.md"
 DOCKER_GUIDE = REPO_ROOT / "docs" / "guides" / "docker.md"
 OIDC_PLAYWRIGHT_CONFIG = REPO_ROOT / "src" / "elspeth" / "web" / "frontend" / "playwright.oidc.config.ts"
 TERRAFORM_README = REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "README.md"
+TRACKED_OTEL_CONFIG = (
+    REPO_ROOT / "deploy" / "aws-ecs" / "terraform" / "telemetry" / "elspeth.cloudwatch-agent.v1" / "elspeth.cloudwatch-agent.v1.otel.yaml"
+)
 
 
 def _text() -> str:
@@ -259,6 +262,8 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         assert required in text
 
     otel = next(document for document in _yaml_documents() if isinstance(document, dict) and "receivers" in document)
+    tracked_otel = yaml.safe_load(TRACKED_OTEL_CONFIG.read_text(encoding="utf-8"))
+    assert otel == tracked_otel
     assert set(otel["receivers"]) == {"otlp/elspeth"}
     assert otel["receivers"]["otlp/elspeth"] == {"protocols": {"grpc": {"endpoint": "127.0.0.1:4317"}}}
     assert set(otel["processors"]) == {"memory_limiter/elspeth", "batch/elspeth"}
@@ -271,7 +276,7 @@ def test_runbook_preserves_versioned_hashed_bounded_agent_config() -> None:
         "retain_initial_value_of_delta_metric": True,
         "resource_to_telemetry_conversion": {"enabled": True},
     }
-    assert otel["exporters"]["awsxray/elspeth"] == {"indexed_attributes": ["run_id", "status"]}
+    assert otel["exporters"]["awsxray/elspeth"] == {}
     assert {
         "OPERATOR_METRICS_LOG_GROUP",
         "CLOUDWATCH_AGENT_IMAGE",

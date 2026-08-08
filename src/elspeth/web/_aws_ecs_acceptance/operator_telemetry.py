@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.telemetry.serialization import derive_trace_id
@@ -50,6 +51,15 @@ from .state import AcceptanceState
 _MAX_XRAY_SEGMENTS = 32
 _MAX_XRAY_DOCUMENT_BYTES = 64 * 1024
 _MAX_XRAY_RESPONSE_BYTES = 256 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedXRayLifecycle:
+    """Owned projection of one validated X-Ray lifecycle segment."""
+
+    name: str
+    run_id: str
+    status: str | None
 
 
 class AuditSentinel(Protocol):
@@ -214,13 +224,7 @@ class AWSOperatorTelemetryQueries:
                 raise ValueError
             values = result.get("Values")
             timestamps = result.get("Timestamps")
-            if (
-                not isinstance(values, list)
-                or not isinstance(timestamps, list)
-                or not values
-                or len(values) != len(timestamps)
-                or len(values) > 100
-            ):
+            if not isinstance(values, list) or not isinstance(timestamps, list) or len(values) != len(timestamps) or len(values) > 100:
                 raise ValueError
             matched = False
             for value, timestamp in zip(values, timestamps, strict=True):
@@ -240,40 +244,117 @@ class AWSOperatorTelemetryQueries:
         return True
 
     @staticmethod
-    def _trace_documents(raw: object, *, expected_trace_id: str) -> list[Mapping[str, object]] | None:
-        if not isinstance(raw, Mapping) or raw.get("NextToken") is not None:
+    @trust_boundary(
+        tier=3,
+        source="AWS X-Ray BatchGetTraces response and embedded segment documents",
+        source_param="raw",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises OperatorTelemetryAcceptanceError on malformed response shape, duplicate JSON keys, "
+            "or conflicting correlation stores; never coerces external values"
+        ),
+        test_ref=(
+            "tests/unit/web/aws_ecs_acceptance/test_operator_telemetry.py::test_xray_trace_boundary_rejects_conflicting_correlation_stores"
+        ),
+        test_fingerprint="5edf32258e9859ffa006743a2e01efbeea7f669d5b4d7503ad121bf01b9ef5b6",
+    )
+    def _trace_documents(raw: object, *, expected_trace_id: str) -> tuple[_AdmittedXRayLifecycle, ...] | None:
+        def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        def _reject_constant(_value: str) -> object:
             raise ValueError
-        unprocessed = raw.get("UnprocessedTraceIds", [])
-        traces = raw.get("Traces")
-        if not isinstance(unprocessed, list) or unprocessed or not isinstance(traces, list):
-            raise ValueError
-        if not traces:
-            return None
-        if len(traces) != 1:
-            raise ValueError
-        trace = traces[0]
-        if not isinstance(trace, Mapping) or trace.get("Id") != expected_trace_id:
-            raise ValueError
-        segments = trace.get("Segments")
-        if not isinstance(segments, list) or not segments or len(segments) > _MAX_XRAY_SEGMENTS:
-            raise ValueError
-        documents: list[Mapping[str, object]] = []
-        total_bytes = 0
-        for segment in segments:
-            if not isinstance(segment, Mapping):
+
+        try:
+            if (
+                type(expected_trace_id) is not str
+                or re.fullmatch(r"1-[0-9a-f]{8}-[0-9a-f]{24}", expected_trace_id) is None
+                or not isinstance(raw, Mapping)
+                or raw.get("NextToken") is not None
+            ):
                 raise ValueError
-            document = segment.get("Document")
-            if type(document) is not str:
+            unprocessed = raw.get("UnprocessedTraceIds", [])
+            traces = raw.get("Traces")
+            if not isinstance(unprocessed, list) or unprocessed or not isinstance(traces, list):
                 raise ValueError
-            size = len(document.encode("utf-8"))
-            total_bytes += size
-            if size > _MAX_XRAY_DOCUMENT_BYTES or total_bytes > _MAX_XRAY_RESPONSE_BYTES:
+            if not traces:
+                return None
+            if len(traces) != 1:
                 raise ValueError
-            parsed = json.loads(document)
-            if not isinstance(parsed, Mapping):
+            trace = traces[0]
+            if not isinstance(trace, Mapping) or trace.get("Id") != expected_trace_id:
                 raise ValueError
-            documents.append(parsed)
-        return documents
+            segments = trace.get("Segments")
+            if not isinstance(segments, list) or not segments or len(segments) > _MAX_XRAY_SEGMENTS:
+                raise ValueError
+            lifecycles: list[_AdmittedXRayLifecycle] = []
+            total_bytes = 0
+            for segment in segments:
+                if not isinstance(segment, Mapping):
+                    raise ValueError
+                document = segment.get("Document")
+                if type(document) is not str:
+                    raise ValueError
+                size = len(document.encode("utf-8"))
+                total_bytes += size
+                if size > _MAX_XRAY_DOCUMENT_BYTES or total_bytes > _MAX_XRAY_RESPONSE_BYTES:
+                    raise ValueError
+                parsed = json.loads(
+                    document,
+                    object_pairs_hook=_unique_object,
+                    parse_constant=_reject_constant,
+                )
+                if not isinstance(parsed, Mapping):
+                    raise ValueError
+                name = parsed.get("name")
+                if name not in _TRACE_NAMES:
+                    continue
+
+                stores: list[Mapping[object, object]] = []
+                annotations = parsed.get("annotations")
+                if annotations is not None:
+                    if not isinstance(annotations, Mapping):
+                        raise ValueError
+                    stores.append(annotations)
+                metadata = parsed.get("metadata")
+                if metadata is not None:
+                    if not isinstance(metadata, Mapping):
+                        raise ValueError
+                    default_metadata = metadata.get("default")
+                    if not isinstance(default_metadata, Mapping):
+                        raise ValueError
+                    stores.append(default_metadata)
+                if not stores:
+                    raise ValueError
+
+                correlations: list[tuple[str, str | None]] = []
+                for store in stores:
+                    run_id = store.get("run_id")
+                    status = store.get("status")
+                    if (
+                        type(run_id) is not str
+                        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", run_id) is None
+                        or (status is not None and type(status) is not str)
+                    ):
+                        raise ValueError
+                    if name == "RunFinished":
+                        if status not in _TERMINAL_RUN_STATUSES:
+                            raise ValueError
+                    elif status is not None:
+                        raise ValueError
+                    correlations.append((run_id, status))
+                if any(correlation != correlations[0] for correlation in correlations[1:]):
+                    raise ValueError
+                run_id, status = correlations[0]
+                lifecycles.append(_AdmittedXRayLifecycle(name=name, run_id=run_id, status=status))
+            return tuple(lifecycles)
+        except (json.JSONDecodeError, RecursionError, TypeError, UnicodeError, ValueError):
+            raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid") from None
 
     def trace_observed(self, *, trace_name: str, run_id: str, started_at: datetime) -> bool:
         if trace_name not in _TRACE_NAMES:
@@ -283,33 +364,24 @@ class AWSOperatorTelemetryQueries:
             raw = self._xray.batch_get_traces(TraceIds=[expected_trace_id])
         except Exception:
             raise OperatorTelemetryAcceptanceError("X-Ray query failed") from None
-        try:
-            documents = self._trace_documents(raw, expected_trace_id=expected_trace_id)
-            if documents is None:
-                return False
-            self._assert_forbidden_absent(documents)
-            observed = False
-            for document in documents:
-                name = document.get("name")
-                if name not in _TRACE_NAMES:
-                    continue
-                annotations = document.get("annotations")
-                if not isinstance(annotations, Mapping) or annotations.get("run_id") != run_id:
-                    raise ValueError
-                if name == "RunFinished":
-                    status = annotations.get("status")
-                    if type(status) is not str or status not in _TERMINAL_RUN_STATUSES:
-                        raise ValueError
-                    prior = None
-                    if run_id in self._trace_terminal_statuses:
-                        prior = self._trace_terminal_statuses[run_id]
-                    if prior is not None and prior != status:
-                        raise ValueError
-                    self._trace_terminal_statuses[run_id] = status
-                observed = observed or name == trace_name
-            return observed
-        except (json.JSONDecodeError, TypeError, UnicodeError, ValueError):
-            raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid") from None
+        self._assert_forbidden_absent(raw)
+        lifecycles = self._trace_documents(raw, expected_trace_id=expected_trace_id)
+        if lifecycles is None:
+            return False
+        observed = False
+        for lifecycle in lifecycles:
+            if lifecycle.run_id != run_id:
+                raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid")
+            if lifecycle.name == "RunFinished":
+                status = lifecycle.status
+                if status is None:
+                    raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid")
+                prior = self._trace_terminal_statuses.get(run_id)
+                if prior is not None and prior != status:
+                    raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid")
+                self._trace_terminal_statuses[run_id] = status
+            observed = observed or lifecycle.name == trace_name
+        return observed
 
     def trace_terminal_status(self, *, run_id: str) -> str | None:
         status = None
