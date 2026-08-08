@@ -27,15 +27,20 @@ Test order is deliberate and load-bearing, not decorative:
    already-baselined site's entry records how many non-amnestied
    occurrences it covers, and ANY divergence (increase OR decrease) must
    fire, not just growth past zero.
-4. Everything else (fixtures, self-test pairing, qualname collisions,
+4. Probe-shape drift, semantic import/shadow resolution, and boundary
+   provenance invalidation — a same-count substitution or alias/rebinding
+   must not create a false green.
+5. Parse/read diagnostics — every independently scanned root fails closed.
+6. Everything else (fixtures, self-test pairing, qualname collisions,
    stale-entry detection).
-5. Finally, the live-tree "zero findings" assertion — meaningful ONLY
+7. Finally, the live-tree "zero findings" assertion — meaningful ONLY
    because every check above it already bites.
 """
 
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
@@ -44,10 +49,30 @@ from elspeth_lints.core.ast_walker import walk_python_files
 from elspeth_lints.rules.masquerade.baseline import BaselineEntry, MasqueradeBaseline, load_baseline, render_baseline_yaml
 from elspeth_lints.rules.masquerade.inventory import compute_qualname, iter_masquerade_sites
 from elspeth_lints.rules.masquerade.metadata import SCAN_SUBDIRS
-from elspeth_lints.rules.masquerade.rule import RULE, collect_sites, group_non_amnestied_sites, scan_root
+from elspeth_lints.rules.masquerade.rule import RULE, SiteGroup, collect_sites, group_non_amnestied_sites, scan_root
 from elspeth_lints.rules.masquerade.seed_baseline import build_entries
+from elspeth_lints.rules.masquerade.seed_baseline import main as seed_baseline_main
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def _complete_synthetic_scan_layout(request: pytest.FixtureRequest) -> None:
+    """Give ordinary tmp-path cases the same four-root layout as production."""
+    if "tmp_path" not in request.fixturenames or request.node.name in {
+        "test_scan_root_rejects_an_inert_repository_root",
+        "test_scan_root_rejects_an_existing_but_empty_declared_root",
+    }:
+        return
+    tmp_path = request.getfixturevalue("tmp_path")
+    for subdir in SCAN_SUBDIRS:
+        (tmp_path / subdir).mkdir(parents=True, exist_ok=True)
+
+
+def _single_non_amnestied_group(source: str, path: str = "src/elspeth/probe.py") -> SiteGroup:
+    groups = group_non_amnestied_sites(iter_masquerade_sites(ast.parse(source), path))
+    assert len(groups) == 1
+    return groups[0]
 
 
 def test_self_test_a_fresh_banned_site_is_never_silently_green(tmp_path: Path) -> None:
@@ -60,7 +85,7 @@ def test_self_test_a_fresh_banned_site_is_never_silently_green(tmp_path: Path) -
     reason — a gate that looked at nothing is indistinguishable, by
     finding-count alone, from a gate that looked at a clean tree.
     """
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "elspeth" / "fresh_probe.py").write_text(
         "def check(plugin):\n    return hasattr(plugin, 'run_batch')\n",
         encoding="utf-8",
@@ -72,6 +97,10 @@ def test_self_test_a_fresh_banned_site_is_never_silently_green(tmp_path: Path) -
     assert findings[0].rule_id == "masquerade.attribute-probes"
     assert "hasattr" in findings[0].message
     assert "check" in findings[0].message
+    suggestion = findings[0].suggestion
+    assert suggestion is not None
+    assert "seed_baseline" in suggestion
+    assert "probe_shapes" in findings[0].message
 
 
 def test_self_test_goes_red_if_a_baseline_entry_covers_it_then_green(tmp_path: Path) -> None:
@@ -81,19 +110,19 @@ def test_self_test_goes_red_if_a_baseline_entry_covers_it_then_green(tmp_path: P
     fire on an unbaselined site AND clear on an adjudicated one — not just
     always-fire or always-clear.
     """
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
-    (tmp_path / "src" / "elspeth" / "fresh_probe.py").write_text(
-        "def check(plugin):\n    return hasattr(plugin, 'run_batch')\n",
-        encoding="utf-8",
-    )
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
+    source = "def check(plugin):\n    return hasattr(plugin, 'run_batch')\n"
+    (tmp_path / "src" / "elspeth" / "fresh_probe.py").write_text(source, encoding="utf-8")
     assert len(scan_root(tmp_path)) == 1
 
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
+    group = _single_non_amnestied_group(source, "src/elspeth/fresh_probe.py")
     entry = BaselineEntry(
         path="src/elspeth/fresh_probe.py",
         qualname="check",
         kind="hasattr",
         occurrences=1,
+        probe_shapes=group.probe_shapes,
         classification="unadjudicated",
         justification="test fixture",
     )
@@ -146,12 +175,12 @@ def test_occurrence_count_drift_fires_when_a_probe_is_added(tmp_path: Path) -> N
     a third lands. The (path, qualname, kind) key is unchanged — a
     key-only comparison would stay green. The count must not.
     """
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "elspeth" / "boundary.py").write_text(
         "def admit(x):\n    a = getattr(x, 'a', None)\n    b = getattr(x, 'b', None)\n    c = getattr(x, 'c', None)\n    return a, b, c\n",
         encoding="utf-8",
     )
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
     entry = BaselineEntry(
         path="src/elspeth/boundary.py",
         qualname="admit",
@@ -177,12 +206,12 @@ def test_occurrence_count_drift_fires_when_a_probe_is_removed(tmp_path: Path) ->
     sites are migrated away, re-opening room for it to creep back up
     unnoticed later.
     """
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "elspeth" / "boundary.py").write_text(
         "def admit(x):\n    return getattr(x, 'a', None)\n",
         encoding="utf-8",
     )
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
     entry = BaselineEntry(
         path="src/elspeth/boundary.py",
         qualname="admit",
@@ -207,7 +236,7 @@ def test_occurrence_count_drift_fires_when_every_occurrence_becomes_amnestied(tm
     The (path, qualname, kind) key still exists in the tree (so this is
     NOT stale-baseline-entry), but zero non-amnestied occurrences remain.
     """
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "elspeth" / "boundary.py").write_text(
         "from elspeth.contracts.trust_boundary import trust_boundary\n"
         "\n"
@@ -217,7 +246,7 @@ def test_occurrence_count_drift_fires_when_every_occurrence_becomes_amnestied(tm
         "    return getattr(response, 'a', None)\n",
         encoding="utf-8",
     )
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
     entry = BaselineEntry(
         path="src/elspeth/boundary.py",
         qualname="admit",
@@ -233,26 +262,247 @@ def test_occurrence_count_drift_fires_when_every_occurrence_becomes_amnestied(tm
     assert len(findings) == 1
     assert "occurrence-count-drift" in findings[0].message
     assert "currently has 0" in findings[0].message
+    suggestion = findings[0].suggestion
+    assert suggestion is not None
+    assert "Delete the entry" in suggestion
+    assert "occurrences: 0" not in suggestion
 
 
 def test_matching_occurrence_count_is_clean(tmp_path: Path) -> None:
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
-    (tmp_path / "src" / "elspeth" / "boundary.py").write_text(
-        "def admit(x):\n    a = getattr(x, 'a', None)\n    b = getattr(x, 'b', None)\n    return a, b\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
+    source = "def admit(x):\n    a = getattr(x, 'a', None)\n    b = getattr(x, 'b', None)\n    return a, b\n"
+    (tmp_path / "src" / "elspeth" / "boundary.py").write_text(source, encoding="utf-8")
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
+    group = _single_non_amnestied_group(source, "src/elspeth/boundary.py")
     entry = BaselineEntry(
         path="src/elspeth/boundary.py",
         qualname="admit",
         kind="getattr",
         occurrences=2,
+        probe_shapes=group.probe_shapes,
         classification="unadjudicated",
         justification="test fixture: matches",
     )
     (tmp_path / "config" / "cicd" / "masquerade_baseline.yaml").write_text(render_baseline_yaml([entry]), encoding="utf-8")
 
     assert scan_root(tmp_path) == []
+
+
+def test_probe_shape_drift_fires_when_count_and_key_stay_unchanged(tmp_path: Path) -> None:
+    """A one-for-one semantic substitution must invalidate the old adjudication."""
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    original = "def inspect_value(obj):\n    return getattr(obj, 'status', None)\n"
+    source_path.write_text(original, encoding="utf-8")
+    original_group = _single_non_amnestied_group(original)
+
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=original_group.path,
+                    qualname=original_group.qualname,
+                    kind=original_group.kind,
+                    occurrences=original_group.count,
+                    probe_shapes=original_group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="reviewed literal field admission",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert scan_root(tmp_path) == []
+
+    replacement = "def inspect_value(obj, name):\n    return getattr(obj, name, None)\n"
+    source_path.write_text(replacement, encoding="utf-8")
+
+    findings = scan_root(tmp_path)
+
+    assert len(findings) == 1
+    assert "probe-shape-drift" in findings[0].message
+
+
+def test_probe_shape_evidence_is_stable_across_reformatting() -> None:
+    compact = _single_non_amnestied_group("def f(obj):\n    return getattr(obj, 'status', None)\n")
+    reformatted = _single_non_amnestied_group("def f(obj):\n    return getattr(\n        obj,\n        'status',\n        None,\n    )\n")
+
+    assert compact.probe_shapes == reformatted.probe_shapes
+
+
+def test_probe_shape_evidence_is_stable_across_equivalent_import_aliases() -> None:
+    builtin = _single_non_amnestied_group("def f(obj):\n    return getattr(obj, 'status', None)\n")
+    imported_alias = _single_non_amnestied_group(
+        "from builtins import getattr as probe\ndef f(obj):\n    return probe(obj, 'status', None)\n"
+    )
+
+    assert builtin.probe_shapes == imported_alias.probe_shapes
+
+
+def test_probe_shape_evidence_binds_each_occurrence_in_a_group(tmp_path: Path) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    original = (
+        "def inspect_value(obj):\n"
+        "    first = getattr(obj, 'status', None)\n"
+        "    second = getattr(obj, 'detail', None)\n"
+        "    return first, second\n"
+    )
+    source_path.write_text(original, encoding="utf-8")
+    original_group = _single_non_amnestied_group(original)
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=original_group.path,
+                    qualname=original_group.qualname,
+                    kind=original_group.kind,
+                    occurrences=original_group.count,
+                    probe_shapes=original_group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="reviewed two-call group",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    replacement = original.replace("'detail'", "dynamic_name")
+    source_path.write_text(replacement, encoding="utf-8")
+
+    findings = scan_root(tmp_path)
+
+    assert len(findings) == 1
+    assert "probe-shape-drift" in findings[0].message
+
+
+def test_seed_refresh_preserves_reviewed_metadata_for_an_unchanged_probe(tmp_path: Path) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source = "def inspect_value(obj):\n    return getattr(obj, 'status', None)\n"
+    source_path.write_text(source, encoding="utf-8")
+    group = _single_non_amnestied_group(source)
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=group.path,
+                    qualname=group.qualname,
+                    kind=group.kind,
+                    occurrences=group.count,
+                    probe_shapes=group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="human-reviewed justification that must survive refresh",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refreshed = build_entries(tmp_path)
+
+    assert len(refreshed) == 1
+    assert refreshed[0].classification == "approved-introspection"
+    assert refreshed[0].justification == "human-reviewed justification that must survive refresh"
+
+
+def test_seed_refresh_does_not_carry_review_across_probe_shape_drift(tmp_path: Path) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    original = "def inspect_value(obj):\n    return getattr(obj, 'status', None)\n"
+    source_path.write_text(original, encoding="utf-8")
+    group = _single_non_amnestied_group(original)
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=group.path,
+                    qualname=group.qualname,
+                    kind=group.kind,
+                    occurrences=group.count,
+                    probe_shapes=group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="review applies only to the literal field shape",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    source_path.write_text("def inspect_value(obj, name):\n    return getattr(obj, name, None)\n", encoding="utf-8")
+
+    refreshed = build_entries(tmp_path)
+
+    assert len(refreshed) == 1
+    assert refreshed[0].classification == "unadjudicated"
+    assert refreshed[0].justification != "review applies only to the literal field shape"
+
+
+def test_seed_refresh_does_not_carry_review_from_a_legacy_shape_unbound_entry(tmp_path: Path) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source = "def inspect_value(obj):\n    return getattr(obj, 'status', None)\n"
+    source_path.write_text(source, encoding="utf-8")
+    group = _single_non_amnestied_group(source)
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=group.path,
+                    qualname=group.qualname,
+                    kind=group.kind,
+                    occurrences=group.count,
+                    probe_shapes=(),
+                    classification="approved-introspection",
+                    justification="legacy review without shape evidence",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    refreshed = build_entries(tmp_path)
+
+    assert len(refreshed) == 1
+    assert refreshed[0].classification == "unadjudicated"
+    assert refreshed[0].justification != "legacy review without shape evidence"
+
+
+def test_seed_check_accepts_an_unchanged_reviewed_ledger(tmp_path: Path) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "probe.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source = "def inspect_value(obj):\n    return getattr(obj, 'status', None)\n"
+    source_path.write_text(source, encoding="utf-8")
+    group = _single_non_amnestied_group(source)
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=group.path,
+                    qualname=group.qualname,
+                    kind=group.kind,
+                    occurrences=group.count,
+                    probe_shapes=group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="reviewed and unchanged",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert seed_baseline_main(["--repo-root", str(tmp_path), "--check"]) == 0
 
 
 def test_live_tree_has_zero_unbaselined_findings() -> None:
@@ -303,8 +553,7 @@ def test_module_getattr_amnesty_requires_the_flat_gate_shape() -> None:
     This documents a deliberate, conservative gap: unrecognised shapes
     fall through to baseline-required, never to silently green (two real
     corpus sites — core/security and engine/orchestrator's __init__.py —
-    exercise exactly this fallback; see seed_baseline.py's
-    _KNOWN_CLASSIFICATIONS).
+    exercise exactly this fallback).
     """
     tree = ast.parse(
         "_A = ('x',)\n"
@@ -341,9 +590,9 @@ def test_trust_boundary_amnesty_does_not_apply_to_a_non_source_param_receiver() 
 
 
 def test_baseline_flags_a_stale_entry_for_a_site_that_no_longer_exists(tmp_path: Path) -> None:
-    (tmp_path / "src" / "elspeth").mkdir(parents=True)
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
     (tmp_path / "src" / "elspeth" / "gone.py").write_text("VALUE = 1\n", encoding="utf-8")
-    (tmp_path / "config" / "cicd").mkdir(parents=True)
+    (tmp_path / "config" / "cicd").mkdir(parents=True, exist_ok=True)
     entry = BaselineEntry(
         path="src/elspeth/gone.py",
         qualname="deleted_function",
@@ -385,7 +634,7 @@ def test_baseline_loader_rejects_a_non_positive_occurrences_value(tmp_path: Path
         load_baseline(baseline_path)
 
 
-def test_seeder_and_rule_agree_on_every_live_site_key_and_count() -> None:
+def test_seeder_and_rule_agree_on_every_live_site_key_count_and_shape() -> None:
     """Blocking amendment A1, checked directly (not just via the zero-findings result).
 
     Every non-amnestied live site the rule enumerates must appear in a
@@ -396,8 +645,8 @@ def test_seeder_and_rule_agree_on_every_live_site_key_and_count() -> None:
     ticket's A1 amendment warns about — even if, by coincidence, the raw
     counts still matched in aggregate.
     """
-    seeded = {entry.key: entry.occurrences for entry in build_entries(REPO_ROOT)}
-    live_groups = {group.key: group.count for group in group_non_amnestied_sites(collect_sites(REPO_ROOT))}
+    seeded = {entry.key: (entry.occurrences, entry.probe_shapes) for entry in build_entries(REPO_ROOT)}
+    live_groups = {group.key: (group.count, group.probe_shapes) for group in group_non_amnestied_sites(collect_sites(REPO_ROOT))}
     assert seeded == live_groups
 
 
@@ -409,14 +658,13 @@ def test_rule_is_registered_under_its_stable_id() -> None:
 @pytest.mark.parametrize(
     ("source", "expected_kind"),
     [
-        ("getattr(x, 'a', None)", "getattr"),
-        ("hasattr(x, 'a')", "hasattr"),
-        ("inspect.getattr_static(x, 'a', None)", "getattr_static"),
+        ("def f(x):\n    return getattr(x, 'a', None)\n", "getattr"),
+        ("def f(x):\n    return hasattr(x, 'a')\n", "hasattr"),
+        ("import inspect\ndef f(x):\n    return inspect.getattr_static(x, 'a', None)\n", "getattr_static"),
     ],
 )
 def test_each_call_kind_is_detected(source: str, expected_kind: str) -> None:
-    tree = ast.parse(f"def f(x):\n    return {source}\n")
-    sites = iter_masquerade_sites(tree, "src/elspeth/kinds.py")
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/kinds.py")
     assert [site.kind for site in sites] == [expected_kind]
 
 
@@ -425,3 +673,743 @@ def test_dunder_getattr_def_is_detected() -> None:
     sites = iter_masquerade_sites(tree, "src/elspeth/dunder.py")
     assert [site.kind for site in sites] == ["dunder_getattr"]
     assert sites[0].qualname == "C.__getattr__"
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kind"),
+    [
+        ("from builtins import getattr as probe\nprobe(obj, name)\n", "getattr"),
+        ("import builtins as b\nb.getattr(obj, name)\n", "getattr"),
+        ("from builtins import hasattr as probe\nprobe(obj, name)\n", "hasattr"),
+        ("from inspect import getattr_static as probe\nprobe(obj, name)\n", "getattr_static"),
+        ("import inspect as i\ni.getattr_static(obj, name)\n", "getattr_static"),
+        ("from inspect import *\ngetattr_static(obj, name)\n", "getattr_static"),
+    ],
+)
+def test_probe_calls_are_resolved_through_import_aliases(source: str, expected_kind: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/aliases.py")
+
+    assert [site.kind for site in sites] == [expected_kind]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def f(getattr, obj):\n    return getattr(obj, 'field')\n",
+        "def getattr(obj, name):\n    return 1\ngetattr(obj, 'field')\n",
+        "from foreign_module import getattr\ngetattr(obj, 'field')\n",
+        "adapter.getattr(obj, 'field')\n",
+        "from builtins import getattr as probe\nprobe = adapter.get\nprobe(obj, 'field')\n",
+    ],
+)
+def test_shadowed_or_foreign_probe_spellings_are_not_classified(source: str) -> None:
+    assert iter_masquerade_sites(ast.parse(source), "src/elspeth/shadowed.py") == []
+
+
+def test_probe_alias_join_records_any_possible_builtin_target() -> None:
+    mixed = ast.parse(
+        "if condition:\n"
+        "    from builtins import getattr as probe\n"
+        "else:\n"
+        "    from foreign_module import getattr as probe\n"
+        "probe(obj, 'field')\n"
+    )
+    identical = ast.parse(
+        "if condition:\n    from builtins import getattr as probe\nelse:\n    from builtins import getattr as probe\nprobe(obj, 'field')\n"
+    )
+
+    assert [site.kind for site in iter_masquerade_sites(mixed, "src/elspeth/mixed.py")] == ["getattr"]
+    assert [site.kind for site in iter_masquerade_sites(identical, "src/elspeth/identical.py")] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "(probe := getattr)(obj, 'field', None)\n",
+        "(probe,) = (getattr,)\nprobe(obj, 'field', None)\n",
+        "probe = getattr if condition else adapter.get\nprobe(obj, 'field', None)\n",
+        "for probe in (getattr,):\n    probe(obj, 'field', None)\n",
+        "from math import *\ngetattr(obj, 'field', None)\n",
+    ],
+)
+def test_builtin_probe_aliases_cannot_escape_through_expression_bindings(source: str) -> None:
+    assert [site.kind for site in iter_masquerade_sites(ast.parse(source), "src/elspeth/expression_alias.py")] == ["getattr"]
+
+
+def test_possible_builtin_alias_survives_an_abrupt_control_flow_join() -> None:
+    source = (
+        "from builtins import getattr as probe\n"
+        "if condition:\n"
+        "    from foreign import getattr as probe\n"
+        "    raise SystemExit\n"
+        "probe(obj, 'field', None)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/abrupt_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_builtin_alias_on_an_abrupt_only_path_does_not_override_reachable_shadowing() -> None:
+    source = (
+        "if condition:\n"
+        "    from builtins import getattr as probe\n"
+        "    raise SystemExit\n"
+        "else:\n"
+        "    from foreign import getattr as probe\n"
+        "probe(obj, 'field', None)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/abrupt_only_alias.py")
+
+    assert sites == []
+
+
+def test_deferred_function_body_uses_the_runtime_module_binding() -> None:
+    source = (
+        "from foreign import getattr as probe\n"
+        "def inspect_value(obj):\n"
+        "    return probe(obj, 'field', None)\n"
+        "from builtins import getattr as probe\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/deferred_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_deferred_lambda_body_uses_the_runtime_module_binding() -> None:
+    source = (
+        "from foreign import getattr as probe\n"
+        "inspect_value = lambda obj: probe(obj, 'field', None)\n"
+        "from builtins import getattr as probe\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/deferred_lambda_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def inspect_value(obj, probe=getattr):\n    return probe(obj, 'field', None)\n",
+        "inspect_value = lambda obj, probe=getattr: probe(obj, 'field', None)\n",
+    ],
+)
+def test_default_parameter_capture_preserves_builtin_probe_identity(source: str) -> None:
+    assert [site.kind for site in iter_masquerade_sites(ast.parse(source), "src/elspeth/default_alias.py")] == ["getattr"]
+
+
+def test_comprehension_target_preserves_builtin_probe_identity() -> None:
+    source = "values = [probe(obj, 'field', None) for probe in (getattr,)]\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/comprehension_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_match_capture_preserves_builtin_probe_identity() -> None:
+    source = "match getattr:\n    case probe:\n        probe(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/match_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "for (probe,) in [(getattr,)]:\n    probe(obj, 'field', None)\n",
+        "values = [probe(obj, 'field', None) for (probe,) in [(getattr,)]]\n",
+        "match [getattr]:\n    case [probe]:\n        probe(obj, 'field', None)\n",
+    ],
+)
+def test_destructured_control_flow_targets_preserve_builtin_probe_identity(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/destructured_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "probe = {'p': getattr}['p']\nprobe(obj, 'field', None)\n",
+        "for probe in {getattr: None}:\n    probe(obj, 'field', None)\n",
+        "match {'p': getattr}:\n    case {'p': probe}:\n        probe(obj, 'field', None)\n",
+    ],
+)
+def test_literal_mapping_transports_preserve_builtin_probe_identity(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/mapping_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_subscript_alias_preserves_builtin_probe_identity() -> None:
+    source = "probe = (getattr,)[0]\nprobe(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/subscript_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_nested_closure_sees_a_later_enclosing_probe_binding() -> None:
+    source = (
+        "def outer(obj):\n"
+        "    def inspect_value():\n"
+        "        return probe(obj, 'field', None)\n"
+        "    probe = getattr\n"
+        "    return inspect_value()\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/closure_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "from foreign import getattr as probe\n"
+            "values = (probe(obj, 'field', None) for _ in range(1))\n"
+            "from builtins import getattr as probe\n"
+            "next(values)\n"
+        ),
+        (
+            "def outer(obj):\n"
+            "    from foreign import getattr as probe\n"
+            "    values = (probe(obj, 'field', None) for _ in range(1))\n"
+            "    from builtins import getattr as probe\n"
+            "    return next(values)\n"
+        ),
+    ],
+)
+def test_generator_expression_sees_later_probe_bindings(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/generator_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_nested_lambda_sees_a_later_binding_in_its_enclosing_lambda() -> None:
+    source = "from foreign import getattr as probe\nouter = lambda obj: ((lambda: probe(obj, 'field', None)), (probe := getattr))\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/nested_lambda_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_future_module_named_expression_is_visible_to_a_deferred_body() -> None:
+    source = (
+        "from foreign import getattr as probe\n"
+        "def inspect_value(obj):\n"
+        "    return probe(obj, 'field', None)\n"
+        "if (probe := getattr):\n"
+        "    pass\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/future_walrus_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_deferred_body_retains_an_earlier_possible_module_binding() -> None:
+    source = (
+        "from builtins import getattr as probe\n"
+        "def inspect_value(obj):\n"
+        "    return probe(obj, 'field', None)\n"
+        "inspect_value(obj)\n"
+        "from foreign import getattr as probe\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/early_call_alias.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_deleting_a_module_shadow_restores_builtin_lookup() -> None:
+    source = "getattr = adapter.get\ndel getattr\ngetattr(obj, 'field', None)\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/deleted_shadow.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "response = owned\n    return getattr(response, 'field', None)",
+        "alias = response\n    alias = owned\n    return getattr(alias, 'field', None)",
+        (
+            "alias = response\n"
+            "    if condition:\n"
+            "        alias = response\n"
+            "    else:\n"
+            "        alias = owned\n"
+            "    return getattr(alias, 'field', None)"
+        ),
+    ],
+)
+def test_boundary_source_amnesty_is_revoked_after_rebinding_or_a_mixed_join(body: str) -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, owned, condition):\n"
+        f"    {body}\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/rebound.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_boundary_source_amnesty_survives_an_identical_control_flow_join() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, condition):\n"
+        "    if condition:\n"
+        "        alias = response\n"
+        "    else:\n"
+        "        alias = response\n"
+        "    return getattr(alias, 'field', None)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/joined.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is True
+
+
+def test_boundary_source_reassignment_revokes_only_subsequent_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, owned):\n"
+        "    before = getattr(response, 'field', None)\n"
+        "    response = owned\n"
+        "    after = getattr(response, 'field', None)\n"
+        "    return before, after\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/reassigned.py")
+
+    assert [site.amnesty for site in sites] == [True, False]
+
+
+def test_comprehension_target_shadowing_cannot_inherit_boundary_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, rows):\n"
+        "    values = [getattr(response, 'field', None) for response in rows]\n"
+        "    after = getattr(response, 'field', None)\n"
+        "    return values, after\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/comprehension.py")
+
+    assert [site.amnesty for site in sites] == [False, True]
+
+
+def test_comprehension_assignment_expression_revokes_boundary_amnesty_after_join() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, rows):\n"
+        "    values = [(response := row) for row in rows]\n"
+        "    return getattr(response, 'field', None), values\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/comprehension_walrus.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_nested_lambda_cannot_inherit_boundary_source_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, owned):\n"
+        "    read_later = lambda: getattr(response, 'field', None)\n"
+        "    response = owned\n"
+        "    return read_later()\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/lambda_capture.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_generator_expression_cannot_inherit_boundary_source_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, owned):\n"
+        "    values = (getattr(response, 'field', None) for _ in range(1))\n"
+        "    response = owned\n"
+        "    return next(values)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/generator_capture.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_type_alias_rebinding_revokes_boundary_source_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response):\n"
+        "    type response = int\n"
+        "    return getattr(response, 'field', None)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/type_alias.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_nested_function_cannot_inherit_boundary_decorator_authenticity() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary as marker\n"
+        "def factory():\n"
+        "    @marker(tier=3, source='x', source_param='response', suppresses=())\n"
+        "    def admit(response):\n"
+        "        return getattr(response, 'field', None)\n"
+        "    return admit\n"
+        "from foreign import decorator as marker\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/nested_boundary.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_outer_decorator_cannot_strip_boundary_authenticity_and_keep_amnesty() -> None:
+    source = (
+        "from inspect import unwrap\n"
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@unwrap\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response):\n"
+        "    return getattr(response, 'field', None)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/stripped_boundary.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_starred_default_is_not_a_trust_boundary_sentinel_amnesty() -> None:
+    source = (
+        "from elspeth.contracts.trust_boundary import trust_boundary\n"
+        "@trust_boundary(tier=3, source='x', source_param='response', suppresses=())\n"
+        "def admit(response, defaults):\n"
+        "    return getattr(response, 'field', *defaults)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/starred_default.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "_ALLOWED = runtime_names()",
+        "_ALLOWED.add(user_name)",
+    ],
+)
+def test_module_getattr_amnesty_rejects_a_mutated_closed_table(mutation: str) -> None:
+    source = (
+        "_ALLOWED = {'safe'}\n"
+        f"{mutation}\n"
+        "def __getattr__(name):\n"
+        "    if name in _ALLOWED:\n"
+        "        return expose(name)\n"
+        "    raise AttributeError(name)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/open_table.py")
+
+    assert len(sites) == 1
+    assert sites[0].kind == "dunder_getattr"
+    assert sites[0].amnesty is False
+
+
+@pytest.mark.parametrize(
+    ("shadow", "raised"),
+    [
+        ("AttributeError = ForeignError", "AttributeError(name)"),
+        ("builtins = foreign", "builtins.AttributeError(name)"),
+    ],
+)
+def test_module_getattr_amnesty_rejects_shadowed_attribute_error(shadow: str, raised: str) -> None:
+    source = (
+        "_ALLOWED = {'safe'}\n"
+        f"{shadow}\n"
+        "def __getattr__(name):\n"
+        "    if name in _ALLOWED:\n"
+        "        return expose(name)\n"
+        f"    raise {raised}\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/shadowed_error.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_module_getattr_amnesty_requires_exclusive_attribute_error_identity() -> None:
+    source = (
+        "if condition:\n"
+        "    AttributeError = RuntimeError\n"
+        "_ALLOWED = {'safe'}\n"
+        "def __getattr__(name):\n"
+        "    if name in _ALLOWED:\n"
+        "        return expose(name)\n"
+        "    raise AttributeError(name)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/conditional_error.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+def test_module_getattr_amnesty_rejects_a_decorated_hook() -> None:
+    source = (
+        "_ALLOWED = {'safe'}\n"
+        "@evil\n"
+        "def __getattr__(name):\n"
+        "    if name in _ALLOWED:\n"
+        "        return expose(name)\n"
+        "    raise AttributeError(name)\n"
+    )
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/decorated_hook.py")
+
+    assert len(sites) == 1
+    assert sites[0].amnesty is False
+
+
+@pytest.mark.parametrize("subdir", SCAN_SUBDIRS)
+@pytest.mark.parametrize("failure", ["syntax", "read"])
+def test_scan_root_surfaces_parse_and_read_failures_from_every_scanned_root(
+    subdir: str,
+    failure: str,
+    tmp_path: Path,
+) -> None:
+    broken_path = tmp_path / subdir / f"broken_{failure}.py"
+    broken_path.parent.mkdir(parents=True, exist_ok=True)
+    if failure == "syntax":
+        broken_path.write_text("def broken(:\n", encoding="utf-8")
+    else:
+        broken_path.write_bytes(b"\xff")
+
+    findings = scan_root(tmp_path)
+
+    expected_rule = "parse-error" if failure == "syntax" else "read-error"
+    assert [finding.rule_id for finding in findings] == [expected_rule]
+    assert findings[0].file_path == f"{subdir}/broken_{failure}.py"
+
+
+@pytest.mark.parametrize("failure", ["syntax", "read"])
+def test_scan_failure_does_not_misreport_the_failed_files_baseline_as_stale(
+    failure: str,
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "src" / "elspeth" / "broken.py"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    source = "def inspect_value(obj):\n    return getattr(obj, 'field', None)\n"
+    source_path.write_text(source, encoding="utf-8")
+    group = _single_non_amnestied_group(source, "src/elspeth/broken.py")
+    baseline_path = tmp_path / "config" / "cicd" / "masquerade_baseline.yaml"
+    baseline_path.parent.mkdir(parents=True, exist_ok=True)
+    baseline_path.write_text(
+        render_baseline_yaml(
+            [
+                BaselineEntry(
+                    path=group.path,
+                    qualname=group.qualname,
+                    kind=group.kind,
+                    occurrences=group.count,
+                    probe_shapes=group.probe_shapes,
+                    classification="approved-introspection",
+                    justification="reviewed before the file became unreadable",
+                )
+            ]
+        ),
+        encoding="utf-8",
+    )
+    if failure == "syntax":
+        source_path.write_text("def broken(:\n", encoding="utf-8")
+    else:
+        source_path.write_bytes(b"\xff")
+
+    findings = scan_root(tmp_path)
+
+    expected_rule = "parse-error" if failure == "syntax" else "read-error"
+    assert [finding.rule_id for finding in findings] == [expected_rule]
+    assert all("stale-baseline-entry" not in finding.message for finding in findings)
+
+
+def test_scan_root_rejects_an_inert_repository_root(tmp_path: Path) -> None:
+    findings = scan_root(tmp_path)
+
+    assert len(findings) == 1
+    assert findings[0].rule_id == "masquerade.attribute-probes"
+    assert "inert-scan" in findings[0].message
+
+
+def test_scan_root_rejects_an_existing_but_empty_declared_root(tmp_path: Path) -> None:
+    (tmp_path / "src" / "elspeth").mkdir(parents=True, exist_ok=True)
+
+    findings = scan_root(tmp_path)
+
+    assert len(findings) == 1
+    assert "inert-scan" in findings[0].message
+
+
+def test_canonical_cli_root_surfaces_failures_from_the_rules_independent_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core.cli import main
+
+    source_root = tmp_path / "src" / "elspeth"
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "clean.py").write_text("VALUE = 1\n", encoding="utf-8")
+    broken_path = tmp_path / "tests" / "broken.py"
+    broken_path.parent.mkdir(parents=True, exist_ok=True)
+    broken_path.write_text("def broken(:\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "check",
+            "--rules",
+            "masquerade.attribute-probes",
+            "--root",
+            str(source_root),
+            "--repo-root",
+            str(tmp_path),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    findings = json.loads(captured.out)
+    assert [finding["rule_id"] for finding in findings] == ["parse-error"]
+    assert findings[0]["file_path"] == "tests/broken.py"
+
+
+def test_cli_does_not_duplicate_a_diagnostic_inside_its_explicit_root(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core.cli import main
+
+    broken_path = tmp_path / "src" / "elspeth" / "broken.py"
+    broken_path.parent.mkdir(parents=True, exist_ok=True)
+    broken_path.write_text("def broken(:\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "check",
+            "--rules",
+            "masquerade.attribute-probes",
+            "--root",
+            str(tmp_path),
+            "--repo-root",
+            str(tmp_path),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    findings = json.loads(captured.out)
+    assert [finding["rule_id"] for finding in findings] == ["parse-error"]
+
+
+def test_canonical_source_cli_root_does_not_suppress_its_own_diagnostic(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core.cli import main
+
+    source_root = tmp_path / "src" / "elspeth"
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    exit_code = main(
+        [
+            "check",
+            "--rules",
+            "masquerade.attribute-probes",
+            "--root",
+            str(source_root),
+            "--repo-root",
+            str(tmp_path),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    findings = json.loads(captured.out)
+    assert [finding["rule_id"] for finding in findings] == ["parse-error"]
+    assert findings[0]["file_path"] == "src/elspeth/broken.py"
+
+
+def test_cli_diagnostic_dedupe_does_not_collapse_same_suffix_from_different_roots(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core.cli import main
+
+    scan_root_path = tmp_path / "scan"
+    repo_root_path = tmp_path / "repo"
+    for root in (scan_root_path, repo_root_path):
+        broken_path = root / "tests" / "broken.py"
+        broken_path.parent.mkdir(parents=True, exist_ok=True)
+        broken_path.write_text("def broken(:\n", encoding="utf-8")
+    for subdir in SCAN_SUBDIRS:
+        (repo_root_path / subdir).mkdir(parents=True, exist_ok=True)
+
+    exit_code = main(
+        [
+            "check",
+            "--rules",
+            "masquerade.attribute-probes",
+            "--root",
+            str(scan_root_path),
+            "--repo-root",
+            str(repo_root_path),
+            "--format",
+            "json",
+        ]
+    )
+
+    assert exit_code == 1
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    findings = json.loads(captured.out)
+    assert [finding["rule_id"] for finding in findings] == ["parse-error", "parse-error"]
+    assert {finding["file_path"] for finding in findings} == {str(scan_root_path / "tests" / "broken.py"), "tests/broken.py"}

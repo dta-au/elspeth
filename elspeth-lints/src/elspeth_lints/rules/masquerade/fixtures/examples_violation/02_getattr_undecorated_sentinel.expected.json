@@ -4,9 +4,9 @@
     "file_path": "src/elspeth/undecorated_probe.py",
     "fingerprint": "bf26e9223808bf3d",
     "line": 13,
-    "message": "getattr site at 'read_status' in src/elspeth/undecorated_probe.py is not covered by a permanent amnesty and has no entry in config/cicd/masquerade_baseline.yaml (arity=3, literal_name=True). It has 1 current occurrence(s). Per ADR-032, classify it \u2014 external-parse (sentinel getattr + value asserts + owned type), approved-introspection, reflection-owned-table, module-getattr, or data-container-api \u2014 and add a baseline entry with occurrences: 1, or rewrite it to direct access / isinstance-against-a-concrete-owned-class if the shape is actually guaranteed.",
+    "message": "getattr site at 'read_status' in src/elspeth/undecorated_probe.py is not covered by a permanent amnesty and has no entry in config/cicd/masquerade_baseline.yaml (arity=3, literal_name=True). It has 1 current occurrence(s). Per ADR-032, classify it \u2014 external-parse (sentinel getattr + value asserts + owned type), approved-introspection, reflection-owned-table, module-getattr, or data-container-api \u2014 then use the baseline seeder to add the occurrence count and normalized probe_shapes, or rewrite it to direct access / isinstance-against-a-concrete-owned-class if the shape is actually guaranteed.",
     "rule_id": "masquerade.attribute-probes",
     "severity": "error",
-    "suggestion": "Add an entry to config/cicd/masquerade_baseline.yaml with occurrences: 1, a real classification and justification, or rewrite the site."
+    "suggestion": "Run `python -m elspeth_lints.rules.masquerade.seed_baseline`, then adjudicate the new entry in config/cicd/masquerade_baseline.yaml; or rewrite the site."
   }
 ]

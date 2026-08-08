@@ -23,15 +23,14 @@
 # Identity is (path, qualname, kind) — no line numbers, so reformatting or
 # moving a site does not require re-adjudication, but renaming or
 # relocating it does (the old entry goes stale, a new one is required).
-# Multiple call sites of the same kind inside one function share one
-# entry, but the `occurrences` field on that entry is a REQUIRED,
-# EXACT-MATCH COUNT of current non-amnestied occurrences at that key —
-# not a one-time snapshot. Adding (or removing, or amnestying away) even
-# one probe at an already-baselined site changes the count and fires
-# occurrence-count-drift until the entry is updated. This is what stops
-# someone from adding a fourth getattr call to an already-adjudicated
-# high-traffic boundary (e.g. tool_batch.py::_admit_tool_batch) and having
-# the gate stay silently green.
+# Multiple probe sites of the same kind inside one function share one
+# entry. `occurrences` is a REQUIRED exact count, and `probe_shapes` is a
+# sorted per-occurrence multiset of SHA-256 fingerprints over normalized
+# AST shapes (source positions excluded). Count drift catches additions /
+# removals; shape drift catches one-for-one semantic substitutions at the
+# same key and count. Whitespace-only reformatting keeps the same shape. A
+# legacy entry with no shapes may be loaded for migration, but it always
+# fires shape drift and its old review is not preserved by refresh.
 #
 # A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
 # the tree is itself a gate failure (stale-baseline-entry) so this file
@@ -44,6 +43,8 @@ entries:
   qualname: to_dict
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b870a86da8b84b7d49e0826931e9963fd1c1f3b3cf6892881c3509064634d30e
   classification: reflection-owned-table
   justification: Iterates dataclasses.fields(obj), the SAME type being serialized;
     the class definition IS the table, so no externally controlled name can reach

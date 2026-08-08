@@ -12,20 +12,14 @@ Identity, and why it is not a security hole
 ---------------------------------------------
 Each entry is keyed by ``(path, qualname, kind)`` — no line number, so a
 reformatted or moved site keeps its identity, and a renamed/relocated one
-correctly re-fires for re-adjudication. Because identity excludes the call
-site itself, one entry can cover more than one textual occurrence: two
-``getattr`` calls in the same function share one key. That collapse would
-be a real hole on its own — someone could add a fourth ``getattr`` call to
-an already-baselined function (exactly the high-traffic boundaries this
-gate exists to protect, e.g. ``tool_batch.py::_admit_tool_batch``) and the
-gate would stay green. It is closed by a mandatory ``occurrences`` count
-carried on the entry: the rule counts every current non-amnestied
-occurrence at that key and requires an EXACT match against the baselined
-count, in both directions. An increase without a matching baseline update
-is the security property (a new probe landed); a silent decrease is
-disallowed too, so the count cannot drift inflated as sites are migrated
-or amnestied away. See ``masquerade_baseline.yaml``'s header comment,
-which restates this for any human reader of the file directly.
+correctly re-fires for re-adjudication. Because identity excludes source
+locations, one entry can cover more than one textual occurrence: two
+``getattr`` calls in the same function share one key. The payload therefore
+binds both an exact ``occurrences`` count and a normalized, sorted
+``probe_shapes`` fingerprint for every occurrence. Counts catch additions
+and removals; the shape multiset catches one-for-one replacement of a
+reviewed literal admission with materially different reflection while
+remaining stable across whitespace-only reformatting.
 
 ``unadjudicated`` honesty
 --------------------------
@@ -86,15 +80,14 @@ BASELINE_HEADER = """\
 # Identity is (path, qualname, kind) — no line numbers, so reformatting or
 # moving a site does not require re-adjudication, but renaming or
 # relocating it does (the old entry goes stale, a new one is required).
-# Multiple call sites of the same kind inside one function share one
-# entry, but the `occurrences` field on that entry is a REQUIRED,
-# EXACT-MATCH COUNT of current non-amnestied occurrences at that key —
-# not a one-time snapshot. Adding (or removing, or amnestying away) even
-# one probe at an already-baselined site changes the count and fires
-# occurrence-count-drift until the entry is updated. This is what stops
-# someone from adding a fourth getattr call to an already-adjudicated
-# high-traffic boundary (e.g. tool_batch.py::_admit_tool_batch) and having
-# the gate stay silently green.
+# Multiple probe sites of the same kind inside one function share one
+# entry. `occurrences` is a REQUIRED exact count, and `probe_shapes` is a
+# sorted per-occurrence multiset of SHA-256 fingerprints over normalized
+# AST shapes (source positions excluded). Count drift catches additions /
+# removals; shape drift catches one-for-one semantic substitutions at the
+# same key and count. Whitespace-only reformatting keeps the same shape. A
+# legacy entry with no shapes may be loaded for migration, but it always
+# fires shape drift and its old review is not preserved by refresh.
 #
 # A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
 # the tree is itself a gate failure (stale-baseline-entry) so this file
@@ -108,13 +101,12 @@ BASELINE_HEADER = """\
 class BaselineEntry:
     """One adjudicated (or not-yet-adjudicated) masquerade site.
 
-    ``occurrences`` is the number of current non-amnestied call sites
+    ``occurrences`` is the number of current non-amnestied probe sites
     sharing this entry's ``(path, qualname, kind)`` key. It is part of
-    the entry's PAYLOAD, not its identity key — a reformat or an
-    amnesty-shape refactor does not change identity, but adding or
-    removing a probe at an already-baselined site changes this count and
-    must trigger re-adjudication (occurrence-count-drift), never a
-    silent pass.
+    the entry's PAYLOAD, not its identity key. ``probe_shapes`` binds the
+    normalized AST of each occurrence without source positions. Empty
+    shapes are accepted only as the legacy migration representation; the
+    rule treats them as drift until the seeder refreshes them.
     """
 
     path: str
@@ -123,6 +115,7 @@ class BaselineEntry:
     occurrences: int
     classification: str
     justification: str
+    probe_shapes: tuple[str, ...] = ()
 
     @property
     def key(self) -> tuple[str, str, str]:
@@ -188,6 +181,17 @@ def _entry_from_mapping(item: Any, *, path: Path, index: int) -> BaselineEntry:
     # cannot silently parse as 1.
     if isinstance(occurrences, bool) or not isinstance(occurrences, int) or occurrences < 1:
         raise ValueError(f"{path}: entries[{index}].occurrences must be an integer >= 1, got {occurrences!r}")
+    probe_shapes_raw = item.get("probe_shapes", [])
+    if not isinstance(probe_shapes_raw, list) or not all(isinstance(shape, str) for shape in probe_shapes_raw):
+        raise ValueError(f"{path}: entries[{index}].probe_shapes must be a list of SHA-256 strings")
+    probe_shapes = tuple(probe_shapes_raw)
+    if probe_shapes:
+        if len(probe_shapes) != occurrences:
+            raise ValueError(f"{path}: entries[{index}].probe_shapes must contain exactly occurrences={occurrences} entries")
+        if any(len(shape) != 64 or any(character not in "0123456789abcdef" for character in shape) for shape in probe_shapes):
+            raise ValueError(f"{path}: entries[{index}].probe_shapes entries must be lowercase SHA-256 hex strings")
+        if probe_shapes != tuple(sorted(probe_shapes)):
+            raise ValueError(f"{path}: entries[{index}].probe_shapes must be sorted")
     classification = required("classification")
     if classification not in CLASSIFICATIONS:
         raise ValueError(f"{path}: entries[{index}].classification {classification!r} is not one of {sorted(CLASSIFICATIONS)!r}")
@@ -199,6 +203,7 @@ def _entry_from_mapping(item: Any, *, path: Path, index: int) -> BaselineEntry:
         occurrences=occurrences,
         classification=classification,
         justification=justification,
+        probe_shapes=probe_shapes,
     )
 
 
@@ -211,6 +216,7 @@ def render_baseline_yaml(entries: Sequence[BaselineEntry]) -> str:
                 "qualname": entry.qualname,
                 "kind": entry.kind,
                 "occurrences": entry.occurrences,
+                "probe_shapes": list(entry.probe_shapes),
                 "classification": entry.classification,
                 "justification": entry.justification,
             }

@@ -20,13 +20,16 @@ of the four covered roots, that is neither amnestied nor already in the
 baseline is an ERROR — new masquerade cannot land silently. A baseline
 entry whose site has disappeared entirely is also an ERROR
 (``stale-baseline-entry``), and a baseline entry whose recorded
-``occurrences`` count no longer matches how many non-amnestied call sites
+``occurrences`` count no longer matches how many non-amnestied probe sites
 currently share its ``(path, qualname, kind)`` key is an ERROR
 (``occurrence-count-drift``) in EITHER direction — this is what prevents
 someone from adding (or, silently, removing) a probe at an
 already-baselined high-traffic boundary (e.g.
 ``tool_batch.py::_admit_tool_batch``) without the gate noticing, which a
-key collapsed purely on shape would otherwise permit.
+key alone would otherwise permit. A normalized per-occurrence
+``probe_shapes`` multiset also has to match exactly, so replacing one
+reviewed probe with a materially different call at the same key and count
+fires ``probe-shape-drift``.
 
 This rule carries NO signature material, NO tier_model coupling, and does
 not touch ``BoundaryRule``. It is a third, independent consumer of
@@ -69,14 +72,34 @@ class MasqueradeAttributeProbesRule:
         return scan_root(file_path, repo_root_override=context.repo_root)
 
 
-def scan_root(root: Path, *, repo_root_override: Path | None = None) -> list[Finding]:
+def scan_root(
+    root: Path,
+    *,
+    repo_root_override: Path | None = None,
+) -> list[Finding]:
     """Walk the four covered roots under the repository root and diff against the baseline."""
     repo_root = repository_root(root, repo_root_override)
     baseline_path = repo_root / BASELINE_RELATIVE_PATH
     baseline = load_baseline(baseline_path)
-    sites = collect_sites(repo_root)
+    diagnostics: list[Finding] = []
+    failed_paths: set[str] = set()
+    sites = collect_sites(
+        repo_root,
+        diagnostics=diagnostics,
+        failed_paths=failed_paths,
+    )
     baseline_display_path = _display_relative(baseline_path, repo_root)
-    return _findings_for_sites(sites, baseline, baseline_display_path=baseline_display_path)
+    findings = [
+        *diagnostics,
+        *_findings_for_sites(
+            sites,
+            baseline,
+            baseline_display_path=baseline_display_path,
+            excluded_paths=failed_paths,
+        ),
+    ]
+    findings.sort(key=lambda finding: (finding.file_path, finding.line, finding.column, finding.fingerprint))
+    return findings
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +129,11 @@ class SiteGroup:
     @property
     def count(self) -> int:
         return len(self.sites)
+
+    @property
+    def probe_shapes(self) -> tuple[str, ...]:
+        """Return the normalized per-occurrence shape multiset."""
+        return tuple(sorted(site.probe_shape for site in self.sites))
 
     @property
     def representative(self) -> MasqueradeSite:
@@ -145,7 +173,12 @@ def group_non_amnestied_sites(sites: list[MasqueradeSite]) -> list[SiteGroup]:
 _LINT_RULE_FIXTURES_SUBDIR = "elspeth-lints/src"
 
 
-def collect_sites(repo_root: Path) -> list[MasqueradeSite]:
+def collect_sites(
+    repo_root: Path,
+    *,
+    diagnostics: list[Finding] | None = None,
+    failed_paths: set[str] | None = None,
+) -> list[MasqueradeSite]:
     """Return every candidate masquerade site across the four covered roots.
 
     This is the SAME enumerator (:func:`iter_masquerade_sites`) the
@@ -153,22 +186,88 @@ def collect_sites(repo_root: Path) -> list[MasqueradeSite]:
     why the rule and the seeder must never diverge here.
     """
     sites: list[MasqueradeSite] = []
+    scanned_item_count = 0
+    missing_subdirs = [subdir for subdir in SCAN_SUBDIRS if not (repo_root / subdir).is_dir()]
+    layout_error = bool(missing_subdirs) and not _is_rule_fixture_repo(repo_root)
+    if layout_error and diagnostics is None:
+        raise ValueError(f"missing required scan roots under {repo_root}: {', '.join(missing_subdirs)}")
     for subdir in SCAN_SUBDIRS:
         subroot = repo_root / subdir
         if not subroot.is_dir():
             continue
         for item in walk_python_files(subroot):
-            if isinstance(item, (PythonSyntaxError, PythonFileReadError)):
-                # A file elspeth-lints cannot parse is out of scope for this
-                # AST gate; the whole-repo diagnostic pass in cli.py already
-                # surfaces syntax/read errors as their own findings.
-                continue
             relative = item.path.relative_to(subroot)
             if subdir == _LINT_RULE_FIXTURES_SUBDIR and "fixtures" in relative.parts:
                 continue
+            scanned_item_count += 1
             display = f"{subdir}/{relative.as_posix()}"
+            if isinstance(item, PythonSyntaxError):
+                finding = _syntax_error_finding(item, display)
+                if diagnostics is None:
+                    raise ValueError(f"{display}: {item.message}")
+                if failed_paths is not None:
+                    failed_paths.add(display)
+                diagnostics.append(finding)
+                continue
+            if isinstance(item, PythonFileReadError):
+                finding = _read_error_finding(item, display)
+                if diagnostics is None:
+                    raise ValueError(f"{display}: {item.error_type}: {item.message}")
+                if failed_paths is not None:
+                    failed_paths.add(display)
+                diagnostics.append(finding)
+                continue
             sites.extend(iter_masquerade_sites(item.tree, display))
+    if layout_error:
+        message = f"missing required scan roots under {repo_root}: {', '.join(missing_subdirs)}"
+        assert diagnostics is not None
+        diagnostics.append(_inert_scan_finding(repo_root, message))
+    elif scanned_item_count == 0:
+        message = f"the required scan roots under {repo_root} contain no in-scope Python files"
+        if diagnostics is None:
+            raise ValueError(message)
+        diagnostics.append(_inert_scan_finding(repo_root, message))
     return sites
+
+
+def _is_rule_fixture_repo(repo_root: Path) -> bool:
+    fixture_root = Path(__file__).resolve().parent / "fixtures"
+    return repo_root.resolve().is_relative_to(fixture_root)
+
+
+def _inert_scan_finding(repo_root: Path, message: str) -> Finding:
+    return Finding(
+        rule_id=RULE_ID,
+        file_path=repo_root.as_posix(),
+        line=0,
+        column=0,
+        message=f"inert-scan: {message}",
+        fingerprint=_fingerprint(f"{RULE_ID}:inert-scan", repo_root.as_posix()),
+        severity=RULE_METADATA.severity,
+        suggestion="Pass the ELSPETH repository root via --repo-root; the gate must scan at least one declared root.",
+    )
+
+
+def _syntax_error_finding(item: PythonSyntaxError, display_path: str) -> Finding:
+    return Finding(
+        rule_id="parse-error",
+        file_path=display_path,
+        line=item.line,
+        column=item.column,
+        message=item.message,
+        fingerprint=f"syntax:{item.line}:{item.column}",
+    )
+
+
+def _read_error_finding(item: PythonFileReadError, display_path: str) -> Finding:
+    return Finding(
+        rule_id="read-error",
+        file_path=display_path,
+        line=0,
+        column=0,
+        message=f"{item.error_type}: {item.message}",
+        fingerprint=f"read:{item.error_type}",
+    )
 
 
 def _findings_for_sites(
@@ -176,13 +275,17 @@ def _findings_for_sites(
     baseline: MasqueradeBaseline,
     *,
     baseline_display_path: str,
+    excluded_paths: set[str] | None = None,
 ) -> list[Finding]:
+    excluded = excluded_paths or set()
     all_keys: set[tuple[str, str, str]] = {(site.path, site.qualname, site.kind) for site in sites}
     groups_by_key = {group.key: group for group in group_non_amnestied_sites(sites)}
     baseline_by_key = {entry.key: entry for entry in baseline.entries}
 
     findings: list[Finding] = []
     for key in sorted(set(groups_by_key) | set(baseline_by_key)):
+        if key[0] in excluded:
+            continue
         group = groups_by_key.get(key)
         entry = baseline_by_key.get(key)
         if entry is None:
@@ -201,6 +304,10 @@ def _findings_for_sites(
             findings.append(
                 _occurrence_drift_finding(entry, actual_count=actual_count, representative=group.representative if group else None)
             )
+            continue
+        assert group is not None
+        if group.probe_shapes != entry.probe_shapes:
+            findings.append(_probe_shape_drift_finding(entry, group=group))
 
     findings.sort(key=lambda finding: (finding.file_path, finding.line, finding.column, finding.fingerprint))
     return findings
@@ -213,8 +320,8 @@ def _unbaselined_finding(group: SiteGroup) -> Finding:
         f"{site.kind} site at {site.qualname!r} in {site.path} is not covered by a permanent amnesty "
         f"and has no entry in {BASELINE_RELATIVE_PATH}{detail}. It has {group.count} current occurrence(s). "
         "Per ADR-032, classify it — external-parse (sentinel getattr + value asserts + owned type), "
-        "approved-introspection, reflection-owned-table, module-getattr, or data-container-api — and add "
-        f"a baseline entry with occurrences: {group.count}, or rewrite it to direct access / "
+        "approved-introspection, reflection-owned-table, module-getattr, or data-container-api — then use "
+        "the baseline seeder to add the occurrence count and normalized probe_shapes, or rewrite it to direct access / "
         "isinstance-against-a-concrete-owned-class if the shape is actually guaranteed."
     )
     fingerprint = _fingerprint(RULE_ID, site.path, site.qualname, site.kind)
@@ -227,8 +334,8 @@ def _unbaselined_finding(group: SiteGroup) -> Finding:
         fingerprint=fingerprint,
         severity=RULE_METADATA.severity,
         suggestion=(
-            f"Add an entry to {BASELINE_RELATIVE_PATH} with occurrences: {group.count}, a real "
-            "classification and justification, or rewrite the site."
+            "Run `python -m elspeth_lints.rules.masquerade.seed_baseline`, then adjudicate the new "
+            f"entry in {BASELINE_RELATIVE_PATH}; or rewrite the site."
         ),
         symbol_context=(site.qualname,),
         ast_path=f"{site.kind}:{site.qualname}",
@@ -261,11 +368,16 @@ def _occurrence_drift_finding(entry: BaselineEntry, *, actual_count: int, repres
     line = representative.line if representative is not None else 1
     column = representative.column if representative is not None else 0
     direction = "a probe was added" if actual_count > entry.occurrences else "a probe was removed, rewritten, or amnestied"
+    remediation = (
+        "Remove the now-fully-amnestied baseline entry"
+        if actual_count == 0
+        else "Refresh the entry with the baseline seeder, including its occurrence count and probe_shapes"
+    )
     message = (
         f"occurrence-count-drift: {BASELINE_RELATIVE_PATH} records occurrences: {entry.occurrences} for "
         f"{entry.kind} at {entry.qualname!r} in {entry.path}, but the tree currently has {actual_count}. "
-        f"Likely cause: {direction}. Update the entry's occurrences field to {actual_count} — after "
-        "re-adjudicating if the count increased; a decrease should also be reviewed rather than assumed safe."
+        f"Likely cause: {direction}. {remediation} — after re-adjudicating if the count increased; "
+        "a decrease should also be reviewed rather than assumed safe."
     )
     fingerprint = _fingerprint(f"{RULE_ID}:occurrence-drift", entry.path, entry.qualname, entry.kind)
     return Finding(
@@ -276,9 +388,39 @@ def _occurrence_drift_finding(entry: BaselineEntry, *, actual_count: int, repres
         message=message,
         fingerprint=fingerprint,
         severity=RULE_METADATA.severity,
-        suggestion=f"Set occurrences: {actual_count} for {entry.path}:{entry.qualname}:{entry.kind} in {BASELINE_RELATIVE_PATH}.",
+        suggestion=(
+            f"Delete the entry for {entry.path}:{entry.qualname}:{entry.kind} from {BASELINE_RELATIVE_PATH}."
+            if actual_count == 0
+            else "Run `python -m elspeth_lints.rules.masquerade.seed_baseline`, then re-adjudicate "
+            f"{entry.path}:{entry.qualname}:{entry.kind}."
+        ),
         symbol_context=(entry.qualname,),
         ast_path=f"occurrence-drift:{entry.kind}:{entry.qualname}",
+    )
+
+
+def _probe_shape_drift_finding(entry: BaselineEntry, *, group: SiteGroup) -> Finding:
+    site = group.representative
+    expected = ", ".join(shape[:12] for shape in entry.probe_shapes) or "<legacy-unbound>"
+    actual = ", ".join(shape[:12] for shape in group.probe_shapes)
+    message = (
+        f"probe-shape-drift: {BASELINE_RELATIVE_PATH} records normalized probe shapes [{expected}] for "
+        f"{entry.kind} at {entry.qualname!r} in {entry.path}, but the tree currently has [{actual}]. "
+        "The key and occurrence count are unchanged, but at least one probe was materially rewritten. "
+        "Refresh probe_shapes and re-adjudicate the changed call before preserving its classification."
+    )
+    fingerprint = _fingerprint(f"{RULE_ID}:probe-shape-drift", entry.path, entry.qualname, entry.kind)
+    return Finding(
+        rule_id=RULE_ID,
+        file_path=entry.path,
+        line=site.line,
+        column=site.column,
+        message=message,
+        fingerprint=fingerprint,
+        severity=RULE_METADATA.severity,
+        suggestion=f"Refresh probe_shapes and re-adjudicate {entry.path}:{entry.qualname}:{entry.kind}.",
+        symbol_context=(entry.qualname,),
+        ast_path=f"probe-shape-drift:{entry.kind}:{entry.qualname}",
     )
 
 

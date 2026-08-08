@@ -23,15 +23,14 @@
 # Identity is (path, qualname, kind) — no line numbers, so reformatting or
 # moving a site does not require re-adjudication, but renaming or
 # relocating it does (the old entry goes stale, a new one is required).
-# Multiple call sites of the same kind inside one function share one
-# entry, but the `occurrences` field on that entry is a REQUIRED,
-# EXACT-MATCH COUNT of current non-amnestied occurrences at that key —
-# not a one-time snapshot. Adding (or removing, or amnestying away) even
-# one probe at an already-baselined site changes the count and fires
-# occurrence-count-drift until the entry is updated. This is what stops
-# someone from adding a fourth getattr call to an already-adjudicated
-# high-traffic boundary (e.g. tool_batch.py::_admit_tool_batch) and having
-# the gate stay silently green.
+# Multiple probe sites of the same kind inside one function share one
+# entry. `occurrences` is a REQUIRED exact count, and `probe_shapes` is a
+# sorted per-occurrence multiset of SHA-256 fingerprints over normalized
+# AST shapes (source positions excluded). Count drift catches additions /
+# removals; shape drift catches one-for-one semantic substitutions at the
+# same key and count. Whitespace-only reformatting keeps the same shape. A
+# legacy entry with no shapes may be loaded for migration, but it always
+# fires shape drift and its old review is not preserved by refresh.
 #
 # A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
 # the tree is itself a gate failure (stale-baseline-entry) so this file
@@ -44,6 +43,8 @@ entries:
   qualname: _execute_new_judgment_action
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -52,6 +53,8 @@ entries:
   qualname: _finding_ast_path
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4457cb6b53b11fdb6c4dad46aaeff632bf1796585fa7106951a0aafe182e6225
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -60,6 +63,8 @@ entries:
   qualname: _finding_file_fingerprint
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 823e3582e9be85d920d394e995ce8354e40eda54a0863ab3a0f4b807331fbf5e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -68,6 +73,8 @@ entries:
   qualname: _finding_scope_fingerprint
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 26505fdcb0c019fecca5ee2623e431c6ee36995dd7069e06e509b2b604d598c2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -76,6 +83,8 @@ entries:
   qualname: _finding_symbol_context
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a068d2609be7e5e99917f6bfbbea999b43d3d036eefe3466f04e5ed4a0a7004b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -84,6 +93,8 @@ entries:
   qualname: _namespace_for_signing_spec
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -92,6 +103,8 @@ entries:
   qualname: _run_check
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1d53f14e275d41f975fbaf39d3bea0342f19a635216805e22305192144d44bc9
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -100,6 +113,9 @@ entries:
   qualname: _run_justify
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
+  - dda22049e63576e25d7533def1e81d30ee9113b4564998291b927a641830f12b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -108,6 +124,8 @@ entries:
   qualname: _load_fixture_rule
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a724270d54b6196629973cb965f2f81387f78df755bb259145f66cc0dd01831f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -116,6 +134,8 @@ entries:
   qualname: _consume_agent_messages
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5f2d967cb3e042b14f96cadacae8f02d3af69ee7cb34263caa4bd8f6a673a17c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -124,6 +144,9 @@ entries:
   qualname: _extract_cache_accounting
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 73b9b35c7e10e2e3507f0fd9c7e8cbe34ddd18f178b9d2847d59c84d2300d549
+  - eb558ae5b2a2af30694afd43c6c0eac73a9ffaa13c6c379c34e0cc57fdcefc95
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -132,6 +155,8 @@ entries:
   qualname: _extract_text_block
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 07669a4daab0d95ce38e5c564f0d712f98d01266fca6d8b410f91a0e8777fd11
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -140,6 +165,8 @@ entries:
   qualname: _finding_int
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7b9c467afbb94cceececd34bb65f4913404ca147c4394f157ff38926582fc2d6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -148,6 +175,8 @@ entries:
   qualname: _finding_string
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7b9c467afbb94cceececd34bb65f4913404ca147c4394f157ff38926582fc2d6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -156,6 +185,8 @@ entries:
   qualname: _lookup_module_attr
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 40236a9297535c20c08a6e2fb3c8452a7024eb888cbf9783b9eb11527266a8a1
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -164,6 +195,8 @@ entries:
   qualname: _reaudit_one_entry
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 3b4db8fb3559b420d3ab3cfbc11dba217ac7c1bbba7d12475171e47be51242ce
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -172,6 +205,8 @@ entries:
   qualname: ActionPreview.__post_init__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -180,6 +215,10 @@ entries:
   qualname: BundleAction.__post_init__
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
+  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
+  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -188,6 +227,8 @@ entries:
   qualname: <module>
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9c7c1c44dbb7139299312a3e2c326dbdb65e4e67910eb5e27d5ff54b7141ae6b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -196,6 +237,8 @@ entries:
   qualname: _verdict_str
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 39f1647006e3924780cbd951c8d4492b84b1c57f72787420f18503a7555dcfb6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -204,6 +247,8 @@ entries:
   qualname: _ImportBindingVisitor._visit_function_definition
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -212,6 +257,8 @@ entries:
   qualname: _ImportBindingVisitor.visit_ClassDef
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -220,6 +267,9 @@ entries:
   qualname: _node_finding
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
+  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -228,6 +278,8 @@ entries:
   qualname: ValidationTheatreVisitor._has_deferred_context
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - eeb92428fbee2cad44c319f90d7a7ff5378e3885aa6b67c6fcb35141cfc8a4db
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -236,6 +288,8 @@ entries:
   qualname: _parse_manifest_value
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - eaba2839701c1f6eac01d5d71790ff24e674fdd0b1102f1a8e643f477c646282
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -244,6 +298,9 @@ entries:
   qualname: _node_location
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
+  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -252,6 +309,9 @@ entries:
   qualname: _node_location
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
+  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -260,6 +320,10 @@ entries:
   qualname: iter_metadata_models
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 06b25e3c47a7711b825b6fbff13c695e228c16b564030a515861bebaafac61cb
+  - 83f5fbe6c0e86213e03e8fbee2b908a5f3ae42d991710889540ed2144d42f0dd
+  - a30145262e9a1c2a3e2168953661eecbfb795c3e99b20006308c98ec992bdd58
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -268,6 +332,8 @@ entries:
   qualname: _allowlist_match
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 26505fdcb0c019fecca5ee2623e431c6ee36995dd7069e06e509b2b604d598c2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -276,6 +342,8 @@ entries:
   qualname: TierModelVisitor._receiver_assigned_known_type_before
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 094be0411c7270d578ead3946bcaab102e0c4af53bbef971db2d7451fb0721bb
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -284,6 +352,8 @@ entries:
   qualname: TierModelVisitor._visit_definition_header
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -292,6 +362,9 @@ entries:
   qualname: find_dict_violations
   kind: hasattr
   occurrences: 2
+  probe_shapes:
+  - 9828e0d7d7e9041f8c9c1c557cd1ce0e2c45dae6ccf2b3366ead97cc034f9a0a
+  - 9828e0d7d7e9041f8c9c1c557cd1ce0e2c45dae6ccf2b3366ead97cc034f9a0a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -300,6 +373,9 @@ entries:
   qualname: _await_rate_limiter
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 27a42c62417dd51d8ee6abfbde07a416c4d9bcca7bedd90e8df01ec577f67f5f
+  - 46b73db4932f9cf87818e2cfdd43af05b92f84d8e3f6680b9094e4f2a1a049cb
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -308,6 +384,8 @@ entries:
   qualname: _ScopeIndex.symbol.walk
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a2c2c2ed4184a6d3f7e1e32a51cdd8830d6b69b7a4b6fc55a9c5135817887fbd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -316,6 +394,8 @@ entries:
   qualname: run_scenario
   kind: hasattr
   occurrences: 1
+  probe_shapes:
+  - 4100bc27bb71f866808f6ec59070b172b22ef569fc4e297756e2364e57ce2864
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -324,6 +404,9 @@ entries:
   qualname: _load_scenario
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 7353d8ec385546d11e687dd04e7b5bf1db3dc9d516c587ba1572886a74e51d36
+  - df35871b84341f571dfd7eac4df7d456a3e0ae639134e1fa7653333f915dec8a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -332,6 +415,8 @@ entries:
   qualname: _load_scenario
   kind: hasattr
   occurrences: 1
+  probe_shapes:
+  - 47020af83f044ed6633651bcc196d211689a9c90b927f98cf82c3380d51bd2b8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -340,6 +425,8 @@ entries:
   qualname: ComposerChatTurn.to_dict
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e4b10dfc7bc9e8f0816a9d1aa93008ec5828fcaf5bdb9f5176c4fbbc67da076c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -348,6 +435,8 @@ entries:
   qualname: ComposerLLMCall.to_dict
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e4b10dfc7bc9e8f0816a9d1aa93008ec5828fcaf5bdb9f5176c4fbbc67da076c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -356,6 +445,8 @@ entries:
   qualname: ExternalCallCompleted.to_dict
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 61d3bda2d057feae9f4186142a562a3a2e5788a3405a04ec051361960f8ddcbe
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -364,6 +455,9 @@ entries:
   qualname: ResourceCleanupFailed.__post_init__
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 4789cb72737725a656e126bc35ecf8f9afe0c91626a31b538b4e89f8cca524c7
+  - 4789cb72737725a656e126bc35ecf8f9afe0c91626a31b538b4e89f8cca524c7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -372,6 +466,8 @@ entries:
   qualname: _event_field_to_serializable
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - faa9e2b29ae5b674ea4eb2e084d62eae50de50309e9b29809479ae35a04e7f9c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -380,6 +476,8 @@ entries:
   qualname: freeze_fields
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 2039457aadedb3a3b7adb092ba894ddb2f2db7a6801f7f86bd39d7da1bd307e5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -388,6 +486,8 @@ entries:
   qualname: _typing_special_form_name
   kind: getattr_static
   occurrences: 1
+  probe_shapes:
+  - f8308a75d60ad35840630376d0735e8c7b314f7c72606da3c4571bb1ad941a61
   classification: approved-introspection
   justification: Fetches the canonical typing special form off a module object for
     an `is` identity comparison; static introspection of stdlib structure, not a trust
@@ -396,6 +496,8 @@ entries:
   qualname: PipelineRow.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 22c7a84047485eb85da19c93a1afdaf23e80f083179239b14fb71393c00a8af2
   classification: data-container-api
   justification: Dot-access API over row DATA delegating to self[key] (a Subscript,
     not attribute forwarding to a foreign object), with a `_`-prefix recursion guard
@@ -406,6 +508,8 @@ entries:
   qualname: build_execution_graph
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 95282d43b453119a3b6f759cb5a50737c5fe6b51ab724b133226c18b45bc2fa6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -414,6 +518,8 @@ entries:
   qualname: dataclass_to_dict
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 22f95c0f9eaec75f16d6d2f5d8ad89fb79e4d62f07bc257552bb6be81bdf63db
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -422,6 +528,8 @@ entries:
   qualname: __getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - c781d204a0d92b0a4fd06115e699f25524310501be647a253b6048c21ba28eea
   classification: module-getattr
   justification: Module-level PEP 562 lazy-import facade over the closed _LAZY_EXPORTS
     dict. The gate is a try/except KeyError rather than an if/raise chain, so it falls
@@ -431,26 +539,33 @@ entries:
   qualname: __getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7a320d2426b5a415cd8a744e3d51ee1f442b457cc128f7ce597fa97d0f098a41
   classification: module-getattr
-  justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module(...), attr_name)
-    inside the PEP 562 lazy-export facade. Reached only after (module_name, attr_name)
-    is unpacked from the closed _LAZY_EXPORTS dict; a KeyError becomes AttributeError.
-    Both the receiver (a module from import_module) and the name (a dict value the
-    module owns) are module-controlled, so nothing caller-supplied reaches it.'
+  justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module(...),
+    attr_name) inside the PEP 562 lazy-export facade. Reached only after (module_name,
+    attr_name) is unpacked from the closed _LAZY_EXPORTS dict; a KeyError becomes
+    AttributeError. Both the receiver (a module from import_module) and the name (a
+    dict value the module owns) are module-controlled, so nothing caller-supplied
+    reaches it.'
 - path: src/elspeth/engine/__init__.py
   qualname: __getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 98aec98d8dc7d3152a2b90ae30ffa09b30eedeff364953cd64391d98a369686c
   classification: module-getattr
   justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module("elspeth.engine.orchestrator"),
     name) inside the PEP 562 facade, guarded by `if name in _ORCHESTRATOR_EXPORTS`
-    (a closed tuple) with a terminal raise AttributeError. Same idiom and same
-    reasoning as core/security and engine/orchestrator: module-owned name, module
-    receiver, no masquerade surface.'
+    (a closed tuple) with a terminal raise AttributeError. Same idiom and same reasoning
+    as core/security and engine/orchestrator: module-owned name, module receiver,
+    no masquerade surface.'
 - path: src/elspeth/engine/orchestrator/__init__.py
   qualname: __getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 7d43697f9d8c727f6d7d9bf51c40e6f5bab964949e7e41dca292f520ab60f87c
   classification: module-getattr
   justification: Module-level PEP 562 lazy-import facade gated on three closed export
     tuples via an if/elif/elif/else chain. The gate is real but uses elif, which this
@@ -459,18 +574,24 @@ entries:
   qualname: __getattr__
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 6c8dee9546691654181cf10e84712d7b9102012d92c086bd1016b2d2940dd28e
+  - a74b18c441ee7cf0e644cbed24c6bf28e5e543d6fbe18041953baca6ab2a5559
+  - ee09c47dad6135ad41abaf4f8f2e6a56297aed2047cbf1731d62b96d1dbbb131
   classification: module-getattr
   justification: 'ADJUDICATED (lead, 2026-08-08): the three getattr(import_module(...),
     name) calls in the PEP 562 facade body. Each is reached ONLY after name has passed
     a closed literal export table (_TYPE_EXPORTS / _PLUGIN_TYPE_EXPORTS / _RUNTIME_EXPORTS),
-    with a terminal else: raise AttributeError. The name can never originate from an
-    untrusted source, and the receiver is a module obtained by import_module, not a
-    caller-supplied object — so no object can masquerade through it. This is the
+    with a terminal else: raise AttributeError. The name can never originate from
+    an untrusted source, and the receiver is a module obtained by import_module, not
+    a caller-supplied object — so no object can masquerade through it. This is the
     explicit-table idiom the ticket asks authors to write, not a presence probe.'
 - path: src/elspeth/engine/orchestrator/counter_classification.py
   qualname: apply_counter_increments
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -479,6 +600,9 @@ entries:
   qualname: reconcile_sink_write_diversions
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -487,6 +611,8 @@ entries:
   qualname: BaseTransform.__init_subclass__
   kind: getattr_static
   occurrences: 1
+  probe_shapes:
+  - 03110fa2ce56a885bb1b56cae50dba8789054cb265e4cf98ae6b1e3bb0160432
   classification: approved-introspection
   justification: __init_subclass__ MRO check that a property wins resolution over
     BaseTransform.input_schema, raising TypeError at class creation on shadowing (elspeth-d6eeb3a71d).
@@ -496,6 +622,8 @@ entries:
   qualname: BaseTransform.__init_subclass__
   kind: hasattr
   occurrences: 1
+  probe_shapes:
+  - 8b0e21c6db1d04135bd0630647b35a12f13e3e033b29ba6121d09742217ceb53
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -504,6 +632,8 @@ entries:
   qualname: BaseTransform._config_named_input_columns
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 316d7d09acb7344def3ce999ebe82b20b59782d2da1cacd8450ac569e35a59fd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -512,6 +642,8 @@ entries:
   qualname: BaseTransform.input_schema
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9e39af6f5a4c825334da3bffb1f80a3c02bf09f9a5bd5318bb7bd68a70a90236
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -520,6 +652,8 @@ entries:
   qualname: DataverseAuthConfig.create_credential
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9cf64971a048192d39e28f6e01311958ff68f5a8a5f4b2c801d59c7a6ce9c967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -528,6 +662,10 @@ entries:
   qualname: _extract_usage_from_provider_response
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 8f37acb03fc9716c42fdfb82ccdef349f1de2309bdefed29275cd44f72e9019c
+  - b152071c62005727ff01cd4a182fd4cc896837b3a8e2f95c1502a8fa1d3a7bdb
+  - cd78238256c587a3f94efda2962ac996ed0f1776579d4c239801e26159111112
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -536,6 +674,8 @@ entries:
   qualname: read_litellm_model_list
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 3dd5d6b1058f531cfb97b22f20c5c6920a3c7137e74e2238ec9a5e45e5179d41
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -544,6 +684,8 @@ entries:
   qualname: _observed_send_attempts
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e14bd0a3576a73c757a8206297682ed40f69dbf59af64a2801a52a5f007f5f61
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -552,6 +694,8 @@ entries:
   qualname: _record_send_attempt
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e14bd0a3576a73c757a8206297682ed40f69dbf59af64a2801a52a5f007f5f61
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -560,6 +704,8 @@ entries:
   qualname: AWSTextractDocumentAnalysisConfig._consistency
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 50e5df14678228b39e3a01a2d2abe0d791af8c65be314316cc5666823e508207
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -568,6 +714,8 @@ entries:
   qualname: AWSTextractDocumentAnalysisConfig._field_name
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5a964b96d563f6e67ac0d9f3c4d6e47e60af6495d833734aa67dac82fba88e75
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -576,6 +724,8 @@ entries:
   qualname: AWSTextractDocumentAnalysisConfig._finite_timing
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - ed78977bb8787bc692bee8b0ffaa6e786d727a4741b499d952a4c788b2f08af5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -584,6 +734,8 @@ entries:
   qualname: AWSTextractDocumentAnalysisConfig.configured_output_fields
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 50e5df14678228b39e3a01a2d2abe0d791af8c65be314316cc5666823e508207
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -592,6 +744,8 @@ entries:
   qualname: AzureDocumentIntelligenceConfig.configured_output_fields
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c5a27fadc6966e946c4d9a0bb92c7d046a16fbf7fbd0c77147da19293bb9f593
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -600,6 +754,8 @@ entries:
   qualname: GatewayLLMProvider._record_logical_llm_error
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7c2b444df9194a340d73d07eba0b4774988f5deeecc590639a7110aa5468cdf6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -608,6 +764,8 @@ entries:
   qualname: OpenRouterLLMProvider._record_logical_llm_error
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7c2b444df9194a340d73d07eba0b4774988f5deeecc590639a7110aa5468cdf6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -616,6 +774,8 @@ entries:
   qualname: LLMTransform._process_row
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 054ad214a5df83a61e8ec600ac65a683d6db32452bbf597dd0b69b672dcff867
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -624,6 +784,8 @@ entries:
   qualname: MultiQueryStrategy.execute
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 054ad214a5df83a61e8ec600ac65a683d6db32452bbf597dd0b69b672dcff867
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -632,6 +794,8 @@ entries:
   qualname: SingleQueryStrategy.execute
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 054ad214a5df83a61e8ec600ac65a683d6db32452bbf597dd0b69b672dcff867
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -640,6 +804,8 @@ entries:
   qualname: _shutdown_event_is_set
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e4fcc2045495e7a2f03123caae4ba9922d227ac21a4df494a29e5089ae56e6f7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -648,6 +814,8 @@ entries:
   qualname: RAGRetrievalTransform._configured_collection_name
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 23c54bbeb32086f3f63643751b94144e4e9bdff13743f4fdcdead2f18dc63248
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -656,6 +824,8 @@ entries:
   qualname: ConsoleExporter._extract_pretty_details
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9386f2ece23803c2d2f38e00d68dc55a2f71cfa9e6d27d6db9b96914c189bd9e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -664,20 +834,25 @@ entries:
   qualname: _exporter_delivery_metrics
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b39727aaec3c603f9f8d32a5d6efc42cc998f3157fa53e953d6af6ca63e229f8
   classification: external-parse
   justification: 'ADJUDICATED BY ADR-032 ITSELF, not by this ticket. Exporters arrive
     from third-party pluggy plugins via elspeth_get_exporters with no type gate in
-    front of them, so this is a Tier-3 external boundary: sentinel getattr with
-    _DELIVERY_METRICS_ABSENT, then value assertions, with malformed-but-present
-    metrics raising rather than being downgraded to "absent". The function docstring
-    records why it must NEVER become a runtime_checkable Protocol isinstance check
-    (Python 3.12+ resolves those via getattr_static, which silently rejected valid
-    forwarding exporters and vanished their delivery accounting). Do not re-litigate;
-    do not "harden" back into a Protocol check.'
+    front of them, so this is a Tier-3 external boundary: sentinel getattr with _DELIVERY_METRICS_ABSENT,
+    then value assertions, with malformed-but-present metrics raising rather than
+    being downgraded to "absent". The function docstring records why it must NEVER
+    become a runtime_checkable Protocol isinstance check (Python 3.12+ resolves those
+    via getattr_static, which silently rejected valid forwarding exporters and vanished
+    their delivery accounting). Do not re-litigate; do not "harden" back into a Protocol
+    check.'
 - path: src/elspeth/web/_aws_ecs_acceptance/contracts.py
   qualname: acceptance_error_envelope
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 6090e0bdbf8d5a6af880d259638a08d3def4ebe9616ab980f185e7ad1f41c843
+  - da6b880283f015a6e338e9943facb74557807c0c32bc21d2aa3d17c577df9f54
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -686,6 +861,8 @@ entries:
   qualname: check_error_with_cause
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 84ac0f70ebc0855548cd5a90b32fe69ce8d3f27fefe2f9007296d6d9166401e9
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -694,6 +871,8 @@ entries:
   qualname: _BrowserDocumentHeadersMiddleware.dispatch
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 360cfd9d0e25c414af8b57af223b6ea2df24d641dc584f101350d99810a6e43b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -702,6 +881,9 @@ entries:
   qualname: _create_app._correlation_id
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 25080647a2f0556a4f0d46a90ec81fb122d702119145d14062171f266b0621eb
+  - a7c81e0bc8eb89313f97bdc80c1393080c66b3ec20914288e0da9b4e4b80923c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -710,6 +892,8 @@ entries:
   qualname: _open_owner_only_database
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 8f127e225a08b4dd97d1191adbd5fe2e96ff0de5e908e6969ce7f095ed2706af
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -718,6 +902,8 @@ entries:
   qualname: _validate_reusable_blob_row
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 2619dfc8a16c249022da2c5e90e55ed1aaaea4c54bd3bf900c81840f1bc5a16d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -726,6 +912,12 @@ entries:
   qualname: _admit_deferred_intent_repair_thread
   kind: getattr
   occurrences: 5
+  probe_shapes:
+  - 1f69ba680d07143896dcd1151761f28d41183a680c756c9d25587c3c4363b392
+  - 1fab5e2cd0c15355ca00ce24014de2097c5214b46fced64132caf783125c91ae
+  - 8923dbae997288081cf903ae25b0685eaf68f4c703847ba2cc97e11ecc2138af
+  - a905194a017472185413fa6095a1c43d4c5fafccbba44e15c3720633640dda81
+  - ecb38be7903352a060352d3db42e1dbef66165c5dd79f830e3a0bc8101d31d76
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -734,6 +926,9 @@ entries:
   qualname: ComposerServiceImpl._call_llm
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 8db4dd38e8917a32cf84749b587527221cbc8312767ee17c50e0a4980ac562e4
+  - a7184e0fea70413ed933dc47e8d4e8670fc3cecea4269eeb725222321e2ff63e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -742,20 +937,27 @@ entries:
   qualname: _admit_tool_batch
   kind: getattr
   occurrences: 4
+  probe_shapes:
+  - 3d6732be63a057e1d0cc2ed0fbe7e62fba1a6c5fe6067b1d2c49d12e367a7c8a
+  - 55cd213a15fb02c51d0c916485e376da08f2d59a4e7b175717c6d8bf1e8180d2
+  - 57d599dfe21df71888a4ff1e12d0870553035537ec8c7795c37899b57429b6b3
+  - bbef1d6333743e88aa9c2e1ac768a450a7e289df9218e2e8cac1027b81ce17a2
   classification: external-parse
   justification: 'ADJUDICATED BY ADR-032 ITSELF — this is the ADR''s cited corrected
-    boundary, the site of P0 elspeth-9ea866438b. Provider tool-call objects are
-    litellm/vendor-owned and frequently hold their payload in pydantic
-    __pydantic_extra__, so the four steps here ARE the control: read each field once
-    with a sentinel, assert the values, construct the owned frozen _AdmittedToolCall,
-    discard the original. The removed runtime_checkable Protocol check was theatre —
-    it admitted impostors and rejected every genuine provider tool call. The module
-    comment records why it must not return. If the occurrence count drifts here,
-    read the whole function before touching anything.'
+    boundary, the site of P0 elspeth-9ea866438b. Provider tool-call objects are litellm/vendor-owned
+    and frequently hold their payload in pydantic __pydantic_extra__, so the four
+    steps here ARE the control: read each field once with a sentinel, assert the values,
+    construct the owned frozen _AdmittedToolCall, discard the original. The removed
+    runtime_checkable Protocol check was theatre — it admitted impostors and rejected
+    every genuine provider tool call. The module comment records why it must not return.
+    If the occurrence count drifts here, read the whole function before touching anything.'
 - path: src/elspeth/web/plugin_policy/compiler.py
   qualname: _validate_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 19e8776f88e5dc93ecde0e3b31a441f12cb4d26c4d49be526e79fea30051d849
+  - e04301362b0a3b17f3f0c3d0f03eefdfb51081a245a687edcbc294c18a8697bf
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -764,6 +966,9 @@ entries:
   qualname: compile_web_plugin_policy
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 5646bcb3c335bb911cac252e850226d0859b9ad02c6dcf5b44f23eda7a70cf2e
+  - a6d662d64b35d01bb32e3976fea52aa8858d1c0ffd9d695f80dac6a78e739e8a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -772,6 +977,9 @@ entries:
   qualname: PreferencesService.update_composer_preferences._sync._resolve_progress
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 3a19ce2bf99e782c74fb93475dc61a1233d9fc430ccb0e31366a1a4c1b63b67f
+  - 90383565d72674725e160eae2a543739b896d7f246b12404280a46022cb4bef1
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -780,6 +988,8 @@ entries:
   qualname: _is_in_memory_sqlite
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d6ad9b17b2ac7b076c4eb2cf6634d07165b66d72206e072d8e24e32e965b4da5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -788,6 +998,9 @@ entries:
   qualname: _sqlstate
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - bdd7179b401a43a16833136dce3e9c9d043d31d53ecc61cceeb6e4de3f30bc80
+  - d6c05d350951b3a47b0320882c4e6fc66dbc952d352fad256f8422a2f00da7f8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -796,6 +1009,8 @@ entries:
   qualname: _upsert_update_mapping
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 8d77d6fad94f28543a1143014a01cfe043b192abe1e5bf315a458d62300922b3
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -804,6 +1019,11 @@ entries:
   qualname: _admit_auto_title_completion
   kind: getattr
   occurrences: 4
+  probe_shapes:
+  - 67c92314923759122b3e0d1de1d639cc43aebc26a420449ebe0c120f1c8554fc
+  - 80d02de3a2733bf7d4a0d9a96cde6657f4cbbce28d016ab2a1b9f46c2108d5b6
+  - a8b62b0fd8171c2773430f5b978bf7b57bdd7e027cd01b8f0cd460b6c310c149
+  - db3bb4304cc994f95a592226a53d8d43d6424ba6f5965e3538badd99146fa1de
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -812,6 +1032,8 @@ entries:
   qualname: _freeze_runtime_val_registries_before_begin_run.with_test_sink_effect_modes
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b85eec36e9db92b96cd4cdaf4ad6914aa6d209f93e4feb272163ac28ae659ea2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -820,6 +1042,8 @@ entries:
   qualname: _expected_section
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - da20b81626e751fe919df35d1de431126d03bd3bdff9d7542e26e649106efdcd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -828,6 +1052,8 @@ entries:
   qualname: assert_reference_text
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0142cf09f3c66ac651cc3389c08d0261201cdd9dcc65f71781716db3e51e1faa
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -836,6 +1062,8 @@ entries:
   qualname: _expansion_child_enqueue_recovery_case.fail_after_source_exhausted
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 26c1f01e5d3e083db6f372f052403a9dff219792b6e7a639fe9ef4309b5c8d2e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -844,6 +1072,8 @@ entries:
   qualname: _pending_sink_redrive_recovery_case.stop_after_source_exhausted
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 26c1f01e5d3e083db6f372f052403a9dff219792b6e7a639fe9ef4309b5c8d2e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -852,6 +1082,8 @@ entries:
   qualname: wire_transforms
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4c2f17f9a541d6bf869c3d76ce3fe053eadf910b10c58ae32602a102b5d22ea0
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -860,6 +1092,8 @@ entries:
   qualname: TelemetryTestExporter.assert_event_emitted
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 21c0825d6503810044e86c0f6130e2630cb7180481e6058392ffb2a81fd231f2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -868,6 +1102,8 @@ entries:
   qualname: test_spool_close_failure_does_not_fail_a_registered_export._ExplodingCloseSpool.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 2db64d14351ca2602639c95746e58318765e47e421a75a7af6a7d951bbfa0819
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -876,6 +1112,8 @@ entries:
   qualname: test_spool_close_failure_does_not_fail_a_registered_export._ExplodingCloseSpool.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7f11ccb7cd9aff119076369a3a3b6a213dee7b4b602e73e77e370be9fbd9347b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -884,6 +1122,8 @@ entries:
   qualname: _invariant2_transforms
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - bd4ba5adbbac54e6f8d6609fdc131d64287854c82342ad20149715c72e45170d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -892,6 +1132,8 @@ entries:
   qualname: TestOrchestratorWiresTelemetryToContext.test_context_telemetry_emit_is_callable
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 53da5ec9439aac1198677aab11b7a4dbfcc353cae7aa63ed13da2c4926bba30d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -900,6 +1142,8 @@ entries:
   qualname: composer_test_client
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 9427ac67e4a6abc0c4a953fbfbcb695bc39d8333b7c9404fabed06f8e53c24a7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -908,6 +1152,10 @@ entries:
   qualname: test_guided_full_atomic_stage_fault_rolls_back_the_entire_cohort.inject_fault
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 129f56c549f8aba5573f4af5f5e28c6e8a371336926b008029e7fe9dec969098
+  - 92e5efdfd4205738827fcbf95871ca3c99e342b0451527156bd76315cae28257
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -916,6 +1164,10 @@ entries:
   qualname: test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together.inject_fault
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 129f56c549f8aba5573f4af5f5e28c6e8a371336926b008029e7fe9dec969098
+  - 92e5efdfd4205738827fcbf95871ca3c99e342b0451527156bd76315cae28257
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -924,6 +1176,8 @@ entries:
   qualname: test_plural_sources_outputs_survive_hydration_and_stage_ordered_proposal
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6240e590488f57d8a86c7335d2cd62395ea6e13fc95c7055ff69d89a8378ca53
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -932,6 +1186,9 @@ entries:
   qualname: TestStep2IntraStep.test_component_back_edit_fault_rolls_back_every_settlement_surface.inject_fault
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 5756ee07d0bcbcea7bfe5109c952b13a53782fc880d4cb0d1d12c5303789b781
+  - 8d4a399d9821e1355114cf463812c8bcf5819c49b0d32f221d518641ea8bd6d8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -940,6 +1197,9 @@ entries:
   qualname: test_only_one_schema8_respond_route_is_registered
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 9f0ffd9b644a8a1210aa70cf531814531668ae012e587eb275c52cf8d44ee443
+  - c037ddc2149c035c4dd0207536b2cbc3f612a55799f2c20482786d79c141343e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -948,6 +1208,10 @@ entries:
   qualname: test_fault_at_each_settlement_boundary_rolls_back_business_state_but_persists_failure_audit.inject_fault
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 129f56c549f8aba5573f4af5f5e28c6e8a371336926b008029e7fe9dec969098
+  - 92e5efdfd4205738827fcbf95871ca3c99e342b0451527156bd76315cae28257
+  - 964786ab0bffe9209851dab56fcf07bd1bfc937ccdef8cb586ceb24f716c8025
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -956,6 +1220,10 @@ entries:
   qualname: test_schema8_management_proposal_invalidation_fault_rolls_back_intent_proposal_checkpoint_and_custody.inject_fault
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 37da08de0f2f92d5434fac9e2f252b11afc7519c707b3afc8a8b88adf98fe12b
+  - 622db1770635d323f41f55b1546b8b0a9c7b34bb779003af6fb0c6707a570496
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -964,6 +1232,9 @@ entries:
   qualname: ParityEnv.drive_freeform
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 8a39d90635d29c9e1fcc064875a9712295ab1da884c68c94024a19aa10136384
+  - 8dc5589a094d3d9fb82144cfbb9e4509cc6aca4584ac8dfa0b9821e9246a8d91
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -972,6 +1243,8 @@ entries:
   qualname: test_negative_example_fires_violation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0f26424ef7d557f186d59b745faa3e1bdf1f53a3cef319762f6129eb6904aa5b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -980,6 +1253,8 @@ entries:
   qualname: test_negative_example_payload_covers_required_schema_keys
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0f26424ef7d557f186d59b745faa3e1bdf1f53a3cef319762f6129eb6904aa5b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -988,6 +1263,8 @@ entries:
   qualname: test_runtime_check_does_not_fire_on_non_apply_scenario
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0f26424ef7d557f186d59b745faa3e1bdf1f53a3cef319762f6129eb6904aa5b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -996,6 +1273,8 @@ entries:
   qualname: test_negative_example_for_real_production_adopter_fires
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0f26424ef7d557f186d59b745faa3e1bdf1f53a3cef319762f6129eb6904aa5b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1004,6 +1283,8 @@ entries:
   qualname: _declares_an_arriving_column
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b15565d9a33ef51db4e5dfa313965d12d2543b544e975efad25bd68f7e455089
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1012,6 +1293,8 @@ entries:
   qualname: _input_naming_options
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 316d7d09acb7344def3ce999ebe82b20b59782d2da1cacd8450ac569e35a59fd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1020,6 +1303,9 @@ entries:
   qualname: TestInputSchemaConfigIsCaptured.test_every_transform_that_validates_its_config_captures_the_schema_block
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 7ccb62bd9dca0300f66a5800465be65331372e2e0a96de5e148d5f6a8089df6c
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1028,6 +1314,9 @@ entries:
   qualname: TestInputSchemaConfigIsCaptured.test_no_registered_transform_demotes_a_field_its_config_declares_required
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 7ccb62bd9dca0300f66a5800465be65331372e2e0a96de5e148d5f6a8089df6c
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1036,6 +1325,8 @@ entries:
   qualname: _probe_instance
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4c0a35eab07a2b264936601903a4a56f155c8aa5239122e1f8afb3df030e76f1
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1044,6 +1335,9 @@ entries:
   qualname: TestTransformInputContractIsSatisfiable.test_declaring_a_created_field_required_is_neutralised
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 7ccb62bd9dca0300f66a5800465be65331372e2e0a96de5e148d5f6a8089df6c
+  - bd4ba5adbbac54e6f8d6609fdc131d64287854c82342ad20149715c72e45170d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1052,6 +1346,8 @@ entries:
   qualname: TestTransformInputContractIsSatisfiable.test_no_transform_requires_a_field_it_creates
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - bd4ba5adbbac54e6f8d6609fdc131d64287854c82342ad20149715c72e45170d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1060,6 +1356,8 @@ entries:
   qualname: _probe_instance
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4c0a35eab07a2b264936601903a4a56f155c8aa5239122e1f8afb3df030e76f1
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1068,6 +1366,8 @@ entries:
   qualname: _plugin_name
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - bd4ba5adbbac54e6f8d6609fdc131d64287854c82342ad20149715c72e45170d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1076,6 +1376,8 @@ entries:
   qualname: _probe_failure_reason
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1256b49533008d2d72e636a580521d9bd0ac408eb84326cb96a498f338f99852
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1084,6 +1386,9 @@ entries:
   qualname: TestForkRecoveryInvariant.test_resume_buffered_counter_reconciles_with_uninterrupted_run
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 3ca22140eb1552117d432bcfda0670cd54e99d0f9aca0c25547d2b3cc7e32415
+  - b33b839c32c34ebaf0aa650683ca096f384a25672a414c181ca68ef7806ab1b5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1092,6 +1397,9 @@ entries:
   qualname: TestForkRecoveryInvariant.test_resume_coalesced_counter_reconciles_with_uninterrupted_run
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 3ca22140eb1552117d432bcfda0670cd54e99d0f9aca0c25547d2b3cc7e32415
+  - b33b839c32c34ebaf0aa650683ca096f384a25672a414c181ca68ef7806ab1b5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1100,6 +1408,9 @@ entries:
   qualname: TestForkRecoveryInvariant.test_rows_buffered_live_equals_derive_after_unification
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 3ca22140eb1552117d432bcfda0670cd54e99d0f9aca0c25547d2b3cc7e32415
+  - b33b839c32c34ebaf0aa650683ca096f384a25672a414c181ca68ef7806ab1b5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1108,6 +1419,9 @@ entries:
   qualname: TestRunResultFieldProperties.test_run_result_field_coverage
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 14fda6b02177c0971343fbdc0e5fa814b0f52840e0f62f1ae243abf6a0ac4531
+  - 9bd738db01f200e5bd8eff81bbf5eff436b858ae13492b922d747006db619b9e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1116,6 +1430,8 @@ entries:
   qualname: TestContentSafetyThresholdsValidation.test_valid_thresholds_accepted
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - dc9e5cc46e17813ad567a130e456fc9b6ba5e6a13637822576a2cd8efaa72bca
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1124,6 +1440,8 @@ entries:
   qualname: test_postgres_bulk_state_completion_prelock_chunks_large_batches.spy
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 25dee086df98c7f873a87a78ffe86fce0e76b686fb86b78c0ec1d39a62713f5b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1132,6 +1450,8 @@ entries:
   qualname: test_b3_error_projections_require_canonical_json
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 04f10c519e00a886ab43f38584a5b45d1f5c0d0be495c11d545fde7cb98f65e3
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1140,6 +1460,10 @@ entries:
   qualname: test_nonempty_stateful_family_changes_semantic_projection_and_hash
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 1350711bb2d04cccde35bc3d9afecb6c2b2fcb9424c7abd61ca4165072df8e02
+  - 45a1a8ad73319efe280f695f921fe3b0f710abe62338928a92593b0882520518
+  - a643e932207375e64531f2d2f992aaa9c4cf153a2b038c384186e00e1f2a6f75
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1148,6 +1472,8 @@ entries:
   qualname: TestCrossValidation.test_default_instance_exposes_all_protocol_properties
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 895115c1b8fb556518aeee33e3ad2ddc8b938182bc66010687610b9e3acdeb6e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1156,6 +1482,8 @@ entries:
   qualname: _config_class_for
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4cb5c8d411981c721a297e029fdc5be1fd39d17309194c651006422be7479b13
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1164,6 +1492,8 @@ entries:
   qualname: _get_protocol_property_names
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c791640ac1fa85f584c401e3488c2dd253a877c886a2b8b37bc47ddd0ad70c30
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1172,6 +1502,8 @@ entries:
   qualname: _get_protocol_property_return_type
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - aa37110c826d1daa08a93115dba0c1177a28fb10d668dd02d21f10068599c8d2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1180,6 +1512,9 @@ entries:
   qualname: _is_runtime_protocol
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 6d7372cf4891a27c8c74051c16e1cb01fffa2ff0af8614312e35cc303c4f7dff
+  - aee5909a3204421265f95738a1d59d16a3ba00956a1d19bf8d0bffff62c9f5c4
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1188,6 +1523,8 @@ entries:
   qualname: _normalize_type_name
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1b955e4b22f431c1d5d67a32f9a9351859f7415b8db5250c26d823ad855d623c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1196,6 +1533,8 @@ entries:
   qualname: get_config_class
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 8bd18996ba6c78a542b31e0ff10f1290d40c7f074664127606251fe1099b61cb
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1204,6 +1543,8 @@ entries:
   qualname: get_protocol_class
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a340dc03ad1573fc3246a03a65f84b098720c00660ecded4c3fe2919d9d31296
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1212,6 +1553,8 @@ entries:
   qualname: get_settings_class
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a340dc03ad1573fc3246a03a65f84b098720c00660ecded4c3fe2919d9d31296
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1220,6 +1563,8 @@ entries:
   qualname: test_l0_module_has_no_upward_imports
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7c42741ca8fdac003c2a44ff01a4385bb13edc1495d52a06dc73016b55512999
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1228,6 +1573,8 @@ entries:
   qualname: test_l0_module_has_no_upward_imports
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7c42741ca8fdac003c2a44ff01a4385bb13edc1495d52a06dc73016b55512999
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1236,6 +1583,8 @@ entries:
   qualname: TestPluginContextProtocolContracts.test_protocol_method_signatures_match_plugin_context
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4a5baf26a1af1b917192c9151c30e35f117384d40cea828c7462efcdbd2b326d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1244,6 +1593,8 @@ entries:
   qualname: test_negative_example_fires_the_violation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - f579a621bce578177fbf15d0c6a6fc5e129672bc3e08a9a6dd50714983ee9c2a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1252,6 +1603,8 @@ entries:
   qualname: TestTokenInfoLineageFieldGuards.test_accepts_non_empty_lineage_field
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 81ddf453ccca3192df69e3e9758d22b30a707a041422aea1af94d2069ef7f963
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1260,22 +1613,19 @@ entries:
   qualname: TestTokenInfoLineageFieldGuards.test_accepts_none_lineage_field
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 81ddf453ccca3192df69e3e9758d22b30a707a041422aea1af94d2069ef7f963
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
     'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
 - path: tests/unit/contracts/test_plugin_assistance_coverage.py
-  qualname: test_builtin_plugin_publishes_discovery_hints.<lambda>
+  qualname: <lambda>
   kind: getattr
-  occurrences: 1
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: tests/unit/contracts/test_plugin_assistance_coverage.py
-  qualname: test_builtin_plugin_publishes_summary.<lambda>
-  kind: getattr
-  occurrences: 1
+  occurrences: 2
+  probe_shapes:
+  - 5a82aa86d10df2d523ff0b96f4de83320e0b9f9a9145bd5011fcd508f21b8794
+  - 5a82aa86d10df2d523ff0b96f4de83320e0b9f9a9145bd5011fcd508f21b8794
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1284,6 +1634,9 @@ entries:
   qualname: test_contracts_re_exports_plugin_schema_data_surface
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 8f5a33db2b1a140688e2bd7a0fafc63aa7eab5718d177ba86f81b75c4e992154
+  - 92a8e13e106cb90c29258c84bbc0d7c052ec9fc9a36f2648fa8ea138f7e27902
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1292,6 +1645,8 @@ entries:
   qualname: test_sink_effect_carriers_are_contract_owned_and_public
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0dd3909d2160fea15ae409354a2692b8238b58c94af5bbad5e28ce0f30a8f8b8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1300,6 +1655,10 @@ entries:
   qualname: test_export_input_is_dense_bounded_exact_and_has_no_pipeline_fields
   kind: getattr_static
   occurrences: 3
+  probe_shapes:
+  - 3ce56da176180ef8eb6b5e0737c3add2e9274bb5c39884f4b1e970842758e1f0
+  - f7153a396922bc3f943f141e1826da018ee2c844a2022a44019623758ad8b41f
+  - fb0974456fe8ac0dba2fea95743a9c59da1c4ce143fa4725e812d95d8e962b1e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1308,6 +1667,8 @@ entries:
   qualname: test_restricted_reader_keeps_manifest_separate_and_exposes_no_arbitrary_read
   kind: getattr_static
   occurrences: 1
+  probe_shapes:
+  - a90db6d5d1e25c5180bd4f18cc5669bb84514ce55509d589586d463acfeeac79
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1316,6 +1677,8 @@ entries:
   qualname: test_sink_effect_protocol_has_independent_kind_capability_and_exact_methods
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e2d68f1542a611bf3bf0cb0377546bff1d7ecc7f1145db0c97a45b4e0e118e84
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1324,6 +1687,8 @@ entries:
   qualname: test_incomplete_token_spec_accepts_none_optional_string
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 59b372004a4dfb6ac3a439e298cdcf120ca1691f13cbf7b2910c09017481d10f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1332,6 +1697,8 @@ entries:
   qualname: test_bound_winner_recomputes_persisted_graph_hashes_from_registered_bytes
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5b98175db4070eb4bb11fadafa974707aff78b672ff44951c23b01dc09e24f3b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1340,6 +1707,8 @@ entries:
   qualname: TestCompleteNodeStateCrashPaths.test_batch_complete_chunks_validation_and_readback_state_id_selects.bounded_state_select_connection.patched_execute
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 700092c410aa5af547f4582f915e222f85af3706ab1062a96e470a2aab35e56a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1348,6 +1717,10 @@ entries:
   qualname: TestCompleteNodeStateCrashPaths.test_complete_node_states_completed_many_skips_prelock_on_sqlite.observe_connection.observed_execute
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 25dee086df98c7f873a87a78ffe86fce0e76b686fb86b78c0ec1d39a62713f5b
+  - 43c99c1a7bf218e19c6cc4174fcf76339f6193435b16a6bfc8b64454078d4f66
+  - 700092c410aa5af547f4582f915e222f85af3706ab1062a96e470a2aab35e56a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1356,6 +1729,9 @@ entries:
   qualname: TestDelegationSignatureAlignment.test_signature_alignment
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - d6f9e5e897011802e4fdd95ba346b8ab309f548a85c41edaed33a8de21c2b3ee
+  - fe2f48d3719b0f00cf1d73e0b14ac99e6febc84d138bd4fb53998f0d44c61471
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1364,6 +1740,8 @@ entries:
   qualname: _SpyReadModel.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - c48fa1bdbf4510c9a54ac6b7c7bf6f3bae27a11eda3f41f70e496b149ad6cd51
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1372,6 +1750,8 @@ entries:
   qualname: _SpyReadModel.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7f11ccb7cd9aff119076369a3a3b6a213dee7b4b602e73e77e370be9fbd9347b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1380,6 +1760,8 @@ entries:
   qualname: TestReadPortDelegation.test_every_public_method_delegates_to_same_named_repo_method
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - cbc09bb60ba345be4310dff039a97c20d7cfbda25b28ce3c695406df010a376e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1388,6 +1770,8 @@ entries:
   qualname: _RecordingRepo.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 7fd5c3156b123c56e887e2f5bdaac31b5db8c34691f5df9c605d373fc98da70c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1396,6 +1780,8 @@ entries:
   qualname: test_landscape_root_does_not_export_raw_schema_tables
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 52b1e862e33985f937a25f9b180b744e75678cd8d969d45857a4e95fcbbd05cd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1404,6 +1790,8 @@ entries:
   qualname: _grouped_by
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1dbca188095c535776c7ed57f62f2844848a86934a5a4f5ffaa9bfc2cd503cba
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1412,6 +1800,8 @@ entries:
   qualname: _legacy_unfenced_recovery_write
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 27024643f4867ca35921c88ac15203f0bddefc513e414418d1d52adf993cc8a2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1420,6 +1810,8 @@ entries:
   qualname: _strict_fenced_write
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - caf2c3f6092c26791b3aa700fdcd1316d717add02c0d09520f2902494a29d57f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1428,6 +1820,8 @@ entries:
   qualname: test_barrier_wrapper_type_contract_requires_authority
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 35fc56f42088562d1e32d5cde232d1460180147f5b0542407e9bed85a07574d6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1436,6 +1830,8 @@ entries:
   qualname: test_legacy_recovery_api_is_explicitly_named_and_has_no_authority_selector
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b0c2142ce8a43297ef9fc9b420fc38c25de53f3882b82462d070c6f1a73cc4ef
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1444,6 +1840,8 @@ entries:
   qualname: test_claim_pending_sink_accepts_complete_legal_bundle
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d219910d568e91aa30055b02173462ab563f4a59d0c72944e01cacd013684929
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1452,6 +1850,8 @@ entries:
   qualname: _check_sql
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5d09588126f1a3f50bc72e8fde0c7f425f1e67b4b4792afcc64021e1cba8ace8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1460,6 +1860,8 @@ entries:
   qualname: test_export_cross_mapping_fails_before_hashing
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6677c6933955725cea726822b916900768c7a699996fe4197ff7c0643eeccc52
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1468,6 +1870,8 @@ entries:
   qualname: TestLeaseOwnerCheckConstraint.test_check_literal_matches_enum_value
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5d09588126f1a3f50bc72e8fde0c7f425f1e67b4b4792afcc64021e1cba8ace8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1476,6 +1880,12 @@ entries:
   qualname: test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed_by_peer.lease_selected_pending_sink_before_claim_update
   kind: getattr
   occurrences: 5
+  probe_shapes:
+  - 256cb87b06ebaee593e5604825117b3cd14a11c5d1b973bb296f42852300ac37
+  - 35cf15d786015d9bd3b4b35004b9e8b600e9d2684ed618765d0fb037c1634107
+  - 622db1770635d323f41f55b1546b8b0a9c7b34bb779003af6fb0c6707a570496
+  - d9d3f9df54eac8105fb50859ade6a30219334221e15169f5109d618f1e2a53e6
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1484,6 +1894,12 @@ entries:
   qualname: test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_peer.lease_selected_item_before_claim_update
   kind: getattr
   occurrences: 5
+  probe_shapes:
+  - 256cb87b06ebaee593e5604825117b3cd14a11c5d1b973bb296f42852300ac37
+  - 35cf15d786015d9bd3b4b35004b9e8b600e9d2684ed618765d0fb037c1634107
+  - 622db1770635d323f41f55b1546b8b0a9c7b34bb779003af6fb0c6707a570496
+  - d9d3f9df54eac8105fb50859ade6a30219334221e15169f5109d618f1e2a53e6
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1492,6 +1908,12 @@ entries:
   qualname: test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_lease.peer_re_leases_between_select_and_update
   kind: getattr
   occurrences: 5
+  probe_shapes:
+  - 256cb87b06ebaee593e5604825117b3cd14a11c5d1b973bb296f42852300ac37
+  - 35cf15d786015d9bd3b4b35004b9e8b600e9d2684ed618765d0fb037c1634107
+  - 622db1770635d323f41f55b1546b8b0a9c7b34bb779003af6fb0c6707a570496
+  - d9d3f9df54eac8105fb50859ade6a30219334221e15169f5109d618f1e2a53e6
+  - fdc05e1d95b4a49967a15a9c2bf4805379668b555b07e00360278b7bc2a8ff06
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1500,6 +1922,8 @@ entries:
   qualname: _write_signed_allowlist
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b192531e2f203712acf01adc63a012d22f654703e3db1fa6f06ddcde50df960c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1508,6 +1932,8 @@ entries:
   qualname: test_call_judge_wraps_openrouter_status_errors
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d224c56b7bc7b98563fa192b1fd57411299513f85acb405ef12b6aaf129c5f5e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1516,6 +1942,8 @@ entries:
   qualname: _UnusedScheduler.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - a8260f6175c452eadf0e79674b63ed401659dd4d4769a437a9fb58d8cc1dd23c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1524,6 +1952,8 @@ entries:
   qualname: test_run_ceremony_emits_partial_summary_from_run_result._FrozenClockTime.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 41c90a157acb93f0338ec9cbbd195bfaddeb9a456094bbf79de0d5084fd477da
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1532,6 +1962,8 @@ entries:
   qualname: test_run_ceremony_emits_partial_summary_from_run_result._FrozenClockTime.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c17c59ac6802200e8e087b6ed8148ee5dca93c0d9e207d6dec063106932350bc
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1540,6 +1972,9 @@ entries:
   qualname: _assert_governed_fields_match
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 2fc082d46049283a5942493ed3c1d0a786e12ba782621f3e38b0d5f331f89c61
+  - f1f661a8ee92605ea87d7186c73525a86643e2be9b8cffdcfef431f32c2a47a0
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1548,6 +1983,8 @@ entries:
   qualname: TestAggregationExecutorTerminality.test_output_hash_failure_marks_state_and_batch_failed
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - ebf61f8d22014d0dc8d8801cd7a2c63dadfef6ae19331865db3222859fee5e04
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1556,6 +1993,8 @@ entries:
   qualname: test_negative_example_fires_violation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - f579a621bce578177fbf15d0c6a6fc5e129672bc3e08a9a6dd50714983ee9c2a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1564,6 +2003,8 @@ entries:
   qualname: _make_processor
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 55668f1d61fad898e92fda71121cfb270a34dea618168e2aa173ff8d1e7d3ad7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1572,6 +2013,8 @@ entries:
   qualname: _RecordingScheduler.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - fad38e87edfa660e6b82cd2355325b6b55fe2a2e2d775f44c3393bdc380802bf
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1580,6 +2023,8 @@ entries:
   qualname: _RecordingScheduler.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7f11ccb7cd9aff119076369a3a3b6a213dee7b4b602e73e77e370be9fbd9347b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1588,6 +2033,9 @@ entries:
   qualname: TestReadyEmissionParity.test_emission_fields_equal_ready_fields
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 6fb0325b923a88a7910375bd832431429ec5f5429241174796c337bd904ba3c4
+  - 9ae544ca96ca9abd83f8a83fcc83852e775446623bd78d24a3ab0212cb4dadf4
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1596,6 +2044,8 @@ entries:
   qualname: TestRehydrateCursor.test_terminal_lane_rehydrates_to_none_cursor
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - ec6c377374d2405462d431e48ff72a66dc2fa680e4ca7d9dea28f1ae1f14f23a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1604,6 +2054,8 @@ entries:
   qualname: test_admission_receipt_is_private_and_forged_lookalike_is_rejected
   kind: getattr_static
   occurrences: 1
+  probe_shapes:
+  - f3ea1ca894a2e1dd6342daf3a8d522fac5e3ef9bef1779a79e673ffc35d5fdc9
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1612,6 +2064,10 @@ entries:
   qualname: test_module_private_receipt_parts_cannot_forge_or_replace_authority
   kind: getattr_static
   occurrences: 3
+  probe_shapes:
+  - a13c535f8f7a8ea400e701091497f6b2723653955e62c31e67c2f3ab03d9a95d
+  - b182ccba08f04d54373a294be0633c80523f5eabd2f157fc7885bf716698abdd
+  - c214366c9c57f260d7dcac8d31959c416b9d1d10191993864f49d1d3ffdd555b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1620,6 +2076,9 @@ entries:
   qualname: TestTokenManagerBoundaryPaths.test_source_identity_parameters_are_required_by_signature
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - a293a6fa96a1e850634f2cc95f7f0a25c196a2c604ddd14336cf7d602c025553
+  - a293a6fa96a1e850634f2cc95f7f0a25c196a2c604ddd14336cf7d602c025553
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1628,6 +2087,8 @@ entries:
   qualname: TestRegisteredTransformsPublishAnHonestOutputContract.test_no_registered_transform_aliases_its_output_schema_onto_its_input
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1636,6 +2097,8 @@ entries:
   qualname: TestRegisteredTransformsPublishAnHonestOutputContract.test_no_registered_transform_forbids_the_fields_it_creates
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1644,6 +2107,8 @@ entries:
   qualname: TestRegisteredTransformsPublishAnHonestOutputContract.test_no_registered_transform_publishes_an_output_config_its_own_parser_rejects
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1652,6 +2117,8 @@ entries:
   qualname: _label
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7ccb62bd9dca0300f66a5800465be65331372e2e0a96de5e148d5f6a8089df6c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1660,6 +2127,8 @@ entries:
   qualname: _output_contract_violations
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 28c95545c823a812108b35444b50fa53628cf321a1b5541e5249d96ec67fc9e0
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1668,6 +2137,8 @@ entries:
   qualname: _output_forbids_extras
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 28c95545c823a812108b35444b50fa53628cf321a1b5541e5249d96ec67fc9e0
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1675,7 +2146,9 @@ entries:
 - path: tests/unit/plugins/infrastructure/test_self_created_input_demotion.py
   qualname: TestSelfCreatedFieldsAreOptionalOnInput.test_every_output_classified_option_really_names_a_written_column
   kind: getattr
-  occurrences: 2
+  occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1683,7 +2156,9 @@ entries:
 - path: tests/unit/plugins/infrastructure/test_self_created_input_demotion.py
   qualname: TestSelfCreatedFieldsAreOptionalOnInput.test_every_read_classified_column_option_reaches_consumed_input_fields
   kind: getattr
-  occurrences: 2
+  occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1691,7 +2166,9 @@ entries:
 - path: tests/unit/plugins/infrastructure/test_self_created_input_demotion.py
   qualname: TestSelfCreatedFieldsAreOptionalOnInput.test_no_registered_transform_demotes_a_column_its_own_config_consumes
   kind: getattr
-  occurrences: 2
+  occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1699,7 +2176,9 @@ entries:
 - path: tests/unit/plugins/infrastructure/test_self_created_input_demotion.py
   qualname: TestSelfCreatedFieldsAreOptionalOnInput.test_no_registered_transform_requires_its_own_output_fields_on_input
   kind: getattr
-  occurrences: 2
+  occurrences: 1
+  probe_shapes:
+  - da1761b0c77d79ea75d946cc378a962c81a0b919e9d72baa9633aa4dc82db91d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1708,6 +2187,9 @@ entries:
   qualname: TestNoOpLangfuseTracer.test_noop_tracer_matches_protocol_signature
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 15e8fa36c5a7ebcd5a8070a311a83d6d3e4265e81349eb16f874fba02ef1d977
+  - e6a0a7124481d596ec8607bd379564a4d2bb11048997f1d5cfc8461c7c599da2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1716,6 +2198,9 @@ entries:
   qualname: test_transform_model_catalog_preserves_public_api_as_identity_reexports
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 321a1fefdeeb6a7533024786cb7fe1811960f05e4b60c3ea7af11c35fa3a6a3d
+  - 683225bd7b20361f02b3b065f9ff3ffadaa3bc6e30c96a758d6d8865fd6108bc
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1724,6 +2209,8 @@ entries:
   qualname: _import_sink_class
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 74dccc1d2b7441b8791cfd45988c0c25690adbeef09ef8697728ab1c0df00160
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1732,6 +2219,8 @@ entries:
   qualname: TestAWSS3SourceConfig.test_resource_limits_are_positive_and_capped
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 856154294ae7501c826646c03188f802c4ea0d82e248e371ba83e923109c8bbd
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1740,6 +2229,8 @@ entries:
   qualname: TestNullSource.test_null_source_reference_content_preserves_writable_protocol_types
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - b9b5d3d29d7534ab94284713b354878c2f3382d2bf552f882fa0c132d196606f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1748,6 +2239,8 @@ entries:
   qualname: test_user_visible_reference_content_is_exactly_unique
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6b82ee82de37039d3ac994b5736ac0d0cdeba2bf1b42e6e3e3ae9a9ad7333e9f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1756,6 +2249,8 @@ entries:
   qualname: test_assert_reference_text_rejects_duplicated_prose
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 84ff13d0a0b071052812653d343c921c7e60930c21d4ef65213ac17cc46b8f1f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1764,6 +2259,10 @@ entries:
   qualname: _iter_hint_bearing_plugins
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 387a9dcb1e1785ef8c8a4a60df1ed5c532b359711033bbc6fb5acee77514f1d9
+  - 4ce66e941a7efadc485d76107415b495a165ad1c2c83f2b168aff4c82c6ef765
+  - b15565d9a33ef51db4e5dfa313965d12d2543b544e975efad25bd68f7e455089
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1772,6 +2271,8 @@ entries:
   qualname: TestPluginContextTypes.test_no_stub_protocol_in_context_module
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c8851d5fe7f70e32a3cba65ece28066e224817405f5fb79d43f1a81257e21819
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1780,6 +2281,9 @@ entries:
   qualname: TestDualSysModulesRegistration.test_canonical_alias_registered_after_fresh_load
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - a0ad7d2a1942698cd4ac5d767fa109765b02ce7155d521d356f5b957653fae63
+  - f4c662b371c660e58948e97492d8e932f3bdc2dc74e1f25156ec3795abf15c3c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1788,6 +2292,8 @@ entries:
   qualname: TestPromptShieldInternalProcessing.test_capacity_retry_backoff_stops_when_shutdown_is_requested._NoSleepAllowedTime.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 41c90a157acb93f0338ec9cbbd195bfaddeb9a456094bbf79de0d5084fd477da
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1796,6 +2302,8 @@ entries:
   qualname: TestPromptShieldInternalProcessing.test_capacity_retry_backoff_stops_when_shutdown_is_requested._NoSleepAllowedTime.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c17c59ac6802200e8e087b6ed8148ee5dca93c0d9e207d6dec063106932350bc
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1804,6 +2312,8 @@ entries:
   qualname: TestPromptShieldInternalProcessing.test_capacity_retry_budget_is_row_scoped_across_fields._FakeClockTime.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 41c90a157acb93f0338ec9cbbd195bfaddeb9a456094bbf79de0d5084fd477da
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1812,6 +2322,8 @@ entries:
   qualname: TestPromptShieldInternalProcessing.test_capacity_retry_budget_is_row_scoped_across_fields._FakeClockTime.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c17c59ac6802200e8e087b6ed8148ee5dca93c0d9e207d6dec063106932350bc
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1820,6 +2332,9 @@ entries:
   qualname: test_batch_catalogue_reference_content_is_class_owned_specific_valid_and_truthful
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 0142cf09f3c66ac651cc3389c08d0261201cdd9dcc65f71781716db3e51e1faa
+  - 0142cf09f3c66ac651cc3389c08d0261201cdd9dcc65f71781716db3e51e1faa
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1828,6 +2343,8 @@ entries:
   qualname: test_core_catalogue_reference_content_is_class_owned_specific_valid_and_truthful
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0142cf09f3c66ac651cc3389c08d0261201cdd9dcc65f71781716db3e51e1faa
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1836,6 +2353,8 @@ entries:
   qualname: test_external_catalogue_reference_content_is_class_owned_specific_valid_and_truthful
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - ab82f65468e165a45f40a2fdb20f12c206308bcb216f581c15f5b4972fa805c2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1844,6 +2363,8 @@ entries:
   qualname: _DynamicDeliveryMetricsExporter.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 7c69056f4c212a909c9c8b24c81bbe8577de69e0579a9791f931faad93982b7d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1852,6 +2373,8 @@ entries:
   qualname: test_explain_exit_not_masked_by_db_close_failure
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5a8deda2a136dcaad3c3c986f55845a0dae566d2d5cc79fc6bf9162243530c1f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1860,6 +2383,8 @@ entries:
   qualname: <module>
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e8017c406e92946aa19cbaa9c5aaa11a10a6bc9fcb8aa3029c29770e9f272e1f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1868,6 +2393,9 @@ entries:
   qualname: test_every_writer_forwards_required_create_tables_policy
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 6f7dbea513d6d7190d270d3c72ed5e834b05c7bf9cc1a2ff6d08cf020c4e68a0
+  - be0cbff5adb4c412415313eb1df9ccff8495a98ccc29336cb5cfce43673552d2
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1875,7 +2403,10 @@ entries:
 - path: tests/unit/web/auth/test_audit.py
   qualname: test_every_writer_propagates_and_redacts_expected_database_failures
   kind: getattr
-  occurrences: 3
+  occurrences: 2
+  probe_shapes:
+  - 6f7dbea513d6d7190d270d3c72ed5e834b05c7bf9cc1a2ff6d08cf020c4e68a0
+  - a4432227583544aa67483a55660b6e29de34a55b3d7524d421e20f8eac320eaf
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1884,6 +2415,8 @@ entries:
   qualname: TestEntraSigningKeyRotation.test_unknown_kid_refreshes_shared_validator_cache
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d1c5fd0fbe7643847b91cd19a0b6d4122ba4dd267a4f177933b1ab926cd61e82
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1892,6 +2425,8 @@ entries:
   qualname: _CommitFailingConnection.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 4aa53e69d44a585b137acfe2a44827e85e70054b9ea6f25f1e9fe3046f77c504
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1900,6 +2435,8 @@ entries:
   qualname: _CommitFailingConnection.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1f38ff657df94ecf76c1d5fbe0e403e3329d52d805bfd036b381c3055780882e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1908,6 +2445,8 @@ entries:
   qualname: _annotation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1916,6 +2455,9 @@ entries:
   qualname: test_facade_reexports_cleanup_and_control_service_owners_by_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 14cd7c6b5fd56d6a53004f009c08c090fd34e9ff0a93391324ea9063736728fd
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1924,6 +2466,11 @@ entries:
   qualname: test_moved_public_foundations_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 4
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  - 8f5a33db2b1a140688e2bd7a0fafc63aa7eab5718d177ba86f81b75c4e992154
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1932,6 +2479,10 @@ entries:
   qualname: test_all_private_owned_exports_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1940,6 +2491,9 @@ entries:
   qualname: test_moved_public_transport_and_capture_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 2c87f44e86445dced904b0564700a7fd4d3a3a5363a5e8d06daddeec12467fd7
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1948,6 +2502,15 @@ entries:
   qualname: test_manifest_and_inventory_owners_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 8
+  probe_shapes:
+  - 256dbcc4c699668498ecf06c78c143871448477924e481fad592c6e94da946a0
+  - 256dbcc4c699668498ecf06c78c143871448477924e481fad592c6e94da946a0
+  - 256dbcc4c699668498ecf06c78c143871448477924e481fad592c6e94da946a0
+  - 8f5a33db2b1a140688e2bd7a0fafc63aa7eab5718d177ba86f81b75c4e992154
+  - 9fef6a018098b7a391420d786f85933d95c0bd8eaa05339c5a06a725114fedd0
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1956,6 +2519,9 @@ entries:
   qualname: test_manifest_and_task_definition_owners_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 478dc39a0d7f724d193d12d92f0f0260bf3ab9f0bad5c891cb32bce5b9b4d003
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1964,6 +2530,9 @@ entries:
   qualname: test_operator_telemetry_symbols_are_owned_by_private_module_and_reexported_by_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 5f3fc9f232b14fc9c4c8df721ecb017506f350eb6f9fd88536bd471d5a17b1df
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1972,6 +2541,8 @@ entries:
   qualname: _FakeOrphanClient.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 08811e67b163a4989cdbaf699ed31fce071f17969153d4fcd524b73c99b7e7ea
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1980,6 +2551,9 @@ entries:
   qualname: test_moved_public_receipt_contracts_are_facade_reexports_by_identity
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 0abe3230e95c24aed7aa0d0f83d3f4888ea5e27d34a777033847f63c248b662c
+  - b209633ec57e7718651f2103bac296c9303f164df0566820df8c11befc4cd711
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1988,6 +2562,8 @@ entries:
   qualname: TestBlobExceptionFamilyInvariants.test_every_family_member_declares_frozen_attrs
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - fbabcd5258571bf4fbfa169e6460ea77f38646af2af171c011994a12f20f5a87
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -1996,6 +2572,8 @@ entries:
   qualname: TestCopyBlobsForFork.test_copy_failure_does_not_invoke_automatic_cleanup
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6393ce6ef4a8096f3b1353acb82c0f812e0f191203f7d719536d8f595d3fa7f8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2004,6 +2582,8 @@ entries:
   qualname: TestInlineCustody.test_insert_conflict_reloads_and_validates_winner._InsertConflictConnection.execute
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0e253929e45ea83cb6b17e42d5638410cead6d2d130812a0df615c70077a02e9
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2012,6 +2592,8 @@ entries:
   qualname: DelegatingPluginManagerDouble.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - e89ec437a739c1350b94aa42ccdebe172d8469f7ea063a62c182ff53acd30d9c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2020,6 +2602,8 @@ entries:
   qualname: DelegatingPluginManagerDouble.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c24bfe8ec970187fc6273527dc75ae4a0fbe6a13d5020dde3b9a71ad46682f33
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2028,6 +2612,8 @@ entries:
   qualname: TrackedPlugin.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 92c9ffadc1c4cb25cc1b032ba4be5e72ae5b45755164d6e19ac7e5663b465e7b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2036,6 +2622,8 @@ entries:
   qualname: TrackedPlugin.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 245e108c9a0e96428290c9fdb98d3744750811435998561565c7a7ef988a8c9f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2044,6 +2632,8 @@ entries:
   qualname: TrackingPluginManager.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 92c9ffadc1c4cb25cc1b032ba4be5e72ae5b45755164d6e19ac7e5663b465e7b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2052,6 +2642,8 @@ entries:
   qualname: TrackingPluginManager.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 245e108c9a0e96428290c9fdb98d3744750811435998561565c7a7ef988a8c9f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2060,6 +2652,8 @@ entries:
   qualname: test_closed_chat_variants_have_only_required_keyword_fields
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9c9a270cd9788acaf465c616b4b6639e0d3b5b8ddb5b5984195850359baf432
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2068,6 +2662,8 @@ entries:
   qualname: test_complete_valid_field_alias_registry_is_reused_unchanged
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 264a64a90be003b1f451b4eed24c860a4457e3ea03a72b399339428a46834f51
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2076,6 +2672,8 @@ entries:
   qualname: test_supplied_field_alias_registry_fails_closed
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 264a64a90be003b1f451b4eed24c860a4457e3ea03a72b399339428a46834f51
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2084,6 +2682,8 @@ entries:
   qualname: test_tool_batch_rejects_duplicate_ids_before_real_handlers_or_blob_state_side_effects
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e2506d9efc8b6ece481bfcd209c058b3655b0a8b5e379cc0a25ad3578749a81f
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2092,6 +2692,8 @@ entries:
   qualname: test_settlement_failure_does_not_replace_primary_provider_failure
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 5a2f2ab303f12e4c0219dbf684a9fcc11de4ea62849d100811678a27d4100ab5
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2100,6 +2702,8 @@ entries:
   qualname: test_provider_telemetry_projector_surface_exists
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 0be51bbe6140dba9bacc84c3fe39574961575e9e6e8291923a953b3550d80086
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2108,6 +2712,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_apply_recipe_over_empty_state_emits_no_replacement_note
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2116,6 +2722,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_apply_recipe_over_populated_state_emits_replacement_note
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2124,6 +2732,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_classify_recipe_passes_set_pipeline_prevalidation_and_drives_proof_step
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2132,6 +2742,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_fork_coalesce_recipe_passes_runtime_equivalent_validation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2140,6 +2752,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_fork_coalesce_truncate_recipe_passes_set_pipeline_prevalidation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2148,6 +2762,8 @@ entries:
   qualname: TestApplyRecipeEndToEnd.test_threshold_recipe_passes_set_pipeline_prevalidation_and_drives_proof_step
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2156,6 +2772,8 @@ entries:
   qualname: TestRecipeIntegrationWithSetPipeline.test_threshold_source_resolves_to_blob_ref_via_resolve_source_blob
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d852d1a686e3d48c3cbeca834f707e050383cc46a780791ca0344c73de553708
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2164,6 +2782,19 @@ entries:
   qualname: test_non_first_row_union_reorder_changes_set_pipeline_dispatch_binding_without_mutating_arguments
   kind: getattr
   occurrences: 12
+  probe_shapes:
+  - 07df3c267a31a02c0314240c0a4ea686f0b9b238352db43f4609765ba0260c86
+  - 0fdb72a927e786397ccbf25dbbe9313c5982b40c640a4186aac90a2fa161cd16
+  - 2b5c832c0ccc7c0726354bbed354775c6dc7596ed1c80cc4e1a5b05b7765c29e
+  - 3dcf0a5f4e9391a51fe730bad1b0b47b989f0ce02688ba9beba46739a1114554
+  - 4d442a5a2e20152740fd02ac12e78c789a96dc506dddb08e4d15e4faf884b23a
+  - 5a572588c6d831d11bcfe68c2b50a8ede5ca2d260847b8840eb74cb96bb88063
+  - 648052f14fa26a3416b8e2765da95e053a54fe55adfd45bc96ca57c228e2bb63
+  - 650ae73e3e1e9a2b2b61d25424840669c66d9365cb9ef3f585b41fc80f334b00
+  - af09d5341247ce50c17bb9e37912ed59e7c83965ce8bd575e403f4b29adfb93f
+  - b759d6fcd922617159bef54d2f99cdb36c50d932f78f75cd8ff56f4a7d675da7
+  - c16f32e7a0fd6d1501105109615d5100343ec9f5d9300ce6f3a11abf4fcf1fae
+  - cbd7f65f4c3a4b762d6677eb0d60e7791eeea8d3d4caebe1a1382823854a7a3d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2172,6 +2803,8 @@ entries:
   qualname: test_structured_llm_probe_failure_abstains_and_blocks_downstream_field_mapper._FailingLlmProbeManager.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 8be5e5edf5287d8e3c8512d771144672b3bf0723e11986c222c4499322268034
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2180,6 +2813,8 @@ entries:
   qualname: test_structured_llm_probe_failure_abstains_and_blocks_downstream_field_mapper._FailingLlmProbeManager.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 948bf16bbb2d1390a818ee144727c40650f1dc4af21b4cb6ceafba05a0b5ef93
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2188,6 +2823,8 @@ entries:
   qualname: TestDeleteBlobActiveRunGuard.test_delete_restores_file_when_db_delete_fails_after_filesystem_mutation.failing_begin.Proxy.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 07ddcb8b5fe3a38e1cfb38e3dae0f828585dcde4c03ae003359dacd6322dda42
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2196,6 +2833,8 @@ entries:
   qualname: TestDeleteBlobActiveRunGuard.test_delete_restores_file_when_db_delete_fails_after_filesystem_mutation.failing_begin.Proxy.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4c73f991e022dce319ddd7c429b798432a1e083d09d9dc38edbb8d4eb99fbcff
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2204,6 +2843,9 @@ entries:
   qualname: TestRemoveEdge.test_remove_sink_edge_clears_node_runtime_route
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 441f9a9ffd5ad6a0421bfec10775d73652ef1e34dec5f09edb91f431f8e8cf26
+  - b2e00c72d85b84fcbbcdf4b6a87db340fde22082393250c06666dfdb001909af
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2212,6 +2854,8 @@ entries:
   qualname: TestUpdateBlobRollbackPreservesPrimaryException.test_clean_db_failure_before_replace_leaves_no_residue
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6393ce6ef4a8096f3b1353acb82c0f812e0f191203f7d719536d8f595d3fa7f8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2220,6 +2864,8 @@ entries:
   qualname: TestUpdateBlobRollbackPreservesPrimaryException.test_primary_db_exception_before_replace_propagates_without_rollback
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6393ce6ef4a8096f3b1353acb82c0f812e0f191203f7d719536d8f595d3fa7f8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2228,6 +2874,8 @@ entries:
   qualname: TestUpdateBlobRollbackPreservesPrimaryException.test_tempfile_cleanup_failure_preserves_primary_db_exception
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - f0b15a114f2a5237ef32e58c0b1d2a71a8771a27cdaf2ef40da8ac34c0f3fbfe
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2236,6 +2884,8 @@ entries:
   qualname: TestUpsertNodeQueue.test_upsert_canonical_queue_succeeds_and_persists
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 26eff3d8c61d1b7d9ada5c074ba0ac64f8d7b67f16f6ca6bfc68e1673f860b4d
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2244,6 +2894,8 @@ entries:
   qualname: test_tools_all_entries_resolve
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c565f407a7108491cfdd0681acaf0eeede12fd946485363007dfb60c7c8544cb
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2252,6 +2904,8 @@ entries:
   qualname: test_apply_web_scrape_recipe_csv_preserves_shield_advisory
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2260,6 +2914,8 @@ entries:
   qualname: test_apply_web_scrape_recipe_json_preserves_shield_advisory
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - d9910c3dd5ec6d9b05d368efa011b17f3bdba8826b5067b9cff9a85d3aba4967
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2268,6 +2924,8 @@ entries:
   qualname: test_canonical_invariant_accepts_exact_coherent_pending_rows
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 143fede7d7e4009ef0be5904805873f1d53b8bf56dbdd5c29a74fb40290af586
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2276,6 +2934,8 @@ entries:
   qualname: test_canonical_invariant_rejects_shape_domain_and_identity_failures_without_leaking
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 143fede7d7e4009ef0be5904805873f1d53b8bf56dbdd5c29a74fb40290af586
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2284,6 +2944,8 @@ entries:
   qualname: test_canonical_invariant_requires_kind_appropriate_resolved_evidence
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 143fede7d7e4009ef0be5904805873f1d53b8bf56dbdd5c29a74fb40290af586
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2292,6 +2954,8 @@ entries:
   qualname: test_composition_gate_registry_covers_every_public_state_mutation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 468c6f3104a13cf6f926dfd524a0ba50299ded0ac7d200daeb3511f2cff56eca
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2300,6 +2964,9 @@ entries:
   qualname: test_client.audit_access_log_write_error_handler
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 25080647a2f0556a4f0d46a90ec81fb122d702119145d14062171f266b0621eb
+  - a7c81e0bc8eb89313f97bdc80c1393080c66b3ec20914288e0da9b4e4b80923c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2308,6 +2975,9 @@ entries:
   qualname: _create_test_app.handle_run_already_active
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 25080647a2f0556a4f0d46a90ec81fb122d702119145d14062171f266b0621eb
+  - a7c81e0bc8eb89313f97bdc80c1393080c66b3ec20914288e0da9b4e4b80923c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2316,6 +2986,8 @@ entries:
   qualname: TestValidatePipelineStateShapeMaterialization.test_rehydrated_state_shape_defect_is_red_verdict_not_crash
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 4bb22d749e2e6fbc0bcb5c2a925241ac0c7514e86e24fb4c78ab33e4da25a555
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2324,6 +2996,9 @@ entries:
   qualname: test_facade_diagnostic_exports_are_the_direct_implementations
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 0480622da756f8551abf85b6a98a320a43a6c01a4873b240f76f3a566171f57e
+  - e075c99e65317636dbeabc423221bf7f0ceee47bd0c72b0e10eef63c6a2d95d1
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2332,6 +3007,8 @@ entries:
   qualname: _patch_route_execute_tool
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 92438695b9dba6b0378c3ac555130b7e79064d869ac3d40140037e1c10adb992
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2340,6 +3017,8 @@ entries:
   qualname: test_every_unconditional_guided_audit_settlement_uses_post_commit_projection
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 1ffee4012dac18cbf43611c08e6f08e5d76878339cd862f9c96dbe074a263ec4
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2348,6 +3027,8 @@ entries:
   qualname: TestForkEndpoint.test_fork_cleanup_failure_preserves_primary_exception_with_note
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 03b0f43449641c23e61fb0b0bf218731264b745456ce767dcc0ccdfb33ed97a6
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2356,6 +3037,9 @@ entries:
   qualname: test_revert_fault_rolls_back_every_settlement_surface.inject
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 5756ee07d0bcbcea7bfe5109c952b13a53782fc880d4cb0d1d12c5303789b781
+  - 8d4a399d9821e1355114cf463812c8bcf5819c49b0d32f221d518641ea8bd6d8
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2364,6 +3048,8 @@ entries:
   qualname: test_postgres_unlock_failure_surfaces_after_unrelated_caught_exception
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - cb9c333c0931bca9a19f8f1a6070d9687a026eafd78fe8695f8cd2ee3c6f6e6c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2372,6 +3058,8 @@ entries:
   qualname: TestCheckConstraints.test_guided_operation_failure_code_check_mirrors_the_python_literal
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a713bac83fb0cf05ec71fdfd9cf215a2ac54dec3bfb1cc6f73156a81e51603de
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2380,6 +3068,8 @@ entries:
   qualname: _MissingSessionService.get_session
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 97781339b1bec55aadf13235a78c367b1b87d574041ec9989d5739cdd5c04078
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2388,6 +3078,8 @@ entries:
   qualname: _get
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - e6ea0947b2e794b5830dd09f7ca3fdd10435dc5e61879c37fcfa9da339526d2b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2396,6 +3088,8 @@ entries:
   qualname: TestLiteLLMErrorRedaction.test_guided_source_commit_failure_requires_tool_result_contract._ForgedToolResult.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - c24d9e914960e322d8a4059792ac0e6fadccb6fca8753a54d21fb83187423229
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2404,6 +3098,9 @@ entries:
   qualname: TestRunAlreadyActiveError.test_run_already_active_returns_409.handle_run_already_active
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 25080647a2f0556a4f0d46a90ec81fb122d702119145d14062171f266b0621eb
+  - a7c81e0bc8eb89313f97bdc80c1393080c66b3ec20914288e0da9b4e4b80923c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2412,6 +3109,8 @@ entries:
   qualname: TestSendMessageTranscriptSnapshot.test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot._StaleGetMessagesService.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 43b86b74188c018c37a691d0a72c8868b401c343bed6fab44efadcbebfa30c32
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2420,6 +3119,8 @@ entries:
   qualname: TestSendMessageTranscriptSnapshot.test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot._StaleGetMessagesService.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7f11ccb7cd9aff119076369a3a3b6a213dee7b4b602e73e77e370be9fbd9347b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2428,6 +3129,8 @@ entries:
   qualname: TestSendMessageTranscriptSnapshot.test_trailing_audit_row_does_not_trip_send_message_guard._TrailingAuditRowService.__getattr__
   kind: dunder_getattr
   occurrences: 1
+  probe_shapes:
+  - 43b86b74188c018c37a691d0a72c8868b401c343bed6fab44efadcbebfa30c32
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2436,6 +3139,8 @@ entries:
   qualname: TestSendMessageTranscriptSnapshot.test_trailing_audit_row_does_not_trip_send_message_guard._TrailingAuditRowService.__getattr__
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 7f11ccb7cd9aff119076369a3a3b6a213dee7b4b602e73e77e370be9fbd9347b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2444,6 +3149,8 @@ entries:
   qualname: test_composition_state_provenance_python_and_sql_enums_agree
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 797ceca29f6adf70cf2b779a6cbea69ff7aa98b2863206e54afc74fad2552a7a
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2452,6 +3159,8 @@ entries:
   qualname: test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c4442dde1aa68f204b8087b8eff3bfce45fc9ce55c6f48ee6885fc70756d6c70
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2460,6 +3169,8 @@ entries:
   qualname: _create_all_on_mock_engine
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 3efeb156f527bce78ad7ae5c819139ee0850d687037b745048bfc66329834ace
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2468,6 +3179,8 @@ entries:
   qualname: _WriterCollector._emit
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2476,6 +3189,10 @@ entries:
   qualname: _call_has_dominating_matching_lock_assertion
   kind: getattr
   occurrences: 3
+  probe_shapes:
+  - 3b1f093099bd5b9004b487528c41efcdeeeaa14195a4b23823e8decbe3ef7c33
+  - 7c0f324a15a8a8c636b49bf87e4970dd364cd4f7ab605e8c090d82bfea588d26
+  - cdd158e0c477efd08f7eb0d28ebc8368bf3a9551224d0b548a8c08a25e9b1949
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2484,6 +3201,9 @@ entries:
   qualname: _enclosing_call
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 10352e1c743e741f08458c205a5d23d2343e9873d4383193596fda7607dfae25
+  - 8d386446453c23226e4fbd29effb41a029f7629282103837a42cf5f30da81151
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2492,6 +3212,9 @@ entries:
   qualname: _enclosing_function
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 10352e1c743e741f08458c205a5d23d2343e9873d4383193596fda7607dfae25
+  - 8d386446453c23226e4fbd29effb41a029f7629282103837a42cf5f30da81151
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2500,6 +3223,9 @@ entries:
   qualname: _enclosing_with_blocks
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 10352e1c743e741f08458c205a5d23d2343e9873d4383193596fda7607dfae25
+  - 8d386446453c23226e4fbd29effb41a029f7629282103837a42cf5f30da81151
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2508,6 +3234,9 @@ entries:
   qualname: _is_docstring_constant
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 3b1f093099bd5b9004b487528c41efcdeeeaa14195a4b23823e8decbe3ef7c33
+  - 8d386446453c23226e4fbd29effb41a029f7629282103837a42cf5f30da81151
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2516,6 +3245,8 @@ entries:
   qualname: _qualified_symbol
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 10352e1c743e741f08458c205a5d23d2343e9873d4383193596fda7607dfae25
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2524,6 +3255,8 @@ entries:
   qualname: check_inline_state_version_allocation
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2532,6 +3265,8 @@ entries:
   qualname: check_lock_discipline
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2540,6 +3275,8 @@ entries:
   qualname: TestExecutionWiring.test_execution_routes_registered
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - c037ddc2149c035c4dd0207536b2cbc3f612a55799f2c20482786d79c141343e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2548,6 +3285,8 @@ entries:
   qualname: TestJsonCollectionFieldsSync.test_all_tuple_fields_in_allowlist
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 8c054d4981ca2a9ea97bb07f92b124e7add8b14dd693276ce384b8da79b8887c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2556,6 +3295,8 @@ entries:
   qualname: TestJsonCollectionFieldsSync.test_no_non_tuple_fields_in_allowlist
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 8c054d4981ca2a9ea97bb07f92b124e7add8b14dd693276ce384b8da79b8887c
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2564,6 +3305,8 @@ entries:
   qualname: test_secret_bearing_path_failures_are_static
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a4433d25cd5fe22c008adaa954d2adb52aac34739d0b7a1aefbcd98df1a0d116
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2572,6 +3315,8 @@ entries:
   qualname: TestOperatorTelemetrySettings.test_aws_mode_accepts_safe_resource_labels
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 162515965e5456458e7fd35800b02ab236bf8c94ced8b4315f80244583c59dd7
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2580,6 +3325,8 @@ entries:
   qualname: test_secret_bearing_path_failures_are_static
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - a4433d25cd5fe22c008adaa954d2adb52aac34739d0b7a1aefbcd98df1a0d116
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2588,6 +3335,9 @@ entries:
   qualname: test_metrics_endpoint_returns_prometheus_format
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 9f0ffd9b644a8a1210aa70cf531814531668ae012e587eb275c52cf8d44ee443
+  - c037ddc2149c035c4dd0207536b2cbc3f612a55799f2c20482786d79c141343e
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2596,6 +3346,8 @@ entries:
   qualname: _single_point_value
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6f2efa85dfed9898ea80eb9faee977e0cadb21f320e3d0b46fe22664e80f803b
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2604,6 +3356,9 @@ entries:
   qualname: test_aws_operator_projects_audited_run_call_and_token_metrics_without_dimensions
   kind: getattr
   occurrences: 2
+  probe_shapes:
+  - 036702ceada91142c231676ae881b0a6fef87f1765e77c616ff243cc1234d945
+  - 6a0b03bacef3a12d297590c0773d9ed3e4176bba0dad04f33ce6ce8869380e32
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2612,6 +3367,8 @@ entries:
   qualname: test_llm_token_projection_retains_partial_provider_usage_without_fabrication
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6a0b03bacef3a12d297590c0773d9ed3e4176bba0dad04f33ce6ce8869380e32
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
@@ -2620,6 +3377,8 @@ entries:
   qualname: test_operator_metric_projection_failure_cannot_replace_the_audited_outcome
   kind: getattr
   occurrences: 1
+  probe_shapes:
+  - 6a0b03bacef3a12d297590c0773d9ed3e4176bba0dad04f33ce6ce8869380e32
   classification: unadjudicated
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not

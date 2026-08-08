@@ -1272,18 +1272,18 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
-    if args.rules is None:
-        # An unselected rule set used to fall through to the empty-findings
-        # emit below, so `check` exited 0 having evaluated nothing — a green
-        # that certified any tree. Refuse instead: silence here is
-        # indistinguishable from a clean result.
+    requested_tokens = _parse_rules(args.rules)
+    if args.rules is None or (not requested_tokens and args.rules != "nothing"):
+        # An unselected or malformed-empty rule set used to fall through to
+        # the empty-findings emit below, so `check` exited 0 having evaluated
+        # nothing — a green that certified any tree. Refuse instead: silence
+        # here is indistinguishable from a clean result.
         sys.stderr.write(
             "check requires an explicit --rules selection: 'all' for every registered "
             "rule, a comma-separated list of rule ids, or 'nothing' for the empty "
             "skeleton run\n"
         )
         return 2
-    requested_tokens = _parse_rules(args.rules)
     if not requested_tokens:
         return _emit_findings([], output_format=args.format, rules=[])
 
@@ -1326,7 +1326,17 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
 
     for rule in whole_repo_rules:
         try:
-            findings.extend(rule.analyze(empty_tree, args.root, context))
+            rule_findings = rule.analyze(empty_tree, args.root, context)
+            finding_base = repo_root if repo_root is not None else args.root
+            findings.extend(
+                finding
+                for finding in rule_findings
+                if not _duplicates_emitted_walk_diagnostic(
+                    finding,
+                    diagnostic_paths,
+                    finding_base=finding_base,
+                )
+            )
         except JudgeMetadataKeyUnavailableError as exc:
             # Operator configuration, not a defect in the scanned tree. Still
             # fail-closed — the run refuses rather than verifying less — but
@@ -1419,6 +1429,27 @@ def _diagnostic_finding_for_walk_item(item: ParsedPythonFile | PythonSyntaxError
     if isinstance(item, PythonFileReadError):
         return _read_error_finding(item)
     return None
+
+
+def _duplicates_emitted_walk_diagnostic(
+    finding: Finding,
+    diagnostic_paths: set[Path],
+    *,
+    finding_base: Path,
+) -> bool:
+    """Return whether the CLI already emitted this whole-repo diagnostic.
+
+    Whole-repository rules may scan roots beyond ``--root`` and therefore
+    must surface their own parse/read failures.  Deduplicate only against
+    paths the generic prewalk actually emitted; treating an enclosing root as
+    blanket coverage can silently drop diagnostics excluded by a rule's path
+    filter or by ``--files``.
+    """
+    if finding.rule_id not in {"parse-error", "read-error"}:
+        return False
+    finding_path = Path(finding.file_path)
+    canonical_finding = (finding_path if finding_path.is_absolute() else finding_base / finding_path).resolve()
+    return any(path.resolve() == canonical_finding for path in diagnostic_paths)
 
 
 def _syntax_error_finding(item: PythonSyntaxError) -> Finding:

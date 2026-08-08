@@ -39,6 +39,23 @@ def test_cli_refuses_to_run_check_without_an_explicit_rule_selection(tmp_path: P
     assert captured.out == ""
 
 
+@pytest.mark.parametrize("selection", ["", "   ", ",,,", " , , ", " nothing ", "nothing,", ",nothing"])
+def test_cli_refuses_empty_parsed_rule_selections(
+    selection: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only the explicit ``nothing`` token may request an empty skeleton run."""
+    from elspeth_lints.core.cli import main
+
+    exit_code = main(["check", "--rules", selection, "--root", str(tmp_path)])
+
+    assert exit_code == 2
+    captured = capsys.readouterr()
+    assert "--rules" in captured.err
+    assert captured.out == ""
+
+
 def test_cli_rules_all_token_selects_every_registered_rule() -> None:
     """``--rules all`` is the affordance for running the whole registered set."""
     from elspeth_lints.core.cli import _expand_rule_tokens
