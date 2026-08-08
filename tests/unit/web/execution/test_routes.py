@@ -1124,7 +1124,7 @@ class TestRunDiagnosticsEndpoint:
         assert response.json()["detail"]["code"] == "run_integrity_error"
 
     @pytest.mark.asyncio
-    async def test_running_run_uses_web_run_id_as_landscape_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_running_unlinked_run_passes_raw_link_and_falls_back_in_loader(self, monkeypatch: pytest.MonkeyPatch) -> None:
         run_id = uuid4()
         svc = _execution_service()
         svc.get_status = AsyncMock(
@@ -1180,11 +1180,116 @@ class TestRunDiagnosticsEndpoint:
 
         assert response.run_id == str(run_id)
         assert captured["run_id"] == str(run_id)
-        assert captured["landscape_run_id"] == str(run_id)
+        # The route hands the loader the RAW link (None here): the loader owns
+        # the web-run-id fallback AND the linked-vs-unlinked distinction that
+        # classifies a missing store file (elspeth-1d24bb0d96).
+        assert captured["landscape_run_id"] is None
         assert captured["run_status"] == "running"
         assert captured["cancel_requested"] is True
         assert response.cancel_requested is True
         assert captured["limit"] == 12
+
+    @pytest.mark.asyncio
+    async def test_diagnostics_missing_audit_store_returns_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A linked run whose audit store is gone must 503, not read as clean (elspeth-1d24bb0d96)."""
+        from fastapi import HTTPException
+
+        from elspeth.web.execution.diagnostics import RunDiagnosticsAuditUnavailableError
+
+        run_id = uuid4()
+        svc = _execution_service()
+        svc.get_status = AsyncMock(
+            spec=ExecutionService.get_status,
+            return_value=RunStatusResponse(
+                run_id=str(run_id),
+                status="failed",
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                error="boom",
+                landscape_run_id=str(run_id),
+            ),
+        )
+
+        def raise_unavailable(*args: object, **kwargs: object) -> RunDiagnosticsResponse:
+            raise RunDiagnosticsAuditUnavailableError(
+                landscape_run_id=str(run_id),
+                landscape_url="sqlite:///deleted/audit.db",
+            )
+
+        async def fake_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr("elspeth.web.execution.routes.load_run_diagnostics_for_settings", raise_unavailable)
+        monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
+        app = _create_test_app(execution_service=svc)
+        endpoint = _route_endpoint(app, "get_run_diagnostics")
+
+        with pytest.raises(HTTPException) as excinfo:
+            await endpoint(
+                run_id,
+                _request_for_app(app),
+                limit=50,
+                user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+                service=svc,
+            )
+
+        assert excinfo.value.status_code == 503
+        assert excinfo.value.detail["error_type"] == "run_diagnostics_audit_unavailable"
+        assert excinfo.value.detail["landscape_run_id"] == str(run_id)
+        assert excinfo.value.detail["audit_location"] == "deleted/audit.db"
+
+    @pytest.mark.asyncio
+    async def test_evaluate_diagnostics_missing_audit_store_returns_503_before_llm(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The LLM explainer must never narrate a projection that conceals evidence loss (elspeth-1d24bb0d96)."""
+        from fastapi import HTTPException
+
+        from elspeth.web.execution.diagnostics import RunDiagnosticsAuditUnavailableError
+
+        run_id = uuid4()
+        svc = _execution_service()
+        svc.get_status = AsyncMock(
+            spec=ExecutionService.get_status,
+            return_value=RunStatusResponse(
+                run_id=str(run_id),
+                status="failed",
+                started_at=datetime.now(UTC),
+                finished_at=datetime.now(UTC),
+                error="boom",
+                landscape_run_id=str(run_id),
+            ),
+        )
+
+        def raise_unavailable(*args: object, **kwargs: object) -> RunDiagnosticsResponse:
+            raise RunDiagnosticsAuditUnavailableError(
+                landscape_run_id=str(run_id),
+                landscape_url="sqlite:///deleted/audit.db",
+            )
+
+        async def fake_to_thread(func, /, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        monkeypatch.setattr("elspeth.web.execution.routes.load_run_diagnostics_for_settings", raise_unavailable)
+        monkeypatch.setattr("elspeth.web.execution.routes.asyncio.to_thread", fake_to_thread)
+
+        class ExplodingComposer:
+            async def explain_run_diagnostics(self, snapshot: dict[str, object], *, recorder: object | None = None) -> str:
+                raise AssertionError("LLM evaluation must not run when the audit store is unavailable")
+
+        app = _create_test_app(execution_service=svc)
+        app.state.composer_service = ExplodingComposer()
+        endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
+
+        with pytest.raises(HTTPException) as excinfo:
+            await endpoint(
+                run_id,
+                _request_for_app(app),
+                limit=50,
+                user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+                service=svc,
+            )
+
+        assert excinfo.value.status_code == 503
+        assert excinfo.value.detail["error_type"] == "run_diagnostics_audit_unavailable"
 
     @pytest.mark.asyncio
     async def test_evaluate_diagnostics_calls_composer_with_bounded_snapshot(self, monkeypatch: pytest.MonkeyPatch) -> None:

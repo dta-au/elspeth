@@ -41,7 +41,11 @@ from elspeth.web.composer.service import _BadRequestLLMError
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import parse_completion_gates
-from elspeth.web.execution.diagnostics import llm_safe_diagnostics_snapshot, load_run_diagnostics_for_settings
+from elspeth.web.execution.diagnostics import (
+    RunDiagnosticsAuditUnavailableError,
+    llm_safe_diagnostics_snapshot,
+    load_run_diagnostics_for_settings,
+)
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
@@ -1185,16 +1189,29 @@ def create_execution_router() -> APIRouter:
         except (ValidationError, _RunStatusIntegrityError) as exc:
             raise _run_integrity_http(exc) from exc
 
-        landscape_run_id = status.landscape_run_id or status.run_id
-        return await run_sync_in_worker(
-            load_run_diagnostics_for_settings,
-            request.app.state.settings,
-            run_id=status.run_id,
-            landscape_run_id=landscape_run_id,
-            run_status=status.status,
-            cancel_requested=status.cancel_requested,
-            limit=limit,
-        )
+        # Raw link, not the ``or status.run_id`` fallback: the loader needs
+        # ``None`` to mean "never admitted to Landscape" so a missing store
+        # file for a linked run raises instead of reading as a clean run
+        # (elspeth-1d24bb0d96).
+        try:
+            return await run_sync_in_worker(
+                load_run_diagnostics_for_settings,
+                request.app.state.settings,
+                run_id=status.run_id,
+                landscape_run_id=status.landscape_run_id,
+                run_status=status.status,
+                cancel_requested=status.cancel_requested,
+                limit=limit,
+            )
+        except RunDiagnosticsAuditUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_type": "run_diagnostics_audit_unavailable",
+                    "landscape_run_id": exc.landscape_run_id,
+                    "audit_location": exc.audit_location,
+                },
+            ) from exc
 
     @router.post(
         "/api/runs/{run_id}/diagnostics/evaluate",
@@ -1218,16 +1235,29 @@ def create_execution_router() -> APIRouter:
         except (ValidationError, _RunStatusIntegrityError) as exc:
             raise _run_integrity_http(exc) from exc
 
-        landscape_run_id = status.landscape_run_id or status.run_id
-        diagnostics = await run_sync_in_worker(
-            load_run_diagnostics_for_settings,
-            request.app.state.settings,
-            run_id=status.run_id,
-            landscape_run_id=landscape_run_id,
-            run_status=status.status,
-            cancel_requested=status.cancel_requested,
-            limit=limit,
-        )
+        # Same raw-link contract as GET /diagnostics above: a linked run with
+        # a missing store must 503 here too, BEFORE any LLM evaluation runs
+        # against a projection that would misreport evidence loss as a clean
+        # run (elspeth-1d24bb0d96).
+        try:
+            diagnostics = await run_sync_in_worker(
+                load_run_diagnostics_for_settings,
+                request.app.state.settings,
+                run_id=status.run_id,
+                landscape_run_id=status.landscape_run_id,
+                run_status=status.status,
+                cancel_requested=status.cancel_requested,
+                limit=limit,
+            )
+        except RunDiagnosticsAuditUnavailableError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "error_type": "run_diagnostics_audit_unavailable",
+                    "landscape_run_id": exc.landscape_run_id,
+                    "audit_location": exc.audit_location,
+                },
+            ) from exc
 
         composer: ComposerService = request.app.state.composer_service
         settings: WebSettings = request.app.state.settings

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import pytest
@@ -20,7 +21,12 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.web.execution.diagnostics import llm_safe_diagnostics_snapshot, load_run_diagnostics_from_db
+from elspeth.web.execution.diagnostics import (
+    RunDiagnosticsAuditUnavailableError,
+    llm_safe_diagnostics_snapshot,
+    load_run_diagnostics_for_settings,
+    load_run_diagnostics_from_db,
+)
 from elspeth.web.execution.schemas import (
     RunDiagnosticFailureDetail,
     RunDiagnosticNodeState,
@@ -698,13 +704,9 @@ def test_diagnostics_failure_detail_ignores_a_diverted_rows_failed_state(tmp_pat
         _register_node(factory, web_run_id, "source", NodeType.SOURCE, "json")
         _register_node(factory, web_run_id, "sink_rows", NodeType.SINK, "database")
 
-        row = factory.data_flow.create_row(
-            web_run_id, "source", 0, {"id": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0
-        )
+        row = factory.data_flow.create_row(web_run_id, "source", 0, {"id": 1}, row_id="row-0", source_row_index=0, ingest_sequence=0)
         token = factory.data_flow.create_token(row.row_id, token_id="token-0")
-        state = factory.execution.begin_node_state(
-            token.token_id, "sink_rows", web_run_id, 1, {"id": 1}, state_id="state-token-0"
-        )
+        state = factory.execution.begin_node_state(token.token_id, "sink_rows", web_run_id, 1, {"id": 1}, state_id="state-token-0")
         factory.execution.complete_node_state(
             state.state_id,
             NodeStateStatus.FAILED,
@@ -1207,6 +1209,59 @@ def test_diagnostics_failure_detail_none_when_no_failed_operations(tmp_path) -> 
         db.close()
 
 
+@dataclass
+class _SettingsFake:
+    landscape_url: str
+    landscape_passphrase: str | None = None
+
+    def get_landscape_url(self) -> str:
+        return self.landscape_url
+
+
+def test_diagnostics_for_settings_missing_store_for_linked_run_raises(tmp_path) -> None:
+    """A linked run whose expected audit store is gone is evidence loss, not a clean run.
+
+    The run row carries a ``landscape_run_id``, which the execution service
+    only writes after admitting the run to Landscape — so the store existed.
+    A missing file now means deleted, unmounted, or misconfigured storage,
+    and rendering that as zero-record diagnostics conceals the loss
+    (elspeth-1d24bb0d96).
+    """
+    settings = _SettingsFake(landscape_url=f"sqlite:///{tmp_path / 'missing-audit.db'}")
+
+    with pytest.raises(RunDiagnosticsAuditUnavailableError) as excinfo:
+        load_run_diagnostics_for_settings(
+            settings,  # type: ignore[arg-type]
+            run_id="web-run-1",
+            landscape_run_id="landscape-run-1",
+            run_status="completed",
+        )
+
+    assert excinfo.value.landscape_run_id == "landscape-run-1"
+    assert "missing-audit.db" in excinfo.value.audit_location
+
+
+def test_diagnostics_for_settings_missing_store_for_unlinked_run_is_empty(tmp_path) -> None:
+    """A run never linked to Landscape has no expected store yet.
+
+    Fresh deployments poll diagnostics for pending runs before the engine
+    creates the audit database; with no ``landscape_run_id`` recorded there
+    is no evidence to lose, so the empty projection is the honest answer.
+    """
+    settings = _SettingsFake(landscape_url=f"sqlite:///{tmp_path / 'missing-audit.db'}")
+
+    diagnostics = load_run_diagnostics_for_settings(
+        settings,  # type: ignore[arg-type]
+        run_id="web-run-1",
+        landscape_run_id=None,
+        run_status="pending",
+    )
+
+    assert diagnostics.landscape_run_id == "web-run-1"
+    assert diagnostics.summary.token_count == 0
+    assert diagnostics.tokens == []
+
+
 def test_diagnostics_empty_when_landscape_run_has_not_started(tmp_path) -> None:
     db = LandscapeDB.from_url(f"sqlite:///{tmp_path / 'audit.db'}")
     try:
@@ -1340,4 +1395,4 @@ def test_diversion_error_types_mirror_the_sink_executor_anchors() -> None:
     """
     from elspeth.web.execution.diagnostics import _DIVERSION_ERROR_TYPES
 
-    assert _DIVERSION_ERROR_TYPES == frozenset({"SinkDiscard", "SinkDiversion"})
+    assert frozenset({"SinkDiscard", "SinkDiversion"}) == _DIVERSION_ERROR_TYPES

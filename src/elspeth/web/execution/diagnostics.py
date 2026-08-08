@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Final, Literal, get_args
 
 from sqlalchemy import and_, func, select
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, make_url
 
 from elspeth.contracts.errors import TransformErrorCategory
 from elspeth.core.landscape.database import LandscapeDB
@@ -111,6 +111,29 @@ _JSON_PAYLOAD_TYPE_NAMES: Final[dict[type[object], str]] = {
     list: "list",
     str: "str",
 }
+
+
+class RunDiagnosticsAuditUnavailableError(RuntimeError):
+    """Raised when a linked run's expected Landscape store cannot be read.
+
+    Sibling of ``outputs.RunOutputsAuditUnavailableError``. A run row that
+    carries a ``landscape_run_id`` was admitted to Landscape, so the store
+    existed; a missing file now is deleted, unmounted, or misconfigured audit
+    storage. Rendering that as a zero-record diagnostics projection would be
+    indistinguishable from a genuinely clean run and would conceal evidence
+    loss (elspeth-1d24bb0d96), so the read raises instead and the routes
+    translate it to an explicit 503.
+    """
+
+    def __init__(self, *, landscape_run_id: str, landscape_url: str) -> None:
+        parsed = make_url(landscape_url)
+        if parsed.drivername.startswith("sqlite"):
+            audit_location = parsed.database or landscape_url
+        else:
+            audit_location = parsed.render_as_string(hide_password=True)
+        self.landscape_run_id = landscape_run_id
+        self.audit_location = audit_location
+        super().__init__(f"Run diagnostics audit database is unavailable for landscape_run_id={landscape_run_id!r} at {audit_location!r}")
 
 
 def llm_safe_diagnostics_snapshot(diagnostics: RunDiagnosticsResponse) -> dict[str, Any]:
@@ -313,17 +336,31 @@ def load_run_diagnostics_for_settings(
     settings: WebSettings,
     *,
     run_id: str,
-    landscape_run_id: str,
+    landscape_run_id: str | None,
     run_status: SessionRunStatus,
     cancel_requested: bool = False,
     limit: int = _DEFAULT_DIAGNOSTIC_LIMIT,
 ) -> RunDiagnosticsResponse:
-    """Open Landscape from web settings and return a bounded run snapshot."""
+    """Open Landscape from web settings and return a bounded run snapshot.
+
+    ``landscape_run_id`` is the raw link from the sessions run row — ``None``
+    when the engine has not admitted the run to Landscape. That distinction is
+    what makes a missing store file classifiable: a linked run's store existed
+    when the link was written, so its absence is evidence loss and raises
+    :class:`RunDiagnosticsAuditUnavailableError`; an unlinked run has nothing
+    recorded yet, so the empty projection is the honest answer (and querying
+    would create an empty audit database on fresh deployments). The service
+    links the run row moments before it opens the store for writing, so a
+    poll racing that window sees a retryable 503 rather than a false clean.
+    """
+    effective_landscape_run_id = landscape_run_id or run_id
     landscape_url = settings.get_landscape_url()
     if _sqlite_database_file_missing(landscape_url):
+        if landscape_run_id is not None:
+            raise RunDiagnosticsAuditUnavailableError(landscape_run_id=landscape_run_id, landscape_url=landscape_url)
         return _empty_diagnostics(
             run_id=run_id,
-            landscape_run_id=landscape_run_id,
+            landscape_run_id=effective_landscape_run_id,
             run_status=run_status,
             cancel_requested=cancel_requested,
             limit=limit,
@@ -339,7 +376,7 @@ def load_run_diagnostics_for_settings(
         return load_run_diagnostics_from_db(
             db,
             run_id=run_id,
-            landscape_run_id=landscape_run_id,
+            landscape_run_id=effective_landscape_run_id,
             run_status=run_status,
             cancel_requested=cancel_requested,
             limit=limit,
