@@ -176,6 +176,7 @@ from elspeth.web.sessions.protocol import (
     ProposalEventRecord,
     ProposalLifecycleStatus,
     RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
     RunDiagnosticsAuthorityLostError,
     RunRecord,
     SessionRecord,
@@ -1660,6 +1661,112 @@ async def _persist_llm_calls(
         ) from save_err
 
 
+async def _persist_turn_audit_cohort(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    tool_invocations: tuple[ComposerToolInvocation, ...],
+    llm_calls: tuple[ComposerLLMCall, ...],
+    *,
+    tool_composition_state_id: UUID | None,
+    llm_composition_state_id: UUID | None,
+    parent_assistant_id: UUID | None = None,
+    plugin_crash_pending: bool,
+) -> tuple[PipelineDispatchAuditBinding, ...]:
+    """Settle one turn's tool AND LLM audit rows as a single atomic cohort.
+
+    :func:`_persist_tool_invocations` and :func:`_persist_llm_calls`
+    each settle atomically, but calling them back-to-back still commits
+    the turn as TWO independent transactions: a failure between them
+    leaves the tool cohort durable without the LLM sidecars that prove
+    what the model saw — the partial-cohort defect elspeth-90231248dc
+    removed, recreated one level up. This helper builds both draft
+    groups and hands them to ``add_messages_atomic`` in ONE call, so the
+    whole turn becomes durable together or not at all.
+
+    The two groups legitimately carry different state ids — tool rows
+    bind to the post-compose state their calls produced,
+    LLM-call sidecars to the pre-send state the request was composed
+    against — expressed via the per-draft ``composition_state_id``
+    override rather than per-group transactions.
+
+    Draft shapes, role selection (``tool`` vs ``audit`` by
+    ``parent_assistant_id``), redaction, and pipeline-binding capture
+    mirror :func:`_persist_tool_invocations`; LLM drafts mirror
+    :func:`_persist_llm_calls`. Audit-primacy disposition is likewise
+    identical (``plugin_crash_pending``): unwind-path failure is counted
+    and slogged without masking the primary error and nothing becomes
+    durable; success-path failure is a Tier-1 audit corruption and
+    raises :class:`AuditIntegrityError`.
+
+    Either group may be empty (e.g. compose-loop turns whose tool rows
+    were already committed by ``persist_compose_turn`` drain only LLM
+    calls here); both empty is a no-op.
+    """
+    if not tool_invocations and not llm_calls:
+        return ()
+    role: ChatMessageRole = "tool" if parent_assistant_id is not None else "audit"
+    tool_csid = str(tool_composition_state_id) if tool_composition_state_id else None
+    llm_csid = str(llm_composition_state_id) if llm_composition_state_id else None
+    drafts: list[AuditMessageDraft] = []
+    pipeline_bindings: list[PipelineDispatchAuditBinding] = []
+    for invocation in tool_invocations:
+        content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+        drafts.append(
+            AuditMessageDraft(
+                role=role,
+                content=content,
+                tool_calls=(envelope,),
+                tool_call_id=invocation.tool_call_id if role == "tool" else None,
+                parent_assistant_id=str(parent_assistant_id) if role == "tool" and parent_assistant_id is not None else None,
+                composition_state_id=tool_csid,
+            )
+        )
+        if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
+            pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
+    for call in llm_calls:
+        drafts.append(
+            AuditMessageDraft(
+                role="audit",
+                content=llm_call_audit_summary(call),
+                tool_calls=(llm_call_audit_envelope(call),),
+                composition_state_id=llm_csid,
+            )
+        )
+    try:
+        await service.add_messages_atomic(
+            session_id,
+            tuple(drafts),
+            composition_state_id=None,
+            writer_principal="compose_loop",
+        )
+    except SQLAlchemyError as save_err:
+        if plugin_crash_pending:
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                1,
+                {"helper": "turn_audit_cohort"},
+            )
+            slog.error(
+                "composer_turn_audit_cohort_persist_failed_during_unwind",
+                session_id=str(session_id),
+                invocations=len(tool_invocations),
+                tool_names=[invocation.tool_name for invocation in tool_invocations],
+                calls=len(llm_calls),
+                exc_class=type(save_err).__name__,
+            )
+            # Nothing became durable, so no binding may claim otherwise.
+            return ()
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "turn_audit_cohort"},
+        )
+        raise AuditIntegrityError(
+            f"composer_turn_audit_cohort_persist_failed: audit insert "
+            f"failed for session_id={session_id!r} after assistant row "
+            f"was persisted — Tier-1 audit corruption (no recovery)"
+        ) from save_err
+    return tuple(pipeline_bindings)
+
+
 async def _persist_run_diagnostics_llm_calls(
     service: SessionServiceProtocol,
     authority: RunDiagnosticsAuditAuthority,
@@ -1670,65 +1777,73 @@ async def _persist_run_diagnostics_llm_calls(
     """Persist run-diagnostics LLM audit rows under run-scoped authority.
 
     Sibling of :func:`_persist_llm_calls` with the same audit-primacy
-    disposition, but every row goes through
-    ``add_run_diagnostics_audit_message`` so the run/session/state
-    binding is re-proven durably inside the write transaction, and the
-    audit envelope carries ``run_id`` so an auditor can answer "which
-    operation wrote this" from the row alone (elspeth-0fcf68d50f).
+    disposition, but the cohort goes through
+    ``add_run_diagnostics_audit_messages_atomic`` so the
+    run/session/state binding is re-proven durably inside the write
+    transaction, and each audit envelope carries ``run_id`` so an
+    auditor can answer "which operation wrote this" from the row alone
+    (elspeth-0fcf68d50f).
+
+    The cohort settles atomically (elspeth-90231248dc): one custody
+    proof and one transaction for every buffered call, so a mid-cohort
+    failure leaves zero sidecars rather than a partial prefix that
+    reads as a complete diagnostics record.
 
     Authority loss is custody movement, not audit corruption: on the
     success path it propagates so the route refuses to return an
     unaudited explanation; on the unwind path it is recorded and
     swallowed so it cannot mask the primary error.
     """
-    for call in llm_calls:
-        content = llm_call_audit_summary(call)
-        envelope = {**llm_call_audit_envelope(call), "run_id": str(authority.run_id)}
-        try:
-            await service.add_run_diagnostics_audit_message(
-                authority,
-                content,
-                tool_calls=[envelope],
-            )
-        except RunDiagnosticsAuthorityLostError as lost:
-            if plugin_crash_pending:
-                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                    1,
-                    {"helper": "run_diagnostics_llm_calls"},
-                )
-                slog.error(
-                    "run_diagnostics_audit_authority_lost_during_unwind",
-                    session_id=str(authority.session_id),
-                    run_id=str(authority.run_id),
-                    reason=lost.reason,
-                )
-                continue
-            raise
-        except SQLAlchemyError as save_err:
-            if plugin_crash_pending:
-                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
-                    1,
-                    {"helper": "run_diagnostics_llm_calls"},
-                )
-                slog.error(
-                    "run_diagnostics_llm_call_persist_failed_during_unwind",
-                    session_id=str(authority.session_id),
-                    run_id=str(authority.run_id),
-                    model_requested=call.model_requested,
-                    status=call.status.value,
-                    exc_class=type(save_err).__name__,
-                )
-                continue
-            _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+    if not llm_calls:
+        return
+    drafts = tuple(
+        RunDiagnosticsAuditDraft(
+            content=llm_call_audit_summary(call),
+            tool_calls=({**llm_call_audit_envelope(call), "run_id": str(authority.run_id)},),
+        )
+        for call in llm_calls
+    )
+    try:
+        await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+    except RunDiagnosticsAuthorityLostError as lost:
+        if plugin_crash_pending:
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
                 1,
                 {"helper": "run_diagnostics_llm_calls"},
             )
-            raise AuditIntegrityError(
-                f"run_diagnostics_llm_call_persist_failed: audit insert failed "
-                f"for session_id={authority.session_id!r} "
-                f"run_id={authority.run_id!r} on success path — Tier-1 audit "
-                f"corruption (no recovery)"
-            ) from save_err
+            slog.error(
+                "run_diagnostics_audit_authority_lost_during_unwind",
+                session_id=str(authority.session_id),
+                run_id=str(authority.run_id),
+                reason=lost.reason,
+            )
+            return
+        raise
+    except SQLAlchemyError as save_err:
+        if plugin_crash_pending:
+            _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                1,
+                {"helper": "run_diagnostics_llm_calls"},
+            )
+            slog.error(
+                "run_diagnostics_llm_call_persist_failed_during_unwind",
+                session_id=str(authority.session_id),
+                run_id=str(authority.run_id),
+                calls=len(llm_calls),
+                model_requested=llm_calls[0].model_requested,
+                exc_class=type(save_err).__name__,
+            )
+            return
+        _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+            1,
+            {"helper": "run_diagnostics_llm_calls"},
+        )
+        raise AuditIntegrityError(
+            f"run_diagnostics_llm_call_persist_failed: audit insert failed "
+            f"for session_id={authority.session_id!r} "
+            f"run_id={authority.run_id!r} on success path — Tier-1 audit "
+            f"corruption (no recovery)"
+        ) from save_err
 
 
 _CLIENT_DISCONNECT_CANCEL_MARKER = object()
@@ -2454,22 +2569,17 @@ async def _handle_convergence_error(
     # leave a record of what the LLM tried.
     # Compose-loop carriers with failed_turn were already committed by
     # persist_compose_turn_async; only pre-cutover/non-loop carriers drain here.
-    if exc.tool_invocations and exc.failed_turn is None:
-        await _persist_tool_invocations(
-            service,
-            session_id,
-            exc.tool_invocations,
-            persisted_state_id,
-            plugin_crash_pending=True,
-        )
-    if exc.llm_calls:
-        await _persist_llm_calls(
-            service,
-            session_id,
-            exc.llm_calls,
-            llm_composition_state_id,
-            plugin_crash_pending=True,
-        )
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    await _persist_turn_audit_cohort(
+        service,
+        session_id,
+        exc.tool_invocations if exc.failed_turn is None else (),
+        exc.llm_calls,
+        tool_composition_state_id=persisted_state_id,
+        llm_composition_state_id=llm_composition_state_id,
+        plugin_crash_pending=True,
+    )
     return response_body
 
 
@@ -2617,22 +2727,17 @@ async def _handle_plugin_crash(
     # plugin bug fired.
     # Compose-loop plugin-crash rows commit before the carrier is raised.
     # Retain this drain only for older/non-loop carriers with no failed_turn.
-    if exc.tool_invocations and exc.failed_turn is None:
-        await _persist_tool_invocations(
-            service,
-            session_id,
-            exc.tool_invocations,
-            persisted_state_id_pc,
-            plugin_crash_pending=True,
-        )
-    if exc.llm_calls:
-        await _persist_llm_calls(
-            service,
-            session_id,
-            exc.llm_calls,
-            llm_composition_state_id,
-            plugin_crash_pending=True,
-        )
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    await _persist_turn_audit_cohort(
+        service,
+        session_id,
+        exc.tool_invocations if exc.failed_turn is None else (),
+        exc.llm_calls,
+        tool_composition_state_id=persisted_state_id_pc,
+        llm_composition_state_id=llm_composition_state_id,
+        plugin_crash_pending=True,
+    )
     return response_body
 
 
@@ -2849,26 +2954,20 @@ async def _handle_runtime_preflight_failure(
     # Persist the per-tool-call audit trail. Preview-path runtime
     # preflight failures now record the preview_pipeline tool invocation
     # before raising; other runtime-preflight failures may still carry an
-    # empty tuple. The unconditional call handles both via the empty-tuple
-    # early-return inside _persist_tool_invocations.
+    # empty tuple (the both-empty no-op inside the helper handles that).
     # Runtime-preflight carriers from the compose loop use the committed
     # failed_turn row; post-compose/non-loop carriers still drain here.
-    if exc.tool_invocations and exc.failed_turn is None:
-        await _persist_tool_invocations(
-            service,
-            session_id,
-            exc.tool_invocations,
-            persisted_state_id_rpf,
-            plugin_crash_pending=True,
-        )
-    if exc.llm_calls:
-        await _persist_llm_calls(
-            service,
-            session_id,
-            exc.llm_calls,
-            llm_composition_state_id,
-            plugin_crash_pending=True,
-        )
+    # Tool rows and LLM sidecars settle as ONE cohort in a single
+    # transaction (elspeth-90231248dc) despite their differing state ids.
+    await _persist_turn_audit_cohort(
+        service,
+        session_id,
+        exc.tool_invocations if exc.failed_turn is None else (),
+        exc.llm_calls,
+        tool_composition_state_id=persisted_state_id_rpf,
+        llm_composition_state_id=llm_composition_state_id,
+        plugin_crash_pending=True,
+    )
     return response_body
 
 
@@ -3139,6 +3238,7 @@ __all__ = [
     "_pending_proposal_responses",
     "_persist_llm_calls",
     "_persist_tool_invocations",
+    "_persist_turn_audit_cohort",
     "_proposal_event_response",
     "_publish_progress",
     "_record_composer_authoring_validation_telemetry",

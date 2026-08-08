@@ -57,7 +57,7 @@ from ._helpers import (
     _message_response,
     _pending_proposal_responses,
     _persist_llm_calls,
-    _persist_tool_invocations,
+    _persist_turn_audit_cohort,
     _publish_progress,
     _record_composer_request_terminal,
     _record_composer_runtime_preflight_telemetry,
@@ -843,24 +843,20 @@ def register_message_routes(router: APIRouter) -> None:
                 # 6b. Persist per-tool-call audit trail. Each ComposerToolInvocation
                 # lands as one role=tool chat message linked to the post-compose
                 # state id (when version advanced) so the audit trail records
-                # which tool calls produced this state.
-                if result.tool_invocations and not result.persisted_tool_call_turn:
-                    await _persist_tool_invocations(
-                        service,
-                        session.id,
-                        result.tool_invocations,
-                        post_compose_state_id,
-                        parent_assistant_id=assistant_msg.id,
-                        plugin_crash_pending=False,
-                    )
-                if result.llm_calls:
-                    await _persist_llm_calls(
-                        service,
-                        session.id,
-                        result.llm_calls,
-                        compose_base_state_id,
-                        plugin_crash_pending=False,
-                    )
+                # which tool calls produced this state. Tool rows and LLM
+                # sidecars are ONE turn cohort and settle in a single
+                # transaction (elspeth-90231248dc) even though they bind to
+                # different state ids.
+                await _persist_turn_audit_cohort(
+                    service,
+                    session.id,
+                    result.tool_invocations if not result.persisted_tool_call_turn else (),
+                    result.llm_calls,
+                    tool_composition_state_id=post_compose_state_id,
+                    llm_composition_state_id=compose_base_state_id,
+                    parent_assistant_id=assistant_msg.id,
+                    plugin_crash_pending=False,
+                )
                 await _publish_progress(
                     progress_sink,
                     event=ComposerProgressEvent(

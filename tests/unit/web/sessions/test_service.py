@@ -41,6 +41,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationClaimed,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
     RunDiagnosticsAuthorityLostError,
     RunRecord,
     SessionRecord,
@@ -1703,6 +1704,88 @@ class TestRunDiagnosticsAuditMessage:
         with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
             await service.add_run_diagnostics_audit_message(authority, "no session")
         assert exc_info.value.reason == "session_missing"
+
+
+class TestRunDiagnosticsAuditMessagesAtomic:
+    """The diagnostics cohort settles all-or-nothing (elspeth-90231248dc)."""
+
+    async def _session_state_run(self, service):
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        run = await service.create_run(session.id, state.id)
+        return session, state, run
+
+    @pytest.mark.asyncio
+    async def test_cohort_lands_contiguously_under_one_authority_proof(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        drafts = tuple(
+            RunDiagnosticsAuditDraft(
+                content=f"diagnostics call {i}",
+                tool_calls=({"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}},),
+            )
+            for i in range(3)
+        )
+
+        records = await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+
+        assert [r.content for r in records] == ["diagnostics call 0", "diagnostics call 1", "diagnostics call 2"]
+        sequence_nos = [r.sequence_no for r in records]
+        assert sequence_nos == list(range(sequence_nos[0], sequence_nos[0] + 3)), "cohort rows must occupy one contiguous sequence block"
+        assert len({r.created_at for r in records}) == 1, "cohort rows must share one transaction timestamp"
+        stored = await service.get_messages(session.id)
+        by_id = {m.id: m for m in stored}
+        for record in records:
+            assert by_id[record.id].writer_principal == "run_diagnostics"
+            assert by_id[record.id].composition_state_id == state.id
+
+    @pytest.mark.asyncio
+    async def test_mid_cohort_failure_leaves_zero_rows_durable(self, service) -> None:
+        """A cohort whose LAST row cannot be written must persist nothing.
+
+        The unserializable envelope on the final draft makes its INSERT
+        raise after the earlier rows' INSERTs executed in the same
+        transaction — if any prefix survives, the write path is a
+        per-row loop again, which is the defect this method removed.
+        """
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        drafts = (
+            RunDiagnosticsAuditDraft(content="prefix row 0"),
+            RunDiagnosticsAuditDraft(content="prefix row 1"),
+            RunDiagnosticsAuditDraft(content="poison row", tool_calls=({"payload": object()},)),
+        )
+
+        with pytest.raises(Exception):  # noqa: B017 - dialect-specific serialization error class
+            await service.add_run_diagnostics_audit_messages_atomic(authority, drafts)
+
+        contents = [m.content for m in await service.get_messages(session.id)]
+        assert "prefix row 0" not in contents, "mid-cohort failure durably committed a prefix"
+        assert "prefix row 1" not in contents, "mid-cohort failure durably committed a prefix"
+
+    @pytest.mark.asyncio
+    async def test_lost_authority_refuses_whole_cohort(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        await service.archive_session(session.id)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_messages_atomic(
+                authority,
+                (RunDiagnosticsAuditDraft(content="after archive"),),
+            )
+        assert exc_info.value.reason == "session_archived"
+
+    @pytest.mark.asyncio
+    async def test_empty_cohort_is_a_noop(self, service) -> None:
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+        before = await service.get_session(session.id)
+
+        assert await service.add_run_diagnostics_audit_messages_atomic(authority, ()) == ()
+
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at == before.updated_at, "an empty cohort must not bump updated_at"
 
 
 class TestGetMessagesNonexistentSession:

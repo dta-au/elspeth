@@ -215,6 +215,7 @@ from elspeth.web.sessions.protocol import (
     ProposalLifecycleStatus,
     RunAlreadyActiveError,
     RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
     RunDiagnosticsAuditMutationAuthority,
     RunEventRecord,
     RunRecord,
@@ -8225,6 +8226,14 @@ class SessionServiceImpl:
         drained through a mid-flight ``CancelledError``, so the cohort is
         either fully durable or untouched — never a cancelled prefix.
 
+        A draft's ``composition_state_id``, when set, overrides the
+        cohort-level ``composition_state_id`` for that row (``None``
+        falls back to it). One turn's tool rows and LLM sidecars carry
+        different state ids — post-compose vs pre-send — and the
+        override is what lets them settle as ONE cohort instead of two
+        independently-committing transactions. Every distinct effective
+        state id is verified against the session before any insert.
+
         An empty ``drafts`` sequence is a no-op (the compose loop drains
         conditionally; an empty cohort must not bump ``updated_at``).
         """
@@ -8233,16 +8242,18 @@ class SessionServiceImpl:
         now = self._now()
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
+        effective_state_ids = tuple(draft.composition_state_id if draft.composition_state_id is not None else csid for draft in drafts)
 
         def _sync() -> None:
             with self._session_process_locked_begin(sid) as conn:
-                if csid is not None:
-                    _assert_state_in_session(
-                        conn,
-                        state_id=csid,
-                        expected_session_id=sid,
-                        caller="add_messages_atomic",
-                    )
+                for state_id in dict.fromkeys(effective_state_ids):
+                    if state_id is not None:
+                        _assert_state_in_session(
+                            conn,
+                            state_id=state_id,
+                            expected_session_id=sid,
+                            caller="add_messages_atomic",
+                        )
                 with self._session_write_lock(conn, sid):
                     base_seq = self._reserve_sequence_range(conn, sid, count=len(drafts))
                     for offset, draft in enumerate(drafts):
@@ -8258,7 +8269,7 @@ class SessionServiceImpl:
                             tool_calls=deep_thaw(draft.tool_calls) if draft.tool_calls else None,
                             sequence_no=base_seq + offset,
                             writer_principal=writer_principal,
-                            composition_state_id=csid,
+                            composition_state_id=effective_state_ids[offset],
                             tool_call_id=draft.tool_call_id,
                             parent_assistant_id=draft.parent_assistant_id,
                             created_at=now,
@@ -8299,6 +8310,31 @@ class SessionServiceImpl:
                 authority=authority,
                 content=content,
                 tool_calls=tool_calls,
+            ),
+        )
+
+    async def add_run_diagnostics_audit_messages_atomic(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        drafts: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]:
+        """Append one run-diagnostics audit cohort all-or-nothing.
+
+        Cohort sibling of :meth:`add_run_diagnostics_audit_message`
+        (elspeth-90231248dc): the injected repository authority proves
+        custody once and commits every draft in the same locked
+        transaction with a contiguous sequence block, so a mid-cohort
+        failure or lost authority leaves zero rows durable — never a
+        prefix that reads as a complete diagnostics record.
+        """
+        if not drafts:
+            return ()
+        return cast(
+            "tuple[ChatMessageRecord, ...]",
+            await self._run_sync(
+                self._run_diagnostics_audit_authority.append_audit_messages,
+                authority=authority,
+                rows=tuple(drafts),
             ),
         )
 

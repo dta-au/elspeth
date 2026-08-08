@@ -1067,7 +1067,7 @@ async def test_add_messages_atomic_mid_cohort_failure_persists_nothing(service, 
     def flaky_insert(conn, **kwargs):
         calls["count"] += 1
         if calls["count"] == 2:
-            raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))  # noqa: TRY003
+            raise OperationalError("INSERT INTO chat_messages", {}, Exception("db unavailable"))
         return original_insert(conn, **kwargs)
 
     monkeypatch.setattr(service, "_insert_chat_message", flaky_insert)
@@ -1084,6 +1084,59 @@ async def test_add_messages_atomic_mid_cohort_failure_persists_nothing(service, 
 
     assert calls["count"] == 2
     assert await service.get_messages(session_uuid, limit=None) == []
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_honors_per_draft_state_id_override(service):
+    """One turn's tool rows (post-compose state) and LLM sidecars (pre-send
+    state) settle as ONE cohort: each draft's ``composition_state_id``
+    override wins over the cohort-level value, and ``None`` falls back."""
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session = await service.create_session("alice", "Pipeline", "local")
+    pre_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    post_state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+    await service.add_messages_atomic(
+        session.id,
+        (
+            AuditMessageDraft(role="audit", content="tool row", composition_state_id=str(post_state.id)),
+            AuditMessageDraft(role="audit", content="llm row", composition_state_id=str(pre_state.id)),
+            AuditMessageDraft(role="audit", content="fallback row"),
+        ),
+        composition_state_id=pre_state.id,
+        writer_principal="compose_loop",
+    )
+
+    by_content = {m.content: m for m in await service.get_messages(session.id, limit=None)}
+    assert by_content["tool row"].composition_state_id == post_state.id
+    assert by_content["llm row"].composition_state_id == pre_state.id
+    assert by_content["fallback row"].composition_state_id == pre_state.id
+
+
+@pytest.mark.asyncio
+async def test_add_messages_atomic_rejects_foreign_per_draft_state_id_atomically(service):
+    """A cross-session override state id is refused BEFORE any insert, so
+    the well-formed sibling drafts in the same cohort persist nothing."""
+    from elspeth.web.sessions._persist_payload import AuditMessageDraft
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session = await service.create_session("alice", "Pipeline", "local")
+    other_session = await service.create_session("alice", "Other", "local")
+    foreign_state = await service.save_composition_state(other_session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+    with pytest.raises(RuntimeError, match=r"add_messages_atomic.*cross-session"):
+        await service.add_messages_atomic(
+            session.id,
+            (
+                AuditMessageDraft(role="audit", content="clean row"),
+                AuditMessageDraft(role="audit", content="foreign row", composition_state_id=str(foreign_state.id)),
+            ),
+            writer_principal="compose_loop",
+        )
+
+    assert await service.get_messages(session.id, limit=None) == []
 
 
 @pytest.mark.asyncio

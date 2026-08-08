@@ -1476,7 +1476,7 @@ class TestRunDiagnosticsEndpoint:
                 )
             assert exc_info.value.status_code == expected_http_status
 
-        persist = app.state.session_service.add_run_diagnostics_audit_message
+        persist = app.state.session_service.add_run_diagnostics_audit_messages_atomic
         assert persist.await_count == 1
         audit_args = persist.await_args
         # elspeth-0fcf68d50f: every diagnostics audit row is written under a
@@ -1487,8 +1487,11 @@ class TestRunDiagnosticsEndpoint:
             session_id=session_id,
             state_id=state_id,
         )
-        assert json.loads(audit_args.args[1])["status"] == status_by_outcome[outcome].value
-        (envelope,) = audit_args.kwargs["tool_calls"]
+        # elspeth-90231248dc: the buffered calls arrive as ONE cohort in
+        # one service call, not one call per row.
+        (draft,) = audit_args.args[1]
+        assert json.loads(draft.content)["status"] == status_by_outcome[outcome].value
+        (envelope,) = draft.tool_calls
         assert envelope["_kind"] == "llm_call_audit"
         assert envelope["run_id"] == str(run_id)
         assert app.state.session_service.add_message.await_count == 0
@@ -1588,8 +1591,8 @@ class TestRunDiagnosticsEndpoint:
         async def _record_lock_state(*args: Any, **kwargs: Any) -> None:
             held_during_persist.append(compose_lock.locked())
 
-        app.state.session_service.add_run_diagnostics_audit_message = AsyncMock(
-            spec=SessionServiceProtocol.add_run_diagnostics_audit_message,
+        app.state.session_service.add_run_diagnostics_audit_messages_atomic = AsyncMock(
+            spec=SessionServiceProtocol.add_run_diagnostics_audit_messages_atomic,
             side_effect=_record_lock_state,
         )
 
@@ -1687,8 +1690,8 @@ class TestRunDiagnosticsEndpoint:
             state_id=state_id,
         )
         authority = RunDiagnosticsAuditAuthority(run_id=run_id, session_id=session_id, state_id=state_id)
-        app.state.session_service.add_run_diagnostics_audit_message = AsyncMock(
-            spec=SessionServiceProtocol.add_run_diagnostics_audit_message,
+        app.state.session_service.add_run_diagnostics_audit_messages_atomic = AsyncMock(
+            spec=SessionServiceProtocol.add_run_diagnostics_audit_messages_atomic,
             side_effect=RunDiagnosticsAuthorityLostError(authority, reason="session_archived"),
         )
         return app, svc, run_id, session_id, state_id, authority.run_id

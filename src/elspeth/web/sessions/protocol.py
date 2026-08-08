@@ -417,6 +417,32 @@ class RunDiagnosticsAuditAuthority:
             raise AuditIntegrityError("RunDiagnosticsAuditAuthority.state_id must be a UUID")
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class RunDiagnosticsAuditDraft:
+    """One row of a run-diagnostics audit cohort.
+
+    Role (``audit``), ``writer_principal`` (``run_diagnostics``) and
+    ``composition_state_id`` (``authority.state_id``) are all derived
+    from the authority at write time, never carried per row — the only
+    per-row facts are the content and its audit envelope. The whole
+    cohort settles in one locked transaction under one custody proof
+    (elspeth-90231248dc), so a mid-cohort failure leaves zero rows
+    durable rather than a prefix that reads as a complete record.
+    """
+
+    content: str
+    tool_calls: tuple[Mapping[str, Any], ...] | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.content) is not str:
+            raise AuditIntegrityError("RunDiagnosticsAuditDraft.content must be an exact string")
+        if self.tool_calls is not None and type(self.tool_calls) is not tuple:
+            raise AuditIntegrityError("RunDiagnosticsAuditDraft.tool_calls must be a tuple or None")
+        if self.tool_calls is not None:
+            freeze_fields(self, "tool_calls")
+
+
 RUN_DIAGNOSTICS_AUTHORITY_LOSS_REASONS: frozenset[str] = frozenset({"session_missing", "session_archived", "run_missing", "run_rebound"})
 
 
@@ -2453,7 +2479,7 @@ class ToolCallIDMismatchError(RuntimeError):
 
 
 class RunDiagnosticsAuditMutationAuthority(Protocol):
-    """Handle-free authority for one run-diagnostics audit append."""
+    """Handle-free authority for run-diagnostics audit appends."""
 
     def append_audit_message(
         self,
@@ -2462,6 +2488,13 @@ class RunDiagnosticsAuditMutationAuthority(Protocol):
         content: str,
         tool_calls: Sequence[Mapping[str, Any]] | None,
     ) -> ChatMessageRecord: ...
+
+    def append_audit_messages(
+        self,
+        *,
+        authority: RunDiagnosticsAuditAuthority,
+        rows: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]: ...
 
 
 class SessionServiceProtocol(Protocol):
@@ -2977,7 +3010,11 @@ class SessionServiceProtocol(Protocol):
         Implementations MUST commit every draft in a single transaction
         under the session write lock with a contiguous sequence block —
         a mid-cohort failure must leave zero rows durable, never a
-        prefix. An empty ``drafts`` sequence is a no-op.
+        prefix. A draft's ``composition_state_id`` overrides the
+        cohort-level value for that row (``None`` falls back to it), and
+        every distinct effective state id MUST be verified against the
+        session before any insert. An empty ``drafts`` sequence is a
+        no-op.
         """
         ...
 
@@ -2999,6 +3036,22 @@ class SessionServiceProtocol(Protocol):
         archived — and MUST raise
         :class:`RunDiagnosticsAuthorityLostError` without consuming a
         chat sequence number when the proof fails.
+        """
+        ...
+
+    async def add_run_diagnostics_audit_messages_atomic(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        drafts: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]:
+        """Append one run-diagnostics audit cohort all-or-nothing.
+
+        Cohort sibling of :meth:`add_run_diagnostics_audit_message`
+        (elspeth-90231248dc): implementations MUST prove the authority
+        once and commit every draft in the same locked transaction with
+        a contiguous sequence block — a mid-cohort failure or lost
+        authority must leave zero rows durable, never a prefix. An empty
+        ``drafts`` sequence is a no-op.
         """
         ...
 

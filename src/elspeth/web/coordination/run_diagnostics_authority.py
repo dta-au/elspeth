@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, final
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from sqlalchemy import Engine, func, insert, select, update
 
@@ -15,13 +15,14 @@ from elspeth.web.sessions.models import chat_messages_table, runs_table, session
 from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditDraft,
     RunDiagnosticsAuthorityLostError,
 )
 
 
 @final
 class RepositoryRunDiagnosticsAuditAuthority:
-    """Append a diagnostics audit row only while exact run custody is live."""
+    """Append diagnostics audit rows only while exact run custody is live."""
 
     __slots__ = ("_engine",)
 
@@ -38,14 +39,44 @@ class RepositoryRunDiagnosticsAuditAuthority:
         tool_calls: Sequence[Mapping[str, Any]] | None,
     ) -> ChatMessageRecord:
         """Prove custody and append one attributed row in one locked commit."""
-        if type(authority) is not RunDiagnosticsAuditAuthority:
-            raise TypeError("authority must be an exact RunDiagnosticsAuditAuthority")
         if type(content) is not str:
             raise TypeError("content must be an exact string")
+        (record,) = self.append_audit_messages(
+            authority=authority,
+            rows=(RunDiagnosticsAuditDraft(content=content, tool_calls=tuple(tool_calls) if tool_calls else None),),
+        )
+        return record
+
+    def append_audit_messages(
+        self,
+        *,
+        authority: RunDiagnosticsAuditAuthority,
+        rows: Sequence[RunDiagnosticsAuditDraft],
+    ) -> tuple[ChatMessageRecord, ...]:
+        """Prove custody once and append the whole cohort in one locked commit.
+
+        The cohort is one logical unit of audit evidence
+        (elspeth-90231248dc): every row commits in the same locked
+        transaction, under one durable custody proof and one contiguous
+        sequence block, or none of it does. The per-row loop this
+        replaces — one ``append_audit_message`` transaction per record —
+        could fail after any prefix, leaving a partial sidecar set that
+        reads as a complete diagnostics record.
+
+        An empty ``rows`` sequence is a no-op: no custody proof runs and
+        ``sessions.updated_at`` is not bumped.
+        """
+        if type(authority) is not RunDiagnosticsAuditAuthority:
+            raise TypeError("authority must be an exact RunDiagnosticsAuditAuthority")
+        for row in rows:
+            if type(row) is not RunDiagnosticsAuditDraft:
+                raise TypeError("rows must contain exact RunDiagnosticsAuditDraft instances")
+        if not rows:
+            return ()
         sid = str(authority.session_id)
         rid = str(authority.run_id)
         stid = str(authority.state_id)
-        message_id = uuid4()
+        message_ids: tuple[UUID, ...] = tuple(uuid4() for _ in rows)
 
         # The canonical same-session lock is acquired before either proof.
         # On PostgreSQL this is the transaction advisory lock shared by
@@ -80,44 +111,48 @@ class RepositoryRunDiagnosticsAuditAuthority:
             if run_row.session_id != sid or run_row.state_id != stid:
                 raise RunDiagnosticsAuthorityLostError(authority, reason="run_rebound")
 
-            next_sequence = int(
+            base_sequence = int(
                 conn.execute(
                     select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0) + 1).where(chat_messages_table.c.session_id == sid)
                 ).scalar_one()
             )
-            conn.execute(
-                insert(chat_messages_table).values(
-                    id=str(message_id),
-                    session_id=sid,
-                    role="audit",
-                    content=content,
-                    raw_content=None,
-                    tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                    sequence_no=next_sequence,
-                    writer_principal="run_diagnostics",
-                    composition_state_id=stid,
-                    tool_call_id=None,
-                    parent_assistant_id=None,
-                    created_at=now,
+            for offset, row in enumerate(rows):
+                conn.execute(
+                    insert(chat_messages_table).values(
+                        id=str(message_ids[offset]),
+                        session_id=sid,
+                        role="audit",
+                        content=row.content,
+                        raw_content=None,
+                        tool_calls=deep_thaw(row.tool_calls) if row.tool_calls else None,
+                        sequence_no=base_sequence + offset,
+                        writer_principal="run_diagnostics",
+                        composition_state_id=stid,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=now,
+                    )
                 )
-            )
             updated = conn.execute(
                 update(sessions_table).where(sessions_table.c.id == sid, sessions_table.c.archived_at.is_(None)).values(updated_at=now)
             )
             if updated.rowcount != 1:
                 raise RunDiagnosticsAuthorityLostError(authority, reason="session_archived")
 
-        return ChatMessageRecord(
-            id=message_id,
-            session_id=authority.session_id,
-            role="audit",
-            content=content,
-            raw_content=None,
-            tool_calls=tool_calls,
-            created_at=now,
-            sequence_no=next_sequence,
-            composition_state_id=authority.state_id,
-            writer_principal="run_diagnostics",
-            tool_call_id=None,
-            parent_assistant_id=None,
+        return tuple(
+            ChatMessageRecord(
+                id=message_ids[offset],
+                session_id=authority.session_id,
+                role="audit",
+                content=row.content,
+                raw_content=None,
+                tool_calls=row.tool_calls,
+                created_at=now,
+                sequence_no=base_sequence + offset,
+                composition_state_id=authority.state_id,
+                writer_principal="run_diagnostics",
+                tool_call_id=None,
+                parent_assistant_id=None,
+            )
+            for offset, row in enumerate(rows)
         )

@@ -94,8 +94,17 @@ class AuditMessageDraft:
     of one compose request, the tool-invocation breadcrumbs of one turn,
     one planner evidence set) that must become durable together or not at
     all (elspeth-90231248dc). Rows share the caller-supplied
-    ``writer_principal`` and ``composition_state_id``; per-row fields are
-    only the ones that legitimately vary inside one cohort.
+    ``writer_principal``; per-row fields are only the ones that
+    legitimately vary inside one cohort.
+
+    ``composition_state_id``, when set, overrides the cohort-level
+    ``composition_state_id`` parameter of ``add_messages_atomic`` for
+    this row; ``None`` falls back to the cohort-level value. One turn's
+    tool rows carry the post-compose state id while its LLM sidecars
+    carry the pre-send state id, and forcing those into separate
+    transactions to express that difference is exactly the partial-cohort
+    defect elspeth-90231248dc removed — the override lets the whole turn
+    settle as one cohort.
 
     ``tool_call_id`` / ``parent_assistant_id`` must satisfy the same
     role biconditional CHECKs as ``add_message``: set exactly when
@@ -107,6 +116,7 @@ class AuditMessageDraft:
     tool_calls: tuple[Mapping[str, Any], ...] | None = None
     tool_call_id: str | None = None
     parent_assistant_id: str | None = None
+    composition_state_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
