@@ -120,14 +120,27 @@ Round 7 is the only cold install since round 4. Deviations recorded as
 findings, not smoothed over. **Three of the five assume stack REUSE** — that is
 the pattern.
 
-| # | Step | Finding |
+**Attribution matters here** — `elspeth-671a17d5c0` is about qualifying the
+*runbook*, so a finding that actually belongs to `ops-local/` or to a prior
+round's brief must not be charged against it. The `Owner` column is the
+artifact that is actually wrong.
+
+| # | Owner | Finding |
 |---|---|---|
-| 1 | §1 identity | The stop condition `test "$(aws configure get region --profile "$AWS_PROFILE")" = "$AWS_REGION"` **fails by construction**: every profile is configured `ap-southeast-1`, the deployment Region is `ap-southeast-2` |
-| 2 | §4 images | `r4_build_images.sh` runs `docker logout` **before** `docker buildx imagetools inspect` — a registry read. The manifest-shape check 401s every time and can never have passed. Fixed in `r7_build_images.sh` |
-| 3 | credentials | The recorded env-export recipe is **insufficient for an apply** — see below. This is how the 2026-08-07 apply died at 79/86 |
-| 4 | trap 3 (stale image pin) | **Does not apply to a cold install.** Terraform rendered the schema-init doctor *at* the candidate digest; no `respin_td.py` needed. It is a stack-**reuse** trap and the runbook does not say so |
-| 5 | S3 fixture | The step reads *"re-upload `docs/exec-summary.pdf` … **if the redeploy disturbed it**"* — a conditional that **never fires on a cold install**, where the bucket is simply empty. g07 failed as a result and read as a regression until diagnosed |
-| 6 | ECR tags | The repo is `IMMUTABLE` and `acceptance-<run-id>` already resolves to round 4's image, so the tag must carry the SHA. Correct registry behaviour; the runbook does not mention it |
+| 1 | **runbook** §1 (`:125-126`) | The stop condition `test "$(aws configure get region --profile "$AWS_PROFILE")" = "$AWS_REGION"` **fails by construction**: every profile is configured `ap-southeast-1`, the deployment Region is `ap-southeast-2`. Pass the region explicitly; do not "fix" the profile |
+| 2 | **runbook** §4 (gap) | The runbook has **no S3 fixture step at all**, yet the g07 corpus intent needs `docs/exec-summary.pdf` under the granted prefix. A cold install creates an empty bucket, so g07 fails with `InvalidS3ObjectException` and reads as a product regression. (The instruction that *does* exist — "re-upload … **if the redeploy disturbed it**" — is the **round-5 brief**, `:257`, and its conditional never fires on a cold install) |
+| 3 | **runbook** §4 | The repo is `IMMUTABLE` and `acceptance-<run-id>` already resolves to round 4's image, so the tag must carry the SHA. Correct registry behaviour, unmentioned |
+| 4 | **runbook** §1 + ops lore | The credential path is **insufficient for an apply** — see below. This is how the 2026-08-07 apply died at 79/86 |
+| 5 | `ops-local/README.md:113` | Trap 3 ("stale image pins on one-shot task definitions") **does not apply to a cold install** — Terraform renders the schema-init doctor *at* the candidate digest, so no `respin_td.py` is needed. It is a stack-**reuse** trap and is not labelled as one |
+| 6 | `ops-local/r4_build_images.sh` | Runs `docker logout` **before** `docker buildx imagetools inspect`, a registry read, so the manifest-shape check 401s every time and can never have passed. Fixed in `r7_build_images.sh` |
+| 7 | `modules/scenario/database_bootstrap.tf` | The provisioner deletes the only evidence of its own failure — see below |
+
+**Correction, recorded because the first draft of this table got it wrong:**
+finding 6 is **not** a runbook defect. `aws-ecs-cold-install.md:346` explicitly
+states it *"uses the ECR API rather than `docker buildx imagetools` because this
+section runs after `docker logout`"* — the runbook anticipated the exact trap
+and routed around it. The bug is in the `ops-local` script lineage only, and on
+this point the runbook is **better** than the tooling built from it.
 
 ### Credentials: the recorded recipe cannot complete an apply
 
@@ -419,8 +432,24 @@ Anything not reached is listed as unsampled, never as passed.
 - **Do not close:** `elspeth-85f3cc3022` (split verdict),
   `elspeth-9595abb7b0` (not exercised).
 - **New, needs triage:** `elspeth-74b795208f`, `elspeth-15c72686f2` (both P1).
-- **Runbook fixes owed** to `elspeth-671a17d5c0`: fidelity findings 1–6 above,
-  particularly the three that assume stack reuse.
+- **Runbook fixes owed** to `elspeth-671a17d5c0`: fidelity findings **1–4**
+  only. Findings 5–7 belong to `ops-local/` and the Terraform module, not the
+  runbook.
+
+### Findings recorded but NOT filed as tickets
+
+The round produced more than the two P1s. These are deliberately listed rather
+than left implicit, because "two new defects" undersells what was found and a
+reader should not have to infer the rest from prose:
+
+| Finding | Where | Why not filed |
+|---|---|---|
+| The composer terminates on a composition it has been **correctly told is invalid** | `elspeth-85f3cc3022` residual | Recommended as a **split-out**; it is a sharper defect than that ticket's original framing and should not inherit its history |
+| The `database_bootstrap` provisioner writes AWS CLI stderr into a dir its `trap … EXIT` deletes, so the failure path destroys the only evidence of the failure | `modules/scenario/database_bootstrap.tf` | **Should be filed.** Real diagnosability defect; cost this round a manual root-cause hunt |
+| `on_write_failure: "discard"` does not cover the sink's own **input** contract — an input-preflight rejection fails the run rather than discarding | noted inside `elspeth-15c72686f2` | Needs a deliberate decision, not obviously a bug. Flagged in-ticket rather than filed separately |
+| Stale allowlist entry `allow_hits[159]` binds to deleted `web/composer/guided/steps.py`; the loader refuses it | `config/cicd/enforce_tier_model/web.yaml` | **Operator action** (remove + re-sign), not a code defect — the signing seam is operator-held |
+| Rounds 5 and 6 recorded a **vacuous** `elspeth-lints check: exit 0` | those two reports | Historical record correction; noted in §gates above |
+| Runbook findings 1–4 | `docs/runbooks/aws-ecs-cold-install.md` | Cheap doc fixes; owed to `elspeth-671a17d5c0`, which already exists |
 
 ## AWS ledger
 
