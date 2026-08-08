@@ -383,7 +383,7 @@ resource "aws_ecs_task_definition" "local_auth" {
 }
 
 resource "aws_ecs_task_definition" "rollback_web" {
-  count = var.scenario_id == "B" ? 1 : 0
+  count = local.deployment_mode == "upgrade" ? 1 : 0
 
   family                   = local.rollback_web_family
   requires_compatibilities = ["FARGATE"]
@@ -417,7 +417,7 @@ resource "aws_ecs_task_definition" "rollback_web" {
 }
 
 resource "aws_ecs_task_definition" "rollback_doctor" {
-  count = var.scenario_id == "B" ? 1 : 0
+  count = local.deployment_mode == "upgrade" ? 1 : 0
 
   family                   = local.rollback_doctor_family
   requires_compatibilities = ["FARGATE"]

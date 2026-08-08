@@ -76,7 +76,7 @@ locals {
     DOCTOR_NETWORK_CONFIGURATION                    = local.doctor_network_configuration
     PAYLOAD_VERIFIER_TASK_DEFINITION                = aws_ecs_task_definition.payload.arn
     LOCAL_AUTH_VERIFIER_TASK_DEFINITION             = aws_ecs_task_definition.local_auth.arn
-    ROLLBACK_DOCTOR_TASK_DEFINITION                 = var.scenario_id == "B" ? aws_ecs_task_definition.rollback_doctor[0].arn : ""
+    ROLLBACK_DOCTOR_TASK_DEFINITION                 = local.deployment_mode == "upgrade" ? aws_ecs_task_definition.rollback_doctor[0].arn : ""
     WEB_LOG_GROUP                                   = local.web_log_group
     WEB_LOG_STREAM_PREFIX                           = "web"
     DOCTOR_LOG_GROUP                                = local.doctor_log_group
@@ -85,15 +85,15 @@ locals {
     ECS_DEPLOYMENT_EVENT_RULE                       = local.event_rule_name
     ECS_DEPLOYMENT_EVENT_TARGET_ID                  = local.event_target_id
     ECS_DEPLOYMENT_EVENT_LOG_GROUP                  = local.event_log_group
-    PREVIOUS_TASK_DEFINITION                        = var.scenario_id == "B" ? aws_ecs_task_definition.rollback_web[0].arn : ""
+    PREVIOUS_TASK_DEFINITION                        = local.deployment_mode == "upgrade" ? aws_ecs_task_definition.rollback_web[0].arn : ""
     FIRST_DEPLOY_LISTENER_RULE_ARN                  = aws_lb_listener_rule.traffic.arn
     FIRST_DEPLOY_FORWARD_ACTIONS                    = local.forward_actions
     FIRST_DEPLOY_DISABLED_ACTIONS                   = local.disabled_actions
-    COGNITO_USER_POOL_ID                            = var.scenario_id == "B" ? aws_cognito_user_pool.web[0].id : ""
+    COGNITO_USER_POOL_ID                            = local.deployment_mode == "upgrade" ? aws_cognito_user_pool.web[0].id : ""
     DB_CLUSTER_IDENTIFIER                           = local.database_identifier
     ELSPETH_TEST_S3_BUCKET                          = local.s3_bucket_name
     OIDC_EXPECTED_ISSUER                            = local.oidc_issuer
-    OIDC_EXPECTED_AUDIENCE                          = var.scenario_id == "B" ? aws_cognito_user_pool_client.web[0].id : ""
+    OIDC_EXPECTED_AUDIENCE                          = local.deployment_mode == "upgrade" ? aws_cognito_user_pool_client.web[0].id : ""
     OIDC_EXPECTED_AUTHORIZATION_ORIGIN              = local.oidc_authorization_origin
     OIDC_EXPECTED_AUDIENCE_CLAIM                    = "client_id"
     SCENARIO_TF_DIR                                 = var.scenario_tf_dir
@@ -111,7 +111,7 @@ locals {
       local.local_auth_family,
       local.database_bootstrap_family,
     ],
-    var.scenario_id == "B" ? [local.rollback_web_family, local.rollback_doctor_family] : [],
+    local.deployment_mode == "upgrade" ? [local.rollback_web_family, local.rollback_doctor_family] : [],
   )
 
   scenario_orphan_sweep = {
@@ -153,8 +153,8 @@ locals {
         versions   = [aws_bedrock_guardrail_version.content.version]
       },
     ]
-    cognito_subject_sub             = var.scenario_id == "B" ? var.cognito_subject_sub : ""
-    cognito_pool_owned              = var.scenario_id == "B"
+    cognito_subject_sub             = local.deployment_mode == "upgrade" ? var.cognito_subject_sub : ""
+    cognito_pool_owned              = local.deployment_mode == "upgrade"
     expected_retained_metric_series = 0
     expected_retained_trace_ids     = 0
   }

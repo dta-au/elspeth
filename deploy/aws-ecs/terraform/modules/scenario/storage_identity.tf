@@ -265,7 +265,7 @@ resource "aws_bedrock_guardrail_version" "content" {
 }
 
 resource "aws_cognito_user_pool" "web" {
-  count = var.scenario_id == "B" ? 1 : 0
+  count = local.deployment_mode == "upgrade" ? 1 : 0
 
   name = "${local.namespace}-pool"
 
@@ -290,14 +290,14 @@ resource "aws_cognito_user_pool" "web" {
 }
 
 resource "aws_cognito_user_pool_domain" "web" {
-  count = var.scenario_id == "B" ? 1 : 0
+  count = local.deployment_mode == "upgrade" ? 1 : 0
 
   domain       = local.oidc_domain_prefix
   user_pool_id = aws_cognito_user_pool.web[0].id
 }
 
 resource "aws_cognito_user_pool_client" "web" {
-  count = var.scenario_id == "B" ? 1 : 0
+  count = local.deployment_mode == "upgrade" ? 1 : 0
 
   name         = "${local.namespace}-public-client"
   user_pool_id = aws_cognito_user_pool.web[0].id

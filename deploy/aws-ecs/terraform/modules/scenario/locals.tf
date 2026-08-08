@@ -20,10 +20,16 @@ locals {
   }
 
   cpu_architecture = var.target_platform == "linux/amd64" ? "X86_64" : "ARM64"
-  deployment_mode  = var.scenario_id == "A" ? "first" : "upgrade"
+  deployment_mode  = var.deployment_lifecycle
 
-  vpc_cidr            = var.scenario_id == "A" ? "10.71.0.0/16" : "10.72.0.0/16"
-  public_subnet_cidrs = var.scenario_id == "A" ? ["10.71.0.0/20", "10.71.16.0/20"] : ["10.72.0.0/20", "10.72.16.0/20"]
+  # Per-letter network identity. Each maintained scenario owns a distinct /16
+  # so disposable stacks for different scenarios can coexist without overlap.
+  scenario_network = {
+    A = { vpc = "10.71.0.0/16", public_subnets = ["10.71.0.0/20", "10.71.16.0/20"] }
+    B = { vpc = "10.72.0.0/16", public_subnets = ["10.72.0.0/20", "10.72.16.0/20"] }
+  }
+  vpc_cidr            = local.scenario_network[var.scenario_id].vpc
+  public_subnet_cidrs = local.scenario_network[var.scenario_id].public_subnets
 
   cluster_name           = "acceptance-${local.namespace}-cluster"
   service_name           = "acceptance-${local.namespace}-service"
@@ -445,7 +451,7 @@ locals {
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
     { name = "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL", value = var.composer_advisor_model },
     { name = "ELSPETH_WEB__REGISTRATION_MODE", value = "open" },
-    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = var.scenario_id == "A" ? "local" : "oidc" },
+    { name = "ELSPETH_WEB__AUTH_PROVIDER", value = local.deployment_mode == "first" ? "local" : "oidc" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY", value = "aws-otlp" },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_SERVICE_NAME", value = local.telemetry_service_name },
     { name = "ELSPETH_WEB__OPERATOR_TELEMETRY_ENVIRONMENT", value = "production" },
@@ -459,7 +465,7 @@ locals {
     { name = "ELSPETH_ACCEPTANCE_SCENARIO_ID", value = var.scenario_id },
     { name = "ELSPETH_ACCEPTANCE_S3_BUCKET", value = local.s3_bucket_name },
     { name = "ELSPETH_ACCEPTANCE_S3_PREFIX", value = local.s3_prefix },
-    ], var.scenario_id == "A" ? [] : [
+    ], local.deployment_mode == "first" ? [] : [
     { name = "ELSPETH_WEB__OIDC_ISSUER", value = local.oidc_issuer },
     { name = "ELSPETH_WEB__OIDC_AUDIENCE", value = aws_cognito_user_pool_client.web[0].id },
     { name = "ELSPETH_WEB__OIDC_CLIENT_ID", value = aws_cognito_user_pool_client.web[0].id },
@@ -501,6 +507,6 @@ locals {
   cw_agent_command            = "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; mkdir -p \"$CONFIG_DIR\"; printf '%s' \"$ELSPETH_CW_AGENT_CONFIG_JSON_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' \"$ELSPETH_CW_AGENT_OTEL_YAML_B64\" | base64 -d > \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\"; printf '%s\\n' \"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" | sha256sum -c -; printf '%s\\n' \"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\" | sha256sum -c -; \"$TRANSLATOR\" -mode auto -os linux -input \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\" -output \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\"; exec \"$AGENT\" -config \"/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml\" -otelconfig \"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml\""
 
   oidc_domain_prefix        = local.namespace
-  oidc_authorization_origin = var.scenario_id == "B" ? "https://${aws_cognito_user_pool_domain.web[0].domain}.auth.${var.aws_region}.amazoncognito.com" : ""
-  oidc_issuer               = var.scenario_id == "B" ? "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.web[0].id}" : ""
+  oidc_authorization_origin = local.deployment_mode == "upgrade" ? "https://${aws_cognito_user_pool_domain.web[0].domain}.auth.${var.aws_region}.amazoncognito.com" : ""
+  oidc_issuer               = local.deployment_mode == "upgrade" ? "https://cognito-idp.${var.aws_region}.amazonaws.com/${aws_cognito_user_pool.web[0].id}" : ""
 }

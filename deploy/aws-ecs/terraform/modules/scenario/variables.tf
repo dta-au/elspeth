@@ -16,6 +16,39 @@ variable "scenario_id" {
   }
 }
 
+# The two behavior axes. Scenario roots state both explicitly; the letter is
+# identity only (naming, CIDR allocation, evidence bindings) and no longer
+# infers either concern. See the integration design §"AWS Terraform Scenario C".
+variable "deployment_lifecycle" {
+  description = "Deployment lifecycle axis: \"first\" (cold install, local auth) or \"upgrade\" (in-place upgrade with rollback definitions and Cognito OIDC)."
+  type        = string
+
+  validation {
+    condition     = contains(["first", "upgrade"], var.deployment_lifecycle)
+    error_message = "deployment_lifecycle must be \"first\" or \"upgrade\"."
+  }
+
+  validation {
+    # Only maintained scenario triples may plan. A contradiction between the
+    # letter and the axes is an authoring error, not a preference conflict.
+    condition = (
+      (var.scenario_id == "A" && var.deployment_lifecycle == "first" && var.llm_backend == "bedrock") ||
+      (var.scenario_id == "B" && var.deployment_lifecycle == "upgrade" && var.llm_backend == "bedrock")
+    )
+    error_message = "scenario_id, deployment_lifecycle, and llm_backend must form a maintained triple: A = first + bedrock, B = upgrade + bedrock."
+  }
+}
+
+variable "llm_backend" {
+  description = "LLM backend axis: \"bedrock\" (direct Bedrock grants and model validation) or \"custom_gateway\" (loopback gateway sidecar; no Bedrock surface)."
+  type        = string
+
+  validation {
+    condition     = contains(["bedrock", "custom_gateway"], var.llm_backend)
+    error_message = "llm_backend must be \"bedrock\" or \"custom_gateway\"."
+  }
+}
+
 variable "candidate_sha" {
   type = string
 
@@ -239,10 +272,10 @@ variable "cognito_subject_sub" {
     # a user in it (two-phase bind — apply, create user, re-apply with the
     # sub). The acceptance inventory check separately refuses to run
     # against a pool with no bound subject.
-    condition = var.scenario_id == "A" ? var.cognito_subject_sub == "" : (
+    condition = var.deployment_lifecycle == "first" ? var.cognito_subject_sub == "" : (
       var.cognito_subject_sub == "" || can(regex("^[\\x20-\\x7e]{1,128}$", var.cognito_subject_sub))
     )
-    error_message = "cognito_subject_sub must be empty for Scenario A and, for Scenario B, either empty (pre-bind fresh apply) or a printable subject of at most 128 characters."
+    error_message = "cognito_subject_sub must be empty for a first (cold-install) deployment and, for an upgrade deployment, either empty (pre-bind fresh apply) or a printable subject of at most 128 characters."
   }
 }
 

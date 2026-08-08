@@ -305,7 +305,7 @@ locals {
     "aws.ecs.task.revision"  = tostring(aws_ecs_task_definition.candidate_web.revision)
   }
 
-  rollback_cloudwatch_dimension_map = var.scenario_id == "B" ? {
+  rollback_cloudwatch_dimension_map = local.deployment_mode == "upgrade" ? {
     "service.name"           = local.telemetry_service_name
     "deployment.environment" = "production"
     "service.version"        = var.rollback_baseline_sha
@@ -318,7 +318,7 @@ locals {
 
   cloudwatch_dimension_maps = concat(
     [local.candidate_cloudwatch_dimension_map],
-    var.scenario_id == "B" ? [local.rollback_cloudwatch_dimension_map] : [],
+    local.deployment_mode == "upgrade" ? [local.rollback_cloudwatch_dimension_map] : [],
   )
   cloudwatch_dimension_maps_by_id = {
     for index, dimension_map in local.cloudwatch_dimension_maps :
