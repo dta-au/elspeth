@@ -17,6 +17,7 @@ from elspeth_lints.rules.contract_invariants import (
 )
 from elspeth_lints.rules.immutability import FREEZE_GUARDS_RULE, FROZEN_ANNOTATIONS_RULE
 from elspeth_lints.rules.manifest import CONTRACT_MANIFEST_RULE, SYMBOL_INVENTORY_RULE, TEST_TO_SOURCE_MAPPING_RULE
+from elspeth_lints.rules.masquerade import RULE as MASQUERADE_ATTRIBUTE_PROBES_RULE
 from elspeth_lints.rules.meta_no_new_bespoke_cicd_enforcer import RULE as META_NO_NEW_BESPOKE_CICD_ENFORCER_RULE
 from elspeth_lints.rules.plugin_contract import COMPONENT_TYPE_RULE, OPTIONS_METADATA_RULE, PLUGIN_HASHES_RULE
 from elspeth_lints.rules.trust_boundary import (
@@ -28,6 +29,7 @@ from elspeth_lints.rules.trust_tier import TIER_MODEL_RULE
 
 BUILTIN_RULES = (
     META_NO_NEW_BESPOKE_CICD_ENFORCER_RULE,
+    MASQUERADE_ATTRIBUTE_PROBES_RULE,
     TIER_MODEL_RULE,
     OPTIONS_METADATA_RULE,
     COMPONENT_TYPE_RULE,
@@ -64,6 +66,7 @@ __all__ = [
     "FROZEN_ANNOTATIONS_RULE",
     "GUARD_SYMMETRY_RULE",
     "GVE_ATTRIBUTION_RULE",
+    "MASQUERADE_ATTRIBUTE_PROBES_RULE",
     "META_NO_NEW_BESPOKE_CICD_ENFORCER_RULE",
     "OPTIONS_METADATA_RULE",
     "PLUGIN_HASHES_RULE",

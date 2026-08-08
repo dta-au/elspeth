@@ -1,0 +1,50 @@
+# masquerade.attribute-probes baseline
+#
+# READ THIS BEFORE TRUSTING A GREEN GATE.
+#
+# This file adjudicates every getattr/hasattr/inspect.getattr_static/
+# __getattr__ site in src/elspeth, tests, scripts, and elspeth-lints/src
+# that is NOT covered by one of the gate's three permanent, structural
+# amnesties (a sentinel getattr on a @trust_boundary/@observation_boundary
+# source_param; assert [not] hasattr(...) in tests; a PEP 562 module
+# __getattr__ gated on a closed literal table). A site listed here is
+# TRACKED, not CLEARED.
+#
+# `classification: unadjudicated` means NOT YET REVIEWED. Most entries in
+# this file were seeded automatically from the corpus measured at gate
+# creation time (elspeth-b9ad1bbee3) and carry no human judgement about
+# whether the site is correct, defective, or should be rewritten. A
+# PASSING GATE MEANS "NOTHING NEW LANDED SINCE THE BASELINE WAS SEEDED" —
+# it does NOT mean "this corpus is clean". Only entries whose
+# classification is one of external-parse / approved-introspection /
+# reflection-owned-table / module-getattr / data-container-api, with a
+# real justification, have been reviewed.
+#
+# Identity is (path, qualname, kind) — no line numbers, so reformatting or
+# moving a site does not require re-adjudication, but renaming or
+# relocating it does (the old entry goes stale, a new one is required).
+# Multiple call sites of the same kind inside one function share one
+# entry, but the `occurrences` field on that entry is a REQUIRED,
+# EXACT-MATCH COUNT of current non-amnestied occurrences at that key —
+# not a one-time snapshot. Adding (or removing, or amnestying away) even
+# one probe at an already-baselined site changes the count and fires
+# occurrence-count-drift until the entry is updated. This is what stops
+# someone from adding a fourth getattr call to an already-adjudicated
+# high-traffic boundary (e.g. tool_batch.py::_admit_tool_batch) and having
+# the gate stay silently green.
+#
+# A baseline entry whose (path, qualname, kind) no longer exists AT ALL in
+# the tree is itself a gate failure (stale-baseline-entry) so this file
+# tracks reality and cannot silently rot as code moves out from under it.
+#
+# Governing document: docs/architecture/adr/032-validate-by-trust-domain.md
+
+entries:
+- path: src/elspeth/serialization.py
+  qualname: to_dict
+  kind: getattr
+  occurrences: 1
+  classification: reflection-owned-table
+  justification: Iterates dataclasses.fields(obj), the SAME type being serialized;
+    the class definition IS the table, so no externally controlled name can reach
+    this call.

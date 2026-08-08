@@ -1,0 +1,12 @@
+[
+  {
+    "column": 4,
+    "file_path": "src/elspeth/wrapper.py",
+    "fingerprint": "94684dca794ecd7a",
+    "line": 18,
+    "message": "dunder_getattr site at 'Wrapper.__getattr__' in src/elspeth/wrapper.py is not covered by a permanent amnesty and has no entry in config/cicd/masquerade_baseline.yaml. It has 1 current occurrence(s). Per ADR-032, classify it \u2014 external-parse (sentinel getattr + value asserts + owned type), approved-introspection, reflection-owned-table, module-getattr, or data-container-api \u2014 and add a baseline entry with occurrences: 1, or rewrite it to direct access / isinstance-against-a-concrete-owned-class if the shape is actually guaranteed.",
+    "rule_id": "masquerade.attribute-probes",
+    "severity": "error",
+    "suggestion": "Add an entry to config/cicd/masquerade_baseline.yaml with occurrences: 1, a real classification and justification, or rewrite the site."
+  }
+]

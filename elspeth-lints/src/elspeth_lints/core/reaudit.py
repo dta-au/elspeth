@@ -512,6 +512,14 @@ def _aggregate_cached_prompt_tokens(outcomes: Sequence[ReauditOutcome]) -> int |
 # * ``meta.no-new-bespoke-cicd-enforcer`` is a project-policy gate, not
 #   a code-pattern lint. It does not emit per-site findings with the
 #   key shape reaudit can dispatch against.
+# * ``masquerade.attribute-probes`` suppresses via its own per-site
+#   classification ledger (``config/cicd/masquerade_baseline.yaml``,
+#   loaded by ``elspeth_lints.rules.masquerade.baseline``), not the
+#   standard ``AllowlistEntry``/``load_allowlist`` shape this module
+#   re-judges. It has no sub-rule vocabulary (one rule id, ``getattr``/
+#   ``hasattr``/``getattr_static``/``dunder_getattr`` site kinds, not
+#   R-numbered sub-findings) and carries no judge-gated allow_hits for
+#   reaudit to re-verify.
 #
 # Adding a new rule package: ensure its YAML files use ``entries:`` (not
 # a private legacy format) and that ``Rule.analyze`` produces findings
@@ -522,6 +530,7 @@ _EXCLUDED_FROM_REAUDIT: frozenset[str] = frozenset(
     {
         "audit_evidence.nominal_base",
         "meta.no-new-bespoke-cicd-enforcer",
+        "masquerade.attribute-probes",
     }
 )
 
