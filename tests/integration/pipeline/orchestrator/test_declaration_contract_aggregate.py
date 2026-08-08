@@ -52,6 +52,8 @@ class _TwoContractViolatingTransform(BaseTransform):
     plugin_version = "1.0.0"
     source_file_hash: str | None = None
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     declared_output_fields = frozenset({"new_a", "new_b"})
     on_success = "default"
     on_error = "discard"

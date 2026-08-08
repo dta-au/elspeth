@@ -412,6 +412,45 @@ class BaseTransform(ABC):
     # cross-check; mis-annotation raises PassThroughContractViolation (TIER_1).
     passes_through_input: bool = False
 
+    # Field-forwarding declaration for the EXTRAS direction (elspeth-15c72686f2).
+    #
+    # `passes_through_input` is all-or-nothing: it demands that EVERY input
+    # field survive, so a transform that forwards the whole row except one
+    # column it consumed cannot declare it. That left a class of transforms —
+    # line_explode, json_explode, field_mapper(select_only=false),
+    # batch_outlier_annotator — invisible to the guarantee/emit walks, which
+    # then stopped at them and hid upstream fields from a locked (extra=forbid)
+    # downstream consumer. The pipeline built green on BOTH gates and every row
+    # died at the consumer's per-row input preflight.
+    #
+    # True means: every SUCCESS row this transform emits carries every field
+    # present on its input row, EXCEPT the names in `removed_input_fields`.
+    # It says nothing about which rows are emitted — batch_outlier_annotator
+    # declares True while dropping whole rows, which is why this is a separate
+    # declaration rather than a relaxation of `passes_through_input`.
+    #
+    # `removed_input_fields` is per-INSTANCE (it is computed from config —
+    # line_explode's `source_field`, field_mapper's rename sources), so
+    # declarers set it in `__init__`, not in the class body. It is a lower
+    # bound on what survives, so OVER-stating removals is safe (it shrinks the
+    # predicted set) and under-stating them is not. A transform that cannot
+    # name its removals at construction time — field_mapper mapping an
+    # unnormalized original header, resolved only against the runtime
+    # contract — must leave `forwards_input_fields` False rather than guess.
+    #
+    # Deliberately NOT defaulted to `passes_through_input`: those nodes already
+    # reach the extras check through `compose_propagation`, whose abstainer-skip
+    # treats a dynamic predecessor as no-vote. This walk unions upstream
+    # unconditionally, so defaulting would silently change the verdict for
+    # every pass-through behind a dynamic producer.
+    #
+    # Truth-tested by the ADR-009 probe harness
+    # (tests/invariants/test_pass_through_invariants.py), NOT by a runtime
+    # cross-check: generalizing PassThroughDeclarationContract over these
+    # plugins is a separate change with live-crash risk.
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
+
     # Empty-emission governance declaration (ADR-012).
     # True means the transform may intentionally emit zero rows on success.
     # False means empty success output is governance-significant for

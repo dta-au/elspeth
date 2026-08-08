@@ -261,6 +261,8 @@ def test_derive_rows_processed_aggregation_counts_source_rows_not_result() -> No
         output_schema = _TestSchema
         is_batch_aware = True
         passes_through_input = False
+        forwards_input_fields = False
+        removed_input_fields = frozenset()
         on_success = "output"
         on_error = "discard"
 
@@ -347,6 +349,8 @@ def test_derive_rows_processed_expand_counts_source_rows_not_children() -> None:
         output_schema = _TestSchema
         is_batch_aware = False
         passes_through_input = False
+        forwards_input_fields = False
+        removed_input_fields = frozenset()
         creates_tokens = True
         on_success = "output"
         on_error = "discard"

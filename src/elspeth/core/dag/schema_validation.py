@@ -21,6 +21,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
     EffectiveGuaranteeVote,
     ResolvedGuaranteeType,
+    get_definite_emitted_fields,
     get_effective_guaranteed_fields,
     get_required_fields,
     resolve_guaranteed_field_type,
@@ -536,7 +537,18 @@ def _validate_locked_consumer_guaranteed_extras(
     if consumer_schema.model_config["extra"] != "forbid":
         return
 
-    producer_guaranteed = get_effective_guaranteed_fields(graph, from_node_id)
+    # DEFINITE EMITS, not effective guarantees. The two agree everywhere except
+    # at a node declaring ``forwards_input_fields`` — a transform that forwards
+    # the whole row minus a named removal set but cannot claim
+    # ``passes_through_input`` (line_explode drops its ``source_field``,
+    # json_explode its ``array_field``, field_mapper its rename sources,
+    # batch_outlier_annotator drops whole ROWS). The presence walk stops at
+    # those nodes, which hid an upstream llm's ``<response_field>_usage`` /
+    # ``_model`` from this check: the graph built green on both gates and every
+    # row died at the locked consumer's per-row preflight
+    # (elspeth-15c72686f2). The walk is additive over the presence answer, so
+    # every rejection this function made before it still fires, unchanged.
+    producer_guaranteed = get_definite_emitted_fields(graph, from_node_id)
     extras = producer_guaranteed - frozenset(consumer_schema.model_fields)
     if not extras:
         return

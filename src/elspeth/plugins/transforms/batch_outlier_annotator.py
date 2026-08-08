@@ -145,7 +145,7 @@ class BatchOutlierAnnotator(BaseTransform):
     name = "batch_outlier_annotator"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:28b8b8345242dd43"
+    source_file_hash: str | None = "sha256:4274c3f811508c8f"
     config_model = BatchOutlierAnnotatorConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -209,6 +209,15 @@ class BatchOutlierAnnotator(BaseTransform):
         self._z_threshold = cfg.z_threshold
         self._robust_z_threshold = cfg.robust_z_threshold
         self.declared_output_fields = _annotation_fields(cfg.output_prefix)
+
+        # Every emitted row is `**entry.row.to_dict()` plus the annotations, so
+        # no input FIELD is ever dropped; what this transform drops is whole
+        # ROWS (missing or non-finite values are skipped), which is why
+        # `passes_through_input` stays False. The extras direction only asks
+        # what a surviving row carries, so it declares forwarding with an empty
+        # removal set (elspeth-15c72686f2).
+        self.forwards_input_fields = True
+        self.removed_input_fields = frozenset()
 
         base_required = set(cfg.schema_config.required_fields or ())
         base_required.add(cfg.value_field)

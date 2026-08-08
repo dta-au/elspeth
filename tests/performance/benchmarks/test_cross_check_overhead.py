@@ -244,6 +244,8 @@ def test_dispatcher_overhead_vs_direct_verify_pass_through(benchmark: pytest.Fix
         name = "bench_dispatcher"
         node_id = "bench_dispatcher_node"
         passes_through_input = True
+        forwards_input_fields = False
+        removed_input_fields = frozenset()
         can_drop_rows = False
         declared_output_fields = frozenset()
         declared_input_fields = frozenset()
@@ -466,6 +468,8 @@ def test_dispatcher_overhead_scales_with_registered_and_applicable_contracts(
         name = "bench_dispatcher_scaling"
         node_id = "bench_dispatcher_scaling_node"
         passes_through_input = True
+        forwards_input_fields = False
+        removed_input_fields = frozenset()
         can_drop_rows = False
         declared_output_fields = frozenset()
         declared_input_fields = frozenset()

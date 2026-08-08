@@ -42,6 +42,8 @@ class MockTransformWithSchemaConfig:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
         # Computed schema config with guaranteed and audit fields
@@ -66,6 +68,8 @@ class MockTransformWithoutSchemaConfig:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
     _output_schema_config: SchemaConfig | None = None
 
 
@@ -452,6 +456,8 @@ class MockAggregationTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self) -> None:
         self._output_schema_config = SchemaConfig(
@@ -1016,6 +1022,8 @@ class _ConfigurableTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self, name: str, guaranteed_fields: tuple[str, ...] | None) -> None:
         self.name = name

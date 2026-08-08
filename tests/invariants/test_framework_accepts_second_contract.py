@@ -83,6 +83,8 @@ def test_dispatcher_invokes_declared_output_fields_proof(proof_contract_register
         name = "CompliantDeclaredOutputFields"
         node_id = "dof-ok-1"
         passes_through_input = False
+        forwards_input_fields = False
+        removed_input_fields = frozenset()
         declared_output_fields = frozenset({"new_a", "new_b"})
         declared_input_fields = frozenset()
         is_batch_aware = False

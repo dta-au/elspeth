@@ -497,7 +497,21 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # projection reproduces every prior declared digest byte-exactly, so no other
 # projection material moved (each old digest asserted to be a single manifest
 # occurrence before the rewrite).
-EXPECTED_CASE_REGISTRY_SHA256 = "f906551fbc6f08238696cb566777f739c4aca90ae4879bc5477deaa0aede518e"
+# Rotated again 2026-08-08 for elspeth-15c72686f2 (the field-forwarding
+# declaration that closes the extras-firewall gap): the four declaring plugins
+# were edited, so PH3 refreshed their ``source_file_hash`` values, and exactly
+# one of them — json_explode — is pinned in the manifest. Exactly ONE token
+# moved (sha256:b1bcb40d6a2e5a02 -> sha256:18ea1830f04c3af8), asserted to be a
+# single occurrence before the rewrite; line_explode, field_mapper and
+# batch_outlier_annotator changed hash too but appear nowhere in the manifest
+# (each asserted absent). Verified mechanical by a field-by-field diff of the
+# live durable projection against the frozen expectation: the ONLY differing
+# field in the whole projection was that one token inside the
+# ``node|transform:explode_items`` audit material — rows, tokens, node_states,
+# expansions, sink_effects and every other record compared equal, so no audit
+# projection material moved. The declarations are build-time only and are read
+# by no runtime path, which is why nothing else could move.
+EXPECTED_CASE_REGISTRY_SHA256 = "031b13edb202e5a8c5341d57f99667c47e6eaac8a10c61200a37d7d303926923"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

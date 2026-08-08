@@ -217,6 +217,8 @@ class _HonestFilterTransform(BaseTransform):
     input_schema: type[PluginSchema] = _TestSchema
     output_schema: type[PluginSchema] = _TestSchema
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     can_drop_rows = True
 
     def __init__(self) -> None:

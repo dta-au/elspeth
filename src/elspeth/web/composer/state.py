@@ -14,7 +14,7 @@ from collections.abc import Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal, NotRequired, Self, TypedDict
+from typing import Any, Final, Literal, NamedTuple, NotRequired, Self, TypedDict
 
 from jinja2 import TemplateSyntaxError
 from pydantic import ValidationError as PydanticValidationError
@@ -79,6 +79,31 @@ _QUEUE_OPTION_KEYS: frozenset[str] = frozenset({"description"})
 # changes its default — the exact drift the normalisation is here to prevent.
 _COALESCE_RUNTIME_POLICY_DEFAULT: Final[str] = CoalesceSettings.model_fields["policy"].default
 _COALESCE_RUNTIME_MERGE_DEFAULT: Final[str] = CoalesceSettings.model_fields["merge"].default
+
+
+class _ProducerEmitProfile(NamedTuple):
+    """What a producer puts on its outgoing edge, for the EXTRAS direction.
+
+    Answer of ``_producer_emit_profile``; see that function for how each field
+    is derived and why the emit set differs from the producer's declared
+    guarantees.
+
+    ``emits`` are the fields this producer itself puts on the row.
+    ``propagates_upstream`` says the fields definitely arriving at its own
+    input survive onto that row too, and ``removes_upstream`` names the ones
+    that do not — a transform consuming a column it does not forward
+    (line_explode's ``source_field``, field_mapper's rename sources).
+    ``removes_upstream`` is meaningful only when ``propagates_upstream``;
+    a non-propagating profile carries the empty set.
+
+    Subtracting rather than folding the removal into ``emits`` is load-bearing:
+    the removal applies to names this node never sees at construction time, so
+    it can only be resolved against the upstream set at the union site.
+    """
+
+    emits: frozenset[str]
+    propagates_upstream: bool
+    removes_upstream: frozenset[str]
 
 
 def validate_composer_source_name(source_name: str) -> None:
@@ -3159,8 +3184,8 @@ def _check_schema_contracts(
     def _format_fields(fields: frozenset[str]) -> str:
         return ", ".join(sorted(fields)) if fields else "(none)"
 
-    def _producer_emit_profile(producer: ProducerEntry) -> tuple[frozenset[str], bool]:
-        """Return ``(predicted emit set, propagates upstream arrivals)``.
+    def _producer_emit_profile(producer: ProducerEntry) -> _ProducerEmitProfile:
+        """Return ``(predicted emit set, propagates upstream arrivals, removals)``.
 
         The emit set is distinct from ``_effective_producer_guarantees``: that
         one returns the producer's *declared* output set
@@ -3217,15 +3242,31 @@ def _check_schema_contracts(
         effective set, which also stops the declared-set fallback composing
         upstream fields through it and re-reporting the same defect one
         consumer downstream.
+
+        The THIRD element carries the second propagation regime
+        (elspeth-15c72686f2). ``passes_through_input`` is all-or-nothing, so a
+        transform that forwards the whole row except one column it consumed
+        cannot declare it — line_explode drops its ``source_field``,
+        json_explode its ``array_field``, field_mapper its rename sources, and
+        batch_outlier_annotator drops whole ROWS rather than fields. Those
+        nodes reported ``propagates_upstream=False``, which stopped this walk
+        at them and hid an upstream llm's ``<response_field>_usage`` /
+        ``_model`` from Rule A: the composition validated clean and every row
+        died at the locked sink's per-row preflight. ``forwards_input_fields``
+        is the weaker declaration those plugins CAN make, and
+        ``removed_input_fields`` names what it subtracts from the propagated
+        set. Same firewall gate as the pass-through arm, for the same reason:
+        behind ``extra='forbid'`` the arriving row dies at THIS node, so
+        nothing propagates past it.
         """
         if is_source_producer_id(producer.producer_id):
-            return _effective_producer_guarantees(producer), False
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
 
         if producer.producer_id not in node_by_id:
             # Sources have producer_id == "source" and are not members of the
             # locally-built node_by_id map; this is expected internal control
             # flow, not a missing-key anomaly, so fall back to the declared set.
-            return _effective_producer_guarantees(producer), False
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
         producer_node = node_by_id[producer.producer_id]
         if producer_node.node_type == "row_union":
             # The two directions have opposite safety polarities
@@ -3237,7 +3278,7 @@ def _check_schema_contracts(
             # participating row_union (elspeth-41bcaa882e) instead of abstaining
             # into the dedicated boundary path, this profile must answer with
             # the same arm-emit union that path computes.
-            return _row_union_definite_emits(producer_node, visited_connections=frozenset()), False
+            return _ProducerEmitProfile(_row_union_definite_emits(producer_node, visited_connections=frozenset()), False, frozenset())
         if producer_node.node_type == "coalesce":
             # Must precede the ``plugin is None`` fallback below: a coalesce has
             # no plugin, so ordering this after it would return the coalesce
@@ -3255,11 +3296,11 @@ def _check_schema_contracts(
             # consumer — the check this profile feeds Rule A/B.
             merged = _union_coalesce_merged_guarantees(producer)
             if merged is not None:
-                return merged, False
+                return _ProducerEmitProfile(merged, False, frozenset())
         if producer_node.plugin is None:
-            return _effective_producer_guarantees(producer), False
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
         if producer_node.node_type not in {"transform", "aggregation"}:
-            return _effective_producer_guarantees(producer), False
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
 
         try:
             from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -3271,32 +3312,40 @@ def _check_schema_contracts(
         except Exception as exc:
             if not _is_config_probe_exception(exc):
                 raise
-            return _effective_producer_guarantees(producer), False
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), False, frozenset())
 
         try:
             output_config = transform._output_schema_config
             passes_through = transform.passes_through_input
+            # The forwarding declaration is the weaker sibling of
+            # passes_through_input (elspeth-15c72686f2); a plugin that can make
+            # the stronger claim never needs this one, so the two are unioned
+            # rather than ordered, and `removes` is empty for a pass-through.
+            forwards = passes_through or transform.forwards_input_fields
+            removes = frozenset() if passes_through else transform.removed_input_fields
             if output_config is None:
-                return _effective_producer_guarantees(producer), passes_through
+                return _ProducerEmitProfile(_effective_producer_guarantees(producer), forwards, removes)
             extras_firewall = not output_config.allows_extra_fields
-            propagates = passes_through and not extras_firewall
+            propagates = forwards and not extras_firewall
             if output_config.guaranteed_fields is not None:
                 if extras_firewall and passes_through:
                     # ADDITIVE behind the firewall: the computed set names only
                     # what this plugin ADDS, so it must be unioned with the
                     # declared-required fields the transform forwards.
-                    return output_config.get_effective_guaranteed_fields(), False
+                    return _ProducerEmitProfile(output_config.get_effective_guaranteed_fields(), False, frozenset())
                 # The plugin computed its own emit set — authoritative, and the
-                # only set that stays correct for REDUCTIVE transforms.
-                return frozenset(output_config.guaranteed_fields), propagates
+                # only set that stays correct for REDUCTIVE transforms. For a
+                # forwarding plugin it names what this node ADDS (line_explode's
+                # output_field); the propagated upstream arrives on top of it.
+                return _ProducerEmitProfile(frozenset(output_config.guaranteed_fields), propagates, removes)
             if extras_firewall:
-                return output_config.get_effective_guaranteed_fields(), False
+                return _ProducerEmitProfile(output_config.get_effective_guaranteed_fields(), False, frozenset())
             # No computed emit set available — fall back to declared.
-            return _effective_producer_guarantees(producer), propagates
+            return _ProducerEmitProfile(_effective_producer_guarantees(producer), propagates, removes)
         finally:
             transform.close()
 
-    def _arm_emit_profile(producer: ProducerEntry) -> tuple[frozenset[str], bool]:
+    def _arm_emit_profile(producer: ProducerEntry) -> _ProducerEmitProfile:
         """Return one resolved row_union arm's predicted emit profile.
 
         Tier-3 parse boundary. At the Rule A/B call sites the producer's
@@ -3313,7 +3362,7 @@ def _check_schema_contracts(
         try:
             return _producer_emit_profile(producer)
         except ValueError:
-            return frozenset(), False
+            return _ProducerEmitProfile(frozenset(), False, frozenset())
 
     def _connection_definite_emits(
         connection_name: str,
@@ -3381,13 +3430,14 @@ def _check_schema_contracts(
             # extras rule to a queue producer is a drop-in branch here, left to
             # the track that owns queue contract semantics.
             return frozenset()
-        emit_set, propagates_upstream = _arm_emit_profile(producer)
+        emit_set, propagates_upstream, removes_upstream = _arm_emit_profile(producer)
         if not propagates_upstream:
             return emit_set
-        return emit_set | _connection_definite_emits(
+        upstream = _connection_definite_emits(
             producer_node.input,
             visited_connections=visited_connections | {connection_name},
         )
+        return emit_set | (upstream - removes_upstream)
 
     def _row_union_definite_emits(
         row_union_node: NodeSpec,
@@ -4005,13 +4055,16 @@ def _check_schema_contracts(
             # deterministically — any ValueError here would be a
             # non-determinism bug in our own code, not a fresh Tier-3 parse
             # fault, so it is left to crash rather than silently swallowed.
-            producer_emit, producer_propagates_upstream = _producer_emit_profile(actual_producer)
+            producer_emit, producer_propagates_upstream, producer_removes_upstream = _producer_emit_profile(actual_producer)
             if producer_propagates_upstream:
-                # The profile only reports pass-through for transforms it
+                # The profile only reports propagation for transforms it
                 # resolved through node_by_id, so this index cannot miss.
-                producer_emit |= _connection_definite_emits(
-                    node_by_id[actual_producer.producer_id].input,
-                    visited_connections=frozenset({node.input}),
+                producer_emit |= (
+                    _connection_definite_emits(
+                        node_by_id[actual_producer.producer_id].input,
+                        visited_connections=frozenset({node.input}),
+                    )
+                    - producer_removes_upstream
                 )
             extras_error = _locked_input_extras_error(
                 node,
@@ -4148,13 +4201,18 @@ def _check_schema_contracts(
                 # swallowed. Pass-through producers union in their own input's
                 # definite arrivals for the same reason as Rule A
                 # (elspeth-902fc354b2).
-                sink_producer_emit, sink_producer_propagates_upstream = _producer_emit_profile(actual_producer)
+                sink_producer_emit, sink_producer_propagates_upstream, sink_producer_removes_upstream = _producer_emit_profile(
+                    actual_producer
+                )
                 if sink_producer_propagates_upstream:
-                    # The profile only reports pass-through for transforms it
+                    # The profile only reports propagation for transforms it
                     # resolved through node_by_id, so this index cannot miss.
-                    sink_producer_emit |= _connection_definite_emits(
-                        node_by_id[actual_producer.producer_id].input,
-                        visited_connections=frozenset({output.name}),
+                    sink_producer_emit |= (
+                        _connection_definite_emits(
+                            node_by_id[actual_producer.producer_id].input,
+                            visited_connections=frozenset({output.name}),
+                        )
+                        - sink_producer_removes_upstream
                     )
                 sink_extras_error = _sink_locked_extras_error(
                     output,

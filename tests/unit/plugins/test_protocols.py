@@ -179,6 +179,8 @@ class TestTransformProtocol:
             requires_runtime_preflight = False  # Optional engine-time readiness check
             creates_tokens = False  # Deaggregation (multi-row output)
             passes_through_input = False  # ADR-007: pass-through contract flag
+            forwards_input_fields = False
+            removed_input_fields = frozenset()
             can_drop_rows = False  # ADR-012: empty-emission governance flag
             declared_input_fields: frozenset[str] = frozenset()
             declared_string_input_fields: frozenset[str] = frozenset()  # elspeth-b19dfe41fb string-scan surface

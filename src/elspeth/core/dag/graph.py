@@ -139,6 +139,8 @@ class ExecutionGraph:
         declared_input_fields: frozenset[str] = frozenset(),
         declared_string_input_fields: frozenset[str] = frozenset(),
         passes_through_input: bool = False,
+        forwards_input_fields: bool = False,
+        removed_input_fields: frozenset[str] = frozenset(),
     ) -> None:
         """Add a node to the execution graph.
 
@@ -187,6 +189,18 @@ class ExecutionGraph:
                 (ADR-007). Validator walk propagates predecessor guarantees
                 through nodes where this is True. Must be False for non-TRANSFORM
                 nodes; NodeInfo guards against misuse.
+            forwards_input_fields: For TRANSFORM/AGGREGATION nodes only — True
+                iff every SUCCESS row carries every input field EXCEPT
+                removed_input_fields. Weaker than passes_through_input, which
+                admits no removals and no dropped rows; read only by the
+                extras-direction walk_definite_emitted_fields
+                (elspeth-15c72686f2). No derivation from schema config when
+                omitted, for the same reason its declaration siblings above
+                cite: the removal set is computed from plugin options
+                (line_explode's source_field, field_mapper's rename sources)
+                that the `schema:` block never carries.
+            removed_input_fields: The names forwards_input_fields subtracts.
+                Meaningless without that flag; NodeInfo guards the pairing.
         """
         self._assert_build_metadata_mutable()
         resolved_config = config or {}
@@ -224,6 +238,8 @@ class ExecutionGraph:
             declared_input_fields=declared_input_fields,
             declared_string_input_fields=declared_string_input_fields,
             passes_through_input=passes_through_input,
+            forwards_input_fields=forwards_input_fields,
+            removed_input_fields=removed_input_fields,
         )
         self._graph.add_node(node_id, info=info)
 

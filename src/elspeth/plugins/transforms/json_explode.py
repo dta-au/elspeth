@@ -268,7 +268,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b1bcb40d6a2e5a02"
+    source_file_hash: str | None = "sha256:18ea1830f04c3af8"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -319,6 +319,13 @@ class JSONExplode(BaseTransform):
         self._array_field = cfg.array_field
         self._output_field = cfg.output_field
         self._include_index = cfg.include_index
+
+        # Sibling fields are duplicated onto every emitted element row (the
+        # plugin's own assistance text says so); only the consumed array field
+        # is dropped. Same extras-firewall gap line_explode carried
+        # (elspeth-15c72686f2).
+        self.forwards_input_fields = True
+        self.removed_input_fields = frozenset({cfg.array_field})
 
         # Declare output fields for centralized collision detection in TransformExecutor.
         fields = [cfg.output_field]

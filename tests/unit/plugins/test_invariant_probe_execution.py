@@ -64,6 +64,8 @@ class _PositionalOnlyInit(BaseTransform):
     input_schema = None
     output_schema = None
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
 
     def __init__(self, config: dict[str, Any], /) -> None:
         super().__init__(config)

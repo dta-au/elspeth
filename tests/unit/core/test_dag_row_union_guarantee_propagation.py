@@ -75,6 +75,8 @@ class _BranchTransform:
     declared_output_fields: frozenset[str] = frozenset()
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -106,6 +108,8 @@ class _RequiringTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self, required: tuple[str, ...], *, via: str = "required_input_fields") -> None:
         self.name = "union_consumer"

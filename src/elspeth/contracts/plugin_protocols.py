@@ -401,6 +401,14 @@ class TransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protoco
     # PassThroughContractViolation (TIER_1).
     passes_through_input: bool
 
+    # Field-forwarding declaration for the extras direction (elspeth-15c72686f2).
+    # When True, every SUCCESS row carries every field on its input row EXCEPT
+    # removed_input_fields. Weaker than passes_through_input in two ways it must
+    # stay weaker in: it tolerates a named removal set, and it says nothing
+    # about WHICH rows are emitted. Read only by walk_definite_emitted_fields.
+    forwards_input_fields: bool
+    removed_input_fields: frozenset[str]
+
     # ADR-012 empty-emission governance declaration.
     # True means the transform may intentionally emit zero rows on success.
     can_drop_rows: bool
@@ -610,6 +618,13 @@ class BatchTransformProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Pr
     # at runtime by TransformExecutor's cross-check (per-row in batch mode).
     # Mis-annotation raises PassThroughContractViolation (TIER_1).
     passes_through_input: bool
+
+    # Field-forwarding declaration for the extras direction (elspeth-15c72686f2).
+    # See TransformProtocol above for the contract; batch-aware declarers
+    # (batch_outlier_annotator) use it to say that a SURVIVING row keeps every
+    # input field even though whole rows may be dropped.
+    forwards_input_fields: bool
+    removed_input_fields: frozenset[str]
 
     # ADR-013 pre-emission declaration surface.
     declared_input_fields: frozenset[str]

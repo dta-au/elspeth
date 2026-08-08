@@ -319,6 +319,81 @@ def walk_effective_guaranteed_fields(
     return result.fields
 
 
+def walk_definite_emitted_fields(
+    graph: ExecutionGraph,
+    node_id: str,
+    cache: dict[str, frozenset[str]],
+) -> frozenset[str]:
+    """Return fields that DEFINITELY arrive on ``node_id``'s output rows.
+
+    The extras-direction counterpart to ``walk_effective_guaranteed_fields``,
+    and deliberately a separate walk rather than a widening of it — the two
+    ask questions with opposite safety polarities, the distinction
+    ``_connection_definite_emits`` (``web/composer/state.py``) already draws on
+    the composer side. The presence direction asks "is every required field
+    guaranteed?", and its consumers read a wider answer as PERMISSION: sink
+    required-fields clearance, ``check_compatibility``'s missing-arm
+    forgiveness (elspeth-7d68b04878), ``validate_forgiven_field_ancestor_types``.
+    Adding fields there would loosen a gate. The extras direction asks "does
+    any field arrive that a locked consumer forbids?", where a wider answer
+    only ever REJECTS more.
+
+    Result = the node's own effective guarantees UNION, for a node declaring
+    ``forwards_input_fields``, its predecessors' definite emits minus its
+    ``removed_input_fields``. Strictly ADDITIVE over the presence walk's
+    answer at the same node, so no graph rejected today stops being rejected
+    and no error message relocates — this can only close the gap
+    elspeth-15c72686f2 reports, never open a new one.
+
+    Fan-in UNIONS rather than intersects, for the reason
+    ``_connection_definite_emits`` documents: a field carried by ONE arm
+    definitely arrives on that arm's rows, and a locked consumer forbidding it
+    is a definite runtime rejection. That is the opposite of
+    ``merge_guaranteed_fields``' intersection, which is correct for the
+    presence question and wrong for this one.
+
+    DIVERT in-edges are excluded: a divert payload is an error envelope, not
+    the producer's declared row, so it vouches for nothing. This mirrors the
+    exclusion ``validate_typed_producer_guaranteed_extras`` applies at its loop
+    head rather than re-deriving it.
+
+    The result is a LOWER BOUND — a node that forwards but cannot name its
+    removals declares nothing and contributes only its own guarantees. That
+    makes it sound to raise an error ON this set but never sound to clear a
+    graph WITH it, the same asymmetry the composer's walk carries.
+    """
+    if node_id in cache:
+        return cache[node_id]
+
+    node_info = graph.get_node_info(node_id)
+    own_fields = walk_effective_guaranteed_fields(graph, node_id, {})
+
+    if not node_info.forwards_input_fields:
+        cache[node_id] = own_fields
+        return own_fields
+
+    # Seed the cache before recursing so a hand-built cyclic graph terminates
+    # with the node's own (forward-free) contribution rather than recursing
+    # forever. Built graphs are DAGs, so this is defensive only — the same
+    # posture resolve_guaranteed_field_type takes on its visited guard.
+    cache[node_id] = own_fields
+
+    forwarded: frozenset[str] = frozenset()
+    for from_id, _to_id, edge_data in graph._graph.in_edges(node_id, data=True):
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            continue
+        forwarded |= walk_definite_emitted_fields(graph, from_id, cache)
+
+    result = own_fields | (forwarded - node_info.removed_input_fields)
+    cache[node_id] = result
+    return result
+
+
+def get_definite_emitted_fields(graph: ExecutionGraph, node_id: str) -> frozenset[str]:
+    """Public entry point for ``walk_definite_emitted_fields`` with a fresh cache."""
+    return walk_definite_emitted_fields(graph, node_id, {})
+
+
 @dataclass(frozen=True, slots=True)
 class ResolvedGuaranteeType:
     """Nearest ancestor declaration for a guarantee-carried field.

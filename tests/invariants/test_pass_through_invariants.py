@@ -366,3 +366,98 @@ def test_non_pass_through_transforms_do_drop_fields(
             f"{_non_pass_through_cls.__name__}.backward_invariant_probe_rows() "
             "to return a shape that triggers the field-dropping code path."
         )
+
+
+def test_forwarding_transforms_remove_only_what_they_declare(
+    _non_pass_through_cls: type[BaseTransform],
+) -> None:
+    """Truth-test for the ``forwards_input_fields`` declaration (elspeth-15c72686f2).
+
+    ``forwards_input_fields`` is what a transform declares when it forwards the
+    whole row but cannot claim ``passes_through_input`` — because it consumes a
+    column (line_explode's ``source_field``, json_explode's ``array_field``,
+    field_mapper's rename sources) or because it drops whole ROWS
+    (batch_outlier_annotator). Unlike ``passes_through_input`` it has no runtime
+    cross-check, so without this test it would be a claim nothing verifies —
+    and it is a claim the build-time extras firewall REJECTS graphs on, so a
+    wrong one produces a false rejection of a working pipeline.
+
+    The assertion is per emitted row against the INTERSECTION of the probe's
+    input rows, not their union. The union is what the backward invariant above
+    uses, and it is wrong here: batch_outlier_annotator's probe deliberately
+    feeds one row that gets skipped entirely, and a field carried only by that
+    row legitimately never reaches the output. The intersection asks the
+    question the declaration actually makes — a field present on EVERY input
+    row survives onto every emitted row, minus the declared removals.
+
+    Over-declaring removals is safe (it shrinks the predicted emit set, so the
+    firewall rejects less), which is why this checks only the ``⊇`` direction.
+    Under-declaring is the failure this catches.
+    """
+    try:
+        transform = _probe_instantiate(_non_pass_through_cls)
+    except _UnprobeableTransform as exc:
+        pytest.skip(f"{_non_pass_through_cls.__name__}: {exc.reason}")
+
+    if not transform.forwards_input_fields:
+        pytest.skip(f"{_non_pass_through_cls.__name__} does not declare forwards_input_fields.")
+
+    removed = transform.removed_input_fields
+    probe_count = 0
+    asserted_count = 0
+    violations: list[str] = []
+
+    @given(probe=probe_row())
+    @settings(
+        max_examples=_SWEEP_EXAMPLES,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.function_scoped_fixture],
+    )
+    def _sweep(probe: PipelineRow) -> None:
+        nonlocal probe_count, asserted_count
+        probe_count += 1
+        probe_rows = transform.backward_invariant_probe_rows(probe)
+        result = transform.execute_backward_invariant_probe(probe_rows, _probe_context(transform))
+        if result.status != "success":
+            return
+        emitted_rows = _emitted_rows_from_result(result)
+        if not emitted_rows:
+            return
+        surviving = frozenset.intersection(*[_observed_fields(input_row) for input_row in probe_rows]) - removed
+        for emitted in emitted_rows:
+            asserted_count += 1
+            dropped = surviving - _observed_fields(emitted)
+            if dropped:
+                violations.append(
+                    f"emitted row dropped {sorted(dropped)!r} that no declared removal accounts for "
+                    f"(removed_input_fields={sorted(removed)!r})"
+                )
+                return
+
+    _sweep()
+
+    if probe_count < _SWEEP_MIN_PROBES:
+        pytest.fail(
+            f"{_non_pass_through_cls.__name__}: only {probe_count} probe rows "
+            f"exercised (expected >= {_SWEEP_MIN_PROBES}). Harness probe generation "
+            "is under-powered for this transform."
+        )
+
+    # An emptiness-graded check scores "every probe errored" as a pass. A
+    # declaring transform that never reached the assertion has not been
+    # verified at all, and the declaration would ship unchecked.
+    if asserted_count == 0:
+        pytest.fail(
+            f"{_non_pass_through_cls.__name__} declares forwards_input_fields=True but no "
+            f"probe produced a success emission in {probe_count} rows, so the declaration "
+            "was never checked. Override backward_invariant_probe_rows() to return a shape "
+            "the transform can actually process."
+        )
+
+    if violations:
+        pytest.fail(
+            f"{_non_pass_through_cls.__name__} declares forwards_input_fields=True but "
+            f"{violations[0]}. Either widen removed_input_fields to name the field, or drop "
+            "the forwards_input_fields declaration — the build-time extras firewall rejects "
+            "graphs on this claim, so an under-stated removal set predicts fields that never arrive."
+        )

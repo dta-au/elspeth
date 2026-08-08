@@ -405,6 +405,8 @@ def build_execution_graph(
             declared_input_fields=transform.declared_input_fields,
             declared_string_input_fields=transform.declared_string_input_fields,
             passes_through_input=transform.passes_through_input,
+            forwards_input_fields=transform.forwards_input_fields,
+            removed_input_fields=transform.removed_input_fields,
         )
 
     graph.set_transform_id_map(transform_ids_by_seq)
@@ -454,6 +456,8 @@ def build_execution_graph(
             output_schema=transform.output_schema,
             output_schema_config=agg_output_schema_config,
             passes_through_input=transform.passes_through_input,
+            forwards_input_fields=transform.forwards_input_fields,
+            removed_input_fields=transform.removed_input_fields,
         )
 
     graph.set_aggregation_id_map(aggregation_ids)

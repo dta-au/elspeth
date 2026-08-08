@@ -117,7 +117,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:291d9bc9cd2fe4c5"
+    source_file_hash: str | None = "sha256:efd187d449d5776f"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -167,6 +167,39 @@ class FieldMapper(BaseTransform):
         # mode, or a source that only resolves at runtime). Requiring any of them
         # on input is the elspeth-d6eeb3a71d trap, so all of them demote.
         self._self_created_input_fields = frozenset(target for source, target in cfg.mapping.items() if source != target)
+
+        # Field-forwarding declaration for the extras direction
+        # (elspeth-15c72686f2). Without select_only, process() deep-copies the
+        # whole input row and then renames within it, so every unmapped column
+        # survives onto the output — including an upstream llm's
+        # <response_field>_usage / _model, which a locked downstream consumer
+        # rejects per-row.
+        #
+        # A source is REMOVED only under the exact condition process() removes
+        # it: not select_only, no dot (a dotted source is a nested read that
+        # leaves its root field in place), and renamed to a different target.
+        # An unresolved original header ("First Name") removes a normalized
+        # name that only `contract.resolve_name` knows at runtime, so it cannot
+        # be named here — the whole declaration abstains rather than
+        # under-state the removal set, which is the only direction that could
+        # produce a FALSE build-time rejection of a working rename pipeline.
+        #
+        # Deliberately WITHOUT `_build_field_mapper_output_schema_config`'s
+        # `source in base_guaranteed` filter: that set is the node's own
+        # AUTHORED guarantees, whereas this rule is applied to fields proven
+        # present by the upstream walk, which the authored config never names.
+        self.forwards_input_fields = not cfg.select_only and not any(
+            source != target and self._is_unresolved_original_source(source) for source, target in cfg.mapping.items()
+        )
+        # Empty unless forwarding: a removal set is a subtraction from what this
+        # node forwards, so carrying one while forwarding nothing describes
+        # nothing. NodeInfo rejects the pairing at graph construction rather
+        # than letting it sit unread.
+        self.removed_input_fields = (
+            frozenset(source for source, target in cfg.mapping.items() if source != target and self._is_static_normalized_source(source))
+            if self.forwards_input_fields
+            else frozenset()
+        )
 
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,

@@ -128,6 +128,8 @@ class _UncalledBatchTransform:
         self.supports_row_mode_when_batch_aware = False
         self.creates_tokens = False
         self.passes_through_input = False
+        self.forwards_input_fields = False
+        self.removed_input_fields: frozenset[str] = frozenset()
         self.can_drop_rows = False
         self.declared_output_fields = frozenset()
         self.declared_input_fields = frozenset()

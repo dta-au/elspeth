@@ -265,6 +265,20 @@ class NodeInfo:
     # nodes; non-False value on any non-TRANSFORM node raises GraphValidationError.
     passes_through_input: bool = False
 
+    # Field-forwarding declaration for the EXTRAS direction (elspeth-15c72686f2).
+    # Populated for TRANSFORM and AGGREGATION nodes by the builder from
+    # TransformProtocol.forwards_input_fields / removed_input_fields. Consumed
+    # ONLY by walk_definite_emitted_fields, the extras-direction walk — never by
+    # the presence-direction walk_effective_guarantee_vote, whose callers read a
+    # wider guarantee set as PERMISSION (missing-arm forgiveness, sink required
+    # fields) rather than as grounds to reject.
+    #
+    # Scoped like passes_through_input (TRANSFORM+AGGREGATION) rather than like
+    # declared_output_fields (TRANSFORM-only): batch_outlier_annotator is wired
+    # under `aggregations:` in YAML and is one of the four declarers.
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = field(default_factory=frozenset)
+
     def __post_init__(self) -> None:
         component_type = self.node_type.name.lower()
         component_id = self.node_id or None
@@ -365,6 +379,30 @@ class NodeInfo:
             raise GraphValidationError(
                 f"NodeInfo.passes_through_input is only meaningful for TRANSFORM or "
                 f"AGGREGATION nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # Offensive programming: the forwarding declaration shares
+        # passes_through_input's scope and rationale above — it too describes a
+        # node executing a TransformProtocol plugin. Checking removed_input_fields
+        # independently rather than only behind the flag catches a stray removal
+        # set left on a node that forwards nothing, which would otherwise sit
+        # unread until a future validator widened its scope.
+        if (self.forwards_input_fields or self.removed_input_fields) and self.node_type not in (NodeType.TRANSFORM, NodeType.AGGREGATION):
+            raise GraphValidationError(
+                f"NodeInfo.forwards_input_fields/removed_input_fields are only meaningful for "
+                f"TRANSFORM or AGGREGATION nodes; node {self.node_id!r} has type {self.node_type.name}.",
+                component_id=self.node_id,
+                component_type=component_type,
+            )
+        # A removal set names fields subtracted from what this node FORWARDS, so
+        # it is meaningless — and silently misleading — without the flag that
+        # turns forwarding on.
+        if self.removed_input_fields and not self.forwards_input_fields:
+            raise GraphValidationError(
+                f"NodeInfo.removed_input_fields on node {self.node_id!r} requires "
+                f"forwards_input_fields=True; got removed_input_fields="
+                f"{sorted(self.removed_input_fields)!r} with the flag unset.",
                 component_id=self.node_id,
                 component_type=component_type,
             )

@@ -74,6 +74,8 @@ class _FakeTransform:
     name = "Fake"
     node_id = "n-1"
     passes_through_input = True
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     can_drop_rows = False
     declared_input_fields = frozenset()
     is_batch_aware = False

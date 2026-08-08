@@ -2733,6 +2733,8 @@ class TestForkRecoveryInvariant:
             output_schema = _TestSchema
             is_batch_aware = True
             passes_through_input = False
+            forwards_input_fields = False
+            removed_input_fields = frozenset()
             on_success = "output"
             on_error = "discard"
 

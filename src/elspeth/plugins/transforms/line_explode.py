@@ -296,7 +296,7 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b229c212e97ec3c4"
+    source_file_hash: str | None = "sha256:b2ee0a335a2edfb1"
     config_model = LineExplodeConfig
     usage_when_to_use: str = (
         "Use to split one newline-framed text field into rows while preserving the rest of the input "
@@ -338,6 +338,15 @@ class LineExplode(BaseTransform):
         self._include_index = cfg.include_index
         self._index_field = cfg.index_field
         self._max_lines = cfg.max_lines
+
+        # process() copies the whole input row minus the consumed source field
+        # onto every emitted line, so the row's other columns — including an
+        # upstream llm's <response_field>_usage / _model — really do reach the
+        # next consumer. `passes_through_input` cannot say that (source_field
+        # is dropped), which is what hid those columns from the extras firewall
+        # (elspeth-15c72686f2).
+        self.forwards_input_fields = True
+        self.removed_input_fields = frozenset({cfg.source_field})
 
         fields = [cfg.output_field]
         if cfg.include_index:

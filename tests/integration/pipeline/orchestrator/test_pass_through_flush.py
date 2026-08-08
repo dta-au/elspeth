@@ -81,6 +81,8 @@ class _MisannotatedBatchDropper(BaseTransform):
     output_schema = _TestSchema
     is_batch_aware = True
     passes_through_input = True  # LIE — process() drops 'to_drop' field.
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     # on_success/on_error must be set at instance level — orchestrator's
     # validate_transform_error_sinks treats None as a Tier-1 invariant
     # violation (TransformSettings always requires on_error in production).
@@ -128,6 +130,8 @@ class _HonestBatchPreserver(BaseTransform):
     output_schema = _TestSchema
     is_batch_aware = True
     passes_through_input = True  # Honest annotation.
+    forwards_input_fields = False
+    removed_input_fields = frozenset()
     on_success = "output"
     on_error = "discard"
 

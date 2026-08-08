@@ -1040,6 +1040,8 @@ class _TransformWithTypedSchema:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = False
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self, name: str, schema: SchemaConfig) -> None:
         self.name = name
@@ -2550,6 +2552,8 @@ class _PassThroughBranchTransform:
     declared_input_fields: frozenset[str] = frozenset()
     declared_string_input_fields: frozenset[str] = frozenset()
     passes_through_input: bool = True
+    forwards_input_fields: bool = False
+    removed_input_fields: frozenset[str] = frozenset()
 
     def __init__(self, name: str, added_field: str) -> None:
         self.name = name

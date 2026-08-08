@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -24,8 +24,8 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
     route_destination_facts,
 )
-from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 from elspeth.web.composer.yaml_generator import generate_yaml
+from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
 
 class TestSourceSpec:
@@ -7468,6 +7468,8 @@ class TestPassThroughComposerParity:
         class _StubPassThrough:
             name = "passthrough"
             passes_through_input = True
+            forwards_input_fields = False
+            removed_input_fields = frozenset()
             is_batch_aware = False  # Required by _known_batch_aware_transform_plugins()
 
         class _StubPluginManager(DelegatingPluginManagerDouble):
@@ -10427,3 +10429,175 @@ class TestExtrasFirewallDirection:
         result = self._state().validate()
 
         assert [error.component for error in result.errors if error.error_code == "schema_contract_violation"] == []
+
+
+class TestForwardingTransformExtrasReachTheLockedSink:
+    """Composer half of elspeth-15c72686f2 — the surface the defect was reported on.
+
+    The battery observed this through ``/api/sessions/{id}/validate`` and the
+    persisted composition state, BOTH reporting ``is_valid: true`` with zero
+    errors, so a DAG-only fix would have left the reporting surface green. The
+    truncation was ``_producer_emit_profile`` answering
+    ``propagates_upstream=False`` for a transform that forwards the whole row
+    minus the column it consumed — it can never declare ``passes_through_input``,
+    so the walk stopped and the upstream llm's ``_usage`` / ``_model`` never
+    reached Rule B.
+    """
+
+    _LLM_SOURCE_OPTIONS: ClassVar[dict[str, Any]] = {
+        "provider": "openrouter",
+        "model": "openai/gpt-4o-mini",
+        "api_key": "test-api-key",
+        "prompt_template": "Write an announcement.",
+        "response_field": "announcement",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+
+    def _explode(self, input_connection: str) -> NodeSpec:
+        return NodeSpec(
+            id="exploded",
+            node_type="transform",
+            plugin="line_explode",
+            input=input_connection,
+            on_success="sentence_rows",
+            on_error="discard",
+            options={
+                "source_field": "announcement",
+                "output_field": "sentence",
+                "include_index": False,
+                "schema": {"mode": "observed"},
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _locked_sink(self, fields: list[str]) -> OutputSpec:
+        return OutputSpec(
+            name="sentence_rows",
+            plugin="text",
+            options={
+                "path": "outputs/announcement_sentences.txt",
+                "field": "sentence",
+                "schema": {"mode": "fixed", "fields": fields},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            on_write_failure="discard",
+        )
+
+    def _llm_source_state(self, sink: OutputSpec) -> CompositionState:
+        return CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                options=dict(self._LLM_SOURCE_OPTIONS),
+                on_success="brief",
+                on_validation_failure="discard",
+            ),
+            nodes=(self._explode("brief"),),
+            edges=(),
+            outputs=(sink,),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_llm_source_metadata_reaches_the_locked_sink_through_line_explode(self) -> None:
+        """The literal g11-s2 graph, on the gate that reported it clean."""
+        result = self._llm_source_state(self._locked_sink(["sentence: str"])).validate()
+
+        assert not result.is_valid
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "exploded"
+        assert detail.extra_fields == ("announcement_model", "announcement_usage")
+
+    def test_consumed_source_field_is_not_named_as_an_extra(self) -> None:
+        """``announcement`` is what line_explode CONSUMES, so it never arrives.
+
+        Naming it would send the authoring loop after a field the transform
+        already removed — the removal set exists to prevent exactly that.
+        """
+        result = self._llm_source_state(self._locked_sink(["sentence: str"])).validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.contract is not None
+        assert "announcement" not in entry.contract.extra_fields
+
+    def test_llm_transform_upstream_reaches_the_same_dead_end(self) -> None:
+        """Shape B: the defect never needed ``source:llm`` to be authorable.
+
+        The ticket argued no earlier battery round could have found this because
+        ``source:llm`` was outside the plugin allowlist. An llm TRANSFORM in
+        front of the same exploder — the far commoner authored shape — was
+        always reachable and equally green.
+        """
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options={
+                    "path": "data/in.csv",
+                    "schema": {"mode": "fixed", "fields": ["topic: str"]},
+                    "on_validation_failure": "discard",
+                },
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="writer",
+                    node_type="transform",
+                    plugin="llm",
+                    input="rows",
+                    on_success="written",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "test-api-key",
+                        "prompt_template": "Write an announcement about {{ row.topic }}.",
+                        "response_field": "announcement",
+                        "required_input_fields": ["topic"],
+                        "schema": {"mode": "observed"},
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                self._explode("written"),
+            ),
+            edges=(),
+            outputs=(self._locked_sink(["sentence: str"]),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.contract is not None
+        # The csv column rides through BOTH hops, so the walk composes across
+        # the pass-through llm and the forwarding exploder rather than stopping
+        # at the nearest producer.
+        assert entry.contract.extra_fields == ("announcement_model", "announcement_usage", "topic")
+
+    def test_sink_declaring_the_metadata_optional_is_clean(self) -> None:
+        """Rejection is on ARRIVAL, not on having an llm upstream.
+
+        The sink stays locked (``mode: fixed``); declaring the metadata
+        OPTIONAL admits it without requiring line_explode to guarantee it. Two
+        of the three g11 samples authored a tolerant sink and ran correctly —
+        those must keep validating.
+        """
+        result = self._llm_source_state(
+            self._locked_sink(["sentence: str", "announcement_usage: any?", "announcement_model: str?"])
+        ).validate()
+
+        assert [error.error_code for error in result.errors if error.error_code == "sink_locked_extras"] == []
