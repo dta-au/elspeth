@@ -1100,6 +1100,69 @@ def test_send_message_auto_commit_settles_exact_pipeline_intent(tmp_path, monkey
     assert assistant.composition_state_id == settled[0].committed_state_id
 
 
+def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_settlement(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A downgrade landing after staging but before settlement blocks auto-commit.
+
+    Regression for the commit-boundary half of elspeth-01d4c6e683: the
+    staging-time preference re-read left a window between intent minting and
+    route settlement. The downgrade here lands during compose (after the
+    staging re-read a real planner would perform), so the route's settlement
+    must observe it inside the settlement transaction and fall back to the
+    review path instead of committing.
+    """
+    from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+
+    app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
+        _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-auto-revoked-pipeline")
+    )
+    assert row.pipeline_metadata is not None
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews, return_value=None
+    )
+
+    async def _compose_then_downgrade(*_args, **_kwargs) -> ComposerResult:
+        # The user's downgrade becomes durable while the compose turn is
+        # still in flight — after intent minting, before settlement.
+        await service.update_composer_preferences(
+            session_id,
+            trust_mode="explicit_approve",
+            density_default="high",
+            actor="user:alice",
+        )
+        assert row.pipeline_metadata is not None
+        return ComposerResult(
+            message="Pipeline prepared.",
+            state=_EMPTY_STATE,
+            repair_turns_used=2,
+            pipeline_commit_intent=PipelineCommitIntent(
+                proposal_id=row.id,
+                draft_hash=row.pipeline_metadata.draft_hash,
+            ),
+        )
+
+    composer.compose = AsyncMock(spec=ComposerService.compose, side_effect=_compose_then_downgrade)
+    app.state.composer_service = composer
+    client = TestClient(app)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/messages",
+        json={"content": "Build the pipeline."},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] is None
+    assert len(body["proposals"]) == 1
+    assert body["proposals"][0]["id"] == str(row.id)
+    assert body["proposals"][0]["status"] == "pending"
+    assert body["message"]["content"] == PIPELINE_STAGED_REVIEW_MESSAGE
+    assert asyncio.run(service.get_current_state(session_id)) is None
+    pending = asyncio.run(service.list_composition_proposals(session_id))
+    assert len(pending) == 1
+    assert pending[0].status == "pending"
+
+
 def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     app, service, _pipeline, session_id, row, _endpoint = asyncio.run(
         _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-explicit-pipeline")

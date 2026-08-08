@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace as _replace_dataclass
+
+from elspeth.web.composer.protocol import PIPELINE_STAGED_REVIEW_MESSAGE
+
 from .._helpers import (
     _COMPOSER_REQUESTS_INFLIGHT,
     UUID,
@@ -65,7 +69,7 @@ from .._helpers import (
     slog,
     validation_errors_for_composer_surface,
 )
-from .pipeline_settlement import settle_pipeline_proposal_under_compose_lock
+from .pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
 
 router = APIRouter()
 
@@ -436,17 +440,14 @@ async def recompose(
             state_response: CompositionStateResponse | None = None
             post_compose_state_id: UUID | None = pre_send_state_id
             assistant_msg: ChatMessageRecord | None = None
+            route_settlement: PipelineRouteSettlement | None = None
             if result.pipeline_commit_intent is not None:
-                authority = await service.get_authoritative_pipeline_proposal(
-                    session_id=session.id,
-                    proposal_id=result.pipeline_commit_intent.proposal_id,
-                    reviewed_facts={},
-                )
-                route_settlement = await settle_pipeline_proposal_under_compose_lock(
+                settlement_outcome = await settle_auto_commit_intent(
                     request=request,
                     user=user,
-                    authority=authority,
-                    draft_hash=result.pipeline_commit_intent.draft_hash,
+                    service=service,
+                    session_id=session.id,
+                    intent=result.pipeline_commit_intent,
                     composer_meta=_post_compose_meta,
                     telemetry_source="recompose",
                     transition_assistant=TransitionAssistantDraft(
@@ -456,6 +457,19 @@ async def recompose(
                     if _guided_terminal_for_compose is not None
                     else None,
                 )
+                if type(settlement_outcome) is PipelineRouteSettlement:
+                    route_settlement = settlement_outcome
+                else:
+                    # Auto-commit authority was durably revoked before the
+                    # settlement transaction (elspeth-01d4c6e683): the
+                    # proposal stays pending, so this turn becomes an
+                    # ordinary review-path response.
+                    result = _replace_dataclass(
+                        result,
+                        message=PIPELINE_STAGED_REVIEW_MESSAGE,
+                        pipeline_commit_intent=None,
+                    )
+            if route_settlement is not None:
                 state_response = _state_response(
                     route_settlement.settlement.state,
                     live_validation=route_settlement.validation,

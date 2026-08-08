@@ -52,7 +52,12 @@ from elspeth.web.sessions.models import (
     proposal_events_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError, TransitionAssistantDraft
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    StaleComposeStateError,
+    TransitionAssistantDraft,
+    TrustModeAutoCommitRevokedError,
+)
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -417,6 +422,100 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
     }
     assert terminal["schema"] == "pipeline_proposal_accepted.v1"
     assert terminal["dispatch"] == binding.to_dict()
+
+
+@pytest.mark.asyncio
+async def test_settlement_required_trust_mode_fails_closed_when_revoked(service: SessionServiceImpl) -> None:
+    """A trust-mode downgrade durable before settlement blocks auto-commit.
+
+    Regression for the commit-boundary half of elspeth-01d4c6e683: the
+    staging-time re-read narrowed the TOCTOU window but the minted
+    ``PipelineCommitIntent`` still executed later with no trust check at
+    the commit boundary. ``required_trust_mode`` re-verifies the session's
+    trust mode INSIDE the settlement write transaction — the same
+    per-session write lock ``update_composer_preferences`` serialises on —
+    so a durable downgrade always lands the proposal on the review path.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)  # trust_mode="explicit_approve"
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    with pytest.raises(TrustModeAutoCommitRevokedError):
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+
+    # The settlement transaction rolled back atomically: no published
+    # state, no terminal event, proposal still pending for review.
+    with service._engine.connect() as conn:
+        assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+        assert (
+            conn.execute(
+                select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.accepted")
+            ).scalar_one()
+            == 0
+        )
+
+    # Manual review approval (no trust requirement) of the same proposal
+    # still succeeds — explicit approval is valid in either trust mode.
+    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_settlement_required_trust_mode_commits_when_authority_holds(service: SessionServiceImpl) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:alice",
+    )
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+
+    settled = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert settled.proposal.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_settlement_exact_retry_ignores_trust_mode_downgrade(service: SessionServiceImpl) -> None:
+    """A downgrade AFTER the commit is durable must not block the exact retry.
+
+    The trust check guards only the pending->committed transition; the
+    committed-replay branch returns the already-durable result so a client
+    retrying a crashed response is not stranded by a later downgrade.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="auto_commit",
+        density_default="high",
+        actor="user:alice",
+    )
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
+    settled = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert settled.proposal.status == "committed"
+
+    await service.update_composer_preferences(
+        session_id,
+        trust_mode="explicit_approve",
+        density_default="high",
+        actor="user:alice",
+    )
+
+    retried = await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    assert retried.proposal.status == "committed"
+    assert retried.state.id == settled.state.id
 
 
 @pytest.mark.asyncio

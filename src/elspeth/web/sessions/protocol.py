@@ -2339,6 +2339,32 @@ class StaleComposeStateError(RuntimeError):
     """
 
 
+class TrustModeAutoCommitRevokedError(RuntimeError):
+    """Auto-commit authority was revoked before pipeline settlement.
+
+    Raised by ``SessionServiceProtocol.settle_pipeline_composition_proposal``
+    when the caller passed ``required_trust_mode`` and the session's durable
+    trust mode no longer matches at the moment of the pending->committed
+    transition. The check runs INSIDE the settlement write transaction,
+    under the same per-session write lock ``update_composer_preferences``
+    serialises on, so a preference downgrade is either visible here (and
+    the proposal lands on the review path) or became durable only after
+    the commit (and legitimately governs future turns) — there is no
+    interleaving in between (elspeth-01d4c6e683, commit-boundary half).
+
+    Not an integrity failure: the proposal remains pending and reviewable;
+    callers translate this into the ordinary review-path response.
+    """
+
+    def __init__(self, session_id: str, *, required: str, current: str) -> None:
+        self.session_id = session_id
+        self.required = required
+        self.current = current
+        super().__init__(
+            f"Session {session_id} trust mode is {current!r}; settlement required {required!r} — auto-commit authority revoked"
+        )
+
+
 class InterpretationResolveError(ValueError):
     """Base class for expected interpretation-resolution failures."""
 
@@ -2718,6 +2744,7 @@ class SessionServiceProtocol(Protocol):
         dispatch: PipelineDispatchAuditBinding,
         actor: str,
         transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
     ) -> PipelineProposalSettlementResult: ...
 
     async def get_pipeline_dispatch_recovery(

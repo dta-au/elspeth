@@ -228,6 +228,7 @@ from elspeth.web.sessions.protocol import (
     ToolCallIDMismatchError,
     TransitionAssistantDraft,
     TransitionResponseSettlement,
+    TrustModeAutoCommitRevokedError,
 )
 from elspeth.web.sessions.protocol import (
     InterpretationResolveError as InterpretationResolveError,
@@ -5834,6 +5835,18 @@ class SessionServiceImpl:
         ``prior.trust_mode`` from this return value are guaranteed to
         find the same value in the audit row, satisfying the
         audit-primacy superset rule.
+
+        Deliberately NOT serialised on the route-level compose lock: that
+        lock is held across entire compose turns (unbounded provider
+        calls), so a PATCH taking it would block until the turn finished
+        and a mid-plan downgrade could never beat the auto-commit. The
+        ordering authority against auto-commit is instead the per-session
+        write lock this transaction already holds:
+        ``settle_pipeline_composition_proposal`` re-reads ``trust_mode``
+        under the same lock at the commit boundary
+        (``required_trust_mode``, elspeth-01d4c6e683), so a downgrade is
+        either durable before settlement (and blocks it) or lands after
+        the commit.
         """
         now = self._now()
         sid = str(session_id)
@@ -6230,8 +6243,21 @@ class SessionServiceImpl:
         dispatch: PipelineDispatchAuditBinding,
         actor: str,
         transition_assistant: TransitionAssistantDraft | None = None,
+        required_trust_mode: ComposerTrustMode | None = None,
     ) -> PipelineProposalSettlementResult:
-        """Atomically publish state and settle a verified pipeline proposal."""
+        """Atomically publish state and settle a verified pipeline proposal.
+
+        ``required_trust_mode`` is the commit-boundary trust check
+        (elspeth-01d4c6e683): auto-commit callers pass ``"auto_commit"``
+        and the session's trust mode is re-read inside this write
+        transaction — under the same per-session write lock
+        ``update_composer_preferences`` serialises on — raising
+        ``TrustModeAutoCommitRevokedError`` on mismatch. Only the
+        pending->committed transition is guarded; the committed-replay
+        branch returns the already-durable result regardless, so exact
+        retries are never stranded by a later downgrade. Manual review
+        approval passes ``None``.
+        """
         if type(dispatch) is not PipelineDispatchAuditBinding:
             raise TypeError("dispatch must be an exact PipelineDispatchAuditBinding")
         state_content_hash = _composition_state_data_content_hash(state)
@@ -6364,6 +6390,19 @@ class SessionServiceImpl:
                     raise ValueError(f"Proposal {pid} must be pending to commit; got {authority.row.status!r}")
                 if terminal_rows:
                     raise AuditIntegrityError("pending pipeline proposal already has a terminal event")
+                if required_trust_mode is not None:
+                    # Commit-boundary trust re-verification: this SELECT runs
+                    # inside the same locked transaction as the settlement
+                    # writes, so a preference PATCH is either durable before
+                    # it (mismatch -> abort to the review path) or lands only
+                    # after this transaction commits.
+                    current_trust_mode = conn.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == sid)).scalar_one()
+                    if current_trust_mode != required_trust_mode:
+                        raise TrustModeAutoCommitRevokedError(
+                            sid,
+                            required=required_trust_mode,
+                            current=current_trust_mode,
+                        )
 
                 current_row = conn.execute(
                     select(composition_states_table)

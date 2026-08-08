@@ -131,10 +131,18 @@ def test_reachable_surfaces_share_one_planner_implementation_boundary() -> None:
 def test_reachable_surfaces_share_one_lock_assuming_commit_boundary() -> None:
     compose_tree = _module_tree("src/elspeth/web/sessions/routes/composer/compose.py")
     guided_tree = _module_tree("src/elspeth/web/sessions/routes/composer/guided.py")
+    settlement_tree = _module_tree("src/elspeth/web/sessions/routes/composer/pipeline_settlement.py")
     freeform_route = _named_scope(compose_tree, "recompose")
     guided_route = _named_scope(guided_tree, "post_guided_respond")
+    auto_commit_adapter = _named_scope(settlement_tree, "settle_auto_commit_intent")
 
-    assert _call_count(freeform_route, "settle_pipeline_proposal_under_compose_lock") == 1
+    # Freeform auto-commit reaches the one shared settlement coordinator
+    # through the trust-checking adapter (elspeth-01d4c6e683): the route
+    # calls the adapter exactly once, and the adapter contains exactly one
+    # call to settle_pipeline_proposal_under_compose_lock.
+    assert _call_count(freeform_route, "settle_auto_commit_intent") == 1
+    assert _call_count(freeform_route, "settle_pipeline_proposal_under_compose_lock") == 0
+    assert _call_count(auto_commit_adapter, "settle_pipeline_proposal_under_compose_lock") == 1
     assert _call_count(guided_route, "prepare_pipeline_proposal_commit") == 1
     assert _call_count(guided_route, "accept_guided_pipeline_proposal") == 1
 

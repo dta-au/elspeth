@@ -140,6 +140,8 @@ from elspeth.web.composer.prompts import build_messages, build_run_diagnostics_m
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
+    PIPELINE_STAGED_AUTO_COMMIT_MESSAGE,
+    PIPELINE_STAGED_REVIEW_MESSAGE,
     ComposerConvergenceError,
     ComposerHistoryMessage,
     ComposerPluginCrashError,
@@ -3601,11 +3603,7 @@ class ComposerServiceImpl:
                 )
             raise deferred
         intent = PipelineCommitIntent(proposal_id=row.id, draft_hash=plan.proposal.draft_hash) if auto_commit_authorized else None
-        message = (
-            "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
-            if intent is not None
-            else "I prepared and validated the requested pipeline for your review."
-        )
+        message = PIPELINE_STAGED_AUTO_COMMIT_MESSAGE if intent is not None else PIPELINE_STAGED_REVIEW_MESSAGE
         return ComposerResult(
             message=message,
             state=state,

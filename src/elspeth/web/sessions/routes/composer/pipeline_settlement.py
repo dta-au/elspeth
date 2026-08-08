@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from typing import Literal
+from uuid import UUID
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
@@ -19,13 +20,16 @@ from elspeth.web.composer.pipeline_commit import (
     prepare_pipeline_proposal_commit,
 )
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.protocol import PipelineCommitIntent
 from elspeth.web.composer.state import ValidationSummary
 from elspeth.web.sessions.protocol import (
     AuthoritativePipelineProposal,
+    ComposerTrustMode,
     CompositionProposalRecord,
     PipelineProposalRejectionReason,
     PipelineProposalSettlementResult,
     TransitionAssistantDraft,
+    TrustModeAutoCommitRevokedError,
 )
 
 from .._helpers import (
@@ -149,8 +153,18 @@ async def settle_pipeline_proposal_under_compose_lock(
     composer_meta: Mapping[str, object] | None = None,
     telemetry_source: Literal["compose", "recompose"] = "compose",
     transition_assistant: TransitionAssistantDraft | None = None,
+    required_trust_mode: ComposerTrustMode | None = None,
 ) -> PipelineRouteSettlement:
-    """Settle one exact canonical proposal while the caller holds the lock."""
+    """Settle one exact canonical proposal while the caller holds the lock.
+
+    ``required_trust_mode`` threads the commit-boundary trust check into the
+    settlement write transaction (elspeth-01d4c6e683): auto-commit callers
+    pass ``"auto_commit"`` and receive ``TrustModeAutoCommitRevokedError``
+    when a durable preference downgrade beat the settlement — the proposal
+    stays pending (with its durable dispatch audit recoverable by a later
+    manual approval, the same crash-between-dispatch-and-settlement state
+    the recovery path already supports). Manual approval passes ``None``.
+    """
     service: SessionServiceProtocol = request.app.state.session_service
     proposal = authority.row
     if draft_hash != authority.proposal.draft_hash:
@@ -331,6 +345,7 @@ async def settle_pipeline_proposal_under_compose_lock(
                 dispatch=bindings[0],
                 actor=f"user:{user.user_id}",
                 transition_assistant=transition_assistant,
+                required_trust_mode=required_trust_mode,
             ),
             state=cancellation_state,
         )
@@ -356,3 +371,55 @@ async def settle_pipeline_proposal_under_compose_lock(
         current_state_id=str(settled.state.id),
     )
     return PipelineRouteSettlement(settlement=settled, validation=validation)
+
+
+@dataclass(frozen=True, slots=True)
+class AutoCommitRevoked:
+    """Auto-commit authority was durably revoked at the settlement boundary.
+
+    Carries the trust facts from ``TrustModeAutoCommitRevokedError`` so the
+    route can act on the revocation as an explicit outcome: the proposal
+    remains pending and the turn becomes an ordinary review-path response.
+    """
+
+    required: str
+    current: str
+
+
+async def settle_auto_commit_intent(
+    *,
+    request: Request,
+    user: UserIdentity,
+    service: SessionServiceProtocol,
+    session_id: UUID,
+    intent: PipelineCommitIntent,
+    composer_meta: Mapping[str, object] | None,
+    telemetry_source: Literal["compose", "recompose"],
+    transition_assistant: TransitionAssistantDraft | None,
+) -> PipelineRouteSettlement | AutoCommitRevoked:
+    """Settle a planner-minted auto-commit intent, or report revocation.
+
+    Shared by the send-message and recompose routes. ``AutoCommitRevoked``
+    means the session's trust mode was durably downgraded before the
+    settlement transaction could commit (elspeth-01d4c6e683): the proposal
+    remains pending and the caller must fall back to the review-path
+    response.
+    """
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=intent.proposal_id,
+        reviewed_facts={},
+    )
+    try:
+        return await settle_pipeline_proposal_under_compose_lock(
+            request=request,
+            user=user,
+            authority=authority,
+            draft_hash=intent.draft_hash,
+            composer_meta=composer_meta,
+            telemetry_source=telemetry_source,
+            transition_assistant=transition_assistant,
+            required_trust_mode="auto_commit",
+        )
+    except TrustModeAutoCommitRevokedError as exc:
+        return AutoCommitRevoked(required=exc.required, current=exc.current)

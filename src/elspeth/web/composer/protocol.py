@@ -48,6 +48,15 @@ class ComposerHistoryMessage(TypedDict):
     _elspeth_user_authored: NotRequired[Literal[True]]
 
 
+# User-facing assistant text for planner-staged pipeline proposals. Shared
+# between the staging path (``service._stage_pipeline_plan``) and the route
+# fallback that lands a minted intent on the review path when auto-commit
+# authority is revoked at the settlement boundary (elspeth-01d4c6e683) —
+# a single source of truth so the two paths can never drift apart.
+PIPELINE_STAGED_AUTO_COMMIT_MESSAGE: Final[str] = "I prepared and validated the requested pipeline. ELSPETH will commit it atomically."
+PIPELINE_STAGED_REVIEW_MESSAGE: Final[str] = "I prepared and validated the requested pipeline for your review."
+
+
 @dataclass(frozen=True, slots=True)
 class PipelineCommitIntent:
     """Authority pointer for route-owned canonical pipeline settlement."""
