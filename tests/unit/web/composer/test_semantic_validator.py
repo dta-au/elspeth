@@ -1875,6 +1875,78 @@ class TestSourceProducerFactsAreRead:
         assert errors == ()
         assert warnings == ()
 
+    def _llm_source_to_line_explode_state(self) -> CompositionState:
+        return CompositionState(
+            metadata=PipelineMetadata(name="llm-source-to-line-explode"),
+            version=1,
+            edges=(),
+            source=SourceSpec(
+                plugin="llm",
+                on_success="split_in",
+                options={
+                    "schema": {"mode": "fixed", "fields": ["announcement: str"]},
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-3.7-sonnet",
+                    "api_key": "sk-test-key",
+                    "prompt_template": "Write an announcement.",
+                    "response_field": "announcement",
+                },
+                on_validation_failure="quarantine",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="split_lines",
+                    node_type="transform",
+                    plugin="line_explode",
+                    input="split_in",
+                    on_success="sink",
+                    on_error="discard",
+                    options={
+                        "schema": {"mode": "flexible", "fields": ["announcement: str"]},
+                        "source_field": "announcement",
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="sink",
+                    plugin="json",
+                    options={"path": "out.json"},
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+
+    def test_llm_source_to_line_explode_is_satisfied(self) -> None:
+        """The SOURCE arm of the elspeth-b6d9f04827 repair, not just the transform arm.
+
+        ``llm TRANSFORM -> line_explode`` is pinned end-to-end elsewhere, but the
+        llm SOURCE feeds the same repair shape through a different probe class
+        (``_instantiate_source_producer``), and nothing pinned that arm — a
+        regression re-skipping source probes would leave this edge UNKNOWN and
+        this test is what would notice.
+        """
+        state = self._llm_source_to_line_explode_state()
+        errors, warnings, contracts = validate_semantic_contracts(state)
+
+        assert errors == ()
+        assert warnings == (), "SATISFIED, not tolerated: the source's UNCONSTRAINED claim must decide the edge, not unknown_policy"
+        edge = next(contract for contract in contracts if contract.to_id == "split_lines")
+        assert edge.from_id == "source"
+        assert edge.producer_plugin == "llm"
+        assert edge.consumer_plugin == "line_explode"
+        assert edge.producer_facts is not None, (
+            "the source probe must READ the source's declaration; None here means create_source was never reached and the gate is inert"
+        )
+        assert edge.producer_facts.text_framing is TextFraming.UNCONSTRAINED
+        assert edge.outcome is SemanticOutcome.SATISFIED
+
     def test_source_producer_probe_is_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The source probe is validation-only and must not outlive its answer.
 

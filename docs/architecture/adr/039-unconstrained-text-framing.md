@@ -124,8 +124,11 @@ correct way to write it to a file.
 (the shape `json_explode` already uses). `splitlines()` cares where the line
 boundaries are, not what the text *means*. The old `{PLAIN_TEXT, MARKDOWN}`
 constraint blocked nothing extra — every producer it should block conflicts on
-framing alone (`web_scrape` raw html declares `NOT_TEXT`, its compact text
-declares `COMPACT`) — while downgrading to `UNKNOWN` every producer that
+framing alone (`web_scrape`'s compact text declares `COMPACT`; its raw html
+declared `NOT_TEXT` when this ADR was written, but that was a false claim
+about a str of HTML and was re-declared `UNCONSTRAINED` in `800b4887a`,
+elspeth-24c04df25f, making raw legitimately splittable rather than blocked)
+— while downgrading to `UNKNOWN` every producer that
 declares framing but honestly abstains on kind. It was also **wrong** in one
 real case: `JSON_STRUCTURED` + `NEWLINE_FRAMED` is JSONL, and splitting JSONL
 into one object per row is correct rather than a defect. `NOT_TEXT` remains the
@@ -144,7 +147,7 @@ Resulting outcome table, verified by execution against the real plugin objects:
 | producer -> `line_explode` | before | after |
 | --- | --- | --- |
 | `web_scrape` compact text | conflict | **conflict** (still blocked) |
-| `web_scrape` raw html | conflict | **conflict** (still blocked) |
+| `web_scrape` raw html | conflict | **satisfied** (since `800b4887a`: raw declares `UNCONSTRAINED`, elspeth-24c04df25f) |
 | `web_scrape` newline-framed | satisfied | satisfied |
 | `web_scrape` markdown | satisfied | satisfied |
 | `llm` transform | unknown -> **error** | **satisfied** |
