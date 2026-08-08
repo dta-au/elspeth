@@ -844,17 +844,20 @@ def _candidate_topology_reference_names(bound: Mapping[str, Any]) -> tuple[set[s
 
 
 def _predecessor_reference_names(predecessor: CompositionState) -> set[str]:
-    """Every routing name the correction predecessor mentions anywhere.
+    """Every routing name the predecessor mentions anywhere.
 
-    Route-target amnesty for the correction flow's dangling check: restoring
-    unselected nodes from private authority can legitimately leave a
-    predecessor connection unconsumed while the selected node's rewiring is
-    adjudicated downstream, so any name the predecessor mentions — including
-    withheld ``routes``/``fork_to``/``branches`` values the provider never
-    saw — is admitted and its residual ambiguity left to validation. These
-    names are consulted SERVER-SIDE only; the rejection's connectivity facts
-    must never include them (custody: restored gate/coalesce structure is
-    withheld from the provider).
+    Route-target amnesty for the dangling check in both flows whose provider
+    saw only the REDACTED predecessor (correction, and prose ``replace``):
+    the redaction withholds ``routes``/``fork_to``/``branches``, so a name
+    the predecessor mentions there may be honestly re-emitted by a model
+    that cannot know its consumer — in the correction flow, restoration can
+    additionally leave a predecessor connection unconsumed while the
+    selected node's rewiring is adjudicated downstream. Any name the
+    predecessor mentions anywhere is therefore admitted and its residual
+    ambiguity left to validation. These names are consulted SERVER-SIDE
+    only; the rejection's connectivity facts must never include them
+    (custody: restored gate/coalesce structure is withheld from the
+    provider).
     """
     names: set[str] = {
         *predecessor.sources,
@@ -884,6 +887,7 @@ def bind_guided_reviewed_components(
     predecessor: CompositionState | None = None,
     correction_target: GuidedCorrectionTarget | None = None,
     enforce_route_targets: bool = True,
+    route_amnesty_predecessor: CompositionState | None = None,
 ) -> GuidedBoundPipeline:
     """Replace provider-authored component configuration with reviewed authority.
 
@@ -903,6 +907,10 @@ def bind_guided_reviewed_components(
         raise TypeError("predecessor must be an exact CompositionState or None")
     if correction_target is not None and type(correction_target) is not GuidedCorrectionTarget:
         raise TypeError("correction_target must be an exact GuidedCorrectionTarget or None")
+    if route_amnesty_predecessor is not None and type(route_amnesty_predecessor) is not CompositionState:
+        raise TypeError("route_amnesty_predecessor must be an exact CompositionState or None")
+    if route_amnesty_predecessor is not None and predecessor is not None:
+        raise ValueError("route_amnesty_predecessor is the amnesty-only seam; the correction flow's predecessor already grants it")
 
     bound = cast(dict[str, Any], deep_thaw(pipeline))
     raw_sources = bound.get("sources")
@@ -1124,9 +1132,17 @@ def bind_guided_reviewed_components(
     # config-masked feedback the plain flow repairs in one turn. The prose
     # AMEND binder alone opts out (enforce_route_targets=False): its
     # adjudication rebuilds routing from predecessor authority into one
-    # closed repair disposition. REPLACE enforces plain-flow semantics — its
-    # explicit destructive authority means the model owns the full topology
-    # it staged, and no downstream adjudication exists to catch the slip.
+    # closed repair disposition. REPLACE enforces with the SAME amnesty
+    # (``route_amnesty_predecessor``): although its explicit destructive
+    # authority means the model owns the topology it staged, the model only
+    # ever saw the redacted predecessor — routes{}/fork_to[]/branches are
+    # withheld — so a faithful re-emission of a fork/coalesce predecessor
+    # carries branch connections nothing visible consumes. Rejecting those
+    # names steered the repair prompt into mangling honest branch wiring and
+    # burned to REPAIR_EXHAUSTED (the 1f7241de failure class); a
+    # predecessor-mentioned name is left to validation, while a name in
+    # NEITHER the candidate NOR the predecessor stays provably invented and
+    # is rejected with one-turn repair facts.
     #
     # Gate routes{}/fork_to[] deliberately stay out of the check: a value
     # outside known_targets is ambiguous there (stale sink name vs. a
@@ -1145,8 +1161,9 @@ def bind_guided_reviewed_components(
     candidate_consumable_connections = connection_names | branch_connection_names
     node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
     known_targets = set(expected_output_names) | node_ids | connection_names | branch_connection_names | {"discard"}
-    if predecessor is not None:
-        known_targets |= _predecessor_reference_names(predecessor)
+    amnesty_predecessor = predecessor if predecessor is not None else route_amnesty_predecessor
+    if amnesty_predecessor is not None:
+        known_targets |= _predecessor_reference_names(amnesty_predecessor)
     dangling_references: set[str] = set()
 
     def _collect_dangling(member: Mapping[str, Any], key: str) -> None:
@@ -1207,10 +1224,20 @@ def bind_guided_prose_revision_candidate(
     # ``amend`` opts out of the binder's route-target rejection: its
     # reconstruction below rebuilds routing from predecessor authority into
     # one closed repair disposition. ``replace`` stages the bound candidate
-    # with NO further adjudication, so it takes the plain-flow rejection —
-    # without it a stale invented sink alias fell through to config-masked
-    # validation and burned the repair loop to REPAIR_EXHAUSTED.
-    bound = bind_guided_reviewed_components(pipeline, guided, enforce_route_targets=authority.mode == "replace")
+    # with NO further adjudication, so it takes the rejection — without it a
+    # stale invented sink alias fell through to config-masked validation and
+    # burned the repair loop to REPAIR_EXHAUSTED — but WITH predecessor-name
+    # amnesty: the replace provider sees the same redacted context as the
+    # correction flow (routes/fork_to/branches withheld), so a faithful
+    # re-emission of a fork/coalesce predecessor names branch connections it
+    # was never shown the consumers of. Only names in NEITHER the candidate
+    # NOR the predecessor are provably invented and rejected.
+    bound = bind_guided_reviewed_components(
+        pipeline,
+        guided,
+        enforce_route_targets=authority.mode == "replace",
+        route_amnesty_predecessor=authority.predecessor if authority.mode == "replace" else None,
+    )
     if authority.mode == "replace":
         return GuidedRevisionBindingResult(pipeline=bound, rejection_code=None)
 

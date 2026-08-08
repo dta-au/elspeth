@@ -1551,26 +1551,98 @@ def test_bind_explicit_prose_replace_rejects_stale_invented_sink_alias() -> None
     }
 
 
-def test_bind_explicit_prose_replace_gets_no_predecessor_amnesty() -> None:
-    # Counterpart boundary to the correction amnesty: replace stages the
-    # candidate ALONE — a reference to a predecessor connection whose
-    # consumer the model removed is genuinely dangling in the staged
-    # pipeline, not withheld structure awaiting restoration.
+def test_bind_explicit_prose_replace_admits_predecessor_mentioned_names_for_validation() -> None:
+    # Amnesty parity with the correction flow: the replace provider saw only
+    # the REDACTED predecessor (routes/fork_to/branches withheld), so the
+    # server cannot distinguish a stale reference to a removed consumer from
+    # an honest re-emission of withheld structure. Every predecessor-mentioned
+    # name is admitted server-side and left to validation; only a name in
+    # NEITHER the candidate NOR the predecessor stays rejected as provably
+    # invented (previous test).
     predecessor = _correction_predecessor()
     candidate = predecessor.to_dict()
     candidate.pop("version")
     candidate["nodes"] = []
     candidate["sources"]["source"]["on_success"] = "amount_gate"
 
-    with pytest.raises(GuidedCandidateBindingRejected) as raised:
-        guided_planning.bind_guided_prose_revision_candidate(
-            candidate,
-            _guided(),
-            authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
-        )
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+    )
 
-    assert raised.value.error_code == "guided_route_target_unknown"
-    assert raised.value.connectivity["dangling_references"] == ["amount_gate"]
+    assert result.rejection_code is None
+    assert result.pipeline["sources"]["source"]["on_success"] == "amount_gate"
+
+
+def test_bind_explicit_prose_replace_admits_withheld_branch_connections() -> None:
+    # A fork→coalesce predecessor's branch connections (tone_done/usage_done)
+    # exist ONLY in the withheld coalesce ``branches`` mapping — the redacted
+    # provider context projects id/input/on_success/on_error and never
+    # routes/fork_to/branches. A model faithfully re-emitting exactly what it
+    # was shown therefore names branch connections whose consumer it cannot
+    # know. Without predecessor amnesty the binder rejected every such
+    # candidate (guided_route_target_unknown on tone_done/usage_done) and the
+    # repair prompt steered the model into re-pointing honest branch wiring
+    # at sinks — the 1f7241de failure class, burning to REPAIR_EXHAUSTED.
+    predecessor = _coalesce_correction_predecessor()
+    candidate = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        # The redacted reconstruction the provider can honestly author: no
+        # routes/fork_to/branches keys — those fields were withheld.
+        "nodes": [
+            {"id": "fan_out", "node_type": "gate", "plugin": None, "input": "rows", "on_success": None, "on_error": None},
+            {
+                "id": "assess_tone",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_a",
+                "on_success": "tone_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "assess_usage",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_b",
+                "on_success": "usage_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {"id": "merge_branches", "node_type": "coalesce", "plugin": None, "input": "branches", "on_success": None, "on_error": None},
+            {
+                "id": "shape_output",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "merge_branches",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+    )
+
+    assert result.rejection_code is None
+    assert result.pipeline["nodes"][1]["on_success"] == "tone_done"
+    assert result.pipeline["nodes"][2]["on_success"] == "usage_done"
 
 
 class TestBindDeclaredRequiredFields:
