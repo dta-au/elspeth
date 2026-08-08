@@ -14,6 +14,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.pipeline_custody import (
+    finalize_pipeline_custody_on_connection,
     inline_custody_audit_projection,
     prepare_pipeline_custody,
 )
@@ -67,12 +68,13 @@ def test_prepare_pipeline_custody_is_pure_and_hashes_only_safe_arguments(tmp_pat
     arguments = _arguments()
     session_id = prepared.storage_path.parent.name
 
-    custody = prepare_pipeline_custody(arguments, prepared, session_id=session_id)
+    custody = prepare_pipeline_custody(arguments, prepared, session_id=session_id, max_storage_per_session=500 * 1024 * 1024)
 
     source = custody.arguments["source"]
     assert isinstance(source, Mapping)
     assert "inline_blob" not in source
     assert source["blob_id"] == str(custody.blob_id)
+    assert custody.max_storage_per_session == 500 * 1024 * 1024, "the plan-time ceiling must be stamped on the preparation"
     assert custody.request.creating_arguments_hash == stable_hash(custody.arguments)
     assert custody.request.content == prepared.content_bytes
     assert not prepared.storage_path.parent.exists()
@@ -98,6 +100,48 @@ def test_audit_projection_recursively_removes_inline_content_from_malformed_and_
     assert secret not in repr(projected)
     assert projected["source"]["inline_blob"] == "[redacted inline content held for custody]"
     assert projected["sources"]["named"]["inline_blob"] == "[redacted inline content held for custody]"
+
+
+def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> None:
+    """The settle-time quota must equal the plan-time quota, or nothing settles.
+
+    The guard fires before any filesystem or DB I/O, so no connection is
+    consumed — a divergent ceiling can never be enforced, not even
+    transiently.
+    """
+    from typing import cast
+
+    from sqlalchemy import Connection
+
+    prepared = _prepared(tmp_path)
+    arguments = _arguments()
+    custody = prepare_pipeline_custody(
+        arguments,
+        prepared,
+        session_id=prepared.storage_path.parent.name,
+        max_storage_per_session=500 * 1024 * 1024,
+    )
+
+    with pytest.raises(AuditIntegrityError, match="diverges from the plan-time ceiling"):
+        finalize_pipeline_custody_on_connection(
+            custody,
+            conn=cast(Connection, object()),  # guard fires before the connection is touched
+            data_dir=tmp_path,
+            max_storage_per_session=1024,
+            write_fence=None,
+        )
+
+
+def test_preparation_rejects_non_positive_or_inexact_ceiling(tmp_path: Path) -> None:
+    prepared = _prepared(tmp_path)
+    for bad_ceiling in (0, -1, True, 10.5):
+        with pytest.raises(AuditIntegrityError, match="positive exact integer"):
+            prepare_pipeline_custody(
+                _arguments(),
+                prepared,
+                session_id=prepared.storage_path.parent.name,
+                max_storage_per_session=bad_ceiling,  # type: ignore[arg-type]
+            )
 
 
 @pytest.mark.parametrize(
@@ -135,7 +179,9 @@ def test_prepare_pipeline_custody_rejects_manual_or_residual_blob_authority(tmp_
     mutate(arguments)
 
     with pytest.raises(AuditIntegrityError):
-        prepare_pipeline_custody(arguments, prepared, session_id=prepared.storage_path.parent.name)
+        prepare_pipeline_custody(
+            arguments, prepared, session_id=prepared.storage_path.parent.name, max_storage_per_session=500 * 1024 * 1024
+        )
 
     assert not prepared.storage_path.parent.exists()
 
@@ -160,7 +206,9 @@ def test_prepare_pipeline_custody_rejects_candidate_argument_seam_mismatch_witho
     arguments["source"]["inline_blob"].update(arguments_patch)
 
     with pytest.raises(AuditIntegrityError) as exc_info:
-        prepare_pipeline_custody(arguments, prepared, session_id=prepared.storage_path.parent.name)
+        prepare_pipeline_custody(
+            arguments, prepared, session_id=prepared.storage_path.parent.name, max_storage_per_session=500 * 1024 * 1024
+        )
 
     assert "different private content" not in str(exc_info.value)
     assert "different description" not in str(exc_info.value)

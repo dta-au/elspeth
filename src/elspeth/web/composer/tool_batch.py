@@ -1140,6 +1140,7 @@ async def run_tool_batch(
                                 arguments,
                                 candidate.prepared_inline_blob,
                                 session_id=session_id,
+                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
                             )
 
                             # From this point forward every authority-bearing

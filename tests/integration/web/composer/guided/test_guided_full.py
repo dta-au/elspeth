@@ -1212,6 +1212,11 @@ class _InlineCustodyPlanner:
             pipeline,
             prepared,
             session_id=originating_message.session_id,
+            # Must match the fixture app's WebSettings default: the route
+            # plumbs settings.max_blob_storage_per_session_bytes into the
+            # stage command, and the command trips on divergence from the
+            # plan-time ceiling stamped here.
+            max_storage_per_session=500 * 1024 * 1024,
         )
         proposal = PipelineProposal.create(
             pipeline=deep_thaw(preparation.arguments),
@@ -1278,6 +1283,44 @@ def test_guided_full_inline_custody_settles_atomically_with_its_originating_mess
     )
     assert replay.status_code == 200
     assert replay.json() == response.json()
+
+
+def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(composer_test_client) -> None:
+    """The stage command trips when the route's settings-derived ceiling
+    differs from the ceiling the plan authorized the preparation under —
+    the two are plumbed from independent sources, so divergence must fail
+    closed instead of silently enforcing whichever value arrived, and
+    nothing from the staging cohort may become durable."""
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full ceiling divergence"}).json()
+    # Simulate the settle-time source diverging after plan time: the fake
+    # planner stamps the fixture default (500 MiB) on the preparation.
+    composer_test_client.app.state.settings = composer_test_client.app.state.settings.model_copy(
+        update={"max_blob_storage_per_session_bytes": 123 * 1024 * 1024}
+    )
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={
+            "operation_id": "00000000-0000-4000-8000-000000000031",
+            "intent": "Load my inline CSV and write it out as JSON.",
+        },
+    )
+
+    # The command __post_init__ trips AuditIntegrityError, which the guided
+    # machinery records as a terminal integrity failure — never a settled
+    # proposal.
+    assert response.status_code == 500, response.text
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+
+    engine = composer_test_client.app.state.session_engine
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+        assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
+        assert (
+            conn.execute(select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.role == "user")).scalar_one()
+            == 0
+        )
 
 
 def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(composer_test_client) -> None:

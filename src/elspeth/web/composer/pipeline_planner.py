@@ -2118,6 +2118,7 @@ async def _build_valid_pipeline_plan(
             pipeline,
             candidate.prepared_inline_blob,
             session_id=originating_message.session_id,
+            max_storage_per_session=custody_config.max_storage_per_session,
         )
         if custody_config.defer_finalize:
             # The blob row's lineage FK needs the originating chat message,

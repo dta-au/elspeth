@@ -122,13 +122,24 @@ def _contains_inline_blob(value: Any) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class PipelineCustodyPreparation:
-    """Pure result produced before custody performs filesystem or DB I/O."""
+    """Pure result produced before custody performs filesystem or DB I/O.
+
+    ``max_storage_per_session`` is the storage ceiling the plan authorized
+    this preparation under. Finalization — whether mid-plan or deferred
+    into a later staging settlement — refuses to enforce any other value:
+    the plan-time and settle-time quotas are plumbed from independent
+    sources (planner custody config vs route settings read), and without
+    this recorded ceiling nothing would trip if they diverged.
+    """
 
     arguments: Mapping[str, Any]
     request: InlineCustodyRequest
     blob_id: UUID
+    max_storage_per_session: int
 
     def __post_init__(self) -> None:
+        if type(self.max_storage_per_session) is not int or self.max_storage_per_session <= 0:
+            raise AuditIntegrityError("Pipeline custody max_storage_per_session must be a positive exact integer")
         freeze_fields(self, "arguments")
 
 
@@ -173,6 +184,7 @@ def prepare_pipeline_custody(
     prepared: _PreparedBlobCreate,
     *,
     session_id: str,
+    max_storage_per_session: int,
 ) -> PipelineCustodyPreparation:
     """Replace the one supported inline source with a deterministic blob id.
 
@@ -180,6 +192,9 @@ def prepare_pipeline_custody(
     identity.  The safe arguments must contain the UUID before their hash can
     be computed, so the request is first used only to derive that UUID and is
     then rebound to the hash of the final, custody-safe arguments.
+
+    ``max_storage_per_session`` is stamped onto the preparation as the
+    ceiling this plan authorized; finalization refuses any other value.
     """
     try:
         session_uuid = UUID(session_id)
@@ -238,6 +253,7 @@ def prepare_pipeline_custody(
         arguments=safe_arguments,
         request=request,
         blob_id=blob_id,
+        max_storage_per_session=max_storage_per_session,
     )
 
 
@@ -260,6 +276,8 @@ def finalize_pipeline_custody_on_connection(
     """
     if type(preparation) is not PipelineCustodyPreparation:
         raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    if max_storage_per_session != preparation.max_storage_per_session:
+        raise AuditIntegrityError("Pipeline custody enforcement ceiling diverges from the plan-time ceiling")
     if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
         raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
     if write_fence is not None and write_fence.session_id != preparation.request.session_id:
@@ -284,6 +302,8 @@ async def finalize_pipeline_custody(
     write_fence: BlobGuidedOperationWriteFence | None = None,
 ) -> BlobRecord:
     """Materialize a prepared inline source through the shared blob service."""
+    if max_storage_per_session != preparation.max_storage_per_session:
+        raise AuditIntegrityError("Pipeline custody enforcement ceiling diverges from the plan-time ceiling")
     if write_fence is not None and type(write_fence) is not BlobGuidedOperationWriteFence:
         raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
     if write_fence is not None and write_fence.session_id != preparation.request.session_id:

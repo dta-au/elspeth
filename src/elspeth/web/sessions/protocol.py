@@ -1769,7 +1769,8 @@ class GuidedFullPipelineProposalStageCommand:
     # Required exactly when plan.custody_preparation is present: the quota
     # ceiling the deferred inline-custody settlement enforces when it
     # materializes the blob inside the staging transaction
-    # (elspeth-1e3ad83d89).
+    # (elspeth-1e3ad83d89). Must equal the ceiling stamped on the
+    # preparation at plan time — __post_init__ trips on divergence.
     custody_max_storage_per_session: int | None = None
 
     def __post_init__(self) -> None:
@@ -1818,8 +1819,16 @@ class GuidedFullPipelineProposalStageCommand:
             type(self.custody_max_storage_per_session) is not int or self.custody_max_storage_per_session <= 0
         ):
             raise AuditIntegrityError("guided-full custody storage ceiling must be a positive int or None")
-        if self.plan.custody_preparation is not None and self.custody_max_storage_per_session is None:
-            raise AuditIntegrityError("guided-full deferred custody requires a storage ceiling")
+        if self.plan.custody_preparation is not None:
+            if self.custody_max_storage_per_session is None:
+                raise AuditIntegrityError("guided-full deferred custody requires a storage ceiling")
+            # The settle-time ceiling and the plan-time ceiling are plumbed
+            # from independent sources (route settings read vs planner
+            # custody config); deferred settlement must enforce exactly the
+            # ceiling the plan authorized, so divergence trips here rather
+            # than silently enforcing whichever value arrived.
+            if self.custody_max_storage_per_session != self.plan.custody_preparation.max_storage_per_session:
+                raise AuditIntegrityError("guided-full custody storage ceiling diverges from the plan-time ceiling")
         freeze_fields(self, "affects", "arguments_redacted_json")
 
 
