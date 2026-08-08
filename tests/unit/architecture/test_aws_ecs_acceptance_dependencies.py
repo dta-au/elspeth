@@ -23,6 +23,7 @@ LAYERS = {
     "http_client": 1,
     "receipt_contracts": 1,
     "capture": 2,
+    "ecs_metadata": 2,
     "s3": 2,
     "textract": 2,
     "bedrock": 2,
