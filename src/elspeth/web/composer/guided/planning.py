@@ -942,6 +942,25 @@ def bind_guided_reviewed_components(
             error_code="guided_output_alias_collision",
             connectivity={"colliding_aliases": cast(JsonValue, sorted(colliding_aliases))},
         )
+    # The reverse direction: the planner never sees reviewed sink NAMES, so it
+    # can innocently author a node id / connection / branch value equal to one.
+    # The rename below then injects that reviewed name as a sink, and the DAG
+    # builder resolves route targets against sink names BEFORE node/connection
+    # names — every reference meant for the planner's node would silently
+    # deliver rows to the sink and skip it, building green where an unshadowed
+    # name fails loudly as an unknown target. The alias-equality skip above
+    # makes this unreachable for the forward check, so guard it here. The
+    # prose revision binder opts out (enforce_route_targets=False) to classify
+    # the same shape under its own closed amend/replace dispositions.
+    shadowed_reviewed_names = (
+        sorted(name for name in expected_output_names if name in topology_reference_names) if enforce_route_targets else []
+    )
+    if shadowed_reviewed_names:
+        raise GuidedCandidateBindingRejected(
+            "guided planner candidate topology names shadow reviewed sink names",
+            error_code="guided_reviewed_name_shadowed",
+            connectivity={"shadowed_reviewed_names": cast(JsonValue, shadowed_reviewed_names)},
+        )
     output_rename: dict[str, str] = {}
     rebound_outputs: list[GuidedBoundOutput] = []
     for index, stable_id in enumerate(guided.output_order):

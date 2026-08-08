@@ -446,6 +446,84 @@ def test_bind_rejects_alias_colliding_with_node_or_connection_names() -> None:
     assert raised.value.connectivity == {"colliding_aliases": ["clean"]}
 
 
+def test_bind_rejects_node_id_shadowing_a_reviewed_sink_name() -> None:
+    # The planner never sees reviewed sink names, so it can innocently name a
+    # transform node "output". After the binder restores the reviewed name,
+    # the DAG builder resolves route targets against sink names BEFORE
+    # connection/node names, so the source's on_success meant for the node
+    # would silently deliver rows to the sink and skip the transform — a
+    # green build with the wrong topology. Reject as repairable instead.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "output",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "output",
+                "on_success": "final_out",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "final_out", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+    assert raised.value.error_code == "guided_reviewed_name_shadowed"
+    assert raised.value.connectivity == {"shadowed_reviewed_names": ["output"]}
+
+
+def test_bind_rejects_alias_matching_reviewed_name_that_also_names_a_node() -> None:
+    # When the candidate alias EQUALS the reviewed name, the alias gate's
+    # equality short-circuit used to skip the topology-collision check
+    # entirely — the same shadow slipping through the other door.
+    pipeline = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "output",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "output",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    assert raised.value.error_code == "guided_reviewed_name_shadowed"
+    assert raised.value.connectivity == {"shadowed_reviewed_names": ["output"]}
+
+
 def test_bind_rejects_dangling_reference_in_multi_output_candidate() -> None:
     # Multi-output candidates get the same unknown-target rejection as the
     # single-output case — previously they slid through to validation, whose

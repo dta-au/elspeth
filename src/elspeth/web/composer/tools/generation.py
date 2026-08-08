@@ -754,6 +754,16 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "one purpose.",
     ),
     (
+        r"guided_reviewed_name_shadowed",
+        "A node id, consumed connection, or branch value in your candidate equals a reviewed sink name you were "
+        "never shown. After the server restores that reviewed name, the engine resolves routing targets against "
+        "sink names FIRST, so every reference meant for your node would silently deliver rows to the sink and "
+        "skip the node. The rejection's 'connectivity' facts list the reserved names as 'shadowed_reviewed_names'.",
+        "Re-emit with every name in 'shadowed_reviewed_names' renamed throughout your topology — the node id, its "
+        "consumers' input, and every route referencing it — to a fresh name of your own. Do not reuse any "
+        "shadowed name for a node, connection, or branch value. Change nothing else.",
+    ),
+    (
         r"gate_on_error_unknown_sink",
         "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
         "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
