@@ -37,9 +37,13 @@ from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_che
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.no_tool_policy import (
+    _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
     _ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL,
+    AssistantTextSegment,
+    TrustedSystemNoticeSegment,
     is_pending_interpretation_handoff,
+    visible_message_segments,
 )
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import (
@@ -2117,6 +2121,7 @@ async def drive_try_terminate(
     repair_turns_used: int = 0,
     runtime_preflight_valid: bool = True,
     runtime_preflight_result: ValidationResult | None = None,
+    tolerant_preflight_result: ValidationResult | None = None,
     message: str = "rate how cool the pages are",
     deadline: float | None = None,
     recorder: BufferingRecorder | None = None,
@@ -2173,7 +2178,34 @@ async def drive_try_terminate(
             ],
             readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
         )
-    service._runtime_preflight = lambda candidate, user_id=None, session_id=None: stubbed_preflight
+    # elspeth-ac85b0ab0e: a handoff-shaped strict preflight is now VERIFIED via
+    # the authoring-masked re-validation before the repair gate stands aside
+    # and before the blocked END-gate terminal announces it — the stub must
+    # therefore answer both call modes. ``tolerant_preflight_result`` supplies
+    # the masked pass; the default green models a verified PURE handoff (the
+    # review card genuinely is all that remains).
+    tolerant_stub = (
+        tolerant_preflight_result
+        if tolerant_preflight_result is not None
+        else ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+        )
+    )
+
+    def _stubbed_runtime_preflight(
+        candidate,
+        user_id=None,
+        session_id=None,
+        plugin_snapshot=None,
+        *,
+        allow_pending_interpretation_placeholders: bool = False,
+    ) -> ValidationResult:
+        return tolerant_stub if allow_pending_interpretation_placeholders else stubbed_preflight
+
+    service._runtime_preflight = _stubbed_runtime_preflight
     # elspeth-2306940c70: a terminal END-gate block persists a durable
     # withheld-turn disclosure, so the gate needs a sessions service and a
     # UUID-shaped session id even in this advisor-focused harness.
@@ -2390,6 +2422,10 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
         allow_repair_continue=False,
         runtime_preflight=runtime_preflight,
         user_message="Review this pipeline",
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
     )
 
     assert outcome.action == "return"
@@ -2609,8 +2645,11 @@ def _pending_handoff_preflight() -> ValidationResult:
     """The truncated-ledger shape ``review_interpretations`` produces at stage 10.
 
     ``is_valid=False`` with authoring valid and a resolvable review card
-    outstanding. ``_attempt_preflight_repair`` passes this shape through
-    deliberately, so it reaches the END gate exactly as written here.
+    outstanding. ``_attempt_preflight_repair`` passes this shape through to
+    the END gate once VERIFIED (the masked re-validation found nothing else,
+    the harness default) or once its repair budget is spent
+    (elspeth-ac85b0ab0e); an unverified handoff with budget remaining is
+    repaired instead.
     """
     return ValidationResult(
         is_valid=False,
@@ -2677,6 +2716,153 @@ async def test_end_gate_preserves_pending_handoff_shape(make_service, clean_runn
     assert detail.startswith(_ADVISOR_SIGNOFF_PENDING_HANDOFF_UNRENDERED_DETAIL)
     assert "cannot mark this turn complete" not in detail
     assert _ADVISOR_UNAVAILABLE_USER_DETAIL in detail  # the reason class still names itself
+    # The default tolerant stub is green (verified PURE handoff), so the
+    # qualified findings shape must NOT fire here (elspeth-ac85b0ab0e).
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER not in outcome.result.message
+
+
+def _masked_failure_preflight() -> ValidationResult:
+    """A graph-stage failure only the authoring-masked re-validation reaches.
+
+    Models battery round 7 g03: the strict ledger halted at
+    ``review_interpretations``, while the composition also carried an
+    edge-contract violation with a repair suggestion in its persisted record.
+    """
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[
+            ValidationError(
+                component_id="sink_combined",
+                component_type="output",
+                message="Edge contract violation: consumer requires 'str', producer emits 'Any'",
+                suggestion="Declare the coalesced fields on the sink schema or coerce them upstream.",
+                error_code="graph_structure",
+            )
+        ],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code="graph_structure",
+                    component_id="sink_combined",
+                    component_type="output",
+                    detail="Edge contract violation: consumer requires 'str', producer emits 'Any'",
+                )
+            ],
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_repair_gate_intercepts_unverified_handoff_before_end_gate(make_service, clean_runnable_state):
+    """elspeth-ac85b0ab0e: masked failures behind a pending review force a repair turn.
+
+    Battery round 7 g03 (run 700e19d5): the repair gate honoured the
+    handoff-shaped strict preflight unverified and stood aside with its full
+    budget unspent, so the loop terminated over a composition whose persisted
+    record carried an edge-contract violation and a repair suggestion nobody
+    consumed. The gate must instead verify the handoff via the masked
+    re-validation and repair the failures it finds, BEFORE the advisor gate
+    can reach a terminal.
+    """
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=0,
+        runtime_preflight_result=_pending_handoff_preflight(),
+        tolerant_preflight_result=_masked_failure_preflight(),
+        llm_messages=llm_messages,
+    )
+
+    assert outcome.action == "continue"
+    assert outcome.repair_turns_delta == 1
+    service._run_advisor_checkpoint.assert_not_awaited()
+    assert llm_messages, "the repair gate must inject a model-facing repair message"
+    repair_message = llm_messages[-1]
+    assert repair_message["role"] == "user"
+    assert "Pre-finalisation runtime preflight" in repair_message["content"]
+    assert "Edge contract violation" in repair_message["content"]
+    assert "Declare the coalesced fields" in repair_message["content"]
+
+
+@pytest.mark.asyncio
+async def test_preflight_repair_gate_passes_verified_handoff_to_end_gate(make_service, clean_runnable_state):
+    """A VERIFIED pure handoff still reaches the END gate without a repair turn.
+
+    The masked re-validation passing means the review card genuinely is all
+    that remains — pestering the model about a blocker only the USER can
+    resolve would burn repair budget for nothing.
+    """
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(return_value=AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"))
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=0,
+        runtime_preflight_result=_pending_handoff_preflight(),
+        llm_messages=llm_messages,
+    )
+
+    assert outcome.action == "return"
+    assert service._run_advisor_checkpoint.await_count == 1
+    assert llm_messages == []
+    assert outcome.result.message == "Done — the pipeline is ready."
+
+
+@pytest.mark.asyncio
+async def test_end_gate_blocked_handoff_names_outstanding_findings(make_service, clean_runnable_state):
+    """elspeth-ac85b0ab0e: the blocked END-gate terminal must not imply review-only.
+
+    Battery round 7 g03's terminal was exactly this shape: the bare
+    pending-handoff notice ("resolve the pending review cards") over a state
+    whose masked re-validation would have named an edge-contract violation.
+    With the repair budget exhausted the gate cannot repair, so the terminal
+    envelope must NAME the outstanding validator objection — as trusted
+    chrome around an untrusted Cause segment, mirroring the preflight
+    wrapper.
+    """
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=2,  # repair budget exhausted -> the preflight gate cannot intercept
+        runtime_preflight_result=_pending_handoff_preflight(),
+        tolerant_preflight_result=_masked_failure_preflight(),
+    )
+
+    assert outcome.action == "return"
+    preflight = outcome.result.runtime_preflight
+    # The resolvable-card shape is still preserved whole (elspeth-66717f0c99).
+    assert is_pending_interpretation_handoff(preflight)
+    assert preflight.readiness.authoring_valid is True
+    assert preflight.readiness.completion_ready is True
+    # ... but the terminal message no longer implies the review is the only
+    # remaining step: the validator's objection is named alongside it.
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE in outcome.result.message
+    assert "Edge contract violation" in outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER in outcome.result.message
+    segments = visible_message_segments(
+        content=outcome.result.message,
+        raw_content=outcome.result.raw_assistant_content,
+    )
+    assert segments[0] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER)
+    assert any(isinstance(segment, AssistantTextSegment) and "Edge contract violation" in segment.content for segment in segments)
 
 
 def test_pending_handoff_note_mints_trusted_chrome() -> None:
@@ -2697,6 +2883,29 @@ def test_pending_handoff_note_mints_trusted_chrome() -> None:
     segments = visible_message_segments(content=content, raw_content=raw)
 
     assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
+
+
+def test_pending_handoff_note_with_findings_mints_trusted_chrome() -> None:
+    """The qualified handoff shape (elspeth-ac85b0ab0e) must also mint chrome.
+
+    A naively concatenated findings sentence would fall outside the closed
+    canonical suffix set and demote the WHOLE notice to a single untrusted
+    text segment — the wrapped header/Cause/footer shape is what keeps the
+    fixed prose trusted while the validator detail stays ordinary text.
+    """
+    from elspeth.web.composer.no_tool_policy import compose_advisor_pending_handoff_message
+
+    raw = "Done — the pipeline is ready."
+    content = compose_advisor_pending_handoff_message(
+        raw,
+        outstanding_findings_detail="consumer requires 'str', producer emits 'Any'",
+    )
+    segments = visible_message_segments(content=content, raw_content=raw)
+
+    assert segments[0] == AssistantTextSegment(raw)
+    assert segments[1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE)
+    assert segments[2] == AssistantTextSegment("Cause: consumer requires 'str', producer emits 'Any'")
+    assert segments[3] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER)
 
 
 @pytest.mark.asyncio
@@ -3504,6 +3713,10 @@ async def test_end_gate_terminal_block_persists_withheld_disclosure_before_retur
         allow_repair_continue=False,
         runtime_preflight=runtime_preflight,
         user_message="remove the gate entirely but keep the guarantee",
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
     )
 
     assert outcome.action == "return"
@@ -3557,6 +3770,10 @@ async def test_end_gate_terminal_block_skips_disclosure_without_session(make_ser
         allow_repair_continue=False,
         runtime_preflight=runtime_preflight,
         user_message="remove the gate entirely but keep the guarantee",
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
     )
 
     assert outcome.action == "return"
@@ -3615,6 +3832,10 @@ async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp
         allow_repair_continue=False,
         runtime_preflight=runtime_preflight,
         user_message=contradiction,
+        user_id="alice",
+        runtime_preflight_cache=service._new_runtime_preflight_cache(),
+        initial_version=1,
+        session_scope="s1",
     )
     assert outcome.action == "return"
     result = outcome.result

@@ -122,6 +122,11 @@ async def finalize_no_tool_response(
       run ``_cached_runtime_preflight`` for the current state.
     - Otherwise, reuse ``last_runtime_preflight`` from the most recent
       ``preview_pipeline`` call (may be ``None``).
+    - When that leaves the verdict unknown (``None``) on a WIRED state
+      (sources and outputs present) whose own Stage-1 ``state.validate()``
+      is invalid, run the preflight anyway (elspeth-ac85b0ab0e): a build
+      damaged on a prior turn must not finalize as a bare pass-through.
+      Half-built intermediates keep the bare passthrough.
     - Whichever of the two paths populated ``runtime_result``, the
       state-claim grounding check runs after preflight-invalid
       branches are dispatched. The grounding check's regex
@@ -236,6 +241,28 @@ async def finalize_no_tool_response(
 
     runtime_result: ValidationResult | None = last_runtime_preflight
     if state.version > initial_version:
+        runtime_result = await service._cached_runtime_preflight(
+            state,
+            user_id=user_id,
+            session_id=session_id,
+            cache=runtime_preflight_cache,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            llm_calls=llm_calls,
+            plugin_snapshot=plugin_snapshot,
+        )
+    elif runtime_result is None and state.sources and state.outputs and not state.validate().is_valid:
+        # Cross-turn arm (elspeth-ac85b0ab0e), mirroring
+        # ``_turn_runtime_preflight`` so the repair gate and this finalize
+        # observe the SAME verdict: a state made invalid on a PRIOR turn used
+        # to finalize bare here (``runtime_result is None`` — "unknown"),
+        # letting a prose-only later turn read as a clean completion over a
+        # persisted ``is_valid=False`` record. The pure-Python Stage-1
+        # ``state.validate()`` is the applicability probe, gated to WIRED
+        # pipelines (sources AND outputs) so half-built intermediates keep
+        # their bare passthrough; the runtime preflight is paid only when
+        # Stage 1 already says a wired state is broken (the per-turn cache
+        # makes the repair gate's earlier call free to reuse).
         runtime_result = await service._cached_runtime_preflight(
             state,
             user_id=user_id,

@@ -7384,12 +7384,16 @@ class TestEmptyStateFinalizePassthrough:
         catalog = _mock_catalog()
         settings = _make_settings()
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        # Routed source -> sink so Stage-1 ``state.validate()`` passes: the
+        # cross-turn arm (elspeth-ac85b0ab0e) reruns the preflight for
+        # Stage-1-invalid unmutated states, and this test's subject is the
+        # grounding check on a genuinely UNKNOWN verdict.
         state = (
             _empty_state()
             .with_source(
                 SourceSpec(
                     plugin="csv",
-                    on_success="rows",
+                    on_success="main",
                     options={"path": "/data/inputs/in.csv"},
                     on_validation_failure="discard",
                 )
@@ -7443,12 +7447,15 @@ class TestEmptyStateFinalizePassthrough:
         catalog = _mock_catalog()
         settings = _make_settings()
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        # Routed source -> sink: Stage-1-clean so the cross-turn arm
+        # (elspeth-ac85b0ab0e) leaves the verdict UNKNOWN — this test's
+        # subject (see the sibling above).
         state = (
             _empty_state()
             .with_source(
                 SourceSpec(
                     plugin="csv",
-                    on_success="rows",
+                    on_success="main",
                     options={"path": "/data/inputs/in.csv"},
                     on_validation_failure="rejected_records",
                 )
@@ -7495,12 +7502,26 @@ class TestEmptyStateFinalizePassthrough:
         catalog = _mock_catalog()
         settings = _make_settings()
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
-        state = _empty_state().with_source(
-            SourceSpec(
-                plugin="csv",
-                on_success="rows",
-                options={"path": "/data/inputs/in.csv"},
-                on_validation_failure="rejected_records",
+        # Routed source -> sink: Stage-1-clean so the cross-turn arm
+        # (elspeth-ac85b0ab0e) leaves the verdict UNKNOWN and the bare
+        # passthrough under test stays reachable.
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="main",
+                    options={"path": "/data/inputs/in.csv"},
+                    on_validation_failure="rejected_records",
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="csv",
+                    options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
             )
         )
         # Bare past tense without a consequence clause — deliberately

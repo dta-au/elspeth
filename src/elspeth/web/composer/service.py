@@ -899,6 +899,19 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
     return handoff_seen
 
 
+def _outstanding_findings_detail(outstanding_findings: ValidationResult | None) -> str | None:
+    """Leading objection from a red masked re-validation, or ``None`` for a pure handoff.
+
+    Single source of the objection-or-fallback rule shared by every surface
+    that qualifies a pending-review handoff with the authoring-masked
+    re-validation's findings (elspeth-5a372d3267, elspeth-ac85b0ab0e).
+    """
+    if outstanding_findings is None:
+        return None
+    objection = _first_validation_objection(outstanding_findings)
+    return objection if objection is not None else "run validation for details."
+
+
 def _append_interpretation_review_handoff_message(
     result: ComposerResult,
     raw_content: str | None,
@@ -914,9 +927,8 @@ def _append_interpretation_review_handoff_message(
     """
 
     suffix = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
-    if outstanding_findings is not None:
-        objection = _first_validation_objection(outstanding_findings)
-        detail = objection if objection is not None else "run validation for details."
+    detail = _outstanding_findings_detail(outstanding_findings)
+    if detail is not None:
         suffix = f"{suffix} Validation also found issues that must be fixed before this pipeline can run: {detail}"
     if result.raw_assistant_content is not None:
         augmented = f"{result.message}\n\n{suffix}" if result.message else suffix
@@ -981,10 +993,16 @@ def _replace_advisor_repair_public_result(
             # advisory review did not clear either, so "ready for the required
             # review" would name the review as the only remaining step — the
             # same over-claim elspeth-5a372d3267 closed for the masked-
-            # revalidation case.
+            # revalidation case. When the masked re-validation ALSO found
+            # failures (elspeth-ac85b0ab0e, battery round 7 g03 terminated
+            # exactly here on the bare notice), the qualified shape names the
+            # validator's objection alongside the handoff.
             return replace(
                 result,
-                message=_compose_advisor_pending_handoff_message(""),
+                message=_compose_advisor_pending_handoff_message(
+                    "",
+                    outstanding_findings_detail=_outstanding_findings_detail(outstanding_findings),
+                ),
                 raw_assistant_content="",
             )
         if outstanding_findings is not None:
@@ -992,8 +1010,7 @@ def _replace_advisor_repair_public_result(
             # interpretation_review, so "ready for the required review" is
             # unverified — the masked re-validation found failures in the
             # stages that never ran. Name them instead of claiming ready.
-            objection = _first_validation_objection(outstanding_findings)
-            detail = objection if objection is not None else "run validation for details."
+            detail = _outstanding_findings_detail(outstanding_findings)
             return replace(
                 result,
                 message=_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE.format(detail=detail),
@@ -2332,9 +2349,14 @@ class ComposerServiceImpl:
         only then did /validate fail graph_structure). Re-run the preflight
         with pending interpretation placeholders masked so the structural
         stages actually execute; return the tolerant result when it is
-        invalid so the announce sites can qualify the handoff message. The
-        repair loop is deliberately NOT engaged — the staged-review handoff
-        contract returns to the user without extra model turns.
+        invalid so the announce sites can qualify the handoff message. On the
+        STAGED-review handoff (the tool batch terminated on a successful
+        ``request_interpretation_review``) the repair loop is deliberately
+        NOT engaged — that contract returns to the user without extra model
+        turns. The NO-TOOL completion claim is different: there
+        ``_attempt_preflight_repair`` consumes this same verification and
+        repairs the masked failures before the loop may terminate
+        (elspeth-ac85b0ab0e).
         """
         tolerant = await self._cached_runtime_preflight(
             state,
@@ -2347,7 +2369,19 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
             interpretation_tolerant=True,
         )
-        return None if tolerant.is_valid else tolerant
+        if tolerant.is_valid:
+            return None
+        if _is_pending_interpretation_handoff(tolerant):
+            # The authoring-masked pass masks placeholder-token sites, but
+            # requirement-style sites (e.g. an auto-staged llm_prompt_template
+            # review) legitimately survive it, so the tolerant result can
+            # itself be handoff-shaped. That result names only the pending
+            # review — it CONFIRMS the handoff claim rather than falsifying
+            # it, and reporting it as "outstanding findings" would point the
+            # repair loop and the announce surfaces at a blocker only the
+            # user can resolve (elspeth-ac85b0ab0e).
+            return None
+        return tolerant
 
     async def _qualified_advisor_repair_public_result(
         self,
@@ -2559,9 +2593,24 @@ class ComposerServiceImpl:
 
         Returns ``None`` for a structurally empty pipeline (nothing to
         validate — the empty-state finalize branch owns that) and when no prior
-        result exists for an unmutated state. May raise
-        ``ComposerRuntimePreflightError`` exactly as the finalize path does;
-        every caller sits under the same shared handler.
+        result exists for an unmutated state whose own Stage-1 record is
+        clean. May raise ``ComposerRuntimePreflightError`` exactly as the
+        finalize path does; every caller sits under the same shared handler.
+
+        Cross-turn arm (elspeth-ac85b0ab0e): an unmutated state with no
+        preview this turn used to return ``None`` — "unknown" — even when the
+        state was made invalid on a PRIOR turn, so a later prose-only turn
+        finalized bare over a persisted ``is_valid=False`` record. Mirrors the
+        proof gate's version-guard removal (see ``_attempt_proof_repair``'s
+        cross-turn comment): the cheap pure-Python Stage-1 ``state.validate()``
+        is the applicability probe, and the full runtime preflight is paid
+        only when Stage 1 already says the state is broken. The arm fires only
+        for a WIRED pipeline (sources AND outputs present): a half-built
+        intermediate is Stage-1-invalid by nature, not by damage, and taxing
+        every mid-composition chat turn with repair pressure would answer a
+        different question than the one this arm asks. A Stage-1-invisible
+        runtime-only defect on an unmutated state remains ``None`` — it was
+        surfaced on its mutation turn, where the preflight ran.
         """
         if _state_is_structurally_empty(state):
             return None
@@ -2576,7 +2625,20 @@ class ComposerServiceImpl:
                 llm_calls=recorder.llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
-        return last_runtime_preflight
+        if last_runtime_preflight is not None:
+            return last_runtime_preflight
+        if state.sources and state.outputs and not state.validate().is_valid:
+            return await self._cached_runtime_preflight(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+        return None
 
     async def _attempt_preflight_repair(
         self,
@@ -2608,8 +2670,21 @@ class ComposerServiceImpl:
         Returns True when a repair message was injected (the loop should
         ``continue``). Returns False when: the budget is exhausted; the state
         is structurally empty (nothing to fix — the empty-state finalize branch
-        owns that); the preflight is valid; or the failure is a pending
-        interpretation handoff (owned by the interpretation/orphan path).
+        owns that); the preflight is valid; or the failure is a VERIFIED
+        pending interpretation handoff (owned by the interpretation/orphan
+        path).
+
+        A handoff-shaped preflight is a truncated-ledger claim: the strict
+        pass halts at ``review_interpretations`` before the graph/schema
+        stages, so it cannot support "the review is all that remains". The
+        gate therefore verifies the shape via the authoring-masked
+        re-validation (``_pending_handoff_outstanding_findings``,
+        elspeth-5a372d3267) before standing aside: masked failures are
+        repaired like any other contract violation, with the repair message
+        built from the TOLERANT result so it names the hidden objection
+        rather than the review card only the user can resolve. Without this,
+        the loop terminates over a composition whose persisted record it was
+        correctly told is invalid (elspeth-ac85b0ab0e, battery round 7 g03).
 
         Mirrors ``_finalize_no_tool_response``'s preflight computation EXACTLY
         (reuse ``last_runtime_preflight``; recompute via
@@ -2642,8 +2717,24 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
         )
 
-        if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
+        if runtime_result is None or runtime_result.is_valid:
             return False
+        if _is_pending_interpretation_handoff(runtime_result):
+            outstanding_findings = await self._pending_handoff_outstanding_findings(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+            if outstanding_findings is None:
+                # Verified pure handoff: the review card genuinely is all that
+                # remains, and only the user can resolve it.
+                return False
+            runtime_result = outstanding_findings
 
         llm_messages.append(
             {
@@ -4259,6 +4350,11 @@ class ComposerServiceImpl:
                                 recorder=recorder,
                                 plugin_snapshot=plugin_snapshot,
                             ),
+                            user_id=user_id,
+                            runtime_preflight_cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            plugin_snapshot=plugin_snapshot,
                             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                             deadline=deadline,
                         )
@@ -4536,6 +4632,11 @@ class ComposerServiceImpl:
                     recorder=recorder,
                     plugin_snapshot=plugin_snapshot,
                 ),
+                user_id=user_id,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                plugin_snapshot=plugin_snapshot,
                 advisor_review_state=advisor_review_state or _AdvisorReviewState(),
                 deadline=deadline,
             )
@@ -4886,6 +4987,11 @@ class ComposerServiceImpl:
         allow_repair_continue: bool,
         runtime_preflight: ValidationResult | None,
         user_message: str,
+        user_id: str | None,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
@@ -4902,6 +5008,14 @@ class ComposerServiceImpl:
         chat turn, forwarded so the END checkpoint can compare the supplied
         pipeline evidence with explicit constraints visible in the bounded
         user excerpt — see :meth:`_build_checkpoint_arguments`.
+
+        ``user_id`` / ``runtime_preflight_cache`` / ``initial_version`` /
+        ``session_scope`` / ``plugin_snapshot`` (elspeth-ac85b0ab0e) exist so
+        a terminal block over a handoff-shaped preflight can run the
+        authoring-masked re-validation (``_pending_handoff_outstanding_findings``)
+        before announcing the handoff: the preserved shape's notice must name
+        any validator failures hidden behind the pending review instead of
+        implying the review cards are the only remaining step.
         """
         max_passes = self._settings.composer_advisor_checkpoint_max_passes
         if _state_is_structurally_empty(state) or advisor_checkpoint_passes_used >= max_passes:
@@ -4960,6 +5074,24 @@ class ComposerServiceImpl:
         # with no sign-off at all.
         terminal_block = (verdict.blocking or not verdict.ok) and (is_last_pass or not allow_repair_continue)
         if terminal_block:
+            # elspeth-ac85b0ab0e: a handoff-shaped preflight is a truncated-
+            # ledger claim (the strict pass halts at review_interpretations),
+            # so before the blocked terminal PRESERVES that shape and tells
+            # the user to resolve the review cards, verify it — the masked
+            # re-validation surfaces any failures in the stages the strict
+            # ledger never reached, and the blocked notice must name them.
+            outstanding_findings: ValidationResult | None = None
+            if runtime_preflight is not None and _is_pending_interpretation_handoff(runtime_preflight):
+                outstanding_findings = await self._pending_handoff_outstanding_findings(
+                    state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    llm_calls=recorder.llm_calls,
+                    plugin_snapshot=plugin_snapshot,
+                )
             orphan_result = await self._surface_pt_and_gate_orphans_or_none(
                 state=state,
                 session_id=session_id,
@@ -5022,6 +5154,7 @@ class ComposerServiceImpl:
                     persisted_assistant_message_id=persisted_assistant_message_id,
                     persisted_tool_call_turn=persisted_tool_call_turn,
                     runtime_preflight=runtime_preflight,
+                    outstanding_findings=outstanding_findings,
                 ),
                 advisor_passes_delta=passes_delta,
                 advisor_review_state=review_state,
@@ -6574,6 +6707,7 @@ class ComposerServiceImpl:
         persisted_assistant_message_id: str | None,
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
+        outstanding_findings: ValidationResult | None = None,
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
@@ -6591,7 +6725,11 @@ class ComposerServiceImpl:
         * a pending-interpretation handoff is preserved WHOLE — the advisor
           verdict is appended as a failed check and nothing is withheld, so
           the resolvable review card the operator can act on survives
-          (elspeth-66717f0c99);
+          (elspeth-66717f0c99). ``outstanding_findings`` (elspeth-ac85b0ab0e)
+          carries the authoring-masked re-validation result when it found
+          failures in the stages the strict ledger never reached; the notice
+          then names the validator's objection instead of implying the review
+          cards are the only remaining step;
         * any other red or absent preflight remains fully red under the
           runtime-preflight header.
 
@@ -6623,7 +6761,10 @@ class ComposerServiceImpl:
                 findings=verdict.findings_text,
                 findings_backend_authored=verdict.findings_backend_authored,
             )
-            augmented = _compose_advisor_pending_handoff_message("")
+            augmented = _compose_advisor_pending_handoff_message(
+                "",
+                outstanding_findings_detail=_outstanding_findings_detail(outstanding_findings),
+            )
         else:
             runtime_result = _advisor_signoff_blocked_validation(
                 reason=reason,

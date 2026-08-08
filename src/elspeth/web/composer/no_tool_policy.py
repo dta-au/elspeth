@@ -86,9 +86,11 @@ _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_
 # there, the review card is what the turn is deferred to) nor genuinely red (so
 # ``_PREFLIGHT_NOTICE_HEADER`` is wrong: authoring validated). This notice
 # names BOTH outstanding facts. It deliberately does not say the review is the
-# only remaining step — ``_advisor_blocked_result`` is sync and cannot run the
-# masked re-validation that would establish that (elspeth-5a372d3267) — and it
-# interpolates nothing, so the whole suffix is fixed operator-authored prose.
+# only remaining step, and it interpolates nothing, so the whole suffix is
+# fixed operator-authored prose. When the masked re-validation
+# (elspeth-5a372d3267) has established that the review is NOT the only
+# remaining step, the qualified wrapped shape below names the outstanding
+# validator objection alongside it (elspeth-ac85b0ab0e).
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
     "A required interpretation review is pending, and the completion advisory review did not clear "
     "after the available attempts. Resolve the pending review cards; validation and the advisory "
@@ -96,6 +98,29 @@ _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE: Final = (
 )
 _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
+)
+
+# elspeth-ac85b0ab0e: the qualified variant of the pending-handoff notice.
+# Battery round 7 (g03, run 700e19d5) terminated on the bare notice above
+# while the persisted state carried an edge-contract violation with a repair
+# suggestion — the strict ledger halts at ``review_interpretations`` before
+# the graph/schema stages, so the bare notice implied the review cards were
+# the only remaining step. When the authoring-masked re-validation
+# (elspeth-5a372d3267) finds failures behind the handoff, this wrapped shape
+# names them: the fixed handoff notice as trusted header, the validator's
+# objection as an untrusted ``Cause:`` segment, and a fixed footer stating
+# the review alone will not make the pipeline runnable. Mirrors the
+# ``_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL`` wrapper so
+# ``_split_wrapped_diagnostic`` recognises it without a new splitter.
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER: Final = (
+    "Resolving the review cards alone will not make this pipeline runnable — fix the validation failure above as well."
+)
+_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL = (
+    _TRUSTED_NOTICE_SEPARATOR
+    + _TRUSTED_NOTICE_MARKER
+    + _ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE
+    + "\n\nCause: {detail}\n\n"
+    + _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER
 )
 
 # The check-detail counterpart of that notice. ``_advisor_signoff_blocked_wording``
@@ -446,6 +471,13 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
     if suffix == _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX:
         return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE),)
+    handoff_with_findings = _split_wrapped_diagnostic(
+        suffix,
+        header=_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+        footer=_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
+    )
+    if handoff_with_findings is not None:
+        return handoff_with_findings
     if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
         return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
     preflight_with_diagnostic = _split_wrapped_diagnostic(
@@ -575,19 +607,32 @@ def compose_advisor_signoff_pending_message(content: str) -> str:
     return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
 
 
-def compose_advisor_pending_handoff_message(content: str) -> str:
+def compose_advisor_pending_handoff_message(content: str, *, outstanding_findings_detail: str | None = None) -> str:
     """Build the user-facing message for a pending handoff the advisor did not clear.
 
     Neither sibling wording fits: the preflight header would claim validation
     failed on a build whose authoring passed, and the sign-off-pending notice
     would claim completion is withheld on a result that keeps
-    ``completion_ready`` (elspeth-66717f0c99). Fixed prose, no interpolated
-    diagnostic — the advisor's own wording rides the appended failed
-    ``advisor_signoff`` check instead of this surface.
+    ``completion_ready`` (elspeth-66717f0c99). The bare shape is fixed prose —
+    the advisor's own wording rides the appended failed ``advisor_signoff``
+    check instead of this surface.
+
+    ``outstanding_findings_detail`` (elspeth-ac85b0ab0e) carries the leading
+    objection from the authoring-masked re-validation when it found failures
+    behind the pending review. The bare notice would then imply the review
+    cards are the only remaining step — false, and exactly how battery round
+    7's g03 sessions terminated over a persisted ``is_valid=False`` state.
+    The detail is VALIDATOR-authored text (same trust class as the preflight
+    wrapper's interpolation), rendered as an untrusted ``Cause:`` segment
+    between the trusted notice and a trusted footer.
     """
+    if outstanding_findings_detail is None:
+        suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
+    else:
+        suffix = _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL.format(detail=outstanding_findings_detail)
     if not content:
-        return _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
-    return content + _ADVISOR_SIGNOFF_PENDING_HANDOFF_FINALIZE_SUFFIX
+        return suffix.lstrip("\n").lstrip("-").lstrip()
+    return content + suffix
 
 
 def advisor_signoff_pending_handoff_wording(*, reason: str, findings: str, findings_backend_authored: bool = False) -> str:
