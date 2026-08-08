@@ -634,6 +634,10 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
         observed_columns: tuple[str, ...] = ()
     else:
         observed_columns = tuple(observed_headers)
+    identity = inspection_facts.redacted_identity
+    anchor = identity["content_hash_prefix"] if "content_hash_prefix" in identity else None
+    if anchor is not None and (type(anchor) is not str or anchor == ""):
+        raise InvariantError("inspection facts content_hash_prefix must be a non-empty exact str")
     return (
         SourceResolved(
             name="source",
@@ -642,6 +646,7 @@ async def _source_from_latest_uploaded_blob_for_step_1_chat(
             observed_columns=observed_columns,
             sample_rows=(),
             on_validation_failure=on_validation_failure,
+            content_hash_prefix=anchor,
         ),
         inspection_facts,
     )

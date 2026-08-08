@@ -13,10 +13,42 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ReviewedSourceAuthority
+from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.sessions.models import blobs_table, sessions_table
 
 _BLOB_PATH_PREFIX = "blob:"
 _BLOB_PATH_KEYS = frozenset({"path", "file"})
+
+
+def _recorded_content_hash_prefix(raw_source: Mapping[str, Any], *, stable_id: str) -> str | None:
+    """Parse the reviewed record's content identity anchor, if recorded.
+
+    Guided review captures the inspected blob's ``content_hash`` prefix into
+    the resolved source record; legacy records and non-blob sources carry
+    ``None``.  A present-but-malformed anchor is an integrity anomaly, not
+    an absent one.
+    """
+    value = raw_source["content_hash_prefix"] if "content_hash_prefix" in raw_source else None
+    if value is None:
+        return None
+    if type(value) is not str or not value:
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}].content_hash_prefix must be a non-empty string when present")
+    return value
+
+
+def _authoring_content_hash(options: Mapping[str, Any], *, stable_id: str) -> str | None:
+    """Parse the full content hash pinned by source-authoring metadata."""
+    authoring = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
+    if authoring is None:
+        return None
+    if not isinstance(authoring, Mapping):
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}] source authoring metadata must be a mapping")
+    value = authoring["content_hash"] if "content_hash" in authoring else None
+    if value is None:
+        return None
+    if type(value) is not str or not value:
+        raise AuditIntegrityError(f"reviewed_sources[{stable_id!r}] source authoring content_hash must be a non-empty string")
+    return value
 
 
 def _canonical_blob_id(value: object, *, field_name: str) -> str:
@@ -62,12 +94,20 @@ def resolve_reviewed_source_authority(
     source_blob_ids: dict[str, str] = {}
     sentinel_blob_ids: dict[str, str] = {}
     raw_storage_paths: dict[str, tuple[str, ...]] = {}
+    reviewed_hash_prefixes: dict[str, str] = {}
+    authoring_hashes: dict[str, str] = {}
     for stable_id, raw_source in sources.items():
         if type(stable_id) is not str or not stable_id or not isinstance(raw_source, Mapping):
             raise AuditIntegrityError("reviewed source authority contains a malformed source record")
         options = raw_source["options"] if "options" in raw_source else None
         if not isinstance(options, Mapping):
             raise AuditIntegrityError("reviewed source authority contains malformed source options")
+        recorded_prefix = _recorded_content_hash_prefix(raw_source, stable_id=stable_id)
+        if recorded_prefix is not None:
+            reviewed_hash_prefixes[stable_id] = recorded_prefix
+        pinned_hash = _authoring_content_hash(options, stable_id=stable_id)
+        if pinned_hash is not None:
+            authoring_hashes[stable_id] = pinned_hash
         referenced_ids: set[str] = set()
         if "blob_ref" in options:
             referenced_ids.add(
@@ -93,6 +133,7 @@ def resolve_reviewed_source_authority(
             source_blob_ids[stable_id] = next(iter(referenced_ids))
 
     verified_storage_by_blob_id: dict[str, str] = {}
+    verified_hash_by_blob_id: dict[str, str] = {}
     with engine.connect() as conn:
         session_owner = conn.execute(select(sessions_table.c.user_id).where(sessions_table.c.id == session_id)).scalar_one_or_none()
         if session_owner != user_id:
@@ -103,6 +144,7 @@ def resolve_reviewed_source_authority(
                     blobs_table.c.session_id,
                     blobs_table.c.status,
                     blobs_table.c.storage_path,
+                    blobs_table.c.content_hash,
                 ).where(blobs_table.c.id == blob_id)
             ).first()
             if row is None:
@@ -113,7 +155,29 @@ def resolve_reviewed_source_authority(
                 raise AuditIntegrityError("reviewed blob authority references a blob that is not ready")
             if type(row.storage_path) is not str or not row.storage_path:
                 raise AuditIntegrityError("reviewed blob authority has a malformed storage path")
+            if type(row.content_hash) is not str or not row.content_hash:
+                raise AuditIntegrityError("reviewed blob authority references a ready blob without a content hash")
             verified_storage_by_blob_id[blob_id] = row.storage_path
+            verified_hash_by_blob_id[blob_id] = row.content_hash
+
+    # Content identity binding: authority is granted for the BYTES that were
+    # reviewed, not for a blob id/path.  update_blob mutates bytes and hash
+    # in place while keeping id, path, session, and ready status — every
+    # location/lifecycle check above still passes — so the recorded review
+    # anchors must match the live content hash or the stale reviewed facts
+    # would silently auto-authorize unreviewed bytes (elspeth-b3feba9a7c).
+    for stable_id, blob_id in source_blob_ids.items():
+        live_hash = verified_hash_by_blob_id[blob_id]
+        recorded_prefix = reviewed_hash_prefixes.get(stable_id)
+        if recorded_prefix is not None and not live_hash.startswith(recorded_prefix):
+            raise AuditIntegrityError(
+                "reviewed blob authority no longer matches the reviewed content; the blob changed after review and requires re-review"
+            )
+        pinned_hash = authoring_hashes.get(stable_id)
+        if pinned_hash is not None and pinned_hash != live_hash:
+            raise AuditIntegrityError(
+                "reviewed source authoring content_hash no longer matches the live blob; the blob changed after review and requires re-review"
+            )
 
     for stable_id, paths in raw_storage_paths.items():
         source_blob_id = source_blob_ids.get(stable_id)

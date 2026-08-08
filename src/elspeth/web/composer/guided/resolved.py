@@ -205,11 +205,21 @@ class SourceResolved:
     observed_columns: Sequence[str]
     sample_rows: Sequence[Mapping[str, Any]]
     on_validation_failure: str
+    # Content identity anchor: the inspected blob's content_hash prefix,
+    # captured at review time from the inspection facts.  ``None`` for
+    # non-blob sources and for pre-anchor legacy records.
+    # ``resolve_reviewed_source_authority`` refuses settlement when a
+    # recorded anchor no longer matches the live blob row — an in-place
+    # update_blob keeps id/path/status, so only content identity can revoke
+    # stale reviewed authority (elspeth-b3feba9a7c).
+    content_hash_prefix: str | None = None
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.name, "SourceResolved.name")
         _require_nonempty_str(self.plugin, "SourceResolved.plugin")
         _require_nonempty_str(self.on_validation_failure, "SourceResolved.on_validation_failure")
+        if self.content_hash_prefix is not None:
+            _require_nonempty_str(self.content_hash_prefix, "SourceResolved.content_hash_prefix")
         sample_rows_value = cast(object, self.sample_rows)
         if not isinstance(sample_rows_value, Sequence) or isinstance(sample_rows_value, (str, bytes, bytearray)):
             raise TypeError("SourceResolved.sample_rows must be a sequence[mapping]")
@@ -242,15 +252,23 @@ class SourceResolved:
             "observed_columns": list(deep_thaw(self.observed_columns)),
             "sample_rows": [dict(deep_thaw(row)) for row in self.sample_rows],
             "on_validation_failure": self.on_validation_failure,
+            "content_hash_prefix": self.content_hash_prefix,
         }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SourceResolved:
+        # ``content_hash_prefix`` is accepted optionally: pre-anchor guided
+        # sessions persisted six-key records, and their absence honestly
+        # means "no content identity was captured" (None) rather than a
+        # malformed record.
         record = _require_exact_keys(
-            d,
-            frozenset({"name", "plugin", "options", "observed_columns", "sample_rows", "on_validation_failure"}),
+            {"content_hash_prefix": None, **d},
+            frozenset({"name", "plugin", "options", "observed_columns", "sample_rows", "on_validation_failure", "content_hash_prefix"}),
             "SourceResolved",
         )
+        anchor = record["content_hash_prefix"]
+        if anchor is not None and (type(anchor) is not str or anchor == ""):
+            raise InvariantError("SourceResolved.content_hash_prefix must be a non-empty exact str or None")
         if type(record["options"]) is not dict:
             raise InvariantError("SourceResolved.options must be an exact dict")
         sample_rows_raw = record["sample_rows"]
@@ -264,6 +282,7 @@ class SourceResolved:
                 observed_columns=_require_str_list(record["observed_columns"], "SourceResolved.observed_columns"),
                 sample_rows=tuple(sample_rows_raw),
                 on_validation_failure=_require_nonempty_str(record["on_validation_failure"], "SourceResolved.on_validation_failure"),
+                content_hash_prefix=anchor,
             )
         except (TypeError, ValueError) as exc:
             raise InvariantError(f"SourceResolved.from_dict: malformed record {record!r}") from exc

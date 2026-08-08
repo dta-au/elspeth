@@ -225,6 +225,16 @@ def _require_inspection_plugin_match(plugin: str, facts: SourceInspectionFacts) 
         raise ValueError(f"selected source plugin {plugin!r} does not match inspection facts for {facts.source_kind!r} content")
 
 
+def _inspection_content_hash_prefix(facts: SourceInspectionFacts) -> str | None:
+    """The inspected content's hash prefix, when the inspection read bytes."""
+    if "content_hash_prefix" not in facts.redacted_identity:
+        return None
+    prefix = facts.redacted_identity["content_hash_prefix"]
+    if type(prefix) is not str or prefix == "":
+        raise InvariantError("inspection facts content_hash_prefix must be a non-empty exact str")
+    return prefix
+
+
 def _inspection_blob_id(facts: SourceInspectionFacts) -> str | None:
     if "blob_id" not in facts.redacted_identity:
         return None
@@ -1054,6 +1064,7 @@ def transition_source_inspection_review(
         observed_columns=columns,
         sample_rows=(),
         on_validation_failure=on_validation_failure,
+        content_hash_prefix=_inspection_content_hash_prefix(facts),
     )
     pending = dict(session.pending_source_intents)
     del pending[stable_id]

@@ -1672,3 +1672,85 @@ def test_finish_component_review_rejects_cross_kind_empty_and_pending_collection
     pending = add_component_intent(source_session, "source", UUID("55555555-5555-4555-8555-555555555555"))
     with pytest.raises(InvariantError, match="pending"):
         finish_component_review(pending, "source")
+
+
+def test_inspection_review_records_content_identity_anchor() -> None:
+    """Blob-backed review must pin the inspected content's hash prefix.
+
+    ``resolve_reviewed_source_authority`` uses the recorded prefix to refuse
+    settlement when the blob's bytes changed after review — location and
+    lifecycle checks alone cannot see an in-place update_blob
+    (elspeth-b3feba9a7c).  A review that read the bytes therefore records
+    the ``content_hash_prefix`` its inspection facts carry.
+    """
+    facts = _inspection()
+    anchored = SourceInspectionFacts(
+        source_kind=facts.source_kind,
+        redacted_identity={**dict(facts.redacted_identity), "content_hash_prefix": "deadbeef"},
+        byte_range_inspected=facts.byte_range_inspected,
+        sample_row_count=facts.sample_row_count,
+        observed_headers=facts.observed_headers,
+        inferred_types=dict(facts.inferred_types) if facts.inferred_types is not None else None,
+        url_candidates=facts.url_candidates,
+        warnings=facts.warnings,
+    )
+    session = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(SOURCE_A,),
+        pending_source_intents={
+            SOURCE_A: SourceIntent(
+                name="source",
+                phase="inspection_review",
+                plugin="csv",
+                options={
+                    "path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "on_validation_failure": "discard",
+                },
+                inspection_facts=anchored,
+                observed_columns=anchored.observed_headers or (),
+                sample_rows=(),
+            )
+        },
+    )
+    session, turn = _with_unanswered_turn(session, TurnType.INSPECT_AND_CONFIRM)
+
+    result = transition_source_inspection_review(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        response=InspectionResponse(columns=("record_id",)),
+    )
+
+    reviewed = result.reviewed_sources[SOURCE_A]
+    assert reviewed.content_hash_prefix == "deadbeef"
+    roundtrip = SourceResolved.from_dict(reviewed.to_dict())
+    assert roundtrip.content_hash_prefix == "deadbeef"
+
+
+def test_inspection_review_without_content_anchor_records_none() -> None:
+    """Facts lacking a hash prefix (non-blob inspection) record None."""
+    session, turn = _source_review_session()
+
+    result = transition_source_inspection_review(
+        session,
+        target_id=SOURCE_A,
+        turn=turn,
+        response=InspectionResponse(columns=("record_id",)),
+    )
+
+    reviewed = result.reviewed_sources[SOURCE_A]
+    assert reviewed.content_hash_prefix is None
+    assert SourceResolved.from_dict(reviewed.to_dict()).content_hash_prefix is None
+
+
+def test_source_resolved_from_dict_accepts_legacy_records_without_anchor() -> None:
+    """Persisted pre-anchor guided sessions must still deserialize (anchor=None)."""
+    legacy = {
+        "name": "source",
+        "plugin": "csv",
+        "options": {"path": "rows.csv"},
+        "observed_columns": ["id"],
+        "sample_rows": [],
+        "on_validation_failure": "discard",
+    }
+    assert SourceResolved.from_dict(legacy).content_hash_prefix is None

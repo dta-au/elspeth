@@ -563,14 +563,22 @@ def build_set_pipeline_candidate(
         if len(matches) != 1:
             return None
         reviewed = matches[0]
-        if set(reviewed) != {
+        required_keys = {
             "name",
             "plugin",
             "options",
             "observed_columns",
             "sample_rows",
             "on_validation_failure",
-        }:
+        }
+        # ``content_hash_prefix`` (the content identity anchor added by
+        # elspeth-b3feba9a7c) is optional here: legacy persisted facts
+        # predate it.  Its VALUE is enforced by
+        # ``resolve_reviewed_source_authority`` against the live blob row
+        # before this authority object ever exists — this shape check only
+        # keeps the record closed.
+        reviewed_keys = set(reviewed)
+        if not required_keys <= reviewed_keys or reviewed_keys - required_keys - {"content_hash_prefix"}:
             return None
         reviewed_binding = {
             "name": reviewed["name"],

@@ -357,7 +357,7 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
         service.create_blob(
             UUID(first_session),
             "first.csv",
-            b"name,score\nAda,42\n",
+            _FIRST_REVIEWED_BLOB_CONTENT,
             "text/csv",
         )
     )
@@ -372,7 +372,16 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
     return engine, first_session, second_session, (first_blob, second_blob)
 
 
-def _reviewed_source_facts(*, blob_id: str, source_name: str = "source", path: str | None = None) -> dict[str, Any]:
+_FIRST_REVIEWED_BLOB_CONTENT = b"name,score\nAda,42\n"
+
+
+def _reviewed_source_facts(
+    *,
+    blob_id: str,
+    source_name: str = "source",
+    path: str | None = None,
+    authoring_content_hash: str | None = None,
+) -> dict[str, Any]:
     stable_id = str(uuid4())
     return {
         "source_order": [stable_id],
@@ -386,7 +395,12 @@ def _reviewed_source_facts(*, blob_id: str, source_name: str = "source", path: s
                     "schema": {"mode": "observed"},
                     SOURCE_AUTHORING_KEY: {
                         "modality": "llm_generated",
-                        "content_hash": "a" * 64,
+                        # The content-identity binding verifies this pin
+                        # against the live blob row, so it must be the real
+                        # hash of the harness blob's bytes.
+                        "content_hash": (
+                            authoring_content_hash if authoring_content_hash is not None else content_hash(_FIRST_REVIEWED_BLOB_CONTENT)
+                        ),
                         "review_event_id": "review-event",
                         "resolved_kind": "invented_source",
                     },
@@ -738,7 +752,10 @@ def test_generic_cross_session_and_filesystem_callers_cannot_reuse_reviewed_auth
     )
     assert generic.acceptable is False
 
-    other_facts = _reviewed_source_facts(blob_id=str(second_blob.id))
+    other_facts = _reviewed_source_facts(
+        blob_id=str(second_blob.id),
+        authoring_content_hash=content_hash(b"name,score\nGrace,99\n"),
+    )
     other_authority = resolve_reviewed_source_authority(
         engine=engine,
         session_id=other_session,
@@ -2749,3 +2766,97 @@ def test_query_template_interpretation_token_is_rejected_at_the_compose_gate(tmp
     assert lead.component == "rejected_mutation"
     assert lead.error_code == "plugin_options_invalid"
     assert "interpretation" in lead.message
+
+
+def _live_blob_hash(engine: Any, blob_id: str) -> str:
+    with engine.begin() as conn:
+        stored = conn.execute(select(blobs_table.c.content_hash).where(blobs_table.c.id == blob_id)).scalar_one()
+    assert isinstance(stored, str)
+    return stored
+
+
+def _content_bound_reviewed_facts(engine: Any, blob_id: str) -> dict[str, Any]:
+    """Reviewed facts whose content identity anchors match the live blob."""
+    live_hash = _live_blob_hash(engine, blob_id)
+    facts = _reviewed_source_facts(blob_id=blob_id)
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    reviewed["content_hash_prefix"] = live_hash[:8]
+    reviewed["options"][SOURCE_AUTHORING_KEY]["content_hash"] = live_hash
+    return facts
+
+
+def _mutate_blob_content_in_place(engine: Any, blob_record: Any, new_content: bytes) -> None:
+    """Model update_blob's effect: same id/path, new bytes and content_hash."""
+    Path(blob_record.storage_path).write_bytes(new_content)
+    with engine.begin() as conn:
+        conn.execute(
+            update(blobs_table)
+            .where(blobs_table.c.id == str(blob_record.id))
+            .values(content_hash=content_hash(new_content), size_bytes=len(new_content))
+        )
+
+
+def test_reviewed_source_authority_accepts_unchanged_reviewed_content(tmp_path: Path) -> None:
+    """Control: content identity anchors matching the live blob resolve."""
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id="review-owner",
+        reviewed_facts=facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(facts),
+    )
+
+    assert authority is not None
+    assert authority.verified_blob_paths == {f"blob:{blob.id}": blob.storage_path}
+
+
+def test_reviewed_source_authority_rejects_content_changed_after_review(tmp_path: Path) -> None:
+    """review -> update_blob -> settle must fail: authority binds content identity.
+
+    The blob keeps its id, path, session, and ready status after an in-place
+    update — every pre-fix custody check still passes — but the reviewed
+    ``content_hash_prefix`` no longer matches the live row, so stale reviewed
+    facts must not auto-authorize the new bytes (elspeth-b3feba9a7c).
+    """
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+    anchor = reviewed_anchor_hash(facts)
+
+    _mutate_blob_content_in_place(engine, blob, b"name,score\nMallory,0\n")
+
+    with pytest.raises(AuditIntegrityError, match="re-review"):
+        resolve_reviewed_source_authority(
+            engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=anchor,
+        )
+
+
+def test_reviewed_source_authority_rejects_stale_authoring_content_hash(tmp_path: Path) -> None:
+    """The source_authoring full-hash pin must also match the live blob row."""
+    engine, session_id, _other_session, blobs = _reviewed_source_harness(tmp_path)
+    blob = blobs[0]
+    facts = _content_bound_reviewed_facts(engine, str(blob.id))
+    reviewed = next(iter(facts["reviewed_sources"].values()))
+    # Keep the prefix consistent with the (stale) authoring pin so THIS test
+    # isolates the full-hash check rather than the prefix check.
+    stale_hash = "b" * 64
+    reviewed["options"][SOURCE_AUTHORING_KEY]["content_hash"] = stale_hash
+    reviewed["content_hash_prefix"] = stale_hash[:8]
+    anchor = reviewed_anchor_hash(facts)
+
+    with pytest.raises(AuditIntegrityError, match="re-review"):
+        resolve_reviewed_source_authority(
+            engine=engine,
+            session_id=session_id,
+            user_id="review-owner",
+            reviewed_facts=facts,
+            expected_reviewed_anchor_hash=anchor,
+        )
