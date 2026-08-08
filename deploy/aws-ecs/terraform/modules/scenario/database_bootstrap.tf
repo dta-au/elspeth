@@ -187,10 +187,12 @@ resource "terraform_data" "database_bootstrap" {
         --query 'tasks[0].taskArn' \
         --output text 2>"$work/run.err"); then
         printf '%s\n' database_bootstrap_run_failed >&2
+        sed -e 's/^/  aws: /' "$work/run.err" >&2 || true
         exit 1
       fi
       test -n "$task_arn" && test "$task_arn" != None || {
         printf '%s\n' database_bootstrap_task_missing >&2
+        sed -e 's/^/  aws: /' "$work/run.err" >&2 || true
         exit 1
       }
       if ! aws ecs wait tasks-stopped \
@@ -208,6 +210,7 @@ resource "terraform_data" "database_bootstrap" {
           --task "$task_arn" \
           --reason database_bootstrap_wait_failed >/dev/null 2>&1 || true
         printf '%s\n' database_bootstrap_wait_failed >&2
+        sed -e 's/^/  aws: /' "$work/wait.err" >&2 || true
         exit 1
       fi
       if ! exit_code=$(aws ecs describe-tasks \
@@ -218,6 +221,7 @@ resource "terraform_data" "database_bootstrap" {
         --query 'tasks[0].containers[?name==`database-bootstrap`].exitCode | [0]' \
         --output text 2>"$work/describe.err"); then
         printf '%s\n' database_bootstrap_describe_failed >&2
+        sed -e 's/^/  aws: /' "$work/describe.err" >&2 || true
         exit 1
       fi
       test "$exit_code" = 0 || {
