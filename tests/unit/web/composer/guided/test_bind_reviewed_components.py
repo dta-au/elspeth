@@ -1098,6 +1098,232 @@ def test_bind_reapplies_node_custody_after_topology_repairs() -> None:
     assert bound["nodes"][2]["input"] == "replacement_input"
 
 
+def test_bind_correction_rejects_stale_invented_sink_alias_in_routing() -> None:
+    # The correction flow lost the old single-output dangling repair when
+    # elspeth-572c642dbf replaced it with the plain-flow rejection and
+    # excluded correction candidates entirely. A stale invented sink alias
+    # then fell through to graph validation, whose source-attributed entries
+    # project config-masked — no connectivity facts — so the repair loop
+    # burned to REPAIR_EXHAUSTED on a defect the plain flow repairs in one
+    # turn. A name appearing in NEITHER the bound topology NOR the
+    # predecessor is provably not withheld structure: reject it with the
+    # same one-turn repair facts as the plain flow.
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][2]["on_success"] = "results_json"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=_correction_predecessor(),
+            correction_target=_format_node_correction_target(),
+        )
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity == {
+        "dangling_references": ["results_json"],
+        "declared_sinks": ["output"],
+        "consumable_connections": ["amount_gate", "format_high_value_input", "high_value"],
+    }
+
+
+def test_bind_correction_admits_predecessor_mentioned_names_for_validation() -> None:
+    # Amnesty boundary: "standard" is mentioned only by the predecessor
+    # gate's withheld routes{} — no candidate node consumes it — yet it is
+    # exactly the withheld-structure placeholder the correction flow must
+    # tolerate (the selected node's rewiring is adjudicated downstream).
+    # Every name the predecessor mentions anywhere stays for validation
+    # rather than being rejected as a stale alias.
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][2]["on_success"] = "standard"
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=_correction_predecessor(),
+        correction_target=_format_node_correction_target(),
+    )
+
+    assert bound["nodes"][2]["on_success"] == "standard"
+
+
+def _coalesce_correction_predecessor() -> CompositionState:
+    # fork -> two branch transforms -> coalesce -> shaper -> sink. The
+    # coalesce ``branches`` VALUES (tone_done / usage_done) are withheld
+    # structural behavior: guided_redacted_current_state_context projects
+    # id/input/on_success/on_error only, never routes/fork_to/branches.
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="fan_out",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={"schema": {"mode": "observed"}},
+                condition="True",
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("branch_a", "branch_b"),
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="assess_tone",
+                node_type="transform",
+                plugin="passthrough",
+                input="branch_a",
+                on_success="tone_done",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="assess_usage",
+                node_type="transform",
+                plugin="passthrough",
+                input="branch_b",
+                on_success="usage_done",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="merge_branches",
+                node_type="coalesce",
+                plugin=None,
+                input="branches",
+                on_success=None,
+                on_error=None,
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches={"branch_a": "tone_done", "branch_b": "usage_done"},
+                policy="require_all",
+                merge="union",
+            ),
+            NodeSpec(
+                id="shape_output",
+                node_type="transform",
+                plugin="passthrough",
+                input="merge_branches",
+                on_success="output",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="output",
+                plugin="json",
+                options={"path": "outputs/rows.jsonl"},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_bind_correction_rejection_facts_stay_candidate_authored() -> None:
+    # Custody guard on the new correction-flow rejection: the amnesty set may
+    # consult withheld predecessor structure (branches VALUES here) to admit
+    # targets server-side, but the connectivity facts crossing back to the
+    # provider must be built from the model's own candidate — a restored
+    # coalesce's branch connections must never surface in
+    # ``consumable_connections``.
+    predecessor = _coalesce_correction_predecessor()
+    candidate = {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        # The redacted reconstruction the provider can honestly author: no
+        # routes/fork_to/branches keys — those fields are withheld.
+        "nodes": [
+            {"id": "fan_out", "node_type": "gate", "plugin": None, "input": "rows", "on_success": None, "on_error": None},
+            {
+                "id": "assess_tone",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_a",
+                "on_success": "results_json",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "assess_usage",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_b",
+                "on_success": "usage_done",
+                "on_error": "discard",
+            },
+            {"id": "merge_branches", "node_type": "coalesce", "plugin": None, "input": "branches", "on_success": None, "on_error": None},
+            {
+                "id": "shape_output",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "merge_branches",
+                "on_success": "output",
+                "on_error": "discard",
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=predecessor,
+            correction_target=_node_correction_target(
+                "assess_tone",
+                stable_id="66666666-6666-4666-8666-666666666666",
+            ),
+        )
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity["dangling_references"] == ["results_json"]
+    consumable = raised.value.connectivity["consumable_connections"]
+    assert "tone_done" not in consumable
+    assert "usage_done" not in consumable
+
+
 def _amend_authority() -> GuidedRevisionAuthority:
     return GuidedRevisionAuthority(mode="amend", predecessor=_correction_predecessor())
 
@@ -1296,6 +1522,55 @@ def test_bind_explicit_prose_replace_permits_node_removal() -> None:
     assert result.rejection_code is None
     assert result.pipeline["nodes"] == []
     assert result.pipeline["sources"]["source"]["on_success"] == "output"
+
+
+def test_bind_explicit_prose_replace_rejects_stale_invented_sink_alias() -> None:
+    # Replace has explicit destructive topology authority and — unlike amend —
+    # NO adjudication of its own after binding, so opting out of the
+    # route-target rejection left a stale invented sink alias to die at
+    # config-masked validation (blind repair, REPAIR_EXHAUSTED). Replace gets
+    # plain-flow enforcement: the model owns every route it wrote.
+    predecessor = _correction_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"] = []
+    candidate["sources"]["source"]["on_success"] = "results_json"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        guided_planning.bind_guided_prose_revision_candidate(
+            candidate,
+            _guided(),
+            authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+        )
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity == {
+        "dangling_references": ["results_json"],
+        "declared_sinks": ["output"],
+        "consumable_connections": [],
+    }
+
+
+def test_bind_explicit_prose_replace_gets_no_predecessor_amnesty() -> None:
+    # Counterpart boundary to the correction amnesty: replace stages the
+    # candidate ALONE — a reference to a predecessor connection whose
+    # consumer the model removed is genuinely dangling in the staged
+    # pipeline, not withheld structure awaiting restoration.
+    predecessor = _correction_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"] = []
+    candidate["sources"]["source"]["on_success"] = "amount_gate"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        guided_planning.bind_guided_prose_revision_candidate(
+            candidate,
+            _guided(),
+            authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+        )
+
+    assert raised.value.error_code == "guided_route_target_unknown"
+    assert raised.value.connectivity["dangling_references"] == ["amount_gate"]
 
 
 class TestBindDeclaredRequiredFields:

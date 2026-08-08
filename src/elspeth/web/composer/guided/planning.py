@@ -843,6 +843,40 @@ def _candidate_topology_reference_names(bound: Mapping[str, Any]) -> tuple[set[s
     return node_ids, connection_names, branch_connection_names
 
 
+def _predecessor_reference_names(predecessor: CompositionState) -> set[str]:
+    """Every routing name the correction predecessor mentions anywhere.
+
+    Route-target amnesty for the correction flow's dangling check: restoring
+    unselected nodes from private authority can legitimately leave a
+    predecessor connection unconsumed while the selected node's rewiring is
+    adjudicated downstream, so any name the predecessor mentions — including
+    withheld ``routes``/``fork_to``/``branches`` values the provider never
+    saw — is admitted and its residual ambiguity left to validation. These
+    names are consulted SERVER-SIDE only; the rejection's connectivity facts
+    must never include them (custody: restored gate/coalesce structure is
+    withheld from the provider).
+    """
+    names: set[str] = {
+        *predecessor.sources,
+        *(source.on_success for source in predecessor.sources.values()),
+        *(output.name for output in predecessor.outputs),
+    }
+    for node in predecessor.nodes:
+        for value in (node.id, node.input, node.on_success, node.on_error):
+            if type(value) is str and value:
+                names.add(value)
+        if node.routes is not None:
+            names.update(value for value in node.routes.values() if type(value) is str)
+        if node.fork_to is not None:
+            names.update(value for value in node.fork_to if type(value) is str)
+        branches = node.branches
+        if isinstance(branches, Mapping):
+            names.update(value for value in branches.values() if type(value) is str)
+        elif branches is not None:
+            names.update(value for value in branches if type(value) is str)
+    return names
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -950,8 +984,9 @@ def bind_guided_reviewed_components(
     # deliver rows to the sink and skip it, building green where an unshadowed
     # name fails loudly as an unknown target. The alias-equality skip above
     # makes this unreachable for the forward check, so guard it here. The
-    # prose revision binder opts out (enforce_route_targets=False) to classify
-    # the same shape under its own closed amend/replace dispositions.
+    # prose AMEND binder opts out (enforce_route_targets=False) to classify
+    # the same shape under its own closed repair dispositions; REPLACE has no
+    # dispositions of its own and enforces like the plain flow.
     shadowed_reviewed_names = (
         sorted(name for name in expected_output_names if name in topology_reference_names) if enforce_route_targets else []
     )
@@ -1077,13 +1112,21 @@ def bind_guided_reviewed_components(
     # source-attributed validation entries project config-masked — no
     # connectivity facts — and the repair would be blind.
     #
-    # Enforcement is scoped to the PLAIN planning flow, where the model owns
-    # the full topology it authored. The correction flow withholds unselected
-    # nodes' structural behavior from the provider — its restoration can
-    # legitimately leave a restored node's on_success unconsumed while the
-    # selected node's rewiring is adjudicated downstream — and the prose
-    # revision binder (amend/replace) opts out to run its own authority
-    # adjudication and closed repair dispositions on the bound result.
+    # Enforcement spans every flow where the model owns the routing it wrote.
+    # The PLAIN planning flow checks the full candidate. The CORRECTION flow
+    # checks the post-restoration result with predecessor-name amnesty:
+    # restoration can legitimately leave a predecessor connection unconsumed
+    # while the selected node's rewiring is adjudicated downstream, so every
+    # name the predecessor mentions anywhere is admitted and left to
+    # validation — but a name in NEITHER the bound topology NOR the
+    # predecessor is provably not withheld structure, and skipping it here
+    # burned the correction repair loop to REPAIR_EXHAUSTED on the same
+    # config-masked feedback the plain flow repairs in one turn. The prose
+    # AMEND binder alone opts out (enforce_route_targets=False): its
+    # adjudication rebuilds routing from predecessor authority into one
+    # closed repair disposition. REPLACE enforces plain-flow semantics — its
+    # explicit destructive authority means the model owns the full topology
+    # it staged, and no downstream adjudication exists to catch the slip.
     #
     # Gate routes{}/fork_to[] deliberately stay out of the check: a value
     # outside known_targets is ambiguous there (stale sink name vs. a
@@ -1093,10 +1136,17 @@ def bind_guided_reviewed_components(
     # ambiguity belongs to validation. A dangling edge from_node likewise
     # stays: it is never a sink reference. "discard" is the legal drop-route
     # sentinel, not a reference.
-    if not enforce_route_targets or predecessor is not None:
+    if not enforce_route_targets:
         return cast(GuidedBoundPipeline, bound)
+    # Custody split for the facts below: known_targets may consult restored
+    # (withheld) structure, but ``consumable_connections`` crossing back to
+    # the provider is built from the PRE-restoration candidate sets computed
+    # above — strings the model itself authored.
+    candidate_consumable_connections = connection_names | branch_connection_names
     node_ids, connection_names, branch_connection_names = _candidate_topology_reference_names(bound)
     known_targets = set(expected_output_names) | node_ids | connection_names | branch_connection_names | {"discard"}
+    if predecessor is not None:
+        known_targets |= _predecessor_reference_names(predecessor)
     dangling_references: set[str] = set()
 
     def _collect_dangling(member: Mapping[str, Any], key: str) -> None:
@@ -1125,7 +1175,7 @@ def bind_guided_reviewed_components(
             connectivity={
                 "dangling_references": cast(JsonValue, sorted(dangling_references)),
                 "declared_sinks": cast(JsonValue, sorted(expected_output_names)),
-                "consumable_connections": cast(JsonValue, sorted(connection_names | branch_connection_names)),
+                "consumable_connections": cast(JsonValue, sorted(candidate_consumable_connections)),
             },
         )
     return cast(GuidedBoundPipeline, bound)
@@ -1154,7 +1204,13 @@ def bind_guided_prose_revision_candidate(
 
     if type(authority) is not GuidedRevisionAuthority:
         raise TypeError("authority must be an exact GuidedRevisionAuthority")
-    bound = bind_guided_reviewed_components(pipeline, guided, enforce_route_targets=False)
+    # ``amend`` opts out of the binder's route-target rejection: its
+    # reconstruction below rebuilds routing from predecessor authority into
+    # one closed repair disposition. ``replace`` stages the bound candidate
+    # with NO further adjudication, so it takes the plain-flow rejection —
+    # without it a stale invented sink alias fell through to config-masked
+    # validation and burned the repair loop to REPAIR_EXHAUSTED.
+    bound = bind_guided_reviewed_components(pipeline, guided, enforce_route_targets=authority.mode == "replace")
     if authority.mode == "replace":
         return GuidedRevisionBindingResult(pipeline=bound, rejection_code=None)
 
