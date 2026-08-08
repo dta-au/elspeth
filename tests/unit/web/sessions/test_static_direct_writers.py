@@ -914,15 +914,17 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     ReviewedWriter(
         path="src/elspeth/web/coordination/run_diagnostics_authority.py",
-        enclosing_symbol="RepositoryRunDiagnosticsAuditAuthority.append_audit_message",
+        enclosing_symbol="RepositoryRunDiagnosticsAuditAuthority.append_audit_messages",
         table="chat_messages",
         operation="sqlalchemy_insert_call",
         purpose=(
             "Run-diagnostics appends are exposed only through a handle-free "
             "repository authority. It acquires the canonical same-session "
             "lock before re-proving the live session and exact run/state "
-            "binding, then allocates the sequence and inserts inside that "
-            "single transaction (elspeth-0fcf68d50f)."
+            "binding, then allocates a contiguous sequence block and inserts "
+            "the whole cohort inside that single transaction "
+            "(elspeth-0fcf68d50f, elspeth-90231248dc). The singular "
+            "``append_audit_message`` delegates here as a cohort of one."
         ),
     ),
     ReviewedWriter(
