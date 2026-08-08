@@ -46,8 +46,9 @@ never invert a stated route — each route must lead to the destination the user
 named for that criterion. State the condition and every route's destination in
 the stage reply. If you had to choose a threshold, cutoff, or category
 yourself, stage a pending `pipeline_decision` interpretation requirement on
-that gate node and call
-`request_interpretation_review(kind="pipeline_decision", ...)` — a gate is not
+that gate node with `user_term: "gate_condition_authored"` — the registered
+term for this escalation, valid only on a gate node — and call
+`request_interpretation_review(kind="pipeline_decision", ...)`. A gate is not
 an `llm` node, so every other review kind (including `vague_term`) is dropped
 there and never surfaces.
 

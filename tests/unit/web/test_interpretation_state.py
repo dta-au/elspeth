@@ -2083,9 +2083,394 @@ def test_pipeline_decision_semantics_rejects_unregistered_user_term() -> None:
         validate_pipeline_decision_semantics(
             node_id="reconcile",
             plugin="field_mapper",
+            node_type="transform",
             options={},
+            condition=None,
+            routes=None,
             user_term="ab_reconciliation_retention",
             draft="Retain both variants in the reconciled row.",
             context="test",
             web_scrape_raw_fields=frozenset(),
         )
+
+
+# --------------------------------------------------------------------------- #
+# gate_condition_authored — the planner-authored gate-semantics review.
+#
+# The composer prompt doctrine instructs the planner to escalate a gate
+# threshold, category literal, or route direction it CHOSE ITSELF (rather than
+# carrying the user's stated value verbatim) as a pipeline_decision review. That
+# instruction was inert until this term was registered: an unregistered term is
+# rejected at validate_pipeline_decision_semantics and again at
+# pipeline_decision_artifact_hash, so the doctrine routed the planner into an
+# unresolvable card (elspeth-c2c35e52ae).
+#
+# A gate is a NODE TYPE, not a plugin (NodeSpec.plugin is None for gates), so
+# this arm binds on node_type — the mechanism differs from web_scrape_http_identity,
+# which binds on plugin.
+# --------------------------------------------------------------------------- #
+
+
+_DEFAULT_GATE_ROUTES: dict[str, str] = {"true": "accepted", "false": "rejected"}
+
+
+def _gate(
+    *,
+    node_id: str = "score_gate",
+    condition: str = "row.score >= 80",
+    # Sentinel-free explicit default: ``routes=None`` is a REAL case under test
+    # (a gate whose route mapping is absent), so it must not collapse into the
+    # convenience default.
+    routes: dict[str, str] | None = _DEFAULT_GATE_ROUTES,
+    fork_to: tuple[str, ...] | None = None,
+    options: dict[str, Any] | None = None,
+) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="gate",
+        plugin=None,
+        input="inbound",
+        on_success=None,
+        on_error=None,
+        options=options if options is not None else {},
+        condition=condition,
+        routes=routes,
+        fork_to=fork_to,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _gate_state(gate: NodeSpec) -> CompositionState:
+    return CompositionState(
+        source=None,
+        nodes=(gate,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_gate_condition_authored_is_registered() -> None:
+    """The escalation path the prompt doctrine names must be resolvable.
+
+    Both the authoring-time validator and the resolve-time hash registry are
+    closed sets keyed on this constant; membership is what makes an authored
+    gate escalation stageable at all.
+    """
+
+    from elspeth.web.interpretation_state import (
+        COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS,
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        REGISTERED_PIPELINE_DECISION_USER_TERMS,
+    )
+
+    assert GATE_CONDITION_AUTHORED_USER_TERM in REGISTERED_PIPELINE_DECISION_USER_TERMS
+    # The planner authors this row itself — it is not a server-staged disclosure.
+    assert GATE_CONDITION_AUTHORED_USER_TERM in COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS
+
+
+def test_registered_pipeline_decision_user_terms_is_the_exact_closed_set() -> None:
+    """Pin the closed registry membership itself.
+
+    Every member must have BOTH a validation arm and an artifact-hash helper.
+    Adding a term without them mints review cards that can never be resolved,
+    so growth of this set is a deliberate, reviewed act — not a side effect.
+    """
+
+    from elspeth.web.interpretation_state import REGISTERED_PIPELINE_DECISION_USER_TERMS
+
+    assert (
+        frozenset(
+            {
+                "drop_raw_html_fields",
+                "gate_condition_authored",
+                "prompt_injection_shield_recommendation",
+                "required_control_auto_wired",
+                "web_scrape_http_identity",
+            }
+        )
+        == REGISTERED_PIPELINE_DECISION_USER_TERMS
+    )
+
+
+def test_gate_condition_authored_passes_semantics_on_a_gate_node() -> None:
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    gate = _gate()
+    validate_pipeline_decision_node_semantics(
+        node=gate,
+        all_nodes=(gate,),
+        user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+        draft="I chose the 80 cutoff; you did not state one.",
+        context="test",
+    )
+
+
+def test_gate_condition_authored_rejects_a_non_gate_node() -> None:
+    """A registered term with no binding validates on ANY node.
+
+    Without this arm the planner could stage the gate escalation on an llm or
+    field_mapper node, pass set_pipeline, mint the card, and only then have
+    pipeline_decision_artifact_hash raise at resolve time — displacing the
+    wedge downstream instead of preventing it.
+    """
+
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    not_a_gate = NodeSpec(
+        id="scorer",
+        node_type="transform",
+        plugin="llm",
+        input="inbound",
+        on_success="scored",
+        on_error="errors",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+    with pytest.raises(ValueError, match="gate node"):
+        validate_pipeline_decision_node_semantics(
+            node=not_a_gate,
+            all_nodes=(not_a_gate,),
+            user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+            draft="I chose the 80 cutoff.",
+            context="test",
+        )
+
+
+@pytest.mark.parametrize(
+    ("condition", "routes"),
+    [
+        pytest.param("", {"true": "a", "false": "b"}, id="blank-condition"),
+        pytest.param("   ", {"true": "a", "false": "b"}, id="whitespace-condition"),
+        pytest.param("row.score >= 80", None, id="absent-routes"),
+    ],
+)
+def test_gate_condition_authored_requires_reviewable_gate_semantics(condition: str, routes: dict[str, str] | None) -> None:
+    """There must be something to review.
+
+    A blank condition or absent route mapping pins nothing — the card would
+    adjudicate an empty artifact.
+    """
+
+    from elspeth.web.interpretation_state import (
+        GATE_CONDITION_AUTHORED_USER_TERM,
+        validate_pipeline_decision_node_semantics,
+    )
+
+    gate = _gate(condition=condition, routes=routes)
+    with pytest.raises(ValueError, match="gate"):
+        validate_pipeline_decision_node_semantics(
+            node=gate,
+            all_nodes=(gate,),
+            user_term=GATE_CONDITION_AUTHORED_USER_TERM,
+            draft="I chose the cutoff.",
+            context="test",
+        )
+
+
+def test_gate_condition_authored_artifact_hash_is_deterministic() -> None:
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate()
+    twin = _gate()
+    assert pipeline_decision_artifact_hash(gate, (gate,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) == pipeline_decision_artifact_hash(
+        twin, (twin,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+def test_gate_condition_authored_artifact_hash_is_route_order_insensitive() -> None:
+    """Route insertion order is not an adjudicated fact — the mapping is."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    forward = _gate(routes={"true": "accepted", "false": "rejected"})
+    reversed_order = _gate(routes={"false": "rejected", "true": "accepted"})
+    assert pipeline_decision_artifact_hash(
+        forward, (forward,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) == pipeline_decision_artifact_hash(reversed_order, (reversed_order,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_tracks_the_condition() -> None:
+    """Fabrication axis 1+2: threshold value and category literal.
+
+    Silently re-cutting 80 to 70 after review must drift the accepted hash.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    at_80 = _gate(condition="row.score >= 80")
+    at_70 = _gate(condition="row.score >= 70")
+    assert pipeline_decision_artifact_hash(at_80, (at_80,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) != pipeline_decision_artifact_hash(
+        at_70, (at_70,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+@pytest.mark.parametrize(
+    "mutated_routes",
+    [
+        pytest.param({"true": "rejected", "false": "accepted"}, id="routes-inverted"),
+        pytest.param({"true": "quarantine", "false": "rejected"}, id="true-destination-changed"),
+        pytest.param({"true": "accepted", "false": "quarantine"}, id="false-destination-changed"),
+    ],
+)
+def test_gate_condition_authored_artifact_hash_tracks_each_route_destination(mutated_routes: dict[str, str]) -> None:
+    """Fabrication axis 3: route direction.
+
+    EACH destination is material — an inversion is the exact failure the
+    doctrine's "never invert stated routes" rule guards, so it must drift the
+    hash, not just a change to the mapping's size.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    baseline = _gate(routes={"true": "accepted", "false": "rejected"})
+    mutated = _gate(routes=mutated_routes)
+    assert pipeline_decision_artifact_hash(
+        baseline, (baseline,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) != pipeline_decision_artifact_hash(mutated, (mutated,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_tracks_fork_destinations() -> None:
+    """A fork gate's route direction lives in fork_to, not routes."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    forked = _gate(fork_to=("fast_path", "slow_path"))
+    reforked = _gate(fork_to=("fast_path", "manual_path"))
+    assert pipeline_decision_artifact_hash(
+        forked, (forked,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    ) != pipeline_decision_artifact_hash(reforked, (reforked,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+
+def test_gate_condition_authored_artifact_hash_ignores_unrelated_option_edits() -> None:
+    """Minimum-projection doctrine: unrelated edits must not re-stage the card."""
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    plain = _gate(options={})
+    annotated = _gate(options={"description": "score cutoff gate"})
+    assert pipeline_decision_artifact_hash(plain, (plain,), user_term=GATE_CONDITION_AUTHORED_USER_TERM) == pipeline_decision_artifact_hash(
+        annotated, (annotated,), user_term=GATE_CONDITION_AUTHORED_USER_TERM
+    )
+
+
+def test_staged_gate_pipeline_decision_survives_the_non_llm_kind_filter() -> None:
+    """The whole point of the escalation: the card must actually surface.
+
+    ``_pending_node_sites`` drops every pending kind except PIPELINE_DECISION on
+    a non-llm node. A gate is non-llm, so this is the one kind that reaches the
+    review surface there — and the review requirement must appear in
+    ``interpretation_sites`` for /validate and /execute to block on it.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate(
+        options={
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": "score_gate:gate_condition_authored",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": GATE_CONDITION_AUTHORED_USER_TERM,
+                    "status": "pending",
+                    "draft": "I chose the 80 cutoff; you did not state one.",
+                    "event_id": None,
+                    "accepted_value": None,
+                    "accepted_artifact_hash": None,
+                    "resolved_prompt_template_hash": None,
+                }
+            ]
+        }
+    )
+
+    sites = interpretation_sites(_gate_state(gate))
+
+    assert len(sites) == 1
+    assert sites[0].component_id == "score_gate"
+    assert sites[0].component_type == "transform"
+    assert sites[0].user_term == GATE_CONDITION_AUTHORED_USER_TERM
+    assert sites[0].kind is InterpretationKind.PIPELINE_DECISION
+
+
+def test_resolved_gate_pipeline_decision_round_trips_through_materialization() -> None:
+    """A resolved gate review must survive the execution drift guard.
+
+    ``_validate_pipeline_decision_review`` re-runs BOTH the semantics arm and
+    the hash arm on the resolved row, so a resolved gate escalation exercises
+    the full write-then-read path the session service uses.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    bare = _gate()
+    accepted_hash = pipeline_decision_artifact_hash(bare, (bare,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+    resolved = _gate(
+        options={
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": "score_gate:gate_condition_authored",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": GATE_CONDITION_AUTHORED_USER_TERM,
+                    "status": "resolved",
+                    "draft": "I chose the 80 cutoff; you did not state one.",
+                    "event_id": "evt-1",
+                    "accepted_value": "Approved: 80 is the right cutoff.",
+                    "accepted_artifact_hash": accepted_hash,
+                    "resolved_prompt_template_hash": None,
+                }
+            ]
+        }
+    )
+
+    assert interpretation_sites(_gate_state(resolved)) == ()
+    # Materialization must not report the gate as blocking. Authoring options are
+    # stripped later by ``strip_authoring_options`` at config lowering, not here,
+    # so this asserts only that the resolved review clears the execution gate.
+    assert not isinstance(materialize_state_for_execution(_gate_state(resolved)), InterpretationReviewPending)
+
+    # Re-cutting the threshold after acceptance must NOT silently execute.
+    drifted = _gate_state(replace(resolved, condition="row.score >= 70"))
+    with pytest.raises(ValueError, match="drifted"):
+        materialize_state_for_execution(drifted)
+
+
+def test_gate_condition_authored_artifact_hash_survives_the_persistence_bridge() -> None:
+    """The write side and the read side must agree across serialization.
+
+    ``gate_condition_authored`` is the FIRST registered term whose projection
+    reads NodeSpec fields OUTSIDE ``options`` (condition / routes / fork_to).
+    The session service recomputes this hash from a persisted state record via
+    ``NodeSpec.from_dict``, so any of those fields dropped or re-typed by the
+    to_dict/from_dict round trip would make an accepted review read as drifted
+    on reload — a wedge that only appears after a session is saved and
+    reopened, never in an in-memory test.
+
+    ``fork_to`` is the sharp edge: it is a tuple in memory and a list on the
+    wire, so the projection must normalise it.
+    """
+
+    from elspeth.web.interpretation_state import GATE_CONDITION_AUTHORED_USER_TERM
+
+    gate = _gate(routes={"true": "accepted", "false": "rejected"}, fork_to=("fast_path", "slow_path"))
+    in_memory = pipeline_decision_artifact_hash(gate, (gate,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+    # Exactly the bridge sessions/service uses: state.to_dict() -> NodeSpec.from_dict.
+    round_tripped = NodeSpec.from_dict(dict(_gate_state(gate).to_dict()["nodes"][0]))
+    reloaded = pipeline_decision_artifact_hash(round_tripped, (round_tripped,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
+
+    assert reloaded == in_memory

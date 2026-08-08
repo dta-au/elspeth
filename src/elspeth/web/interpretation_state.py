@@ -48,6 +48,7 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
         "web_scrape_http_identity",
         "prompt_injection_shield_recommendation",
         "required_control_auto_wired",
+        "gate_condition_authored",
     }
 )
 # Sink-neutral wording (pack pressure-suite run 2, G6): the old "JSON output"
@@ -61,6 +62,18 @@ PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
 # elspeth-f99655f540). The row rides on the INSERTED node, staged pending by
 # ``web.composer.required_controls.wire_required_controls``.
 REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
+# Planner-authored gate semantics (elspeth-c2c35e52ae). The composer prompt
+# doctrine tells the planner to escalate a gate threshold, category literal, or
+# route direction it CHOSE ITSELF rather than carrying the user's stated value
+# verbatim. That instruction was inert until this term existed: an unregistered
+# term is rejected at ``validate_pipeline_decision_semantics`` and again at
+# ``pipeline_decision_artifact_hash``, so the doctrine routed the planner into a
+# card that could never be minted.
+#
+# Unlike the two plugin-bound terms above, a gate is a NODE TYPE and carries no
+# plugin at all (``NodeSpec.plugin`` is None for structural nodes), so this term
+# binds on ``node_type == "gate"``.
+GATE_CONDITION_AUTHORED_USER_TERM: Final[str] = "gate_condition_authored"
 
 # The public composer may author only these pipeline-decision rows.  The full
 # registry above also contains server-staged disclosures, so teaching that set
@@ -238,13 +251,25 @@ def validate_pipeline_decision_semantics(
     *,
     node_id: str,
     plugin: str | None,
+    node_type: str,
     options: Mapping[str, Any],
+    condition: str | None,
+    routes: Mapping[str, str] | None,
     user_term: str,
     draft: str | None,
     context: str,
     web_scrape_raw_fields: frozenset[str],
 ) -> None:
-    """Validate that reviewed pipeline-shaping decisions match node behavior."""
+    """Validate that reviewed pipeline-shaping decisions match node behavior.
+
+    Every registered term needs a binding arm here. A registered term that
+    falls through validates on ANY node, which lets a misplaced row pass
+    ``set_pipeline`` and mint a card that only fails later at
+    ``pipeline_decision_artifact_hash`` — displacing the unresolvable-card wedge
+    downstream instead of preventing it. ``node_type``/``condition``/``routes``
+    are required rather than defaulted for the same reason: a caller that omits
+    the gate facts would silently skip the gate arm.
+    """
 
     normalized_term = user_term.strip()
     if normalized_term not in REGISTERED_PIPELINE_DECISION_USER_TERMS:
@@ -257,6 +282,29 @@ def validate_pipeline_decision_semantics(
             "be reviewed or resolved — drop the requirement and record the rationale in "
             "metadata.description, or use an llm_prompt_template review for prompt-shaped decisions."
         )
+    if _is_gate_condition_authored_decision(user_term=user_term):
+        if node_type != "gate":
+            raise ValueError(
+                f"{context}: authored gate-condition decision must be implemented by a gate node; "
+                f"node {node_id!r} has node_type {node_type!r}"
+            )
+        # There must be something to adjudicate. Composer Stage 1 already
+        # requires BOTH fields on every gate (``gate_missing_condition`` /
+        # ``gate_missing_routes``), so requiring them here cannot reject a gate
+        # the composer would otherwise accept — this arm is never stricter than
+        # the legality rules, it only refuses to pin an empty artifact.
+        #
+        # These are NOMINAL checks, not structural ones: ``condition`` and
+        # ``routes`` are typed fields of the owned ``NodeSpec`` dataclass, so
+        # ADR-032 says type them nominally. The sibling arms below reach for
+        # ``isinstance`` only because they parse ``options``, an untyped
+        # Tier-3 ``Mapping[str, Any]`` blob — a different trust domain.
+        if condition is None or not condition.strip():
+            raise ValueError(f"{context}: authored gate-condition decision requires a non-empty condition on gate {node_id!r}")
+        if routes is None:
+            raise ValueError(f"{context}: authored gate-condition decision requires a routes mapping on gate {node_id!r}")
+        return
+
     if _is_web_scrape_http_identity_decision(user_term=user_term):
         if plugin != "web_scrape":
             raise ValueError(
@@ -311,7 +359,10 @@ def validate_pipeline_decision_node_semantics(
     validate_pipeline_decision_semantics(
         node_id=node.id,
         plugin=node.plugin,
+        node_type=node.node_type,
         options=node.options,
+        condition=node.condition,
+        routes=node.routes,
         user_term=user_term,
         draft=draft,
         context=context,
@@ -622,7 +673,10 @@ def _raw_html_cleanup_requirement_contract_error(
             validate_pipeline_decision_semantics(
                 node_id=node.id,
                 plugin=node.plugin,
+                node_type=node.node_type,
                 options=node.options,
+                condition=node.condition,
+                routes=node.routes,
                 user_term=requirement["user_term"],
                 draft=requirement["draft"],
                 context="raw-html cleanup review contract",
@@ -645,6 +699,10 @@ def _is_raw_html_cleanup_decision(*, user_term: str, draft: str | None) -> bool:
 
 def _is_web_scrape_http_identity_decision(*, user_term: str) -> bool:
     return user_term.strip() == WEB_SCRAPE_HTTP_IDENTITY_USER_TERM
+
+
+def _is_gate_condition_authored_decision(*, user_term: str) -> bool:
+    return user_term.strip() == GATE_CONDITION_AUTHORED_USER_TERM
 
 
 def _validated_mapping_pair(source_field: object, target_field: object, *, context: str, node_id: str) -> tuple[str, str]:
@@ -1294,7 +1352,45 @@ def pipeline_decision_artifact_hash(
         return _web_scrape_http_identity_artifact_hash(node)
     if normalized == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
         return _required_control_auto_wired_artifact_hash(node)
+    if normalized == GATE_CONDITION_AUTHORED_USER_TERM:
+        return _gate_condition_authored_artifact_hash(node)
     raise ValueError(f"pipeline_decision_artifact_hash: unknown pipeline_decision user_term {user_term!r}")
+
+
+def _gate_condition_authored_artifact_hash(node: NodeSpec) -> str:
+    """Material-scoped hash for the planner-authored gate-semantics review.
+
+    The review accepts a gate criterion the PLANNER chose rather than one the
+    user stated verbatim. The hash binds to exactly the three fabrication axes
+    the doctrine names:
+
+    - the ``condition`` expression, which carries both the threshold VALUE and
+      any category LITERAL compared against;
+    - the ``routes`` mapping, whose every destination is material — an inverted
+      route is the precise failure the "never invert stated routes" rule guards,
+      and it changes no other field;
+    - ``fork_to``, because a fork gate's route direction lives there rather than
+      in ``routes``; omitting it would leave that axis unpinned for fork gates.
+
+    ``options`` and ``on_error`` are deliberately excluded: neither changes the
+    criterion the reviewer adjudicated, so editing them should leave an accepted
+    review intact (the minimum-projection doctrine on this function).
+
+    Route insertion order is NOT material — ``stable_hash`` canonicalises the
+    mapping by key, so re-ordering the routes cannot drift an accepted review.
+    """
+
+    if node.node_type != "gate":
+        raise ValueError(f"pipeline_decision_artifact_hash: gate_condition_authored requires a gate node, got {node.node_type!r}")
+    return stable_hash(
+        {
+            "review_kind": "gate_condition_authored",
+            "gate_node_id": node.id,
+            "condition": node.condition,
+            "routes": dict(node.routes) if node.routes is not None else None,
+            "fork_to": list(node.fork_to) if node.fork_to is not None else None,
+        }
+    )
 
 
 def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:

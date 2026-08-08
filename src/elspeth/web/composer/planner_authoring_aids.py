@@ -686,6 +686,12 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "required_control_auto_wired — that disclosure is staged exclusively by "
     "the server's required-control auto-wire pass, and a hand-authored row "
     "forges a policy_required entry in the audit disclosure.",
+    "When YOU chose a gate's threshold, cutoff, category literal, or route "
+    "direction — rather than carrying a value the user stated verbatim or a "
+    "reviewed schema fact established — stage a pipeline_decision row with "
+    "user_term gate_condition_authored ON THAT GATE NODE and call "
+    "request_interpretation_review for it. The row is valid only on a gate "
+    "node; the review pins the gate's condition and every route destination.",
 )
 
 

@@ -446,10 +446,15 @@ a gate:
 - Never invert stated routes: the criterion the user attached to a route must
   reach the destination the user named for it — check each route's destination
   against the user's words, not against what seems sensible.
-- If you chose a threshold, cutoff, or category yourself because the user's
-  criterion was not operational, stage a pending `pipeline_decision`
-  requirement on that gate node in the same mutation and call
-  `request_interpretation_review(kind="pipeline_decision", ...)` for it.
+- If you chose a threshold, cutoff, category, or route direction yourself
+  because the user's criterion was not operational, stage a pending
+  `pipeline_decision` requirement on that gate node in the same mutation with
+  `user_term: "gate_condition_authored"` — the registered term for exactly this
+  escalation — and call
+  `request_interpretation_review(kind="pipeline_decision", ...)` for it. That
+  term is valid ONLY on a gate node, and its review pins the gate's `condition`
+  and every route destination, so a later silent re-cut of the threshold or an
+  inverted route re-stages the card instead of executing unreviewed.
 - State the gate's condition and each route's destination in your stage reply,
   in the user's terms, so the routing decision is visible before review.
 
