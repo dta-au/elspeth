@@ -90,16 +90,27 @@ data "aws_iam_policy_document" "task" {
     resources = [aws_s3_bucket.acceptance.arn]
   }
 
-  statement {
-    sid       = "InvokeConfiguredBedrockModels"
-    actions   = ["bedrock:InvokeModel"]
-    resources = local.bedrock_invoke_model_arns
+  # Both Bedrock statements exist only under the bedrock backend: under
+  # custom_gateway the task role carries no Bedrock permission of any kind
+  # (the gateway sidecar owns the upstream, outside AWS IAM entirely).
+  dynamic "statement" {
+    for_each = local.bedrock_backend ? [1] : []
+
+    content {
+      sid       = "InvokeConfiguredBedrockModels"
+      actions   = ["bedrock:InvokeModel"]
+      resources = local.bedrock_invoke_model_arns
+    }
   }
 
-  statement {
-    sid       = "ApplyAcceptanceGuardrails"
-    actions   = ["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"]
-    resources = [aws_bedrock_guardrail.prompt.guardrail_arn, aws_bedrock_guardrail.content.guardrail_arn]
+  dynamic "statement" {
+    for_each = local.bedrock_backend ? [1] : []
+
+    content {
+      sid       = "ApplyAcceptanceGuardrails"
+      actions   = ["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"]
+      resources = [aws_bedrock_guardrail.prompt[0].guardrail_arn, aws_bedrock_guardrail.content[0].guardrail_arn]
+    }
   }
 
   statement {

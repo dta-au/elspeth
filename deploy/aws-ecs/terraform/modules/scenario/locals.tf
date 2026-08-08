@@ -21,6 +21,7 @@ locals {
 
   cpu_architecture = var.target_platform == "linux/amd64" ? "X86_64" : "ARM64"
   deployment_mode  = var.deployment_lifecycle
+  bedrock_backend  = var.llm_backend == "bedrock"
 
   # Per-letter network identity. Each maintained scenario owns a distinct /16
   # so disposable stacks for different scenarios can coexist without overlap.
@@ -231,13 +232,13 @@ locals {
   # model passed startup validation and then died at invoke with AccessDenied —
   # a trap the module comment and the reference docs both had to WARN about.
   # Including the profile models makes that failure unreachable.
-  bedrock_configured_model_ids = distinct(concat(
+  bedrock_configured_model_ids = local.bedrock_backend ? distinct(concat(
     [
       trimprefix(var.composer_model, "bedrock/"),
       trimprefix(var.composer_advisor_model, "bedrock/"),
     ],
     [for profile in values(local.effective_llm_profile_bindings) : trimprefix(profile.model, "bedrock/")],
-  ))
+  )) : []
 
   # Map each configured model id to the cross-region prefix it starts with, or null if it is
   # region-pinned. try() turns the index-out-of-bounds error from an empty match list into null.
@@ -274,8 +275,10 @@ locals {
     if prefix != null
   ])
 
-  bedrock_litellm_model      = var.composer_model
-  bedrock_fast_litellm_model = var.composer_advisor_model
+  # Empty under custom_gateway: the composer models are not Bedrock ids there
+  # and the Bedrock live-test env var must not name an uninvokable model.
+  bedrock_litellm_model      = local.bedrock_backend ? var.composer_model : ""
+  bedrock_fast_litellm_model = local.bedrock_backend ? var.composer_advisor_model : ""
   # Two default profiles so a pipeline can pick a tier, and web authors keep
   # selecting an opaque alias rather than a model id.
   #
@@ -307,24 +310,24 @@ locals {
       region_name = coalesce(profile.region_name, var.aws_region)
     }
   }
-  bedrock_profile_model_ids = {
+  bedrock_profile_model_ids = local.bedrock_backend ? {
     for alias, profile in local.effective_llm_profile_bindings :
     alias => trimprefix(profile.model, "bedrock/")
-  }
+  } : {}
   bedrock_profile_cross_region_prefixes = {
     for alias, model_id in local.bedrock_profile_model_ids :
     alias => local.bedrock_configured_model_cross_region_prefixes[model_id]
   }
-  bedrock_profile_foundation_model_arns = distinct([
+  bedrock_profile_foundation_model_arns = local.bedrock_backend ? distinct([
     for alias, profile in local.effective_llm_profile_bindings :
     "arn:aws:bedrock:${profile.region_name}::foundation-model/${local.bedrock_profile_model_ids[alias]}"
     if local.bedrock_profile_cross_region_prefixes[alias] == null
-  ])
-  bedrock_profile_inference_profile_arns = distinct([
+  ]) : []
+  bedrock_profile_inference_profile_arns = local.bedrock_backend ? distinct([
     for alias, profile in local.effective_llm_profile_bindings :
     "arn:aws:bedrock:${profile.region_name}:${var.aws_account_id}:inference-profile/${local.bedrock_profile_model_ids[alias]}"
     if local.bedrock_profile_cross_region_prefixes[alias] != null
-  ])
+  ]) : []
   bedrock_invoke_model_arns = distinct(concat(
     tolist(var.bedrock_inference_profile_arns),
     tolist(var.bedrock_foundation_model_arns),
@@ -369,26 +372,26 @@ locals {
   effective_prompt_guardrail  = var.prompt_guardrail == null ? local.default_prompt_guardrail : var.prompt_guardrail
   effective_content_guardrail = var.content_guardrail == null ? local.default_content_guardrail : var.content_guardrail
 
-  guardrail_profiles = jsonencode([
+  guardrail_profiles = local.bedrock_backend ? jsonencode([
     {
       alias                = "prompt-approved"
       plugin               = "aws_bedrock_prompt_shield"
-      guardrail_identifier = aws_bedrock_guardrail.prompt.guardrail_id
-      guardrail_version    = aws_bedrock_guardrail_version.prompt.version
+      guardrail_identifier = aws_bedrock_guardrail.prompt[0].guardrail_id
+      guardrail_version    = aws_bedrock_guardrail_version.prompt[0].version
       region               = var.aws_region
     },
     {
       alias                = "content-approved"
       plugin               = "aws_bedrock_content_safety"
-      guardrail_identifier = aws_bedrock_guardrail.content.guardrail_id
-      guardrail_version    = aws_bedrock_guardrail_version.content.version
+      guardrail_identifier = aws_bedrock_guardrail.content[0].guardrail_id
+      guardrail_version    = aws_bedrock_guardrail_version.content[0].version
       region               = var.aws_region
     },
-  ])
-  guardrail_defaults = jsonencode({
+  ]) : jsonencode([])
+  guardrail_defaults = local.bedrock_backend ? jsonencode({
     aws_bedrock_prompt_shield  = "prompt-approved"
     aws_bedrock_content_safety = "content-approved"
-  })
+  }) : jsonencode({})
 
   plugin_policy_projection = {
     ELSPETH_WEB__PLUGIN_ALLOWLIST                   = local.plugin_allowlist

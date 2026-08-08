@@ -185,8 +185,12 @@ variable "composer_model" {
   type = string
 
   validation {
-    condition     = startswith(var.composer_model, "bedrock/") && var.composer_model != var.composer_advisor_model
-    error_message = "composer_model must be a bedrock/... provider ID distinct from composer_advisor_model."
+    condition = var.composer_model != var.composer_advisor_model && (
+      var.llm_backend == "bedrock"
+      ? startswith(var.composer_model, "bedrock/")
+      : !startswith(var.composer_model, "bedrock/")
+    )
+    error_message = "composer_model must be distinct from composer_advisor_model, and must be a bedrock/... provider ID under the bedrock backend (a non-bedrock provider ID under custom_gateway)."
   }
 }
 
@@ -194,26 +198,43 @@ variable "composer_advisor_model" {
   type = string
 
   validation {
-    condition     = startswith(var.composer_advisor_model, "bedrock/")
-    error_message = "composer_advisor_model must be a bedrock/... provider ID."
+    condition = (
+      var.llm_backend == "bedrock"
+      ? startswith(var.composer_advisor_model, "bedrock/")
+      : !startswith(var.composer_advisor_model, "bedrock/")
+    )
+    error_message = "composer_advisor_model must be a bedrock/... provider ID under the bedrock backend (a non-bedrock provider ID under custom_gateway)."
   }
 }
 
 variable "bedrock_inference_profile_arns" {
-  type = set(string)
+  type    = set(string)
+  default = []
 
   validation {
-    condition     = length(var.bedrock_inference_profile_arns) > 0 && alltrue([for arn in var.bedrock_inference_profile_arns : can(regex("^arn:[^:]+:bedrock:[^:]+:[0-9]{12}:inference-profile/", arn))])
-    error_message = "bedrock_inference_profile_arns must contain at least one inference-profile ARN."
+    # Required under the bedrock backend; REJECTED under custom_gateway
+    # (acceptance criterion: Scenario C requires no Bedrock model or ARN
+    # input — a stray grant input is an authoring error, not dead weight).
+    condition = (
+      var.llm_backend == "bedrock"
+      ? length(var.bedrock_inference_profile_arns) > 0 && alltrue([for arn in var.bedrock_inference_profile_arns : can(regex("^arn:[^:]+:bedrock:[^:]+:[0-9]{12}:inference-profile/", arn))])
+      : length(var.bedrock_inference_profile_arns) == 0
+    )
+    error_message = "bedrock_inference_profile_arns must contain at least one inference-profile ARN under the bedrock backend, and must be unset under custom_gateway."
   }
 }
 
 variable "bedrock_foundation_model_arns" {
-  type = set(string)
+  type    = set(string)
+  default = []
 
   validation {
-    condition     = length(var.bedrock_foundation_model_arns) > 0 && alltrue([for arn in var.bedrock_foundation_model_arns : can(regex("^arn:[^:]+:bedrock:[^:]+::foundation-model/", arn))])
-    error_message = "bedrock_foundation_model_arns must contain at least one foundation-model ARN."
+    condition = (
+      var.llm_backend == "bedrock"
+      ? length(var.bedrock_foundation_model_arns) > 0 && alltrue([for arn in var.bedrock_foundation_model_arns : can(regex("^arn:[^:]+:bedrock:[^:]+::foundation-model/", arn))])
+      : length(var.bedrock_foundation_model_arns) == 0
+    )
+    error_message = "bedrock_foundation_model_arns must contain at least one foundation-model ARN under the bedrock backend, and must be unset under custom_gateway."
   }
 }
 
@@ -389,6 +410,15 @@ variable "plugin_allowlist" {
     ])
     error_message = "each plugin_allowlist entry must be kind-qualified, e.g. \"transform:llm\"."
   }
+
+  validation {
+    # Bedrock-implemented plugins cannot run without Bedrock IAM, and an
+    # authorization that can never run misstates the deployment's posture.
+    condition = var.llm_backend == "bedrock" || var.plugin_allowlist == null || alltrue([
+      for id in var.plugin_allowlist : !startswith(id, "transform:aws_bedrock_")
+    ])
+    error_message = "under custom_gateway the plugin_allowlist must not authorize transform:aws_bedrock_* plugins; the deployment carries no Bedrock IAM."
+  }
 }
 
 variable "plugin_preferences" {
@@ -436,6 +466,15 @@ variable "plugin_preferences" {
     ]))
     error_message = "every preferred implementation must be authorized by the always-authorized web core or plugin_allowlist."
   }
+
+  validation {
+    condition = var.llm_backend == "bedrock" || var.plugin_preferences == null || alltrue(flatten([
+      for implementations in values(var.plugin_preferences) : [
+        for implementation in implementations : !startswith(implementation, "transform:aws_bedrock_")
+      ]
+    ]))
+    error_message = "under custom_gateway plugin_preferences must not select transform:aws_bedrock_* implementations; the deployment carries no Bedrock IAM."
+  }
 }
 
 variable "plugin_control_modes" {
@@ -472,6 +511,20 @@ variable "plugin_control_modes" {
     error_message = "a control set to \"required\" must name at least one implementation in plugin_preferences."
   }
 
+  # Fail closed under custom_gateway: the shipped defaults implement
+  # prompt_shield and content_safety with Bedrock transforms, which cannot run
+  # without Bedrock IAM. Silently weakening a required control is not an
+  # option, so the module refuses its own defaults and demands the operator
+  # state the control posture explicitly in the scenario configuration.
+  validation {
+    condition = var.llm_backend == "bedrock" || (
+      var.plugin_control_modes != null &&
+      contains(keys(var.plugin_control_modes), "prompt_shield") &&
+      contains(keys(var.plugin_control_modes), "content_safety")
+    )
+    error_message = "under custom_gateway the module default control posture (Bedrock-implemented, required) cannot apply; plugin_control_modes must explicitly state the prompt_shield and content_safety modes, and any \"required\" mode must name a non-Bedrock implementation in plugin_preferences."
+  }
+
 }
 
 variable "llm_profiles" {
@@ -484,9 +537,13 @@ variable "llm_profiles" {
 
   validation {
     condition = var.llm_profiles == null || alltrue([
-      for profile in values(var.llm_profiles) : startswith(profile.model, "bedrock/")
+      for profile in values(var.llm_profiles) : (
+        var.llm_backend == "bedrock"
+        ? startswith(profile.model, "bedrock/")
+        : !startswith(profile.model, "bedrock/")
+      )
     ])
-    error_message = "each llm_profiles model must be a bedrock/... provider id; this module grants Bedrock access only."
+    error_message = "each llm_profiles model must be a bedrock/... provider id under the bedrock backend (the Bedrock IAM grant is derived from it), and a non-bedrock model id under custom_gateway (the gateway sidecar owns the upstream)."
   }
 
   validation {
@@ -570,6 +627,11 @@ variable "prompt_guardrail" {
     condition     = var.prompt_guardrail == null || length(var.prompt_guardrail.filters) > 0
     error_message = "prompt_guardrail.filters must not be empty; a Guardrail with no filter screens nothing."
   }
+
+  validation {
+    condition     = var.llm_backend == "bedrock" || var.prompt_guardrail == null
+    error_message = "prompt_guardrail configures a Bedrock Guardrail resource and must be unset under custom_gateway."
+  }
 }
 
 variable "content_guardrail" {
@@ -598,5 +660,10 @@ variable "content_guardrail" {
   validation {
     condition     = var.content_guardrail == null || length(var.content_guardrail.filters) > 0
     error_message = "content_guardrail.filters must not be empty; a Guardrail with no filter screens nothing."
+  }
+
+  validation {
+    condition     = var.llm_backend == "bedrock" || var.content_guardrail == null
+    error_message = "content_guardrail configures a Bedrock Guardrail resource and must be unset under custom_gateway."
   }
 }

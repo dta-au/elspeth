@@ -197,6 +197,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "acceptance" {
 }
 
 resource "aws_bedrock_guardrail" "prompt" {
+  count = local.bedrock_backend ? 1 : 0
+
   name                      = "elspeth-${local.compact_run_id}-${local.scenario_id_lower}-prompt"
   description               = "Disposable ELSPETH ${var.scenario_id} prompt acceptance Guardrail"
   blocked_input_messaging   = local.effective_prompt_guardrail.blocked_input_messaging
@@ -218,7 +220,9 @@ resource "aws_bedrock_guardrail" "prompt" {
 }
 
 resource "aws_bedrock_guardrail_version" "prompt" {
-  guardrail_arn = aws_bedrock_guardrail.prompt.guardrail_arn
+  count = local.bedrock_backend ? 1 : 0
+
+  guardrail_arn = aws_bedrock_guardrail.prompt[count.index].guardrail_arn
   # The content digest in the description forces a NEW immutable version
   # whenever the effective guardrail policy changes. With a constant
   # description the parent updated in place, no new version was cut, and
@@ -232,6 +236,8 @@ resource "aws_bedrock_guardrail_version" "prompt" {
 }
 
 resource "aws_bedrock_guardrail" "content" {
+  count = local.bedrock_backend ? 1 : 0
+
   name                      = "elspeth-${local.compact_run_id}-${local.scenario_id_lower}-content"
   description               = "Disposable ELSPETH ${var.scenario_id} content acceptance Guardrail"
   blocked_input_messaging   = local.effective_content_guardrail.blocked_input_messaging
@@ -253,7 +259,9 @@ resource "aws_bedrock_guardrail" "content" {
 }
 
 resource "aws_bedrock_guardrail_version" "content" {
-  guardrail_arn = aws_bedrock_guardrail.content.guardrail_arn
+  count = local.bedrock_backend ? 1 : 0
+
+  guardrail_arn = aws_bedrock_guardrail.content[count.index].guardrail_arn
   # Content digest forces a new version on policy change — see the
   # prompt version resource above for the full rationale.
   description  = "Disposable ELSPETH content acceptance version ${substr(sha256(jsonencode(local.effective_content_guardrail)), 0, 12)}"

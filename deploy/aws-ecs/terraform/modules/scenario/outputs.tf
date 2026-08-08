@@ -143,16 +143,18 @@ locals {
       rule_name      = local.event_rule_name
       target_ids     = [local.event_target_id]
     }]
-    bedrock_guardrails = [
-      {
-        identifier = aws_bedrock_guardrail.prompt.guardrail_id
-        versions   = [aws_bedrock_guardrail_version.prompt.version]
-      },
-      {
-        identifier = aws_bedrock_guardrail.content.guardrail_id
-        versions   = [aws_bedrock_guardrail_version.content.version]
-      },
-    ]
+    # Comprehensions over the count-gated resources: empty under
+    # custom_gateway, the two disposable Guardrails under bedrock.
+    bedrock_guardrails = concat(
+      [for i, guardrail in aws_bedrock_guardrail.prompt : {
+        identifier = guardrail.guardrail_id
+        versions   = [aws_bedrock_guardrail_version.prompt[i].version]
+      }],
+      [for i, guardrail in aws_bedrock_guardrail.content : {
+        identifier = guardrail.guardrail_id
+        versions   = [aws_bedrock_guardrail_version.content[i].version]
+      }],
+    )
     cognito_subject_sub             = local.deployment_mode == "upgrade" ? var.cognito_subject_sub : ""
     cognito_pool_owned              = local.deployment_mode == "upgrade"
     expected_retained_metric_series = 0
