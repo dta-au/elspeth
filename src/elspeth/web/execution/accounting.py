@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
@@ -36,6 +37,7 @@ from elspeth.web.execution.schemas import (
 # the run's distinct outcome shapes, and the marker keeps the response bounded
 # without pretending the list is complete.
 _MAX_VIOLATIONS_PER_RUN = 8
+_DIAGNOSTIC_VALUE_PREVIEW_CHARS = 48
 
 
 @dataclass(frozen=True)
@@ -92,10 +94,10 @@ if not {"sink_name"} >= _EXACT_CONSTRAINT_FIELDS:
 
 def _outcome_shape_violation(
     *,
-    completed: int,
-    outcome: str | None,
-    path: str,
-    sink_name: str | None,
+    completed: object,
+    outcome: object,
+    path: object,
+    sink_name: object,
     evidence_present: dict[str, bool],
     count: int,
 ) -> str | None:
@@ -111,53 +113,89 @@ def _outcome_shape_violation(
     evidence). Non-completed rows get exactly what closure classification
     trusts: the ADR-019 XOR (outcome must be NULL) and a non-terminal path.
 
-    Returns one bounded, audit-safe violation string, or None. Text carries
-    enum values, column names, and counts — sink_name is an authored node
-    name (same disclosure class as node_id) — never row payloads.
+    Returns one bounded, audit-safe violation string, or None. Corrupt stored
+    values are represented by bounded escaped previews, adding a hash when a
+    value is truncated; no row payloads are read here.
     """
-    if completed not in (0, 1):
-        return f"{count} outcome row(s) with non-boolean completed={completed!r}"
+    if type(completed) is not int or completed not in (0, 1):
+        return f"{count} outcome row(s) with non-boolean completed={_diagnostic_value(completed)}"
 
+    if type(path) is not str:
+        return f"{count} outcome row(s) with unknown path {_diagnostic_value(path)}"
     try:
         parsed_path = TerminalPath(path)
     except ValueError:
-        return f"{count} outcome row(s) with unknown path {path!r}"
+        return f"{count} outcome row(s) with unknown path {_diagnostic_value(path)}"
 
     if completed == 0:
         if outcome is not None:
-            return f"{count} outcome row(s) with completed=0 but outcome={outcome!r} (ADR-019 XOR violation)"
+            return f"{count} outcome row(s) with completed=0 but outcome={_diagnostic_value(outcome)} (ADR-019 XOR violation)"
         if parsed_path not in _NON_TERMINAL_PATHS:
-            return f"{count} outcome row(s) with completed=0 on terminal path {path!r}"
+            return f"{count} outcome row(s) with completed=0 on terminal path {_diagnostic_value(path)}"
         return None
 
     if outcome is None:
         return f"{count} outcome row(s) with completed=1 but outcome NULL (ADR-019 XOR violation)"
+    if type(outcome) is not str:
+        return f"{count} outcome row(s) with unknown outcome {_diagnostic_value(outcome)}"
     try:
         parsed_outcome = TerminalOutcome(outcome)
     except ValueError:
-        return f"{count} outcome row(s) with unknown outcome {outcome!r}"
+        return f"{count} outcome row(s) with unknown outcome {_diagnostic_value(outcome)}"
     if (parsed_outcome, parsed_path) not in _LEGAL_TERMINAL_PAIRS:
-        return f"{count} outcome row(s) with ({outcome!r}, {path!r}) — not a legal ADR-019 terminal pair"
+        return f"{count} outcome row(s) with ({_diagnostic_value(outcome)}, {_diagnostic_value(path)}) — not a legal ADR-019 terminal pair"
 
     constraints = _TERMINAL_PAIR_FIELD_CONSTRAINTS[(parsed_outcome, parsed_path)]
     for field_name in constraints.required:
         if not evidence_present[field_name]:
-            return f"{count} outcome row(s) with ({outcome!r}, {path!r}) missing required {field_name}"
+            return f"{count} outcome row(s) with ({_diagnostic_value(outcome)}, {_diagnostic_value(path)}) missing required {field_name}"
     for field_name, expected in constraints.exact.items():
         # Import-time guard above: exact constraints only name sink_name.
         if sink_name != expected:
-            return f"{count} outcome row(s) with ({outcome!r}, {path!r}) requiring {field_name}={expected!r}, got {sink_name!r}"
+            return (
+                f"{count} outcome row(s) with ({_diagnostic_value(outcome)}, {_diagnostic_value(path)}) "
+                f"requiring {field_name}={expected!r}, got {_diagnostic_value(sink_name)}"
+            )
     for field_name in constraints.forbidden:
         if evidence_present[field_name]:
-            return f"{count} outcome row(s) with ({outcome!r}, {path!r}) — pair forbids {field_name}"
+            return f"{count} outcome row(s) with ({_diagnostic_value(outcome)}, {_diagnostic_value(path)}) — pair forbids {field_name}"
     return None
 
 
+def _diagnostic_value(value: object) -> str:
+    """Return a deterministic, fixed-size projection of one stored scalar."""
+    if type(value) is bytes:
+        if len(value) <= _DIAGNOSTIC_VALUE_PREVIEW_CHARS:
+            return repr(value)
+        encoded = value
+        preview = repr(value[:_DIAGNOSTIC_VALUE_PREVIEW_CHARS])
+        length = len(value)
+    else:
+        if type(value) is str:
+            raw_text = value
+            encoded = value.encode("utf-8", errors="surrogatepass")
+        else:
+            # SQLAlchemy returns database scalar values here; their repr is
+            # deterministic and cannot invoke application-defined methods.
+            raw_text = repr(value)
+            encoded = raw_text.encode("utf-8", errors="replace")
+        if len(raw_text) <= _DIAGNOSTIC_VALUE_PREVIEW_CHARS:
+            return repr(value) if type(value) is str else raw_text
+        preview = repr(raw_text[:_DIAGNOSTIC_VALUE_PREVIEW_CHARS])
+        length = len(raw_text)
+    digest = hashlib.sha256(encoded).hexdigest()[:16]
+    return f"type={type(value).__name__}, length={length}, sha256={digest}, preview={preview}"
+
+
 def _bounded_violations(violations: list[str]) -> list[str]:
-    if len(violations) <= _MAX_VIOLATIONS_PER_RUN:
-        return violations
-    kept = violations[:_MAX_VIOLATIONS_PER_RUN]
-    kept.append(f"+{len(violations) - _MAX_VIOLATIONS_PER_RUN} more violation(s) truncated")
+    # Each message is a stable diagnostic key: corrupt scalars are represented
+    # by type/length/hash above. Deduplicate and sort before truncation so the
+    # retained subset does not depend on database query-plan row order.
+    ordered = sorted(set(violations))
+    if len(ordered) <= _MAX_VIOLATIONS_PER_RUN:
+        return ordered
+    kept = ordered[:_MAX_VIOLATIONS_PER_RUN]
+    kept.append(f"+{len(ordered) - _MAX_VIOLATIONS_PER_RUN} more violation(s) truncated")
     return kept
 
 
@@ -226,7 +264,7 @@ def load_run_accounting_map_from_db(
                 "error_hash": bool(shape.has_error_hash),
             }
             violation = _outcome_shape_violation(
-                completed=int(shape.completed),
+                completed=shape.completed,
                 outcome=shape.outcome,
                 path=shape.path,
                 sink_name=shape.sink_name,

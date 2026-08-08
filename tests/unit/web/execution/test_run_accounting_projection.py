@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -17,6 +18,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_sources_table, token_outcomes_table, tokens_table, transform_errors_table
 from elspeth.web.execution.accounting import (
+    _bounded_violations,
     load_run_accounting_for_settings,
     load_run_accounting_from_db,
     load_run_accounting_map_from_db,
@@ -788,6 +790,77 @@ def test_not_completed_with_outcome_marks_run_corrupt() -> None:
         assert set(batch.corrupt) == {"run-xor2"}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("raw_completed", [pytest.param(1.5, id="fractional"), pytest.param("not-an-integer", id="text")])
+def test_non_integer_completed_marks_run_corrupt_without_escaping_batch(raw_completed: object) -> None:
+    """The accounting boundary must validate raw SQLite values before interpreting them."""
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-completed-shape")
+        _insert_tokens(db, run_id="run-completed-shape", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-completed-shape",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
+        with db.write_connection() as conn:
+            conn.exec_driver_sql(
+                "UPDATE token_outcomes SET completed = ? WHERE run_id = ?",
+                (raw_completed, "run-completed-shape"),
+            )
+
+        batch = load_run_accounting_map_from_db(db, ("run-completed-shape",))
+
+        assert batch.accounting == {}
+        corruption = batch.corrupt["run-completed-shape"]
+        assert any("non-boolean completed" in violation for violation in corruption.violations)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("corrupt_field", ["path", "outcome", "sink_name"])
+def test_corrupt_outcome_diagnostics_bound_stored_values(corrupt_field: str) -> None:
+    """One oversized stored discriminator must not create an oversized API diagnostic."""
+    db = LandscapeDB.in_memory()
+    oversized_value = f"{corrupt_field}\n" + ("x" * 200_000)
+    try:
+        _setup_run_with_row(db, run_id="run-oversized-diagnostic")
+        _insert_tokens(db, run_id="run-oversized-diagnostic", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-oversized-diagnostic",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.FAILURE if corrupt_field == "sink_name" else TerminalOutcome.SUCCESS,
+            path=TerminalPath.SINK_DISCARDED if corrupt_field == "sink_name" else TerminalPath.DEFAULT_FLOW,
+        )
+        with db.write_connection() as conn:
+            conn.exec_driver_sql(
+                f"UPDATE token_outcomes SET {corrupt_field} = ? WHERE run_id = ?",
+                (oversized_value, "run-oversized-diagnostic"),
+            )
+
+        batch = load_run_accounting_map_from_db(db, ("run-oversized-diagnostic",))
+
+        violations = batch.corrupt["run-oversized-diagnostic"].violations
+        digest = hashlib.sha256(oversized_value.encode("utf-8")).hexdigest()[:16]
+        assert all(len(violation) < 1024 for violation in violations)
+        assert oversized_value not in "".join(violations)
+        assert "\n" not in "".join(violations)
+        assert f"sha256={digest}" in "".join(violations)
+    finally:
+        db.close()
+
+
+def test_violation_bounding_is_deduplicated_and_permutation_stable() -> None:
+    violations = [f"violation-{index:02d}" for index in range(10)]
+    scrambled_with_duplicate = [violations[index] for index in (9, 0, 4, 2, 7, 0, 5, 1, 8, 6, 3)]
+    expected = [*violations[:8], "+2 more violation(s) truncated"]
+
+    assert _bounded_violations(scrambled_with_duplicate) == expected
+    assert _bounded_violations(list(reversed(scrambled_with_duplicate))) == expected
 
 
 def test_sqlite_blocks_duplicate_completed_terminal_outcomes() -> None:
