@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from elspeth.web.composer import no_tool_policy
 from elspeth.web.composer.no_tool_policy import (
     AssistantTextSegment,
     TrustedSystemNoticeSegment,
@@ -295,36 +296,34 @@ class TestWrappedDiagnosticWireShapeLinkage:
     """
 
     @pytest.mark.parametrize(
-        ("template_name", "header_name", "footer_name", "format_kwargs"),
+        ("template", "header", "footer", "format_kwargs"),
         [
-            (
-                "_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER",
-                "_EMPTY_STATE_NOTICE_HEADER",
-                "_EMPTY_STATE_NOTICE_NEXT_STEP",
+            pytest.param(
+                no_tool_policy._EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER,
+                no_tool_policy._EMPTY_STATE_NOTICE_HEADER,
+                no_tool_policy._EMPTY_STATE_NOTICE_NEXT_STEP,
                 {"blocker": "a concrete blocker detail"},
+                id="_EMPTY_STATE_FINALIZE_SUFFIX_WITH_BLOCKER",
             ),
-            (
-                "_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
-                "_PREFLIGHT_NOTICE_HEADER",
-                "_PREFLIGHT_NOTICE_FOOTER",
+            pytest.param(
+                no_tool_policy._PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL,
+                no_tool_policy._PREFLIGHT_NOTICE_HEADER,
+                no_tool_policy._PREFLIGHT_NOTICE_FOOTER,
                 {"detail": "a validator objection", "suggestion_block": "\n\nSuggested fix: do the thing"},
+                id="_PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_WITH_DETAIL",
             ),
-            (
-                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
-                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE",
-                "_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER",
+            pytest.param(
+                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL,
+                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE,
+                no_tool_policy._ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_FOOTER,
                 {"detail": "a validator objection"},
+                id="_ADVISOR_SIGNOFF_PENDING_HANDOFF_FINDINGS_SUFFIX_WITH_DETAIL",
             ),
         ],
     )
     def test_every_wrapped_template_round_trips_through_the_splitter(
-        self, template_name: str, header_name: str, footer_name: str, format_kwargs: dict[str, str]
+        self, template: str, header: str, footer: str, format_kwargs: dict[str, str]
     ) -> None:
-        from elspeth.web.composer import no_tool_policy
-
-        template = getattr(no_tool_policy, template_name)
-        header = getattr(no_tool_policy, header_name)
-        footer = getattr(no_tool_policy, footer_name)
         suffix = template.format(**format_kwargs)
         segments = no_tool_policy._split_wrapped_diagnostic(suffix, header=header, footer=footer)
         assert segments is not None

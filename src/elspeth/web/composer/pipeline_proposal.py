@@ -12,7 +12,6 @@ both would allow two different integrity meanings to share one draft concept.
 
 from __future__ import annotations
 
-import contextlib
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -607,7 +606,7 @@ def composition_content_hash(state: CompositionState) -> str:
     serialization. The write is idempotent, so a concurrent duplicate compute
     is merely wasted work, never a wrong answer.
     """
-    memo: str | None = getattr(state, "_content_hash_memo", None)
+    memo = state._content_hash_memo
     if memo is not None:
         return memo
     state_d = state.to_dict()
@@ -620,8 +619,5 @@ def composition_content_hash(state: CompositionState) -> str:
             "metadata": state_d["metadata"],
         }
     )
-    # Duck-typed stand-ins (test fakes) without the memo slot simply skip
-    # memoization; the hash itself is unaffected.
-    with contextlib.suppress(AttributeError):
-        object.__setattr__(state, "_content_hash_memo", content_hash)
+    object.__setattr__(state, "_content_hash_memo", content_hash)
     return content_hash

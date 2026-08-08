@@ -521,6 +521,11 @@ def test_envelope_defines_no_duplicate_topology_dataclasses_or_rationale() -> No
 
 def test_composition_content_hash_exactly_matches_moved_legacy_preimage() -> None:
     class _State:
+        # Real CompositionState instances always carry the memo slot; the
+        # stand-in models that contract so the preimage pin exercises the
+        # same uncached-compute path.
+        _content_hash_memo: str | None = None
+
         def to_dict(self) -> dict[str, Any]:
             return {
                 "version": 17,
