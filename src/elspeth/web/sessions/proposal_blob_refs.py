@@ -21,7 +21,7 @@ _TOP_LEVEL_BLOB_TOOLS = frozenset(
         "wire_blob_inline_ref",
     }
 )
-_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline"}
+_BLOB_REFERENCE_TOOLS = _TOP_LEVEL_BLOB_TOOLS | {"set_pipeline", "set_source_from_blobs"}
 
 _BLOB_SENTINEL_OPTION_KEYS = frozenset({"path", "file"})
 
@@ -52,6 +52,13 @@ def _collect_option_blob_references(value: Any, *, position: str, into: list[str
             if key == "blob_ref" and child is not None:
                 if type(child) is not str or not child:
                     raise ValueError(f"{position} blob_ref must be a non-empty string")
+                into.append(child)
+            elif key == "blob_id" and child is not None:
+                # blob_rows persists custody as blobs[].blob_id
+                # (elspeth-0c6a343921); treated exactly like blob_ref so a
+                # pending proposal binding blobs plurally retains every one.
+                if type(child) is not str or not child:
+                    raise ValueError(f"{position} blob_id must be a non-empty string")
                 into.append(child)
             elif key in _BLOB_SENTINEL_OPTION_KEYS and type(child) is str and child.startswith(BLOB_REF_PATH_PREFIX):
                 into.append(_canonical_sentinel_blob_id(child, position=f"{position}.{key}"))
@@ -93,6 +100,17 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
     """
     if tool_name not in _BLOB_REFERENCE_TOOLS:
         return ()
+
+    if tool_name == "set_source_from_blobs":
+        raw_blob_ids = arguments["blob_ids"] if "blob_ids" in arguments else None
+        if raw_blob_ids is None:
+            return ()
+        if type(raw_blob_ids) is not list:
+            raise ValueError("set_source_from_blobs blob_ids must be a list when present")
+        for index, member in enumerate(raw_blob_ids):
+            if type(member) is not str or not member:
+                raise ValueError(f"set_source_from_blobs blob_ids[{index}] must be a non-empty string")
+        return tuple(dict.fromkeys(raw_blob_ids))
 
     if tool_name == "set_pipeline":
         collected: list[str] = []

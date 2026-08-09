@@ -76,6 +76,64 @@ class TestLegacySetPipelineShapes:
             proposal_blob_reference_ids("set_pipeline", arguments)
 
 
+class TestSetSourceFromBlobsRetention:
+    """The plural binding's inputs must be retained while a proposal is
+    pending (elspeth-0c6a343921 review): the tool's blob_ids and the
+    persisted blob_rows blobs[].blob_id identity shape both create
+    custody/retention edges."""
+
+    def test_blob_ids_are_extracted(self) -> None:
+        blob_a = str(uuid4())
+        blob_b = str(uuid4())
+        arguments = {"blob_ids": [blob_a, blob_b], "on_success": "continue"}
+        assert proposal_blob_reference_ids("set_source_from_blobs", arguments) == (blob_a, blob_b)
+
+    def test_blob_ids_dedupe(self) -> None:
+        blob_id = str(uuid4())
+        arguments = {"blob_ids": [blob_id, blob_id], "on_success": "continue"}
+        assert proposal_blob_reference_ids("set_source_from_blobs", arguments) == (blob_id,)
+
+    def test_missing_blob_ids_yields_nothing(self) -> None:
+        assert proposal_blob_reference_ids("set_source_from_blobs", {"on_success": "continue"}) == ()
+
+    def test_non_list_blob_ids_raises(self) -> None:
+        with pytest.raises(ValueError):
+            proposal_blob_reference_ids("set_source_from_blobs", {"blob_ids": "not-a-list"})
+
+    def test_non_string_member_raises(self) -> None:
+        with pytest.raises(ValueError):
+            proposal_blob_reference_ids("set_source_from_blobs", {"blob_ids": [str(uuid4()), 7]})
+
+
+class TestBlobRowsEntryShapes:
+    def test_legacy_set_pipeline_blob_rows_entries_are_extracted(self) -> None:
+        blob_a = str(uuid4())
+        blob_b = str(uuid4())
+        arguments = {
+            "source": {
+                "plugin": "blob_rows",
+                "options": {
+                    "blobs": [
+                        {"blob_id": blob_a, "payload_ref": _sha(), "filename": "a.pdf", "mime_type": "application/pdf", "size_bytes": 10},
+                        {"blob_id": blob_b, "payload_ref": _sha(), "filename": "b.png", "mime_type": "image/png", "size_bytes": 20},
+                    ],
+                    "schema": {"mode": "observed"},
+                },
+            }
+        }
+        assert set(proposal_blob_reference_ids("set_pipeline", arguments)) == {blob_a, blob_b}
+
+    def test_non_string_entry_blob_id_raises(self) -> None:
+        arguments = {
+            "source": {
+                "plugin": "blob_rows",
+                "options": {"blobs": [{"blob_id": 7, "payload_ref": _sha()}]},
+            }
+        }
+        with pytest.raises(ValueError):
+            proposal_blob_reference_ids("set_pipeline", arguments)
+
+
 class TestOwnedAuthorityShapes:
     def _owned(self, *, sources: dict, nodes: list | None = None, outputs: list | None = None) -> dict:
         return {
@@ -86,6 +144,31 @@ class TestOwnedAuthorityShapes:
             "outputs": outputs if outputs is not None else [],
             "metadata": {"name": "owned", "description": ""},
         }
+
+    def test_owned_blob_rows_entries_are_extracted(self) -> None:
+        """An owned set_pipeline proposal persisting a blob_rows source must
+        retain every blobs[].blob_id while pending (elspeth-0c6a343921)."""
+        blob_id = str(uuid4())
+        arguments = self._owned(
+            sources={
+                "documents": {
+                    "plugin": "blob_rows",
+                    "options": {
+                        "blobs": [
+                            {
+                                "blob_id": blob_id,
+                                "payload_ref": _sha(),
+                                "filename": "doc.pdf",
+                                "mime_type": "application/pdf",
+                                "size_bytes": 10,
+                            }
+                        ],
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            }
+        )
+        assert proposal_blob_reference_ids("set_pipeline", arguments) == (blob_id,)
 
     def test_named_source_path_sentinels_are_extracted(self) -> None:
         blob_a = str(uuid4())
