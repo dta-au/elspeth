@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         TransformProtocol,
         TransformResult,
     )
+    from elspeth.contracts.schema import SchemaConfig
     from elspeth.contracts.schema_contract import SchemaContract
 
 
@@ -70,6 +71,7 @@ class _TestSourceBase:
     _on_validation_failure: str = "discard"
     on_success: str = "default"
     declared_guaranteed_fields: frozenset[str] = frozenset()
+    _output_schema_config: SchemaConfig | None = None
 
     def __init__(self) -> None:
         self.config: dict[str, Any] = {"schema": {"mode": "observed"}}

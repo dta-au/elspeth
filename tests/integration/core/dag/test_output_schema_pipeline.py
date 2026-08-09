@@ -32,6 +32,7 @@ class MockSource:
 
     name = "mock_source"
     output_schema = None
+    _output_schema_config: SchemaConfig | None = None
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "output"

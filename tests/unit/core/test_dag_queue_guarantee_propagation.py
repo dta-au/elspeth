@@ -31,6 +31,7 @@ from typing import Any, ClassVar
 import pytest
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import (
     QueueSettings,
     SourceSettings,
@@ -49,6 +50,7 @@ class _SourceWithGuarantees:
     """Mock source declaring guaranteed_fields via its config schema."""
 
     output_schema = None
+    _output_schema_config: SchemaConfig | None = None
     _on_validation_failure = "discard"
 
     def __init__(self, name: str, guaranteed: tuple[str, ...], on_success: str) -> None:

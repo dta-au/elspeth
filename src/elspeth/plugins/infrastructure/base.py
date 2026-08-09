@@ -246,7 +246,9 @@ class BaseTransform(ABC):
     _input_schema_cache: tuple[type[PluginSchema], frozenset[str], type[PluginSchema]] | None = None
     # Memo for _config_named_input_columns, keyed on the config object identity.
     _config_columns_cache: tuple[object, frozenset[str]] | None = None
-    output_schema: type[PluginSchema]
+    # Declared nominally so direct access is safe while a transform is still
+    # constructing its schemas. Concrete transforms populate it before use.
+    output_schema: type[PluginSchema] | None = None
     node_id: str | None = None  # Set by orchestrator after registration
 
     # Audit metadata
@@ -284,6 +286,11 @@ class BaseTransform(ABC):
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this transform's local optional dependencies exist."""
+        return True
 
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
@@ -1174,7 +1181,7 @@ class BaseTransform(ABC):
             )
         demote = self._effective_demoted_fields(declared)
         # Unset output_schema means nothing is shared yet, so nothing to violate.
-        if demote and getattr(self, "output_schema", None) is declared:
+        if demote and self.output_schema is declared:
             # Shape-preserving transforms (_create_schemas with adds_fields=False)
             # share ONE model between input and output. Demoting would hand back a
             # subclass for input while output kept the original, silently splitting
@@ -1591,6 +1598,12 @@ class BaseSink(ABC, SinkEffectContract):
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this sink's local optional dependencies exist."""
+        return True
+
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
@@ -2030,6 +2043,12 @@ class BaseSource(ABC):
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
     policy_capabilities: frozenset[CapabilityDeclaration] = frozenset()
+
+    @classmethod
+    def check_web_local_requirements(cls) -> bool:
+        """Return whether this source's local optional dependencies exist."""
+        return True
+
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags

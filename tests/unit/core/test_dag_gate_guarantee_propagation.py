@@ -43,6 +43,7 @@ class _SourceWithGuarantees:
 
     name = "mock_source_guaranteeing"
     output_schema = None
+    _output_schema_config: SchemaConfig | None = None
     _on_validation_failure = "discard"
     on_success = "output"
 

@@ -128,7 +128,11 @@ def test_client(tmp_path: Path) -> TestClient:
             content={
                 "error_type": "audit_access_log_write_failed",
                 "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
-                "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                "request_id": (
+                    request.scope["state"]["request_id"]
+                    if type(request.scope.get("state")) is dict and type(request.scope["state"].get("request_id")) is str
+                    else None
+                ),
             },
         )
 

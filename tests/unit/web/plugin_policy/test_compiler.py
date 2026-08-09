@@ -7,7 +7,9 @@ from dataclasses import replace
 import pytest
 from structlog.testing import capture_logs
 
+from elspeth.contracts import Determinism
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability
+from elspeth.plugins.infrastructure.base import BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm import LLMSource
@@ -160,9 +162,10 @@ class _FakeRegistry:
 def _control(name: str, *, available: bool = True) -> type:
     return type(
         name.title().replace("_", ""),
-        (),
+        (BaseTransform,),
         {
             "name": name,
+            "determinism": Determinism.DETERMINISTIC,
             "plugin_version": "1.0.0",
             "source_file_hash": "sha256:0123456789abcdef",
             "policy_capabilities": frozenset(
@@ -177,6 +180,41 @@ def _control(name: str, *, available: bool = True) -> type:
             "check_web_local_requirements": classmethod(lambda cls: available),
         },
     )
+
+
+def test_shape_impostor_cannot_enter_the_transform_registry_category() -> None:
+    impostor = type(
+        "ShapeImpostor",
+        (),
+        {
+            "name": "shape_impostor",
+            "plugin_version": "1.0.0",
+            "source_file_hash": "sha256:0123456789abcdef",
+            "policy_capabilities": frozenset(),
+            "check_web_local_requirements": classmethod(lambda cls: True),
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("transform:shape_impostor",)))
+
+    with pytest.raises(ValueError, match=r"^web plugin policy invalid: plugin_category_mismatch$"):
+        compile_web_plugin_policy(registry=_FakeRegistry(transforms=[impostor]), settings=runtime)
+
+
+def test_source_class_cannot_masquerade_as_a_transform_registry_entry() -> None:
+    wrong_category = type(
+        "WrongCategory",
+        (BaseSource,),
+        {
+            "name": "wrong_category",
+            "determinism": Determinism.IO_READ,
+            "plugin_version": "1.0.0",
+            "source_file_hash": "sha256:0123456789abcdef",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("transform:wrong_category",)))
+
+    with pytest.raises(ValueError, match=r"^web plugin policy invalid: plugin_category_mismatch$"):
+        compile_web_plugin_policy(registry=_FakeRegistry(transforms=[wrong_category]), settings=runtime)
 
 
 def test_preference_order_must_cover_every_authorized_implementation() -> None:

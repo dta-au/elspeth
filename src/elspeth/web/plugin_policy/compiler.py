@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Sequence
-from typing import NoReturn, Protocol, cast
+from typing import Literal, NoReturn, Protocol
 
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
+from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
 
@@ -38,27 +39,37 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
 )
 
 
-class _PluginClass(Protocol):
-    name: str
-    plugin_version: str
-    source_file_hash: str | None
+type _PluginClass = BaseSource | BaseTransform | BaseSink
 
 
 class PluginRegistry(Protocol):
-    def get_sources(self) -> Sequence[type[_PluginClass]]: ...
-    def get_transforms(self) -> Sequence[type[_PluginClass]]: ...
-    def get_sinks(self) -> Sequence[type[_PluginClass]]: ...
+    def get_sources(self) -> Sequence[type]: ...
+    def get_transforms(self) -> Sequence[type]: ...
+    def get_sinks(self) -> Sequence[type]: ...
 
 
 def _fail(reason: str) -> NoReturn:
     raise ValueError(f"web plugin policy invalid: {reason}")
 
 
+def _admit_registry_category(
+    classes: Sequence[type],
+    expected_base: type[_PluginClass],
+    category: Literal["source", "transform", "sink"],
+) -> dict[PluginId, type[_PluginClass]]:
+    admitted: dict[PluginId, type[_PluginClass]] = {}
+    for plugin_cls in classes:
+        if not issubclass(plugin_cls, expected_base):
+            _fail("plugin_category_mismatch")
+        admitted[PluginId(category, plugin_cls.name)] = plugin_cls
+    return admitted
+
+
 def _registry_map(registry: PluginRegistry) -> dict[PluginId, type[_PluginClass]]:
     return {
-        **{PluginId("source", cls.name): cls for cls in registry.get_sources()},
-        **{PluginId("transform", cls.name): cls for cls in registry.get_transforms()},
-        **{PluginId("sink", cls.name): cls for cls in registry.get_sinks()},
+        **_admit_registry_category(registry.get_sources(), BaseSource, "source"),
+        **_admit_registry_category(registry.get_transforms(), BaseTransform, "transform"),
+        **_admit_registry_category(registry.get_sinks(), BaseSink, "sink"),
     }
 
 
@@ -78,8 +89,8 @@ def _parse_unique(raw_values: Iterable[str]) -> tuple[PluginId, ...]:
 
 
 def _validate_identity(plugin_cls: type[_PluginClass]) -> tuple[str, str]:
-    version = getattr(plugin_cls, "plugin_version", None)
-    source_hash = getattr(plugin_cls, "source_file_hash", None)
+    version = plugin_cls.plugin_version
+    source_hash = plugin_cls.source_file_hash
     if not isinstance(version, str) or version == "0.0.0" or _VERSION.fullmatch(version) is None:
         _fail("invalid_plugin_version")
     if not isinstance(source_hash, str) or _SOURCE_HASH.fullmatch(source_hash) is None:
@@ -105,11 +116,9 @@ def compile_web_plugin_policy(*, registry: PluginRegistry, settings: RuntimeWebP
     implementations: dict[PluginCapability, set[PluginId]] = {capability: set() for capability in PluginCapability}
     for plugin_id in sorted(authorized):
         plugin_cls = installed[plugin_id]
-        local_check = getattr(plugin_cls, "check_web_local_requirements", None)
-        if local_check is not None and not local_check():
+        if not plugin_cls.check_web_local_requirements():
             _fail("plugin_unavailable")
-        raw_declarations: object = getattr(plugin_cls, "policy_capabilities", frozenset())
-        declarations = cast("frozenset[CapabilityDeclaration]", raw_declarations)
+        declarations = plugin_cls.policy_capabilities
         if not isinstance(declarations, frozenset) or any(not isinstance(item, CapabilityDeclaration) for item in declarations):
             _fail("invalid_capability_declaration")
         for declaration in declarations:

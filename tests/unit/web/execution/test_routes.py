@@ -254,7 +254,11 @@ def _create_test_app(
             content={
                 "detail": str(exc),
                 "error_type": "run_already_active",
-                "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                "request_id": (
+                    request.scope["state"]["request_id"]
+                    if type(request.scope.get("state")) is dict and type(request.scope["state"].get("request_id")) is str
+                    else None
+                ),
             },
         )
 

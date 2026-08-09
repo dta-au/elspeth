@@ -175,7 +175,15 @@ class DataverseAuthConfig(BaseModel):
 
         if self.method == "service_principal":
             if self.tenant_id is None or self.client_id is None or self.client_secret is None:
-                missing = [f for f in ("tenant_id", "client_id", "client_secret") if getattr(self, f) is None]
+                missing = [
+                    field_name
+                    for field_name, value in (
+                        ("tenant_id", self.tenant_id),
+                        ("client_id", self.client_id),
+                        ("client_secret", self.client_secret),
+                    )
+                    if value is None
+                ]
                 raise RuntimeError(
                     f"service_principal auth fields are None at credential creation time: {missing}. "
                     f"model_validator should have rejected this at construction — this is a bug."

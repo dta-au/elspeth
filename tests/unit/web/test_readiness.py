@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy.engine import make_url
 from structlog.testing import capture_logs
 
 import elspeth.web.readiness as readiness
@@ -510,7 +511,7 @@ class _FakeEngine:
         url: str = "postgresql+psycopg://redacted.invalid/db",
     ) -> None:
         self.dialect = SimpleNamespace(name=dialect)
-        self.url = url
+        self.url = make_url(url)
         self.connection = connection or _FakeConnection()
         self.connect_calls = 0
         self.disposed = False

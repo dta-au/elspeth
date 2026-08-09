@@ -13,6 +13,7 @@ Note: Tests updated for unified LLMTransform and Langfuse SDK v3
 from __future__ import annotations
 
 import sys
+import threading
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import patch
@@ -95,6 +96,7 @@ class _TracingContext:
         self.rate_limit_registry = None
         self.state_id = "state-123"
         self.token: TokenInfo | None = None
+        self.shutdown_event: threading.Event | None = None
 
 
 class _RecordingObservation:

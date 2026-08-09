@@ -121,10 +121,9 @@ def _serialize_finish_reason(finish_reason: ParsedFinishReason) -> str | None:
     return str(finish_reason)  # type: ignore[unreachable]  # pragma: no cover — exhaustive, but future-proof
 
 
-def _shutdown_event_is_set(shutdown_event: object | None) -> bool:
-    """Return True only for concrete cancellation signals, not arbitrary mocks."""
-    is_set = getattr(shutdown_event, "is_set", None)
-    return callable(is_set) and is_set() is True
+def _shutdown_event_is_set(shutdown_event: threading.Event | None) -> bool:
+    """Return whether the declared cancellation signal has been set."""
+    return shutdown_event is not None and shutdown_event.is_set()
 
 
 def _shutdown_requested_result(
@@ -269,7 +268,7 @@ class SingleQueryStrategy:
         if ctx.token is None:
             raise RuntimeError("LLMTransform requires ctx.token")
         token_id = ctx.token.token_id
-        shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        shutdown_event = ctx.shutdown_event
 
         # 1. Render template (THEIR DATA — wrap)
         try:
@@ -479,7 +478,7 @@ class MultiQueryStrategy:
         if ctx.token is None:
             raise RuntimeError("LLMTransform requires ctx.token")
         token_id = ctx.token.token_id
-        shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        shutdown_event = ctx.shutdown_event
 
         if self.executor is not None:
             return self._execute_parallel(row, state_id, token_id, provider, tracer, shutdown_event)
@@ -1158,7 +1157,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b75d8ce3136ba2ab"
+    source_file_hash: str | None = "sha256:3fec8ad7269dc4f0"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1754,7 +1753,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         """
         if self._provider is None:
             raise RuntimeError("Provider not initialized — _process_row called before on_start()")
-        self._shutdown_event = cast("threading.Event | None", getattr(ctx, "shutdown_event", None))
+        self._shutdown_event = ctx.shutdown_event
 
         blank_required_input = _blank_required_input_result(row, self.declared_input_fields)
         if blank_required_input is not None:

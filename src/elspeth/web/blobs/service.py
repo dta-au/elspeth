@@ -655,7 +655,7 @@ def reconcile_blob_storage_versions(storage: Path, *, expected_hash: str | None)
 
 
 def _validate_reusable_blob_row(
-    row: Any,
+    row: Row[Any],
     *,
     expected: _ExpectedBlobFields,
     blob_id: str,
@@ -678,11 +678,13 @@ def _validate_reusable_blob_row(
         "creating_composer_skill_hash": expected["creating_composer_skill_hash"],
         "creating_arguments_hash": expected["creating_arguments_hash"],
     }
+    row_mapping = row._mapping
     for field_name, expected_value in expected_fields.items():
-        if getattr(row, field_name) != expected_value:
+        if row_mapping[field_name] != expected_value:
             raise AuditIntegrityError(f"Inline custody blob {blob_id} has mismatched {field_name}")
-    if row.status not in {"pending", "ready"}:
-        raise AuditIntegrityError(f"Inline custody blob {blob_id} has invalid reuse status {row.status!r}")
+    status = row_mapping["status"]
+    if status not in {"pending", "ready"}:
+        raise AuditIntegrityError(f"Inline custody blob {blob_id} has invalid reuse status {status!r}")
 
 
 @contextmanager

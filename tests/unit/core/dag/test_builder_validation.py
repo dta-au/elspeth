@@ -27,6 +27,15 @@ class _BuilderValidationMockSource:
     config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
     _on_validation_failure = "discard"
     on_success = "source_out"
+    _output_schema_config: SchemaConfig | None = None
+
+
+class _BuilderValidationSourceImpostor:
+    name = "source_impostor"
+    output_schema = None
+    config: ClassVar[dict[str, Any]] = {"schema": {"mode": "observed"}}
+    _on_validation_failure = "discard"
+    on_success = "source_out"
 
 
 class _BuilderValidationMockSink:
@@ -90,6 +99,20 @@ class TestCoalesceBranchPlanning:
             graph.set_sink_id_map({})
         with pytest.raises(GraphValidationError, match="build metadata is frozen"):
             graph.add_route_resolution_entry(NodeID("gate"), "true", RouteDestination.discard())
+
+    def test_source_missing_owned_schema_contract_fails_loudly(self) -> None:
+        source = _BuilderValidationSourceImpostor()
+
+        with pytest.raises(AttributeError, match="_output_schema_config"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
 
     def test_branch_info_carries_identity_and_transform_branch_plan(self) -> None:
         source = _BuilderValidationMockSource()

@@ -55,7 +55,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:eaaa6cc43af4fb75"
+    source_file_hash: str | None = "sha256:db8cc2f7aaf49719"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -228,7 +228,7 @@ class RAGRetrievalTransform(BaseTransform):
         provider_name = self._rag_config.provider
         config_cls, factory = PROVIDERS[provider_name]
         provider_config = config_cls(**self._rag_config.provider_config)
-        collection_name = self._configured_collection_name(provider_config)
+        collection_name = self._configured_collection_name(provider_name, provider_config)
 
         try:
             self._provider = factory(
@@ -433,16 +433,27 @@ class RAGRetrievalTransform(BaseTransform):
             },
         )
 
-    def _configured_collection_name(self, provider_config: Any) -> str:
-        """Extract the configured collection/index name for readiness audit records."""
-        for field_name in ("collection", "index"):
-            value = getattr(provider_config, field_name, None)
-            if isinstance(value, str) and value:
-                return value
-        raise FrameworkBugError(
-            f"{self.__class__.__name__} provider config {type(provider_config).__name__} "
-            "must expose a non-empty 'collection' or 'index' for readiness auditing."
-        )
+    def _configured_collection_name(self, provider_name: str, provider_config: Any) -> str:
+        """Read readiness identity from the nominal config for a known provider."""
+        if provider_name == "chroma":
+            from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
+
+            if not isinstance(provider_config, ChromaSearchProviderConfig):
+                raise FrameworkBugError(
+                    f"{self.__class__.__name__} provider chroma requires ChromaSearchProviderConfig; "
+                    f"received {type(provider_config).__name__}."
+                )
+            return provider_config.collection
+        if provider_name == "azure_search":
+            from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProviderConfig
+
+            if not isinstance(provider_config, AzureSearchProviderConfig):
+                raise FrameworkBugError(
+                    f"{self.__class__.__name__} provider azure_search requires AzureSearchProviderConfig; "
+                    f"received {type(provider_config).__name__}."
+                )
+            return provider_config.index
+        raise FrameworkBugError(f"{self.__class__.__name__} has no readiness identity contract for provider {provider_name!r}.")
 
     def _record_readiness_check(
         self,

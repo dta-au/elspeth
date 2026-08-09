@@ -168,7 +168,7 @@ def _owned_database_check(
 def _is_in_memory_sqlite(engine: Engine) -> bool:
     if engine.dialect.name != "sqlite":
         return False
-    database = getattr(engine.url, "database", None)
+    database = engine.url.database
     return database == ":memory:" or str(engine.url) in {"sqlite:///:memory:", "sqlite://"}
 
 

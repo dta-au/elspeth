@@ -286,10 +286,9 @@ def build_execution_graph(
         # options dict — the source-side mirror of the transform path below.
         # Sources that rewrite their schema at construction (the LLM source's
         # guaranteed-field augmentation) must feed the augmented contract into
-        # graph validation (elspeth-db98d3f660). getattr sentinel: legacy test
-        # stubs predate the SourceProtocol attribute; absence means the same
-        # as None — the source computes no output contract.
-        source_schema_config: SchemaConfig | None = getattr(source_instance, "_output_schema_config", None)
+        # graph validation (elspeth-db98d3f660). SourceProtocol owns this
+        # field; absence is a broken source contract and must fail loudly.
+        source_schema_config: SchemaConfig | None = source_instance._output_schema_config
         if source_schema_config is None:
             source_schema_config = _parse_contract_schema_config(
                 source_config,

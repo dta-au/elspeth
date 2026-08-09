@@ -13,7 +13,7 @@ from types import MappingProxyType
 from typing import Any, ClassVar, Literal, Self, cast
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -255,9 +255,9 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         "batch_wait_timeout_seconds",
     )
     @classmethod
-    def _finite_timing(cls, value: float, info: object) -> float:
+    def _finite_timing(cls, value: float, info: ValidationInfo) -> float:
         if not math.isfinite(value):
-            field_name = getattr(info, "field_name", "timing value")
+            field_name = info.field_name or "timing value"
             raise ValueError(f"{field_name} must be finite")
         return value
 
@@ -289,8 +289,8 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
 
     @field_validator("bucket_field", "key_field", "version_field", "text_field", "page_count_field", "metadata_field", "result_field")
     @classmethod
-    def _field_name(cls, value: str | None, info: object) -> str | None:
-        field_name = getattr(info, "field_name", "field")
+    def _field_name(cls, value: str | None, info: ValidationInfo) -> str | None:
+        field_name = info.field_name or "field"
         return _require_non_whitespace(value, field_name=field_name)
 
     @field_validator("feature_types")
@@ -374,7 +374,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c66b7e92392fba68"
+    source_file_hash: str | None = "sha256:30622a952cac77ab"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False

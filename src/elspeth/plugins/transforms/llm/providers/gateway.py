@@ -628,7 +628,7 @@ class GatewayLLMProvider:
             error=LLMCallError(
                 type=type(exc).__name__,
                 message=message,
-                retryable=bool(getattr(exc, "retryable", False)),
+                retryable=exc.retryable,
             ),
             latency_ms=(time.perf_counter() - started_at) * 1000,
             resolved_prompt_template_hash=self._resolved_prompt_template_hash,

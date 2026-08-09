@@ -260,13 +260,20 @@ class ResourceCleanupFailed(TelemetryEvent):
     token_id: str | None = None
 
     def __post_init__(self) -> None:
-        for field_name in ("component", "resource", "error_type"):
-            _validate_cleanup_field(getattr(self, field_name), field_name)
+        for field_name, owned_value in (
+            ("component", self.component),
+            ("resource", self.resource),
+            ("error_type", self.error_type),
+        ):
+            _validate_cleanup_field(owned_value, field_name)
         if type(self.suppressed) is not bool:
             raise TypeError("suppressed must be bool")
-        for field_name in ("state_id", "operation_id", "token_id"):
-            value = getattr(self, field_name)
-            if value is not None and (type(value) is not str or not value.strip()):
+        for field_name, parent_value in (
+            ("state_id", self.state_id),
+            ("operation_id", self.operation_id),
+            ("token_id", self.token_id),
+        ):
+            if parent_value is not None and (type(parent_value) is not str or not parent_value.strip()):
                 raise ValueError(f"{field_name} must be a non-empty exact string when present")
         row_parent = self.state_id is not None or self.token_id is not None
         operation_parent = self.operation_id is not None

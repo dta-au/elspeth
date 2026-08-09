@@ -49,6 +49,7 @@ class _SourceWithGuarantees:
     """Mock source declaring guaranteed_fields via its config schema."""
 
     output_schema = None
+    _output_schema_config: SchemaConfig | None = None
     _on_validation_failure = "discard"
 
     def __init__(self, guaranteed: tuple[str, ...]) -> None:

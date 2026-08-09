@@ -842,7 +842,7 @@ class _BrowserDocumentHeadersMiddleware(BaseHTTPMiddleware):
             return response
 
         connect_origin: str | None = None
-        token_endpoint = getattr(request.app.state, "oidc_token_endpoint", None)
+        token_endpoint = request.app.state.oidc_token_endpoint
         if isinstance(token_endpoint, str):
             token_origin = oidc_browser_endpoint_origin(token_endpoint)
             request_port = request.url.port
@@ -1545,8 +1545,14 @@ def _create_app(
         for the operator this field exists to serve. A None here is honest
         ("no middleware stamped an id"), not fabricated.
         """
-        request_id: str | None = getattr(getattr(request, "state", None), "request_id", None)
-        return request_id
+        scope = request.scope
+        if "state" not in scope:
+            return None
+        state = scope["state"]
+        if type(state) is not dict or "request_id" not in state:
+            return None
+        request_id = state["request_id"]
+        return request_id if type(request_id) is str else None
 
     @app.exception_handler(FingerprintKeyMissingError)
     async def handle_fingerprint_missing(

@@ -366,6 +366,20 @@ def test_check_error_without_cause_keeps_prior_envelope_shape() -> None:
     assert "cause_fields" not in envelope
 
 
+def test_unknown_exception_cannot_masquerade_as_an_owned_acceptance_error() -> None:
+    impostor = type(
+        "AcceptanceErrorImpostor",
+        (RuntimeError,),
+        {"error_code": "request_timeout", "status": 599},
+    )("private failure")
+
+    assert contracts.acceptance_error_envelope(impostor) == {
+        "error_class": "AcceptanceErrorImpostor",
+        "step": None,
+        "error_code": "acceptance_internal",
+    }
+
+
 def test_provision_storage_settings_failure_names_cause(monkeypatch: pytest.MonkeyPatch) -> None:
     from elspeth.web._aws_ecs_acceptance import capture
 

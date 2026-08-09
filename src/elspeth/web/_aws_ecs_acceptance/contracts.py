@@ -401,11 +401,12 @@ def acceptance_error_envelope(exc: BaseException) -> dict[str, object]:
         if exc.cause_fields:
             envelope["cause_fields"] = sorted(exc.cause_fields)
         return envelope
-    error_code = getattr(exc, "error_code", None)
-    envelope["error_code"] = error_code if isinstance(error_code, str) and error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"
-    status = getattr(exc, "status", None)
-    if type(status) is int:
-        envelope["status"] = status
+    if isinstance(exc, AcceptanceInputError | AcceptanceHttpError | AcceptanceStateError | OperatorTelemetryAcceptanceError):
+        envelope["error_code"] = exc.error_code
+        if type(exc.status) is int:
+            envelope["status"] = exc.status
+    else:
+        envelope["error_code"] = "acceptance_internal"
     return envelope
 
 

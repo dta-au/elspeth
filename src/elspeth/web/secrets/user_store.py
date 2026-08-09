@@ -107,7 +107,7 @@ _UpsertBuilder = Callable[[sa.Table, dict[str, Any]], Any]
 
 def _upsert_update_mapping(insert_namespace: Any) -> dict[str, Any]:
     """Build the per-column update mapping for dialect-specific upsert clauses."""
-    return {column: getattr(insert_namespace, column) for column in _USER_SECRET_UPSERT_UPDATE_COLUMNS}
+    return {column: insert_namespace[column] for column in _USER_SECRET_UPSERT_UPDATE_COLUMNS}
 
 
 def _resolve_upsert_builder(engine: Engine) -> _UpsertBuilder:
