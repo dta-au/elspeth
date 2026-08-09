@@ -94,6 +94,7 @@
         "cloudwatch:ListMetrics",
         "cloudwatch:ListTagsForResource",
         "cognito-idp:Describe*",
+        "cognito-idp:GetUserPoolMfaConfig",
         "cognito-idp:List*",
         "ec2:Describe*",
         "ecr:Describe*",
@@ -132,6 +133,21 @@
         "xray:GetSamplingRules"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "CreateRunTaggedXrayResources",
+      "Effect": "Allow",
+      "Action": [
+        "xray:CreateGroup",
+        "xray:CreateSamplingRule"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
     },
     {
       "Sid": "MutateRunTaggedXrayResources",

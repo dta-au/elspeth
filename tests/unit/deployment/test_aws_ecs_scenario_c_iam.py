@@ -190,7 +190,7 @@ def test_scenario_c_repository_and_secret_inputs_are_exactly_bound() -> None:
 def test_scenario_c_iam_documents_stay_within_managed_policy_limit() -> None:
     documents = _render_installer_policies(maximum_names=True)
     sizes = {name: len(json.dumps(document, separators=(",", ":"))) for name, document in documents.items()}
-    assert len(documents) == 4
+    assert len(documents) == 5
     assert all(size <= 6_144 for size in sizes.values()), sizes
 
     lifecycle = _text("iam/lifecycle-policy.json.tftpl")

@@ -57,6 +57,7 @@ EXPECTED_FILES = {
     "iam/installer-regional-resources-policy.json.tftpl",
     "iam/installer-relationships-policy.json.tftpl",
     "iam/installer-runtime-observation-policy.json.tftpl",
+    "iam/installer-tagless-updates-policy.json.tftpl",
     "iam/lifecycle-policy.json.tftpl",
     "modules/scenario/database_bootstrap.tf",
     "modules/scenario/ecs.tf",
@@ -1748,12 +1749,13 @@ def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit(
     rendered_sizes = {path.name: len(json.dumps(document, separators=(",", ":"))) for path, _rendered, document in documents}
     assert rendered_sizes == {
         "installer-control-plane-policy.json.tftpl": 6_017,
-        "installer-regional-resources-policy.json.tftpl": 6_102,
-        "installer-relationships-policy.json.tftpl": 5_865,
-        "installer-runtime-observation-policy.json.tftpl": 5_767,
+        "installer-regional-resources-policy.json.tftpl": 5_921,
+        "installer-relationships-policy.json.tftpl": 6_014,
+        "installer-runtime-observation-policy.json.tftpl": 6_073,
+        "installer-tagless-updates-policy.json.tftpl": 688,
     }
     assert all(size <= 6_144 for size in rendered_sizes.values()), rendered_sizes
-    assert len(documents) == 4
+    assert len(documents) == 5
 
     statement_sids = [statement["Sid"] for _path, _rendered, document in documents for statement in document["Statement"]]
     assert len(statement_sids) == len(set(statement_sids))
@@ -1866,6 +1868,99 @@ def test_installer_policy_grants_exact_run_tagged_cognito_child_update_path() ->
     assert {sid for sid, statement in statements.items() if "cognito-idp:UpdateUserPoolClient" in statement["Action"]} == {
         "ManageRunCognitoChildren"
     }
+
+
+def test_installer_policy_covers_pinned_provider_update_calls_without_lifecycle_widening() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    run_tagged = statements["MutateRunTaggedRegionalResources"]
+    region_scoped_provider_resources = statements["MutateRegionScopedProviderResources"]
+    network_relationships = statements["ManageRunEc2NetworkRelationships"]
+    efs_mount_targets = statements["ManageRunEfsMountTargets"]
+
+    assert {
+        "ecs:UpdateCluster",
+        "elasticloadbalancing:SetSecurityGroups",
+        "elasticloadbalancing:SetSubnets",
+        "rds:RebootDBInstance",
+    }.issubset(run_tagged["Action"])
+    assert "ecs:UpdateClusterSettings" not in run_tagged["Action"]
+    assert run_tagged["Resource"] == "*"
+    assert run_tagged["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+
+    assert {
+        "ec2:ModifySecurityGroupRules",
+        "ec2:ReplaceRoute",
+        "ec2:ReplaceRouteTableAssociation",
+    }.issubset(network_relationships["Action"])
+    assert network_relationships["Resource"] == [
+        "arn:aws:ec2:ap-southeast-1:123456789012:internet-gateway/*",
+        "arn:aws:ec2:ap-southeast-1:123456789012:route-table/*",
+        "arn:aws:ec2:ap-southeast-1:123456789012:security-group/*",
+        "arn:aws:ec2:ap-southeast-1:123456789012:security-group-rule/*",
+        "arn:aws:ec2:ap-southeast-1:123456789012:subnet/*",
+        "arn:aws:ec2:ap-southeast-1:123456789012:vpc/*",
+    ]
+    assert network_relationships["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+
+    assert efs_mount_targets["Action"] == ["elasticfilesystem:CreateMountTarget", "elasticfilesystem:DeleteMountTarget"]
+    assert efs_mount_targets["Resource"] == "arn:aws:elasticfilesystem:ap-southeast-1:123456789012:file-system/*"
+    assert efs_mount_targets["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+
+    assert region_scoped_provider_resources["Action"] == [
+        "elasticfilesystem:ModifyMountTargetSecurityGroups",
+        "elasticloadbalancing:SetRulePriorities",
+    ]
+    assert region_scoped_provider_resources["Resource"] == [
+        "arn:aws:elasticfilesystem:ap-southeast-1:123456789012:file-system/*",
+        "arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:listener-rule/app/a-0123456789abcdefabcd-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:listener-rule/app/b-0123456789abcdefabcd-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:listener-rule/app/c-0123456789abcdefabcd-alb/*/*/*",
+    ]
+    assert region_scoped_provider_resources["Condition"]["StringEquals"] == {
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+    assert "aws:ResourceTag/ACCEPTANCE_RUN_ID" not in json.dumps(region_scoped_provider_resources)
+    tagless_updates = [document for path, _rendered, document in documents if path.name == "installer-tagless-updates-policy.json.tftpl"]
+    assert len(tagless_updates) == 1
+    assert tagless_updates[0]["Statement"] == [region_scoped_provider_resources]
+
+    discovery_actions = statements["ReadDiscovery"]["Action"]
+    assert "cognito-idp:GetUserPoolMfaConfig" in discovery_actions
+    assert "elasticfilesystem:Describe*" in discovery_actions
+    assert "elasticloadbalancing:Describe*" in discovery_actions
+    assert "bedrock:DeleteGuardrail" in run_tagged["Action"]
+    assert "s3:PutBucketTagging" in statements["ManageElspethNamedBuckets"]["Action"]
+
+    installer_actions = {action for statement in statements.values() for action in statement["Action"]}
+    assert not {
+        "iam:PutRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy",
+    }.intersection(installer_actions)
+
+    expected_sids = {
+        "ecs:UpdateCluster": "MutateRunTaggedRegionalResources",
+        "ec2:ModifySecurityGroupRules": "ManageRunEc2NetworkRelationships",
+        "ec2:ReplaceRoute": "ManageRunEc2NetworkRelationships",
+        "ec2:ReplaceRouteTableAssociation": "ManageRunEc2NetworkRelationships",
+        "elasticfilesystem:ModifyMountTargetSecurityGroups": "MutateRegionScopedProviderResources",
+        "elasticloadbalancing:SetRulePriorities": "MutateRegionScopedProviderResources",
+        "elasticloadbalancing:SetSecurityGroups": "MutateRunTaggedRegionalResources",
+        "elasticloadbalancing:SetSubnets": "MutateRunTaggedRegionalResources",
+        "cognito-idp:GetUserPoolMfaConfig": "ReadDiscovery",
+        "rds:RebootDBInstance": "MutateRunTaggedRegionalResources",
+    }
+    for action, expected_sid in expected_sids.items():
+        assert {sid for sid, statement in statements.items() if action in statement["Action"]} == {expected_sid}
 
 
 def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
@@ -2104,7 +2199,8 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     readme = _text("README.md")
     for name in values:
         assert f"${{{name}}}" in readme
-    assert "four customer-managed policies" in readme
+    assert "five customer-managed policies" in readme
+    assert "detach and delete all six" in readme
     assert "6,144" in readme
     assert "inline policies" in readme
     assert "dedicated empty account" in readme

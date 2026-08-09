@@ -88,8 +88,11 @@
         "ec2:DeleteRoute",
         "ec2:DetachInternetGateway",
         "ec2:DisassociateRouteTable",
+        "ec2:ModifySecurityGroupRules",
         "ec2:ModifySubnetAttribute",
         "ec2:ModifyVpcAttribute",
+        "ec2:ReplaceRoute",
+        "ec2:ReplaceRouteTableAssociation",
         "ec2:RevokeSecurityGroupEgress",
         "ec2:RevokeSecurityGroupIngress"
       ],
@@ -97,6 +100,7 @@
         "arn:aws:ec2:${aws_region}:${aws_account_id}:internet-gateway/*",
         "arn:aws:ec2:${aws_region}:${aws_account_id}:route-table/*",
         "arn:aws:ec2:${aws_region}:${aws_account_id}:security-group/*",
+        "arn:aws:ec2:${aws_region}:${aws_account_id}:security-group-rule/*",
         "arn:aws:ec2:${aws_region}:${aws_account_id}:subnet/*",
         "arn:aws:ec2:${aws_region}:${aws_account_id}:vpc/*"
       ],

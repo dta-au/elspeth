@@ -97,7 +97,7 @@
         "ecr:UntagResource",
         "ecs:DeleteCluster",
         "ecs:DeleteService",
-        "ecs:UpdateClusterSettings",
+        "ecs:UpdateCluster",
         "ecs:UpdateService",
         "elasticfilesystem:DeleteAccessPoint",
         "elasticfilesystem:DeleteFileSystem",
@@ -114,6 +114,8 @@
         "elasticloadbalancing:ModifyTargetGroup",
         "elasticloadbalancing:ModifyTargetGroupAttributes",
         "elasticloadbalancing:RemoveTags",
+        "elasticloadbalancing:SetSecurityGroups",
+        "elasticloadbalancing:SetSubnets",
         "events:DeleteRule",
         "events:PutRule",
         "events:TagResource",
@@ -129,6 +131,7 @@
         "rds:ModifyDBCluster",
         "rds:ModifyDBInstance",
         "rds:ModifyDBSubnetGroup",
+        "rds:RebootDBInstance",
         "rds:RemoveTagsFromResource",
         "secretsmanager:DeleteSecret",
         "secretsmanager:PutSecretValue",
@@ -209,21 +212,6 @@
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_c_namespace}-cluster/performance",
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_c_namespace}-cluster/performance:*"
       ]
-    },
-    {
-      "Sid": "CreateRunTaggedXrayResources",
-      "Effect": "Allow",
-      "Action": [
-        "xray:CreateGroup",
-        "xray:CreateSamplingRule"
-      ],
-      "Resource": "*",
-      "Condition": {
-        "StringEquals": {
-          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
-        }
-      }
     },
     {
       "Sid": "ManageRunEfsLifecycleConfiguration",

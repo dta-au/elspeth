@@ -164,22 +164,29 @@ index. Supply the package, SHA, and image only from the verified release build.
 
 The package deliberately splits IAM authority across two principals:
 
-- The four customer-managed policies for the normal installer are:
+- The five customer-managed policies for the normal installer are:
   `iam/installer-control-plane-policy.json.tftpl`,
   `iam/installer-regional-resources-policy.json.tftpl`,
-  `iam/installer-relationships-policy.json.tftpl`, and
-  `iam/installer-runtime-observation-policy.json.tftpl`. Together they separate
+  `iam/installer-relationships-policy.json.tftpl`,
+  `iam/installer-runtime-observation-policy.json.tftpl`, and
+  `iam/installer-tagless-updates-policy.json.tftpl`. Together they separate
   discovery reads from mutations, limit named resources, manage only the known
   inline and managed role-policy bindings, and permit `iam:PassRole` only to
-  `ecs-tasks.amazonaws.com`. They cannot create or delete the generated roles,
-  change their trust or boundary, or manage the boundary policy.
+  `ecs-tasks.amazonaws.com`. The tagless-updates policy is limited to the two
+  provider update calls that cannot use the run-tag condition. EFS mount-target
+  security-group updates have no usable resource-tag condition or mount-target
+  resource scope, so their unavoidable limit is the configured account and
+  region's file systems; listener-rule priority changes remain restricted to
+  the three scenario load-balancer rule families. They cannot create or delete
+  the generated roles, change their trust or boundary, or manage the boundary
+  policy.
 - `iam/lifecycle-policy.json.tftpl` is for a separate IAM lifecycle principal.
   It can create, tag, and delete only the six bounded scenario-role patterns
   and can create, version, and delete only the exact run boundary. Explicit
   denies prevent it from adding role permissions, passing or assuming a role,
   or starting an ECS task.
 
-Render all four installer policies plus the lifecycle policy for one account,
+Render all five installer policies plus the lifecycle policy for one account,
 region, and run before attaching them to their respective principals:
 
 ```sh
@@ -211,12 +218,15 @@ envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ec
 envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
   < iam/installer-runtime-observation-policy.json.tftpl \
   > bootstrap/.terraform/installer-runtime-observation-policy.json
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
+  < iam/installer-tagless-updates-policy.json.tftpl \
+  > bootstrap/.terraform/installer-tagless-updates-policy.json
 envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
   < iam/lifecycle-policy.json.tftpl \
   > bootstrap/.terraform/iam-lifecycle-policy.json
 ```
 
-Inspect the rendered JSON and attach all four installer documents as separate
+Inspect the rendered JSON and attach all five installer documents as separate
 customer-managed policies to the normal installer principal. Attach the
 lifecycle policy only to the lifecycle principal. Each rendered installer
 document must remain within IAM's 6,144-character customer-managed-policy
@@ -1326,10 +1336,10 @@ lifecycle principal deletes each role. The lifecycle principal then deletes
 the custom boundary only during the final bootstrap destroy. Repeated apply
 and full `terraform destroy` commands remain the supported idempotent workflow.
 
-The four installer policies and the lifecycle policy attached before
+The five installer policies and the lifecycle policy attached before
 bootstrap live outside every Terraform state, so no destroy removes them.
 After the bootstrap destroy succeeds — both destroys still need those
-policies — detach and delete all five through the same paths used to attach
+policies — detach and delete all six through the same paths used to attach
 them.
 
 ### Container Insights log-group orphan on redeploy (R2-D3, elspeth-a229c247a1)

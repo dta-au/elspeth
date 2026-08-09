@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "MutateRegionScopedProviderResources",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:ModifyMountTargetSecurityGroups",
+        "elasticloadbalancing:SetRulePriorities"
+      ],
+      "Resource": [
+        "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_a_namespace}-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_b_namespace}-alb/*/*/*",
+        "arn:aws:elasticloadbalancing:${aws_region}:${aws_account_id}:listener-rule/app/${scenario_c_namespace}-alb/*/*/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    }
+  ]
+}
