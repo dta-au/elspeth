@@ -153,6 +153,24 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-10 — a `DateTime(timezone=True)` column does NOT round-trip aware on
+  SQLite**: the blobs write stamps `datetime.now(UTC)`, the column declares
+  `timezone=True`, and `BlobRecord.created_at` still comes back with
+  `tzinfo=None` through the SQLite dialect. So a `created_at.tzinfo is not None`
+  assertion reads as obviously correct, raises on EVERY write under SQLite, and
+  passes under PostgreSQL — an environment-dependent production break that a
+  PostgreSQL-only test lane would never show you. Check `created_at` for shape
+  (`type(x) is datetime`) unless you have proven awareness on the backend you
+  actually run. `verify_finalized_pipeline_custody`
+  (`web/composer/pipeline_custody.py`) documents the narrowing and
+  `test_verify_accepts_a_naive_created_at` pins it against a well-meaning
+  re-tightening. Found while extracting the check from an abandoned WIP branch
+  (a5d7fc0e7): salvaged WIP is a hypothesis, not reviewed code — probe its
+  assertions against a live round-trip before porting them. The same function
+  arrived using a `getattr(record, field_name)` loop, which gate 1/2 above
+  forbid outright; `BlobRecord` is an owned type, so direct attribute access
+  was always the correct form.
+
 - **2026-08-09 — composer edge/route contract (Lane W2, elspeth-67b44040ee)**:
   scalar routing fields are the runtime authority; SINK-targeting edges are
   their mirror and must agree; node-targeting on_success edges are advisory.

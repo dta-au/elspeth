@@ -12,6 +12,7 @@ from __future__ import annotations
 import hmac
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
@@ -28,6 +29,7 @@ from elspeth.contracts.blobs import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.service import (
     BlobServiceImpl,
     _normalized_inline_custody_fields,
@@ -364,4 +366,77 @@ async def finalize_pipeline_custody(
     record = await service.reserve_inline_custody(preparation.request, write_fence=write_fence)
     if record.id != preparation.blob_id:
         raise AuditIntegrityError("Inline custody returned a blob id different from the prepared proposal")
+    await run_sync_in_worker(verify_finalized_pipeline_custody, preparation, record, data_dir=data_dir)
     return record
+
+
+def verify_finalized_pipeline_custody(
+    preparation: PipelineCustodyPreparation,
+    record: BlobRecord,
+    *,
+    data_dir: str | Path,
+) -> None:
+    """Verify publication returned the exact row the preparation promised.
+
+    Agreeing on the blob id shows only that the write was addressed correctly;
+    it cannot show that the persisted row and the file on disk carry the bytes
+    and provenance this plan authorized. Every field is re-derived through the
+    SAME normalization and path formula the settlement insert uses, then
+    compared on exact runtime type as well as value — a ``size_bytes`` of
+    ``8.0`` equals ``8`` and must still not settle.
+
+    Two deliberate narrowings:
+
+    ``created_at`` is checked for shape only. The column is
+    ``DateTime(timezone=True)`` and the write stamps an aware value, but the
+    SQLite round-trip returns it naive, so awareness is not a property this
+    storage layer can promise on every backend.
+
+    The symbolic-link guard tests the settled file itself, not its ancestors:
+    ``inline_custody_storage_path`` already resolves ``data_dir``, so a link
+    planted at the blob path is the reachable case, while walking the operator's
+    configured parents would reject legitimate deployments.
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    if type(record) is not BlobRecord:
+        raise TypeError("record must be an exact BlobRecord")
+    request = preparation.request
+    fields = _normalized_inline_custody_fields(request)
+    storage_path = inline_custody_storage_path(
+        Path(data_dir),
+        session_id=fields["session_id"],
+        blob_id=str(preparation.blob_id),
+        filename=fields["filename"],
+    )
+    settled: tuple[tuple[str, object, object], ...] = (
+        ("id", record.id, preparation.blob_id),
+        ("session_id", record.session_id, request.session_id),
+        ("filename", record.filename, fields["filename"]),
+        ("mime_type", record.mime_type, fields["mime_type"]),
+        ("size_bytes", record.size_bytes, fields["size_bytes"]),
+        ("content_hash", record.content_hash, fields["content_hash"]),
+        ("storage_path", record.storage_path, str(storage_path)),
+        ("created_by", record.created_by, "assistant"),
+        ("source_description", record.source_description, fields["source_description"]),
+        ("status", record.status, "ready"),
+        ("creation_modality", record.creation_modality, fields["creation_modality"]),
+        ("created_from_message_id", record.created_from_message_id, fields["created_from_message_id"]),
+        ("creating_model_identifier", record.creating_model_identifier, fields["creating_model_identifier"]),
+        ("creating_model_version", record.creating_model_version, fields["creating_model_version"]),
+        ("creating_provider", record.creating_provider, fields["creating_provider"]),
+        ("creating_composer_skill_hash", record.creating_composer_skill_hash, fields["creating_composer_skill_hash"]),
+        ("creating_arguments_hash", record.creating_arguments_hash, fields["creating_arguments_hash"]),
+    )
+    for field_name, actual, expected in settled:
+        if type(actual) is not type(expected) or actual != expected:
+            raise AuditIntegrityError(f"Inline custody finalization returned mismatched {field_name}")
+    if type(record.created_at) is not datetime:
+        raise AuditIntegrityError("Inline custody finalization returned mismatched created_at")
+    if storage_path.is_symlink():
+        raise AuditIntegrityError("Inline custody finalization returned a symbolic-link storage path")
+    if not storage_path.is_file():
+        raise AuditIntegrityError("Inline custody finalization returned a missing storage file")
+    stored_bytes = storage_path.read_bytes()
+    if not hmac.compare_digest(stored_bytes, request.content):
+        raise AuditIntegrityError("Inline custody finalization returned mismatched storage bytes")

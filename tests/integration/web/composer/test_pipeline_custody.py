@@ -4,19 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.web.blobs.service import content_hash
 from elspeth.web.composer.pipeline_custody import (
+    PipelineCustodyPreparation,
     finalize_pipeline_custody_on_connection,
     inline_custody_audit_projection,
     prepare_pipeline_custody,
+    verify_finalized_pipeline_custody,
 )
 from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
 
@@ -213,3 +217,140 @@ def test_prepare_pipeline_custody_rejects_candidate_argument_seam_mismatch_witho
     assert "different private content" not in str(exc_info.value)
     assert "different description" not in str(exc_info.value)
     assert not prepared.storage_path.parent.exists()
+
+
+_CUSTODY_CONTENT = b"private-inline-value\n42\n"
+
+
+def _settled(tmp_path: Path) -> tuple[PipelineCustodyPreparation, BlobRecord]:
+    """Prepare one custody plan and the exact settled row it promises.
+
+    Expected values are written out literally rather than re-derived through
+    ``_normalized_inline_custody_fields``: a record built by the same helper the
+    verifier calls would agree with itself no matter what either one did.  Only
+    ``creating_arguments_hash`` comes from the preparation, because
+    ``prepare_pipeline_custody`` deliberately rebinds it to the hash of the
+    custody-safe arguments and no literal can stand in for that.
+    """
+    prepared = _prepared(tmp_path, content=_CUSTODY_CONTENT)
+    session_id = prepared.storage_path.parent.name
+    custody = prepare_pipeline_custody(
+        _arguments(),
+        prepared,
+        session_id=session_id,
+        max_storage_per_session=500 * 1024 * 1024,
+    )
+    storage = tmp_path.expanduser().resolve() / "blobs" / session_id / f"{custody.blob_id}_candidate.csv"
+    storage.parent.mkdir(parents=True, exist_ok=True)
+    storage.write_bytes(_CUSTODY_CONTENT)
+    record = BlobRecord(
+        id=custody.blob_id,
+        session_id=custody.request.session_id,
+        filename="candidate.csv",
+        mime_type="text/csv",
+        size_bytes=len(_CUSTODY_CONTENT),
+        content_hash=content_hash(_CUSTODY_CONTENT),
+        storage_path=str(storage),
+        created_at=datetime.now(UTC),
+        created_by="assistant",
+        source_description="reviewed candidate",
+        status="ready",
+        creation_modality=CreationModality.LLM_GENERATED,
+        created_from_message_id=prepared.created_from_message_id,
+        creating_model_identifier="composer-model",
+        creating_model_version="composer-version",
+        creating_provider="provider",
+        creating_composer_skill_hash="a" * 64,
+        creating_arguments_hash=custody.request.creating_arguments_hash,
+    )
+    return custody, record
+
+
+def test_verify_accepts_the_row_the_preparation_promised(tmp_path: Path) -> None:
+    custody, record = _settled(tmp_path)
+
+    verify_finalized_pipeline_custody(custody, record, data_dir=tmp_path)
+
+
+def test_verify_accepts_a_naive_created_at(tmp_path: Path) -> None:
+    """``created_at`` is checked for shape only, and deliberately so.
+
+    The column is ``DateTime(timezone=True)`` and the write stamps an aware
+    value, but the SQLite round-trip returns it naive.  Asserting awareness here
+    would raise on every inline custody finalization under SQLite, so this pins
+    the narrowing against a well-meaning future tightening.
+    """
+    custody, record = _settled(tmp_path)
+
+    verify_finalized_pipeline_custody(custody, replace(record, created_at=datetime.now()), data_dir=tmp_path)  # noqa: DTZ005
+
+
+def test_verify_rejects_a_value_equal_but_differently_typed_size(tmp_path: Path) -> None:
+    """``24.0 == 24`` is True; the settled row still carried the wrong type."""
+    custody, record = _settled(tmp_path)
+    widened = replace(record, size_bytes=float(len(_CUSTODY_CONTENT)))
+
+    assert widened.size_bytes == record.size_bytes
+    with pytest.raises(AuditIntegrityError, match="mismatched size_bytes"):
+        verify_finalized_pipeline_custody(custody, widened, data_dir=tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "tampered_value"),
+    [
+        ("filename", "attacker.csv"),
+        ("mime_type", "text/plain"),
+        ("content_hash", "f" * 64),
+        ("created_by", "user"),
+        ("source_description", "quietly relabelled"),
+        ("status", "pending"),
+        ("creation_modality", CreationModality.VERBATIM),
+        ("creating_model_identifier", "other-model"),
+        ("creating_provider", "other-provider"),
+        ("creating_composer_skill_hash", "c" * 64),
+        ("creating_arguments_hash", "d" * 64),
+    ],
+)
+def test_verify_rejects_every_tampered_provenance_field(tmp_path: Path, field_name: str, tampered_value: object) -> None:
+    custody, record = _settled(tmp_path)
+
+    with pytest.raises(AuditIntegrityError, match=f"mismatched {field_name}"):
+        verify_finalized_pipeline_custody(custody, replace(record, **{field_name: tampered_value}), data_dir=tmp_path)
+
+
+def test_verify_rejects_a_row_pointing_at_another_blobs_storage(tmp_path: Path) -> None:
+    custody, record = _settled(tmp_path)
+    elsewhere = tmp_path / "blobs" / "elsewhere.csv"
+    elsewhere.parent.mkdir(parents=True, exist_ok=True)
+    elsewhere.write_bytes(_CUSTODY_CONTENT)
+
+    with pytest.raises(AuditIntegrityError, match="mismatched storage_path"):
+        verify_finalized_pipeline_custody(custody, replace(record, storage_path=str(elsewhere)), data_dir=tmp_path)
+
+
+def test_verify_rejects_a_missing_storage_file(tmp_path: Path) -> None:
+    custody, record = _settled(tmp_path)
+    Path(record.storage_path).unlink()
+
+    with pytest.raises(AuditIntegrityError, match="missing storage file"):
+        verify_finalized_pipeline_custody(custody, record, data_dir=tmp_path)
+
+
+def test_verify_rejects_storage_bytes_that_drifted_from_the_authorized_content(tmp_path: Path) -> None:
+    custody, record = _settled(tmp_path)
+    Path(record.storage_path).write_bytes(b"substituted-after-the-row-was-written\n")
+
+    with pytest.raises(AuditIntegrityError, match="mismatched storage bytes"):
+        verify_finalized_pipeline_custody(custody, record, data_dir=tmp_path)
+
+
+def test_verify_rejects_a_symbolic_link_planted_at_the_storage_path(tmp_path: Path) -> None:
+    custody, record = _settled(tmp_path)
+    settled_path = Path(record.storage_path)
+    target = tmp_path / "attacker-controlled.csv"
+    target.write_bytes(_CUSTODY_CONTENT)
+    settled_path.unlink()
+    settled_path.symlink_to(target)
+
+    with pytest.raises(AuditIntegrityError, match="symbolic-link storage path"):
+        verify_finalized_pipeline_custody(custody, record, data_dir=tmp_path)
