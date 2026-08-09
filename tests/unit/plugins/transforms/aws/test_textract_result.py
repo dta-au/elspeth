@@ -10,6 +10,7 @@ import pytest
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
+    normalize_analyze_document_result,
     normalize_textract_result,
 )
 
@@ -658,3 +659,116 @@ def test_cycle_in_non_facet_page_graph_fails_closed() -> None:
 
     with pytest.raises(MalformedTextractResponse, match="cyclic CHILD"):
         _normalize(first, _second_page())
+
+
+# ---------------------------------------------------------------------------
+# Synchronous AnalyzeDocument entry point (aws_textract_inline_analysis).
+# The sync response has no JobStatus, Warnings, job identity, or S3 version;
+# HumanLoopActivationOutput is a malformed known response because V1 never
+# sends HumanLoopConfig.
+# ---------------------------------------------------------------------------
+
+
+def _sync_response() -> dict[str, Any]:
+    return {
+        "DocumentMetadata": {"Pages": 1},
+        "AnalyzeDocumentModelVersion": "1.0",
+        "Blocks": list(_first_page()["Blocks"]),
+    }
+
+
+def _normalize_sync(response: dict[str, Any], *, max_blocks: int = 200_000, max_result_bytes: int = 50_000_000):
+    return normalize_analyze_document_result(
+        response=response,
+        feature_types=("FORMS", "TABLES"),
+        max_blocks=max_blocks,
+        max_result_bytes=max_result_bytes,
+    )
+
+
+def test_analyze_document_normalizes_single_response() -> None:
+    result = _normalize_sync(_sync_response())
+
+    assert result.text == "Invoice\nTotal $42"
+    assert result.page_count == 1
+    assert result.block_count == 6
+    assert [page["page"] for page in result.pages] == [1]
+    assert result.metadata == {
+        "page_count": 1,
+        "block_count": 6,
+        "model_version": "1.0",
+        "feature_types": ["FORMS", "TABLES"],
+    }
+    assert list(result.native_result.keys()) == ["DocumentMetadata", "AnalyzeDocumentModelVersion", "Blocks"]
+    assert result.native_result["DocumentMetadata"] == {"Pages": 1}
+    assert result.native_result["Blocks"][2]["UnknownMember"] == {"preserved": True}
+
+
+def test_analyze_document_accepts_deeply_frozen_response() -> None:
+    result = _normalize_sync(deep_freeze(_sync_response()))
+
+    assert result.text == "Invoice\nTotal $42"
+    assert result.native_result["Blocks"][0]["Relationships"] == [{"Type": "CHILD", "Ids": ["line-1", "line-2"]}]
+
+
+def test_analyze_document_rejects_human_loop_activation_output() -> None:
+    response = _sync_response()
+    response["HumanLoopActivationOutput"] = {"HumanLoopArn": "arn:aws:sagemaker:..."}
+
+    with pytest.raises(MalformedTextractResponse, match="HumanLoopActivationOutput"):
+        _normalize_sync(response)
+
+
+@pytest.mark.parametrize("missing", ["DocumentMetadata", "AnalyzeDocumentModelVersion", "Blocks"])
+def test_analyze_document_missing_required_member_fails_closed(missing: str) -> None:
+    response = _sync_response()
+    del response[missing]
+
+    with pytest.raises(MalformedTextractResponse):
+        _normalize_sync(response)
+
+
+def test_analyze_document_unknown_top_level_members_are_omitted() -> None:
+    response = _sync_response()
+    response["Warnings"] = [{"ErrorCode": "PAGE_CHARACTERS_EXCEEDED", "Pages": [1]}]
+    response["NextToken"] = "unused"
+
+    result = _normalize_sync(response)
+
+    assert "Warnings" not in result.native_result
+    assert "NextToken" not in result.native_result
+    assert "warnings" not in result.metadata
+
+
+def test_analyze_document_multi_page_response_normalizes() -> None:
+    """The parser stays general; the inline transform owns the Pages == 1 rule."""
+    first = _first_page()
+    second = _second_page()
+    response = {
+        "DocumentMetadata": {"Pages": 2},
+        "AnalyzeDocumentModelVersion": "1.0",
+        "Blocks": [*first["Blocks"], *second["Blocks"]],
+    }
+
+    result = _normalize_sync(response)
+
+    assert result.page_count == 2
+    assert result.text == "Invoice\nTotal $42\n\f\nThank you"
+
+
+def test_analyze_document_duplicate_block_id_fails_closed() -> None:
+    response = _sync_response()
+    response["Blocks"].append(dict(response["Blocks"][1]))
+
+    with pytest.raises(MalformedTextractResponse, match="duplicate block id"):
+        _normalize_sync(response)
+
+
+def test_analyze_document_block_bound_fails_closed() -> None:
+    with pytest.raises(MalformedTextractResponse, match="max_blocks"):
+        _normalize_sync(_sync_response(), max_blocks=3)
+
+
+def test_analyze_document_oversized_native_result_fails_closed() -> None:
+    with pytest.raises(MalformedTextractResponse, match="max_result_bytes"):
+        _normalize_sync(_sync_response(), max_result_bytes=64)
