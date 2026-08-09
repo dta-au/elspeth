@@ -1,0 +1,11 @@
+# The S3 backend reads and writes state BEFORE any provider-level account
+# validation runs (allowed_account_ids fires only once resources refresh).
+# Verify the active profile's account before `terraform init`:
+#   aws sts get-caller-identity --profile <profile> --query Account --output text
+# must print the account that owns this bucket.
+bucket         = "REPLACE_WITH_BOOTSTRAP_STATE_BUCKET"
+key            = "elspeth/scenario-c/terraform.tfstate"
+region         = "REPLACE_WITH_AWS_REGION"
+profile        = "REPLACE_WITH_AWS_PROFILE"
+encrypt        = true
+use_lockfile   = true

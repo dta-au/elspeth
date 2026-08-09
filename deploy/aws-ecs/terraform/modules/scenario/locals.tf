@@ -28,6 +28,7 @@ locals {
   scenario_network = {
     A = { vpc = "10.71.0.0/16", public_subnets = ["10.71.0.0/20", "10.71.16.0/20"] }
     B = { vpc = "10.72.0.0/16", public_subnets = ["10.72.0.0/20", "10.72.16.0/20"] }
+    C = { vpc = "10.73.0.0/16", public_subnets = ["10.73.0.0/20", "10.73.16.0/20"] }
   }
   vpc_cidr            = local.scenario_network[var.scenario_id].vpc
   public_subnet_cidrs = local.scenario_network[var.scenario_id].public_subnets

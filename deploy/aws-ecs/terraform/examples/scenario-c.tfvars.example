@@ -1,0 +1,83 @@
+run_id                       = "REPLACE_WITH_LOWERCASE_UUID"
+scenario_id                  = "C"
+candidate_sha                = "REPLACE_WITH_FULL_GIT_SHA"
+candidate_image              = "REPLACE_WITH_ELSPETH_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+candidate_ecr_repository     = "REPLACE_WITH_BOOTSTRAP_ECR_REPOSITORY_NAME"
+aws_account_id               = "REPLACE_WITH_12_DIGIT_ACCOUNT_ID"
+aws_region                   = "REPLACE_WITH_AWS_REGION"
+aws_profile                  = "REPLACE_WITH_AWS_PROFILE"
+iam_lifecycle_aws_profile    = "REPLACE_WITH_DISTINCT_IAM_LIFECYCLE_AWS_PROFILE"
+iam_permissions_boundary_arn = "arn:aws:iam::REPLACE_WITH_12_DIGIT_ACCOUNT_ID:policy/elspeth-REPLACE_WITH_LOWERCASE_UUID-ecs-boundary"
+target_platform              = "linux/amd64"
+owner                        = "REPLACE_WITH_OWNER"
+purpose                      = "ELSPETH disposable cold install (custom gateway)"
+cleanup_deadline             = "2030-01-01T00:00:00Z"
+alb_https_ingress_cidrs      = ["REPLACE_WITH_OPERATOR_CIDR"]
+
+cloudwatch_agent_image          = "REPLACE_WITH_AGENT_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+cloudwatch_agent_ecr_repository = "REPLACE_WITH_BOOTSTRAP_AGENT_ECR_REPOSITORY_NAME"
+
+# Non-bedrock model ALIASES: what ELSPETH names, and what the gateway's
+# model mappings translate for the adapter. Never bedrock/... ids here.
+composer_model         = "REPLACE_WITH_PRIMARY_MODEL_ALIAS"
+composer_advisor_model = "REPLACE_WITH_DISTINCT_ADVISOR_MODEL_ALIAS"
+
+# ── Explicit control posture (REQUIRED under custom_gateway) ────────────────
+# The module refuses its shipped defaults here because they implement
+# prompt_shield and content_safety with Bedrock transforms, which cannot run
+# without Bedrock IAM. Setting these to "recommend" is an EXPLICIT, reviewable
+# weakening: web authors are advised, not blocked, when an LLM node lacks
+# shield/safety coverage. If your agency supplies non-Bedrock control
+# implementations, list them in plugin_preferences and restore "required".
+plugin_control_modes = {
+  prompt_shield  = "recommend"
+  content_safety = "recommend"
+}
+plugin_preferences = {}
+# The shipped default allowlist minus the two Bedrock control transforms.
+plugin_allowlist = [
+  "source:aws_s3",
+  "source:csv",
+  "source:json",
+  "source:llm",
+  "source:text",
+  "sink:aws_s3",
+  "sink:csv",
+  "sink:document",
+  "sink:json",
+  "sink:text",
+  "transform:aws_textract_document_analysis",
+  "transform:field_mapper",
+  "transform:line_explode",
+  "transform:llm",
+  "transform:passthrough",
+  "transform:report_assemble",
+  "transform:web_scrape",
+]
+
+# ── Gateway sidecar ─────────────────────────────────────────────────────────
+gateway_image          = "REPLACE_WITH_GATEWAY_IMAGE@sha256:REPLACE_WITH_64_HEX_DIGEST"
+gateway_sha            = "REPLACE_WITH_FULL_GIT_SHA_OF_GATEWAY_IMAGE"
+gateway_ecr_repository = "REPLACE_WITH_GATEWAY_ECR_REPOSITORY_NAME"
+
+# Operator-created Secrets Manager secrets. Terraform receives ARNs only —
+# never the values — and does not create or rotate them. The bearer reaches
+# both containers; the OAuth client credentials reach the gateway ONLY.
+gateway_bearer_secret_arn              = "arn:aws:secretsmanager:REPLACE_REGION:REPLACE_ACCOUNT:secret:REPLACE_BEARER_SECRET_NAME"
+gateway_oauth_client_id_secret_arn     = "arn:aws:secretsmanager:REPLACE_REGION:REPLACE_ACCOUNT:secret:REPLACE_OAUTH_CLIENT_ID_SECRET_NAME"
+gateway_oauth_client_secret_secret_arn = "arn:aws:secretsmanager:REPLACE_REGION:REPLACE_ACCOUNT:secret:REPLACE_OAUTH_CLIENT_SECRET_SECRET_NAME"
+
+gateway_adapter = "REPLACE_WITH_ADAPTER_NAME"
+
+# HTTPS egress destinations the deployment network must reach; documented
+# here, never baked into the module.
+gateway_upstream_origin = "https://REPLACE_WITH_AGENCY_UPSTREAM_ORIGIN"
+gateway_oauth_token_url = "https://REPLACE_WITH_TOKEN_ENDPOINT/oauth2/token"
+
+# alias => adapter-defined mapping object; must cover both composer models.
+gateway_model_mappings_json = <<JSON
+{
+  "REPLACE_WITH_PRIMARY_MODEL_ALIAS": {"upstream_model": "REPLACE_WITH_UPSTREAM_PRIMARY"},
+  "REPLACE_WITH_DISTINCT_ADVISOR_MODEL_ALIAS": {"upstream_model": "REPLACE_WITH_UPSTREAM_ADVISOR"}
+}
+JSON

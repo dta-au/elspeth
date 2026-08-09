@@ -11,8 +11,8 @@ variable "scenario_id" {
   type = string
 
   validation {
-    condition     = contains(["A", "B"], var.scenario_id)
-    error_message = "scenario_id must be A or B."
+    condition     = contains(["A", "B", "C"], var.scenario_id)
+    error_message = "scenario_id must be A, B, or C."
   }
 }
 
@@ -33,9 +33,10 @@ variable "deployment_lifecycle" {
     # letter and the axes is an authoring error, not a preference conflict.
     condition = (
       (var.scenario_id == "A" && var.deployment_lifecycle == "first" && var.llm_backend == "bedrock") ||
-      (var.scenario_id == "B" && var.deployment_lifecycle == "upgrade" && var.llm_backend == "bedrock")
+      (var.scenario_id == "B" && var.deployment_lifecycle == "upgrade" && var.llm_backend == "bedrock") ||
+      (var.scenario_id == "C" && var.deployment_lifecycle == "first" && var.llm_backend == "custom_gateway")
     )
-    error_message = "scenario_id, deployment_lifecycle, and llm_backend must form a maintained triple: A = first + bedrock, B = upgrade + bedrock."
+    error_message = "scenario_id, deployment_lifecycle, and llm_backend must form a maintained triple: A = first + bedrock, B = upgrade + bedrock, C = first + custom_gateway."
   }
 }
 
@@ -414,10 +415,15 @@ variable "plugin_allowlist" {
   validation {
     # Bedrock-implemented plugins cannot run without Bedrock IAM, and an
     # authorization that can never run misstates the deployment's posture.
-    condition = var.llm_backend == "bedrock" || var.plugin_allowlist == null || alltrue([
-      for id in var.plugin_allowlist : !startswith(id, "transform:aws_bedrock_")
-    ])
-    error_message = "under custom_gateway the plugin_allowlist must not authorize transform:aws_bedrock_* plugins; the deployment carries no Bedrock IAM."
+    # The module's shipped default includes Bedrock transforms, so under
+    # custom_gateway the allowlist must be stated explicitly (null would
+    # silently apply that default) and must not name them.
+    condition = var.llm_backend == "bedrock" || (
+      var.plugin_allowlist != null && alltrue([
+        for id in var.plugin_allowlist : !startswith(id, "transform:aws_bedrock_")
+      ])
+    )
+    error_message = "under custom_gateway plugin_allowlist must be set explicitly and must not authorize transform:aws_bedrock_* plugins; the deployment carries no Bedrock IAM and the shipped default includes them."
   }
 }
 
@@ -468,12 +474,16 @@ variable "plugin_preferences" {
   }
 
   validation {
-    condition = var.llm_backend == "bedrock" || var.plugin_preferences == null || alltrue(flatten([
-      for implementations in values(var.plugin_preferences) : [
-        for implementation in implementations : !startswith(implementation, "transform:aws_bedrock_")
-      ]
-    ]))
-    error_message = "under custom_gateway plugin_preferences must not select transform:aws_bedrock_* implementations; the deployment carries no Bedrock IAM."
+    # Explicitness required for the same reason as the allowlist: the
+    # shipped default preferences select the Bedrock control transforms.
+    condition = var.llm_backend == "bedrock" || (
+      var.plugin_preferences != null && alltrue(flatten([
+        for implementations in values(var.plugin_preferences) : [
+          for implementation in implementations : !startswith(implementation, "transform:aws_bedrock_")
+        ]
+      ]))
+    )
+    error_message = "under custom_gateway plugin_preferences must be set explicitly (an empty map is valid) and must not select transform:aws_bedrock_* implementations; the deployment carries no Bedrock IAM and the shipped default selects them."
   }
 }
 
