@@ -63,7 +63,12 @@ _CONTROL_MANIFEST_FIELDS = frozenset(
         "updated_at",
     }
 )
-_INFRASTRUCTURE_APPROVAL_SCOPES = frozenset({"A", "B", "bootstrap"})
+# "C" admits Scenario C terraform-plan/destroy-plan approvals only. The
+# release acceptance manifest's evidence pairing remains A/B: Scenario C
+# carries its own acceptance evidence per the 2026-07-30 integration design,
+# and its evidence schema is defined with the operator-gated live half of
+# the Scenario C work, not here.
+_INFRASTRUCTURE_APPROVAL_SCOPES = frozenset({"A", "B", "C", "bootstrap"})
 _RETAINED_EVIDENCE_FIELDS = frozenset(
     {
         "cloudwatch_retained_metrics",
