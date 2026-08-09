@@ -230,8 +230,8 @@ def reset_acceptance_step() -> None:
     _ACCEPTANCE_STEP.set(None)
 
 
-def _closed_error_code(error_code: str) -> str:
-    return error_code if error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"
+def _closed_error_code(error_code: object) -> str:
+    return error_code if type(error_code) is str and error_code in ACCEPTANCE_ERROR_CODES else "acceptance_internal"
 
 
 class AcceptanceInputError(RuntimeError):
@@ -402,7 +402,7 @@ def acceptance_error_envelope(exc: BaseException) -> dict[str, object]:
             envelope["cause_fields"] = sorted(exc.cause_fields)
         return envelope
     if isinstance(exc, AcceptanceInputError | AcceptanceHttpError | AcceptanceStateError | OperatorTelemetryAcceptanceError):
-        envelope["error_code"] = exc.error_code
+        envelope["error_code"] = _closed_error_code(exc.error_code)
         if type(exc.status) is int:
             envelope["status"] = exc.status
     else:

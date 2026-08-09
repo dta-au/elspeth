@@ -54,6 +54,37 @@ def test_error_code_vocabulary_is_closed_and_coerces_unknown_codes() -> None:
     assert coerced.error_code == "acceptance_internal"
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        contracts.AcceptanceHttpError("static", error_code="request_timeout"),
+        contracts.AcceptanceStateError("static", error_code="state_file_invalid"),
+        contracts.AcceptanceInputError("static"),
+        contracts.OperatorTelemetryAcceptanceError("static"),
+    ],
+    ids=("unknown-string", "unhashable", "string-subclass", "non-string"),
+)
+def test_error_envelope_reclamps_mutated_owned_error_codes(error: RuntimeError) -> None:
+    """Only exact closed-vocabulary strings may leave the nominal envelope."""
+
+    replacements: dict[str, object] = {
+        "AcceptanceHttpError": "provider_auth_secret",
+        "AcceptanceStateError": ["request_timeout"],
+        "AcceptanceInputError": type("MutableCode", (str,), {})("input_invalid"),
+        "OperatorTelemetryAcceptanceError": 7,
+    }
+    error.error_code = replacements[type(error).__name__]  # type: ignore[attr-defined]
+
+    assert contracts.acceptance_error_envelope(error)["error_code"] == "acceptance_internal"
+
+
+def test_error_envelope_reclamps_subclass_error_code_override() -> None:
+    class _MutatedInputError(contracts.AcceptanceInputError):
+        error_code = "provider_private_code"
+
+    assert contracts.acceptance_error_envelope(_MutatedInputError("static"))["error_code"] == "acceptance_internal"
+
+
 def test_acceptance_step_requires_a_vocabulary_name() -> None:
     with pytest.raises(ValueError, match="unknown acceptance step"), contracts.acceptance_step("made_up_step"):
         pytest.fail("step body must not run")

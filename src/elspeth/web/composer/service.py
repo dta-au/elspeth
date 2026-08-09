@@ -4429,6 +4429,39 @@ class ComposerServiceImpl:
             plugin_snapshot=plugin_snapshot,
         )
 
+    def _enforce_tool_call_cap(
+        self,
+        *,
+        assistant_tool_calls: Sequence[_AdmittedToolCall],
+        state: CompositionState,
+        initial_version: int,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        recorder: BufferingRecorder,
+        failed_turn: FailedTurnMetadata | None,
+        persisted_tool_call_turn: bool,
+    ) -> None:
+        """Reject an admitted completion whose tool batch exceeds the shared cap."""
+
+        observed = len(assistant_tool_calls)
+        if observed <= self._max_tool_calls_per_turn:
+            return
+        self._telemetry.tool_call_cap_exceeded_total.add(1)
+        raise ComposerConvergenceError.capture(
+            max_turns=composition_turns_used + discovery_turns_used,
+            budget_exhausted="composition",
+            state=state,
+            initial_version=initial_version,
+            tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+            llm_calls=recorder.llm_calls,
+            reason="tool_call_cap_exceeded",
+            evidence={
+                "observed": observed,
+                "cap": self._max_tool_calls_per_turn,
+            },
+            failed_turn=failed_turn,
+        )
+
     async def _call_model_turn(
         self,
         *,
@@ -4474,21 +4507,16 @@ class ComposerServiceImpl:
             returned if type(returned) is _AdmittedLLMCompletion else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
         )
         assistant_tool_calls = completion.tool_batch.calls
-        if len(assistant_tool_calls) > self._max_tool_calls_per_turn:
-            self._telemetry.tool_call_cap_exceeded_total.add(1)
-            raise ComposerConvergenceError.capture(
-                max_turns=composition_turns_used + discovery_turns_used,
-                budget_exhausted="composition",
-                state=state,
-                initial_version=initial_version,
-                tool_invocations=recorder.invocations,
-                llm_calls=recorder.llm_calls,
-                reason="tool_call_cap_exceeded",
-                evidence={
-                    "observed": len(assistant_tool_calls),
-                    "cap": self._max_tool_calls_per_turn,
-                },
-            )
+        self._enforce_tool_call_cap(
+            assistant_tool_calls=assistant_tool_calls,
+            state=state,
+            initial_version=initial_version,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            recorder=recorder,
+            failed_turn=failed_turn,
+            persisted_tool_call_turn=False,
+        )
 
         return _CallModelOutcome(completion=completion)
 
@@ -4829,6 +4857,16 @@ class ComposerServiceImpl:
                     returned
                     if type(returned) is _AdmittedLLMCompletion
                     else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
+                )
+                self._enforce_tool_call_cap(
+                    assistant_tool_calls=completion.tool_batch.calls,
+                    state=state,
+                    initial_version=initial_version,
+                    composition_turns_used=new_composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    recorder=recorder,
+                    failed_turn=failed_turn,
+                    persisted_tool_call_turn=persisted_tool_call_turn,
                 )
                 assistant_message = completion.message
                 if not completion.tool_batch.calls:
@@ -7665,12 +7703,14 @@ class ComposerServiceImpl:
         except AuditIntegrityError as exc:
             # Established monkeypatch seam: a raw completion can return
             # successfully yet fail the post-success tool-identity guard.
-            # Preserve that audit status while attaching the already-admitted
-            # provider facts; production `_call_llm` converts this case to the
-            # malformed-response carrier before it reaches this wrapper.
-            status = ComposerLLMCallStatus.SUCCESS if response_metadata is not None else ComposerLLMCallStatus.API_ERROR
-            error_class = None if response_metadata is not None else type(exc).__name__
-            error_message = None if response_metadata is not None else type(exc).__name__
+            # A provider completion with malformed tool identity is not a
+            # successful model call merely because the compatibility seam
+            # returned a raw response. Preserve the historical hard
+            # AuditIntegrityError raise while recording the same malformed
+            # disposition as the production admission path.
+            status = ComposerLLMCallStatus.MALFORMED_RESPONSE if response_metadata is not None else ComposerLLMCallStatus.API_ERROR
+            error_class = type(exc).__name__
+            error_message = "malformed_response" if response_metadata is not None else type(exc).__name__
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:

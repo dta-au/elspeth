@@ -213,7 +213,8 @@ async def test_over_cap_identity_violation_precedes_cap_telemetry_and_dispatch(
     assert type(attached_calls) is tuple
     assert len(attached_calls) == 1
     assert type(attached_calls[0]) is ComposerLLMCall
-    assert attached_calls[0].status is ComposerLLMCallStatus.SUCCESS
+    assert attached_calls[0].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert attached_calls[0].error_message == "malformed_response"
 
 
 @pytest.mark.asyncio
@@ -270,4 +271,101 @@ async def test_cap_not_exceeded_does_not_increment(
 
     await _run_one_turn(fake_composer_service, llm=fake_llm, session_id=result_session_id)
 
+    assert observed_value(telemetry.tool_call_cap_exceeded_total) == 0
+
+
+def _raw_response_with_tool_calls(tool_calls: list[SimpleNamespace]) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))],
+    )
+
+
+def _provider_tool_call(call_id: str, name: str, arguments: str = "{}") -> SimpleNamespace:
+    return SimpleNamespace(
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
+
+
+@pytest.mark.asyncio
+async def test_bonus_over_cap_raises_shared_cap_error_before_bonus_dispatch(
+    fake_composer_service: object,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The B-4D-3 completion obeys the same cap as an ordinary P1 turn."""
+
+    service = cast(Any, fake_composer_service)
+    telemetry = build_sessions_telemetry()
+    service._telemetry = telemetry
+    service._max_composition_turns = 1
+    service._max_tool_calls_per_turn = 2
+    responses = iter(
+        [
+            _raw_response_with_tool_calls([_provider_tool_call("mutate", "set_metadata", '{"patch":{"name":"charged"}}')]),
+            _raw_response_with_tool_calls(
+                [
+                    _provider_tool_call("bonus-1", "get_pipeline_state"),
+                    _provider_tool_call("bonus-2", "get_pipeline_state"),
+                    _provider_tool_call("bonus-3", "get_pipeline_state"),
+                ]
+            ),
+        ]
+    )
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return next(responses)
+
+    original_execute_tool = tool_batch_module.execute_tool
+    dispatched_names: list[str] = []
+
+    def _recording_execute_tool(tool_name: str, *args: Any, **kwargs: Any) -> Any:
+        dispatched_names.append(tool_name)
+        return original_execute_tool(tool_name, *args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "execute_tool", _recording_execute_tool)
+
+    with pytest.raises(ComposerConvergenceError) as excinfo:
+        await _run_one_turn(service, llm=_fake_llm, session_id=result_session_id)
+
+    assert excinfo.value.reason == "tool_call_cap_exceeded"
+    assert excinfo.value.evidence == {"observed": 3, "cap": 2}
+    assert excinfo.value.max_turns == 1
+    assert observed_value(telemetry.tool_call_cap_exceeded_total) == 1
+    assert dispatched_names == ["set_metadata"]
+
+
+@pytest.mark.asyncio
+async def test_bonus_exactly_at_cap_keeps_generic_composition_exhaustion(
+    fake_composer_service: object,
+    result_session_id: str,
+) -> None:
+    """Exactly-at-cap bonus calls are legal, then hit the normal budget arm."""
+
+    service = cast(Any, fake_composer_service)
+    telemetry = build_sessions_telemetry()
+    service._telemetry = telemetry
+    service._max_composition_turns = 1
+    service._max_tool_calls_per_turn = 2
+    responses = iter(
+        [
+            _raw_response_with_tool_calls([_provider_tool_call("mutate", "set_metadata", '{"patch":{"name":"charged"}}')]),
+            _raw_response_with_tool_calls(
+                [
+                    _provider_tool_call("bonus-1", "get_pipeline_state"),
+                    _provider_tool_call("bonus-2", "get_pipeline_state"),
+                ]
+            ),
+        ]
+    )
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return next(responses)
+
+    with pytest.raises(ComposerConvergenceError) as excinfo:
+        await _run_one_turn(service, llm=_fake_llm, session_id=result_session_id)
+
+    assert excinfo.value.reason == "convergence_composition_budget"
+    assert excinfo.value.evidence == {}
+    assert excinfo.value.max_turns == 1
     assert observed_value(telemetry.tool_call_cap_exceeded_total) == 0

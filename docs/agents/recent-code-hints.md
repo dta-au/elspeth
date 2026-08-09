@@ -109,6 +109,16 @@ what you touch, or run the full suite.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-09 — re-check mutable exception facts and every composer completion at their exit gate**:
+  nominal ownership of an exception does not make its class or instance
+  attributes immutable. Operator-facing acceptance envelopes must clamp
+  `error_code` again at projection time, requiring an exact `str` from the
+  closed vocabulary. In the freeform Composer, the B-4D-3 budget-exhaustion
+  bonus response is still a model completion: apply the shared per-turn tool
+  cap before its no-tool/generic-budget branch, using the already-charged
+  composition count. Raw `_call_llm` test-seam responses that fail tool-call
+  identity admission still re-raise `AuditIntegrityError`, but their LLM audit
+  row is `MALFORMED_RESPONSE`/`malformed_response`, never `SUCCESS`.
 - **2026-08-09 — review bundles are v2 exact-source assertions**: staging and
   firing bind full Git HEAD, tracked-source dirty state, and every scanner
   Python/YAML byte. The YAML set is the production loader's non-recursive
