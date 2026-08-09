@@ -99,6 +99,7 @@ allowed_dict_patterns:
 
   # Source plugins - row validation
   - "src/elspeth/plugins/sources/text_source.py:TextSource._validate_and_yield:row"
+  - "src/elspeth/plugins/sources/blob_rows.py:BlobRowsSource._validate_and_yield:row"
 
   # Pooling executor - row processing
   # _execute_single.row is now Mapping[str, Any] (IM-2 fix — freeze_fields
@@ -212,6 +213,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.__init__:config"
   - "src/elspeth/plugins/sources/json_source.py:JSONSource.__init__:config"
   - "src/elspeth/plugins/sources/csv_source.py:CSVSource.__init__:config"
+  - "src/elspeth/plugins/sources/blob_rows.py:BlobRowsSource.__init__:config"
   - "src/elspeth/plugins/sources/null_source.py:NullSource.__init__:config"
   - "src/elspeth/plugins/sources/text_source.py:TextSource.__init__:config"
   - "src/elspeth/plugins/sources/llm/source.py:LLMSource.__init__:config"
