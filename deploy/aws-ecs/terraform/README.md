@@ -36,9 +36,36 @@ installation. Its tfvars must name the nonempty Cognito subject that the
 acceptance run owns; the resolved inventory binds that subject to the
 Terraform-owned pool.
 
-Both scenarios create a disposable self-signed ALB certificate. It is valid for
-only 24 hours. Terraform outputs its CA certificate so a client can trust it
-temporarily; this is not a production certificate strategy.
+### Scenario C: cold install with a custom LLM gateway
+
+`scenario-c/` is Scenario A's deployment shape with the direct Bedrock LLM
+access replaced by an `elspeth-llm-gateway` sidecar in the same service task:
+loopback-only (`http://127.0.0.1:8787/v1`), essential, digest-pinned and
+admitted like the Web image, started and healthy before Web starts. It plans
+with **no Bedrock model or ARN input**; every `bedrock_*` variable is rejected.
+Differences from Scenario A an operator must supply:
+
+- The ten `gateway_*` inputs (image digest + revision + repository, three
+  operator-created Secrets Manager ARNs — bearer to both containers, OAuth
+  client ID/secret to the gateway only — adapter name, upstream origin, token
+  URL, and the model-mappings JSON covering both composer models).
+- Non-bedrock composer model aliases (the gateway's mappings translate them).
+- An **explicit control posture**: the module refuses its Bedrock-implemented
+  `prompt_shield`/`content_safety` defaults, so `plugin_control_modes`,
+  `plugin_preferences`, and `plugin_allowlist` must be stated in the tfvars.
+  `examples/scenario-c.tfvars.example` carries the reviewed weakening
+  (`recommend`) and the allowlist minus the two Bedrock control transforms.
+- HTTPS egress to the gateway's upstream origin and token endpoint must be
+  possible through the deployment network; both are documented in the tfvars,
+  never baked into the module. No inbound rule exposes the gateway port.
+
+The deployment is only as trustworthy as the endpoint behind the gateway: the
+operator owns that link and the risk transfer documented in
+`docs/reference/environment-variables.md` applies in full.
+
+All three scenarios create a disposable self-signed ALB certificate. It is
+valid for only 24 hours. Terraform outputs its CA certificate so a client can
+trust it temporarily; this is not a production certificate strategy.
 
 ## Prerequisites and identity checks
 
