@@ -1,15 +1,149 @@
 {
-  "schema": "elspeth.aws-ecs-module-action-oracle.v1",
+  "schema": "elspeth.aws-ecs-module-action-oracle.v2",
   "reviewed_on": "2026-08-09",
-  "scope": "Every aws_* resource type declared by deploy/aws-ecs/terraform/modules/scenario, mapped to reviewed lifecycle actions exercised by this module's configured create/read/update/delete paths.",
+  "scope": "Every aws_* resource type declared by deploy/aws-ecs/terraform/modules/scenario, mapped to the minimum IAM actions required for its configured create/read/update/delete paths to succeed.",
+  "provider": {
+    "repository": "https://github.com/hashicorp/terraform-provider-aws",
+    "tag": "v6.54.0",
+    "version": "6.54.0",
+    "commit": "8ca5b8dac50747f51e02a122d058f6eebd58ba19",
+    "lockfiles": [
+      "deploy/aws-ecs/terraform/bootstrap/.terraform.lock.hcl",
+      "deploy/aws-ecs/terraform/scenario-a/.terraform.lock.hcl",
+      "deploy/aws-ecs/terraform/scenario-b/.terraform.lock.hcl",
+      "deploy/aws-ecs/terraform/scenario-c/.terraform.lock.hcl"
+    ]
+  },
+  "default_provider_alias": "aws",
+  "provider_alias_overrides": {
+    "aws_iam_role": "aws.iam_lifecycle"
+  },
+  "expected_denies": [
+    {
+      "resource_type": "aws_iam_role",
+      "provider_alias": "aws.iam_lifecycle",
+      "actions": [
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:PutRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy"
+      ],
+      "issue": "elspeth-724e9cb5d5",
+      "rationale": "The dedicated lifecycle principal must not change a role trust policy or permissions boundary; replacement-safe drift semantics are tracked separately."
+    }
+  ],
+  "policy_sets": {
+    "aws": [
+      "installer-control-plane-policy.json.tftpl",
+      "installer-regional-resources-policy.json.tftpl",
+      "installer-relationships-policy.json.tftpl",
+      "installer-runtime-observation-policy.json.tftpl",
+      "installer-tagless-updates-policy.json.tftpl"
+    ],
+    "aws.iam_lifecycle": [
+      "lifecycle-policy.json.tftpl"
+    ]
+  },
+  "provider_sources": {
+    "aws_acm_certificate": "internal/service/acm/certificate.go",
+    "aws_bedrock_guardrail": "internal/service/bedrock/guardrail.go",
+    "aws_bedrock_guardrail_version": "internal/service/bedrock/guardrail_version.go",
+    "aws_cloudwatch_dashboard": "internal/service/cloudwatch/dashboard.go",
+    "aws_cloudwatch_event_rule": "internal/service/events/rule.go",
+    "aws_cloudwatch_event_target": "internal/service/events/target.go",
+    "aws_cloudwatch_log_group": "internal/service/logs/group.go",
+    "aws_cloudwatch_log_resource_policy": "internal/service/logs/resource_policy.go",
+    "aws_cloudwatch_metric_alarm": "internal/service/cloudwatch/metric_alarm.go",
+    "aws_cognito_user_pool": "internal/service/cognitoidp/user_pool.go",
+    "aws_cognito_user_pool_client": "internal/service/cognitoidp/user_pool_client.go",
+    "aws_cognito_user_pool_domain": "internal/service/cognitoidp/user_pool_domain.go",
+    "aws_db_subnet_group": "internal/service/rds/subnet_group.go",
+    "aws_ecs_cluster": "internal/service/ecs/cluster.go",
+    "aws_ecs_service": "internal/service/ecs/service.go",
+    "aws_ecs_task_definition": "internal/service/ecs/task_definition.go",
+    "aws_efs_access_point": "internal/service/efs/access_point.go",
+    "aws_efs_file_system": "internal/service/efs/file_system.go",
+    "aws_efs_mount_target": "internal/service/efs/mount_target.go",
+    "aws_iam_role": "internal/service/iam/role.go",
+    "aws_iam_role_policy": "internal/service/iam/role_policy.go",
+    "aws_iam_role_policy_attachment": "internal/service/iam/role_policy_attachment.go",
+    "aws_internet_gateway": "internal/service/ec2/vpc_internet_gateway.go",
+    "aws_lb": "internal/service/elbv2/load_balancer.go",
+    "aws_lb_listener": "internal/service/elbv2/listener.go",
+    "aws_lb_listener_rule": "internal/service/elbv2/listener_rule.go",
+    "aws_lb_target_group": "internal/service/elbv2/target_group.go",
+    "aws_rds_cluster": "internal/service/rds/cluster.go",
+    "aws_rds_cluster_instance": "internal/service/rds/cluster_instance.go",
+    "aws_route_table": "internal/service/ec2/vpc_route_table.go",
+    "aws_route_table_association": "internal/service/ec2/vpc_route_table_association.go",
+    "aws_s3_bucket": "internal/service/s3/bucket.go",
+    "aws_s3_bucket_ownership_controls": "internal/service/s3/bucket_ownership_controls.go",
+    "aws_s3_bucket_public_access_block": "internal/service/s3/bucket_public_access_block.go",
+    "aws_s3_bucket_server_side_encryption_configuration": "internal/service/s3/bucket_server_side_encryption_configuration.go",
+    "aws_secretsmanager_secret": "internal/service/secretsmanager/secret.go",
+    "aws_secretsmanager_secret_version": "internal/service/secretsmanager/secret_version.go",
+    "aws_security_group": "internal/service/ec2/vpc_security_group.go",
+    "aws_sns_topic": "internal/service/sns/topic.go",
+    "aws_subnet": "internal/service/ec2/vpc_subnet.go",
+    "aws_vpc": "internal/service/ec2/vpc_.go",
+    "aws_vpc_security_group_egress_rule": "internal/service/ec2/vpc_security_group_egress_rule.go",
+    "aws_vpc_security_group_ingress_rule": "internal/service/ec2/vpc_security_group_ingress_rule.go",
+    "aws_xray_group": "internal/service/xray/group.go",
+    "aws_xray_sampling_rule": "internal/service/xray/sampling_rule.go"
+  },
+  "provider_helper_sources": {
+    "aws_bedrock_guardrail_version": [
+      "internal/service/bedrock/guardrail.go"
+    ],
+    "aws_efs_mount_target": [
+      "internal/service/ec2/find.go"
+    ],
+    "aws_iam_role": [
+      "internal/service/iam/instance_profiles_data_source.go"
+    ],
+    "aws_rds_cluster": [
+      "internal/service/rds/global_cluster.go"
+    ],
+    "aws_rds_cluster_instance": [
+      "internal/service/rds/cluster.go"
+    ],
+    "aws_route_table": [
+      "internal/service/ec2/vpc_route_table_association.go"
+    ],
+    "aws_s3_bucket": [
+      "internal/service/s3/tags.go"
+    ],
+    "aws_secretsmanager_secret": [
+      "internal/service/secretsmanager/secret_policy.go"
+    ],
+    "aws_security_group": [
+      "internal/service/ec2/vpc_network_interface.go"
+    ],
+    "aws_subnet": [
+      "internal/service/ec2/vpc_network_interface.go"
+    ],
+    "aws_vpc": [
+      "internal/service/ec2/find.go"
+    ],
+    "aws_vpc_security_group_egress_rule": [
+      "internal/service/ec2/vpc_security_group_ingress_rule.go"
+    ]
+  },
+  "shared_provider_sources": [
+    "internal/provider/framework/tags_interceptor.go",
+    "internal/provider/sdkv2/tags_interceptor.go"
+  ],
+  "refresh_procedure": "tests/fixtures/aws_ecs_module_action_oracle.md",
   "review_basis": [
     "deploy/aws-ecs/terraform/modules/scenario resource declarations and configured lifecycle fields",
-    "tests/fixtures/aws_iam_action_vocabulary_2026-08-09.jsonl canonical IAM action names",
-    "docs-archive/acceptance/aws-install-policy-rca.md section 6.2(d)"
+    "hashicorp/terraform-provider-aws v6.54.0 source at commit 8ca5b8dac50747f51e02a122d058f6eebd58ba19",
+    "tests/fixtures/aws_iam_action_vocabulary_2026-08-09.jsonl canonical IAM action names"
   ],
   "limitations": [
-    "This hand-maintained oracle catches missing grants only for actions named here; it does not infer provider behavior or unknown dependent actions.",
+    "This provider-source-reviewed oracle catches missing grants only for actions named here; it does not infer undocumented provider behavior or unknown dependent actions.",
     "Condition satisfiability is outside this mapping and is protected only for the separately declared known traps.",
+    "The resource-type census cannot detect a new configured field on an existing block; provider or module field changes require the documented source review.",
+    "Provider probes whose denial is explicitly tolerated are excluded, including ELB capacity-reservation and deletion ENI reads and S3 tag APIs with a required legacy fallback.",
+    "The aws.iam_lifecycle provider's configured trust-policy and permissions-boundary update paths are intentionally denied; elspeth-724e9cb5d5 tracks replacement-safe drift semantics.",
     "The disputed ec2:CreateNetworkInterface dependency of aws_efs_mount_target remains contingent on the least-privilege verification apply tracked by elspeth-acc2ce713b; it is not asserted or pre-granted."
   ],
   "resources": {
@@ -17,7 +151,6 @@
       "acm:AddTagsToCertificate",
       "acm:DeleteCertificate",
       "acm:DescribeCertificate",
-      "acm:GetCertificate",
       "acm:ImportCertificate",
       "acm:ListTagsForCertificate",
       "acm:RemoveTagsFromCertificate"
@@ -33,6 +166,7 @@
     ],
     "aws_bedrock_guardrail_version": [
       "bedrock:CreateGuardrailVersion",
+      "bedrock:DeleteGuardrail",
       "bedrock:GetGuardrail"
     ],
     "aws_cloudwatch_dashboard": [
@@ -79,7 +213,7 @@
       "cognito-idp:CreateUserPool",
       "cognito-idp:DeleteUserPool",
       "cognito-idp:DescribeUserPool",
-      "cognito-idp:ListTagsForResource",
+      "cognito-idp:GetUserPoolMfaConfig",
       "cognito-idp:TagResource",
       "cognito-idp:UntagResource",
       "cognito-idp:UpdateUserPool"
@@ -111,13 +245,12 @@
       "ecs:ListTagsForResource",
       "ecs:TagResource",
       "ecs:UntagResource",
-      "ecs:UpdateClusterSettings"
+      "ecs:UpdateCluster"
     ],
     "aws_ecs_service": [
       "ecs:CreateService",
       "ecs:DeleteService",
       "ecs:DescribeServices",
-      "ecs:ListTagsForResource",
       "ecs:TagResource",
       "ecs:UntagResource",
       "ecs:UpdateService"
@@ -125,7 +258,6 @@
     "aws_ecs_task_definition": [
       "ecs:DeregisterTaskDefinition",
       "ecs:DescribeTaskDefinition",
-      "ecs:ListTagsForResource",
       "ecs:RegisterTaskDefinition",
       "ecs:TagResource",
       "ecs:UntagResource"
@@ -147,18 +279,25 @@
       "elasticfilesystem:UntagResource"
     ],
     "aws_efs_mount_target": [
+      "ec2:DescribeSubnets",
       "elasticfilesystem:CreateMountTarget",
       "elasticfilesystem:DeleteMountTarget",
-      "elasticfilesystem:DescribeMountTargets"
+      "elasticfilesystem:DescribeMountTargetSecurityGroups",
+      "elasticfilesystem:DescribeMountTargets",
+      "elasticfilesystem:ModifyMountTargetSecurityGroups"
     ],
     "aws_iam_role": [
       "iam:CreateRole",
       "iam:DeleteRole",
-      "iam:DeleteRolePermissionsBoundary",
       "iam:GetRole",
-      "iam:ListRoleTags",
+      "iam:GetRolePolicy",
+      "iam:ListAttachedRolePolicies",
+      "iam:ListInstanceProfilesForRole",
+      "iam:ListRolePolicies",
+      "iam:PutRolePermissionsBoundary",
       "iam:TagRole",
-      "iam:UntagRole"
+      "iam:UntagRole",
+      "iam:UpdateAssumeRolePolicy"
     ],
     "aws_iam_role_policy": [
       "iam:DeleteRolePolicy",
@@ -187,12 +326,15 @@
       "elasticloadbalancing:DescribeLoadBalancers",
       "elasticloadbalancing:DescribeTags",
       "elasticloadbalancing:ModifyLoadBalancerAttributes",
-      "elasticloadbalancing:RemoveTags"
+      "elasticloadbalancing:RemoveTags",
+      "elasticloadbalancing:SetSecurityGroups",
+      "elasticloadbalancing:SetSubnets"
     ],
     "aws_lb_listener": [
       "elasticloadbalancing:AddTags",
       "elasticloadbalancing:CreateListener",
       "elasticloadbalancing:DeleteListener",
+      "elasticloadbalancing:DescribeListenerAttributes",
       "elasticloadbalancing:DescribeListeners",
       "elasticloadbalancing:DescribeTags",
       "elasticloadbalancing:ModifyListener",
@@ -205,7 +347,8 @@
       "elasticloadbalancing:DescribeRules",
       "elasticloadbalancing:DescribeTags",
       "elasticloadbalancing:ModifyRule",
-      "elasticloadbalancing:RemoveTags"
+      "elasticloadbalancing:RemoveTags",
+      "elasticloadbalancing:SetRulePriorities"
     ],
     "aws_lb_target_group": [
       "elasticloadbalancing:AddTags",
@@ -214,7 +357,6 @@
       "elasticloadbalancing:DescribeTags",
       "elasticloadbalancing:DescribeTargetGroupAttributes",
       "elasticloadbalancing:DescribeTargetGroups",
-      "elasticloadbalancing:DescribeTargetHealth",
       "elasticloadbalancing:ModifyTargetGroup",
       "elasticloadbalancing:ModifyTargetGroupAttributes",
       "elasticloadbalancing:RemoveTags"
@@ -224,7 +366,7 @@
       "rds:CreateDBCluster",
       "rds:DeleteDBCluster",
       "rds:DescribeDBClusters",
-      "rds:ListTagsForResource",
+      "rds:DescribeGlobalClusters",
       "rds:ModifyDBCluster",
       "rds:RemoveTagsFromResource"
     ],
@@ -232,9 +374,10 @@
       "rds:AddTagsToResource",
       "rds:CreateDBInstance",
       "rds:DeleteDBInstance",
+      "rds:DescribeDBClusters",
       "rds:DescribeDBInstances",
-      "rds:ListTagsForResource",
       "rds:ModifyDBInstance",
+      "rds:RebootDBInstance",
       "rds:RemoveTagsFromResource"
     ],
     "aws_route_table": [
@@ -244,12 +387,15 @@
       "ec2:DeleteRoute",
       "ec2:DeleteRouteTable",
       "ec2:DeleteTags",
-      "ec2:DescribeRouteTables"
+      "ec2:DescribeRouteTables",
+      "ec2:DisassociateRouteTable",
+      "ec2:ReplaceRoute"
     ],
     "aws_route_table_association": [
       "ec2:AssociateRouteTable",
       "ec2:DescribeRouteTables",
-      "ec2:DisassociateRouteTable"
+      "ec2:DisassociateRouteTable",
+      "ec2:ReplaceRouteTableAssociation"
     ],
     "aws_s3_bucket": [
       "s3:CreateBucket",
@@ -257,27 +403,21 @@
       "s3:DeleteObject",
       "s3:DeleteObjectVersion",
       "s3:GetAccelerateConfiguration",
-      "s3:GetAnalyticsConfiguration",
       "s3:GetBucketAcl",
       "s3:GetBucketCORS",
-      "s3:GetBucketLocation",
       "s3:GetBucketLogging",
       "s3:GetBucketObjectLockConfiguration",
       "s3:GetBucketPolicy",
-      "s3:GetBucketPublicAccessBlock",
       "s3:GetBucketRequestPayment",
       "s3:GetBucketTagging",
       "s3:GetBucketVersioning",
       "s3:GetBucketWebsite",
       "s3:GetEncryptionConfiguration",
-      "s3:GetIntelligentTieringConfiguration",
-      "s3:GetInventoryConfiguration",
       "s3:GetLifecycleConfiguration",
-      "s3:GetMetricsConfiguration",
       "s3:GetReplicationConfiguration",
-      "s3:ListAllMyBuckets",
       "s3:ListBucket",
-      "s3:ListBucketVersions"
+      "s3:ListBucketVersions",
+      "s3:PutBucketTagging"
     ],
     "aws_s3_bucket_ownership_controls": [
       "s3:GetBucketOwnershipControls",
@@ -296,15 +436,11 @@
       "secretsmanager:DeleteSecret",
       "secretsmanager:DescribeSecret",
       "secretsmanager:GetResourcePolicy",
-      "secretsmanager:ListSecretVersionIds",
       "secretsmanager:TagResource",
-      "secretsmanager:UntagResource",
-      "secretsmanager:UpdateSecret"
+      "secretsmanager:UntagResource"
     ],
     "aws_secretsmanager_secret_version": [
-      "secretsmanager:DescribeSecret",
       "secretsmanager:GetSecretValue",
-      "secretsmanager:ListSecretVersionIds",
       "secretsmanager:PutSecretValue"
     ],
     "aws_security_group": [
@@ -312,6 +448,7 @@
       "ec2:CreateTags",
       "ec2:DeleteSecurityGroup",
       "ec2:DeleteTags",
+      "ec2:DescribeNetworkInterfaces",
       "ec2:DescribeSecurityGroups",
       "ec2:RevokeSecurityGroupEgress"
     ],
@@ -329,6 +466,7 @@
       "ec2:CreateTags",
       "ec2:DeleteSubnet",
       "ec2:DeleteTags",
+      "ec2:DescribeNetworkInterfaces",
       "ec2:DescribeSubnets",
       "ec2:ModifySubnetAttribute"
     ],
@@ -337,6 +475,10 @@
       "ec2:CreateVpc",
       "ec2:DeleteTags",
       "ec2:DeleteVpc",
+      "ec2:DescribeNetworkAcls",
+      "ec2:DescribeRouteTables",
+      "ec2:DescribeSecurityGroups",
+      "ec2:DescribeVpcAttribute",
       "ec2:DescribeVpcs",
       "ec2:ModifyVpcAttribute"
     ],
@@ -345,6 +487,7 @@
       "ec2:CreateTags",
       "ec2:DeleteTags",
       "ec2:DescribeSecurityGroupRules",
+      "ec2:ModifySecurityGroupRules",
       "ec2:RevokeSecurityGroupEgress"
     ],
     "aws_vpc_security_group_ingress_rule": [
@@ -352,13 +495,13 @@
       "ec2:CreateTags",
       "ec2:DeleteTags",
       "ec2:DescribeSecurityGroupRules",
+      "ec2:ModifySecurityGroupRules",
       "ec2:RevokeSecurityGroupIngress"
     ],
     "aws_xray_group": [
       "xray:CreateGroup",
       "xray:DeleteGroup",
       "xray:GetGroup",
-      "xray:GetGroups",
       "xray:ListTagsForResource",
       "xray:TagResource",
       "xray:UntagResource",
