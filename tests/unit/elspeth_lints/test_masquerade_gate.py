@@ -139,13 +139,18 @@ def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
 
     A path-filter regression can zero out one root while the other three
     keep contributing files and findings — a single aggregate count would
-    hide that. Each of the four roots must independently show both a
-    nonzero file count and a nonzero candidate-site count. A site-count
-    check alone would also miss the case where a root's files are all
-    walked but zero of them happen to be parseable Python; the file count
-    is checked first and separately.
+    hide that. Each root must independently show a nonzero file count, and
+    a nonzero candidate-site count wherever the baseline expects sites. A
+    root whose baseline holds no entries may legitimately scan clean —
+    scripts/ reached that state when 037ce6def eliminated its last probe —
+    so for those roots the file count alone proves visitation; demanding a
+    site there would make cleaning the final probe out of a root a test
+    failure. A site-count check alone would also miss the case where a
+    root's files are all walked but zero of them happen to be parseable
+    Python; the file count is checked first and separately.
     """
     sites = collect_sites(REPO_ROOT)
+    baseline = load_baseline(REPO_ROOT / "config" / "cicd" / "masquerade_baseline.yaml")
     for subdir in SCAN_SUBDIRS:
         subroot = REPO_ROOT / subdir
         assert subroot.is_dir(), f"expected scan root {subroot} to exist"
@@ -153,8 +158,10 @@ def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
         files_in_root = sum(1 for _ in walk_python_files(subroot))
         assert files_in_root > 0, f"{subdir}: zero files visited"
 
+        baseline_expects_sites = any(entry.path == subdir or entry.path.startswith(f"{subdir}/") for entry in baseline.entries)
         sites_in_root = [site for site in sites if site.path == subdir or site.path.startswith(f"{subdir}/")]
-        assert sites_in_root, f"{subdir}: zero candidate masquerade sites found"
+        if baseline_expects_sites:
+            assert sites_in_root, f"{subdir}: zero candidate masquerade sites found where the baseline expects entries"
 
 
 def test_live_scan_visits_more_than_zero_files_and_sites_in_aggregate() -> None:
