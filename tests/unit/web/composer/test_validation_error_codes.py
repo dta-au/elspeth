@@ -61,7 +61,7 @@ def _make_source(
         plugin="csv",
         on_success=on_success,
         options={"path": "/data/input.csv", **(options or {})},
-        on_validation_failure="quarantine",
+        on_validation_failure="discard",
     )
 
 

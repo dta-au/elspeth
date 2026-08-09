@@ -1529,6 +1529,22 @@ def _validate_runtime_route_destinations(
                         "gate_on_error_unknown_sink",
                     )
                 )
+            # Mirror the DAG builder's route resolution: every non-reserved
+            # route destination must resolve to a sink or a consumed
+            # connection, or the routed rows dead-end at graph compilation.
+            for route_label, route_target in (node.routes or {}).items():
+                if route_target in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET):
+                    continue
+                if route_target not in output_names and route_target not in consumer_connections:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Gate '{node.id}' route '{route_label}' destination '{route_target}' is neither "
+                            "a sink nor a known connection.",
+                            "high",
+                            "gate_route_target_unknown",
+                        )
+                    )
             continue
 
         if node.node_type == "transform":
@@ -1560,6 +1576,18 @@ def _validate_runtime_route_destinations(
                         f"Aggregation '{node.id}' on_success '{node.on_success}' is neither a sink nor a known connection.",
                         "high",
                         "aggregation_on_success_dangling",
+                    )
+                )
+            # AggregationSettings.on_error is a sink name or 'discard'; a
+            # failing batch routed to a ghost sink is a deterministic runtime
+            # failure the engine only discovers when a batch actually fails.
+            if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET and node.on_error not in output_names:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"Aggregation '{node.id}' on_error '{node.on_error}' references unknown sink.",
+                        "high",
+                        "aggregation_on_error_unknown_sink",
                     )
                 )
             continue
@@ -1670,6 +1698,205 @@ def gate_route_destinations(node: NodeSpec, route_target: str) -> frozenset[str]
     if route_target == _FORK_ROUTE_TARGET:
         return frozenset(node.fork_to or ())
     return frozenset({route_target})
+
+
+# --- Edge/route reconciliation contract (elspeth-67b44040ee) -----------------
+#
+# Visual edges and scalar routing fields describe ONE runtime routing model.
+# The scalar fields are the runtime authority (generate_yaml() and DAG build
+# read only them); sink-targeting edges are their operator-facing mirror and
+# must agree, while node-targeting on_success edges remain advisory editor
+# state. The helpers below are the single source of truth for which
+# (component kind, edge type, target kind) combinations can lower at all —
+# shared by the mutation tools (admission) and validate() (every entry path).
+
+ComponentKind = Literal["source", "output", "transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
+
+
+def composer_component_kind(
+    component_id: str,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+    outputs: tuple[OutputSpec, ...],
+) -> ComponentKind | None:
+    """Classify an edge endpoint. None when the id resolves to nothing yet."""
+    if component_id in sources or component_id == "source":
+        return "source"
+    for node in nodes:
+        if node.id == component_id:
+            return node.node_type
+    for output in outputs:
+        if output.name == component_id:
+            return "output"
+    return None
+
+
+def edge_lowering_error(edge: EdgeSpec, *, from_kind: ComponentKind | None, to_kind: ComponentKind | None) -> str | None:
+    """Return why this edge cannot lower to a runtime route, or None.
+
+    Unknown endpoints (kind None) are tolerated for the axes they blind:
+    incremental authoring may reference a component before it exists, and the
+    edge_unknown_node check owns unresolved ids at Stage 1. Every verdict here
+    is therefore based only on facts already present in the state.
+    """
+    if from_kind is None or from_kind == "output":
+        return None
+    edge_type = edge.edge_type
+    if from_kind == "source":
+        if edge_type != "on_success":
+            return f"Source edges must use 'on_success'; '{edge_type}' has no source runtime route."
+        return None
+    if from_kind == "gate":
+        if edge_type == "on_success":
+            # A labeled route to a connection has no dedicated EdgeType, so an
+            # on_success edge into a processing node is the advisory picture
+            # for it. A sink target is different: it would demand an
+            # on_success scalar a gate does not have.
+            if to_kind == "output":
+                return f"Gate '{edge.from_node}' sink edges must use route_true, route_false, or fork."
+            return None
+        if edge_type == "on_error":
+            return (
+                f"Gate '{edge.from_node}' evaluation-error routing is node-level: use upsert_node with on_error="
+                f"'{edge.to_node}' (or 'discard'). upsert_edge(edge_type='on_error') is unsupported for gates."
+            )
+        return None
+    if edge_type in ("route_true", "route_false", "fork"):
+        return f"Only gates can use '{edge_type}' edges; '{edge.from_node}' is a {from_kind}."
+    if from_kind in ("transform", "aggregation"):
+        if edge_type == "on_error" and to_kind is not None and to_kind != "output":
+            return (
+                f"{from_kind.capitalize()} '{edge.from_node}' on_error must route to a sink or 'discard'; '{edge.to_node}' is a {to_kind}."
+            )
+        return None
+    if from_kind == "coalesce":
+        if edge_type == "on_error":
+            return f"Coalesce '{edge.from_node}' has no on_error route: coalesce outcomes are governed by its arrival policy."
+        return None
+    if from_kind == "row_union":
+        if edge_type == "on_error":
+            return f"row_union '{edge.from_node}' has no on_error route."
+        if to_kind == "output":
+            return (
+                f"row_union '{edge.from_node}' on_success '{edge.to_node}' names a sink. "
+                "A released group must continue on a processing connection."
+            )
+        return None
+    # from_kind == "queue"
+    if edge_type == "on_error":
+        return f"Queue '{edge.from_node}' has no on_error route: queues are structural pass-through points."
+    if to_kind == "output":
+        return (
+            f"Queue '{edge.from_node}' cannot route to sink '{edge.to_node}': queues release rows on the "
+            "connection named by their id, and only processing nodes may consume it."
+        )
+    return None
+
+
+def sink_edge_route_mismatch(
+    edge: EdgeSpec,
+    *,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+) -> str | None:
+    """Return why a sink-targeting edge disagrees with its scalar mirror.
+
+    Callers must only pass edges whose to_node is a declared output and whose
+    shape already passed edge_lowering_error — this checks agreement, not
+    legality. Returns None when the scalar carries the route the edge draws.
+    """
+    if edge.from_node in sources:
+        source = sources[edge.from_node]
+        if source.on_success != edge.to_node:
+            return f"Edge '{edge.id}' draws source on_success to sink '{edge.to_node}' but the source routes to '{source.on_success}'."
+        return None
+    node = next((candidate for candidate in nodes if candidate.id == edge.from_node), None)
+    if node is None:
+        return None
+    if edge.edge_type == "on_success":
+        if node.on_success != edge.to_node:
+            return f"Edge '{edge.id}' draws '{node.id}' on_success to sink '{edge.to_node}' but the node routes to '{node.on_success}'."
+        return None
+    if edge.edge_type == "on_error":
+        if node.on_error != edge.to_node:
+            return f"Edge '{edge.id}' draws '{node.id}' on_error to sink '{edge.to_node}' but the node routes to '{node.on_error}'."
+        return None
+    if edge.edge_type in ("route_true", "route_false"):
+        route_key = "true" if edge.edge_type == "route_true" else "false"
+        routes = node.routes or {}
+        actual = routes[route_key] if route_key in routes else None
+        if actual != edge.to_node:
+            return (
+                f"Edge '{edge.id}' draws gate '{node.id}' route '{route_key}' to sink '{edge.to_node}' "
+                f"but the gate routes it to '{actual}'."
+            )
+        return None
+    # fork
+    if edge.to_node not in (node.fork_to or ()):
+        return f"Edge '{edge.id}' draws gate '{node.id}' fork branch to sink '{edge.to_node}' but fork_to does not include it."
+    return None
+
+
+def _validate_edge_route_contract(
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+    outputs: tuple[OutputSpec, ...],
+    edges: tuple[EdgeSpec, ...],
+) -> tuple[ValidationEntry, ...]:
+    """Stage-1 edge/route contract: lowerability, slot uniqueness, mirror truth.
+
+    Runs on the raw edge tuple so bulk entry paths (set_pipeline, session
+    deserialization) meet the same contract as the incremental mutation tools.
+    Edges with unresolved endpoints are skipped per axis — edge_unknown_node
+    owns those.
+    """
+    errors: list[ValidationEntry] = []
+    _err = ValidationEntry
+    output_names = {output.name for output in outputs}
+
+    sink_slot_claims: dict[tuple[str, str], list[str]] = {}
+    fork_claims: dict[tuple[str, str], list[str]] = {}
+    for edge in edges:
+        from_kind = composer_component_kind(edge.from_node, sources, nodes, outputs)
+        to_kind = composer_component_kind(edge.to_node, sources, nodes, outputs)
+        lowering_error = edge_lowering_error(edge, from_kind=from_kind, to_kind=to_kind)
+        if lowering_error is not None:
+            errors.append(_err(f"edge:{edge.id}", lowering_error, "high", "edge_not_lowerable"))
+            continue
+        if edge.to_node not in output_names:
+            continue
+        if edge.edge_type == "fork":
+            fork_claims.setdefault((edge.from_node, edge.to_node), []).append(edge.id)
+        else:
+            sink_slot_claims.setdefault((edge.from_node, edge.edge_type), []).append(edge.id)
+        if from_kind is None:
+            continue
+        mismatch = sink_edge_route_mismatch(edge, sources=sources, nodes=nodes)
+        if mismatch is not None:
+            errors.append(_err(f"edge:{edge.id}", mismatch, "high", "edge_route_mismatch"))
+
+    for (from_node, edge_type), edge_ids in sink_slot_claims.items():
+        if len(edge_ids) > 1:
+            errors.append(
+                _err(
+                    f"edge:{edge_ids[1]}",
+                    f"Edges {sorted(edge_ids)} all claim the single '{edge_type}' sink route of '{from_node}'. "
+                    "One routing slot has one edge: remove or retarget the duplicates.",
+                    "high",
+                    "edge_route_conflict",
+                )
+            )
+    for (from_node, to_node), edge_ids in fork_claims.items():
+        if len(edge_ids) > 1:
+            errors.append(
+                _err(
+                    f"edge:{edge_ids[1]}",
+                    f"Edges {sorted(edge_ids)} duplicate the fork branch from '{from_node}' to sink '{to_node}'.",
+                    "high",
+                    "edge_route_conflict",
+                )
+            )
+    return tuple(errors)
 
 
 def _validate_gate_route_parity(condition: str, routes: Mapping[str, str] | None) -> str | None:
@@ -4880,6 +5107,41 @@ class CompositionState:
                     errors.append(
                         _err(f"node:{node.id}", f"Gate '{node.id}' is missing required field 'routes'.", "high", "gate_missing_routes")
                     )
+                elif not node.routes:
+                    # GateSettings.validate_routes requires at least one entry;
+                    # an empty mapping is a deterministic runtime rejection.
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Gate '{node.id}' routes must have at least one entry.",
+                            "high",
+                            "gate_routes_empty",
+                        )
+                    )
+                else:
+                    # Mirror GateSettings.validate_fork_consistency: 'fork'
+                    # route destinations and fork_to require each other.
+                    has_fork_route = any(target == _FORK_ROUTE_TARGET for target in node.routes.values())
+                    if has_fork_route and not node.fork_to:
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"Gate '{node.id}' routes to 'fork' but fork_to is missing: fork_to is required "
+                                "when any route destination is 'fork'.",
+                                "high",
+                                "gate_fork_route_without_fork_to",
+                            )
+                        )
+                    if node.fork_to and not has_fork_route:
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"Gate '{node.id}' declares fork_to but no route destination is 'fork': "
+                                "fork_to is only valid when a route destination is 'fork'.",
+                                "high",
+                                "gate_fork_to_without_fork_route",
+                            )
+                        )
             elif node.node_type == "transform":
                 # Negative constraints — transforms must not have gate fields
                 if node.condition is not None:
@@ -5160,6 +5422,7 @@ class CompositionState:
                     errors.append(_err(f"node:{node.id}", queue_error, "high", "queue_config_invalid"))
 
         errors.extend(_validate_runtime_route_destinations(self.sources, self.nodes, self.outputs))
+        errors.extend(_validate_edge_route_contract(self.sources, self.nodes, self.outputs, self.edges))
 
         # 8. Connection completeness
         runtime_connections = _runtime_connection_targets(self.sources, self.nodes)
@@ -5617,9 +5880,11 @@ class CompositionState:
                         )
                     )
 
-        # W7: on_write_failure reference validation
-        # Mirrors rules from engine/orchestrator/validation.py so LLMs get
-        # early feedback instead of failing at pipeline build time.
+        # Failsink (on_write_failure) reference validation. Mirrors
+        # engine/orchestrator/validation.py validate_sink_failsink_destinations,
+        # where every one of these rules raises RouteValidationError at
+        # pipeline initialization — deterministic runtime-fatal routes are
+        # Stage-1 ERRORS, not advisory warnings (elspeth-eb4127fb49).
         _failsink_eligible = FAILSINK_ELIGIBLE_SINK_PLUGINS
         output_name_set = {o.name for o in self.outputs}
         output_by_name = {o.name: o for o in self.outputs}
@@ -5629,47 +5894,52 @@ class CompositionState:
                 continue
             # Rule 2: must reference an existing output
             if dest not in output_name_set:
-                warnings.append(
-                    _warn(
+                errors.append(
+                    _err(
                         f"output:{output.name}",
                         f"Output '{output.name}' on_write_failure references '{dest}' which is not a configured output.",
                         "high",
+                        "failsink_unknown_output",
                     )
                 )
                 continue  # Skip dependent checks
             # Rule 3: no self-reference
             if dest == output.name:
-                warnings.append(
-                    _warn(
+                errors.append(
+                    _err(
                         f"output:{output.name}",
                         f"Output '{output.name}' on_write_failure references itself — a sink cannot be its own failsink.",
                         "high",
+                        "failsink_self_reference",
                     )
                 )
                 continue
             # Rule 4: target must use an eligible file plugin
             target = output_by_name[dest]
             if target.plugin not in _failsink_eligible:
-                warnings.append(
-                    _warn(
+                errors.append(
+                    _err(
                         f"output:{output.name}",
                         f"Output '{output.name}' on_write_failure references '{dest}' (plugin='{target.plugin}'), but failsinks must use {FAILSINK_ELIGIBLE_PLUGIN_TEXT}.",
-                        "medium",
+                        "high",
+                        "failsink_ineligible_plugin",
                     )
                 )
             # Rule 5: no chains — target must use 'discard'
             if target.on_write_failure != "discard":
-                warnings.append(
-                    _warn(
+                errors.append(
+                    _err(
                         f"output:{output.name}",
                         f"Output '{output.name}' on_write_failure references '{dest}', but '{dest}' has on_write_failure='{target.on_write_failure}' — failsink targets must use 'discard' (no chains).",
-                        "medium",
+                        "high",
+                        "failsink_chain",
                     )
                 )
 
-        # W8: Source on_validation_failure reference validation
-        # Mirrors rules from engine/orchestrator/validation.py so LLMs get
-        # early feedback instead of failing at pipeline build time.
+        # Source on_validation_failure (quarantine) reference validation.
+        # Mirrors validate_source_quarantine_destination, which raises
+        # RouteValidationError at pipeline initialization — same promotion
+        # rationale as the failsink rules above.
         for source_name, source in self.sources.items():
             vf_dest = source.on_validation_failure
             if vf_dest != "discard" and vf_dest not in output_name_set:
@@ -5684,11 +5954,12 @@ class CompositionState:
                         f"Source '{source_name}' on_validation_failure references '{vf_dest}' which is not a configured output — "
                         "validation failures will cause a pipeline build error."
                     )
-                warnings.append(
-                    _warn(
+                errors.append(
+                    _err(
                         component,
                         message,
                         "high",
+                        "quarantine_unknown_output",
                     )
                 )
 

@@ -68,18 +68,26 @@ def _make_sink(*, name: str = "json", on_write_failure: str = "discard") -> Fake
     return FakeSink(name=name, _on_write_failure=on_write_failure)
 
 
+@dataclass
+class FakeAggregationSettings:
+    name: str
+    on_error: str = "discard"
+
+
 def _make_pipeline_config(
     *,
     source: FakeSource | None = None,
     transform: FakeTransform | None = None,
     sinks: dict[str, FakeSink] | None = None,
     gates: list[FakeConfigGate] | None = None,
+    aggregation_settings: dict[str, FakeAggregationSettings] | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         sources={"source": source or _make_source()},
         transforms=[transform or _make_transform(node_id="t-1", name="mapper", on_error="discard")],
         sinks=sinks or {"output": _make_sink()},
         gates=gates or [FakeConfigGate(name="quality_gate")],
+        aggregation_settings=aggregation_settings or {},
     )
 
 
@@ -303,6 +311,47 @@ class TestValidatePipelineRouteTargets:
                 transform_id_map={},
                 config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
             )
+
+    def test_bundle_rejects_missing_aggregation_error_sink(self) -> None:
+        """AggregationSettings.on_error is a sink name or 'discard'; a ghost
+        sink must fail at initialization, not when the first batch fails
+        (elspeth-eb4127fb49)."""
+        config = _make_pipeline_config(
+            aggregation_settings={"agg-1": FakeAggregationSettings(name="batch_stats", on_error="ghost")},
+        )
+
+        with pytest.raises(RouteValidationError, match=r"batch_stats.*ghost"):
+            validate_pipeline_route_targets(
+                config=config,
+                route_resolution_map={},
+                transform_id_map={},
+                config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
+            )
+
+    def test_bundle_accepts_valid_aggregation_error_sink(self) -> None:
+        config = _make_pipeline_config(
+            sinks={"output": _make_sink(), "errors": _make_sink()},
+            aggregation_settings={"agg-1": FakeAggregationSettings(name="batch_stats", on_error="errors")},
+        )
+
+        validate_pipeline_route_targets(
+            config=config,
+            route_resolution_map={},
+            transform_id_map={},
+            config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
+        )
+
+    def test_bundle_accepts_discard_aggregation_error(self) -> None:
+        config = _make_pipeline_config(
+            aggregation_settings={"agg-1": FakeAggregationSettings(name="batch_stats", on_error="discard")},
+        )
+
+        validate_pipeline_route_targets(
+            config=config,
+            route_resolution_map={},
+            transform_id_map={},
+            config_gate_id_map={GateName("quality_gate"): NodeID("cfg-gate-1")},
+        )
 
     def test_bundle_rejects_invalid_sink_failsink(self) -> None:
         config = _make_pipeline_config(sinks={"output": _make_sink(name="json", on_write_failure="missing")})

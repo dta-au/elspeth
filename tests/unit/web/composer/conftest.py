@@ -733,7 +733,7 @@ def fake_llm_one_set_pipeline_tool_call(tmp_path: Path, result_session_id: str) 
                                 "plugin": "csv",
                                 "on_success": "source_out",
                                 "options": {"path": str(input_path), "schema": {"mode": "observed"}},
-                                "on_validation_failure": "quarantine",
+                                "on_validation_failure": "discard",
                             },
                             "nodes": [
                                 {

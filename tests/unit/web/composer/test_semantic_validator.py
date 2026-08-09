@@ -1329,7 +1329,7 @@ def _sink_state(
             plugin="csv",
             on_success="producer_in",
             options={"path": "data/rows.csv", "schema": {"mode": "fixed", "fields": list(source_fields)}},
-            on_validation_failure="quarantine",
+            on_validation_failure="errors",
         ),
         nodes=(producer,),
         outputs=(

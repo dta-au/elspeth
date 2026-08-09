@@ -32,7 +32,7 @@ from elspeth.engine.orchestrator.types import RouteValidationError
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
     from elspeth.contracts.types import NodeID
-    from elspeth.core.config import GateSettings
+    from elspeth.core.config import AggregationSettings, GateSettings
     from elspeth.engine.orchestrator.plugin_types import RowPlugin
     from elspeth.engine.orchestrator.types import PipelineConfig
 
@@ -125,6 +125,10 @@ def validate_pipeline_route_targets(
         gates=config.gates,
         available_sinks=available_sinks,
     )
+    validate_aggregation_error_sinks(
+        aggregation_settings=config.aggregation_settings,
+        available_sinks=available_sinks,
+    )
     for source in config.sources.values():
         validate_source_quarantine_destination(
             source=source,
@@ -192,6 +196,30 @@ def validate_gate_error_sinks(
                 f"but no sink named '{on_error}' exists. "
                 f"Available sinks: {sorted(available_sinks)}. "
                 "Use 'discard' to drop gate-error rows or omit on_error to fail fast."
+            )
+
+
+def validate_aggregation_error_sinks(
+    aggregation_settings: Mapping[str, AggregationSettings],
+    available_sinks: set[str],
+) -> None:
+    """Validate aggregation on_error destinations reference existing sinks.
+
+    AggregationSettings.on_error is required ("sink name or 'discard'"), but a
+    ghost sink was only discovered when the first batch actually failed —
+    mid-run, after rows were consumed. Mirror the transform/gate checks and
+    fail at pipeline initialization instead (elspeth-eb4127fb49).
+    """
+    for settings in aggregation_settings.values():
+        on_error = settings.on_error
+        if on_error == "discard":
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Aggregation '{settings.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                f"Use 'discard' to drop failed batches without routing."
             )
 
 

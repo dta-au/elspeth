@@ -8,7 +8,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from elspeth.contracts.sink import FAILSINK_ELIGIBLE_PLUGIN_TEXT, FAILSINK_ELIGIBLE_SINK_PLUGINS
+from elspeth.contracts.sink import FAILSINK_ELIGIBLE_SINK_PLUGINS
 from elspeth.core.config import CoalesceSettings
 from elspeth.plugins.infrastructure.templates import TemplateError
 from elspeth.web.composer.state import (
@@ -149,7 +149,7 @@ class TestCompositionStateNamedSources:
 
         result = state.validate()
 
-        assert any(w.component == "source:orders" and "on_validation_failure" in w.message for w in result.warnings)
+        assert any(e.component == "source:orders" and e.error_code == "quarantine_unknown_output" for e in result.errors)
         assert any(s.component == "source:orders" and "no explicit schema" in s.message for s in result.suggestions)
 
     def test_sources_mapping_is_the_only_domain_and_serialized_source_shape(self) -> None:
@@ -851,7 +851,7 @@ class TestStage1Validation:
             version=1,
         )
 
-    def _make_source(self, on_success: str = "t1", on_validation_failure: str = "quarantine") -> SourceSpec:
+    def _make_source(self, on_success: str = "t1", on_validation_failure: str = "discard") -> SourceSpec:
         return SourceSpec(
             plugin="csv",
             on_success=on_success,
@@ -1857,8 +1857,9 @@ class TestStage1Validation:
 
     # --- W7: on_write_failure reference validation ---
 
-    def test_validate_on_write_failure_nonexistent_output_warns(self) -> None:
-        """W7: on_write_failure references output that doesn't exist."""
+    def test_validate_on_write_failure_nonexistent_output_is_error(self) -> None:
+        """A dangling failsink raises RouteValidationError at runtime init, so
+        Stage 1 reports it as an error (elspeth-eb4127fb49)."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1867,10 +1868,10 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("not a configured output" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_unknown_output" for e in result.errors)
 
-    def test_validate_on_write_failure_self_reference_warns(self) -> None:
-        """W7: on_write_failure references itself."""
+    def test_validate_on_write_failure_self_reference_is_error(self) -> None:
+        """A self-referencing failsink is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1879,10 +1880,10 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("references itself" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_self_reference" for e in result.errors)
 
-    def test_validate_on_write_failure_ineligible_plugin_warns(self) -> None:
-        """W7: failsink target uses non-file plugin (e.g. database)."""
+    def test_validate_on_write_failure_ineligible_plugin_is_error(self) -> None:
+        """A non-file failsink target is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1895,11 +1896,11 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any(f"must use {FAILSINK_ELIGIBLE_PLUGIN_TEXT}" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_ineligible_plugin" for e in result.errors)
 
     @pytest.mark.parametrize("plugin_name", sorted(FAILSINK_ELIGIBLE_SINK_PLUGINS))
     def test_validate_on_write_failure_shared_policy_plugins_are_valid(self, plugin_name: str) -> None:
-        """W7: every centrally failsink-capable plugin is accepted by composer warnings."""
+        """Every centrally failsink-capable plugin is accepted by Stage 1."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1912,10 +1913,10 @@ class TestStage1Validation:
 
         result = state.validate()
 
-        assert not any("on_write_failure" in w.message for w in result.warnings)
+        assert not any("on_write_failure" in e.message for e in (*result.errors, *result.warnings))
 
-    def test_validate_on_write_failure_chain_warns(self) -> None:
-        """W7: failsink target has its own non-discard on_write_failure (chain)."""
+    def test_validate_on_write_failure_chain_is_error(self) -> None:
+        """A chained failsink is a deterministic runtime rejection."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1928,7 +1929,7 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("no chains" in w.message for w in result.warnings)
+        assert any(e.error_code == "failsink_chain" for e in result.errors)
 
     def test_validate_on_write_failure_valid_no_warning(self) -> None:
         """W7: Valid failsink reference produces no warning."""
@@ -1942,8 +1943,8 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        # No on_write_failure warnings
-        assert not any("on_write_failure" in w.message for w in result.warnings)
+        # No on_write_failure findings at any severity
+        assert not any("on_write_failure" in e.message for e in (*result.errors, *result.warnings))
 
     def test_validate_on_write_failure_discard_no_warning(self) -> None:
         """W7: on_write_failure='discard' is always valid, no warning."""
@@ -1958,8 +1959,9 @@ class TestStage1Validation:
 
     # --- W8: on_validation_failure reference validation ---
 
-    def test_validate_on_validation_failure_nonexistent_output_warns(self) -> None:
-        """W8: on_validation_failure references output that doesn't exist."""
+    def test_validate_on_validation_failure_nonexistent_output_is_error(self) -> None:
+        """A dangling quarantine destination raises RouteValidationError at
+        runtime init, so Stage 1 reports it as an error."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="t1", on_validation_failure="nonexistent_sink"))
         state = state.with_node(self._make_transform("t1", "t1", "main"))
@@ -1967,7 +1969,7 @@ class TestStage1Validation:
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "main"))
         result = state.validate()
-        assert any("not a configured output" in w.message for w in result.warnings)
+        assert any(e.error_code == "quarantine_unknown_output" for e in result.errors)
 
     def test_validate_on_validation_failure_discard_no_warning(self) -> None:
         """W8: on_validation_failure='discard' is always valid, no warning."""
@@ -2457,8 +2459,8 @@ class TestStage1Validation:
         state = state.with_output(quarantine_output)
         state = state.with_edge(self._make_edge("e1", "source", "t1"))
         state = state.with_edge(self._make_edge("e2", "t1", "gate_1"))
-        state = state.with_edge(self._make_edge("e3", "gate_1", "main"))
-        state = state.with_edge(self._make_edge("e4", "gate_1", "errors"))
+        state = state.with_edge(self._make_edge("e3", "gate_1", "main", edge_type="route_true"))
+        state = state.with_edge(self._make_edge("e4", "gate_1", "errors", edge_type="route_false"))
         result = state.validate()
         assert result.is_valid, result.errors
         assert result.warnings == ()
@@ -3257,7 +3259,7 @@ class TestSchemaContractValidation:
         on_success: str = "t1",
         plugin: str = "csv",
         options: dict[str, Any] | None = None,
-        on_validation_failure: str = "quarantine",
+        on_validation_failure: str = "discard",
     ) -> SourceSpec:
         opts = dict(options or {})
         if plugin == "csv":
@@ -5749,8 +5751,8 @@ class TestSchemaContractValidation:
             )
         )
         state = state.with_edge(self._make_edge("e1", "source", "g1"))
-        state = state.with_edge(self._make_edge("e2", "g1", "sink_a"))
-        state = state.with_edge(self._make_edge("e3", "g1", "sink_b"))
+        state = state.with_edge(self._make_edge("e2", "g1", "sink_a", edge_type="route_true"))
+        state = state.with_edge(self._make_edge("e3", "g1", "sink_b", edge_type="route_false"))
 
         result = state.validate()
 
@@ -7168,7 +7170,7 @@ class TestPassThroughComposerParity:
             plugin=plugin,
             on_success=on_success,
             options=opts,
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         )
 
     def _make_transform(

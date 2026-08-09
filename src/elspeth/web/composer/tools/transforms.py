@@ -28,6 +28,8 @@ from elspeth.web.composer.state import (
     _batch_aware_required_input_fields_error,
     _validate_gate_expression,
     _validate_gate_route_parity,
+    composer_component_kind,
+    edge_lowering_error,
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
@@ -672,6 +674,10 @@ def _execute_upsert_node(
         return _failure_result(state, message, error_code=error_code)
 
     proposed_state = state.with_node(node)
+    # Scalar routes committed here are the runtime authority; any visual edge
+    # that mirrored the node's previous sink routes must follow in the same
+    # commit or the graph keeps drawing the old route (elspeth-372e18e365).
+    proposed_state = _reconcile_node_sink_mirror_edges(proposed_state, node)
     invariant_error = _post_mutation_invariant_error(proposed_state)
     if invariant_error is not None:
         message, error_code = invariant_error
@@ -729,6 +735,112 @@ def _normalized_splice_node_projection(node: NodeSpec) -> dict[str, Any]:
         "on_error": node.on_error or "discard",
         "options": serialize_authoring_review_options(node.options),
     }
+
+
+def _sink_route_still_expressed(state: CompositionState, edge: EdgeSpec) -> bool:
+    """Return whether another edge in ``state`` expresses the same sink route.
+
+    Legacy persisted states can carry semantic duplicates from before the
+    slot-uniqueness admission rule; clearing a scalar mirror while a surviving
+    duplicate still draws the route would desynchronise graph and runtime.
+    """
+    return any(
+        candidate.id != edge.id
+        and candidate.from_node == edge.from_node
+        and candidate.edge_type == edge.edge_type
+        and candidate.to_node == edge.to_node
+        for candidate in state.edges
+    )
+
+
+def _apply_sink_edge_route(state: CompositionState, edge: EdgeSpec) -> CompositionState:
+    """Write the scalar route a sink-targeting edge expresses.
+
+    Exact dual of :func:`_clear_removed_sink_edge_route`. Callers must have
+    admitted the edge through :func:`edge_lowering_error` first — this maps an
+    already-legal edge onto its scalar slot; it decides nothing. Edges whose
+    target is not a declared output are advisory and left unmirrored.
+    """
+    output_names = {output.name for output in state.outputs}
+    if edge.to_node not in output_names:
+        return state
+
+    if edge.from_node in state.sources:
+        source = state.sources[edge.from_node]
+        if source.on_success != edge.to_node:
+            return state.with_named_source(edge.from_node, replace(source, on_success=edge.to_node))
+        return state
+
+    node = next((candidate for candidate in state.nodes if candidate.id == edge.from_node), None)
+    if node is None:
+        return state
+    if edge.edge_type == "on_success":
+        if node.on_success != edge.to_node:
+            return state.with_node(replace(node, on_success=edge.to_node))
+        return state
+    if edge.edge_type == "on_error":
+        if node.on_error != edge.to_node:
+            return state.with_node(replace(node, on_error=edge.to_node))
+        return state
+    if edge.edge_type in ("route_true", "route_false"):
+        route_key = "true" if edge.edge_type == "route_true" else "false"
+        routes = dict(node.routes or {})
+        if route_key not in routes or routes[route_key] != edge.to_node:
+            routes[route_key] = edge.to_node
+            return state.with_node(replace(node, routes=routes))
+        return state
+    # fork
+    fork_targets = tuple(dict.fromkeys((*(node.fork_to or ()), edge.to_node)))
+    if node.fork_to != fork_targets:
+        return state.with_node(replace(node, fork_to=fork_targets))
+    return state
+
+
+def _reconcile_node_sink_mirror_edges(state: CompositionState, node: NodeSpec) -> CompositionState:
+    """Converge this node's sink-mirror edges onto its scalar routes.
+
+    upsert_node commits scalar routing directly; any visual edge that mirrored
+    the previous scalars would otherwise keep drawing the old route. Each
+    sink-targeting edge from the node is retargeted to the scalar's current
+    sink or removed when the slot no longer routes to a sink. Missing edges
+    are never invented — the graph view infers undrawn routes from the
+    scalars, so absence cannot lie the way a stale edge does.
+    """
+    output_names = {output.name for output in state.outputs}
+    routes = node.routes or {}
+
+    def _slot_sink(value: str | None) -> str | None:
+        return value if value is not None and value in output_names else None
+
+    slot_sinks: dict[str, str | None] = {
+        "on_success": _slot_sink(node.on_success),
+        "on_error": _slot_sink(node.on_error),
+        "route_true": _slot_sink(routes["true"] if "true" in routes else None),
+        "route_false": _slot_sink(routes["false"] if "false" in routes else None),
+    }
+    fork_sinks = {target for target in (node.fork_to or ()) if target in output_names}
+
+    claimed_slots: set[str] = set()
+    new_state = state
+    for edge in state.edges:
+        if edge.from_node != node.id or edge.to_node not in output_names:
+            continue
+        if edge.edge_type == "fork":
+            if edge.to_node not in fork_sinks:
+                without = new_state.without_edge(edge.id)
+                if without is not None:
+                    new_state = without
+            continue
+        desired = slot_sinks[edge.edge_type]
+        if desired is None or edge.edge_type in claimed_slots:
+            without = new_state.without_edge(edge.id)
+            if without is not None:
+                new_state = without
+            continue
+        claimed_slots.add(edge.edge_type)
+        if edge.to_node != desired:
+            new_state = new_state.with_edge(replace(edge, to_node=desired))
+    return new_state
 
 
 def _clear_removed_sink_edge_route(state: CompositionState, edge: EdgeSpec) -> CompositionState:
@@ -1087,14 +1199,6 @@ def _execute_upsert_edge(
     to_node = validated.to_node
     edge_type = validated.edge_type
 
-    origin_node = next((node for node in state.nodes if node.id == from_node), None)
-    if edge_type == "on_error" and origin_node is not None and origin_node.node_type == "gate":
-        return _failure_result(
-            state,
-            f"Gate '{from_node}' evaluation-error routing is node-level: use upsert_node with on_error="
-            f"'{to_node}' (or 'discard'). upsert_edge(edge_type='on_error') is unsupported for gates.",
-        )
-
     edge = EdgeSpec(
         id=validated.id,
         from_node=from_node,
@@ -1102,45 +1206,54 @@ def _execute_upsert_edge(
         edge_type=edge_type,
         label=validated.label,
     )
-    new_state = state.with_edge(edge)
 
-    # Synchronise connection field when the edge targets an output.
-    # generate_yaml() and the engine use on_success/on_error values
-    # (not edges) to route data to sinks, so the connection field
-    # must match the output name for the pipeline to work at runtime.
-    output_names = {o.name for o in new_state.outputs}
-    if to_node in output_names:
-        if from_node in new_state.sources:
-            if edge_type != "on_success":
-                return _failure_result(state, "Source sink edges must use 'on_success'.")
-            source = new_state.sources[from_node]
-            if source.on_success != to_node:
-                new_state = new_state.with_named_source(from_node, replace(source, on_success=to_node))
-        else:
-            node = next((n for n in new_state.nodes if n.id == from_node), None)
-            if node is not None:
-                if edge_type == "on_success":
-                    if node.node_type == "gate":
-                        return _failure_result(state, f"Gate '{from_node}' sink edges must use route_true, route_false, or fork.")
-                    if node.on_success != to_node:
-                        new_state = new_state.with_node(replace(node, on_success=to_node))
-                elif edge_type == "on_error":
-                    if node.on_error != to_node:
-                        new_state = new_state.with_node(replace(node, on_error=to_node))
-                elif edge_type in ("route_true", "route_false"):
-                    if node.node_type != "gate":
-                        return _failure_result(state, f"Only gates can use '{edge_type}' edges to sinks.")
-                    route_key = "true" if edge_type == "route_true" else "false"
-                    routes = dict(node.routes or {})
-                    if route_key not in routes or routes[route_key] != to_node:
-                        routes[route_key] = to_node
-                        new_state = new_state.with_node(replace(node, routes=routes))
-                elif edge_type == "fork":
-                    if node.node_type != "gate":
-                        return _failure_result(state, "Only gates can use 'fork' edges to sinks.")
-                    fork_targets = tuple(dict.fromkeys((*(node.fork_to or ()), to_node)))
-                    if node.fork_to != fork_targets:
-                        new_state = new_state.with_node(replace(node, fork_to=fork_targets))
+    # Admission: the shared lowering matrix decides whether this
+    # (component kind, edge type, target kind) combination has any runtime
+    # meaning — the same predicate Stage 1 applies to bulk entry paths.
+    from_kind = composer_component_kind(from_node, state.sources, state.nodes, state.outputs)
+    to_kind = composer_component_kind(to_node, state.sources, state.nodes, state.outputs)
+    lowering_error = edge_lowering_error(edge, from_kind=from_kind, to_kind=to_kind)
+    if lowering_error is not None:
+        return _failure_result(state, lowering_error, error_code="edge_not_lowerable")
+
+    # Slot uniqueness: one sink-routing slot, one edge. A second edge id
+    # claiming the same slot would make removal ambiguous and let the graph
+    # draw a route the scalar cannot carry.
+    if to_kind == "output":
+        output_names = {output.name for output in state.outputs}
+        for existing in state.edges:
+            if existing.id == edge.id or existing.from_node != from_node or existing.to_node not in output_names:
+                continue
+            if edge_type == "fork":
+                conflict = existing.edge_type == "fork" and existing.to_node == to_node
+            else:
+                conflict = existing.edge_type == edge_type
+            if conflict:
+                return _failure_result(
+                    state,
+                    f"Edge '{existing.id}' already expresses the '{edge_type}' sink route of '{from_node}'. "
+                    f"Update or remove edge '{existing.id}' instead of adding '{edge.id}'.",
+                    error_code="edge_route_conflict",
+                )
+
+    # Atomic commit: the visual edge and its scalar mirror derive from one
+    # model. Replacing an edge id first releases the route the old edge
+    # expressed (unless a legacy duplicate still draws it), then writes the
+    # route the new edge expresses — no ordering leaves a stale mirror.
+    old_edge = next((candidate for candidate in state.edges if candidate.id == edge.id), None)
+    new_state = state.with_edge(edge)
+    if (
+        old_edge is not None
+        and (old_edge.from_node, old_edge.edge_type, old_edge.to_node)
+        != (
+            edge.from_node,
+            edge.edge_type,
+            edge.to_node,
+        )
+        and not _sink_route_still_expressed(new_state, old_edge)
+    ):
+        new_state = _clear_removed_sink_edge_route(new_state, old_edge)
+    new_state = _apply_sink_edge_route(new_state, edge)
 
     invariant_error = _post_mutation_invariant_error(new_state)
     if invariant_error is not None:
@@ -1192,7 +1305,8 @@ def _execute_remove_edge(
     new_state = state.without_edge(edge_id)
     if new_state is None:
         return _failure_result(state, f"Edge '{edge_id}' not found.")
-    new_state = _clear_removed_sink_edge_route(new_state, edge)
+    if not _sink_route_still_expressed(new_state, edge):
+        new_state = _clear_removed_sink_edge_route(new_state, edge)
 
     return _mutation_result(new_state, affected)
 

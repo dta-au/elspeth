@@ -145,6 +145,27 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-09 — composer edge/route contract (Lane W2, elspeth-67b44040ee)**:
+  scalar routing fields are the runtime authority; SINK-targeting edges are
+  their mirror and must agree; node-targeting on_success edges are advisory.
+  One shared predicate — `edge_lowering_error` in `web/composer/state.py` —
+  decides which (component kind, edge type, target kind) combinations are
+  legal, for BOTH upsert_edge admission and Stage-1 `validate()`; its full
+  matrix is pinned by `test_edge_route_reconciliation.py` — extend the matrix
+  and its pin together. upsert_edge/remove_edge/upsert_node reconcile the
+  mirror through `_apply_sink_edge_route` / `_clear_removed_sink_edge_route` /
+  `_reconcile_node_sink_mirror_edges` (tools/transforms.py); do not hand-sync
+  a route in a new tool. Two traps: (a) deterministic runtime-fatal routes are
+  now Stage-1 ERRORS, not warnings — `quarantine_unknown_output`,
+  `failsink_unknown_output`/`_self_reference`/`_ineligible_plugin`/`_chain`,
+  `aggregation_on_error_unknown_sink`, `gate_route_target_unknown`,
+  `gate_routes_empty`, gate fork-consistency — so a test fixture with
+  `on_validation_failure="quarantine"` and no quarantine sink no longer
+  validates green (this silently broke dozens of fixtures; declare the sink or
+  use "discard"); (b) one sink-route slot carries ONE edge
+  (`edge_route_conflict`) — a second edge id on the same (from_node,
+  edge_type) sink route is rejected at upsert and red in Stage 1.
+
 - **2026-08-09 — plugin config unions use nominal admission plus owned MRO evidence**:
   `declares_discriminated_config_variants()` derives whether an admitted
   `BaseSource`, `BaseTransform`, or `BaseSink` class declares

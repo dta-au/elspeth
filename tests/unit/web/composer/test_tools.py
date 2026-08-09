@@ -8854,7 +8854,7 @@ def _valid_pipeline_args() -> dict[str, Any]:
             "plugin": "csv",
             "on_success": "source_out",
             "options": {"path": "/data/in.csv", "schema": {"mode": "observed"}},
-            "on_validation_failure": "quarantine",
+            "on_validation_failure": "discard",
         },
         "nodes": [
             {
@@ -12307,7 +12307,7 @@ class TestPreviewPipeline:
                 "plugin": "csv",
                 "on_success": "t1",
                 "options": {"path": "/data/in.csv", "schema": {"mode": "fixed", "fields": ["text: str"]}},
-                "on_validation_failure": "quarantine",
+                "on_validation_failure": "discard",
             },
             state,
             catalog,

@@ -7231,6 +7231,14 @@ class TestEmptyStateFinalizePassthrough:
                     on_write_failure="discard",
                 )
             )
+            .with_output(
+                OutputSpec(
+                    name="rejected_records",
+                    plugin="csv",
+                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
         )
         valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         # Prose contradicts state: claims discard, but state has rejected_records.
@@ -7291,6 +7299,14 @@ class TestEmptyStateFinalizePassthrough:
                     on_write_failure="discard",
                 )
             )
+            .with_output(
+                OutputSpec(
+                    name="rejected_records",
+                    plugin="csv",
+                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
         )
         valid_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         unmotivated_prose = "I just fixed the workflow behavior. All set now."
@@ -7340,6 +7356,14 @@ class TestEmptyStateFinalizePassthrough:
                     name="main",
                     plugin="csv",
                     options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="rejected_records",
+                    plugin="csv",
+                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
                     on_write_failure="discard",
                 )
             )
@@ -7469,6 +7493,14 @@ class TestEmptyStateFinalizePassthrough:
                     on_write_failure="discard",
                 )
             )
+            .with_output(
+                OutputSpec(
+                    name="rejected_records",
+                    plugin="csv",
+                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
         )
         t5_prose = "I fixed the workflow behavior so source validation is no longer silently dropping rows from the record set."
 
@@ -7521,6 +7553,14 @@ class TestEmptyStateFinalizePassthrough:
                     name="main",
                     plugin="csv",
                     options={"path": "/data/outputs/out.csv", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="rejected_records",
+                    plugin="csv",
+                    options={"path": "/data/outputs/rejected.csv", "schema": {"mode": "observed"}},
                     on_write_failure="discard",
                 )
             )
