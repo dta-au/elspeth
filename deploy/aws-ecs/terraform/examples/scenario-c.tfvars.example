@@ -69,6 +69,13 @@ gateway_oauth_client_secret_secret_arn = "arn:aws:secretsmanager:REPLACE_REGION:
 
 gateway_adapter = "REPLACE_WITH_ADAPTER_NAME"
 
+# Exact identity the gateway image must prove OFFLINE (image labels) before
+# any secret-bearing task definition is registered. Read them from the built
+# image: docker image inspect --format '{{ json .Config.Labels }}' <image>
+gateway_adapter_version     = "REPLACE_WITH_ADAPTER_VERSION"
+gateway_adapter_api_major   = 1
+gateway_adapter_fingerprint = "REPLACE_WITH_64_HEX_ADAPTER_PACKAGE_FINGERPRINT"
+
 # HTTPS egress destinations the deployment network must reach; documented
 # here, never baked into the module.
 gateway_upstream_origin = "https://REPLACE_WITH_AGENCY_UPSTREAM_ORIGIN"

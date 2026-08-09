@@ -83,6 +83,9 @@ variables {
   gateway_oauth_client_id_secret_arn     = format("arn:aws:secretsmanager:ap-southeast-1:%s:secret:elspeth-gateway-oauth-id-AbCdEf", join("", ["123456", "789012"]))
   gateway_oauth_client_secret_secret_arn = format("arn:aws:secretsmanager:ap-southeast-1:%s:secret:elspeth-gateway-oauth-secret-AbCdEf", join("", ["123456", "789012"]))
   gateway_adapter                        = "reference_v1"
+  gateway_adapter_version                = "0.1.0"
+  gateway_adapter_api_major              = 1
+  gateway_adapter_fingerprint            = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
   gateway_upstream_origin                = "https://agency.example.invalid"
   gateway_oauth_token_url                = "https://auth.example.invalid/oauth2/token"
   gateway_model_mappings_json = jsonencode({

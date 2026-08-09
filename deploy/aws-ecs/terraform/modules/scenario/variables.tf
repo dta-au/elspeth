@@ -805,6 +805,51 @@ variable "gateway_oauth_client_secret_secret_arn" {
   }
 }
 
+variable "gateway_adapter_version" {
+  type        = string
+  default     = ""
+  description = "Exact adapter version the gateway image must carry (io.elspeth.llm-gateway.adapter-version label); admission fails on mismatch, before any secret-bearing task definition exists."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? length(var.gateway_adapter_version) > 0
+      : var.gateway_adapter_version == ""
+    )
+    error_message = "gateway_adapter_version must be set under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_adapter_api_major" {
+  type        = number
+  default     = 0
+  description = "Adapter API major the gateway image must declare (io.elspeth.llm-gateway.adapter-api-major label)."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? var.gateway_adapter_api_major >= 1 && floor(var.gateway_adapter_api_major) == var.gateway_adapter_api_major
+      : var.gateway_adapter_api_major == 0
+    )
+    error_message = "gateway_adapter_api_major must be a positive integer under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_adapter_fingerprint" {
+  type        = string
+  default     = ""
+  description = "SHA-256 package fingerprint of the installed adapter (io.elspeth.llm-gateway.adapter-fingerprint label)."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^[0-9a-f]{64}$", var.gateway_adapter_fingerprint))
+      : var.gateway_adapter_fingerprint == ""
+    )
+    error_message = "gateway_adapter_fingerprint must be a 64-hex SHA-256 under custom_gateway, and unset under bedrock."
+  }
+}
+
 variable "gateway_adapter" {
   type        = string
   default     = ""

@@ -182,14 +182,19 @@ resource "terraform_data" "cloudwatch_agent_image_provenance" {
   }
 }
 
-# Gateway sidecar admission (custom_gateway backend only). Same trust model
-# as the candidate image: digest-pinned pull from the approved registry plus
-# a revision-label match against the operator-claimed SHA, before any
-# credential-bearing task definition is registered. Deeper identity claims
-# (adapter package fingerprint, contract major) are verified by the gateway
-# itself at readiness — /readyz fails if the installed adapter does not match
-# ELSPETH_LLM_GATEWAY_ADAPTER — and Web will not start until the gateway is
-# HEALTHY, so a wrong-adapter image never receives live traffic.
+# Gateway sidecar admission (custom_gateway backend only). The complete
+# identity gate runs OFFLINE, before any credential-bearing task definition
+# is registered (elspeth-ef60d2ff3c): digest-pinned pull from the approved
+# registry, revision-label match against the operator-claimed SHA, and exact
+# matches on the image's identity labels — base runtime identity, supported
+# gateway contract major, and the adapter's name, version, API major, and
+# package fingerprint. The task definition consumes this resource's output,
+# so any mismatch blocks before the gateway or OAuth secret selectors exist
+# anywhere. /readyz re-verifies adapter identity at runtime as defense in
+# depth, not as the admission boundary. The same candidate-gate caveat
+# applies: labels prove what the image declares, not who built it — the
+# supported pairing remains an image and expectations supplied together by
+# the operator.
 resource "terraform_data" "gateway_image_provenance" {
   count = local.bedrock_backend ? 0 : 1
 
@@ -199,6 +204,10 @@ resource "terraform_data" "gateway_image_provenance" {
     var.gateway_image,
     var.gateway_sha,
     var.gateway_ecr_repository,
+    var.gateway_adapter,
+    var.gateway_adapter_version,
+    var.gateway_adapter_api_major,
+    var.gateway_adapter_fingerprint,
     var.target_platform,
   ]
 
@@ -231,15 +240,41 @@ resource "terraform_data" "gateway_image_provenance" {
         printf '%s\n' gateway_image_revision_mismatch >&2
         exit 1
       }
+      for check in \
+        "io.elspeth.llm-gateway.runtime-identity|$EXPECTED_RUNTIME_IDENTITY|gateway_image_runtime_identity_mismatch" \
+        "io.elspeth.llm-gateway.contract-major|$EXPECTED_CONTRACT_MAJOR|gateway_image_contract_major_mismatch" \
+        "io.elspeth.llm-gateway.adapter-name|$EXPECTED_ADAPTER_NAME|gateway_image_adapter_name_mismatch" \
+        "io.elspeth.llm-gateway.adapter-version|$EXPECTED_ADAPTER_VERSION|gateway_image_adapter_version_mismatch" \
+        "io.elspeth.llm-gateway.adapter-api-major|$EXPECTED_ADAPTER_API_MAJOR|gateway_image_adapter_api_major_mismatch" \
+        "io.elspeth.llm-gateway.adapter-fingerprint|$EXPECTED_ADAPTER_FINGERPRINT|gateway_image_adapter_fingerprint_mismatch"
+      do
+        label=$${check%%|*}
+        rest=$${check#*|}
+        expected=$${rest%%|*}
+        error_token=$${rest#*|}
+        actual=$(docker image inspect \
+          --format "{{ index .Config.Labels \"$label\" }}" \
+          "$GATEWAY_IMAGE")
+        test "$actual" = "$expected" || {
+          printf '%s\n' "$error_token" >&2
+          exit 1
+        }
+      done
     SHELL
 
     environment = {
-      AWS_ACCOUNT_ID  = var.aws_account_id
-      AWS_PROFILE     = var.aws_profile
-      AWS_REGION      = var.aws_region
-      GATEWAY_IMAGE   = var.gateway_image
-      GATEWAY_SHA     = var.gateway_sha
-      TARGET_PLATFORM = var.target_platform
+      AWS_ACCOUNT_ID               = var.aws_account_id
+      AWS_PROFILE                  = var.aws_profile
+      AWS_REGION                   = var.aws_region
+      GATEWAY_IMAGE                = var.gateway_image
+      GATEWAY_SHA                  = var.gateway_sha
+      EXPECTED_RUNTIME_IDENTITY    = "elspeth-llm-gateway"
+      EXPECTED_CONTRACT_MAJOR      = "1"
+      EXPECTED_ADAPTER_NAME        = var.gateway_adapter
+      EXPECTED_ADAPTER_VERSION     = var.gateway_adapter_version
+      EXPECTED_ADAPTER_API_MAJOR   = tostring(var.gateway_adapter_api_major)
+      EXPECTED_ADAPTER_FINGERPRINT = var.gateway_adapter_fingerprint
+      TARGET_PLATFORM              = var.target_platform
     }
   }
 }

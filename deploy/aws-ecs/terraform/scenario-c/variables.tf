@@ -360,6 +360,26 @@ variable "gateway_oauth_client_secret_secret_arn" {
   }
 }
 
+variable "gateway_adapter_version" {
+  type        = string
+  description = "Exact adapter version the gateway image must carry; offline admission fails on mismatch."
+}
+
+variable "gateway_adapter_api_major" {
+  type        = number
+  description = "Adapter API major the gateway image must declare."
+}
+
+variable "gateway_adapter_fingerprint" {
+  type        = string
+  description = "SHA-256 package fingerprint of the installed adapter."
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.gateway_adapter_fingerprint))
+    error_message = "gateway_adapter_fingerprint must be a 64-hex SHA-256."
+  }
+}
+
 variable "gateway_adapter" {
   type        = string
   description = "Adapter name the gateway must load; readiness fails on mismatch."

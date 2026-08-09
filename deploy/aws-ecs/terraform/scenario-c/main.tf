@@ -59,6 +59,9 @@ module "scenario" {
   gateway_oauth_client_id_secret_arn     = var.gateway_oauth_client_id_secret_arn
   gateway_oauth_client_secret_secret_arn = var.gateway_oauth_client_secret_secret_arn
   gateway_adapter                        = var.gateway_adapter
+  gateway_adapter_version                = var.gateway_adapter_version
+  gateway_adapter_api_major              = var.gateway_adapter_api_major
+  gateway_adapter_fingerprint            = var.gateway_adapter_fingerprint
   gateway_upstream_origin                = var.gateway_upstream_origin
   gateway_oauth_token_url                = var.gateway_oauth_token_url
   gateway_model_mappings_json            = var.gateway_model_mappings_json
