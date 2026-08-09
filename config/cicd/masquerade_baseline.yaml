@@ -39,107 +39,17 @@
 # Governing document: docs/architecture/adr/032-validate-by-trust-domain.md
 
 entries:
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _execute_new_judgment_action
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _finding_ast_path
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 4457cb6b53b11fdb6c4dad46aaeff632bf1796585fa7106951a0aafe182e6225
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _finding_file_fingerprint
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 823e3582e9be85d920d394e995ce8354e40eda54a0863ab3a0f4b807331fbf5e
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _finding_scope_fingerprint
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26505fdcb0c019fecca5ee2623e431c6ee36995dd7069e06e509b2b604d598c2
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _finding_symbol_context
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - a068d2609be7e5e99917f6bfbbea999b43d3d036eefe3466f04e5ed4a0a7004b
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _namespace_for_signing_spec
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _run_check
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 1d53f14e275d41f975fbaf39d3bea0342f19a635216805e22305192144d44bc9
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/cli.py
-  qualname: _run_justify
-  kind: getattr
-  occurrences: 2
-  probe_shapes:
-  - 7d104c1fe8720a1ef6cb19ab1920c69dd667e6a9c75301f4ea8f821d5c4e6b9d
-  - dda22049e63576e25d7533def1e81d30ee9113b4564998291b927a641830f12b
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/fixture_harness.py
-  qualname: _load_fixture_rule
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - a724270d54b6196629973cb965f2f81387f78df755bb259145f66cc0dd01831f
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
 - path: elspeth-lints/src/elspeth_lints/core/judge.py
   qualname: _consume_agent_messages
   kind: getattr
   occurrences: 1
   probe_shapes:
-  - 5f2d967cb3e042b14f96cadacae8f02d3af69ee7cb34263caa4bd8f6a673a17c
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
+  - b4faada866688b2b682c965481d2fc97a4c7ec3e1d6f4fef76c454718a0247e4
+  classification: external-parse
+  justification: Parses the optional num_turns field from a terminal claude-agent-sdk
+    ResultMessage after nominal SDK message discrimination. The value is read once,
+    accepted only as an exact int or None, and retained only as owned turn-budget
+    evidence.
 - path: elspeth-lints/src/elspeth_lints/core/judge.py
   qualname: _extract_cache_accounting
   kind: getattr
@@ -147,217 +57,40 @@ entries:
   probe_shapes:
   - 73b9b35c7e10e2e3507f0fd9c7e8cbe34ddd18f178b9d2847d59c84d2300d549
   - eb558ae5b2a2af30694afd43c6c0eac73a9ffaa13c6c379c34e0cc57fdcefc95
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
+  classification: external-parse
+  justification: Parses compatibility-optional OpenAI/OpenRouter prompt-token detail
+    fields. Each foreign field is read once, exact-int validated, and reduced to the
+    owned int-or-None accounting tuple; provider objects do not escape.
 - path: elspeth-lints/src/elspeth_lints/core/judge.py
   qualname: _extract_text_block
   kind: getattr
   occurrences: 1
   probe_shapes:
-  - 07669a4daab0d95ce38e5c564f0d712f98d01266fca6d8b410f91a0e8777fd11
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/judge_signature_diagnosis.py
-  qualname: _finding_int
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 7b9c467afbb94cceececd34bb65f4913404ca147c4394f157ff38926582fc2d6
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/judge_signature_diagnosis.py
-  qualname: _finding_string
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 7b9c467afbb94cceececd34bb65f4913404ca147c4394f157ff38926582fc2d6
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
+  - 5d64249c2c40f4832e87b098f86dde63251fb1d094681828648cd50db00763c0
+  classification: external-parse
+  justification: Admits one foreign OpenAI/OpenRouter Choice finish_reason field with
+    a missing sentinel and exact-string validation before returning only owned text;
+    the raw provider response does not escape this boundary.
 - path: elspeth-lints/src/elspeth_lints/core/reaudit.py
   qualname: _lookup_module_attr
   kind: getattr
   occurrences: 1
   probe_shapes:
   - 40236a9297535c20c08a6e2fb3c8452a7024eb888cbf9783b9eb11527266a8a1
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/reaudit.py
-  qualname: _reaudit_one_entry
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 3b4db8fb3559b420d3ab3cfbc11dba217ac7c1bbba7d12475171e47be51242ce
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/review_bundle.py
-  qualname: ActionPreview.__post_init__
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/core/review_bundle.py
-  qualname: BundleAction.__post_init__
-  kind: getattr
-  occurrences: 3
-  probe_shapes:
-  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
-  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
-  - fdb3373b4e87b800359e7c53ae6e68b9216940fb947a36f30f86014354cb107f
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
+  classification: module-getattr
+  justification: Resolves a constant from an imported module using the closed _RULE_VOCABULARY_REGISTRY.
+    The lookup has no default, missing names fail loudly, and callers validate the
+    resolved registry value before use.
 - path: elspeth-lints/src/elspeth_lints/core/sign_bundle_transaction.py
   qualname: <module>
   kind: getattr
   occurrences: 1
   probe_shapes:
   - 9c7c1c44dbb7139299312a3e2c326dbdb65e4e67910eb5e27d5ff54b7141ae6b
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/mcp/server.py
-  qualname: _verdict_str
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 39f1647006e3924780cbd951c8d4492b84b1c57f72787420f18503a7555dcfb6
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/contract_invariants/portable_sqlite_insert/rule.py
-  qualname: _ImportBindingVisitor._visit_function_definition
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/contract_invariants/portable_sqlite_insert/rule.py
-  qualname: _ImportBindingVisitor.visit_ClassDef
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/contract_invariants/portable_sqlite_insert/rule.py
-  qualname: _node_finding
-  kind: getattr
-  occurrences: 2
-  probe_shapes:
-  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
-  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/contract_invariants/validation_theatre/rule.py
-  qualname: ValidationTheatreVisitor._has_deferred_context
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - eeb92428fbee2cad44c319f90d7a7ff5378e3885aa6b67c6fcb35141cfc8a4db
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/manifest/contract_manifest/rule.py
-  qualname: _parse_manifest_value
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - eaba2839701c1f6eac01d5d71790ff24e674fdd0b1102f1a8e643f477c646282
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/manifest/symbol_inventory/rule.py
-  qualname: _node_location
-  kind: getattr
-  occurrences: 2
-  probe_shapes:
-  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
-  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/manifest/test_to_source_mapping/rule.py
-  qualname: _node_location
-  kind: getattr
-  occurrences: 2
-  probe_shapes:
-  - 83b35a438b486c13363140a42bc0bc4cc367e6731d983a502e2b59b02921d63e
-  - e66c01b4740f5983f9516ec9c7cee0490d9e42a3ad54ca9279bd775fa53d8827
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/plugin_contract/options_metadata/rule.py
-  qualname: iter_metadata_models
-  kind: getattr
-  occurrences: 3
-  probe_shapes:
-  - 06b25e3c47a7711b825b6fbff13c695e228c16b564030a515861bebaafac61cb
-  - 83f5fbe6c0e86213e03e8fbee2b908a5f3ae42d991710889540ed2144d42f0dd
-  - a30145262e9a1c2a3e2168953661eecbfb795c3e99b20006308c98ec992bdd58
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/trust_boundary/shared.py
-  qualname: _allowlist_match
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 26505fdcb0c019fecca5ee2623e431c6ee36995dd7069e06e509b2b604d598c2
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/trust_tier/tier_model/rule.py
-  qualname: TierModelVisitor._receiver_assigned_known_type_before
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - 094be0411c7270d578ead3946bcaab102e0c4af53bbef971db2d7451fb0721bb
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: elspeth-lints/src/elspeth_lints/rules/trust_tier/tier_model/rule.py
-  qualname: TierModelVisitor._visit_definition_header
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - e24d813bcec63b93fe662274c2848f21b538fbbcd9772a04e0d7eaa9a2f6052d
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
+  classification: module-getattr
+  justification: Probes the platform C library for the optional Linux renameat2 capability
+    at module initialization. Absence selects the explicit portable fallback; no arbitrary
+    attribute name or masquerader-controlled object is used.
 - path: scripts/check_contracts.py
   qualname: find_dict_violations
   kind: hasattr

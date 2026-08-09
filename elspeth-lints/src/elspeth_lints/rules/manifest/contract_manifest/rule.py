@@ -198,8 +198,9 @@ def _parse_manifest_value(
     name_to_sites: dict[str, frozenset[str]] = {}
     name_to_line: dict[str, int] = {}
     for key_node, value_node in zip(inner.keys, inner.values, strict=True):
+        key_line = key_node.lineno if key_node is not None else assign_line
         if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
-            raise ValueError(f"{manifest_file}:{getattr(key_node, 'lineno', assign_line)} manifest key must be a string literal")
+            raise ValueError(f"{manifest_file}:{key_line} manifest key must be a string literal")
         contract_name = key_node.value
         if contract_name in name_to_sites:
             raise ValueError(f"{manifest_file}:{key_node.lineno} duplicate manifest contract {contract_name!r}")

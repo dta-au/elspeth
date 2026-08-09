@@ -489,6 +489,26 @@ def test_tool_mode_no_verdict_without_exhaustion_is_contract_error(monkeypatch: 
         call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
 
 
+def test_tool_mode_rejects_boolean_num_turns(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
+    _install_tool_fake_sdk(
+        monkeypatch,
+        messages=[("I decline to decide.", False)],
+        num_turns=True,
+    )
+    with pytest.raises(JudgeContractError, match="num_turns must be an exact int or None"):
+        call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
+
+
+def test_tool_mode_rejects_negative_num_turns(monkeypatch: pytest.MonkeyPatch, scope: AgentToolScope) -> None:
+    _install_tool_fake_sdk(
+        monkeypatch,
+        messages=[("I decline to decide.", False)],
+        num_turns=-1,
+    )
+    with pytest.raises(JudgeContractError, match="num_turns must be non-negative"):
+        call_judge(_request(), transport=TRANSPORT_AGENT, tool_scope=scope)
+
+
 # --------------------------------------------------------------------------
 # OpenRouter / call_judge reject a tool scope
 # --------------------------------------------------------------------------

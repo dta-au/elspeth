@@ -43,16 +43,6 @@ _KIND_TO_LANE: dict[str, str] = {
     "stale_delete": "resign",
 }
 
-# Per-kind required fields (``key`` is required for every kind, checked
-# separately). A malformed action raises a typed ``ValueError`` at construction
-# so ``load_bundle`` rejects it before any tree walk.
-_REQUIRED_FIELDS_BY_KIND: dict[str, tuple[str, ...]] = {
-    "justify": ("file_path", "symbol", "fingerprint"),
-    "drift_repair": ("diagnosis_status",),
-    "rotation": ("source_file",),
-    "stale_delete": ("source_file",),
-}
-
 _PREVIEW_FIELDS = ("verdict", "rationale", "model", "transport", "authoritative")
 _ACTION_FIELDS = (
     "lane",
@@ -101,8 +91,12 @@ class ActionPreview:
     authoritative: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("verdict", "rationale", "model", "transport"):
-            value = getattr(self, name)
+        for name, value in (
+            ("verdict", self.verdict),
+            ("rationale", self.rationale),
+            ("model", self.model),
+            ("transport", self.transport),
+        ):
             if not isinstance(value, str):
                 raise ValueError(f"ActionPreview.{name} must be a string; got {type(value).__name__}")
         if not isinstance(self.authoritative, bool):
@@ -134,24 +128,22 @@ class BundleAction:
     preview: ActionPreview | None = None
 
     def __post_init__(self) -> None:
-        for name in ("lane", "kind", "key"):
-            value = getattr(self, name)
+        for name, value in (("lane", self.lane), ("kind", self.kind), ("key", self.key)):
             if not isinstance(value, str):
                 raise ValueError(f"BundleAction.{name} must be a string; got {type(value).__name__}")
-        for name in (
-            "file_path",
-            "symbol",
-            "rule",
-            "fingerprint",
-            "scope_fingerprint",
-            "ast_path",
-            "draft_rationale",
-            "diagnosis_status",
-            "source_file",
+        for name, optional_value in (
+            ("file_path", self.file_path),
+            ("symbol", self.symbol),
+            ("rule", self.rule),
+            ("fingerprint", self.fingerprint),
+            ("scope_fingerprint", self.scope_fingerprint),
+            ("ast_path", self.ast_path),
+            ("draft_rationale", self.draft_rationale),
+            ("diagnosis_status", self.diagnosis_status),
+            ("source_file", self.source_file),
         ):
-            value = getattr(self, name)
-            if value is not None and not isinstance(value, str):
-                raise ValueError(f"BundleAction.{name} must be a string or null; got {type(value).__name__}")
+            if optional_value is not None and not isinstance(optional_value, str):
+                raise ValueError(f"BundleAction.{name} must be a string or null; got {type(optional_value).__name__}")
         if self.preview is not None and not isinstance(self.preview, ActionPreview):
             raise ValueError(f"BundleAction.preview must be an ActionPreview or null; got {type(self.preview).__name__}")
         if self.key == "":
@@ -164,7 +156,13 @@ class BundleAction:
                 f"BundleAction.lane={self.lane!r} is incoherent with kind={self.kind!r} "
                 f"(kind {self.kind!r} requires lane {expected_lane!r})"
             )
-        missing = [name for name in _REQUIRED_FIELDS_BY_KIND[self.kind] if getattr(self, name) in {None, ""}]
+        required_values_by_kind = {
+            "justify": (("file_path", self.file_path), ("symbol", self.symbol), ("fingerprint", self.fingerprint)),
+            "drift_repair": (("diagnosis_status", self.diagnosis_status),),
+            "rotation": (("source_file", self.source_file),),
+            "stale_delete": (("source_file", self.source_file),),
+        }
+        missing = [name for name, value in required_values_by_kind[self.kind] if value in {None, ""}]
         if missing:
             raise ValueError(f"BundleAction kind={self.kind!r} is missing required field(s): {missing}")
         if self.kind in {"rotation", "stale_delete"}:

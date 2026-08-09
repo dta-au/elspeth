@@ -53,6 +53,8 @@ from elspeth_lints.core.judge import (
     JudgeResponse,
     JudgeTransportError,
     SimilarAllowlistEntry,
+    _extract_cache_accounting,
+    _extract_text_block,
     call_judge,
 )
 from elspeth_lints.core.override_rate import judge_decision_events_path
@@ -605,6 +607,46 @@ def test_call_judge_rejects_length_truncated_completion() -> None:
         pytest.raises(JudgeContractError, match="finish_reason='length'"),
     ):
         call_judge(request)
+
+
+def test_call_judge_accepts_completion_missing_finish_reason() -> None:
+    request = JudgeRequest(
+        file_path="plugins/widget.py",
+        rule_id="R1",
+        symbol="Widget.lookup",
+        fingerprint="abc",
+        rationale="...",
+        surrounding_code="...",
+    )
+    fake_completion = _mock_openrouter_completion(verdict="ACCEPTED", rationale="ok")
+    del fake_completion.choices[0].finish_reason
+    fake_client = _OpenAIClientDouble(fake_completion)
+
+    with (
+        patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False),
+        patch("openai.OpenAI", return_value=fake_client),
+    ):
+        response = call_judge(request)
+
+    assert response.verdict is JudgeVerdict.ACCEPTED
+
+
+def test_provider_choice_finish_reason_is_read_once_at_admission() -> None:
+    class _Choice:
+        def __init__(self) -> None:
+            self.message = SimpleNamespace(content='{"verdict":"ACCEPTED"}')
+            self.reads = 0
+
+        @property
+        def finish_reason(self) -> str:
+            self.reads += 1
+            return "stop"
+
+    choice = _Choice()
+    completion = SimpleNamespace(choices=[choice])
+
+    assert _extract_text_block(completion) == '{"verdict":"ACCEPTED"}'
+    assert choice.reads == 1
 
 
 def test_call_judge_wraps_raw_httpx_connect_error() -> None:
@@ -2467,6 +2509,72 @@ def test_call_judge_returns_cache_accounting_when_provider_reports_it() -> None:
         response = call_judge(request)
     assert response.prompt_tokens_total == 4000
     assert response.prompt_tokens_cached == 3500
+
+
+def test_call_judge_rejects_boolean_cached_token_accounting() -> None:
+    request = JudgeRequest(
+        file_path="plugins/widget.py",
+        rule_id="R1",
+        symbol="Widget.lookup",
+        fingerprint="fp",
+        rationale="...",
+        surrounding_code="...",
+    )
+    with (
+        _mock_judge_call(verdict="ACCEPTED", rationale="ok", prompt_tokens=4000, cached_tokens=True),
+        pytest.raises(JudgeContractError, match="cached_tokens must be int or None"),
+    ):
+        call_judge(request)
+
+
+def test_provider_cache_accounting_fields_are_read_once_at_admission() -> None:
+    class _Details:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        @property
+        def cached_tokens(self) -> int:
+            self.reads += 1
+            return 7
+
+    class _Usage:
+        prompt_tokens = 11
+
+        def __init__(self, details: _Details) -> None:
+            self._details = details
+            self.reads = 0
+
+        @property
+        def prompt_tokens_details(self) -> _Details:
+            self.reads += 1
+            return self._details
+
+    details = _Details()
+    usage = _Usage(details)
+
+    assert _extract_cache_accounting(SimpleNamespace(usage=usage)) == (11, 7)
+    assert usage.reads == 1
+    assert details.reads == 1
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "cached_tokens"),
+    ((-1, None), (10, -1), (10, 11)),
+)
+def test_provider_cache_accounting_rejects_impossible_bounds(
+    prompt_tokens: int,
+    cached_tokens: int | None,
+) -> None:
+    details = None if cached_tokens is None else SimpleNamespace(cached_tokens=cached_tokens)
+    completion = SimpleNamespace(
+        usage=SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            prompt_tokens_details=details,
+        )
+    )
+
+    with pytest.raises(JudgeContractError, match="prompt token accounting"):
+        _extract_cache_accounting(completion)
 
 
 def test_call_judge_distinguishes_cached_zero_from_cached_none() -> None:

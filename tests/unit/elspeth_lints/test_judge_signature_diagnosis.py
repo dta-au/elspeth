@@ -415,7 +415,7 @@ def test_cli_sign_loads_env_removes_stale_entry_and_invokes_justify(
 
     calls: list[Any] = []
 
-    def fake_justify(args: Any) -> int:
+    def fake_justify(args: Any, **_kwargs: Any) -> int:
         calls.append(args)
         return 0
 
@@ -512,7 +512,7 @@ entries:
     calls: list[Any] = []
 
     try:
-        with patch("elspeth_lints.core.cli._run_justify", side_effect=lambda args: calls.append(args) or 0):
+        with patch("elspeth_lints.core.cli._run_justify", side_effect=lambda args, **_kwargs: calls.append(args) or 0):
             assert (
                 _run_sign(
                     root,
@@ -661,7 +661,7 @@ entries:
     monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
     calls: list[Any] = []
 
-    def fake_justify(args: Any) -> int:
+    def fake_justify(args: Any, **_kwargs: Any) -> int:
         calls.append(args)
         return 1 if args.fingerprint == "blocked123" else 0
 

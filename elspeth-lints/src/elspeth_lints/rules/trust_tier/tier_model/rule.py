@@ -968,7 +968,8 @@ class TierModelVisitor(ast.NodeVisitor):
                 self._visit_ast_child("args", node.args)
                 if not isinstance(node, ast.Lambda):
                     self._visit_ast_child("returns", node.returns)
-            for index, type_param in enumerate(getattr(node, "type_params", ())):
+            type_params = () if isinstance(node, ast.Lambda) else node.type_params
+            for index, type_param in enumerate(type_params):
                 self._visit_ast_list_item("type_params", index, type_param)
         finally:
             popped = self._definition_header_stack.pop()
@@ -1180,7 +1181,9 @@ class TierModelVisitor(ast.NodeVisitor):
     def _receiver_assigned_known_type_before(self, scope: ast.AST, receiver: ast.expr, lineno: int) -> bool:
         known: bool | None = None
         for child in self._walk_scope_nodes(scope):
-            if getattr(child, "lineno", lineno) >= lineno:
+            if not isinstance(child, (ast.Assign, ast.AnnAssign, ast.With, ast.AsyncWith)):
+                continue
+            if child.lineno >= lineno:
                 continue
             if isinstance(child, ast.Assign):
                 value_is_known = isinstance(child.value, ast.Call) and self._call_constructs_known_non_dict_get_receiver(child.value)
@@ -3188,6 +3191,11 @@ def _legacy_finding_to_lint(finding: Finding) -> LintFinding:
         fingerprint=finding.fingerprint,
         severity=Severity.NOTE if finding.rule_id == "R_TB_SUPPRESSED" else RULE_METADATA.severity,
         suggestion=rule.get("remediation"),
+        symbol_context=finding.symbol_context,
+        ast_path=finding.ast_path,
+        scope_fingerprint=finding.scope_fingerprint,
+        file_fingerprint=finding.file_fingerprint,
+        scope_depth=finding.scope_depth,
     )
 
 

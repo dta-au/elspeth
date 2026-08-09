@@ -1069,8 +1069,8 @@ def _reaudit_one_entry(
     # record-and-continue handling as ENTRY_OBSOLETE — rather than aborting the
     # whole sweep on the first drifted entry. The cryptographic anti-forgery
     # gate remains HMAC-at-load in CI; this is benign development drift, not the
-    # forgery surface. ``getattr(..., "scope_fingerprint", "")`` is the
-    # sanctioned cross-protocol bridge (v1 findings predate the field); the
+    # forgery surface. The shared Finding contract carries an empty default for
+    # v1 findings that predate the field; the
     # verifier rejects an empty value for a v2 entry, which is the right crash —
     # but that crash is captured here as drift, not propagated.
     try:
@@ -1078,7 +1078,7 @@ def _reaudit_one_entry(
             entry,
             file_path=matching_finding.file_path,
             ast_path=matching_finding.ast_path,
-            scope_fingerprint=getattr(matching_finding, "scope_fingerprint", ""),
+            scope_fingerprint=matching_finding.scope_fingerprint,
         )
     except ValueError as exc:
         return ReauditOutcome(

@@ -1462,6 +1462,18 @@ class BaseTransform(ABC):
         return ()
 
 
+def declares_discriminated_config_variants(
+    plugin_type: type[BaseSource] | type[BaseTransform] | type[BaseSink],
+) -> bool:
+    """Return whether a nominal plugin class declares the variants protocol.
+
+    Derive this fact from the live MRO instead of caching a mutable marker on
+    the subclass. That keeps inherited and mixin-provided declarations aligned
+    with the Composer's structural ``DiscriminatedPlugin`` admission path.
+    """
+    return any("discriminated_variants" in owner.__dict__ for owner in plugin_type.__mro__)
+
+
 class BaseSink(ABC, SinkEffectContract):
     """Base class for sink plugins.
 

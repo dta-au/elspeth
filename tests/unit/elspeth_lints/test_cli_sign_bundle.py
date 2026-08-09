@@ -1785,8 +1785,12 @@ def test_sign_bundle_rejects_unrelated_candidate_mutation(tmp_path: Path) -> Non
     )
     real_execute = cli_module._execute_new_judgment_action
 
-    def _execute_then_tamper(action: Any, *, args: Any) -> int:
-        code = real_execute(action, args=args)
+    def _execute_then_tamper(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        code = real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
         (args.allowlist_dir / "unrelated.yaml").write_text(
             "allow_hits: []\n",
             encoding="utf-8",
@@ -1828,8 +1832,12 @@ def test_sign_bundle_rejects_judge_decision_event_rewrite(
     )
     real_execute = cli_module._execute_new_judgment_action
 
-    def _execute_then_rewrite_events(action: Any, *, args: Any) -> int:
-        code = real_execute(action, args=args)
+    def _execute_then_rewrite_events(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        code = real_execute(
+            action,
+            args=args,
+            defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+        )
         event_path = args.allowlist_dir / ".judge-metrics" / "judge-decision-events.jsonl"
         record = json.loads(event_path.read_text(encoding="utf-8"))
         if tamper == "impossible_verdict_pair":
@@ -1885,8 +1893,15 @@ def test_sign_bundle_resume_rejects_written_event_for_incomplete_action(
     )
     real_execute = cli_module._execute_new_judgment_action
 
-    def _execute_then_remove_written_entry(action: Any, *, args: Any) -> int:
-        assert real_execute(action, args=args) == 0
+    def _execute_then_remove_written_entry(action: Any, *, args: Any, defer_override_rate_counter_snapshot: bool) -> int:
+        assert (
+            real_execute(
+                action,
+                args=args,
+                defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+            )
+            == 0
+        )
         cli_module._pop_allow_hits_entry(
             args.allowlist_dir / "plugins.yaml",
             action.key,

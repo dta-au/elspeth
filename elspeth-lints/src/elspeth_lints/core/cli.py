@@ -1299,7 +1299,7 @@ def _run_check(args: argparse.Namespace, *, registry: RuleRegistry) -> int:
     if allowlist_dir is not None and not allowlist_dir.is_dir():
         sys.stderr.write(f"--allowlist-dir: {allowlist_dir} is not a directory\n")
         return 2
-    repo_root = getattr(args, "repo_root", None)
+    repo_root = args.repo_root
     if repo_root is not None and not repo_root.is_dir():
         sys.stderr.write(f"--repo-root: {repo_root} is not a directory\n")
         return 2
@@ -1716,7 +1716,12 @@ def _run_dump_edges(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_justify(args: argparse.Namespace) -> int:
+def _run_justify(
+    args: argparse.Namespace,
+    *,
+    allow_hits_entry_index: int | None = None,
+    defer_override_rate_counter_snapshot: bool = False,
+) -> int:
     """Drive the cicd-judge gate for one proposed allowlist entry.
 
     Re-runs the tier_model rule against ``--file-path`` to locate the
@@ -2114,7 +2119,7 @@ def _run_justify(args: argparse.Namespace) -> int:
         _append_entry_to_yaml(
             target_yaml,
             yaml_entry,
-            entry_index=getattr(args, "_allow_hits_entry_index", None),
+            entry_index=allow_hits_entry_index,
         )
         _append_judge_decision_event_after_judge(
             allowlist_dir=allowlist_dir,
@@ -2124,7 +2129,7 @@ def _run_justify(args: argparse.Namespace) -> int:
             recorded_at=response.recorded_at,
             write_disposition="written",
         )
-        if not getattr(args, "_defer_override_rate_counter_snapshot", False):
+        if not defer_override_rate_counter_snapshot:
             _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
     _emit_justify_output(
         args=args,
@@ -2420,7 +2425,7 @@ def _finding_symbol_matches(finding: Any, symbol_tuple: tuple[str, ...]) -> bool
 
 
 def _finding_symbol_context(finding: Any) -> tuple[str, ...]:
-    raw = getattr(finding, "symbol_context", ())
+    raw = finding.symbol_context
     return tuple(raw)
 
 
@@ -2436,7 +2441,7 @@ def _finding_canonical_key(finding: Any) -> str:
 
 
 def _finding_ast_path(finding: Any) -> str:
-    ast_path = getattr(finding, "ast_path", "")
+    ast_path = finding.ast_path
     if not isinstance(ast_path, str) or not ast_path:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no ast_path; "
@@ -2449,12 +2454,12 @@ def _finding_scope_fingerprint(finding: Any) -> str:
     """Return the finding's enclosing-scope fingerprint for a v2 binding.
 
     Tier-model findings carry ``scope_fingerprint`` (stamped by the scanner).
-    A trust_boundary ``protocols.Finding`` does NOT — so v2 justify is
-    TIER-MODEL-ONLY today; justifying a trust_boundary rule raises here
+    A trust_boundary ``protocols.Finding`` carries the shared contract's empty,
+    unstamped default — so v2 justify is TIER-MODEL-ONLY today; justifying a trust_boundary rule raises here
     (fail-closed) until that scanner stamps the field. Do not fabricate a
     value: an empty/absent scope_fingerprint cannot bind a v2 entry.
     """
-    scope_fingerprint = getattr(finding, "scope_fingerprint", "")
+    scope_fingerprint = finding.scope_fingerprint
     if not isinstance(scope_fingerprint, str) or not scope_fingerprint:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no scope_fingerprint; "
@@ -2467,7 +2472,7 @@ def _finding_scope_fingerprint(finding: Any) -> str:
 
 def _finding_file_fingerprint(finding: Any) -> str:
     """Return the source-file digest stamped by the scanner pass."""
-    file_fingerprint = getattr(finding, "file_fingerprint", "")
+    file_fingerprint = finding.file_fingerprint
     if not isinstance(file_fingerprint, str) or not file_fingerprint:
         raise ValueError(
             f"finding {_finding_canonical_key(finding)} has no file_fingerprint; "
@@ -3574,11 +3579,8 @@ def _run_sign_judge_signatures(args: argparse.Namespace) -> int:
             return 2
 
         exit_code = _run_justify(
-            _namespace_for_signing_spec(
-                spec,
-                args,
-                allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
-            )
+            _namespace_for_signing_spec(spec, args),
+            allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
         )
         if exit_code != 0:
             failures.append(
@@ -3912,8 +3914,6 @@ def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
 def _namespace_for_signing_spec(
     spec: _JudgeSignatureSigningSpec,
     args: argparse.Namespace,
-    *,
-    allow_hits_entry_index: int | None = None,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         root=args.root,
@@ -3931,12 +3931,6 @@ def _namespace_for_signing_spec(
         justify_format=args.justify_format,
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
-        _allow_hits_entry_index=allow_hits_entry_index,
-        _defer_override_rate_counter_snapshot=getattr(
-            args,
-            "_defer_override_rate_counter_snapshot",
-            False,
-        ),
     )
 
 
@@ -4321,9 +4315,14 @@ def _execute_one_sign_bundle_action(
 ) -> int:
     """Execute one already-verified bundle action against the private copy."""
     if action.kind == "drift_repair":
-        return _execute_drift_repair_action(action, specs_by_stale_key=specs_by_stale_key, args=args)
+        return _execute_drift_repair_action(
+            action,
+            specs_by_stale_key=specs_by_stale_key,
+            args=args,
+            defer_override_rate_counter_snapshot=True,
+        )
     if action.kind == "justify":
-        return _execute_new_judgment_action(action, args=args)
+        return _execute_new_judgment_action(action, args=args, defer_override_rate_counter_snapshot=True)
     if action.kind == "rotation":
         return _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
     if action.kind == "stale_delete":
@@ -4374,7 +4373,13 @@ def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reaso
     )
 
 
-def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, Any], args: argparse.Namespace) -> int:
+def _execute_drift_repair_action(
+    action: Any,
+    *,
+    specs_by_stale_key: dict[str, Any],
+    args: argparse.Namespace,
+    defer_override_rate_counter_snapshot: bool,
+) -> int:
     """Re-judge a drifted entry: pop the stale row, re-run justify, restore on failure.
 
     Replicates the ``sign-judge-signatures`` pop -> ``_run_justify`` ->
@@ -4402,11 +4407,9 @@ def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, A
         return 2
 
     exit_code = _run_justify(
-        _namespace_for_signing_spec(
-            spec,
-            args,
-            allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
-        )
+        _namespace_for_signing_spec(spec, args),
+        allow_hits_entry_index=removed_stale_entry.index if removed_stale_entry is not None else None,
+        defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
     )
     if exit_code != 0 and stale_yaml is not None and removed_stale_entry is not None:
         _append_entry_to_yaml(
@@ -4421,7 +4424,12 @@ def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, A
     return exit_code
 
 
-def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> int:
+def _execute_new_judgment_action(
+    action: Any,
+    *,
+    args: argparse.Namespace,
+    defer_override_rate_counter_snapshot: bool,
+) -> int:
     """Run the real judge for a brand-new finding inside the keyed step.
 
     ``new_judgment`` actions have no diagnose item (no entry exists yet), so the
@@ -4447,13 +4455,11 @@ def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> in
         justify_format=args.justify_format,
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
-        _defer_override_rate_counter_snapshot=getattr(
-            args,
-            "_defer_override_rate_counter_snapshot",
-            False,
-        ),
     )
-    return _run_justify(namespace)
+    return _run_justify(
+        namespace,
+        defer_override_rate_counter_snapshot=defer_override_rate_counter_snapshot,
+    )
 
 
 def _execute_rotation_action(action: Any, *, rotation_plan: Any, args: argparse.Namespace) -> int:

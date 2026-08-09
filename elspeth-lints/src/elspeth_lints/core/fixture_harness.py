@@ -201,7 +201,10 @@ def _load_fixture_rule(path: Path) -> Rule:
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
-    rule = getattr(module, "RULE", None)
+    try:
+        rule = module.RULE
+    except AttributeError:
+        raise AssertionError(f"{path}: fixture module must expose a Rule-compatible RULE object") from None
     if not isinstance(rule, Rule):
         raise AssertionError(f"{path}: fixture module must expose a Rule-compatible RULE object")
     return rule

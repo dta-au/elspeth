@@ -76,13 +76,35 @@ class OptionsMetadataRule:
 
 def iter_metadata_models(kind: str, plugin_cls: object) -> Iterator[tuple[str, type[Any]]]:
     """Yield the metadata-bearing config models for one plugin class."""
+    from elspeth.contracts.discriminated import DiscriminatedPlugin
+    from elspeth.plugins.infrastructure.base import (
+        BaseSink,
+        BaseSource,
+        BaseTransform,
+        declares_discriminated_config_variants,
+    )
+
     base_model = _pydantic_base_model()
-    plugin_name = getattr(plugin_cls, "name", None)
+    expected_base_by_kind = {
+        "source": BaseSource,
+        "transform": BaseTransform,
+        "sink": BaseSink,
+    }
+    try:
+        expected_base = expected_base_by_kind[kind]
+    except KeyError as exc:
+        raise ValueError(f"unknown plugin kind {kind!r}") from exc
+    if not isinstance(plugin_cls, type) or not issubclass(plugin_cls, expected_base):
+        raise TypeError(f"{kind} plugin {plugin_cls!r} must inherit {expected_base.__name__}")
+    plugin_type = cast(type[BaseSource] | type[BaseTransform] | type[BaseSink], plugin_cls)
+    plugin_name = plugin_type.name
     if not isinstance(plugin_name, str):
         raise TypeError(f"{kind} plugin {plugin_cls!r} has no string name")
-    variants_fn = getattr(plugin_cls, "discriminated_variants", None)
-    if variants_fn is not None and callable(variants_fn):
-        variants_raw = variants_fn()
+    if declares_discriminated_config_variants(plugin_type):
+        # The owned helper admits the nominal Base* category and derives the
+        # public protocol declaration across the complete MRO. The Protocol
+        # cast is typing-only; it is not the runtime identity control.
+        variants_raw = cast(type[DiscriminatedPlugin], plugin_type).discriminated_variants()
         if not isinstance(variants_raw, tuple) or len(variants_raw) != 2:
             raise TypeError(f"{kind}/{plugin_name}: discriminated_variants() returned an invalid shape")
         variants = variants_raw[1]
@@ -96,7 +118,7 @@ def iter_metadata_models(kind: str, plugin_cls: object) -> Iterator[tuple[str, t
             yield f"{kind}/{plugin_name}[{variant_name}]", model
         return
 
-    options_model = getattr(plugin_cls, "config_model", None)
+    options_model = plugin_type.config_model
     if isinstance(options_model, type) and issubclass(options_model, base_model):
         yield f"{kind}/{plugin_name}", options_model
 

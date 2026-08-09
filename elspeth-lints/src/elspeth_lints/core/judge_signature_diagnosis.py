@@ -524,8 +524,8 @@ def _diagnose_v1_entry(
         verify_entry_binding_against_finding(
             entry,
             file_path=_entry_file_path(entry),
-            ast_path=_finding_string(matching_finding, "ast_path"),
-            scope_fingerprint=_finding_string(matching_finding, "scope_fingerprint"),
+            ast_path=matching_finding.ast_path,
+            scope_fingerprint=matching_finding.scope_fingerprint,
         )
     except ValueError as exc:
         return JudgeSignatureDiagnosis(
@@ -563,9 +563,9 @@ def _diagnose_v2_entry(
             if find_scope_fallback_entry(
                 [entry],
                 canonical_key=_canonical_key_for_finding(candidate),
-                scope_fingerprint=_finding_string(candidate, "scope_fingerprint"),
-                ast_path=_finding_string(candidate, "ast_path"),
-                scope_depth=_finding_int(candidate, "scope_depth"),
+                scope_fingerprint=candidate.scope_fingerprint,
+                ast_path=candidate.ast_path,
+                scope_depth=candidate.scope_depth,
             )
             is entry
         ]
@@ -611,8 +611,8 @@ def _diagnose_v2_entry(
         verify_entry_binding_against_finding(
             entry,
             file_path=_entry_file_path(entry),
-            ast_path=_finding_string(finding, "ast_path"),
-            scope_fingerprint=_finding_string(finding, "scope_fingerprint"),
+            ast_path=finding.ast_path,
+            scope_fingerprint=finding.scope_fingerprint,
         )
     except ValueError as exc:
         message = str(exc)
@@ -676,20 +676,6 @@ def _entry_file_path(entry: AllowlistEntry) -> str:
     if parsed is None:
         return "<invalid>"
     return parsed[0]
-
-
-def _finding_string(finding: Any, field_name: str) -> str:
-    value = getattr(finding, field_name)
-    if not isinstance(value, str):
-        raise ValueError(f"finding.{field_name} must be str; got {type(value).__name__}")
-    return value
-
-
-def _finding_int(finding: Any, field_name: str) -> int:
-    value = getattr(finding, field_name)
-    if not isinstance(value, int):
-        raise ValueError(f"finding.{field_name} must be int; got {type(value).__name__}")
-    return value
 
 
 def _justify_command(*, entry: AllowlistEntry, root: Path, allowlist_dir: Path, repair_key: str | None = None) -> str:

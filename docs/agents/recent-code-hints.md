@@ -109,6 +109,15 @@ what you touch, or run the full suite.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-09 — plugin config unions use nominal admission plus owned MRO evidence**:
+  `declares_discriminated_config_variants()` derives whether an admitted
+  `BaseSource`, `BaseTransform`, or `BaseSink` class declares
+  `discriminated_variants()` anywhere in its live MRO. Consumers such as the
+  options-metadata lint first admit the nominal Base* category, then use that
+  non-cached evidence and call the declared method directly. Do not bring back
+  `getattr`/`hasattr` capability probes,
+  treat the runtime-checkable structural Protocol as an identity control, or
+  hard-code the currently known LLM implementations.
 - **2026-08-09 — re-check mutable exception facts and every composer completion at their exit gate**:
   nominal ownership of an exception does not make its class or instance
   attributes immutable. Operator-facing acceptance envelopes must clamp

@@ -1774,8 +1774,19 @@ async def _consume_agent_messages(
             raw_text = verdict_json
             stripped = verdict_json
         else:
-            num_turns = getattr(result_message, "num_turns", None)
-            if isinstance(num_turns, int) and max_turns is not None and num_turns >= max_turns:
+            missing = object()
+            raw_num_turns = getattr(result_message, "num_turns", missing)
+            if raw_num_turns is missing or raw_num_turns is None:
+                num_turns: int | None = None
+            elif type(raw_num_turns) is int:
+                num_turns = raw_num_turns
+            else:
+                raise JudgeContractError(
+                    f"agent ResultMessage.num_turns must be an exact int or None when reported; got {type(raw_num_turns).__name__}"
+                )
+            if num_turns is not None and num_turns < 0:
+                raise JudgeContractError(f"agent ResultMessage.num_turns must be non-negative; got {num_turns}")
+            if num_turns is not None and max_turns is not None and num_turns >= max_turns:
                 raise JudgeContractError(
                     f"agent turn budget (max_turns={max_turns}) exhausted before a verdict "
                     f"(num_turns={num_turns}); the final assistant message contained no "
@@ -2391,7 +2402,16 @@ def _extract_text_block(completion: Any) -> str:
             f"judge response must have exactly one choice; got {len(choices) if isinstance(choices, list) else type(choices).__name__}"
         )
     choice = choices[0]
-    finish_reason = getattr(choice, "finish_reason", None)
+    missing = object()
+    raw_finish_reason = getattr(choice, "finish_reason", missing)
+    if raw_finish_reason is missing or raw_finish_reason is None:
+        finish_reason: str | None = None
+    elif type(raw_finish_reason) is str:
+        finish_reason = raw_finish_reason
+    else:
+        raise JudgeContractError(
+            f"judge response choice.finish_reason must be a string or None when reported; got {type(raw_finish_reason).__name__}"
+        )
     if finish_reason == "length":
         raise JudgeContractError(
             "judge response finish_reason='length'; output was truncated by "
@@ -2421,17 +2441,24 @@ def _extract_cache_accounting(completion: Any) -> tuple[int, int | None]:
     """
     usage = completion.usage
     prompt_tokens_total = usage.prompt_tokens
-    if not isinstance(prompt_tokens_total, int):
+    if type(prompt_tokens_total) is not int:
         raise JudgeContractError(f"judge response usage.prompt_tokens must be int; got {type(prompt_tokens_total).__name__}")
+    if prompt_tokens_total < 0:
+        raise JudgeContractError(f"judge response prompt token accounting cannot be negative; got total={prompt_tokens_total}")
     details = getattr(usage, "prompt_tokens_details", None)
     if details is None:
         return prompt_tokens_total, None
     cached = getattr(details, "cached_tokens", None)
     if cached is None:
         return prompt_tokens_total, None
-    if not isinstance(cached, int):
+    if type(cached) is not int:
         raise JudgeContractError(
             f"judge response usage.prompt_tokens_details.cached_tokens must be int or None; got {type(cached).__name__}"
+        )
+    if cached < 0 or cached > prompt_tokens_total:
+        raise JudgeContractError(
+            "judge response prompt token accounting must satisfy "
+            f"0 <= cached_tokens <= prompt_tokens; got cached={cached}, total={prompt_tokens_total}"
         )
     return prompt_tokens_total, cached
 

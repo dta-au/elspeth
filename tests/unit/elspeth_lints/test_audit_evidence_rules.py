@@ -980,6 +980,7 @@ def test_gve_attribution_syntax_errors_surface_as_parse_error_findings(tmp_path:
             rule_set="static",
             format="json",
             root=tmp_path,
+            repo_root=None,
             allowlist_dir=empty_allowlist,
             files=None,
         ),

@@ -3,7 +3,7 @@
     "column": 4,
     "file_path": "_fixture_rule.py",
     "fingerprint": "source/metadata_gap:missing_title:missing-title",
-    "line": 9,
+    "line": 12,
     "message": "source/metadata_gap:missing_title: missing title",
     "rule_id": "plugin_contract.options_metadata",
     "severity": "error",

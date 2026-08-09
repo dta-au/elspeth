@@ -110,7 +110,7 @@ class ADR019Visitor(ast.NodeVisitor):
         self.path = path
         self.findings: list[InventoryFinding] = []
 
-    def _add(self, kind: FindingKind, node: ast.AST, symbol: str) -> None:
+    def _add(self, kind: FindingKind, node: ast.expr | ast.stmt | ast.arg, symbol: str) -> None:
         line, col = _node_location(node)
         self.findings.append(
             InventoryFinding(
@@ -347,8 +347,8 @@ def _context(node: ast.AST) -> str:
         return node.__class__.__name__
 
 
-def _node_location(node: ast.AST) -> tuple[int, int]:
-    return getattr(node, "lineno", 0), getattr(node, "col_offset", 0)
+def _node_location(node: ast.expr | ast.stmt | ast.arg) -> tuple[int, int]:
+    return node.lineno, node.col_offset
 
 
 def _name_for_compare_side(node: ast.AST) -> str | None:

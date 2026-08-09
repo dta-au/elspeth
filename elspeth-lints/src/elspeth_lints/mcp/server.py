@@ -31,7 +31,7 @@ from datetime import UTC
 from pathlib import Path
 from typing import Any
 
-from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR
+from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR, JudgeVerdict
 
 __all__ = [
     "HmacKeyPresentError",
@@ -532,9 +532,8 @@ def _surrounding_code_for(ctx: _ServerContext, action: Any) -> str:
     return excerpt.text
 
 
-def _verdict_str(verdict: Any) -> str:
-    value = getattr(verdict, "value", None)
-    return value if isinstance(value, str) else str(verdict)
+def _verdict_str(verdict: JudgeVerdict) -> str:
+    return verdict.value
 
 
 def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:

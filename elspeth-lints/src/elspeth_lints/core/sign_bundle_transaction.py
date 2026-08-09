@@ -659,7 +659,6 @@ def run_sign_bundle_transaction(
     candidate_args = argparse.Namespace(**vars(args))
     candidate_args.allowlist_dir = args.allowlist_dir if disposition.startswith("published") else Path(manifest["candidate_dir"])
     candidate_args.rotation_log = tx_path / "rotation-staged.log"
-    candidate_args._defer_override_rate_counter_snapshot = True
     completed = {int(index) for index in manifest["completed_actions"]}
     running = manifest.get("running_action")
     recorded_rotation_hash = cast("str", manifest["rotation_staged_sha256"])

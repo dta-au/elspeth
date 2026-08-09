@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
+from elspeth.contracts.enums import Determinism
+from elspeth.plugins.infrastructure.base import BaseSource
+from elspeth.plugins.infrastructure.config_base import PluginConfig
 from elspeth_lints.rules.plugin_contract.options_metadata.rule import OptionsMetadataRule
 
 
-class _Options(BaseModel):
+class _Options(PluginConfig):
     complete: str = Field(title="Complete", description="Complete metadata")
 
 
-class _Source:
+class _Source(BaseSource):
     name = "metadata_ok"
+    determinism = Determinism.IO_READ
     config_model = _Options
 
 
