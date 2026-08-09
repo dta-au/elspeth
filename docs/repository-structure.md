@@ -78,17 +78,21 @@ either has a stated boundary (✓) or a flagged problem (⚠, see
 [Findings](#findings--recommended-actions)).
 
 ### CI: the three-way split
+
 ✓ Distinct by *axis*:
+
 - `.github/workflows/` — **when** CI runs (triggers, job orchestration).
 - `config/cicd/` — **what** is enforced (declarative policy cells, allowlists, defaults).
 - `scripts/cicd/` — **how** a check executes (the runnable analysis logic).
 
 ### scripts/ vs tools/
+
 ✓ `scripts/` = automation run *during development/CI*; `tools/` = build pipelines
 that produce *distributable artifacts*. A helper that emits a deliverable PDF is a
 tool; a helper that lints, tests, deploys, or generates fixtures is a script.
 
 ### PDF pipelines: tools/pdf/ vs docs/release/pdf/
+
 ✓ Distinct by *output*: `docs/release/pdf/` builds the **release assurance set**
 (executive-summary, architecture, composer, guarantees, data-trust); `tools/pdf/`
 builds the **architecture presentation pack** (`build-arch-pack.sh`). The stale
@@ -96,6 +100,7 @@ builds the **architecture presentation pack** (`build-arch-pack.sh`). The stale
 two pipelines no longer overlap.
 
 ### Deployment spread
+
 ✓ Distinct by *target*: `deploy/compose/` = maintained database/web overlays;
 `deploy/aws-ecs/terraform/` = maintained disposable AWS ECS infrastructure;
 `deploy/linux-systemd/` = portable host service and environment example; root
@@ -104,6 +109,7 @@ two pipelines no longer overlap.
 deploy.
 
 ### Working-state: where runtime data lives
+
 ✓ Distinct by *role*: `data/` = app/session working data (sessions DB, skill
 examples); `state/` = the `audit.db` landscape database (its path is hardcoded in
 `core/config.py`). Scratch is settled by `.gitignore`: `.scratch/` is the canonical
@@ -112,6 +118,7 @@ duplicate. `.elspeth/rotations.log` is deliberately force-tracked as a tier-mode
 rotation audit trail.
 
 ### prompts overlap
+
 ✓ Resolved — the root `prompts/` one-off was archived 2026-06-28; agent prompts
 that must live in-tree belong under a single, named home, not a second top-level
 `prompts/`.

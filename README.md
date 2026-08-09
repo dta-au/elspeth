@@ -101,25 +101,22 @@ surface over the same substrate.
 
 ## Architecture At A Glance
 
-```text
-YAML authoring                         Web Composer authoring
-operator-reviewed settings             LLM tool loop + session state
-        │                                      │
-        └──────────────┬───────────────────────┘
-                       ▼
-       source/transform/sink plugins + pure-config gates
-                       │
-                       ▼
-       plugin schema contracts + route/semantic contracts
-                       │
-                       ▼
-   runtime assembly + graph validation + preflight
-                       │
-                       ▼
-        executor + orchestrator + payload store
-                       │
-                       ▼
-  Landscape audit trail + run accounting + artifacts
+```mermaid
+graph TD
+    A["YAML authoring<br/>operator-reviewed settings"]
+    B["Web Composer authoring<br/>LLM tool loop + session state"]
+    C["source/transform/sink plugins<br/>+ pure-config gates"]
+    D["plugin schema contracts<br/>+ route/semantic contracts"]
+    E["runtime assembly<br/>+ graph validation + preflight"]
+    F["executor + orchestrator<br/>+ payload store"]
+    G["Landscape audit trail<br/>+ run accounting + artifacts"]
+
+    A --> C
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
 ```
 
 The current implementation provides these precise guarantees:
@@ -842,8 +839,7 @@ export ELSPETH_AUDIT_PASSPHRASE="$(openssl rand -base64 32)"
 
 Elspeth automatically loads `.env` files. Use `--no-dotenv` to skip in CI/CD.
 
-<details>
-<summary><strong>Advanced Configuration</strong></summary>
+## Advanced Configuration
 
 ### Hierarchical Settings
 
@@ -988,26 +984,26 @@ See [Docker Guide](docs/guides/docker.md) for complete deployment documentation.
 
 ```text
 elspeth/
-	├── src/elspeth/
-	│   ├── core/               # Config, canonical JSON, rate limiting, retention
-	│   │   ├── dag/            # DAG construction, validation, graph models (NetworkX)
-	│   │   └── landscape/      # Audit repositories, effect ledgers, export, schema
+ ├── src/elspeth/
+ │   ├── core/               # Config, canonical JSON, rate limiting, retention
+ │   │   ├── dag/            # DAG construction, validation, graph models (NetworkX)
+ │   │   └── landscape/      # Audit repositories, effect ledgers, export, schema
 │   ├── contracts/          # Type contracts, schemas, protocol definitions
 │   ├── engine/             # Orchestrator, durable scheduler, DAG and effect coordination
 │   │   └── executors/      # Transform, gate, sink, aggregation executors
 │   ├── plugins/            # Sources, transforms, sinks, LLM integrations
 │   ├── mcp/                # Landscape MCP analysis server
-	│   ├── testing/            # ChaosLLM, ChaosWeb, ChaosEngine test servers
-	│   ├── web/                # FastAPI app, Composer routes, auth/session storage, frontend
-	│   ├── tui/                # Terminal UI (Textual)
-	│   └── cli.py              # Typer CLI
-	├── gateway/                # Standalone LLM compatibility gateway service
-	├── deploy/                 # Compose, AWS ECS Terraform, and Linux systemd bundles
-	├── elspeth-lints/          # Project-specific static analysis (ADR-023)
-	├── examples/               # Runnable example pipelines
-	├── docs/                   # Active public documentation
-	├── website/                # Standalone static marketing site
-	└── tests/
+ │   ├── testing/            # ChaosLLM, ChaosWeb, ChaosEngine test servers
+ │   ├── web/                # FastAPI app, Composer routes, auth/session storage, frontend
+ │   ├── tui/                # Terminal UI (Textual)
+ │   └── cli.py              # Typer CLI
+ ├── gateway/                # Standalone LLM compatibility gateway service
+ ├── deploy/                 # Compose, AWS ECS Terraform, and Linux systemd bundles
+ ├── elspeth-lints/          # Project-specific static analysis (ADR-023)
+ ├── examples/               # Runnable example pipelines
+ ├── docs/                   # Active public documentation
+ ├── website/                # Standalone static marketing site
+ └── tests/
     ├── unit/               # Unit tests
     ├── integration/        # Integration tests
     ├── property/           # Hypothesis property-based tests

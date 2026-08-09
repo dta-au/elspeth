@@ -10,9 +10,9 @@ C4 model documentation for the ELSPETH auditable pipeline framework.
 
 ## At a Glance
 
-| Question | Answer |
-|----------|--------|
-| **What is ELSPETH?** | Auditable Sense/Decide/Act pipeline framework with YAML, CLI/TUI, and Web Composer authoring surfaces |
+ | Question | Answer |
+ | ---------- | -------- |
+ | **What is ELSPETH?** | Auditable Sense/Decide/Act pipeline framework with YAML, CLI/TUI, and Web Composer authoring surfaces |
 | **Core subsystems?** | 11 major subsystems (20+ including sub-components) across 5 architectural tiers |
 | **Data flow?** | Source → Transforms/Gates → Sinks (all recorded) |
 | **Audit storage?** | SQLite/SQLCipher (dev) / PostgreSQL (prod) |
@@ -24,9 +24,9 @@ C4 model documentation for the ELSPETH auditable pipeline framework.
 
 ## How to Read This Document
 
-| Audience | Start Here |
-|----------|------------|
-| **New developers** | [System Context](#level-1-system-context-diagram) → [Container Diagram](#level-2-container-diagram) → [Quality Assessment](#quality-assessment) |
+ | Audience | Start Here |
+ | ---------- | ------------ |
+ | **New developers** | [System Context](#level-1-system-context-diagram) → [Container Diagram](#level-2-container-diagram) → [Quality Assessment](#quality-assessment) |
 | **Plugin authors** | [Plugins Components](#33-plugins-components) → [Schema Contract Validation](#schema-contract-validation-flow) |
 | **Engine contributors** | [Engine Components](#31-engine-components) → [Pipeline Execution Flow](#pipeline-execution-flow) → [Fork/Join Processing](#forkjoin-processing-flow) |
 | **Operators** | [Deployment View](#deployment-view) → [Telemetry Flow](#telemetry-flow-diagram) |
@@ -95,7 +95,7 @@ than inside the container boundary below.
 **Key relationships:**
 
 | Actor/System | Interaction |
-|--------------|-------------|
+| -------------- | ------------- |
 | Pipeline Operator | Authors YAML or uses Web Composer, executes pipelines, and monitors runs |
 | Auditor | Queries lineage through CLI, TUI, or MCP and verifies decisions |
 | Data Sources | CSV, JSON, APIs - read by Source plugins |
@@ -166,7 +166,7 @@ C4Container
 ### Container Responsibilities
 
 | Container | Technology | LOC | Purpose |
-|-----------|------------|-----|---------|
+| ----------- | ------------ | ----- | --------- |
 | **CLI** | Typer | ~2,200 | User commands: `run`, `explain`, `validate`, `resume` |
 | **Web app + Composer** | FastAPI + React | ~133,700 Python | Authenticated sessions, guided/freeform authoring, validation, execution, and review |
 | **TUI** | Textual | ~800 | Interactive lineage exploration |
@@ -227,7 +227,7 @@ C4Component
 ```
 
 | Component | File | LOC | Responsibility |
-|-----------|------|-----|----------------|
+| ----------- | ------ | ----- | ---------------- |
 | **Orchestrator** | `orchestrator/` | ~3,500 | Begin run → register nodes/edges → process rows → complete run |
 | **RowProcessor** | `processor.py` | ~1,860 | Work queue-based DAG traversal, fork/join handling |
 | **DAGNavigator** | `dag_navigator.py` | ~250 | DAG edge traversal and next-node resolution |
@@ -283,10 +283,10 @@ C4Component
     Rel(database, db, "Connects to")
     Rel(exporter, query_repo, "Reads through")
     Rel(journal, database, "Commits outbox rows with audit writes")
-```
+```mermaid
 
 | Component | File | Responsibility |
-|-----------|------|----------------|
+| ----------- | ------ | ---------------- |
 | **RecorderFactory** | `factory.py` | Composition root for repositories and plugin audit adapters. |
 | **RunLifecycleRepository** | `run_lifecycle_repository.py` | Run lifecycle, graph registration, per-source state, attribution, and web plugin-policy evidence. |
 | **DataFlowRepository** | `data_flow_repository.py` | Rows, tokens, ancestry, outcomes, validation errors, and durable coalesce effects. |
@@ -432,7 +432,7 @@ C4Component
 ```
 
 | Component | Count/Purpose |
-|-----------|---------------|
+| --- | --- |
 | **Protocols** | 4 runtime-checkable interfaces (Source, Transform, BatchTransform, Sink) |
 | **Base Classes** | Abstract implementations with common functionality |
 | **Results** | Typed results (`TransformResult`, `SourceRow`) |
@@ -455,7 +455,7 @@ narrative, as the exact-count authority. Sub-package layout: `infrastructure/`,
 Plugin methods accept narrowed protocol types instead of the full `PluginContext`:
 
 | Protocol | Used By | Key Fields |
-|----------|---------|------------|
+| ---------- | --------- | ------------ |
 | `SourceContext` | `load()` | `run_id`, `node_id`, `record_validation_error()`, `record_call()` |
 | `TransformContext` | `process()` / `accept()` | `state_id`, `token`, `record_call()`, checkpoint API |
 | `SinkContext` | `write()` | `contract`, `landscape`, `run_id`, `record_call()` |
@@ -585,7 +585,7 @@ stateDiagram-v2
 **Terminal states:**
 
 | State | Meaning |
-|-------|---------|
+| ------- | --------- |
 | `COMPLETED` | Reached output sink |
 | `ROUTED` | Gate sent to named sink |
 | `FORKED` | Split to multiple paths (parent token) |
@@ -769,7 +769,7 @@ graph LR
 **Telemetry Granularity Levels:**
 
 | Level | Events | Use Case |
-|-------|--------|----------|
+| ------- | -------- | ---------- |
 | `lifecycle` | Run start/complete, phase transitions (~10-20 events/run) | High-level monitoring |
 | `rows` | Above + row creation, transform completion, gate routing (N×M events) | Detailed tracking |
 | `full` | Above + external call details (LLM, HTTP, SQL) | Deep debugging |
@@ -976,7 +976,7 @@ flowchart TB
 ### Trust Tier Summary
 
 | Tier | Trust Level | Coercion | On Error |
-|------|-------------|----------|----------|
+| ------ | ------------- | ---------- | ---------- |
 | **Tier 1** (Audit DB) | Full trust | Never | Crash immediately |
 | **Tier 2** (Pipeline) | Elevated ("probably OK") | Never | Return error result |
 | **Tier 3** (External) | Zero trust | At boundary | Quarantine row |
@@ -990,7 +990,7 @@ ELSPETH uses ADRs to document significant architectural choices.
 ### Documented ADRs
 
 | ADR | Title | Decision | Rationale |
-|-----|-------|----------|-----------|
+| ----- | ------- | ---------- | ----------- |
 | **ADR-001** | Plugin-level concurrency | Pool-based with FIFO ordering | Maintains auditability while enabling parallelism |
 | **ADR-002** | Routing copy mode limitation | Move-only (no copy) | Prevents ambiguous audit trail for routed tokens |
 | **ADR-003** | Schema validation lifecycle | Two-phase (contract → type) at DAG construction | Catches mismatches before processing |
@@ -1036,7 +1036,7 @@ filenames; the record is now contiguously numbered 000–038.
 ### Implicit Architectural Decisions
 
 | Technology | Choice | Rationale |
-|------------|--------|-----------|
+| ------------ | -------- | ----------- |
 | **Database ORM** | SQLAlchemy Core (not ORM) | Audit trail needs precise SQL control, multi-DB support |
 | **Plugin System** | pluggy | Battle-tested (pytest uses it), clean hook specifications |
 | **Graph Library** | NetworkX | Industry-standard, topological sort, cycle detection |
@@ -1056,7 +1056,7 @@ ongoing CI enforcement.
 ### Design Characteristics
 
 | Dimension | Evidence |
-|-----------|----------|
+| ----------- | ---------- |
 | **Maintainability** | Clean module boundaries, consistent patterns across subsystems |
 | **Testability** | 2.4:1 test-to-production LOC ratio, mutation testing, property tests |
 | **Type Safety** | mypy strict mode, runtime-checkable protocols, NewType aliases |
@@ -1077,7 +1077,7 @@ ongoing CI enforcement.
 ### Areas for Future Improvement
 
 | Area | Concern | Priority |
-|------|---------|----------|
+| ------ | --------- | ---------- |
 | **Large Files** | orchestrator/core.py (~2,070 LOC), processor.py (~1,860 LOC) | Medium |
 | **Aggregation Complexity** | Multiple state machines (buffer/trigger/flush) | Medium |
 | **Composite PK Queries** | `nodes` table joins require care | Low |
@@ -1086,7 +1086,7 @@ ongoing CI enforcement.
 ### Risk Assessment
 
 | Category | Status | Evidence |
-|----------|--------|----------|
+| ---------- | -------- | ---------- |
 | **Audit Integrity** | ✅ Low Risk | Tier 1 crash policy, NaN/Infinity rejected |
 | **Type Safety** | ✅ Low Risk | mypy strict, runtime protocol verification |
 | **Test Coverage** | ✅ Low Risk | 2.4:1 ratio, mutation testing, property tests |
@@ -1099,7 +1099,7 @@ ongoing CI enforcement.
 ### Key Architectural Decisions
 
 | Decision | Rationale |
-|----------|-----------|
+| ---------- | ----------- |
 | **SQLAlchemy Core** (not ORM) | Audit trail needs precise SQL, not object mapping |
 | **pluggy** | Battle-tested (pytest), clean hook system |
 | **Canonical JSON** (RFC 8785) | Deterministic hashing for audit integrity |

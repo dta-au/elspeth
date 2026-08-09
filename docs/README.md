@@ -15,7 +15,7 @@ history.
 ## Start Here
 
 | You are... | Read this first |
-|------------|----------------|
+| ---------- | --------------- |
 | New to ELSPETH | [Your First Pipeline](guides/your-first-pipeline.md) then [User Manual](guides/user-manual.md) |
 | Deploying a new AWS stack | [AWS ECS Cold Install](runbooks/aws-ecs-cold-install.md), then the [Terraform package reference](../deploy/aws-ecs/terraform/README.md) |
 | Building or operating pipelines | [Configuration Reference](reference/configuration.md), [Runbooks](runbooks/index.md), and [Troubleshooting](guides/troubleshooting.md) |
