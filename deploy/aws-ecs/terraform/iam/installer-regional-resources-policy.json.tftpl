@@ -187,7 +187,9 @@
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_a_namespace}-cluster/performance",
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_a_namespace}-cluster/performance:*",
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance",
-        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance:*"
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance:*",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_c_namespace}-cluster/performance",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_c_namespace}-cluster/performance:*"
       ]
     },
     {
@@ -201,32 +203,6 @@
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
-        }
-      }
-    },
-    {
-      "Sid": "MutateRunTaggedXrayResources",
-      "Effect": "Allow",
-      "Action": [
-        "xray:DeleteGroup",
-        "xray:DeleteSamplingRule",
-        "xray:GetGroup",
-        "xray:ListTagsForResource",
-        "xray:TagResource",
-        "xray:UntagResource",
-        "xray:UpdateGroup",
-        "xray:UpdateSamplingRule"
-      ],
-      "Resource": [
-        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_a_namespace}-*/*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_b_namespace}-*/*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_a_namespace}-*",
-        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_b_namespace}-*"
-      ],
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
           "aws:RequestedRegion": "${aws_region}"
         }
       }

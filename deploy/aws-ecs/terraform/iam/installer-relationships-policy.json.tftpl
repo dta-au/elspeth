@@ -24,7 +24,8 @@
       "Resource": [
         "arn:aws:s3:::${backend_state_bucket}",
         "arn:aws:s3:::${scenario_a_bucket}",
-        "arn:aws:s3:::${scenario_b_bucket}"
+        "arn:aws:s3:::${scenario_b_bucket}",
+        "arn:aws:s3:::${scenario_c_bucket}"
       ]
     },
     {
@@ -39,7 +40,8 @@
       "Resource": [
         "arn:aws:s3:::${backend_state_bucket}/*",
         "arn:aws:s3:::${scenario_a_bucket}/*",
-        "arn:aws:s3:::${scenario_b_bucket}/*"
+        "arn:aws:s3:::${scenario_b_bucket}/*",
+        "arn:aws:s3:::${scenario_c_bucket}/*"
       ]
     },
     {
@@ -57,7 +59,8 @@
       ],
       "Resource": [
         "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
-        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}",
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${gateway_ecr_repository}"
       ]
     },
     {
@@ -68,7 +71,8 @@
       ],
       "Resource": [
         "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${ecr_repository}",
-        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}"
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${cloudwatch_agent_ecr_repository}",
+        "arn:aws:ecr:${aws_region}:${aws_account_id}:repository/${gateway_ecr_repository}"
       ],
       "Condition": {
         "StringEquals": {
@@ -171,39 +175,6 @@
         "cognito-idp:DeleteUserPoolDomain"
       ],
       "Resource": "arn:aws:cognito-idp:${aws_region}:${aws_account_id}:userpool/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
-        }
-      }
-    },
-    {
-      "Sid": "ManageRunEfsMountTargets",
-      "Effect": "Allow",
-      "Action": [
-        "elasticfilesystem:CreateMountTarget",
-        "elasticfilesystem:DeleteMountTarget"
-      ],
-      "Resource": "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
-      "Condition": {
-        "StringEquals": {
-          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
-        }
-      }
-    },
-    {
-      "Sid": "ManageRunEventTargets",
-      "Effect": "Allow",
-      "Action": [
-        "events:PutTargets",
-        "events:RemoveTargets"
-      ],
-      "Resource": [
-        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_a_namespace}-*",
-        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_b_namespace}-*"
-      ],
       "Condition": {
         "StringEquals": {
           "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",

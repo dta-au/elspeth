@@ -164,14 +164,14 @@ locals {
 
 output "resolved_inventory" {
   value = {
-    schema            = "elspeth.aws-ecs-scenario-inventory.v7"
+    schema            = "elspeth.aws-ecs-scenario-inventory.v8"
     acceptance_run_id = var.run_id
     candidate_sha     = var.candidate_sha
-    # Gateway sidecar identity (empty strings under the bedrock backend).
+    # Gateway sidecar identity (explicit nulls under the bedrock backend).
     # Digest and revision only — secret names and values never appear here.
-    gateway_image   = var.gateway_image
-    gateway_sha     = var.gateway_sha
-    gateway_adapter = var.gateway_adapter
+    gateway_image   = var.llm_backend == "custom_gateway" ? var.gateway_image : null
+    gateway_sha     = var.llm_backend == "custom_gateway" ? var.gateway_sha : null
+    gateway_adapter = var.llm_backend == "custom_gateway" ? var.gateway_adapter : null
     aws_account_id  = var.aws_account_id
     aws_region      = var.aws_region
     scenario_id     = var.scenario_id

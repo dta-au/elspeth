@@ -146,7 +146,7 @@ def _scenario_inventory(
     ]
     values.update(
         {
-            "DEPLOYMENT_MODE": "first" if scenario_id == "A" else "upgrade",
+            "DEPLOYMENT_MODE": "upgrade" if scenario_id == "B" else "first",
             "TARGET_PLATFORM": "linux/amd64",
             "AWS_REGION": region,
             "ECS_CLUSTER": f"acceptance-{namespace}-cluster",
@@ -154,9 +154,9 @@ def _scenario_inventory(
             "WEB_CONTAINER_NAME": "elspeth-web",
             "ELSPETH_WEB__DATA_DIR": "/var/lib/elspeth",
             "ELSPETH_WEB__PAYLOAD_STORE_PATH": "/var/lib/elspeth/payloads",
-            "ELSPETH_WEB__COMPOSER_MODEL": "openrouter/openai/gpt-5.4",
-            "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL": "openrouter/anthropic/claude-opus-4.6",
-            "ELSPETH_BEDROCK_LIVE_TEST_MODEL": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "ELSPETH_WEB__COMPOSER_MODEL": "agency-primary" if scenario_id == "C" else "openrouter/openai/gpt-5.4",
+            "ELSPETH_WEB__COMPOSER_ADVISOR_MODEL": ("agency-advisor" if scenario_id == "C" else "openrouter/anthropic/claude-opus-4.6"),
+            "ELSPETH_BEDROCK_LIVE_TEST_MODEL": ("" if scenario_id == "C" else "bedrock/anthropic.claude-3-haiku-20240307-v1:0"),
             "CLOUDWATCH_AGENT_IMAGE": CLOUDWATCH_AGENT_IMAGE,
             "CLOUDWATCH_AGENT_CONFIG_JSON_SHA256": hashlib.sha256(CLOUDWATCH_AGENT_CONFIG_JSON).hexdigest(),
             "CLOUDWATCH_AGENT_OTEL_YAML_SHA256": hashlib.sha256(CLOUDWATCH_AGENT_OTEL_YAML).hexdigest(),
@@ -195,7 +195,44 @@ def _scenario_inventory(
             "OIDC_EXPECTED_AUDIENCE_CLAIM": "client_id",
         }
     )
-    policy_env = _guardrail_env()
+    policy_env = (
+        {
+            "ELSPETH_WEB__PLUGIN_ALLOWLIST": json.dumps(["source:llm", "transform:llm", "sink:json"]),
+            "ELSPETH_WEB__PLUGIN_PREFERENCES": "{}",
+            "ELSPETH_WEB__PLUGIN_CONTROL_MODES": json.dumps(
+                {"prompt_shield": "recommend", "content_safety": "recommend"},
+                separators=(",", ":"),
+            ),
+            "ELSPETH_WEB__LLM_PROFILES": json.dumps(
+                {
+                    "standard": {
+                        "provider": "gateway",
+                        "model": "agency-primary",
+                        "endpoint": "http://127.0.0.1:8787/v1",
+                        "credential_scope": "server",
+                        "credential_ref": "GATEWAY_BEARER",
+                        "contract_major": 1,
+                        "required_capabilities": ["text", "tools", "json_schema", "usage"],
+                    },
+                    "fast": {
+                        "provider": "gateway",
+                        "model": "agency-advisor",
+                        "endpoint": "http://127.0.0.1:8787/v1",
+                        "credential_scope": "server",
+                        "credential_ref": "GATEWAY_BEARER",
+                        "contract_major": 1,
+                        "required_capabilities": ["text", "tools", "json_schema", "usage"],
+                    },
+                },
+                separators=(",", ":"),
+            ),
+            "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "standard",
+            "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES": "[]",
+            "ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES": "{}",
+        }
+        if scenario_id == "C"
+        else _guardrail_env()
+    )
     scenario_profiles = json.loads(policy_env["ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES"])
     compact_namespace = namespace.replace("-", "")
     for profile in scenario_profiles:
@@ -258,9 +295,14 @@ def _scenario_inventory(
         for profile in guardrail_profiles
     ]
     return {
-        "schema": "elspeth.aws-ecs-scenario-inventory.v7",
+        "schema": "elspeth.aws-ecs-scenario-inventory.v8",
         "acceptance_run_id": run_id,
         "candidate_sha": "c" * 40,
+        "gateway_image": (
+            f"{account}.dkr.ecr.{region}.amazonaws.com/elspeth-llm-gateway@sha256:{'d' * 64}" if scenario_id == "C" else None
+        ),
+        "gateway_sha": "d" * 40 if scenario_id == "C" else None,
+        "gateway_adapter": "reference_v1" if scenario_id == "C" else None,
         "aws_account_id": account,
         "aws_region": region,
         "scenario_id": scenario_id,
@@ -315,6 +357,193 @@ def _scenario_inventory(
             "expected_retained_trace_ids": 0,
         },
     }
+
+
+def _inventory_fixture(tmp_path: Path, scenario_id: str) -> tuple[dict[str, object], str]:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    account = "123456789012"
+    region = "ap-southeast-2"
+    binding_path = tmp_path / f"tf-binding-{scenario_id.lower()}.json"
+    receipt = {
+        "schema": "elspeth.aws-ecs-tf-binding.v1",
+        "acceptance_run_id": run_id,
+        "scenario_id": scenario_id,
+        "repository_commit": "a" * 40,
+        "terraform_lock_sha256": "b" * 64,
+        "terraform_version": "1.9.0",
+        "backend_type": "s3",
+        "backend_encrypted": True,
+        "backend_locked": True,
+        "backend_state_key_sha256": "c" * 64,
+        "workspace": f"acceptance-{scenario_id.lower()}",
+        "aws_account_id": account,
+        "aws_region": region,
+        "vars_sha256": "d" * 64,
+    }
+    binding_path.write_text(json.dumps(receipt))
+    os.chmod(binding_path, 0o600)
+    binding = hashlib.sha256(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return _scenario_inventory(run_id, scenario_id, binding, str(binding_path)), binding
+
+
+def _validate_inventory_fixture(tmp_path: Path, scenario_id: str) -> dict[str, object]:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    account = "123456789012"
+    region = "ap-southeast-2"
+    inventory, binding = _inventory_fixture(tmp_path, scenario_id)
+    return acceptance._validate_scenario_inventory(
+        inventory,
+        scenario_id=scenario_id,
+        acceptance_run_id=run_id,
+        candidate_sha="c" * 40,
+        aws_account_id=account,
+        aws_region=region,
+        tf_binding_sha256=binding,
+        expected_phase="resolved",
+    )
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "deployment_mode", "gateway_present"),
+    [
+        pytest.param("A", "first", False, id="first-bedrock"),
+        pytest.param("B", "upgrade", False, id="upgrade-bedrock"),
+        pytest.param("C", "first", True, id="first-custom-gateway"),
+    ],
+)
+def test_scenario_inventory_v8_admits_only_the_maintained_scenario_shapes(
+    tmp_path: Path,
+    scenario_id: str,
+    deployment_mode: str,
+    gateway_present: bool,
+) -> None:
+    inventory = _validate_inventory_fixture(tmp_path, scenario_id)
+
+    assert inventory["schema"] == "elspeth.aws-ecs-scenario-inventory.v8"
+    values = inventory["values"]
+    assert isinstance(values, dict)
+    assert values["DEPLOYMENT_MODE"] == deployment_mode
+    if gateway_present:
+        assert isinstance(inventory["gateway_image"], str)
+        assert isinstance(inventory["gateway_sha"], str)
+        assert isinstance(inventory["gateway_adapter"], str)
+    else:
+        assert inventory["gateway_image"] is None
+        assert inventory["gateway_sha"] is None
+        assert inventory["gateway_adapter"] is None
+
+
+def test_scenario_c_namespace_matches_the_public_exact_derivation() -> None:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    expected = f"c-{hashlib.sha256(f'{run_id}\0C'.encode()).hexdigest()[:20]}"
+
+    assert acceptance.scenario_resource_namespace(run_id, "C") == expected
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_binding"):
+        acceptance.scenario_resource_namespace(run_id, "D")
+
+
+@pytest.mark.parametrize(
+    ("scenario_id", "field", "value"),
+    [
+        pytest.param("A", "gateway_image", "", id="bedrock-empty-string-is-not-null"),
+        pytest.param("B", "gateway_sha", "d" * 40, id="bedrock-cannot-claim-gateway-revision"),
+        pytest.param("C", "gateway_image", None, id="gateway-image-required"),
+        pytest.param("C", "gateway_image", "repo:latest", id="gateway-image-must-be-pinned"),
+        pytest.param("C", "gateway_sha", "D" * 40, id="gateway-revision-is-lowercase-sha"),
+        pytest.param("C", "gateway_adapter", "", id="gateway-adapter-required"),
+        pytest.param("C", "gateway_adapter", " ", id="gateway-adapter-not-blank"),
+        pytest.param("C", "gateway_adapter", "x" * 257, id="gateway-adapter-bounded"),
+        pytest.param("C", "gateway_adapter", "unsafe\nname", id="gateway-adapter-no-controls"),
+        pytest.param("C", "orphan_sweep", None, id="malformed-custom-gateway-orphan-shape"),
+    ],
+)
+def test_scenario_inventory_v8_rejects_invalid_gateway_identity_shape(
+    tmp_path: Path,
+    scenario_id: str,
+    field: str,
+    value: object,
+) -> None:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    inventory, binding = _inventory_fixture(tmp_path, scenario_id)
+    inventory[field] = value
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        acceptance._validate_scenario_inventory(
+            inventory,
+            scenario_id=scenario_id,
+            acceptance_run_id=run_id,
+            candidate_sha="c" * 40,
+            aws_account_id="123456789012",
+            aws_region="ap-southeast-2",
+            tf_binding_sha256=binding,
+            expected_phase="resolved",
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile_override", "default_profile"),
+    [
+        pytest.param(
+            {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                "region_name": "ap-southeast-2",
+            },
+            "standard",
+            id="bedrock-provider",
+        ),
+        pytest.param(
+            {
+                "provider": "gateway",
+                "model": "agency-primary",
+                "endpoint": "https://attacker.invalid/v1",
+                "credential_scope": "server",
+                "credential_ref": "GATEWAY_BEARER",
+                "contract_major": 1,
+                "required_capabilities": ["text"],
+            },
+            "standard",
+            id="non-loopback-endpoint",
+        ),
+        pytest.param(
+            {
+                "provider": "gateway",
+                "model": "agency-primary",
+                "endpoint": "http://127.0.0.1:8787/v1",
+                "credential_scope": "server",
+                "credential_ref": "GATEWAY_BEARER",
+                "contract_major": 1,
+                "required_capabilities": ["text"],
+            },
+            "missing",
+            id="unbound-default-profile",
+        ),
+    ],
+)
+def test_scenario_c_inventory_rejects_invalid_gateway_profiles(
+    tmp_path: Path,
+    profile_override: dict[str, object],
+    default_profile: str,
+) -> None:
+    run_id = "4adf8a87-7fe2-44cc-9c9f-e39f9f51ac48"
+    inventory, binding = _inventory_fixture(tmp_path, "C")
+    values = inventory["values"]
+    assert isinstance(values, dict)
+    values["ELSPETH_WEB__LLM_PROFILES"] = json.dumps({"standard": profile_override}, separators=(",", ":"))
+    values["ELSPETH_WEB__DEFAULT_LLM_PROFILE"] = default_profile
+    values["ELSPETH_ACCEPTANCE_PLUGIN_POLICY_BINDING_SHA256"] = acceptance.plugin_policy_binding_sha256(values)
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="scenario_inventory_schema"):
+        acceptance._validate_scenario_inventory(
+            inventory,
+            scenario_id="C",
+            acceptance_run_id=run_id,
+            candidate_sha="c" * 40,
+            aws_account_id="123456789012",
+            aws_region="ap-southeast-2",
+            tf_binding_sha256=binding,
+            expected_phase="resolved",
+        )
 
 
 def _init_control_manifest(

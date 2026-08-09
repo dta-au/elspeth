@@ -162,7 +162,7 @@ The package deliberately splits IAM authority across two principals:
   `ecs-tasks.amazonaws.com`. They cannot create or delete the generated roles,
   change their trust or boundary, or manage the boundary policy.
 - `iam/lifecycle-policy.json.tftpl` is for a separate IAM lifecycle principal.
-  It can create, tag, and delete only the four bounded scenario-role patterns
+  It can create, tag, and delete only the six bounded scenario-role patterns
   and can create, version, and delete only the exact run boundary. Explicit
   denies prevent it from adding role permissions, passing or assuming a role,
   or starting an ECS task.
@@ -177,23 +177,26 @@ export run_id=REPLACE_WITH_LOWERCASE_UUID
 export backend_state_bucket=REPLACE_WITH_EXACT_BOOTSTRAP_STATE_BUCKET
 export ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_APP_REPOSITORY
 export cloudwatch_agent_ecr_repository=REPLACE_WITH_EXACT_BOOTSTRAP_AGENT_REPOSITORY
+export gateway_ecr_repository=REPLACE_WITH_EXACT_SCENARIO_C_GATEWAY_REPOSITORY
 export iam_permissions_boundary_arn="arn:aws:iam::${aws_account_id}:policy/elspeth-${run_id}-ecs-boundary"
 export scenario_a_namespace="a-$(printf '%s\0A' "$run_id" | sha256sum | cut -c1-20)"
 export scenario_b_namespace="b-$(printf '%s\0B' "$run_id" | sha256sum | cut -c1-20)"
+export scenario_c_namespace="c-$(printf '%s\0C' "$run_id" | sha256sum | cut -c1-20)"
 compact_run_id="$(printf '%s' "$run_id" | tr -d '-')"
 export scenario_a_bucket="elspeth-${scenario_a_namespace}-$(printf '%.12s' "$compact_run_id")"
 export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$compact_run_id")"
+export scenario_c_bucket="elspeth-${scenario_c_namespace}-$(printf '%.12s' "$compact_run_id")"
 mkdir -p bootstrap/.terraform
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
   < iam/installer-control-plane-policy.json.tftpl \
   > bootstrap/.terraform/installer-control-plane-policy.json
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
   < iam/installer-regional-resources-policy.json.tftpl \
   > bootstrap/.terraform/installer-regional-resources-policy.json
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
   < iam/installer-relationships-policy.json.tftpl \
   > bootstrap/.terraform/installer-relationships-policy.json
-envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}' \
+envsubst '${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}' \
   < iam/installer-runtime-observation-policy.json.tftpl \
   > bootstrap/.terraform/installer-runtime-observation-policy.json
 envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
@@ -219,8 +222,11 @@ wildcard policy.
 The bucket derivation above is the same deterministic formula used by the
 scenario module. The rendered policy consequently limits S3 bucket/object
 mutations and ECR image push or force-delete operations to the exact bootstrap,
-Scenario A, and Scenario B names for this run. The three bootstrap names must
-match `examples/bootstrap.tfvars` exactly.
+Scenario A, Scenario B, and Scenario C names for this run. The state bucket and
+three ECR repository names must match the corresponding scenario/bootstrap
+inputs exactly. A repository need not exist merely to appear in this policy,
+so an A/B-only install can reserve its future Scenario C repository name
+without pre-creating it.
 
 Bootstrap creates the custom run-scoped boundary named by
 `iam_permissions_boundary_arn`; copy the `iam_permissions_boundary_arn`
@@ -232,7 +238,18 @@ permissions or activate them. Effective task permissions remain the
 intersection of the lifecycle-principal-controlled boundary and the normal
 installer's task/execution policies. The boundary permits only the package
 runtime surfaces, including destination foundation models needed by the exact
-cross-region Bedrock inference-profile inputs.
+cross-region Bedrock inference-profile inputs. Its four Scenario C bootstrap
+inputs are optional as a group: leave all four empty for an A/B-only install.
+Before a Scenario C bootstrap, set all four to the repository and exact
+commercial-partition, Region, and account secret ARNs used by `scenario-c`
+(partial input is rejected):
+
+```sh
+export gateway_ecr_repository=REPLACE_WITH_EXACT_SCENARIO_C_GATEWAY_REPOSITORY
+export gateway_bearer_secret_arn=REPLACE_WITH_EXACT_GATEWAY_BEARER_SECRET_ARN
+export gateway_oauth_client_id_secret_arn=REPLACE_WITH_EXACT_GATEWAY_OAUTH_CLIENT_ID_SECRET_ARN
+export gateway_oauth_client_secret_secret_arn=REPLACE_WITH_EXACT_GATEWAY_OAUTH_CLIENT_SECRET_ARN
+```
 
 Networking relationships, EFS mount targets, Cognito children, EventBridge
 targets, and X-Ray resources use supported ARN and run-tag conditions. The

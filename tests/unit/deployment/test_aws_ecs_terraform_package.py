@@ -51,6 +51,8 @@ EXPECTED_FILES = {
     "examples/scenario-a.tfvars.example",
     "examples/scenario-b.s3.tfbackend.example",
     "examples/scenario-b.tfvars.example",
+    "examples/scenario-c.s3.tfbackend.example",
+    "examples/scenario-c.tfvars.example",
     "iam/installer-control-plane-policy.json.tftpl",
     "iam/installer-regional-resources-policy.json.tftpl",
     "iam/installer-relationships-policy.json.tftpl",
@@ -79,6 +81,13 @@ EXPECTED_FILES = {
     "scenario-b/outputs.tf",
     "scenario-b/variables.tf",
     "scenario-b/versions.tf",
+    "scenario-c/.terraform.lock.hcl",
+    "scenario-c/codeblind-compatibility.json",
+    "scenario-c/gateway_contract.tftest.hcl",
+    "scenario-c/main.tf",
+    "scenario-c/outputs.tf",
+    "scenario-c/variables.tf",
+    "scenario-c/versions.tf",
     "scripts/validate-ecs-run-task.py",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml",
@@ -138,10 +147,13 @@ _INSTALLER_POLICY_VALUES = {
     "backend_state_bucket": "elspeth-state-example",
     "ecr_repository": "elspeth-web-example",
     "cloudwatch_agent_ecr_repository": "elspeth-agent-example",
+    "gateway_ecr_repository": "elspeth-gateway-example",
     "scenario_a_namespace": "a-0123456789abcdefabcd",
     "scenario_b_namespace": "b-0123456789abcdefabcd",
+    "scenario_c_namespace": "c-0123456789abcdefabcd",
     "scenario_a_bucket": "elspeth-a-example",
     "scenario_b_bucket": "elspeth-b-example",
+    "scenario_c_bucket": "elspeth-c-example",
 }
 
 
@@ -166,26 +178,44 @@ def _render_installer_policy_documents(
 _ECR_REPOSITORY_VARIABLES = (
     ("bootstrap/variables.tf", "ecr_repository"),
     ("bootstrap/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("bootstrap/variables.tf", "gateway_ecr_repository"),
     ("modules/scenario/variables.tf", "candidate_ecr_repository"),
     ("modules/scenario/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("modules/scenario/variables.tf", "gateway_ecr_repository"),
     ("scenario-a/variables.tf", "candidate_ecr_repository"),
     ("scenario-a/variables.tf", "cloudwatch_agent_ecr_repository"),
     ("scenario-b/variables.tf", "candidate_ecr_repository"),
     ("scenario-b/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("scenario-c/variables.tf", "candidate_ecr_repository"),
+    ("scenario-c/variables.tf", "cloudwatch_agent_ecr_repository"),
+    ("scenario-c/variables.tf", "gateway_ecr_repository"),
 )
 _ECR_REPOSITORY_PATTERN = r"^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$"
 
 
 def test_all_ecr_repository_inputs_enforce_the_same_aws_contract() -> None:
-    expected_condition = f'length(var.repository) <= 256 && can(regex("{_ECR_REPOSITORY_PATTERN}", var.repository))'
+    expected_contract = f'length(var.repository) <= 256 && can(regex("{_ECR_REPOSITORY_PATTERN}", var.repository))'
 
     for relative, variable_name in _ECR_REPOSITORY_VARIABLES:
         match = re.search(rf'variable "{variable_name}" \{{.*?\n\}}\n', _text(relative), re.DOTALL)
         assert match is not None, f"{relative} no longer declares {variable_name}"
-        condition = re.search(r"^\s*condition\s+=\s+(?P<value>.+)$", match.group(0), re.MULTILINE)
+        condition = re.search(
+            r"\bcondition\s*=\s*(?P<value>.*?)\n\s*error_message\s*=",
+            match.group(0),
+            re.DOTALL,
+        )
         assert condition is not None
-        normalized = condition.group("value").replace(f"var.{variable_name}", "var.repository")
-        assert normalized == expected_condition, f"{relative}:{variable_name} has drifted from the ECR repository contract"
+        normalized = " ".join(condition.group("value").split()).replace(f"var.{variable_name}", "var.repository")
+        if relative == "modules/scenario/variables.tf" and variable_name == "gateway_ecr_repository":
+            assert normalized == (f'( var.llm_backend == "custom_gateway" ? {expected_contract} : var.repository == "" )'), (
+                f"{relative}:{variable_name} has drifted from the backend-gated ECR repository contract"
+            )
+        elif relative == "bootstrap/variables.tf" and variable_name == "gateway_ecr_repository":
+            assert normalized == f'var.repository == "" || ({expected_contract})', (
+                f"{relative}:{variable_name} has drifted from the optional bootstrap ECR repository contract"
+            )
+        else:
+            assert normalized == expected_contract, f"{relative}:{variable_name} has drifted from the ECR repository contract"
 
 
 @pytest.mark.parametrize(
@@ -473,7 +503,7 @@ def test_container_insights_performance_log_group_is_terraform_owned() -> None:
     # an operator can formally adopt the orphan back into state on a
     # same-namespace redeploy retry, default false so fresh accounts are
     # unaffected.
-    for scenario in ("scenario-a", "scenario-b"):
+    for scenario in ("scenario-a", "scenario-b", "scenario-c"):
         main = _text(f"{scenario}/main.tf")
         variables = _text(f"{scenario}/variables.tf")
 
@@ -508,22 +538,31 @@ def test_container_insights_adoption_guidance_requires_a_replacement_plan() -> N
     deployment = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md").read_text(encoding="utf-8")
     readme = _text("README.md")
 
-    for text in (cold_install, deployment, readme, _text("scenario-a/main.tf"), _text("scenario-b/main.tf")):
+    for text in (
+        cold_install,
+        deployment,
+        readme,
+        _text("scenario-a/main.tf"),
+        _text("scenario-b/main.tf"),
+        _text("scenario-c/main.tf"),
+    ):
         normalized = " ".join(text.split())
         assert "replacement plan" in normalized
         assert "on that apply" not in normalized
     assert "obtain a new signed approval" in deployment
 
 
-def test_installer_secret_reads_are_bound_to_the_two_exact_run_namespaces() -> None:
+def test_installer_secret_reads_are_bound_to_the_three_exact_run_namespaces() -> None:
     template = _installer_policy_template_text()
     secret_resources = re.search(r'"Sid": "ReadScenarioSecretValues"(?P<body>.*?)\n    \}', template, re.DOTALL)
 
     assert secret_resources is not None
     assert "secret:${scenario_a_namespace}-*" in secret_resources.group("body")
     assert "secret:${scenario_b_namespace}-*" in secret_resources.group("body")
+    assert "secret:${scenario_c_namespace}-*" in secret_resources.group("body")
     assert "secret:a-*" not in secret_resources.group("body")
     assert "secret:b-*" not in secret_resources.group("body")
+    assert "secret:c-*" not in secret_resources.group("body")
 
 
 def test_live_composer_generation_is_not_a_cold_install_gate() -> None:
@@ -664,7 +703,7 @@ def test_web_plugin_policy_is_operator_configurable() -> None:
     assert "var.content_guardrail == null ? local.default_content_guardrail" in locals_text
 
 
-def test_bedrock_invoke_grant_follows_the_configured_llm_profiles() -> None:
+def test_bedrock_invoke_grant_is_backend_gated_and_follows_the_configured_llm_profiles() -> None:
     """The IAM grant must be derived from the profiles, not just the Composer pair.
 
     Deriving it from composer_model/composer_advisor_model alone meant a profile
@@ -674,12 +713,12 @@ def test_bedrock_invoke_grant_follows_the_configured_llm_profiles() -> None:
     """
     locals_text = _text("modules/scenario/locals.tf")
     grant = re.search(
-        r"bedrock_configured_model_ids\s*=\s*distinct\((?P<body>.*?)\n  \)",
+        r"bedrock_configured_model_ids\s*=\s*local\.bedrock_backend\s*\?\s*distinct\((?P<body>.*?)\)\s*:\s*\[\]",
         locals_text,
         re.DOTALL,
     )
 
-    assert grant is not None, "bedrock_configured_model_ids must still be derived, not hardcoded"
+    assert grant is not None, "bedrock_configured_model_ids must be derived only for the Bedrock backend"
     body = grant.group("body")
     assert "var.composer_model" in body
     assert "var.composer_advisor_model" in body
@@ -796,6 +835,7 @@ def test_terraform_and_provider_versions_are_current_and_locked() -> None:
         "modules/scenario/versions.tf",
         "scenario-a/versions.tf",
         "scenario-b/versions.tf",
+        "scenario-c/versions.tf",
     ):
         text = _text(relative)
         assert 'required_version = ">= 1.14, < 2.0"' in text
@@ -804,6 +844,7 @@ def test_terraform_and_provider_versions_are_current_and_locked() -> None:
         "bootstrap/.terraform.lock.hcl",
         "scenario-a/.terraform.lock.hcl",
         "scenario-b/.terraform.lock.hcl",
+        "scenario-c/.terraform.lock.hcl",
     ):
         text = _text(relative)
         assert 'provider "registry.terraform.io/hashicorp/aws"' in text
@@ -816,7 +857,7 @@ def test_terraform_and_provider_versions_are_current_and_locked() -> None:
 
 
 def test_scenario_backends_are_partial_locked_encrypted_and_isolated() -> None:
-    for scenario in ("scenario-a", "scenario-b"):
+    for scenario in ("scenario-a", "scenario-b", "scenario-c"):
         versions = _text(f"{scenario}/versions.tf")
         backend_block = re.search(r'backend\s+"s3"\s*\{(?P<body>.*?)\}', versions, re.DOTALL)
         assert backend_block is not None
@@ -841,8 +882,8 @@ def test_scenario_backends_are_partial_locked_encrypted_and_isolated() -> None:
         assert phrase in readme
 
 
-def test_ownership_tags_are_mandatory_and_propagated_by_both_scenarios() -> None:
-    for scenario in ("scenario-a", "scenario-b"):
+def test_ownership_tags_are_mandatory_and_propagated_by_every_scenario() -> None:
+    for scenario in ("scenario-a", "scenario-b", "scenario-c"):
         variables = _text(f"{scenario}/variables.tf")
         main = _text(f"{scenario}/main.tf")
         provider = _text(f"{scenario}/versions.tf")
@@ -905,6 +946,7 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
         "modules/scenario/variables.tf",
         "scenario-a/variables.tf",
         "scenario-b/variables.tf",
+        "scenario-c/variables.tf",
     ):
         text = _text(relative)
         assert re.search(r'variable "aurora_engine_version".*?default\s*=\s*"16\.13"', text, re.DOTALL)
@@ -921,9 +963,12 @@ def test_database_topology_is_aurora_with_separate_databases_and_roles() -> None
 def test_read_only_root_filesystem_matches_the_container_contract() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     bootstrap = _text("modules/scenario/database_bootstrap.tf")
-    assert ecs.count("readonlyRootFilesystem = true") == 4
+    assert ecs.count("readonlyRootFilesystem = true") == 5
     assert "readonlyRootFilesystem = true" in bootstrap
-    assert "readonlyRootFilesystem" not in ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("candidate_web_container = {")]
+    cloudwatch_agent = ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("gateway_container = {")]
+    gateway = ecs[ecs.index("gateway_container = {") : ecs.index("candidate_web_container = {")]
+    assert "readonlyRootFilesystem" not in cloudwatch_agent
+    assert "readonlyRootFilesystem = true" in gateway
     assert "readonlyRootFilesystem" not in ecs[ecs.index("candidate_web_container = {") : ecs.index("schema_init_doctor_container = {")]
     assert "rollback_web_container = merge(local.candidate_web_container" in ecs
     assert "rollback_doctor_container = merge(local.runtime_doctor_container" in ecs
@@ -1144,28 +1189,34 @@ def test_every_image_is_proven_before_any_credentialed_task_definition() -> None
             "var.aws_region",
             "var.candidate_ecr_repository",
             "var.cloudwatch_agent_ecr_repository",
+            "var.gateway_ecr_repository",
             "amazonaws",
         )
     )
     assert 'resource "terraform_data" "candidate_image_provenance"' in provenance
     assert 'resource "terraform_data" "rollback_image_provenance"' in provenance
     assert 'resource "terraform_data" "cloudwatch_agent_image_provenance"' in provenance
+    assert 'resource "terraform_data" "gateway_image_provenance"' in provenance
     assert 'docker pull --platform "$TARGET_PLATFORM" "$CANDIDATE_IMAGE"' in provenance
     assert 'docker pull --platform "$TARGET_PLATFORM" "$ROLLBACK_IMAGE"' in provenance
     assert 'docker pull --platform "$TARGET_PLATFORM" "$CLOUDWATCH_AGENT_IMAGE"' in provenance
+    assert 'docker pull --platform "$TARGET_PLATFORM" "$GATEWAY_IMAGE"' in provenance
     assert "org.opencontainers.image.revision" in provenance
     assert 'test "$revision" = "$CANDIDATE_SHA"' in provenance
+    assert 'test "$revision" = "$GATEWAY_SHA"' in provenance
     assert 'test "$revision" = "$ROLLBACK_SHA"' in provenance
     assert 'test "$revision" = "$CANDIDATE_SHA"' in provenance
     assert "terraform_data.candidate_image_provenance.output" in credentialed_definitions
     assert "terraform_data.rollback_image_provenance.output" in credentialed_definitions
     assert "terraform_data.cloudwatch_agent_image_provenance.output" in credentialed_definitions
+    assert "terraform_data.gateway_image_provenance[*].output" in credentialed_definitions
     assert "image                  = var.candidate_image" not in credentialed_definitions
     assert "image      = var.candidate_image" not in credentialed_definitions
     assert "image = var.rollback_baseline_image" not in credentialed_definitions
     assert "image             = local.cloudwatch_agent_image" not in credentialed_definitions
+    assert "image                  = var.gateway_image" not in credentialed_definitions
 
-    for root in ("scenario-a", "scenario-b"):
+    for root in ("scenario-a", "scenario-b", "scenario-c"):
         assert 'variable "candidate_ecr_repository"' in _text(f"{root}/variables.tf")
         assert 'variable "cloudwatch_agent_ecr_repository"' in _text(f"{root}/variables.tf")
         assert re.search(r"candidate_ecr_repository\s+=\s+var\.candidate_ecr_repository", _text(f"{root}/main.tf"))
@@ -1175,6 +1226,13 @@ def test_every_image_is_proven_before_any_credentialed_task_definition() -> None
         )
         assert "candidate_ecr_repository" in _text(f"examples/{root}.tfvars.example")
         assert "cloudwatch_agent_ecr_repository" in _text(f"examples/{root}.tfvars.example")
+
+    scenario_c_variables = _text("scenario-c/variables.tf")
+    scenario_c_main = _text("scenario-c/main.tf")
+    scenario_c_example = _text("examples/scenario-c.tfvars.example")
+    assert 'variable "gateway_ecr_repository"' in scenario_c_variables
+    assert re.search(r"gateway_ecr_repository\s+=\s+var\.gateway_ecr_repository", scenario_c_main)
+    assert "gateway_ecr_repository" in scenario_c_example
 
     native_test = _text("scenario-a/codeblind.tftest.hcl")
     assert 'run "reject_foreign_registry_candidate"' in native_test
@@ -1275,20 +1333,25 @@ def test_repository_regexes_escape_dots_before_interpolation() -> None:
         assert r'${replace(var.candidate_ecr_repository, ".", "\\.")}@sha256' in text
         assert r'${replace(var.cloudwatch_agent_ecr_repository, ".", "\\.")}@sha256' in text
 
+    module_variables = _text("modules/scenario/variables.tf")
+    assert "${var.gateway_ecr_repository}@sha256" not in module_variables
+    assert r'${replace(var.gateway_ecr_repository, ".", "\\.")}@sha256' in module_variables
+
 
 def test_image_provenance_isolates_docker_credentials_from_the_operator_default() -> None:
     provenance = _text("modules/scenario/image_provenance.tf")
 
-    assert provenance.count('mkdir -m 700 "$work/docker-config"') == 3
-    assert provenance.count('export DOCKER_CONFIG="$work/docker-config"') == 3
+    assert provenance.count('mkdir -m 700 "$work/docker-config"') == 4
+    assert provenance.count('export DOCKER_CONFIG="$work/docker-config"') == 4
 
-    boundaries = [
-        provenance.index('resource "terraform_data" "candidate_image_provenance"'),
-        provenance.index('resource "terraform_data" "rollback_image_provenance"'),
-        provenance.index('resource "terraform_data" "cloudwatch_agent_image_provenance"'),
-        len(provenance),
-    ]
-    for start, end in itertools.pairwise(boundaries):
+    resource_names = (
+        "candidate_image_provenance",
+        "rollback_image_provenance",
+        "cloudwatch_agent_image_provenance",
+        "gateway_image_provenance",
+    )
+    boundaries = [provenance.index(f'resource "terraform_data" "{name}"') for name in resource_names]
+    for start, end in itertools.pairwise([*boundaries, len(provenance)]):
         block = provenance[start:end]
         export_index = block.index('export DOCKER_CONFIG="$work/docker-config"')
         assert export_index < block.index("trap ")
@@ -1303,6 +1366,7 @@ def test_image_provenance_binds_every_check_to_the_selected_target_platform() ->
         ("candidate_image_provenance", "CANDIDATE_IMAGE"),
         ("rollback_image_provenance", "ROLLBACK_IMAGE"),
         ("cloudwatch_agent_image_provenance", "CLOUDWATCH_AGENT_IMAGE"),
+        ("gateway_image_provenance", "GATEWAY_IMAGE"),
     )
 
     for index, (resource_name, image_name) in enumerate(resources):
@@ -1324,6 +1388,43 @@ def test_image_provenance_binds_every_check_to_the_selected_target_platform() ->
         assert "--platform" not in inspect
         assert f'"${image_name}"' in inspect
         assert re.search(r"TARGET_PLATFORM\s*=\s*var\.target_platform", block)
+
+
+def test_scenario_c_gateway_image_is_proven_and_bedrock_runtime_authority_is_absent() -> None:
+    scenario_c = _text("scenario-c/main.tf")
+    provenance = _text("modules/scenario/image_provenance.tf")
+    ecs = _text("modules/scenario/ecs.tf")
+    iam = _text("modules/scenario/iam_observability.tf")
+    storage = _text("modules/scenario/storage_identity.tf")
+    locals_text = _text("modules/scenario/locals.tf")
+
+    assert re.search(r'\bllm_backend\s*=\s*"custom_gateway"', scenario_c)
+    assert 'resource "terraform_data" "gateway_image_provenance"' in provenance
+    gateway_start = provenance.index('resource "terraform_data" "gateway_image_provenance"')
+    gateway = provenance[gateway_start:]
+    assert re.search(r"\bcount\s*=\s*local\.bedrock_backend\s*\?\s*0\s*:\s*1", gateway)
+    for trigger in (
+        "var.gateway_image",
+        "var.gateway_sha",
+        "var.gateway_ecr_repository",
+        "var.target_platform",
+    ):
+        assert trigger in gateway[gateway.index("triggers_replace = [") : gateway.index("]", gateway.index("triggers_replace = ["))]
+    assert 'docker pull --platform "$TARGET_PLATFORM" "$GATEWAY_IMAGE"' in gateway
+    assert 'test "$revision" = "$GATEWAY_SHA"' in gateway
+    assert "image                  = one(terraform_data.gateway_image_provenance[*].output)" in ecs
+
+    assert iam.count("for_each = local.bedrock_backend ? [1] : []") == 2
+    for resource_name in ("prompt", "content"):
+        guardrail = re.search(
+            rf'resource "aws_bedrock_guardrail" "{resource_name}" \{{(?P<body>.*?)\n\}}',
+            storage,
+            re.DOTALL,
+        )
+        assert guardrail is not None
+        assert re.search(r"\bcount\s*=\s*local\.bedrock_backend\s*\?\s*1\s*:\s*0", guardrail.group("body"))
+    assert 'bedrock_litellm_model      = local.bedrock_backend ? var.composer_model : ""' in locals_text
+    assert 'bedrock_fast_litellm_model = local.bedrock_backend ? var.composer_advisor_model : ""' in locals_text
 
 
 def test_database_password_rotation_reexecutes_the_database_bootstrap() -> None:
@@ -1530,7 +1631,7 @@ def test_private_candidate_pulls_use_isolated_ecr_credentials_for_registry_comma
             assert block.index(login) < block.index(command)
 
 
-def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
+def test_inventory_v8_exactly_matches_the_runtime_validator_contract() -> None:
     locals = _text("modules/scenario/locals.tf")
     ecs = _text("modules/scenario/ecs.tf")
     outputs = _text("modules/scenario/outputs.tf")
@@ -1541,6 +1642,9 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
             "schema",
             "acceptance_run_id",
             "candidate_sha",
+            "gateway_image",
+            "gateway_sha",
+            "gateway_adapter",
             "aws_account_id",
             "aws_region",
             "scenario_id",
@@ -1551,7 +1655,7 @@ def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     )
     assert _hcl_map_keys(outputs, "scenario_values") == scenario_inventory.SCENARIO_VALUE_FIELDS
     assert _hcl_map_keys(outputs, "scenario_orphan_sweep") == scenario_inventory.ORPHAN_INVENTORY_FIELDS
-    assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v7"', resolved_output)
+    assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v8"', resolved_output)
     assert re.search(r"acceptance_run_id\s+=\s+var\.run_id", resolved_output)
     assert re.search(r'tag_key\s+=\s+"ACCEPTANCE_RUN_ID"', outputs)
     assert re.search(r"cleanup_owner\s+=\s+var\.owner", outputs)
@@ -1631,8 +1735,10 @@ def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit(
             "backend_state_bucket": "elspeth-" + ("s" * 55),
             "ecr_repository": "elspeth-" + ("a" * 248),
             "cloudwatch_agent_ecr_repository": "elspeth-" + ("b" * 248),
+            "gateway_ecr_repository": "elspeth-" + ("g" * 248),
             "scenario_a_bucket": "elspeth-a-" + ("c" * 33),
             "scenario_b_bucket": "elspeth-b-" + ("d" * 33),
+            "scenario_c_bucket": "elspeth-c-" + ("e" * 33),
         }
     )
     assert documents
@@ -1697,6 +1803,7 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert push_images["Resource"] == [
         "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-web-example",
         "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-agent-example",
+        "arn:aws:ecr:ap-southeast-1:123456789012:repository/elspeth-gateway-example",
     ]
     assert all(sid == "PushAndCleanElspethImages" for sid, statement in statements.items() if "ecr:BatchDeleteImage" in statement["Action"])
     assert statements["AuthenticateForEcrPush"]["Action"] == ["ecr:GetAuthorizationToken"]
@@ -1707,31 +1814,37 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert run_tasks["Resource"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-0123456789abcdefabcd-*:*",
         "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/c-0123456789abcdefabcd-*:*",
     ]
     assert run_tasks["Condition"]["ArnLike"]["ecs:cluster"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
     ]
     stop_tasks = statements["StopRunScenarioTasks"]
     assert stop_tasks["Action"] == ["ecs:StopTask"]
     assert stop_tasks["Resource"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-a-0123456789abcdefabcd-cluster/*",
         "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-b-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-c-0123456789abcdefabcd-cluster/*",
     ]
     assert stop_tasks["Condition"]["ArnEquals"]["ecs:cluster"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
     ]
     assert statements["ReadScenarioSecretValues"]["Action"] == ["secretsmanager:GetSecretValue"]
     assert statements["ReadScenarioSecretValues"]["Resource"] == [
         "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:a-0123456789abcdefabcd-*",
         "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:b-0123456789abcdefabcd-*",
+        "arn:aws:secretsmanager:ap-southeast-1:123456789012:secret:c-0123456789abcdefabcd-*",
     ]
 
     dashboards = statements["ManageRunDashboards"]
     assert dashboards["Resource"] == [
         "arn:aws:cloudwatch::123456789012:dashboard/a-0123456789abcdefabcd-elspeth-aws-operator-v1",
         "arn:aws:cloudwatch::123456789012:dashboard/b-0123456789abcdefabcd-elspeth-aws-operator-v1",
+        "arn:aws:cloudwatch::123456789012:dashboard/c-0123456789abcdefabcd-elspeth-aws-operator-v1",
     ]
     assert {"cloudwatch:GetDashboard", "cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"} == set(dashboards["Action"])
     assert not {"cloudwatch:PutDashboard", "cloudwatch:DeleteDashboards"}.intersection(
@@ -1743,6 +1856,7 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "arn:aws:s3:::elspeth-state-example",
         "arn:aws:s3:::elspeth-a-example",
         "arn:aws:s3:::elspeth-b-example",
+        "arn:aws:s3:::elspeth-c-example",
     ]
     named_objects = statements["ManageElspethNamedBucketObjects"]
     assert "s3:DeleteObjectVersion" in named_objects["Action"]
@@ -1750,6 +1864,7 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "arn:aws:s3:::elspeth-state-example/*",
         "arn:aws:s3:::elspeth-a-example/*",
         "arn:aws:s3:::elspeth-b-example/*",
+        "arn:aws:s3:::elspeth-c-example/*",
     ]
     assert "acm:GetCertificate" in statements["ReadDiscovery"]["Action"]
     assert {
@@ -1776,6 +1891,8 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-task-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-0123456789abcdefabcd-execution-role",
     ]
     iam_roles = _text("modules/scenario/iam_observability.tf")
     assert iam_roles.count('path                 = "/elspeth/${var.run_id}/"') == 2
@@ -1786,6 +1903,7 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
     assert managed_attachment["Resource"] == [
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-0123456789abcdefabcd-execution-role",
     ]
     assert managed_attachment["Condition"]["ArnEquals"]["iam:PolicyARN"] == (
         "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
@@ -1806,11 +1924,15 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         "rds.amazonaws.com",
     ]
 
-    for relative in ("scenario-a/variables.tf", "scenario-b/variables.tf"):
+    for relative in ("scenario-a/variables.tf", "scenario-b/variables.tf", "scenario-c/variables.tf"):
         root_variables = _text(relative)
         assert 'variable "iam_permissions_boundary_arn"' in root_variables
         assert 'variable "iam_lifecycle_aws_profile"' in root_variables
-    for relative in ("examples/scenario-a.tfvars.example", "examples/scenario-b.tfvars.example"):
+    for relative in (
+        "examples/scenario-a.tfvars.example",
+        "examples/scenario-b.tfvars.example",
+        "examples/scenario-c.tfvars.example",
+    ):
         example = _text(relative)
         assert "iam_permissions_boundary_arn" in example
         assert "iam_lifecycle_aws_profile" in example
@@ -1898,44 +2020,66 @@ def test_installer_discovery_and_named_mutations_use_exact_scenario_resources() 
     assert statements["ReadScenarioEcsResources"]["Resource"] == [
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
         "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
         "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-a-0123456789abcdefabcd-cluster/acceptance-a-0123456789abcdefabcd-service",
         "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-b-0123456789abcdefabcd-cluster/acceptance-b-0123456789abcdefabcd-service",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-c-0123456789abcdefabcd-cluster/acceptance-c-0123456789abcdefabcd-service",
         "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-0123456789abcdefabcd-*:*",
         "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/c-0123456789abcdefabcd-*:*",
         "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-a-0123456789abcdefabcd-cluster/*",
         "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-b-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-c-0123456789abcdefabcd-cluster/*",
     ]
     assert statements["ReadRunLogs"]["Resource"] == [
         "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/a-0123456789abcdefabcd-*:log-stream:*",
         "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/b-0123456789abcdefabcd-*:log-stream:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/c-0123456789abcdefabcd-*:log-stream:*",
         "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/containerinsights/acceptance-a-0123456789abcdefabcd-cluster/performance:log-stream:*",
         "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/containerinsights/acceptance-b-0123456789abcdefabcd-cluster/performance:log-stream:*",
+        "arn:aws:logs:ap-southeast-1:123456789012:log-group:/aws/ecs/containerinsights/acceptance-c-0123456789abcdefabcd-cluster/performance:log-stream:*",
     ]
     assert statements["ManageRunScopedInlinePolicies"]["Resource"] == [
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-task-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-0123456789abcdefabcd-execution-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-task-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-0123456789abcdefabcd-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-0123456789abcdefabcd-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-0123456789abcdefabcd-execution-role",
     ]
     assert statements["ManageRunDashboards"]["Resource"] == [
         "arn:aws:cloudwatch::123456789012:dashboard/a-0123456789abcdefabcd-elspeth-aws-operator-v1",
         "arn:aws:cloudwatch::123456789012:dashboard/b-0123456789abcdefabcd-elspeth-aws-operator-v1",
+        "arn:aws:cloudwatch::123456789012:dashboard/c-0123456789abcdefabcd-elspeth-aws-operator-v1",
     ]
     assert statements["ManageRunEventTargets"]["Resource"] == [
         "arn:aws:events:ap-southeast-1:123456789012:rule/a-0123456789abcdefabcd-*",
         "arn:aws:events:ap-southeast-1:123456789012:rule/b-0123456789abcdefabcd-*",
+        "arn:aws:events:ap-southeast-1:123456789012:rule/c-0123456789abcdefabcd-*",
     ]
     xray = statements["MutateRunTaggedXrayResources"]
     assert {"xray:GetGroup", "xray:ListTagsForResource"}.issubset(xray["Action"])
     assert xray["Resource"] == [
         "arn:aws:xray:ap-southeast-1:123456789012:group/a-0123456789abcdefabcd-*/*",
         "arn:aws:xray:ap-southeast-1:123456789012:group/b-0123456789abcdefabcd-*/*",
+        "arn:aws:xray:ap-southeast-1:123456789012:group/c-0123456789abcdefabcd-*/*",
         "arn:aws:xray:ap-southeast-1:123456789012:sampling-rule/a-0123456789abcdefabcd-*",
         "arn:aws:xray:ap-southeast-1:123456789012:sampling-rule/b-0123456789abcdefabcd-*",
+        "arn:aws:xray:ap-southeast-1:123456789012:sampling-rule/c-0123456789abcdefabcd-*",
     ]
 
     for _path, rendered, _document in documents:
-        for generic_pattern in ("/a-*", "/b-*", "group/a-*", "group/b-*", "rule/a-*", "rule/b-*"):
+        for generic_pattern in (
+            "/a-*",
+            "/b-*",
+            "/c-*",
+            "group/a-*",
+            "group/b-*",
+            "group/c-*",
+            "rule/a-*",
+            "rule/b-*",
+            "rule/c-*",
+        ):
             assert generic_pattern not in rendered
 
 
@@ -1969,6 +2113,8 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/a-*-execution-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-task-role",
         "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/b-*-execution-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-*-task-role",
+        "arn:aws:iam::123456789012:role/elspeth/12345678-1234-4123-8123-123456789abc/c-*-execution-role",
     ]
     create_roles = statements["CreateRunRolesWithNarrowBoundary"]
     assert create_roles["Resource"] == role_resources
@@ -2006,7 +2152,7 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     assert 'alias               = "iam_lifecycle"' in bootstrap_versions
     assert "configuration_aliases = [aws.iam_lifecycle]" in module_versions
     assert iam_resources.count("provider             = aws.iam_lifecycle") == 2
-    for scenario in ("scenario-a", "scenario-b"):
+    for scenario in ("scenario-a", "scenario-b", "scenario-c"):
         versions = _text(f"{scenario}/versions.tf")
         main = _text(f"{scenario}/main.tf")
         assert 'alias               = "iam_lifecycle"' in versions
@@ -2023,8 +2169,9 @@ def initialized_terraform_package(tmp_path_factory: pytest.TempPathFactory) -> P
     """Validate an isolated copy of every Terraform root from shipped files.
 
     The copy excludes every pre-existing ``.terraform`` directory and ignored
-    operator input. All three roots must initialise from their checked-in lock
-    files and validate before the native Scenario A contracts run unfiltered.
+    operator input. All four roots must initialise from their checked-in lock
+    files and validate before the native Scenario A and C contracts run
+    unfiltered.
 
     ``-backend=false`` is deliberate: scenario roots declare partial S3
     backends, and a contract test must never reach for remote state or AWS
@@ -2046,7 +2193,7 @@ def initialized_terraform_package(tmp_path_factory: pytest.TempPathFactory) -> P
     )
     assert formatted.returncode == 0, "terraform fmt -check failed:\n" + formatted.stdout + formatted.stderr
 
-    for root_name in ("bootstrap", "scenario-a", "scenario-b"):
+    for root_name in ("bootstrap", "scenario-a", "scenario-b", "scenario-c"):
         directory = isolated / root_name
         result = subprocess.run(
             [
@@ -2110,6 +2257,34 @@ def test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs(initial
     assert "Success!" in result.stdout
 
 
+def test_scenario_c_native_mock_plans_enforce_the_gateway_contract(initialized_terraform_package: Path) -> None:
+    scenario_c = initialized_terraform_package / "scenario-c"
+    gateway_test = scenario_c / "gateway_contract.tftest.hcl"
+    assert gateway_test.is_file()
+    content = gateway_test.read_text(encoding="utf-8")
+    for provider in ("aws", "random", "tls"):
+        assert f'mock_provider "{provider}"' in content
+    assert 'alias = "iam_lifecycle"' in content
+    for run_name in (
+        "plans_as_first_custom_gateway_without_bedrock_inputs",
+        "profiles_lower_to_gateway_bindings",
+        "bedrock_composer_model_is_rejected",
+        "malformed_gateway_sha_is_rejected",
+    ):
+        assert f'run "{run_name}"' in content
+
+    result = subprocess.run(
+        ["terraform", f"-chdir={scenario_c}", "test", "-no-color"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "gateway_contract.tftest.hcl" in result.stdout
+    assert "Success!" in result.stdout
+
+
 def test_networking_has_long_request_support_and_correct_listener_target() -> None:
     network = _text("modules/scenario/network.tf")
     assert re.search(r"idle_timeout\s+=\s+var\.alb_idle_timeout_seconds", network)
@@ -2117,18 +2292,21 @@ def test_networking_has_long_request_support_and_correct_listener_target() -> No
     assert re.search(r"target_group_arn\s+=\s+aws_lb_target_group\.web\.arn", network)
 
 
-def test_scenario_a_is_the_obvious_cold_install_and_b_hostname_matches_runtime_namespace() -> None:
+def test_scenario_a_and_c_are_cold_installs_while_b_owns_the_oidc_upgrade_surface() -> None:
     readme = _text("README.md")
     assert "Scenario A: cold install (recommended)" in readme
     assert "Scenario B: OIDC acceptance variant" in readme
     assert readme.index("Scenario A: cold install (recommended)") < readme.index("Scenario B: OIDC acceptance variant")
+    assert re.search(r'\bdeployment_lifecycle\s*=\s*"first"', _text("scenario-a/main.tf"))
+    assert re.search(r'\bdeployment_lifecycle\s*=\s*"upgrade"', _text("scenario-b/main.tf"))
+    assert re.search(r'\bdeployment_lifecycle\s*=\s*"first"', _text("scenario-c/main.tf"))
 
     module_locals = _text("modules/scenario/locals.tf")
     assert "oidc_domain_prefix        = local.namespace" in module_locals
     assert 'oidc_domain_prefix        = "${local.namespace}-${' not in module_locals
     assert 'substr(sha256("${lower(var.run_id)}\\u0000${local.scenario_id_upper}"), 0, 20)' in module_locals
     assert (
-        'oidc_authorization_origin = var.scenario_id == "B" ? '
+        'oidc_authorization_origin = local.deployment_mode == "upgrade" ? '
         '"https://${aws_cognito_user_pool_domain.web[0].domain}.auth.${var.aws_region}.amazoncognito.com" : ""'
     ) in module_locals
     assert "domain       = local.oidc_domain_prefix" in _text("modules/scenario/storage_identity.tf")
@@ -2169,7 +2347,7 @@ def test_monitoring_resources_use_a_retained_digest_pinned_collector() -> None:
 def test_cloudwatch_agent_sidecar_exactly_matches_runtime_admission_constants() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     module_locals = _text("modules/scenario/locals.tf")
-    sidecar = ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("candidate_web_container = {")]
+    sidecar = ecs[ecs.index("cloudwatch_agent_container = {") : ecs.index("gateway_container = {")]
     observed_env_names = frozenset(re.findall(r'\{ name = "([^"]+)", value = ', sidecar))
 
     assert observed_env_names == task_definition._CLOUDWATCH_AGENT_ENV_NAMES
@@ -2206,7 +2384,7 @@ def test_cold_install_pauses_service_until_two_stage_doctor_and_explicit_enable(
 def test_schema_init_and_runtime_doctors_have_separate_credentials_and_commands() -> None:
     ecs = _text("modules/scenario/ecs.tf")
     outputs = _text("modules/scenario/outputs.tf")
-    root_outputs = "\n".join((_text("scenario-a/outputs.tf"), _text("scenario-b/outputs.tf")))
+    root_outputs = "\n".join((_text("scenario-a/outputs.tf"), _text("scenario-b/outputs.tf"), _text("scenario-c/outputs.tf")))
     readme = _text("README.md")
 
     schema_container = ecs[ecs.index("schema_init_doctor_container = {") : ecs.index("runtime_doctor_container = {")]
@@ -2247,7 +2425,7 @@ def test_acceptance_verifier_containers_use_the_live_published_identity() -> Non
         assert re.search(rf'\buser\s*=\s*"{re.escape(published_user)}"', container)
 
 
-def test_scenario_b_cognito_subject_binds_after_pool_creation_not_before() -> None:
+def test_upgrade_cognito_subject_binds_after_pool_creation_not_before() -> None:
     """The subject cannot exist before the apply that creates the pool.
 
     Requiring a nonempty subject on the fresh apply was a bootstrap
@@ -2259,12 +2437,14 @@ def test_scenario_b_cognito_subject_binds_after_pool_creation_not_before() -> No
     outputs = _text("modules/scenario/outputs.tf")
     scenario_a_variables = _text("scenario-a/variables.tf")
     scenario_b_variables = _text("scenario-b/variables.tf")
+    scenario_c_variables = _text("scenario-c/variables.tf")
     scenario_b_example = _text("examples/scenario-b.tfvars.example")
+    scenario_c_example = _text("examples/scenario-c.tfvars.example")
 
     assert 'variable "cognito_subject_sub"' in module_variables
-    assert 'var.scenario_id == "A" ? var.cognito_subject_sub == ""' in module_variables
+    assert 'var.deployment_lifecycle == "first" ? var.cognito_subject_sub == ""' in module_variables
     assert 'var.cognito_subject_sub == "" || can(regex(' in module_variables
-    assert 'cognito_subject_sub             = var.scenario_id == "B" ? var.cognito_subject_sub : ""' in outputs
+    assert 'cognito_subject_sub             = local.deployment_mode == "upgrade" ? var.cognito_subject_sub : ""' in outputs
     assert re.search(r'variable "cognito_subject_sub".*?default\s*=\s*""', scenario_a_variables, re.DOTALL)
     assert re.search(
         r'variable "cognito_subject_sub".*?default\s*=\s*""',
@@ -2282,6 +2462,8 @@ def test_scenario_b_cognito_subject_binds_after_pool_creation_not_before() -> No
         scenario_b_example,
     )
     assert "re-apply" in scenario_b_example
+    assert 'variable "cognito_subject_sub"' not in scenario_c_variables
+    assert "cognito_subject_sub" not in scenario_c_example
 
 
 def test_scenario_b_reuses_the_single_bootstrap_run_identity() -> None:
@@ -2302,14 +2484,14 @@ def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -
     readme = _text("README.md")
 
     assert 'variable "aws_profile"' in module_variables
-    for root in ("bootstrap", "scenario-a", "scenario-b"):
+    for root in ("bootstrap", "scenario-a", "scenario-b", "scenario-c"):
         variables = _text(f"{root}/variables.tf")
         provider = _text(f"{root}/versions.tf")
         example = _text(f"examples/{root}.tfvars.example")
         assert 'variable "aws_profile"' in variables
         assert "profile             = var.aws_profile" in provider
         assert "aws_profile" in example
-    for scenario in ("scenario-a", "scenario-b"):
+    for scenario in ("scenario-a", "scenario-b", "scenario-c"):
         assert re.search(
             r'profile\s*=\s*"REPLACE_WITH_AWS_PROFILE"',
             _text(f"examples/{scenario}.s3.tfbackend.example"),
@@ -2351,7 +2533,12 @@ def test_cold_install_runbook_does_not_re_derive_the_namespace() -> None:
     assert re.search(r'cluster_name\s+=\s+"acceptance-\$\{local\.namespace\}-cluster"', locals_text)
 
     for name in ("namespace", "cluster_name"):
-        for relative in ("modules/scenario/outputs.tf", "scenario-a/outputs.tf", "scenario-b/outputs.tf"):
+        for relative in (
+            "modules/scenario/outputs.tf",
+            "scenario-a/outputs.tf",
+            "scenario-b/outputs.tf",
+            "scenario-c/outputs.tf",
+        ):
             assert f'output "{name}"' in _text(relative), f"{relative} must expose the {name} output"
 
     # The runbook reuses the namespace it already had to compute at install

@@ -77,6 +77,63 @@ variable "cloudwatch_agent_ecr_repository" {
   }
 }
 
+variable "gateway_ecr_repository" {
+  type        = string
+  default     = ""
+  description = "Exact ECR repository that holds the independently admitted Scenario C gateway image."
+
+  validation {
+    condition     = var.gateway_ecr_repository == "" || (length(var.gateway_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.gateway_ecr_repository)))
+    error_message = "gateway_ecr_repository must be empty when Scenario C is not installed, or use the elspeth- prefix and AWS ECR repository-name grammar with at most 256 characters."
+  }
+
+  validation {
+    condition = contains(
+      [0, 4],
+      length(compact([
+        var.gateway_ecr_repository,
+        var.gateway_bearer_secret_arn,
+        var.gateway_oauth_client_id_secret_arn,
+        var.gateway_oauth_client_secret_secret_arn,
+      ])),
+    )
+    error_message = "Scenario C bootstrap inputs must be either all empty or all set so the execution-role boundary cannot be created with partial gateway authority."
+  }
+}
+
+variable "gateway_bearer_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Exact commercial-partition Secrets Manager ARN for the Scenario C Web-to-gateway bearer."
+
+  validation {
+    condition     = var.gateway_bearer_secret_arn == "" || can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_bearer_secret_arn))
+    error_message = "gateway_bearer_secret_arn must be empty when Scenario C is not installed, or an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
+}
+
+variable "gateway_oauth_client_id_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Exact commercial-partition Secrets Manager ARN for the Scenario C gateway OAuth client id."
+
+  validation {
+    condition     = var.gateway_oauth_client_id_secret_arn == "" || can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_id_secret_arn))
+    error_message = "gateway_oauth_client_id_secret_arn must be empty when Scenario C is not installed, or an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
+}
+
+variable "gateway_oauth_client_secret_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Exact commercial-partition Secrets Manager ARN for the Scenario C gateway OAuth client secret."
+
+  validation {
+    condition     = var.gateway_oauth_client_secret_secret_arn == "" || can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_secret_secret_arn))
+    error_message = "gateway_oauth_client_secret_secret_arn must be empty when Scenario C is not installed, or an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
+}
+
 variable "owner" {
   type = string
 }

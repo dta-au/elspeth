@@ -2,63 +2,6 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "ReadDiscovery",
-      "Effect": "Allow",
-      "Action": [
-        "acm:DescribeCertificate",
-        "acm:GetCertificate",
-        "acm:ListCertificates",
-        "acm:ListTagsForCertificate",
-        "bedrock:GetGuardrail",
-        "bedrock:GetInferenceProfile",
-        "bedrock:ListGuardrails",
-        "bedrock:ListInferenceProfiles",
-        "bedrock:ListTagsForResource",
-        "cloudwatch:DescribeAlarms",
-        "cloudwatch:ListDashboards",
-        "cloudwatch:ListMetrics",
-        "cloudwatch:ListTagsForResource",
-        "cognito-idp:Describe*",
-        "cognito-idp:List*",
-        "ec2:Describe*",
-        "ecr:Describe*",
-        "ecr:GetLifecyclePolicy",
-        "ecr:List*",
-        "ecs:DescribeTaskDefinition",
-        "ecs:ListTaskDefinitionFamilies",
-        "ecs:ListTaskDefinitions",
-        "elasticfilesystem:Describe*",
-        "elasticloadbalancing:Describe*",
-        "events:DescribeRule",
-        "events:List*",
-        "iam:Get*",
-        "iam:List*",
-        "logs:Describe*",
-        "logs:List*",
-        "rds:Describe*",
-        "rds:ListTagsForResource",
-        "s3:GetAccelerateConfiguration",
-        "s3:GetAnalyticsConfiguration",
-        "s3:GetBucket*",
-        "s3:GetEncryptionConfiguration",
-        "s3:GetIntelligentTieringConfiguration",
-        "s3:GetInventoryConfiguration",
-        "s3:GetLifecycleConfiguration",
-        "s3:GetMetricsConfiguration",
-        "s3:GetReplicationConfiguration",
-        "s3:ListAllMyBuckets",
-        "secretsmanager:DescribeSecret",
-        "secretsmanager:GetResourcePolicy",
-        "secretsmanager:List*",
-        "sns:GetTopicAttributes",
-        "sns:List*",
-        "sts:GetCallerIdentity",
-        "xray:GetGroups",
-        "xray:GetSamplingRules"
-      ],
-      "Resource": "*"
-    },
-    {
       "Sid": "AuthenticateForEcrPush",
       "Effect": "Allow",
       "Action": [
@@ -79,13 +22,15 @@
       ],
       "Resource": [
         "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_a_namespace}-*:*",
-        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_b_namespace}-*:*"
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_b_namespace}-*:*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_c_namespace}-*:*"
       ],
       "Condition": {
         "ArnLike": {
           "ecs:cluster": [
             "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
-            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster"
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
           ]
         },
         "StringEquals": {
@@ -101,13 +46,15 @@
       ],
       "Resource": [
         "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_a_namespace}-cluster/*",
-        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*"
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_c_namespace}-cluster/*"
       ],
       "Condition": {
         "ArnEquals": {
           "ecs:cluster": [
             "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
-            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster"
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
           ]
         },
         "StringEquals": {
@@ -123,7 +70,8 @@
       ],
       "Resource": [
         "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_a_namespace}-*",
-        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_b_namespace}-*"
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_b_namespace}-*",
+        "arn:aws:secretsmanager:${aws_region}:${aws_account_id}:secret:${scenario_c_namespace}-*"
       ]
     },
     {
@@ -137,7 +85,9 @@
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-task-role",
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_c_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_c_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -154,7 +104,8 @@
       ],
       "Resource": [
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_c_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -175,7 +126,9 @@
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-task-role",
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_a_namespace}-execution-role",
         "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-task-role",
-        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role"
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_b_namespace}-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_c_namespace}-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/${scenario_c_namespace}-execution-role"
       ],
       "Condition": {
         "StringEquals": {
@@ -214,6 +167,40 @@
       "Resource": "*",
       "Condition": {
         "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageRunEfsMountTargets",
+      "Effect": "Allow",
+      "Action": [
+        "elasticfilesystem:CreateMountTarget",
+        "elasticfilesystem:DeleteMountTarget"
+      ],
+      "Resource": "arn:aws:elasticfilesystem:${aws_region}:${aws_account_id}:file-system/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageRunEventTargets",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutTargets",
+        "events:RemoveTargets"
+      ],
+      "Resource": [
+        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_a_namespace}-*",
+        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_b_namespace}-*",
+        "arn:aws:events:${aws_region}:${aws_account_id}:rule/${scenario_c_namespace}-*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
           "aws:RequestedRegion": "${aws_region}"
         }
       }

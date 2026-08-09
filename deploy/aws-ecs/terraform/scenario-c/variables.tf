@@ -42,8 +42,8 @@ variable "candidate_ecr_repository" {
   description = "Exact application-image ECR repository output by the shared bootstrap."
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.candidate_ecr_repository))
-    error_message = "candidate_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
+    condition     = length(var.candidate_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.candidate_ecr_repository))
+    error_message = "candidate_ecr_repository must be the bootstrap-created elspeth-prefixed AWS ECR repository name and be at most 256 characters."
   }
 }
 
@@ -140,8 +140,8 @@ variable "cloudwatch_agent_ecr_repository" {
   description = "Exact CloudWatch-agent ECR repository output by the shared bootstrap."
 
   validation {
-    condition     = can(regex("^elspeth-[a-z0-9][a-z0-9._/-]{1,254}$", var.cloudwatch_agent_ecr_repository))
-    error_message = "cloudwatch_agent_ecr_repository must be the bootstrap-created elspeth-prefixed repository name."
+    condition     = length(var.cloudwatch_agent_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.cloudwatch_agent_ecr_repository))
+    error_message = "cloudwatch_agent_ecr_repository must be the bootstrap-created elspeth-prefixed AWS ECR repository name and be at most 256 characters."
   }
 }
 
@@ -323,21 +323,41 @@ variable "gateway_sha" {
 variable "gateway_ecr_repository" {
   type        = string
   description = "ECR repository name the gateway image must come from."
+
+  validation {
+    condition     = length(var.gateway_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.gateway_ecr_repository))
+    error_message = "gateway_ecr_repository must use the elspeth- prefix and AWS ECR repository-name grammar, and be at most 256 characters."
+  }
 }
 
 variable "gateway_bearer_secret_arn" {
   type        = string
   description = "Secrets Manager ARN holding the static ELSPETH-to-gateway bearer (operator-created; Terraform never sees the value)."
+
+  validation {
+    condition     = can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_bearer_secret_arn))
+    error_message = "gateway_bearer_secret_arn must be an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
 }
 
 variable "gateway_oauth_client_id_secret_arn" {
   type        = string
   description = "Secrets Manager ARN holding the OAuth client ID (gateway container only)."
+
+  validation {
+    condition     = can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_id_secret_arn))
+    error_message = "gateway_oauth_client_id_secret_arn must be an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
 }
 
 variable "gateway_oauth_client_secret_secret_arn" {
   type        = string
   description = "Secrets Manager ARN holding the OAuth client secret (gateway container only)."
+
+  validation {
+    condition     = can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_secret_secret_arn))
+    error_message = "gateway_oauth_client_secret_secret_arn must be an exact Secrets Manager ARN in this package's aws partition, aws_region, and aws_account_id."
+  }
 }
 
 variable "gateway_adapter" {

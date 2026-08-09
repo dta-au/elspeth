@@ -1,10 +1,10 @@
 locals {
-  # Mirrors modules/scenario/locals.tf exactly: both scenario namespaces
+  # Mirrors modules/scenario/locals.tf exactly: all scenario namespaces
   # (and the bucket names built from them) are pure functions of run_id,
   # so the boundary below can name only THIS run's resources instead of
-  # every a-*/b-* sibling in the account.
+  # every a-*/b-*/c-* sibling in the account.
   scenario_namespaces = {
-    for scenario_id in ["A", "B"] :
+    for scenario_id in ["A", "B", "C"] :
     scenario_id => format(
       "%s-%s",
       lower(scenario_id),
@@ -15,6 +15,14 @@ locals {
   scenario_buckets = [
     for namespace in values(local.scenario_namespaces) :
     "elspeth-${namespace}-${substr(local.compact_run_id, 0, 12)}"
+  ]
+  gateway_secret_arns = compact([
+    var.gateway_bearer_secret_arn,
+    var.gateway_oauth_client_id_secret_arn,
+    var.gateway_oauth_client_secret_secret_arn,
+  ])
+  gateway_repository_arns = var.gateway_ecr_repository == "" ? [] : [
+    "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.gateway_ecr_repository}",
   ]
 }
 
@@ -138,10 +146,13 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
     ]
-    resources = [
-      "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.ecr_repository}",
-      "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.cloudwatch_agent_ecr_repository}",
-    ]
+    resources = concat(
+      [
+        "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.ecr_repository}",
+        "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.cloudwatch_agent_ecr_repository}",
+      ],
+      local.gateway_repository_arns,
+    )
   }
 
   statement {
@@ -170,10 +181,13 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
   statement {
     sid     = "ReadRunSecrets"
     actions = ["secretsmanager:GetSecretValue"]
-    resources = [
-      for namespace in values(local.scenario_namespaces) :
-      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:${namespace}-database-*"
-    ]
+    resources = concat(
+      [
+        for namespace in values(local.scenario_namespaces) :
+        "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:${namespace}-database-*"
+      ],
+      local.gateway_secret_arns,
+    )
   }
 
   statement {

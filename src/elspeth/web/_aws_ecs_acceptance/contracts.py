@@ -510,7 +510,7 @@ def scenario_resource_namespace(acceptance_run_id: str, scenario_id: str) -> str
         canonical_run_id = _canonical_uuid(acceptance_run_id, label="acceptance run ID")
     except AcceptanceInputError:
         raise AcceptanceCheckError("scenario_inventory_binding") from None
-    if scenario_id not in {"A", "B"}:
+    if scenario_id not in {"A", "B", "C"}:
         raise AcceptanceCheckError("scenario_inventory_binding")
     digest = _sha256(f"{canonical_run_id}\0{scenario_id}".encode())[:20]
     return f"{scenario_id.lower()}-{digest}"

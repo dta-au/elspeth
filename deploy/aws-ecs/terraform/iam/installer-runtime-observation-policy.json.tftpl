@@ -13,12 +13,16 @@
       "Resource": [
         "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_a_namespace}-cluster/acceptance-${scenario_a_namespace}-service",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_b_namespace}-cluster/acceptance-${scenario_b_namespace}-service",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_c_namespace}-cluster/acceptance-${scenario_c_namespace}-service",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_a_namespace}-*:*",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_b_namespace}-*:*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task-definition/${scenario_c_namespace}-*:*",
         "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_a_namespace}-cluster/*",
-        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*"
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_c_namespace}-cluster/*"
       ]
     },
     {
@@ -30,8 +34,10 @@
       "Resource": [
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/${scenario_a_namespace}-*:log-stream:*",
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/${scenario_b_namespace}-*:log-stream:*",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/${scenario_c_namespace}-*:log-stream:*",
         "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_a_namespace}-cluster/performance:log-stream:*",
-        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance:log-stream:*"
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance:log-stream:*",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_c_namespace}-cluster/performance:log-stream:*"
       ]
     },
     {
@@ -44,8 +50,94 @@
       ],
       "Resource": [
         "arn:aws:cloudwatch::${aws_account_id}:dashboard/${scenario_a_namespace}-elspeth-aws-operator-v1",
-        "arn:aws:cloudwatch::${aws_account_id}:dashboard/${scenario_b_namespace}-elspeth-aws-operator-v1"
+        "arn:aws:cloudwatch::${aws_account_id}:dashboard/${scenario_b_namespace}-elspeth-aws-operator-v1",
+        "arn:aws:cloudwatch::${aws_account_id}:dashboard/${scenario_c_namespace}-elspeth-aws-operator-v1"
       ]
+    },
+    {
+      "Sid": "ReadDiscovery",
+      "Effect": "Allow",
+      "Action": [
+        "acm:DescribeCertificate",
+        "acm:GetCertificate",
+        "acm:ListCertificates",
+        "acm:ListTagsForCertificate",
+        "bedrock:GetGuardrail",
+        "bedrock:GetInferenceProfile",
+        "bedrock:ListGuardrails",
+        "bedrock:ListInferenceProfiles",
+        "bedrock:ListTagsForResource",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:ListDashboards",
+        "cloudwatch:ListMetrics",
+        "cloudwatch:ListTagsForResource",
+        "cognito-idp:Describe*",
+        "cognito-idp:List*",
+        "ec2:Describe*",
+        "ecr:Describe*",
+        "ecr:GetLifecyclePolicy",
+        "ecr:List*",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTaskDefinitionFamilies",
+        "ecs:ListTaskDefinitions",
+        "elasticfilesystem:Describe*",
+        "elasticloadbalancing:Describe*",
+        "events:DescribeRule",
+        "events:List*",
+        "iam:Get*",
+        "iam:List*",
+        "logs:Describe*",
+        "logs:List*",
+        "rds:Describe*",
+        "rds:ListTagsForResource",
+        "s3:GetAccelerateConfiguration",
+        "s3:GetAnalyticsConfiguration",
+        "s3:GetBucket*",
+        "s3:GetEncryptionConfiguration",
+        "s3:GetIntelligentTieringConfiguration",
+        "s3:GetInventoryConfiguration",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetMetricsConfiguration",
+        "s3:GetReplicationConfiguration",
+        "s3:ListAllMyBuckets",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:GetResourcePolicy",
+        "secretsmanager:List*",
+        "sns:GetTopicAttributes",
+        "sns:List*",
+        "sts:GetCallerIdentity",
+        "xray:GetGroups",
+        "xray:GetSamplingRules"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "MutateRunTaggedXrayResources",
+      "Effect": "Allow",
+      "Action": [
+        "xray:DeleteGroup",
+        "xray:DeleteSamplingRule",
+        "xray:GetGroup",
+        "xray:ListTagsForResource",
+        "xray:TagResource",
+        "xray:UntagResource",
+        "xray:UpdateGroup",
+        "xray:UpdateSamplingRule"
+      ],
+      "Resource": [
+        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_a_namespace}-*/*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_b_namespace}-*/*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:group/${scenario_c_namespace}-*/*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_a_namespace}-*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_b_namespace}-*",
+        "arn:aws:xray:${aws_region}:${aws_account_id}:sampling-rule/${scenario_c_namespace}-*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
     }
   ]
 }

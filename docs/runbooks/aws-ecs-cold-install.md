@@ -143,6 +143,7 @@ CLEANUP_DEADLINE=$(date -u -d "+8 hours" +"%Y-%m-%dT%H:%M:%SZ")
 STATE_BUCKET="elspeth-state-${AWS_ACCOUNT_ID}-${RUN_ID%%-*}"
 APP_REPOSITORY="elspeth-web"
 AGENT_REPOSITORY="elspeth-cloudwatch-agent"
+GATEWAY_REPOSITORY="elspeth-llm-gateway"
 
 printf 'run_id=%s\naccount=%s\nregion=%s\ncleanup=%s\n' \
   "$RUN_ID" "$AWS_ACCOUNT_ID" "$AWS_REGION" "$CLEANUP_DEADLINE"
@@ -166,15 +167,18 @@ export run_id="$RUN_ID"
 export backend_state_bucket="$STATE_BUCKET"
 export ecr_repository="$APP_REPOSITORY"
 export cloudwatch_agent_ecr_repository="$AGENT_REPOSITORY"
+export gateway_ecr_repository="$GATEWAY_REPOSITORY"
 export iam_permissions_boundary_arn="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/elspeth-${RUN_ID}-ecs-boundary"
 
 export scenario_a_namespace="a-$(printf '%s\0A' "$RUN_ID" | sha256sum | cut -c1-20)"
 export scenario_b_namespace="b-$(printf '%s\0B' "$RUN_ID" | sha256sum | cut -c1-20)"
+export scenario_c_namespace="c-$(printf '%s\0C' "$RUN_ID" | sha256sum | cut -c1-20)"
 compact_run_id=$(printf '%s' "$RUN_ID" | tr -d '-')
 export scenario_a_bucket="elspeth-${scenario_a_namespace}-$(printf '%.12s' "$compact_run_id")"
 export scenario_b_bucket="elspeth-${scenario_b_namespace}-$(printf '%.12s' "$compact_run_id")"
+export scenario_c_bucket="elspeth-${scenario_c_namespace}-$(printf '%.12s' "$compact_run_id")"
 
-installer_substitutions='${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_a_bucket} ${scenario_b_bucket}'
+installer_substitutions='${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}'
 
 mkdir -p bootstrap/.terraform
 for policy in control-plane regional-resources relationships runtime-observation; do
@@ -222,8 +226,27 @@ selected above:
 | `backend_state_bucket` | `$STATE_BUCKET` |
 | `ecr_repository` | `$APP_REPOSITORY` |
 | `cloudwatch_agent_ecr_repository` | `$AGENT_REPOSITORY` |
+| `gateway_ecr_repository` | Empty for an A/B-only run; `$GATEWAY_REPOSITORY` for Scenario C |
+| `gateway_bearer_secret_arn` | Empty for an A/B-only run; the exact operator-created ARN for Scenario C |
+| `gateway_oauth_client_id_secret_arn` | Empty for an A/B-only run; the exact operator-created ARN for Scenario C |
+| `gateway_oauth_client_secret_secret_arn` | Empty for an A/B-only run; the exact operator-created ARN for Scenario C |
 | `owner` | `$OWNER` |
 | `cleanup_deadline` | `$CLEANUP_DEADLINE` |
+
+The four gateway inputs are an all-or-none group. Leaving all four empty keeps
+the existing Scenario A/B bootstrap valid and omits gateway repository/secret
+ARNs from the shared ECS-role boundary. A Scenario C bootstrap must provide all four,
+and Terraform rejects a repository outside the exact ECR grammar or a secret
+ARN outside the commercial `aws` partition, selected Region, or selected
+account. For a Scenario C run, export the same exact values before editing the
+tfvars file:
+
+```bash
+export gateway_ecr_repository="$GATEWAY_REPOSITORY"
+export gateway_bearer_secret_arn="REPLACE_WITH_EXACT_GATEWAY_BEARER_SECRET_ARN"
+export gateway_oauth_client_id_secret_arn="REPLACE_WITH_EXACT_GATEWAY_OAUTH_CLIENT_ID_SECRET_ARN"
+export gateway_oauth_client_secret_secret_arn="REPLACE_WITH_EXACT_GATEWAY_OAUTH_CLIENT_SECRET_ARN"
+```
 
 Refuse unresolved placeholders, then initialize, review, and apply:
 

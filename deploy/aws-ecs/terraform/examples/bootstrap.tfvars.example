@@ -6,6 +6,13 @@ iam_lifecycle_aws_profile      = "REPLACE_WITH_DISTINCT_IAM_LIFECYCLE_AWS_PROFIL
 backend_state_bucket           = "REPLACE_WITH_GLOBALLY_UNIQUE_STATE_BUCKET"
 ecr_repository                 = "elspeth-web"
 cloudwatch_agent_ecr_repository = "elspeth-cloudwatch-agent"
+# Leave all four values empty for Scenario A/B-only runs. For Scenario C,
+# set all four before bootstrap so its execution-role boundary admits only
+# the exact gateway repository and operator-created secret ARNs.
+gateway_ecr_repository                      = ""
+gateway_bearer_secret_arn                   = ""
+gateway_oauth_client_id_secret_arn          = ""
+gateway_oauth_client_secret_secret_arn      = ""
 owner                          = "REPLACE_WITH_OWNER"
 purpose                        = "ELSPETH disposable cold install"
 cleanup_deadline               = "2030-01-01T00:00:00Z"

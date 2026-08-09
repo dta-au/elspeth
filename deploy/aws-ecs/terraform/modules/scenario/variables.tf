@@ -753,10 +753,10 @@ variable "gateway_ecr_repository" {
   validation {
     condition = (
       var.llm_backend == "custom_gateway"
-      ? can(regex("^[a-z0-9][a-z0-9._/-]{1,254}$", var.gateway_ecr_repository))
+      ? length(var.gateway_ecr_repository) <= 256 && can(regex("^elspeth-[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\\.|_|__|-+)[a-z0-9]+)*)*$", var.gateway_ecr_repository))
       : var.gateway_ecr_repository == ""
     )
-    error_message = "gateway_ecr_repository must be a valid ECR repository name under custom_gateway (gateway_image is pinned to it), and unset under bedrock."
+    error_message = "gateway_ecr_repository must use the elspeth- prefix and AWS ECR repository-name grammar with at most 256 characters under custom_gateway (gateway_image is pinned to it), and be unset under bedrock."
   }
 }
 
@@ -768,7 +768,7 @@ variable "gateway_bearer_secret_arn" {
   validation {
     condition = (
       var.llm_backend == "custom_gateway"
-      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_bearer_secret_arn))
+      ? can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_bearer_secret_arn))
       : var.gateway_bearer_secret_arn == ""
     )
     error_message = "gateway_bearer_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."
@@ -783,7 +783,7 @@ variable "gateway_oauth_client_id_secret_arn" {
   validation {
     condition = (
       var.llm_backend == "custom_gateway"
-      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_oauth_client_id_secret_arn))
+      ? can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_id_secret_arn))
       : var.gateway_oauth_client_id_secret_arn == ""
     )
     error_message = "gateway_oauth_client_id_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."
@@ -798,7 +798,7 @@ variable "gateway_oauth_client_secret_secret_arn" {
   validation {
     condition = (
       var.llm_backend == "custom_gateway"
-      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_oauth_client_secret_secret_arn))
+      ? can(regex("^arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:[A-Za-z0-9/_+=.@-]{1,519}$", var.gateway_oauth_client_secret_secret_arn))
       : var.gateway_oauth_client_secret_secret_arn == ""
     )
     error_message = "gateway_oauth_client_secret_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."

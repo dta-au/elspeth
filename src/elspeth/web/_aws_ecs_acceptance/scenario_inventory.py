@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
+from elspeth.core.llm_profiles import LLMProfileSettings, validate_profile_alias
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 
@@ -123,6 +124,36 @@ def _control_path(value: str) -> str:
 
 def _scenario_inventory_hash(inventory: Mapping[str, object]) -> str:
     return _sha256(json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _validate_gateway_profiles(values: Mapping[str, object]) -> None:
+    try:
+        profile_payload = json.loads(cast(str, values["ELSPETH_WEB__LLM_PROFILES"]))
+    except json.JSONDecodeError:
+        raise AcceptanceCheckError("scenario_inventory_schema") from None
+    if not isinstance(profile_payload, dict) or not profile_payload:
+        raise AcceptanceCheckError("scenario_inventory_schema")
+    admitted_profiles: dict[str, LLMProfileSettings] = {}
+    try:
+        for alias, profile in profile_payload.items():
+            if type(alias) is not str or not isinstance(profile, dict):
+                raise AcceptanceCheckError("scenario_inventory_schema")
+            admitted_profiles[validate_profile_alias(alias)] = LLMProfileSettings.model_validate(profile)
+        default_alias = validate_profile_alias(cast(str, values["ELSPETH_WEB__DEFAULT_LLM_PROFILE"]))
+    except (TypeError, ValueError):
+        raise AcceptanceCheckError("scenario_inventory_schema") from None
+    if default_alias not in admitted_profiles:
+        raise AcceptanceCheckError("scenario_inventory_schema")
+    if any(
+        profile.provider != "gateway"
+        or profile.model.startswith("bedrock/")
+        or profile.endpoint != "http://127.0.0.1:8787/v1"
+        or profile.credential_scope != "server"
+        or profile.credential_ref != "GATEWAY_BEARER"
+        or profile.contract_major != 1
+        for profile in admitted_profiles.values()
+    ):
+        raise AcceptanceCheckError("scenario_inventory_schema")
 
 
 def _validate_orphan_inventory(payload: object) -> dict[str, object]:
@@ -458,7 +489,7 @@ def _validate_scenario_resource_bindings(
         and not any(rule["rule_name"] == event_rule and event_target in cast(list[object], rule["target_ids"]) for rule in event_rules)
     ):
         raise AcceptanceCheckError("scenario_inventory_binding")
-    if scenario_id == "A":
+    if scenario_id in {"A", "C"}:
         if orphan["cognito_pool_owned"] is not False or orphan["cognito_subject_sub"] != "":
             raise AcceptanceCheckError("scenario_inventory_binding")
     elif values["COGNITO_USER_POOL_ID"] and (orphan["cognito_pool_owned"] is not True or not orphan["cognito_subject_sub"]):
@@ -501,7 +532,7 @@ def _validate_resolved_scenario_values(
     }
     if any(not values[field] for field in required_common):
         raise AcceptanceCheckError("scenario_inventory_schema")
-    if values["DEPLOYMENT_MODE"] != ("first" if scenario_id == "A" else "upgrade"):
+    if values["DEPLOYMENT_MODE"] != ("upgrade" if scenario_id == "B" else "first"):
         raise AcceptanceCheckError("scenario_inventory_binding")
     data_dir = PurePosixPath(cast(str, values["ELSPETH_WEB__DATA_DIR"]))
     payload_root = PurePosixPath(cast(str, values["ELSPETH_WEB__PAYLOAD_STORE_PATH"]))
@@ -592,7 +623,7 @@ def _validate_resolved_scenario_values(
         ):
             raise AcceptanceCheckError("scenario_inventory_binding")
 
-    if scenario_id == "A":
+    if scenario_id in {"A", "C"}:
         forbidden = {
             "PREVIOUS_TASK_DEFINITION",
             "ROLLBACK_DOCTOR_TASK_DEFINITION",
@@ -656,6 +687,9 @@ def _validate_scenario_inventory(
         "schema",
         "acceptance_run_id",
         "candidate_sha",
+        "gateway_image",
+        "gateway_sha",
+        "gateway_adapter",
         "aws_account_id",
         "aws_region",
         "scenario_id",
@@ -665,7 +699,7 @@ def _validate_scenario_inventory(
     }:
         raise AcceptanceCheckError("scenario_inventory_schema")
     if (
-        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v7"
+        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v8"
         or payload["scenario_id"] != scenario_id
         or payload["phase"] != expected_phase
         or payload["acceptance_run_id"] != acceptance_run_id
@@ -673,6 +707,29 @@ def _validate_scenario_inventory(
         or payload["aws_account_id"] != aws_account_id
         or payload["aws_region"] != aws_region
     ):
+        raise AcceptanceCheckError("scenario_inventory_binding")
+    gateway_image = payload["gateway_image"]
+    gateway_sha = payload["gateway_sha"]
+    gateway_adapter = payload["gateway_adapter"]
+    if scenario_id == "C":
+        expected_gateway_registry = f"{aws_account_id}.dkr.ecr.{aws_region}.amazonaws.com/"
+        if (
+            type(gateway_image) is not str
+            or len(gateway_image) > 2048
+            or not gateway_image.startswith(expected_gateway_registry)
+            or _DIGEST_PINNED_CONTAINER_IMAGE_PATTERN.fullmatch(gateway_image) is None
+            or type(gateway_sha) is not str
+            or re.fullmatch(r"[0-9a-f]{40}", gateway_sha) is None
+            or type(gateway_adapter) is not str
+            or not 1 <= len(gateway_adapter) <= 256
+            or gateway_adapter != gateway_adapter.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in gateway_adapter)
+        ):
+            raise AcceptanceCheckError("scenario_inventory_schema")
+    elif scenario_id in {"A", "B"}:
+        if gateway_image is not None or gateway_sha is not None or gateway_adapter is not None:
+            raise AcceptanceCheckError("scenario_inventory_schema")
+    else:
         raise AcceptanceCheckError("scenario_inventory_binding")
     values = payload["values"]
     if not isinstance(values, dict) or set(values) != SCENARIO_VALUE_FIELDS:
@@ -683,7 +740,7 @@ def _validate_scenario_inventory(
     if (
         values["AWS_REGION"] != aws_region
         or values["SCENARIO_TF_BINDING_SHA"] != tf_binding_sha256
-        or values["DEPLOYMENT_MODE"] != ("first" if scenario_id == "A" else "upgrade")
+        or values["DEPLOYMENT_MODE"] != ("upgrade" if scenario_id == "B" else "first")
         or values["TARGET_PLATFORM"] not in {"linux/amd64", "linux/arm64"}
         or values["OIDC_EXPECTED_AUDIENCE_CLAIM"] not in {"aud", "client_id"}
     ):
@@ -702,14 +759,18 @@ def _validate_scenario_inventory(
     ):
         raise AcceptanceCheckError("scenario_inventory_schema")
     live_model = values["ELSPETH_BEDROCK_LIVE_TEST_MODEL"]
-    if not live_model.startswith("bedrock/") or any(character.isspace() for character in live_model):
+    if scenario_id == "C":
+        if live_model != "":
+            raise AcceptanceCheckError("scenario_inventory_schema")
+    elif not live_model.startswith("bedrock/") or any(character.isspace() for character in live_model):
         raise AcceptanceCheckError("scenario_inventory_schema")
     for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV:
         model = values[name]
         if (
             not model
             or any(character.isspace() for character in model)
-            or (infer_provider_from_model_name(model) or infer_provider_from_unprefixed_model_name(model)) is None
+            or (scenario_id != "C" and (infer_provider_from_model_name(model) or infer_provider_from_unprefixed_model_name(model)) is None)
+            or (scenario_id == "C" and model.startswith("bedrock/"))
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
@@ -719,6 +780,8 @@ def _validate_scenario_inventory(
             json.loads(cast(str, values[name]))
         except json.JSONDecodeError:
             raise AcceptanceCheckError("scenario_inventory_schema") from None
+    if scenario_id == "C":
+        _validate_gateway_profiles(values)
     for field in (
         "ECS_CLUSTER",
         "ECS_SERVICE",
@@ -750,7 +813,16 @@ def _validate_scenario_inventory(
         guardrail_profiles_payload = json.loads(cast(str, values["ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES"]))
     except json.JSONDecodeError:
         raise AcceptanceCheckError("scenario_inventory_schema") from None
-    if expected_phase == "preapply":
+    if scenario_id == "C":
+        if guardrail_profiles_payload != []:
+            raise AcceptanceCheckError("scenario_inventory_schema")
+        try:
+            guardrail_defaults = json.loads(cast(str, values["ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES"]))
+        except json.JSONDecodeError:
+            raise AcceptanceCheckError("scenario_inventory_schema") from None
+        if guardrail_defaults != {} or orphan["bedrock_guardrails"] != []:
+            raise AcceptanceCheckError("scenario_inventory_schema")
+    elif expected_phase == "preapply":
         if guardrail_profiles_payload != []:
             raise AcceptanceCheckError("scenario_inventory_schema")
     else:
