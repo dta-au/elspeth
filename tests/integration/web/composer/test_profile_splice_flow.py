@@ -6,10 +6,12 @@ import json
 from dataclasses import dataclass, replace
 
 import pytest
+import yaml
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.core.config import load_settings_from_config_dict
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import begin_dispatch, finish_success
@@ -227,7 +229,9 @@ def _reviewed_state() -> CompositionState:
     )
 
 
-def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(caplog: pytest.LogCaptureFixture) -> None:
+def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     view, snapshot = _policy_context()
     state = _reviewed_state()
     arguments = {
@@ -303,3 +307,36 @@ def test_profile_splice_flow_is_valid_review_aware_and_private_binding_safe(capl
     }
     for surface, rendered in surfaces.items():
         assert _PRIVATE_BINDING not in rendered, surface
+
+    # Round-trip contract (elspeth-b73666ac82): the sanctioned public export is
+    # a re-runnable artifact. The AUTHORED state carries the server-written
+    # resolved_prompt_template_hash on the profile-selecting llm node; the
+    # EXPORT must strip it (it is a private profile field the batch/CLI
+    # loader rejects with ValueError('private_profile_option')), and the
+    # exported document must load once the operator supplies the profile map.
+    authored_llm = next(node for node in result.updated_state.nodes if node.plugin == "llm")
+    assert "resolved_prompt_template_hash" in authored_llm.options
+    exported = yaml.safe_load(surfaces["yaml"])
+    exported_llm = next(t for t in exported["transforms"] if t["plugin"] == "llm")
+    assert exported_llm["options"]["profile"] == "llm-default"
+    assert "resolved_prompt_template_hash" not in exported_llm["options"]
+    exported["llm_profiles"] = {
+        "llm-default": {
+            "provider": "gateway",
+            "model": "standard",
+            "credential_scope": "server",
+            "credential_ref": "LLM_GATEWAY_BEARER_TOKEN",
+            "endpoint": "http://127.0.0.1:8787/v1",
+            "contract_major": 1,
+            "required_capabilities": ["text", "tools", "usage"],
+        }
+    }
+    exported["default_llm_profile"] = "llm-default"
+    # expand_env_vars=True is load-bearing: profile MATERIALIZATION (and with
+    # it the private-fields guard at llm_profiles.lower_llm_profile_options)
+    # only runs on that path — the un-materialized parse would pass even with
+    # the hash still present.
+    monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "test-bearer-token")
+    settings = load_settings_from_config_dict(exported, expand_env_vars=True)
+    lowered_llm = next(t for t in settings.transforms if t.plugin == "llm")
+    assert lowered_llm.options["provider"] == "gateway"

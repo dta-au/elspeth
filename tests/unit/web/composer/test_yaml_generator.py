@@ -1874,3 +1874,102 @@ class TestConditionalKeyGuards:
         """Compatibility contract the non-validation lowering callers depend on."""
         assert issubclass(PipelineLoweringError, ValueError)
         assert not issubclass(PipelineLoweringError, KeyError)
+
+
+class TestProfileLoweringProvenanceStrip:
+    """Scoped export strip for resolved_prompt_template_hash (elspeth-b73666ac82).
+
+    The batch/CLI loader's profile-lowering pass rejects any llm component
+    that both selects a ``profile`` and carries a private profile field, so a
+    profile-selecting export must not emit the hash. A plain provider-config
+    llm node keeps it: there the hash is a declared, drift-validated LLMConfig
+    field and the Landscape<->session-DB audit join anchor.
+    """
+
+    @staticmethod
+    def _state_with_llm_nodes() -> CompositionState:
+        prompt = "Summarize {{ row.text }}"
+        return CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="profiled",
+                options={"path": "/data/input.csv", "schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            ),
+            nodes=(
+                NodeSpec(
+                    id="profiled",
+                    node_type="transform",
+                    plugin="llm",
+                    input="source_out",
+                    on_success="plain",
+                    on_error="discard",
+                    options={
+                        "profile": "standard",
+                        "prompt_template": prompt,
+                        "resolved_prompt_template_hash": "a" * 64,
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+                NodeSpec(
+                    id="plain",
+                    node_type="transform",
+                    plugin="llm",
+                    input="profiled",
+                    on_success="main_output",
+                    on_error="discard",
+                    options={
+                        "provider": "openrouter",
+                        "prompt_template": prompt,
+                        "resolved_prompt_template_hash": "b" * 64,
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(
+                EdgeSpec(id="e1", from_node="source", to_node="profiled", edge_type="on_success", label=None),
+                EdgeSpec(id="e2", from_node="profiled", to_node="plain", edge_type="on_success", label=None),
+                EdgeSpec(id="e3", from_node="plain", to_node="main_output", edge_type="on_success", label=None),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="main_output",
+                    plugin="csv",
+                    options={"path": "/data/output.csv"},
+                    on_write_failure="quarantine",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Profiled", description="hash strip pin"),
+            version=1,
+        )
+
+    def _transforms_by_name(self, doc: dict) -> dict[str, dict]:
+        return {t["name"]: t for t in doc["transforms"]}
+
+    def test_profile_selecting_llm_node_exports_without_the_hash(self) -> None:
+        doc = generate_pipeline_dict(self._state_with_llm_nodes())
+        transforms = self._transforms_by_name(doc)
+        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
+        assert transforms["profiled"]["options"]["profile"] == "standard"
+
+    def test_plain_provider_llm_node_keeps_the_hash(self) -> None:
+        doc = generate_pipeline_dict(self._state_with_llm_nodes())
+        transforms = self._transforms_by_name(doc)
+        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64
+
+    def test_public_yaml_matches_the_scoped_strip(self) -> None:
+        rendered = generate_public_yaml(self._state_with_llm_nodes())
+        doc = yaml.safe_load(rendered)
+        transforms = self._transforms_by_name(doc)
+        assert "resolved_prompt_template_hash" not in transforms["profiled"]["options"]
+        assert transforms["plain"]["options"]["resolved_prompt_template_hash"] == "b" * 64

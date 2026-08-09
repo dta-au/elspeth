@@ -693,6 +693,8 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/yaml_generator.py:generate_pipeline_dict:return"
   - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:options"
   - "src/elspeth/web/composer/yaml_generator.py:_strip_web_metadata:return"
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_profile_lowering_provenance:options"
+  - "src/elspeth/web/composer/yaml_generator.py:_strip_profile_lowering_provenance:return"
 
   # Redaction — shared traversal iterator (§4.2.5)
   # The value_provider closure receives the model's serialised root dict.

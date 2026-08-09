@@ -124,11 +124,35 @@ def _strip_web_metadata(options: dict[str, Any], *, omit_source_paths: bool = Fa
     return stripped
 
 
+def _strip_profile_lowering_provenance(plugin: str, options: dict[str, Any]) -> dict[str, Any]:
+    """Drop server-authored prompt provenance from profile-selecting llm nodes.
+
+    ``resolved_prompt_template_hash`` is in ``LLM_PROFILE_PRIVATE_FIELDS``, so
+    the batch/CLI loader's profile-lowering pass rejects any llm component
+    that both selects a ``profile`` and carries the hash
+    (``ValueError('private_profile_option')``) — exported YAML could never be
+    re-loaded (elspeth-b73666ac82). The web resolver strips exactly this key at
+    its own lowering seam (``_PROFILE_LOWERING_METADATA_OPTION_KEYS``); the
+    export mirrors that, at the same two component kinds the loader lowers
+    (sources and transforms). Plain provider-config llm nodes keep the hash:
+    there it is a declared, drift-validated ``LLMConfig`` field and the
+    Landscape<->session-DB audit join anchor. For a re-loaded profile export,
+    prompt provenance lives in the audit trail, not in plugin options
+    (operator decision, 2026-08-09).
+    """
+    if plugin == "llm" and "profile" in options and "resolved_prompt_template_hash" in options:
+        del options["resolved_prompt_template_hash"]
+    return options
+
+
 def _source_entry(source: dict[str, Any], *, omit_source_paths: bool) -> dict[str, Any]:
     """Convert a serialized SourceSpec dict into runtime YAML shape."""
-    source_options = _strip_web_metadata(
-        dict(source["options"]),
-        omit_source_paths=omit_source_paths,
+    source_options = _strip_profile_lowering_provenance(
+        source["plugin"],
+        _strip_web_metadata(
+            dict(source["options"]),
+            omit_source_paths=omit_source_paths,
+        ),
     )
     source_options["on_validation_failure"] = source["on_validation_failure"]
     return {
@@ -221,7 +245,7 @@ def _generate_pipeline_dict(
                 "on_error": t["on_error"],
             }
             if t["options"]:
-                entry["options"] = _strip_web_metadata(dict(t["options"]))
+                entry["options"] = _strip_profile_lowering_provenance(t["plugin"], _strip_web_metadata(dict(t["options"])))
             doc["transforms"].append(entry)
 
     # Gates — condition and routes are conditionally present (only on gates).
