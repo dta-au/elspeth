@@ -41,6 +41,7 @@ from elspeth.web.composer.state import (
 from elspeth.web.composer.tools._common import (
     _DEFAULT_SOURCE_VALIDATION_FAILURE,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+    PendingCustodyBlobView,
     ToolContext,
     ToolResult,
     _apply_merge_patch,
@@ -403,6 +404,35 @@ def _validate_source_name_argument(source_name: str) -> None:
         ) from exc
 
 
+def _pending_custody_tool_record(pending: PendingCustodyBlobView) -> BlobToolRecord:
+    """Project the deferred-custody view as the ready row it will settle to.
+
+    Field-for-field the row :func:`persist_inline_custody_blob_on_connection`
+    inserts at the atomic staging settlement (elspeth-282f392fae): the view
+    is built by the same normalization and storage-path derivation, so this
+    projection and the settled row cannot disagree.
+    """
+    return {
+        "id": pending.blob_id,
+        "session_id": pending.session_id,
+        "filename": pending.filename,
+        "mime_type": pending.mime_type,
+        "size_bytes": pending.size_bytes,
+        "content_hash": pending.content_hash,
+        "storage_path": pending.storage_path,
+        "created_by": "assistant",
+        "source_description": pending.source_description,
+        "status": "ready",
+        "creation_modality": pending.creation_modality,
+        "created_from_message_id": pending.created_from_message_id,
+        "creating_model_identifier": pending.creating_model_identifier,
+        "creating_model_version": pending.creating_model_version,
+        "creating_provider": pending.creating_provider,
+        "creating_composer_skill_hash": pending.creating_composer_skill_hash,
+        "creating_arguments_hash": pending.creating_arguments_hash,
+    }
+
+
 def _resolve_source_blob(
     *,
     blob_id: str,
@@ -427,6 +457,17 @@ def _resolve_source_blob(
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
     blob = _sync_get_blob(session_engine, blob_id, session_id)
+    # Deferred inline custody (elspeth-282f392fae): the planner's custody-safe
+    # revalidation runs BEFORE the atomic staging settlement materializes the
+    # blob, so the one blob this plan will settle is resolvable from the
+    # server-derived view on the context. Exact blob_id AND session_id match
+    # only; any other reference keeps the fail-closed database verdict, and a
+    # row that already exists (idempotent replay) stays authoritative.
+    pending_content: bytes | None = None
+    pending = context._pending_custody
+    if blob is None and pending is not None and pending.blob_id == blob_id and pending.session_id == session_id:
+        blob = _pending_custody_tool_record(pending)
+        pending_content = pending.content
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")
 
@@ -459,7 +500,15 @@ def _resolve_source_blob(
         # custody lock: an unlocked read racing update_blob's in-transaction
         # file swap pairs the stale committed hash with the new bytes and
         # escalates a false BlobIntegrityError (elspeth-3d1d1fcb6c).
-        fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob_id)
+        # A deferred-custody resolution has no row or file to lock yet; the
+        # view IS the single version (content and hash derived together
+        # server-side), so it satisfies the same one-version guarantee.
+        fresh_blob: BlobToolRecord | None
+        data: bytes | None
+        if pending_content is not None:
+            fresh_blob, data = blob, pending_content
+        else:
+            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob_id)
         if fresh_blob is None:
             return _failure_result(state, f"Blob '{blob_id}' not found.")
         if fresh_blob["status"] != "ready":

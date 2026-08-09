@@ -30,12 +30,15 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.blobs.service import (
     BlobServiceImpl,
+    _normalized_inline_custody_fields,
     content_hash,
     inline_custody_blob_id,
+    inline_custody_storage_path,
     persist_inline_custody_blob_on_connection,
     sanitize_filename,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
+from elspeth.web.composer.tools._common import PendingCustodyBlobView
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
@@ -291,6 +294,51 @@ def finalize_pipeline_custody_on_connection(
     )
     if str(row.id) != str(preparation.blob_id):
         raise AuditIntegrityError("Inline custody settled a blob id different from the prepared proposal")
+
+
+def pending_custody_blob_view(
+    preparation: PipelineCustodyPreparation,
+    *,
+    data_dir: str | Path,
+) -> PendingCustodyBlobView:
+    """Settlement-equivalent view of the one blob this plan defers.
+
+    Guided-full defers :func:`finalize_pipeline_custody_on_connection` into
+    the atomic staging settlement, so at custody-safe revalidation time the
+    rewritten ``source.blob_id`` names a blob with no row and no file yet
+    (elspeth-282f392fae). This derives every field the resolver needs through
+    the SAME normalization and storage-path formula the settlement insert
+    uses, so the sealed candidate state and the eventually-settled row cannot
+    disagree.
+    """
+    if type(preparation) is not PipelineCustodyPreparation:
+        raise TypeError("preparation must be an exact PipelineCustodyPreparation")
+    fields = _normalized_inline_custody_fields(preparation.request)
+    blob_id = str(preparation.blob_id)
+    storage = inline_custody_storage_path(
+        Path(data_dir),
+        session_id=fields["session_id"],
+        blob_id=blob_id,
+        filename=fields["filename"],
+    )
+    return PendingCustodyBlobView(
+        blob_id=blob_id,
+        session_id=fields["session_id"],
+        filename=fields["filename"],
+        mime_type=fields["mime_type"],
+        size_bytes=len(preparation.request.content),
+        content_hash=content_hash(preparation.request.content),
+        storage_path=str(storage),
+        source_description=fields["source_description"],
+        creation_modality=fields["creation_modality"].value,
+        created_from_message_id=fields["created_from_message_id"],
+        creating_model_identifier=fields["creating_model_identifier"],
+        creating_model_version=fields["creating_model_version"],
+        creating_provider=fields["creating_provider"],
+        creating_composer_skill_hash=fields["creating_composer_skill_hash"],
+        creating_arguments_hash=fields["creating_arguments_hash"],
+        content=preparation.request.content,
+    )
 
 
 async def finalize_pipeline_custody(

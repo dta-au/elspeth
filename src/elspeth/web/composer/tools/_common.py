@@ -2710,6 +2710,61 @@ class ReviewedSourceAuthority:
 
 
 @dataclass(frozen=True, slots=True)
+class PendingCustodyBlobView:
+    """One deferred inline-custody blob, resolvable before it is settled.
+
+    Guided-full defers inline-custody finalization into the atomic staging
+    settlement (elspeth-1e3ad83d89), so at custody-safe revalidation time the
+    proposal's ``source.blob_id`` names a blob with no row and no storage
+    file yet. This view carries the settlement-equivalent row fields plus the
+    content bytes so ``_resolve_source_blob`` can resolve exactly that one
+    blob (elspeth-282f392fae). Every field is derived server-side from the
+    planner's own ``PipelineCustodyPreparation`` — never from tool arguments —
+    and resolution requires an exact ``blob_id`` AND ``session_id`` match; any
+    other reference falls through to the normal fail-closed database path.
+    """
+
+    blob_id: str
+    session_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    content_hash: str
+    storage_path: str
+    source_description: str | None
+    creation_modality: str
+    created_from_message_id: str
+    creating_model_identifier: str | None
+    creating_model_version: str | None
+    creating_provider: str | None
+    creating_composer_skill_hash: str | None
+    creating_arguments_hash: str | None
+    content: bytes
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not str or not self.blob_id:
+            raise TypeError("PendingCustodyBlobView.blob_id must be a non-empty exact string")
+        if type(self.session_id) is not str or not self.session_id:
+            raise TypeError("PendingCustodyBlobView.session_id must be a non-empty exact string")
+        if type(self.filename) is not str or not self.filename:
+            raise TypeError("PendingCustodyBlobView.filename must be a non-empty exact string")
+        if type(self.mime_type) is not str or not self.mime_type:
+            raise TypeError("PendingCustodyBlobView.mime_type must be a non-empty exact string")
+        if type(self.content_hash) is not str or not self.content_hash:
+            raise TypeError("PendingCustodyBlobView.content_hash must be a non-empty exact string")
+        if type(self.storage_path) is not str or not self.storage_path:
+            raise TypeError("PendingCustodyBlobView.storage_path must be a non-empty exact string")
+        if type(self.creation_modality) is not str or not self.creation_modality:
+            raise TypeError("PendingCustodyBlobView.creation_modality must be a non-empty exact string")
+        if type(self.size_bytes) is not int or self.size_bytes < 0:
+            raise TypeError("PendingCustodyBlobView.size_bytes must be a non-negative exact integer")
+        if type(self.content) is not bytes:
+            raise TypeError("PendingCustodyBlobView.content must be exact bytes")
+        if len(self.content) != self.size_bytes:
+            raise ValueError("PendingCustodyBlobView.size_bytes must equal len(content)")
+
+
+@dataclass(frozen=True, slots=True)
 class ToolContext:
     """Immutable per-call context threaded through every ``execute_tool``
     dispatch.
@@ -2807,6 +2862,12 @@ class ToolContext:
     reviewed_source_authority: ReviewedSourceAuthority | None = None
     executing_proposal_id: str | None = None
     _interpretation_requirements_are_internal: bool = False
+    # Private server-owned field, set ONLY by the planner's deferred
+    # custody-safe revalidation (elspeth-282f392fae): the one inline-custody
+    # blob this plan will settle atomically at staging. _resolve_source_blob
+    # may resolve exactly this blob_id/session_id pair from the view; every
+    # other blob reference keeps the fail-closed database path.
+    _pending_custody: PendingCustodyBlobView | None = None
 
 
 ToolHandler = Callable[

@@ -4582,16 +4582,6 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AuditIntegrityError,
-    reason=(
-        "elspeth-282f392fae: the deferred blob is not materialized until "
-        "settlement, so the custody-safe revalidation rejects its blob_id "
-        "with Blob-not-found and the planner escalates AuditIntegrityError. "
-        "Remove this marker with the fix."
-    ),
-)
 async def test_defer_finalize_carries_custody_preparation_and_writes_no_blob_mid_plan(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -4630,6 +4620,67 @@ async def test_defer_finalize_carries_custody_preparation_and_writes_no_blob_mid
     with engine.begin() as conn:
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
     assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
+async def test_pending_custody_view_resolves_only_its_exact_blob_id(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    # elspeth-282f392fae fail-closed pin: the deferred-custody view may stand
+    # in for exactly the one blob this plan settles. Any OTHER blob_id keeps
+    # the database verdict — with no row, that is a rejection.
+    from dataclasses import replace as dc_replace
+    from uuid import uuid4
+
+    from elspeth.web.composer.pipeline_custody import pending_custody_blob_view
+    from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate
+
+    engine, origin = await _session_context()
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        originating_message=origin,
+        custody_config=PlannerCustodyConfig(
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            max_storage_per_session=1_000_000,
+            secret_service=None,
+            runtime_preflight=None,
+            defer_finalize=True,
+        ),
+    )
+    assert result.custody_preparation is not None
+    view = pending_custody_blob_view(result.custody_preparation, data_dir=str(tmp_path))
+
+    full_catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+    context = ToolContext(
+        catalog=PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot),
+        plugin_snapshot=plugin_snapshot,
+        data_dir=str(tmp_path),
+        session_engine=engine,
+        session_id=origin.session_id,
+        _interpretation_requirements_are_internal=True,
+        _pending_custody=view,
+    )
+    safe_pipeline = deep_thaw(result.custody_preparation.arguments)
+
+    matching = build_set_pipeline_candidate(safe_pipeline, _empty_state(), context)
+    assert matching.acceptable
+
+    foreign = deepcopy(safe_pipeline)
+    foreign["source"]["blob_id"] = str(uuid4())
+    mismatched = build_set_pipeline_candidate(foreign, _empty_state(), context)
+    assert not mismatched.acceptable
+    assert "not found" in mismatched.result.data["error"]
+
+    wrong_session = dc_replace(context, _pending_custody=dc_replace(view, session_id=str(uuid4())))
+    rejected = build_set_pipeline_candidate(safe_pipeline, _empty_state(), wrong_session)
+    assert not rejected.acceptable
+    assert "not found" in rejected.result.data["error"]
 
 
 @pytest.mark.asyncio

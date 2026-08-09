@@ -180,6 +180,18 @@ def _active_run_pipeline_dict(active_run: Any) -> dict[str, Any]:
     )
 
 
+def inline_custody_storage_path(data_dir: Path, *, session_id: str, blob_id: str, filename: str) -> Path:
+    """Derive the storage path an inline-custody blob settles to.
+
+    ONE formula shared by :func:`persist_inline_custody_blob_on_connection`
+    (which writes the file at settlement) and the planner's deferred
+    ``PendingCustodyBlobView`` (which must predict the identical path at
+    custody-safe revalidation time, elspeth-282f392fae). Deriving it twice
+    is how the sealed candidate state and the settled blob row drift apart.
+    """
+    return data_dir.expanduser().resolve() / "blobs" / session_id / f"{blob_id}_{filename}"
+
+
 def content_hash(data: bytes) -> str:
     """Compute SHA-256 hex digest of raw content bytes.
 
@@ -1078,7 +1090,7 @@ def persist_inline_custody_blob_on_connection(
     fields = _normalized_inline_custody_fields(request)
     blob_id = str(inline_custody_blob_id(request))
     session_id = fields["session_id"]
-    storage = data_dir.expanduser().resolve() / "blobs" / session_id / f"{blob_id}_{fields['filename']}"
+    storage = inline_custody_storage_path(data_dir, session_id=session_id, blob_id=blob_id, filename=fields["filename"])
     expected: _ExpectedBlobFields = {
         "session_id": session_id,
         "filename": fields["filename"],

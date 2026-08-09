@@ -63,6 +63,7 @@ from elspeth.web.composer.llm_response_parsing import (
 from elspeth.web.composer.pipeline_custody import (
     PipelineCustodyPreparation,
     finalize_pipeline_custody,
+    pending_custody_blob_view,
     prepare_pipeline_custody,
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, ProposalBase, reviewed_anchor_hash
@@ -88,7 +89,7 @@ from elspeth.web.composer.state import (
     gate_condition_is_constant,
     route_destination_facts,
 )
-from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
+from elspeth.web.composer.tools._common import PendingCustodyBlobView, RuntimePreflight, ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
     get_tool_definitions,
@@ -2140,12 +2141,20 @@ async def _build_valid_pipeline_plan(
             session_id=originating_message.session_id,
             max_storage_per_session=custody_config.max_storage_per_session,
         )
+        pending_custody_view: PendingCustodyBlobView | None = None
         if custody_config.defer_finalize:
             # The blob row's lineage FK needs the originating chat message,
             # which this surface inserts only inside the atomic staging
             # settlement — carry the preparation there instead of violating
-            # the FK here (elspeth-1e3ad83d89).
+            # the FK here (elspeth-1e3ad83d89). The revalidation below must
+            # still resolve the rewritten blob_id, so hand it the
+            # settlement-equivalent view of this one blob
+            # (elspeth-282f392fae).
             custody_preparation = preparation
+            pending_custody_view = pending_custody_blob_view(
+                preparation,
+                data_dir=custody_config.data_dir,
+            )
         else:
             await _await_custody_settlement(
                 finalize_pipeline_custody(
@@ -2161,6 +2170,7 @@ async def _build_valid_pipeline_plan(
             terminal_context,
             tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(safe_pipeline)}),
             _interpretation_requirements_are_internal=True,
+            _pending_custody=pending_custody_view,
         )
         safe_candidate = await run_sync(
             build_set_pipeline_candidate,
