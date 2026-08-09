@@ -268,6 +268,16 @@ installer's task/execution policies. The boundary permits only the package
 runtime surfaces, including destination foundation models needed by the exact
 cross-region Bedrock inference-profile inputs. Its four Scenario C bootstrap
 inputs are optional as a group: leave all four empty for an A/B-only install.
+
+If the task-role trust policy or permissions-boundary ARN changes, Terraform
+replaces both fixed-name ECS roles and their dependent inline and managed
+policy bindings instead of calling the IAM update APIs denied to the lifecycle
+principal. Replacement is destroy-before-create because the role names are
+fixed, so apply this maintenance change only when a brief role interruption is
+acceptable. Do not grant `iam:UpdateAssumeRolePolicy`,
+`iam:PutRolePermissionsBoundary`, or `iam:DeleteRolePermissionsBoundary` to
+avoid that replacement.
+
 Before a Scenario C bootstrap, set all four to the repository and exact
 commercial-partition, Region, and account secret ARNs used by `scenario-c`
 (partial input is rejected):

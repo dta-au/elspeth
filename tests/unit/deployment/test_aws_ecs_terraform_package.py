@@ -72,6 +72,7 @@ EXPECTED_FILES = {
     "scenario-a/.terraform.lock.hcl",
     "scenario-a/codeblind-compatibility.json",
     "scenario-a/codeblind.tftest.hcl",
+    "scenario-a/iam_role_replacement.tftest.hcl",
     "scenario-a/web_policy.tftest.hcl",
     "scenario-a/main.tf",
     "scenario-a/outputs.tf",
@@ -2141,7 +2142,14 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         assert "iam_permissions_boundary_arn" in example
         assert "iam_lifecycle_aws_profile" in example
     iam = _text("modules/scenario/iam_observability.tf")
-    assert iam.count("permissions_boundary = var.iam_permissions_boundary_arn") == 2
+    for role_name in ("task", "execution"):
+        role = re.search(
+            rf'resource "aws_iam_role" "{role_name}" \{{(?P<body>.*?)(?=\nresource )',
+            iam,
+            re.DOTALL,
+        )
+        assert role is not None
+        assert "permissions_boundary = var.iam_permissions_boundary_arn" in role.group("body")
     assert '"${aws_cloudwatch_log_group.operator.arn}:log-stream:*"' in iam
     network = _text("modules/scenario/network.tf")
     for resource_type, name in (
@@ -2460,6 +2468,77 @@ def test_scenario_a_native_mock_plans_use_only_documented_minimal_inputs(initial
     assert "codeblind.tftest.hcl" in result.stdout
     assert "web_policy.tftest.hcl" in result.stdout
     assert "Success!" in result.stdout
+
+
+def test_iam_role_contract_drift_replaces_roles_and_dependent_policies(
+    initialized_terraform_package: Path,
+) -> None:
+    scenario_a = initialized_terraform_package / "scenario-a"
+    test_file = scenario_a / "iam_role_replacement.tftest.hcl"
+    assert test_file.is_file()
+
+    result = subprocess.run(
+        [
+            "terraform",
+            f"-chdir={scenario_a}",
+            "test",
+            "-filter=iam_role_replacement.tftest.hcl",
+            "-json",
+            "-verbose",
+            "-no-color",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+    plans = [event["test_plan"] for event in events if event.get("type") == "test_plan"]
+    assert len(plans) == 1
+    changes = {change["address"]: change for change in plans[0]["resource_changes"]}
+    expected_replacements = {
+        "module.scenario.aws_iam_role.execution",
+        "module.scenario.aws_iam_role.task",
+        "module.scenario.aws_iam_role_policy.execution_secrets",
+        "module.scenario.aws_iam_role_policy.task",
+        "module.scenario.aws_iam_role_policy_attachment.execution_managed",
+    }
+    assert expected_replacements.issubset(changes)
+    for address in expected_replacements:
+        assert changes[address]["change"]["actions"] == ["delete", "create"]
+        assert changes[address]["action_reason"] == "replace_by_triggers"
+
+
+def test_iam_role_replacement_trigger_binds_the_complete_role_contract() -> None:
+    iam = _text("modules/scenario/iam_observability.tf")
+    trigger = re.search(
+        r'resource "terraform_data" "iam_role_contract" \{(?P<body>.*?\n)\}',
+        iam,
+        re.DOTALL,
+    )
+    assert trigger is not None
+    trigger_body = trigger.group("body")
+    assert "data.aws_iam_policy_document.ecs_tasks_assume.json" in trigger_body
+    assert "var.iam_permissions_boundary_arn" in trigger_body
+
+    for resource_type, name in (
+        ("aws_iam_role", "task"),
+        ("aws_iam_role", "execution"),
+        ("aws_iam_role_policy_attachment", "execution_managed"),
+        ("aws_iam_role_policy", "execution_secrets"),
+        ("aws_iam_role_policy", "task"),
+    ):
+        resource = re.search(
+            rf'resource "{resource_type}" "{name}" \{{(?P<body>.*?)(?=\nresource |\ndata |\nlocals |\Z)',
+            iam,
+            re.DOTALL,
+        )
+        assert resource is not None
+        body = resource.group("body")
+        assert "replace_triggered_by = [terraform_data.iam_role_contract]" in body
+        assert "create_before_destroy" not in body
 
 
 def test_scenario_c_native_mock_plans_enforce_the_gateway_contract(initialized_terraform_package: Path) -> None:

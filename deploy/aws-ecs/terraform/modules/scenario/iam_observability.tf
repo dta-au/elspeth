@@ -24,6 +24,24 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
   }
 }
 
+# The lifecycle principal may create and delete these exact run roles, but it
+# is deliberately denied the two provider update paths that could widen role
+# trust or swap the permissions boundary. Reify the complete role contract as
+# Terraform lifecycle state so a legitimate contract change replaces the
+# roles and their IAM children instead of selecting either forbidden in-place
+# API. The fixed role names require destroy-before-create ordering.
+resource "terraform_data" "iam_role_contract" {
+  input = {
+    assume_role_policy   = data.aws_iam_policy_document.ecs_tasks_assume.json
+    permissions_boundary = var.iam_permissions_boundary_arn
+  }
+
+  triggers_replace = [
+    data.aws_iam_policy_document.ecs_tasks_assume.json,
+    var.iam_permissions_boundary_arn,
+  ]
+}
+
 resource "aws_iam_role" "task" {
   name                 = "${local.namespace}-task-role"
   path                 = "/elspeth/${var.run_id}/"
@@ -32,6 +50,10 @@ resource "aws_iam_role" "task" {
   permissions_boundary = var.iam_permissions_boundary_arn
 
   tags = local.tags
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.iam_role_contract]
+  }
 }
 
 resource "aws_iam_role" "execution" {
@@ -42,11 +64,19 @@ resource "aws_iam_role" "execution" {
   permissions_boundary = var.iam_permissions_boundary_arn
 
   tags = local.tags
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.iam_role_contract]
+  }
 }
 
 resource "aws_iam_role_policy_attachment" "execution_managed" {
   role       = aws_iam_role.execution.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.iam_role_contract]
+  }
 }
 
 data "aws_iam_policy_document" "execution_secrets" {
@@ -74,6 +104,10 @@ resource "aws_iam_role_policy" "execution_secrets" {
   name   = "${local.namespace}-execution-secrets"
   role   = aws_iam_role.execution.id
   policy = data.aws_iam_policy_document.execution_secrets.json
+
+  lifecycle {
+    replace_triggered_by = [terraform_data.iam_role_contract]
+  }
 }
 
 data "aws_iam_policy_document" "task" {
@@ -195,6 +229,8 @@ resource "aws_iam_role_policy" "task" {
   # intermittently at runtime depending on which destination region a geography profile
   # routed to. Fail the plan instead and say exactly how to resolve it.
   lifecycle {
+    replace_triggered_by = [terraform_data.iam_role_contract]
+
     precondition {
       condition = length(local.bedrock_unclassified_model_ids) == 0
       error_message = format(
