@@ -378,7 +378,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                         violations.append(
                             DictViolation(
                                 file=relative_path,
-                                line=arg.lineno if hasattr(arg, "lineno") else node.lineno,
+                                line=arg.lineno,
                                 context=context,
                                 param_name=param_name,
                             )
@@ -392,7 +392,7 @@ def find_dict_violations(file_path: Path, whitelist: set[str], matched_entries: 
                         violations.append(
                             DictViolation(
                                 file=relative_path,
-                                line=arg.lineno if hasattr(arg, "lineno") else node.lineno,
+                                line=arg.lineno,
                                 context=context,
                                 param_name=f"{param_name} (list)",
                             )

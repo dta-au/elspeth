@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 import re
 import subprocess
@@ -298,23 +297,9 @@ def make_codex_rate_limiter(rate_limit: int | None) -> AsyncRequestRateLimiter |
     return AsyncRequestRateLimiter(max_calls=rate_limit)
 
 
-async def _await_rate_limiter(rate_limiter: Any) -> None:
-    """Acquire a rate-limit slot, preferring the shared async wrapper API."""
-    acquire = getattr(rate_limiter, "acquire", None)
-    if acquire is not None:
-        acquired = acquire()
-        if inspect.isawaitable(acquired):
-            await acquired
-        return
-
-    acquire_async = getattr(rate_limiter, "try_acquire_async", None)
-    if acquire_async is not None:
-        await acquire_async("codex_api")
-        return
-
-    acquired = rate_limiter.try_acquire("codex_api")
-    if asyncio.iscoroutine(acquired):
-        await acquired
+async def _await_rate_limiter(rate_limiter: AsyncRequestRateLimiter) -> None:
+    """Acquire a slot from the owned Codex subprocess rate limiter."""
+    await rate_limiter.acquire()
 
 
 async def append_log(
@@ -693,7 +678,7 @@ async def run_codex_with_retry_and_logging(
     log_lock: asyncio.Lock,
     file_display: str,
     output_display: str,
-    rate_limiter: Any | None,
+    rate_limiter: AsyncRequestRateLimiter | None,
     evidence_gate_summary_prefix: str = "",
     output_schema: Path | None = None,
     structured_markdown_field: str | None = None,

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import UserDict
 from pathlib import Path
 from typing import Any
 
 import litellm
 import pytest
+from litellm.types.utils import Message
 from scripts.skill_rgr import harness
 
 
@@ -26,6 +28,20 @@ class _FakeChoice:
 class _FakeResponse:
     def __init__(self, payload: dict[str, Any]) -> None:
         self.choices = [_FakeChoice(payload)]
+
+
+class _MessageChoice:
+    def __init__(self, message: object) -> None:
+        self.message = message
+
+
+class _MessageResponse:
+    def __init__(self, message: object) -> None:
+        self.choices = [_MessageChoice(message)]
+
+
+class _DictSubclass(dict[str, Any]):
+    pass
 
 
 def test_run_scenario_rejects_malformed_tool_call_arguments(
@@ -121,3 +137,104 @@ def test_run_scenario_pins_sampling_controls(
     assert captured_kwargs["temperature"] == 0
     assert captured_kwargs["seed"] == 0
     assert captured_kwargs["drop_params"] is True
+
+
+def test_run_scenario_accepts_a_real_litellm_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(harness, "TRANSCRIPTS_DIR", tmp_path)
+    monkeypatch.setattr(harness, "get_tool_definitions", lambda: [])
+    message = Message(content="done", role="assistant")
+    monkeypatch.setattr(litellm, "completion", lambda **_kwargs: _MessageResponse(message))
+    scenario = harness.Scenario(name="real-message", user_prompt="compose", max_turns=1)
+
+    transcript = harness.run_scenario(
+        scenario,
+        skill_text="system",
+        model="test-model",
+        label="red",
+    )
+
+    assert transcript[-1]["role"] == "assistant"
+    assert transcript[-1]["content"] == "done"
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        [],
+        _DictSubclass(role="assistant", content="done"),
+        {1: "non-string-key", "role": "assistant", "content": "done"},
+    ],
+)
+def test_run_scenario_rejects_a_non_exact_dict_message_dump(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    malformed: object,
+) -> None:
+    class MalformedMessage:
+        def model_dump(self) -> object:
+            return malformed
+
+    monkeypatch.setattr(harness, "TRANSCRIPTS_DIR", tmp_path)
+    monkeypatch.setattr(harness, "get_tool_definitions", lambda: [])
+    monkeypatch.setattr(litellm, "completion", lambda **_kwargs: _MessageResponse(MalformedMessage()))
+    scenario = harness.Scenario(name="malformed-message", user_prompt="compose", max_turns=1)
+
+    with pytest.raises(TypeError, match="model_dump must return an exact dict"):
+        harness.run_scenario(
+            scenario,
+            skill_text="system",
+            model="test-model",
+            label="red",
+        )
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {"role": "user", "content": "not an assistant"},
+        {"role": "assistant", "content": "done", "turn": 999},
+    ],
+)
+def test_run_scenario_rejects_message_fields_that_override_owned_transcript_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    malformed: dict[str, Any],
+) -> None:
+    class MalformedMessage:
+        def model_dump(self) -> dict[str, Any]:
+            return malformed
+
+    monkeypatch.setattr(harness, "TRANSCRIPTS_DIR", tmp_path)
+    monkeypatch.setattr(harness, "get_tool_definitions", lambda: [])
+    monkeypatch.setattr(litellm, "completion", lambda **_kwargs: _MessageResponse(MalformedMessage()))
+    scenario = harness.Scenario(name="override-message", user_prompt="compose", max_turns=1)
+
+    with pytest.raises(TypeError, match="assistant role without a reserved turn"):
+        harness.run_scenario(
+            scenario,
+            skill_text="system",
+            model="test-model",
+            label="red",
+        )
+
+
+def test_run_scenario_does_not_admit_a_mapping_without_model_dump(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    message = UserDict({"role": "assistant", "content": "done", "tool_calls": []})
+    monkeypatch.setattr(harness, "TRANSCRIPTS_DIR", tmp_path)
+    monkeypatch.setattr(harness, "get_tool_definitions", lambda: [])
+    monkeypatch.setattr(litellm, "completion", lambda **_kwargs: _MessageResponse(message))
+    scenario = harness.Scenario(name="mapping-message", user_prompt="compose", max_turns=1)
+
+    with pytest.raises(AttributeError, match="model_dump"):
+        harness.run_scenario(
+            scenario,
+            skill_text="system",
+            model="test-model",
+            label="red",
+        )

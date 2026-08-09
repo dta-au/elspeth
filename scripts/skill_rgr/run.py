@@ -14,9 +14,9 @@ Environment:
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,26 +27,81 @@ sys.path.insert(0, str(_HARNESS_ROOT))
 sys.path.insert(0, str(_HARNESS_ROOT / "scenarios"))
 
 
+def _load_batch1() -> Any:
+    from scenarios.batch1 import BATCH1  # type: ignore[import-not-found]
+
+    return BATCH1
+
+
+def _load_batch1_pressured() -> Any:
+    from scenarios.batch1_pressured import BATCH1_PRESSURED  # type: ignore[import-not-found]
+
+    return BATCH1_PRESSURED
+
+
+def _load_batch1_refactor_incomplete() -> Any:
+    from scenarios.batch1_refactor_incomplete import BATCH1_REFACTOR_INCOMPLETE  # type: ignore[import-not-found]
+
+    return BATCH1_REFACTOR_INCOMPLETE
+
+
+def _load_batch1_refactor_insist() -> Any:
+    from scenarios.batch1_refactor_insist import BATCH1_REFACTOR_INSIST  # type: ignore[import-not-found]
+
+    return BATCH1_REFACTOR_INSIST
+
+
+def _load_batch1_refactor_override() -> Any:
+    from scenarios.batch1_refactor_override import BATCH1_REFACTOR_OVERRIDE  # type: ignore[import-not-found]
+
+    return BATCH1_REFACTOR_OVERRIDE
+
+
+def _load_batch3_bootstrap() -> Any:
+    from scenarios.batch3_bootstrap import BATCH3_BOOTSTRAP  # type: ignore[import-not-found]
+
+    return BATCH3_BOOTSTRAP
+
+
+def _load_batch3_contract_loop() -> Any:
+    from scenarios.batch3_contract_loop import BATCH3_CONTRACT_LOOP  # type: ignore[import-not-found]
+
+    return BATCH3_CONTRACT_LOOP
+
+
+def _load_batch3_contract_loop_insist() -> Any:
+    from scenarios.batch3_contract_loop_insist import BATCH3_CONTRACT_LOOP_INSIST  # type: ignore[import-not-found]
+
+    return BATCH3_CONTRACT_LOOP_INSIST
+
+
+def _load_calibration() -> Any:
+    from scenarios.calibration import CALIBRATION  # type: ignore[import-not-found]
+
+    return CALIBRATION
+
+
+_SCENARIO_LOADERS: dict[str, Callable[[], Any]] = {
+    "batch1": _load_batch1,
+    "batch1_pressured": _load_batch1_pressured,
+    "batch1_refactor_incomplete": _load_batch1_refactor_incomplete,
+    "batch1_refactor_insist": _load_batch1_refactor_insist,
+    "batch1_refactor_override": _load_batch1_refactor_override,
+    "batch3_bootstrap": _load_batch3_bootstrap,
+    "batch3_contract_loop": _load_batch3_contract_loop,
+    "batch3_contract_loop_insist": _load_batch3_contract_loop_insist,
+    "calibration": _load_calibration,
+}
+
+
 def _load_scenario(name: str) -> Any:
-    """Load the scenario object by name from ``scenarios/<name>.py``.
-
-    The scenario module is expected to expose a single uppercase
-    constant matching the module name (e.g. ``CALIBRATION`` in
-    ``scenarios/calibration.py``).
-    """
-
-    module = importlib.import_module(f"scenarios.{name}")
-    expected = name.upper()
-    if not hasattr(module, expected):
-        # Fall back to the first Scenario instance found.
-        from harness import Scenario  # type: ignore[import-not-found]
-
-        for attr in dir(module):
-            obj = getattr(module, attr)
-            if isinstance(obj, Scenario):
-                return obj
-        raise AttributeError(f"No Scenario found in scenarios.{name}")
-    return getattr(module, expected)
+    """Load one scenario from the closed registry without eager imports."""
+    try:
+        loader = _SCENARIO_LOADERS[name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_SCENARIO_LOADERS))
+        raise ValueError(f"Unknown scenario {name!r}; choose one of: {supported}") from exc
+    return loader()
 
 
 def main() -> int:
@@ -79,7 +134,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    from harness import evaluate, load_skill, run_scenario
+    from harness import evaluate, load_skill, run_scenario  # type: ignore[import-not-found]
 
     scenario = _load_scenario(args.scenario)
     skill_text = load_skill(override_path=Path(args.skill)) if args.skill else load_skill()

@@ -1,5 +1,6 @@
 """Tests for contracts enforcement script."""
 
+import inspect
 from pathlib import Path
 from unittest.mock import patch
 
@@ -366,6 +367,38 @@ def build(payload: dict[str, typing.Any]) -> dict[str, typing.Any]:
         f"{test_file}:build:payload",
         f"{test_file}:build:return",
     ]
+
+
+def test_dict_pattern_guard_reports_parameter_annotation_lines(tmp_path: Path) -> None:
+    test_file = tmp_path / "parameter_lines.py"
+    test_file.write_text(
+        "\n".join(
+            [
+                "from typing import Any",
+                "",
+                "def build(",
+                "    payload: dict[str, Any],",
+                "    *,",
+                "    batches: list[dict[str, Any]],",
+                ") -> None:",
+                "    pass",
+                "",
+            ]
+        )
+    )
+
+    violations = find_dict_violations(test_file, whitelist=set(), matched_entries={})
+
+    assert [(violation.param_name, violation.line) for violation in violations] == [
+        ("payload", 4),
+        ("batches (list)", 6),
+    ]
+
+
+def test_dict_pattern_guard_uses_the_owned_ast_arg_contract() -> None:
+    source = inspect.getsource(find_dict_violations)
+
+    assert "hasattr" not in source
 
 
 # =============================================================================

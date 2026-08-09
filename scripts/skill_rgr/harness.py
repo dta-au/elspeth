@@ -215,7 +215,11 @@ def run_scenario(
             drop_params=True,
         )
         choice = resp.choices[0].message
-        msg_dict = choice.model_dump() if hasattr(choice, "model_dump") else dict(choice)
+        msg_dict = choice.model_dump()
+        if type(msg_dict) is not dict or any(type(key) is not str for key in msg_dict):
+            raise TypeError("LiteLLM Message.model_dump must return an exact dict with exact str keys")
+        if msg_dict.get("role") != "assistant" or "turn" in msg_dict:
+            raise TypeError("LiteLLM Message.model_dump must declare the assistant role without a reserved turn")
         transcript.append({"role": "assistant", "turn": turn, **msg_dict})
 
         tool_calls = msg_dict.get("tool_calls") or []

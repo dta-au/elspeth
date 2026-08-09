@@ -15,18 +15,48 @@ Covers two CI/CD fail-open defects:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 
 from scripts.codex_audit_common import (
+    AsyncRequestRateLimiter,
+    _await_rate_limiter,
     exit_code_from_stats,
     generate_summary,
+    make_codex_rate_limiter,
     structured_output_path_for_report,
     write_summary_file,
 )
 
 NO_DEFECT_MARKER = "No concrete bug found"
+
+
+def test_codex_rate_limiter_factory_and_await_helper_share_owned_contract() -> None:
+    now = [0.0]
+    sleeps: list[float] = []
+
+    async def advance_clock(delay: float) -> None:
+        sleeps.append(delay)
+        now[0] += delay
+
+    limiter = AsyncRequestRateLimiter(
+        max_calls=1,
+        period_s=5.0,
+        clock=lambda: now[0],
+        sleep=advance_clock,
+    )
+
+    async def acquire_twice() -> None:
+        await _await_rate_limiter(limiter)
+        await _await_rate_limiter(limiter)
+
+    asyncio.run(acquire_twice())
+
+    assert sleeps == [5.0]
+    assert isinstance(make_codex_rate_limiter(2), AsyncRequestRateLimiter)
+    assert make_codex_rate_limiter(None) is None
 
 
 def _write_report(output_dir: Path, name: str, markdown: str) -> Path:
