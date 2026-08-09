@@ -1673,8 +1673,16 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async sendMessage(content: string, signal?: AbortSignal) {
-    const { activeSessionId } = get();
+    const { activeSessionId, isComposing } = get();
     if (!activeSessionId) return;
+    // Synchronous admission gate (elspeth-3f38ebb1b5): exactly one freeform
+    // compose may be in flight. isComposing is set synchronously below
+    // before any await, so this check cannot race another entry point —
+    // without it Retry / Use-as-input could start a second compose whose
+    // AbortController displaced the first one's, leaving Stop owning only
+    // the newest request. Entry surfaces are disabled while composing;
+    // this gate is the invariant for programmatic callers.
+    if (isComposing) return;
     const recoveryStartedCompositionVersion =
       get().compositionState?.version ?? null;
 
@@ -2190,8 +2198,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
   },
 
   async retryMessage(messageId: string, signal?: AbortSignal) {
-    const { activeSessionId, messages } = get();
+    const { activeSessionId, messages, isComposing } = get();
     if (!activeSessionId) return;
+    // Same synchronous admission gate as sendMessage (elspeth-3f38ebb1b5).
+    if (isComposing) return;
     const recoveryStartedCompositionVersion =
       get().compositionState?.version ?? null;
 

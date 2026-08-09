@@ -2118,6 +2118,107 @@ describe("sessionStore", () => {
     });
   });
 
+  describe("freeform compose admission gate (elspeth-3f38ebb1b5)", () => {
+    // Exactly one freeform compose may be admitted per session: without a
+    // synchronous store-level gate, alternate entry points (Retry on a
+    // failed bubble, Use-as-input in the blob manager) could start a second
+    // compose whose AbortController replaced the first one's — leaving Stop
+    // owning only the newest request.
+    function assistantReply(id: string): {
+      message: ChatMessage;
+      state: null;
+    } {
+      return {
+        message: {
+          id,
+          session_id: "session-1",
+          role: "assistant",
+          content: "done",
+          tool_calls: null,
+          created_at: "2026-08-09T10:00:00Z",
+        },
+        state: null,
+      };
+    }
+
+    it("refuses a second sendMessage while one is in flight", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const first = deferred<{ message: ChatMessage; state: null }>();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        first.promise,
+      );
+
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      const firstSend = useSessionStore.getState().sendMessage("first");
+      await Promise.resolve();
+
+      await useSessionStore.getState().sendMessage("second");
+
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+      const userContents = useSessionStore
+        .getState()
+        .messages.filter((m) => m.role === "user")
+        .map((m) => m.content);
+      expect(userContents).toEqual(["first"]);
+
+      first.resolve(assistantReply("asst-gate-1"));
+      await firstSend;
+      expect(useSessionStore.getState().isComposing).toBe(false);
+    });
+
+    it("refuses retryMessage while a compose is in flight", async () => {
+      const { sendMessage: mockSendMessage, recompose: mockRecompose } =
+        await import("@/api/client");
+      const first = deferred<{ message: ChatMessage; state: null }>();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(
+        first.promise,
+      );
+
+      const failedMessage: ChatMessage = {
+        id: "failed-1",
+        session_id: "session-1",
+        role: "user",
+        content: "previously failed",
+        tool_calls: null,
+        created_at: "2026-08-09T09:59:00Z",
+        local_status: "failed",
+      };
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [failedMessage],
+      });
+      const firstSend = useSessionStore.getState().sendMessage("first");
+      await Promise.resolve();
+
+      await useSessionStore.getState().retryMessage("failed-1");
+
+      expect(mockRecompose).not.toHaveBeenCalled();
+      // The failed message must not have been flipped to pending by a
+      // refused retry.
+      expect(
+        useSessionStore
+          .getState()
+          .messages.find((m) => m.id === "failed-1")?.local_status,
+      ).toBe("failed");
+
+      first.resolve(assistantReply("asst-gate-2"));
+      await firstSend;
+    });
+
+    it("admits a new compose after the previous settles (control)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(assistantReply("asst-gate-3"))
+        .mockResolvedValueOnce(assistantReply("asst-gate-4"));
+
+      useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+      await useSessionStore.getState().sendMessage("first");
+      await useSessionStore.getState().sendMessage("second");
+
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("renameSession", () => {
     it("persists a trimmed title and updates the matching session", async () => {
       const apiClient = await import("@/api/client");

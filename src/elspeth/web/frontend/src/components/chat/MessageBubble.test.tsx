@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MessageBubble } from "./MessageBubble";
 import type { ChatMessage, CompositionProposal } from "@/types/api";
@@ -82,6 +82,24 @@ describe("MessageBubble", () => {
       );
       expect(screen.getByText("Retry")).toBeInTheDocument();
       expect(screen.getByText("The AI service is temporarily unavailable. Please try again in a moment.")).toBeInTheDocument();
+    });
+
+    it("disables Retry while a compose is active (elspeth-3f38ebb1b5)", () => {
+      // Retry is a compose entry point: while one freeform compose is in
+      // flight it must not admit a second (the store gate refuses it, and
+      // the affordance must say so).
+      const onRetry = vi.fn();
+      render(
+        <MessageBubble
+          message={makeMessage({ local_status: "failed" })}
+          isComposing={true}
+          onRetry={onRetry}
+        />,
+      );
+      const retry = screen.getByRole("button", { name: "Retry" });
+      expect(retry).toBeDisabled();
+      fireEvent.click(retry);
+      expect(onRetry).not.toHaveBeenCalled();
     });
 
     it("shows default error when local_error is absent", () => {

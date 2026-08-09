@@ -24,6 +24,9 @@ interface BlobRowProps {
   onDownload: (blobId: string) => void;
   onDelete: (blobId: string) => void;
   onUseAsInput: (blob: BlobMetadata) => void;
+  /** Disables the Use-as-input compose entry point while a freeform compose
+   *  is in flight (elspeth-3f38ebb1b5). Preview/download/delete stay live. */
+  useAsInputDisabled?: boolean;
 }
 
 function formatBytes(bytes: number): string {
@@ -75,7 +78,14 @@ function statusIndicator(status: string): {
   }
 }
 
-export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }: BlobRowProps) {
+export function BlobRow({
+  blob,
+  sessionId,
+  onDownload,
+  onDelete,
+  onUseAsInput,
+  useAsInputDisabled = false,
+}: BlobRowProps) {
   const status = statusIndicator(blob.status);
   const creatorLabel = creatorBadgeLabel(blob.created_by);
   const normalizedMimeType = normalizeMimeType(blob.mime_type);
@@ -200,6 +210,7 @@ export function BlobRow({ blob, sessionId, onDownload, onDelete, onUseAsInput }:
                 title="Use as pipeline input"
                 aria-label={`Use ${blob.filename} as input`}
                 className="blob-action-btn"
+                disabled={useAsInputDisabled}
               >
                 <Icon name="play" />
               </button>

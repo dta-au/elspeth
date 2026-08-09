@@ -37,6 +37,10 @@ const CATEGORY_ORDER: BlobCategory[] = ["source", "sink", "other"];
  */
 export function BlobManager({ onUseAsInput }: BlobManagerProps) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  // Use-as-input is a compose entry point: disable it while a freeform
+  // compose is in flight (elspeth-3f38ebb1b5) so the manager cannot offer a
+  // second compose the store admission gate would refuse.
+  const isComposing = useSessionStore((s) => s.isComposing);
   const { blobs, isLoading, error, loadBlobs, uploadBlob, deleteBlob, downloadBlob } =
     useBlobStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -176,6 +180,7 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
                     onDownload={handleDownload}
                     onDelete={handleRequestDelete}
                     onUseAsInput={onUseAsInput}
+                    useAsInputDisabled={isComposing}
                   />
                 ))}
               </div>

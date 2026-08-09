@@ -41,8 +41,14 @@ export function useComposer() {
     [composeTimeoutReady],
   );
 
+  // Admission pre-check (elspeth-3f38ebb1b5): the store's synchronous gate
+  // refuses a second freeform compose, but the refusal must also never touch
+  // activeControllerRef — runComposeWithTimeout installs (then clears) a
+  // fresh controller before the store can refuse, which would leave Stop
+  // owning no controller while the first compose still runs.
   const sendMessage = useCallback(
     async (content: string) => {
+      if (useSessionStore.getState().isComposing) return;
       await runWithTimeout((signal) => storeSendMessage(content, signal));
     },
     [runWithTimeout, storeSendMessage],
@@ -50,6 +56,7 @@ export function useComposer() {
 
   const retryMessage = useCallback(
     async (messageId: string) => {
+      if (useSessionStore.getState().isComposing) return;
       await runWithTimeout((signal) => storeRetryMessage(messageId, signal));
     },
     [runWithTimeout, storeRetryMessage],

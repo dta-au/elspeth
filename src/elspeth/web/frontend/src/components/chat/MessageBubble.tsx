@@ -246,6 +246,10 @@ export function MessageBubble({
               <button
                 onClick={() => onRetry(message.id)}
                 className="message-retry-btn"
+                // Retry is a compose entry point: the store admission gate
+                // (elspeth-3f38ebb1b5) refuses a second compose while one is
+                // in flight, and the affordance must say so.
+                disabled={isComposing}
               >
                 Retry
               </button>

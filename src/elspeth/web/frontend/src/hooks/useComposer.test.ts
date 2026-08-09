@@ -133,4 +133,37 @@ describe("compose timeout ceiling", () => {
     expect(storeSend).toHaveBeenCalledWith("hello", expect.any(AbortSignal));
     expect(storeRetry).toHaveBeenCalledWith("msg-1", expect.any(AbortSignal));
   });
+
+  it("keeps Stop bound to the active compose when a raced entry is refused (elspeth-3f38ebb1b5)", async () => {
+    applyServerComposerTimeout(300);
+    let firstSignal: AbortSignal | undefined;
+    // Mirror the real store contract: the admission gate refuses when a
+    // compose is in flight, and isComposing is set synchronously before any
+    // await.
+    const storeSend = vi.fn(async (_content: string, signal?: AbortSignal) => {
+      if (useSessionStore.getState().isComposing) return;
+      useSessionStore.setState({ isComposing: true });
+      firstSignal = signal;
+      await new Promise<void>((resolve) => {
+        signal?.addEventListener("abort", () => resolve());
+      });
+      useSessionStore.setState({ isComposing: false });
+    });
+    useSessionStore.setState({ composeTimeoutReady: true, sendMessage: storeSend });
+
+    const { result } = renderHook(() => useComposer());
+    const firstPromise = result.current.sendMessage("first");
+    await Promise.resolve();
+
+    // A raced second entry (Retry, Use-as-input) is refused — and the
+    // refusal must NOT displace the first compose's AbortController:
+    // runComposeWithTimeout would otherwise install (then clear) a fresh
+    // controller, leaving Stop a no-op against the running compose.
+    await result.current.sendMessage("second");
+
+    result.current.cancelComposition();
+    expect(firstSignal?.aborted).toBe(true);
+    expect(firstSignal?.reason).toBe(COMPOSE_USER_CANCEL_ABORT_REASON);
+    await firstPromise;
+  });
 });

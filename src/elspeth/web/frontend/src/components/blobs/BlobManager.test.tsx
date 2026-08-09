@@ -97,6 +97,42 @@ describe("BlobManager categorized folders", () => {
   });
 });
 
+describe("BlobManager compose-busy gating (elspeth-3f38ebb1b5)", () => {
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    vi.clearAllMocks();
+  });
+
+  it("disables Use-as-input while a freeform compose is active", async () => {
+    // Use-as-input starts a compose: while one is in flight it must not
+    // offer a second entry point (the store admission gate refuses it; the
+    // affordance must say so).
+    const onUseAsInput = vi.fn();
+    setBlobState([makeBlob({ id: "b1", filename: "data.csv", created_by: "user" })]);
+    useSessionStore.setState({ isComposing: true });
+
+    const user = userEvent.setup();
+    render(<BlobManager onUseAsInput={onUseAsInput} />);
+
+    const useButton = screen.getByRole("button", { name: "Use data.csv as input" });
+    expect(useButton).toBeDisabled();
+    await user.click(useButton).catch(() => undefined);
+    expect(onUseAsInput).not.toHaveBeenCalled();
+  });
+
+  it("keeps Use-as-input enabled when idle (control)", async () => {
+    const onUseAsInput = vi.fn();
+    setBlobState([makeBlob({ id: "b1", filename: "data.csv", created_by: "user" })]);
+    useSessionStore.setState({ isComposing: false });
+
+    const user = userEvent.setup();
+    render(<BlobManager onUseAsInput={onUseAsInput} />);
+
+    await user.click(screen.getByRole("button", { name: "Use data.csv as input" }));
+    expect(onUseAsInput).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("BlobManager delete confirmation (WCAG 3.3.4)", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1" });
