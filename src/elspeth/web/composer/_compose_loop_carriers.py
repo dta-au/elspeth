@@ -311,3 +311,8 @@ class _ClassifyOutcome:
     # driver's ``advisor_checkpoint_passes_used`` after P5, mirroring the
     # P2 ``_TerminateOutcome.advisor_passes_delta`` field.
     advisor_passes_delta: int = 0  # bounded non-negative delta; retries may consume more than one
+    # Staged-review verified-handoff repair (elspeth-85f3cc3022): the P5
+    # staged-handoff branch can spend a repair turn instead of completing
+    # the handoff. Folded into the driver's ``repair_turns_used`` after P5,
+    # mirroring the P2 ``_TerminateOutcome.repair_turns_delta`` field.
+    repair_turns_delta: int = 0  # 0 or 1

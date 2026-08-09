@@ -2614,14 +2614,15 @@ class ComposerServiceImpl:
         only then did /validate fail graph_structure). Re-run the preflight
         with pending interpretation placeholders masked so the structural
         stages actually execute; return the tolerant result when it is
-        invalid so the announce sites can qualify the handoff message. On the
-        STAGED-review handoff (the tool batch terminated on a successful
-        ``request_interpretation_review``) the repair loop is deliberately
-        NOT engaged — that contract returns to the user without extra model
-        turns. The NO-TOOL completion claim is different: there
-        ``_attempt_preflight_repair`` consumes this same verification and
-        repairs the masked failures before the loop may terminate
-        (elspeth-ac85b0ab0e).
+        invalid so the announce sites can qualify the handoff message. Both
+        terminal exits consume this verification through
+        ``_attempt_preflight_repair`` and repair the masked failures before
+        they may complete: the NO-TOOL completion claim (elspeth-ac85b0ab0e,
+        battery round 7 g03) and — for a WIRED state — the STAGED-review
+        handoff (elspeth-85f3cc3022, battery round 8 g03-s1, where the
+        disclosure reached the user but the model never got a repair turn).
+        A verified pure staged handoff still returns to the user without
+        extra model turns (the elspeth-e6ff1b8c13 liveness bound).
         """
         tolerant = await self._cached_runtime_preflight(
             state,
@@ -4750,6 +4751,11 @@ class ComposerServiceImpl:
             # The branch is intentionally narrower than "any review tool
             # succeeded": a review followed by another tool call or a mixed
             # success/error batch is not a terminal user-action boundary.
+            # Surfacing runs BEFORE the repair gate below: it creates the
+            # backend-obligation events (model-choice, auto-staged prompt
+            # template, ...) the downstream orphan gate assumes exist, it is
+            # idempotent, and events match sites by (node, term, kind) — so a
+            # repair turn after it composes fine.
             await self.surface_pending_interpretation_reviews(
                 state,
                 session_id=session_id,
@@ -4766,6 +4772,48 @@ class ComposerServiceImpl:
                     session_scope=session_scope,
                     llm_calls=recorder.llm_calls,
                     plugin_snapshot=plugin_snapshot,
+                )
+
+            # Verified-handoff repair gate (elspeth-85f3cc3022, battery round
+            # 8 g03-s1). The staged review is a user-action boundary only when
+            # the review is genuinely all that remains: at pin 230fd9dfd this
+            # exit completed the handoff over a WIRED state whose masked
+            # re-validation carried an edge-contract violation — the finalize
+            # tail disclosed the finding to the USER, but the MODEL never got
+            # a repair turn, so a known-broken pipeline was handed to a review
+            # card that cannot fix it. ``_attempt_preflight_repair`` verifies
+            # the handoff claim via the masked re-validation and spends the
+            # shared ``_MAX_REPAIR_TURNS`` budget on masked failures BEFORE
+            # the handoff may complete — the same gate the no-tool completion
+            # claim consumes. A verified pure handoff, or a spent budget,
+            # falls through to the handoff exactly as before, preserving the
+            # elspeth-e6ff1b8c13 no-extra-turns liveness bound. Wiredness
+            # (sources AND outputs — the cross-turn arm's applicability axis)
+            # scopes the gate: an early-staged review over a half-built draft
+            # is incomplete by nature, not damaged, and repair pressure there
+            # would resurrect the re-surfacing spam e6ff1b8c13 fixed.
+            if (
+                state.sources
+                and state.outputs
+                and await self._attempt_preflight_repair(
+                    state=state,
+                    llm_messages=llm_messages,
+                    user_id=user_id,
+                    session_id=session_id,
+                    last_runtime_preflight=runtime_result,
+                    runtime_preflight_cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    recorder=recorder,
+                    repair_turns_used=repair_turns_used,
+                    plugin_snapshot=plugin_snapshot,
+                )
+            ):
+                return _ClassifyOutcome(
+                    action="continue",
+                    composition_turns_delta=1 if turn_has_mutation else 0,
+                    discovery_turns_delta=1 if turn_has_discovery else 0,
+                    repair_turns_delta=1,
                 )
 
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
@@ -6275,6 +6323,7 @@ class ComposerServiceImpl:
             composition_turns_used += classify.composition_turns_delta
             discovery_turns_used += classify.discovery_turns_delta
             advisor_checkpoint_passes_used += classify.advisor_passes_delta
+            repair_turns_used += classify.repair_turns_delta
             if classify.action == "return":
                 # Offensive guard (explicit raise, not assert): ``python -O``
                 # strips assert statements. The contract between

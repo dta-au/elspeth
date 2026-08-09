@@ -591,6 +591,7 @@ def _build_composer(
     sessions_service: SessionServiceImpl,
     *,
     max_composition_turns: int = 15,
+    with_csv_sink: bool = False,
 ) -> ComposerServiceImpl:
     from unittest.mock import MagicMock
 
@@ -607,7 +608,9 @@ def _build_composer(
         PluginSummary(name="field_mapper", description="Field mapper", plugin_type="transform", config_fields=[]),
         PluginSummary(name="web_scrape", description="Web scrape", plugin_type="transform", config_fields=[]),
     ]
-    catalog.list_sinks.return_value = []
+    catalog.list_sinks.return_value = (
+        [PluginSummary(name="csv", description="CSV sink", plugin_type="sink", config_fields=[])] if with_csv_sink else []
+    )
     settings = WebSettings(
         data_dir=tmp_path,
         composer_max_composition_turns=max_composition_turns,
@@ -1090,6 +1093,334 @@ async def test_successful_interpretation_review_returns_user_handoff_without_ext
     pt_events = [e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
     assert len(pt_events) == 1
     assert pt_events[0].tool_call_id.startswith("backend_auto_surface:")
+
+
+# ---------------------------------------------------------------------------
+# elspeth-85f3cc3022 (battery round 8, g03-s1): the staged-review exit must
+# verify the handoff claim and spend the repair budget, not just disclose.
+# ---------------------------------------------------------------------------
+
+
+def _staged_handoff_preflight() -> ValidationResult:
+    """The truncated-ledger shape ``review_interpretations`` produces at stage 10."""
+    from elspeth.web.execution.schemas import ValidationReadinessBlocker
+    from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
+
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=True,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=INTERPRETATION_REVIEW_PENDING_CODE,
+                    component_id="rate_node",
+                    component_type="transform",
+                    detail="vague_term review pending for transform 'rate_node': cool",
+                )
+            ],
+        ),
+    )
+
+
+def _masked_structural_failure() -> ValidationResult:
+    """A graph_structure-class failure only the masked re-validation can see."""
+    from elspeth.web.execution.schemas import ValidationError, ValidationReadinessBlocker
+
+    detail = "consumer requires 'str', producer emits 'Any' for field 'price_display'"
+    return ValidationResult(
+        is_valid=False,
+        checks=[],
+        errors=[
+            ValidationError(
+                component_id="rate_node",
+                component_type="transform",
+                message=detail,
+                suggestion=None,
+                error_code="graph_structure",
+            )
+        ],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=False,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code="graph_structure",
+                    component_id="rate_node",
+                    component_type="transform",
+                    detail=detail,
+                )
+            ],
+        ),
+    )
+
+
+def _masked_valid() -> ValidationResult:
+    return ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=True,
+            blockers=[],
+        ),
+    )
+
+
+class _ModeSequencedValidatePipeline:
+    """Strict passes always return the staged handoff shape; tolerant passes
+    consume a scripted sequence (then default to valid), so a test can model
+    "the masked re-validation failed until the model repaired the state"."""
+
+    def __init__(self, tolerant_sequence: list[ValidationResult]) -> None:
+        self._tolerant = list(tolerant_sequence)
+        self.calls: list[bool] = []
+
+    def __call__(self, *args: Any, **kwargs: Any) -> ValidationResult:
+        tolerant_mode = bool(kwargs.get("allow_pending_interpretation_placeholders", False))
+        self.calls.append(tolerant_mode)
+        if tolerant_mode:
+            return self._tolerant.pop(0) if self._tolerant else _masked_valid()
+        return _staged_handoff_preflight()
+
+
+def _wired_set_pipeline_with_pending_interpretation_args(*, sink_path: str) -> dict[str, Any]:
+    """The pending-interpretation payload made WIRED (sources AND outputs).
+
+    Wiredness is the staged-exit gate's applicability axis: a half-built
+    draft staging an early review is incomplete by nature, not damaged. The
+    sink options mirror the conftest full-pipeline shape (path under the
+    session outputs dir, explicit schema and collision_policy) so the
+    set_pipeline APPLIES rather than failing path admission.
+    """
+    args = _set_pipeline_with_pending_interpretation_args()
+    args["outputs"] = [
+        {
+            "sink_name": "scored_rows",
+            "plugin": "csv",
+            "options": {
+                "path": sink_path,
+                "schema": {"mode": "observed"},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+    ]
+    return args
+
+
+def _staged_review_script_prefix(*, sink_path: str) -> list[Any]:
+    return [
+        _fake_response_with_tool_call(
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            arguments=_wired_set_pipeline_with_pending_interpretation_args(sink_path=sink_path),
+        ),
+        _fake_response_with_tool_call(
+            tool_call_id="call_review",
+            tool_name="request_interpretation_review",
+            content="Surfacing the review card now.",
+            arguments={
+                "affected_node_id": "rate_node",
+                "kind": "vague_term",
+                "user_term": "cool",
+                "llm_draft": "modern, useful, engaging, and clear for the public.",
+            },
+        ),
+    ]
+
+
+async def _seed_bare_session(sessions_service: SessionServiceImpl, title: str) -> UUID:
+    session_id = uuid4()
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    return session_id
+
+
+@pytest.mark.asyncio
+async def test_staged_review_over_masked_invalid_wired_state_spends_a_repair_turn(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """elspeth-85f3cc3022 (battery round 8, g03-s1): disclosure is not repair.
+
+    At pin 230fd9dfd the compose loop terminated through the staged-review
+    exit over a WIRED state whose masked re-validation carried an
+    edge-contract violation: the finalize tail disclosed the finding to the
+    USER, but the MODEL never received a repair turn — four tool calls, no
+    repair, known-broken pipeline handed to a review card that cannot fix
+    it. The staged-review exit must consume the same verified-handoff
+    repair gate as the no-tool completion claim: masked failures spend the
+    shared repair budget BEFORE the handoff may complete.
+    """
+    from elspeth.web.composer import service as service_module
+
+    composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
+    session_id = await _seed_bare_session(sessions_service, "Staged review spends a repair turn")
+
+    fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_valid()])
+    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+
+    sink_dir = tmp_path / "outputs" / str(session_id)
+    llm = _ScriptedLLM(
+        [
+            *_staged_review_script_prefix(sink_path=str(sink_dir / "output.csv")),
+            # The repair turn the gate must grant: the model consumes the
+            # injected objection and repairs surgically (a mutation, so the
+            # masked re-validation is recomputed and comes back clean). A
+            # patch — not a full set_pipeline — keeps the review site and its
+            # persisted event linked, so the orphan gate stays quiet.
+            _fake_response_with_tool_call(
+                tool_call_id="call_repair_patch_output",
+                tool_name="patch_output_options",
+                arguments={"sink_name": "scored_rows", "patch": {"path": str(sink_dir / "output2.csv")}},
+            ),
+            _fake_text_response("Fixed the contract violation — review still pending."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    # The loop must have continued past the staged review with a repair turn:
+    # four model calls, and the third one carries the injected repair message.
+    assert len(llm.messages) == 4, [len(m) for m in llm.messages]
+    repair_message = llm.messages[2][-1]
+    assert repair_message["role"] == "user"
+    assert "Pre-finalisation runtime preflight" in repair_message["content"]
+    assert "producer emits 'Any'" in repair_message["content"]
+
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+        "patch_output_options",
+    ]
+
+    # The handoff completes VERIFIED: bare notice, no outstanding-findings
+    # qualification, because the post-repair masked re-validation is clean.
+    assert _HANDOFF_SUFFIX in result.assistant_message
+    assert "must be fixed before this pipeline can run" not in result.assistant_message
+
+    # Instrument guard: both masked passes ran (fail before repair, clean after).
+    assert fake.calls.count(True) >= 2
+
+
+@pytest.mark.asyncio
+async def test_staged_review_over_unwired_draft_keeps_no_extra_turns_contract(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged-exit repair gate must NOT fire on a half-built draft.
+
+    An early-staged review over a draft with no outputs is legitimately
+    incomplete — repair pressure there resurrects the re-surfacing spam
+    elspeth-e6ff1b8c13 fixed. Wiredness (sources AND outputs) is the
+    applicability axis, the same one the cross-turn arm uses.
+    """
+    from elspeth.web.composer import service as service_module
+
+    composer = _build_composer(tmp_path, sessions_service)
+    session_id = await _seed_bare_session(sessions_service, "Unwired draft keeps the handoff")
+
+    fake = _ModeSequencedValidatePipeline([_masked_structural_failure()])
+    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_set_pipeline",
+                tool_name="set_pipeline",
+                arguments=_set_pipeline_with_pending_interpretation_args(),
+            ),
+            _fake_response_with_tool_call(
+                tool_call_id="call_review",
+                tool_name="request_interpretation_review",
+                content="Surfacing the review card now.",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "modern, useful, engaging, and clear for the public.",
+                },
+            ),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    assert len(llm.messages) == 2, [len(m) for m in llm.messages]
+    for call_messages in llm.messages:
+        assert not any(
+            "Pre-finalisation runtime preflight" in m.get("content", "") for m in call_messages if isinstance(m.get("content"), str)
+        )
+    assert [inv.tool_name for inv in result.tool_invocations] == [
+        "set_pipeline",
+        "request_interpretation_review",
+    ]
+    assert _HANDOFF_SUFFIX in result.assistant_message
+
+
+@pytest.mark.asyncio
+async def test_staged_review_with_spent_budget_completes_with_qualified_disclosure(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no repair budget the handoff still completes — never silently.
+
+    The fallback is exactly the round-8 observed shape: the handoff notice
+    qualified with the outstanding validator objection, so the user is told
+    the review cards are NOT all that remains.
+    """
+    from elspeth.web.composer import service as service_module
+
+    composer = _build_composer(tmp_path, sessions_service, with_csv_sink=True)
+    session_id = await _seed_bare_session(sessions_service, "Spent budget completes qualified")
+
+    fake = _ModeSequencedValidatePipeline([_masked_structural_failure(), _masked_structural_failure()])
+    monkeypatch.setattr(service_module, "validate_pipeline", fake)
+    monkeypatch.setattr(service_module, "_MAX_REPAIR_TURNS", 0)
+
+    llm = _ScriptedLLM(_staged_review_script_prefix(sink_path=str(tmp_path / "outputs" / str(session_id) / "output.csv")))
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=None,
+        message="create a workflow that rates how cool pages are",
+    )
+
+    assert len(llm.messages) == 2, [len(m) for m in llm.messages]
+    assert _HANDOFF_SUFFIX in result.assistant_message
+    assert "must be fixed before this pipeline can run" in result.assistant_message
+    assert "producer emits 'Any'" in result.assistant_message
 
 
 @pytest.mark.asyncio
