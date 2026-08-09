@@ -10,10 +10,10 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal, Self, cast
+from typing import Any, ClassVar, Self, cast
 
 import structlog
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
@@ -62,6 +62,16 @@ from elspeth.plugins.transforms.aws.textract_client import (
     TextractServiceError,
     build_textract_sdk_client,
 )
+from elspeth.plugins.transforms.aws.textract_config_shared import (
+    FACET_NAMES,
+    FEATURE_TYPES,
+    AuthMode,
+    FeatureType,
+    TextractExtractFields,
+    TextractQueryConfig,
+    require_non_whitespace,
+    validate_textract_credential_fields,
+)
 from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
@@ -69,13 +79,6 @@ from elspeth.plugins.transforms.aws.textract_result import (
     normalize_textract_result,
 )
 
-FeatureType = Literal["TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"]
-AuthMode = Literal["default_chain", "secret_refs"]
-
-_FEATURE_TYPES = frozenset({"TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"})
-_QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|}~><]+$")
-_QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
-_FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
 _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
 
@@ -97,69 +100,6 @@ _S3_OBJECT_UNREADABLE_HINT = (
 
 logger = structlog.get_logger(__name__)
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
-
-
-def _require_non_whitespace(value: str | None, *, field_name: str) -> str | None:
-    if value is not None and not value.strip():
-        raise ValueError(f"{field_name} must not be empty or whitespace-only")
-    return value
-
-
-class TextractQueryConfig(BaseModel):
-    """One Textract query and its optional page selection."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    text: str = Field(min_length=1, max_length=200)
-    alias: str | None = Field(default=None, min_length=1, max_length=200)
-    pages: list[str] = Field(default_factory=list)
-
-    @field_validator("text", "alias")
-    @classmethod
-    def _provider_text(cls, value: str | None) -> str | None:
-        if value is not None and _QUERY_TEXT_PATTERN.fullmatch(value) is None:
-            raise ValueError("value contains characters unsupported by Amazon Textract queries")
-        return value
-
-    @field_validator("pages")
-    @classmethod
-    def _page_selectors(cls, selectors: list[str]) -> list[str]:
-        if len(set(selectors)) != len(selectors):
-            raise ValueError("pages must not contain duplicate selectors")
-        if "*" in selectors and selectors != ["*"]:
-            raise ValueError("pages selector '*' must be the only selector")
-        for selector in selectors:
-            if not 1 <= len(selector) <= 9 or _QUERY_PAGE_PATTERN.fullmatch(selector) is None:
-                raise ValueError("pages selectors must be 1-9 characters matching ^[0-9*-]+$")
-            if selector == "*":
-                continue
-            parts = selector.split("-")
-            if len(parts) == 1:
-                if not parts[0].isdigit() or int(parts[0]) <= 0:
-                    raise ValueError("pages selectors must use positive page numbers")
-                continue
-            if len(parts) != 2 or not parts[0].isdigit() or int(parts[0]) <= 0:
-                raise ValueError("pages ranges must start with a positive page number")
-            start = int(parts[0])
-            end_text = parts[1]
-            if end_text == "*":
-                continue
-            if not end_text.isdigit() or int(end_text) <= 0 or int(end_text) < start:
-                raise ValueError("pages ranges must have positive, ordered endpoints")
-        return selectors
-
-
-class TextractExtractFields(BaseModel):
-    """Optional normalized facet-to-row-field mappings."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    pages: str | None = None
-    tables: str | None = None
-    forms: str | None = None
-    queries: str | None = None
-    signatures: str | None = None
-    layout: str | None = None
 
 
 class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
@@ -291,21 +231,21 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     @classmethod
     def _field_name(cls, value: str | None, info: ValidationInfo) -> str | None:
         field_name = info.field_name or "field"
-        return _require_non_whitespace(value, field_name=field_name)
+        return require_non_whitespace(value, field_name=field_name)
 
     @field_validator("feature_types")
     @classmethod
     def _features(cls, value: list[FeatureType]) -> list[FeatureType]:
-        if any(feature not in _FEATURE_TYPES for feature in value):
-            raise ValueError(f"feature_types must use only {sorted(_FEATURE_TYPES)}")
+        if any(feature not in FEATURE_TYPES for feature in value):
+            raise ValueError(f"feature_types must use only {sorted(FEATURE_TYPES)}")
         if len(set(value)) != len(value):
             raise ValueError("feature_types must not contain duplicates")
         return value
 
     @model_validator(mode="after")
     def _consistency(self) -> Self:
-        for facet_name in _FACET_NAMES:
-            _require_non_whitespace(getattr(self.extract, facet_name), field_name=f"extract.{facet_name}")
+        for facet_name in FACET_NAMES:
+            require_non_whitespace(getattr(self.extract, facet_name), field_name=f"extract.{facet_name}")
 
         if self.bucket is not None and self.bucket_field is not None:
             raise ValueError("bucket and bucket_field are mutually exclusive document-location modes")
@@ -319,18 +259,12 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         if has_queries != has_query_feature:
             raise ValueError("queries and the QUERIES feature must be configured together")
 
-        access_present = self.aws_access_key_id is not None
-        secret_present = self.aws_secret_access_key is not None
-        session_present = self.aws_session_token is not None
-        if self.auth_mode == "default_chain":
-            if access_present or secret_present or session_present:
-                raise ValueError("explicit credentials are forbidden in default_chain auth mode")
-        elif access_present != secret_present:
-            raise ValueError("aws_access_key_id and aws_secret_access_key are required together as a credential pair")
-        elif not access_present:
-            if session_present:
-                raise ValueError("aws_session_token requires the access and secret credential pair")
-            raise ValueError("aws_access_key_id and aws_secret_access_key are required together in secret_refs auth mode")
+        validate_textract_credential_fields(
+            auth_mode=self.auth_mode,
+            aws_access_key_id=self.aws_access_key_id,
+            aws_secret_access_key=self.aws_secret_access_key,
+            aws_session_token=self.aws_session_token,
+        )
 
         if self.poll_max_interval_seconds < self.poll_interval_seconds:
             raise ValueError("poll_max_interval_seconds must be >= poll_interval_seconds")
@@ -347,7 +281,7 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
 
     def configured_output_fields(self) -> dict[str, str]:
         """Map configured normalized facet names to their output-row fields."""
-        return {facet_name: field_name for facet_name in _FACET_NAMES if (field_name := getattr(self.extract, facet_name)) is not None}
+        return {facet_name: field_name for facet_name in FACET_NAMES if (field_name := getattr(self.extract, facet_name)) is not None}
 
     def all_output_field_names(self) -> list[str]:
         """Return every configured output row field in stable projection order."""
@@ -374,7 +308,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:30622a952cac77ab"
+    source_file_hash: str | None = "sha256:a1c50e4b927137f7"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -388,8 +322,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         "scope, and extracted remote content remains untrusted before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for inline bytes, document URLs, or synchronous low-latency analysis. This catalogue has no "
-        "registered synchronous Textract transform; stage each document in S3 before using this plugin."
+        "Not for inline bytes, document URLs, or synchronous low-latency analysis. For managed-blob documents "
+        "up to 5 MiB (single-page for PDF), use aws_textract_inline_analysis; stage each document in S3 "
+        "before using this plugin."
     )
     example_use = (
         "transform:\n"
@@ -1148,7 +1083,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 "Locate documents with a static bucket (plus optional key_prefix) and per-row keys in key_field, "
                 "or with per-row bucket_field and key_field; the two location modes are mutually exclusive.",
                 "In static bucket mode rows carry relative object keys only — never bucket names or locations.",
-                "QUERIES requires query definitions; inline document bytes belong in the separate synchronous plugin.",
+                "QUERIES requires query definitions; inline document bytes belong in aws_textract_inline_analysis.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),
         )
