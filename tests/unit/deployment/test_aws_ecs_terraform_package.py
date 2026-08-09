@@ -89,6 +89,8 @@ EXPECTED_FILES = {
     "scenario-c/variables.tf",
     "scenario-c/versions.tf",
     "scripts/validate-ecs-run-task.py",
+    "scripts/verify-iam-policy-actions.py",
+    "scripts/verify-terraform-profiles.py",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.json",
     "telemetry/elspeth.cloudwatch-agent.v1/elspeth.cloudwatch-agent.v1.otel.yaml",
 }

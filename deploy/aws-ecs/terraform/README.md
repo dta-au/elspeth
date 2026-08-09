@@ -96,7 +96,11 @@ region explicitly:
 ```sh
 export AWS_PROFILE=REPLACE_WITH_AWS_PROFILE
 export IAM_LIFECYCLE_AWS_PROFILE=REPLACE_WITH_DISTINCT_IAM_LIFECYCLE_AWS_PROFILE
+export AWS_ROOT_PROFILE=REPLACE_WITH_ADMINISTRATOR_PROFILE_TERRAFORM_MUST_NOT_USE
 export AWS_REGION=REPLACE_WITH_AWS_REGION
+test "$AWS_PROFILE" != "$IAM_LIFECYCLE_AWS_PROFILE"
+test "$AWS_PROFILE" != "$AWS_ROOT_PROFILE"
+test "$IAM_LIFECYCLE_AWS_PROFILE" != "$AWS_ROOT_PROFILE"
 aws --profile "$AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity
 aws --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" sts get-caller-identity
 aws --profile "$AWS_PROFILE" configure get region
@@ -109,6 +113,14 @@ regions with `aws_region`. Set the same required `aws_profile` and
 rely on an implicit profile, region, or remembered account. Each provider binds
 its resources to its explicit profile while `allowed_account_ids`
 independently protects the account boundary.
+
+For a qualifying cold install, every saved plan must also be rendered with
+`terraform show -json` and admitted before apply by
+`scripts/verify-terraform-profiles.py plan`, using the three selected profile
+values above. The validator requires the exact installer and lifecycle values,
+requires them to differ, and rejects the named administrator profile. Follow
+the complete command sequence in the project
+[AWS ECS cold-install runbook](../../../docs/runbooks/aws-ecs-cold-install.md).
 
 ### Producing the candidate image
 
@@ -211,13 +223,18 @@ document must remain within IAM's 6,144-character customer-managed-policy
 limit; the package contract test enforces that bound. Do not combine them as
 role inline policies: their aggregate rendered size exceeds IAM's inline-policy
 limit. Keep the two profiles backed by distinct principals for the supported
-least-privilege installation. A purpose-built root acceptance profile may set
-both provider variables to `elspeth-acceptance` for a smoke exercise, but that
-deliberately gives up the privilege separation and is not the supported
-least-privilege posture. If an account-specific prerequisite is missing, use a
-trusted administrator only to install or amend these policies in the dedicated
-disposable account; do not run Terraform with an account-administrator
-wildcard policy.
+least-privilege installation. A collapsed or administrator-backed plan is not
+eligible as cold-install qualification evidence. If an account-specific
+prerequisite is missing, use a trusted administrator only to install or amend
+these policies in the dedicated disposable account; do not run Terraform with
+an account-administrator wildcard policy.
+
+Before Terraform uses those policies, retrieve the live default policy version
+for each recorded ARN in the cold-install runbook's exact `get-policy` then
+`get-policy-version` sequence and compare it with the freshly rendered template
+using `scripts/verify-iam-policy-actions.py`. The validator flattens every
+`Statement[].Action` and fails on missing or unexpected actions; the runbook
+adds a bounded IAM propagation quiet window and recheck.
 
 The bucket derivation above is the same deterministic formula used by the
 scenario module. The rendered policy consequently limits S3 bucket/object
@@ -1246,6 +1263,25 @@ For teardown, select the same backend config and exact workspace used for
 installation, verify both explicit AWS profiles, account, and region again.
 Drain each applied service and prove it has no running tasks before destroying
 its state:
+
+For Scenario A qualification, first reinitialize the backend from its explicit
+file and verify the initialized local backend evidence before reading outputs,
+planning, or destroying:
+
+```sh
+terraform -chdir=scenario-a init -reconfigure \
+  -backend-config=../examples/scenario-a.s3.tfbackend
+python3 scripts/verify-terraform-profiles.py backend \
+  --backend-state scenario-a/.terraform/terraform.tfstate \
+  --installer-profile "$AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
+```
+
+The qualifying path then creates a saved destroy plan, records it with
+`terraform show -json`, runs `scripts/verify-terraform-profiles.py plan` with
+the exact installer, IAM-lifecycle, and forbidden profiles, and only then
+applies that saved plan. The cold-install runbook carries the exhaustive
+commands; the shorter cleanup example below is not qualification evidence.
 
 ```sh
 drain_scenario_service() {

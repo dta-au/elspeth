@@ -186,3 +186,116 @@ def test_cold_install_replans_to_enable_log_group_adoption_before_saved_plan_app
     assert cleanup.index(plan) < cleanup.index(variable) < cleanup.index(plan_file) < cleanup.index(apply)
     assert not re.search(r"terraform\s+-chdir=scenario-a\s+apply[^\n]*-var", cleanup)
     assert "on that apply" not in cleanup
+
+
+def test_cold_install_refuses_root_or_collapsed_terraform_profiles() -> None:
+    text = _read(RUNBOOK)
+    identity = text[text.index("## 1. Select and prove the AWS identity") : text.index("## 2.")]
+
+    assert ': "${AWS_ROOT_PROFILE:?set the administrator profile Terraform must never use}"' in identity
+    assert 'test "$AWS_PROFILE" != "$IAM_LIFECYCLE_AWS_PROFILE"' in identity
+    assert 'test "$AWS_PROFILE" != "$AWS_ROOT_PROFILE"' in identity
+    assert 'test "$IAM_LIFECYCLE_AWS_PROFILE" != "$AWS_ROOT_PROFILE"' in identity
+    assert "arn:aws:iam::${AWS_ACCOUNT_ID}:root" in identity
+
+
+def test_cold_install_checks_all_four_live_default_installer_policy_action_sets() -> None:
+    text = _read(RUNBOOK)
+    policies = text[text.index("## 2. Install the installer and lifecycle policies") : text.index("## 3.")]
+
+    for name in ("control-plane", "regional-resources", "relationships", "runtime-observation"):
+        assert name in policies
+    for marker in (
+        "render_installer_policies",
+        "verify_installer_policy_currency",
+        "await_installer_policy_currency",
+        "DefaultVersionId",
+        "aws iam get-policy",
+        "aws iam get-policy-version",
+        "verify-iam-policy-actions.py",
+        "IAM_POLICY_SETTLE_MAX_SECONDS",
+        "IAM_POLICY_SETTLE_QUIET_SECONDS",
+        "IAM_POLICY_SETTLE_POLL_SECONDS",
+    ):
+        assert marker in policies
+    assert policies.index("aws iam get-policy") < policies.index("aws iam get-policy-version")
+    assert policies.index("render_installer_policies") < policies.index("await_installer_policy_currency")
+    assert "bounded quiet window" in policies
+    assert "fail closed" in policies
+
+
+def test_policy_currency_helpers_propagate_each_failure_even_when_polled_as_a_condition() -> None:
+    text = _read(RUNBOOK)
+    policies = text[text.index("## 2. Install the installer and lifecycle policies") : text.index("## 3.")]
+    render = policies[policies.index("render_installer_policies()") : policies.index("render_installer_policies\n")]
+    verify = policies[policies.index("verify_installer_policy_currency()") : policies.index("IAM_POLICY_SETTLE_MAX_SECONDS")]
+
+    assert render.count("|| return") >= 4
+    for marker in (
+        "render_installer_policies || return",
+        ") || return\n    jq -e --arg arn",
+        '<<<"$metadata" >/dev/null || return',
+        '<<<"$metadata") || return',
+        '>"$live_path" || return',
+        '--label "$name" || return',
+    ):
+        assert marker in verify
+
+
+def test_every_saved_plan_json_is_profile_verified_before_apply() -> None:
+    text = _read(RUNBOOK)
+    expected_plans = {
+        "bootstrap",
+        "scenario-a",
+        "scenario-a-destroy",
+        "bootstrap-destroy",
+        "scenario-a-adopt",
+    }
+    recorded_plans = set(re.findall(r"-out=\.terraform/([a-z0-9-]+)\.tfplan", text))
+    applied_plans = set(re.findall(r"apply \.terraform/([a-z0-9-]+)\.tfplan", text))
+    assert recorded_plans == applied_plans == expected_plans
+
+    for plan in recorded_plans:
+        plan_file = f".terraform/{plan}.tfplan"
+        json_file = f".terraform/{plan}.json"
+        plan_at = text.index(f"-out={plan_file}")
+        json_at = text.index(f"show -json {plan_file} >{json_file}", plan_at)
+        verify_at = text.index(f"--plan-json {json_file}", json_at)
+        apply_at = text.index(f"apply {plan_file}", verify_at)
+        assert plan_at < json_at < verify_at < apply_at
+
+    assert text.count("verify-terraform-profiles.py plan") == 5
+    assert text.count('--installer-profile "$AWS_PROFILE"') >= 6
+    assert text.count('--iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE"') == 5
+    assert text.count('--forbidden-profile "$AWS_ROOT_PROFILE"') >= 6
+
+
+def test_teardown_reconfigures_and_verifies_the_initialized_backend_before_state_reads() -> None:
+    text = _read(RUNBOOK)
+    teardown = text[text.index("## Teardown") :]
+
+    init = teardown.index("terraform -chdir=scenario-a init -reconfigure")
+    backend_config = teardown.index("-backend-config=../examples/scenario-a.s3.tfbackend", init)
+    verify = teardown.index("verify-terraform-profiles.py backend", backend_config)
+    backend_state = teardown.index("--backend-state scenario-a/.terraform/terraform.tfstate", verify)
+    expected_profile = teardown.index('--installer-profile "$AWS_PROFILE"', backend_state)
+    workspace = teardown.index("terraform -chdir=scenario-a workspace show", expected_profile)
+    first_output = teardown.index("terraform -chdir=scenario-a output", workspace)
+
+    assert init < backend_config < verify < backend_state < expected_profile < workspace < first_output
+
+
+def test_terraform_package_reference_points_qualification_to_the_fail_closed_evidence_gates() -> None:
+    text = _read(PACKAGE_README)
+
+    for marker in (
+        "AWS_ROOT_PROFILE",
+        'test "$AWS_PROFILE" != "$IAM_LIFECYCLE_AWS_PROFILE"',
+        "verify-terraform-profiles.py plan",
+        "verify-terraform-profiles.py backend",
+        "verify-iam-policy-actions.py",
+        "live default policy version",
+        "aws-ecs-cold-install.md",
+    ):
+        assert marker in text
+    assert "may set both provider variables" not in text

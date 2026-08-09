@@ -86,9 +86,10 @@ account and Region:
 2. a separate IAM lifecycle principal that creates and deletes the narrow task
    roles and permissions boundary.
 
-For a one-off smoke exercise in a dedicated empty acceptance account, both
-Terraform providers may use the same purpose-built acceptance profile. That is
-less privilege-separated and is not the normal posture.
+This least-privilege qualification procedure requires two distinct profiles.
+It also requires the operator to name the administrator/root-capable profile
+that Terraform must never use. A collapsed or administrator-backed smoke run
+is a different exercise and cannot qualify this installation path.
 
 Before continuing, choose two distinct Bedrock inference profiles that are
 available in the deployment Region. The application image must include the
@@ -106,8 +107,13 @@ export AWS_PAGER=""
 
 : "${AWS_PROFILE:?set the normal installer profile}"
 : "${IAM_LIFECYCLE_AWS_PROFILE:?set the IAM lifecycle profile}"
+: "${AWS_ROOT_PROFILE:?set the administrator profile Terraform must never use}"
 : "${AWS_REGION:?set the deployment Region}"
 : "${OWNER:?set the operator or team name}"
+
+test "$AWS_PROFILE" != "$IAM_LIFECYCLE_AWS_PROFILE"
+test "$AWS_PROFILE" != "$AWS_ROOT_PROFILE"
+test "$IAM_LIFECYCLE_AWS_PROFILE" != "$AWS_ROOT_PROFILE"
 
 REPO_ROOT=$(git rev-parse --show-toplevel)
 PACKAGE_DIR="$REPO_ROOT/deploy/aws-ecs/terraform"
@@ -121,6 +127,15 @@ IAM_ACCOUNT_ID=$(aws sts get-caller-identity \
   --query Account --output text)
 test "$AWS_ACCOUNT_ID" = "$IAM_ACCOUNT_ID"
 [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]]
+
+AWS_PRINCIPAL_ARN=$(aws sts get-caller-identity \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --query Arn --output text)
+IAM_PRINCIPAL_ARN=$(aws sts get-caller-identity \
+  --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" \
+  --query Arn --output text)
+test "$AWS_PRINCIPAL_ARN" != "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
+test "$IAM_PRINCIPAL_ARN" != "arn:aws:iam::${AWS_ACCOUNT_ID}:root"
 
 test "$(aws configure get region --profile "$AWS_PROFILE")" = "$AWS_REGION"
 test "$(aws configure get region --profile "$IAM_LIFECYCLE_AWS_PROFILE")" = "$AWS_REGION"
@@ -180,18 +195,22 @@ export scenario_c_bucket="elspeth-${scenario_c_namespace}-$(printf '%.12s' "$com
 
 installer_substitutions='${aws_account_id} ${aws_region} ${run_id} ${backend_state_bucket} ${ecr_repository} ${cloudwatch_agent_ecr_repository} ${gateway_ecr_repository} ${scenario_a_namespace} ${scenario_b_namespace} ${scenario_c_namespace} ${scenario_a_bucket} ${scenario_b_bucket} ${scenario_c_bucket}'
 
-mkdir -p bootstrap/.terraform
-for policy in control-plane regional-resources relationships runtime-observation; do
-  envsubst "$installer_substitutions" \
-    < "iam/installer-${policy}-policy.json.tftpl" \
-    > "bootstrap/.terraform/installer-${policy}-policy.json"
-  jq -e . "bootstrap/.terraform/installer-${policy}-policy.json" >/dev/null
-done
-envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
-  < iam/lifecycle-policy.json.tftpl \
-  > bootstrap/.terraform/iam-lifecycle-policy.json
+render_installer_policies() {
+  local policy
+  mkdir -p bootstrap/.terraform || return
+  for policy in control-plane regional-resources relationships runtime-observation; do
+    envsubst "$installer_substitutions" \
+      < "iam/installer-${policy}-policy.json.tftpl" \
+      > "bootstrap/.terraform/installer-${policy}-policy.json" || return
+    jq -e . "bootstrap/.terraform/installer-${policy}-policy.json" >/dev/null || return
+  done
+  envsubst '${aws_account_id} ${run_id} ${iam_permissions_boundary_arn}' \
+    < iam/lifecycle-policy.json.tftpl \
+    > bootstrap/.terraform/iam-lifecycle-policy.json || return
+  jq -e . bootstrap/.terraform/iam-lifecycle-policy.json >/dev/null || return
+}
 
-jq -e . bootstrap/.terraform/iam-lifecycle-policy.json >/dev/null
+render_installer_policies
 ```
 
 Inspect all five JSON files. Attach the four
@@ -206,6 +225,115 @@ detaches and deletes them by recorded ARN rather than by tag or state. The
 detailed authority split and its one account-level CloudWatch Logs
 limitation are documented in the
 [Terraform package README](../../deploy/aws-ecs/terraform/README.md#installer-policy-and-task-role-boundary).
+
+Export the four recorded installer policy ARNs. Presence is not currency: the
+gate below re-renders all four templates, retrieves each live policy's declared
+default version using the documented `get-policy` then `get-policy-version`
+sequence, and compares the complete flattened action sets in both directions.
+The source-free validator rejects malformed or ambiguous JSON and reports both
+actions missing from live policy and actions unexpectedly present there.
+
+```bash
+: "${INSTALLER_CONTROL_PLANE_POLICY_ARN:?set the recorded control-plane policy ARN}"
+: "${INSTALLER_REGIONAL_RESOURCES_POLICY_ARN:?set the recorded regional-resources policy ARN}"
+: "${INSTALLER_RELATIONSHIPS_POLICY_ARN:?set the recorded relationships policy ARN}"
+: "${INSTALLER_RUNTIME_OBSERVATION_POLICY_ARN:?set the recorded runtime-observation policy ARN}"
+
+INSTALLER_POLICY_NAMES=(
+  control-plane
+  regional-resources
+  relationships
+  runtime-observation
+)
+INSTALLER_POLICY_ARNS=(
+  "$INSTALLER_CONTROL_PLANE_POLICY_ARN"
+  "$INSTALLER_REGIONAL_RESOURCES_POLICY_ARN"
+  "$INSTALLER_RELATIONSHIPS_POLICY_ARN"
+  "$INSTALLER_RUNTIME_OBSERVATION_POLICY_ARN"
+)
+
+verify_installer_policy_currency() (
+  set -Eeuo pipefail
+  local index name arn metadata version_id live_path unique_count
+
+  render_installer_policies || return
+  test "${#INSTALLER_POLICY_NAMES[@]}" = 4 || return
+  test "${#INSTALLER_POLICY_ARNS[@]}" = 4 || return
+  unique_count=$(printf '%s\n' "${INSTALLER_POLICY_ARNS[@]}" | LC_ALL=C sort -u | wc -l) || return
+  test "$unique_count" = 4 || return
+  for index in "${!INSTALLER_POLICY_NAMES[@]}"; do
+    name=${INSTALLER_POLICY_NAMES[$index]}
+    arn=${INSTALLER_POLICY_ARNS[$index]}
+    case "$arn" in
+      "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/"?*) ;;
+      *) printf 'invalid installer policy ARN for %s\n' "$name" >&2; return 1 ;;
+    esac
+    metadata=$(aws iam get-policy \
+      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+      --policy-arn "$arn" --output json) || return
+    jq -e --arg arn "$arn" '.Policy.Arn == $arn' <<<"$metadata" >/dev/null || return
+    version_id=$(jq -er \
+      '.Policy.DefaultVersionId | select(type == "string" and test("^v[1-9][0-9]*$"))' \
+      <<<"$metadata") || return
+    live_path="bootstrap/.terraform/live-${name}-policy-version.json"
+    aws iam get-policy-version \
+      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+      --policy-arn "$arn" --version-id "$version_id" --output json \
+      >"$live_path" || return
+    python3 scripts/verify-iam-policy-actions.py \
+      --rendered-policy "bootstrap/.terraform/installer-${name}-policy.json" \
+      --live-policy-version "$live_path" \
+      --label "$name" || return
+  done
+)
+
+IAM_POLICY_SETTLE_MAX_SECONDS=120
+IAM_POLICY_SETTLE_QUIET_SECONDS=30
+IAM_POLICY_SETTLE_POLL_SECONDS=5
+
+await_installer_policy_currency() (
+  set -Eeuo pipefail
+  local started_at quiet_started_at=-1 elapsed quiet_elapsed remaining sleep_seconds
+  test "$IAM_POLICY_SETTLE_MAX_SECONDS" -gt 0
+  test "$IAM_POLICY_SETTLE_QUIET_SECONDS" -gt 0
+  test "$IAM_POLICY_SETTLE_POLL_SECONDS" -gt 0
+  test "$IAM_POLICY_SETTLE_QUIET_SECONDS" -le "$IAM_POLICY_SETTLE_MAX_SECONDS"
+
+  started_at=$SECONDS
+  while true; do
+    if verify_installer_policy_currency; then
+      if test "$quiet_started_at" -lt 0; then quiet_started_at=$SECONDS; fi
+      quiet_elapsed=$((SECONDS - quiet_started_at))
+      if test "$quiet_elapsed" -ge "$IAM_POLICY_SETTLE_QUIET_SECONDS"; then
+        printf 'installer_policy_currency_stable quiet_seconds=%s\n' "$quiet_elapsed"
+        return 0
+      fi
+    else
+      quiet_started_at=-1
+    fi
+
+    elapsed=$((SECONDS - started_at))
+    if test "$elapsed" -ge "$IAM_POLICY_SETTLE_MAX_SECONDS"; then
+      printf 'installer_policy_currency_not_stable elapsed_seconds=%s\n' "$elapsed" >&2
+      return 1
+    fi
+    remaining=$((IAM_POLICY_SETTLE_MAX_SECONDS - elapsed))
+    sleep_seconds=$IAM_POLICY_SETTLE_POLL_SECONDS
+    if test "$sleep_seconds" -gt "$remaining"; then sleep_seconds=$remaining; fi
+    sleep "$sleep_seconds"
+  done
+)
+
+verify_installer_policy_currency
+await_installer_policy_currency
+```
+
+Any action-set drift makes the preflight fail closed. Repair a stale policy
+through the trusted IAM administration path with a new version and
+`--set-as-default`, then rerun both commands above. The second command requires
+a bounded quiet window of repeated default-document matches so Terraform is
+not started immediately after an IAM policy-version change. It fails rather
+than waiting without a bound.
 
 ## 3. Bootstrap remote state and image repositories
 
@@ -255,10 +383,18 @@ Refuse unresolved placeholders, then initialize, review, and apply:
 terraform fmt -check -recursive
 terraform -chdir=bootstrap init
 terraform -chdir=bootstrap validate
+verify_installer_policy_currency
+await_installer_policy_currency
 terraform -chdir=bootstrap plan \
   -var-file=../examples/bootstrap.tfvars \
   -out=.terraform/bootstrap.tfplan
 terraform -chdir=bootstrap show -no-color .terraform/bootstrap.tfplan
+terraform -chdir=bootstrap show -json .terraform/bootstrap.tfplan >.terraform/bootstrap.json
+python3 scripts/verify-terraform-profiles.py plan \
+  --plan-json .terraform/bootstrap.json \
+  --installer-profile "$AWS_PROFILE" \
+  --iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
 terraform -chdir=bootstrap apply .terraform/bootstrap.tfplan
 
 BOUNDARY_ARN=$(terraform -chdir=bootstrap output -raw iam_permissions_boundary_arn)
@@ -498,7 +634,7 @@ verified for `db.serverless` in `ap-southeast-1`.
 ```bash
 ! rg -n 'REPLACE_WITH|2030-01-01' \
   examples/scenario-a.tfvars examples/scenario-a.s3.tfbackend
-terraform -chdir=scenario-a init \
+terraform -chdir=scenario-a init -reconfigure \
   -backend-config=../examples/scenario-a.s3.tfbackend
 terraform -chdir=scenario-a workspace select default
 test "$(terraform -chdir=scenario-a workspace show)" = default
@@ -519,10 +655,18 @@ test "$(aws sts get-caller-identity \
   --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
 
+verify_installer_policy_currency
+await_installer_policy_currency
 terraform -chdir=scenario-a plan \
   -var-file=../examples/scenario-a.tfvars \
   -out=.terraform/scenario-a.tfplan
 terraform -chdir=scenario-a show -no-color .terraform/scenario-a.tfplan
+terraform -chdir=scenario-a show -json .terraform/scenario-a.tfplan >.terraform/scenario-a.json
+python3 scripts/verify-terraform-profiles.py plan \
+  --plan-json .terraform/scenario-a.json \
+  --installer-profile "$AWS_PROFILE" \
+  --iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
 terraform -chdir=scenario-a apply .terraform/scenario-a.tfplan
 ```
 
@@ -779,13 +923,24 @@ backend, workspace, profiles, account, and Region used to install it.
 
 ```bash
 cd "$PACKAGE_DIR"
-test "$(terraform -chdir=scenario-a workspace show)" = default
 test "$(aws sts get-caller-identity \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
 test "$(aws sts get-caller-identity \
   --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
+
+! rg -n 'REPLACE_WITH|2030-01-01' \
+  examples/scenario-a.tfvars examples/scenario-a.s3.tfbackend
+terraform -chdir=scenario-a init -reconfigure \
+  -backend-config=../examples/scenario-a.s3.tfbackend
+python3 scripts/verify-terraform-profiles.py backend \
+  --backend-state scenario-a/.terraform/terraform.tfstate \
+  --installer-profile "$AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
+test "$(terraform -chdir=scenario-a workspace show)" = default
+verify_installer_policy_currency
+await_installer_policy_currency
 
 ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
 ECS_SERVICE=$(terraform -chdir=scenario-a output -raw service_name)
@@ -808,6 +963,12 @@ terraform -chdir=scenario-a plan -destroy \
   -var-file=../examples/scenario-a.tfvars \
   -out=.terraform/scenario-a-destroy.tfplan
 terraform -chdir=scenario-a show -no-color .terraform/scenario-a-destroy.tfplan
+terraform -chdir=scenario-a show -json .terraform/scenario-a-destroy.tfplan >.terraform/scenario-a-destroy.json
+python3 scripts/verify-terraform-profiles.py plan \
+  --plan-json .terraform/scenario-a-destroy.json \
+  --installer-profile "$AWS_PROFILE" \
+  --iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
 terraform -chdir=scenario-a apply .terraform/scenario-a-destroy.tfplan
 test -z "$(terraform -chdir=scenario-a state list)"
 ```
@@ -877,6 +1038,12 @@ terraform -chdir=bootstrap plan -destroy \
   -var-file=../examples/bootstrap.tfvars \
   -out=.terraform/bootstrap-destroy.tfplan
 terraform -chdir=bootstrap show -no-color .terraform/bootstrap-destroy.tfplan
+terraform -chdir=bootstrap show -json .terraform/bootstrap-destroy.tfplan >.terraform/bootstrap-destroy.json
+python3 scripts/verify-terraform-profiles.py plan \
+  --plan-json .terraform/bootstrap-destroy.json \
+  --installer-profile "$AWS_PROFILE" \
+  --iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
 terraform -chdir=bootstrap apply .terraform/bootstrap-destroy.tfplan
 test -z "$(terraform -chdir=bootstrap state list)"
 ```
@@ -1109,6 +1276,12 @@ terraform -chdir=scenario-a plan \
   -var='adopt_container_insights_log_group=true' \
   -out=.terraform/scenario-a-adopt.tfplan
 terraform -chdir=scenario-a show -no-color .terraform/scenario-a-adopt.tfplan
+terraform -chdir=scenario-a show -json .terraform/scenario-a-adopt.tfplan >.terraform/scenario-a-adopt.json
+python3 scripts/verify-terraform-profiles.py plan \
+  --plan-json .terraform/scenario-a-adopt.json \
+  --installer-profile "$AWS_PROFILE" \
+  --iam-lifecycle-profile "$IAM_LIFECYCLE_AWS_PROFILE" \
+  --forbidden-profile "$AWS_ROOT_PROFILE"
 terraform -chdir=scenario-a apply .terraform/scenario-a-adopt.tfplan
 ```
 
