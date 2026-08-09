@@ -157,12 +157,16 @@ data "aws_iam_policy_document" "task" {
   }
 
   statement {
-    # Neither Textract async action names an ARN, so "*" is the only expressible resource
-    # (the permissions boundary carries the same statement). Scope comes from the object
-    # grant above: StartDocumentAnalysis reads DocumentLocation.S3Object under this role's
-    # own credentials, so it can only analyse documents already inside this run's prefix.
+    # No Textract document-analysis action names an ARN, so "*" is the only expressible
+    # resource (the permissions boundary carries the same statement). For the async pair,
+    # scope comes from the object grant above: StartDocumentAnalysis reads
+    # DocumentLocation.S3Object under this role's own credentials, so it can only analyse
+    # documents already inside this run's prefix. The synchronous AnalyzeDocument call
+    # carries document bytes in the request; those bytes come from this deployment's own
+    # payload store, and the runtime enforces the 5 MiB synchronous bound and
+    # byte-signature/format agreement fail-closed before any call is made.
     sid       = "RunDocumentAnalysis"
-    actions   = ["textract:StartDocumentAnalysis", "textract:GetDocumentAnalysis"]
+    actions   = ["textract:AnalyzeDocument", "textract:StartDocumentAnalysis", "textract:GetDocumentAnalysis"]
     resources = ["*"]
   }
 

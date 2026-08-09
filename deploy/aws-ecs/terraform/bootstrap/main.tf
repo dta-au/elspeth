@@ -239,13 +239,16 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
   }
 
   statement {
-    # Textract's asynchronous document-analysis pair is not resource-scopable: neither
-    # StartDocumentAnalysis nor GetDocumentAnalysis names an ARN, so IAM offers no
-    # narrower resource than "*". The real boundary is the S3 object grant above —
-    # StartDocumentAnalysis reads DocumentLocation.S3Object under the caller's own
-    # credentials, so a task can only analyse documents it could already read.
+    # Textract's document-analysis actions are not resource-scopable: none of them
+    # names an ARN, so IAM offers no narrower resource than "*". The real boundary
+    # for the asynchronous pair is the S3 object grant above — StartDocumentAnalysis
+    # reads DocumentLocation.S3Object under the caller's own credentials, so a task
+    # can only analyse documents it could already read. The synchronous
+    # AnalyzeDocument call takes document bytes in the request itself; its inputs
+    # come from the deployment's own payload store (the runtime enforces the
+    # 5 MiB synchronous bound and byte-signature/format agreement fail-closed).
     sid       = "RunDocumentAnalysis"
-    actions   = ["textract:StartDocumentAnalysis", "textract:GetDocumentAnalysis"]
+    actions   = ["textract:AnalyzeDocument", "textract:StartDocumentAnalysis", "textract:GetDocumentAnalysis"]
     resources = ["*"]
   }
 
