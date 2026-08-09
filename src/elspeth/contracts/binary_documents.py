@@ -16,7 +16,7 @@ agreement with a declared format; it does not choose one.
 from __future__ import annotations
 
 from types import MappingProxyType
-from typing import Final, Literal, get_args
+from typing import Final, Literal, cast, get_args
 
 BinaryDocumentFormat = Literal["jpeg", "png", "pdf"]
 """Closed set of approved binary document formats (JPEG is spelled ``jpeg``)."""
@@ -51,6 +51,26 @@ _SIGNATURES: Final = MappingProxyType(
         "pdf": b"%PDF-",
     }
 )
+
+
+def detect_binary_document_signature(data: bytes) -> BinaryDocumentFormat | None:
+    """Return the approved format whose exact signature ``data`` starts with.
+
+    This does NOT reclassify content — its one consumer contract is
+    rejection: a boundary that reached a non-binary admission path may use
+    a positive detection only to REFUSE the payload (the declared type and
+    the byte signature disagree), never to admit it under the detected
+    type. An ASCII-only PDF decodes as UTF-8, so without this check a
+    ``text/plain`` declaration would walk a known binary signature past
+    the binary branch's declared-MIME/signature agreement and size
+    admission (elspeth-0c6a343921 review follow-up).
+    """
+    for document_format, signature in _SIGNATURES.items():
+        if data.startswith(signature):
+            # _SIGNATURES keys are exactly the BinaryDocumentFormat members;
+            # mypy sees the dict literal as str-keyed, so narrow explicitly.
+            return cast(BinaryDocumentFormat, document_format)
+    return None
 
 
 def binary_document_signature_matches(document_format: str, data: bytes) -> bool:

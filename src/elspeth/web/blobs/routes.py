@@ -17,7 +17,9 @@ from fastapi.responses import Response
 from elspeth.contracts.binary_documents import (
     BINARY_DOCUMENT_FORMAT_BY_MIME,
     BINARY_DOCUMENT_MAX_BYTES,
+    BINARY_DOCUMENT_MIME_BY_FORMAT,
     binary_document_signature_matches,
+    detect_binary_document_signature,
 )
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -191,6 +193,21 @@ def create_blobs_router() -> APIRouter:
                 raise HTTPException(status_code=413, detail=str(exc)) from None
             return _blob_response(record)
 
+        # A known binary signature reaching the text path is a declaration
+        # mismatch by construction (the matching binary MIME would have
+        # taken the branch above) — reject, never reclassify. Without this,
+        # an ASCII-only PDF declared text/plain (or octet-stream) sniffs as
+        # text and bypasses the binary size/signature admission entirely.
+        smuggled_format = detect_binary_document_signature(content)
+        if smuggled_format is not None:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Content signature matches binary format '{smuggled_format}' but the declared type is "
+                    f"'{mime_type}'; declare '{BINARY_DOCUMENT_MIME_BY_FORMAT[smuggled_format]}' instead"
+                ),
+            )
+
         # Server-side MIME detection — reject if declared type doesn't
         # match detected content (defense-in-depth, client MIME is untrusted)
         detected = detect_mime_type(content)
@@ -248,6 +265,20 @@ def create_blobs_router() -> APIRouter:
             raise HTTPException(
                 status_code=413,
                 detail=f"Content exceeds maximum size of {settings.max_upload_bytes} bytes",
+            )
+
+        # This route's MIME vocabulary is text-only (enforced by the request
+        # model), so a known binary signature in the pasted content is a
+        # declaration mismatch by construction — the same smuggle the upload
+        # route's text path rejects. Reject, never reclassify.
+        smuggled_format = detect_binary_document_signature(content_bytes)
+        if smuggled_format is not None:
+            raise HTTPException(
+                status_code=415,
+                detail=(
+                    f"Content signature matches binary format '{smuggled_format}' but inline blobs are text-only; "
+                    f"upload the file as '{BINARY_DOCUMENT_MIME_BY_FORMAT[smuggled_format]}' instead"
+                ),
             )
 
         try:

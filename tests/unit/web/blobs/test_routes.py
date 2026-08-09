@@ -909,6 +909,29 @@ class TestBinaryDocumentUpload:
         assert resp.status_code == 415
         assert "signature" in resp.json()["detail"].lower()
 
+    @pytest.mark.parametrize(
+        "content_type",
+        [
+            # An ASCII-only PDF decodes as UTF-8, so the text sniffer would
+            # classify it text/plain; declaring a text/none MIME must not
+            # smuggle a known binary signature past the binary branch's
+            # declared-MIME/signature agreement and size admission.
+            "text/plain",
+            "application/octet-stream",
+        ],
+    )
+    def test_binary_signature_declared_as_text_rejected(self, tmp_path, content_type: str) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("doc.pdf", io.BytesIO(_PDF_BYTES), content_type)},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
+
     def test_unsupported_binary_mime_stays_rejected(self, tmp_path) -> None:
         """TIFF is a non-goal: it falls through to the text path's 415."""
         app, _, _ = _make_app(tmp_path)
@@ -920,6 +943,20 @@ class TestBinaryDocumentUpload:
             files={"file": ("doc.tiff", io.BytesIO(b"II*\x00rest"), "image/tiff")},
         )
         assert resp.status_code == 415
+
+    def test_inline_text_route_rejects_binary_signature_content(self, tmp_path) -> None:
+        """A pasted string carrying a known binary signature is the same
+        declaration mismatch as the upload route's text-path smuggle."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "doc.txt", "mime_type": "text/plain", "content": _PDF_BYTES.decode("ascii")},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
 
     def test_inline_text_route_rejects_binary_mime(self, tmp_path) -> None:
         """The string-content inline route keeps its text-only vocabulary."""
