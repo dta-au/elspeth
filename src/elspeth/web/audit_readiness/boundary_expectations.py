@@ -124,6 +124,7 @@ from elspeth.contracts.enums import Determinism
 EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "aws_s3": Determinism.IO_READ,
     "azure_blob": Determinism.IO_READ,
+    "blob_rows": Determinism.IO_READ,
     "csv": Determinism.IO_READ,
     "dataverse": Determinism.EXTERNAL_CALL,
     "json": Determinism.IO_READ,
@@ -148,6 +149,7 @@ EXPECTED_TRANSFORM_DETERMINISMS: dict[str, Determinism] = {
     "aws_bedrock_content_safety": Determinism.EXTERNAL_CALL,
     "aws_bedrock_prompt_shield": Determinism.EXTERNAL_CALL,
     "aws_textract_document_analysis": Determinism.EXTERNAL_CALL,
+    "aws_textract_inline_analysis": Determinism.EXTERNAL_CALL,
     "azure_content_safety": Determinism.EXTERNAL_CALL,
     "azure_document_intelligence": Determinism.EXTERNAL_CALL,
     "azure_prompt_shield": Determinism.EXTERNAL_CALL,
