@@ -1460,6 +1460,26 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SetSourceFromBlobsArgumentsModel(BaseModel):
+    """Redaction-bearing argument model for the ``set_source_from_blobs`` tool.
+
+    The PLURAL authoritative binding (elspeth-0c6a343921): the caller
+    supplies only blob IDs; every persisted ``blobs`` entry field is
+    resolved from the session's authoritative records, never copied from
+    LLM assertions. ``options`` is Sensitive for uniformity with the other
+    source-binding tools; the resolver rejects a caller-supplied ``blobs``
+    key outright.
+    """
+
+    blob_ids: list[str] = Field(min_length=1, max_length=1000)
+    on_success: str
+    source_name: str = "source"
+    on_validation_failure: str | None = None
+    options: _LlmJsonObject = Field(default_factory=dict)
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class UpdateBlobArgumentsModel(BaseModel):
     """Redaction-bearing argument model for the ``update_blob`` tool.
 
@@ -3426,6 +3446,10 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
         ),
         "set_source_from_blob": ToolRedaction(
             argument_model=SetSourceFromBlobArgumentsModel,
+            response_model=_ToolResultResponseModel,
+        ),
+        "set_source_from_blobs": ToolRedaction(
+            argument_model=SetSourceFromBlobsArgumentsModel,
             response_model=_ToolResultResponseModel,
         ),
         # full-pipeline mutations.

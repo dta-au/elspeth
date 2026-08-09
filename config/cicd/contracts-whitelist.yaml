@@ -824,6 +824,7 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/tools/blobs.py:_set_nested_option:return"
   - "src/elspeth/web/composer/tools/blobs.py:_apply_inline_blob_marker:marker"
   - "src/elspeth/web/composer/tools/sources.py:_execute_set_source_from_blob:arguments"
+  - "src/elspeth/web/composer/tools/sources.py:_execute_set_source_from_blobs:arguments"
   - "src/elspeth/web/composer/tools/sources.py:_execute_inspect_source:arguments"
   - "src/elspeth/web/composer/tools/sessions.py:_execute_apply_pipeline_recipe:arguments"
   - "src/elspeth/web/composer/tools/recipes.py:_execute_list_recipes:arguments"

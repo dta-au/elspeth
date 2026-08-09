@@ -404,6 +404,7 @@ _COMPOSITION_STATE_MUTATION_TOOL_NAMES: Final[frozenset[str]] = (
     | frozenset(
         {
             "set_source_from_blob",
+            "set_source_from_blobs",
             "wire_blob_inline_ref",
         }
     )

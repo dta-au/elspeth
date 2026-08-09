@@ -1174,6 +1174,7 @@ def test_composition_gate_registry_covers_every_public_state_mutation() -> None:
         | frozenset(
             {
                 "set_source_from_blob",
+                "set_source_from_blobs",
                 "wire_blob_inline_ref",
             }
         )

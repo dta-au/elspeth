@@ -6,7 +6,7 @@ import codecs
 import csv
 import hashlib
 import io
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, TypedDict
@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine, select
 
+from elspeth.contracts.blobs import STORAGE_MIME_TYPES
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
@@ -25,6 +26,7 @@ from elspeth.web.composer.redaction import (
     PatchSourceOptionsArgumentsModel,
     SetSourceArgumentsModel,
     SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
 )
 from elspeth.web.composer.source_inspection import (
     delimiter_for_filename,
@@ -761,6 +763,236 @@ def _execute_set_source_from_blob(
     return _mutation_result(new_state, (_source_component_id(source_name),), data={**data, "source_blob": resolved.payload})
 
 
+def _resolve_source_blobs(
+    *,
+    blob_ids: Sequence[str],
+    caller_options: Mapping[str, Any],
+    on_validation_failure: str,
+    state: CompositionState,
+    context: ToolContext,
+    session_engine: Engine | None,
+    session_id: str | None,
+    source_name: str,
+) -> tuple[Mapping[str, Any], tuple[SourceBlobPayload, ...]] | ToolResult:
+    """Resolve a bounded blob-id list into authoritative blob_rows options.
+
+    The PLURAL binding (elspeth-0c6a343921): every persisted ``blobs`` entry
+    field comes from the session's authoritative blob record, never from LLM
+    assertions, and the WHOLE list is validated before any composition
+    mutation — one malformed, missing, duplicated, foreign, non-ready, or
+    inconsistent member fails the complete call. Binary blobs are never
+    UTF-8 decoded here; no content is read at all (run admission re-resolves
+    the records and web execution stages the bytes for the payload store).
+    """
+    if session_engine is None or session_id is None:
+        return _failure_result(state, "Blob tools require session context.")
+    manual_authoring_error = _reject_manual_source_authoring(caller_options, tool_name="set_source_from_blobs")
+    if manual_authoring_error is not None:
+        return _failure_result(state, manual_authoring_error)
+    if "blobs" in caller_options:
+        return _failure_result(
+            state,
+            "set_source_from_blobs resolves the 'blobs' list from session records; do not author or edit it directly.",
+        )
+    seen_ids: set[str] = set()
+    for blob_id in blob_ids:
+        blob_id_error = _blob_id_uuid_validation_error(blob_id)
+        if blob_id_error is not None:
+            return _failure_result(state, blob_id_error)
+        normalized = blob_id.lower()
+        if normalized in seen_ids:
+            return _failure_result(state, f"Duplicate blob id '{blob_id}' in blob_ids.")
+        seen_ids.add(normalized)
+
+    entries: list[dict[str, Any]] = []
+    payloads: list[SourceBlobPayload] = []
+    seen_hashes: dict[str, str] = {}
+    for blob_id in blob_ids:
+        blob = _sync_get_blob(session_engine, blob_id, session_id)
+        if blob is None:
+            return _failure_result(state, f"Blob '{blob_id}' not found.")
+        if blob["status"] != "ready":
+            return _failure_result(state, f"Blob '{blob_id}' is not ready (status: {blob['status']}).")
+        content_hash_value = blob["content_hash"]
+        if content_hash_value is None:
+            return _failure_result(state, f"Blob '{blob_id}' has no canonical content hash.")
+        if blob["mime_type"] not in STORAGE_MIME_TYPES:
+            return _failure_result(state, f"Blob '{blob_id}' has unsupported MIME type '{blob['mime_type']}'.")
+        creation_modality = CreationModality(blob["creation_modality"])
+        if is_llm_authored_creation_modality(creation_modality):
+            # Fail-closed v1 boundary (recorded design deviation): the
+            # singular set_source_from_blob path owns the LLM-authored
+            # review custody (it stamps source_authoring metadata and a
+            # pending review over the decoded content). The plural path
+            # serves the authenticated upload/paste flow, whose blobs are
+            # always user-verbatim; admitting LLM-authored blobs here
+            # without an equivalent review shape would bypass human review.
+            return _failure_result(
+                state,
+                f"Blob '{blob_id}' is LLM-authored; bind it through set_source_from_blob so its interpretation review is staged.",
+            )
+        if content_hash_value in seen_hashes:
+            return _failure_result(
+                state,
+                f"Blob '{blob_id}' has the same content as blob '{seen_hashes[content_hash_value]}'; entries must be unique documents.",
+            )
+        seen_hashes[content_hash_value] = blob["id"]
+        entries.append(
+            {
+                "blob_id": blob["id"],
+                "payload_ref": content_hash_value,
+                "filename": blob["filename"],
+                "mime_type": blob["mime_type"],
+                "size_bytes": blob["size_bytes"],
+            }
+        )
+        payloads.append(_source_blob_payload(blob))
+
+    merged_options: dict[str, Any] = {**caller_options, "blobs": entries}
+    if "schema" not in merged_options and "schema_config" not in merged_options:
+        merged_options["schema"] = {"mode": "observed"}
+    canonical_error = _canonical_interpretation_requirement_error(merged_options, tool_name="set_source_from_blobs")
+    if canonical_error is not None:
+        return _failure_result(state, canonical_error, error_code="interpretation_requirements_invalid")
+    try:
+        context.catalog.get_schema("source", "blob_rows")
+    except (ValueError, KeyError) as exc:
+        return _failure_result(state, f"Unknown source plugin 'blob_rows': {exc}")
+    prevalidation_error = _prevalidate_source_for_context(
+        context,
+        "blob_rows",
+        merged_options,
+        on_validation_failure,
+        source_name=source_name,
+    )
+    if prevalidation_error is not None:
+        return _failure_result(state, prevalidation_error)
+    return merged_options, tuple(payloads)
+
+
+def _execute_set_source_from_blobs(
+    arguments: dict[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+) -> ToolResult:
+    """Bind one or more existing blobs to a blob_rows source, atomically.
+
+    Tier-3 boundary: ``arguments`` is an LLM-supplied dict, validated via
+    :class:`SetSourceFromBlobsArgumentsModel`; ValidationError re-raises as
+    ToolArgumentError for the compose loop's ARG_ERROR routing (same
+    discipline as the singular handler above).
+    """
+    try:
+        validated = SetSourceFromBlobsArgumentsModel.model_validate(arguments)
+    except PydanticValidationError as exc:
+        raise ToolArgumentError(
+            argument="set_source_from_blobs arguments",
+            expected="object conforming to SetSourceFromBlobsArgumentsModel",
+            actual_type=type(exc).__name__,
+        ) from exc
+
+    source_name = validated.source_name
+    _validate_source_name_argument(source_name)
+
+    review_metadata_error = _resolver_owned_interpretation_requirement_error(
+        validated.options,
+        tool_name="set_source_from_blobs",
+        component_id=_source_component_id(source_name),
+        source=True,
+    )
+    if review_metadata_error is not None:
+        return _failure_result(state, review_metadata_error, error_code="interpretation_requirements_invalid")
+    caller_options = _canonicalize_authored_interpretation_requirements(
+        validated.options,
+        component_id=_source_component_id(source_name),
+        source=True,
+        existing_options=state.sources[source_name].options if source_name in state.sources else None,
+    )
+    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
+    resolved = _resolve_source_blobs(
+        blob_ids=validated.blob_ids,
+        caller_options=caller_options,
+        on_validation_failure=on_vf,
+        state=state,
+        context=context,
+        session_engine=context.session_engine,
+        session_id=context.session_id,
+        source_name=source_name,
+    )
+    if isinstance(resolved, ToolResult):
+        return resolved
+    merged_options, payloads = resolved
+
+    plugin_error = _validate_plugin_name(context, "source", "blob_rows")
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
+
+    source = SourceSpec(
+        plugin="blob_rows",
+        on_success=validated.on_success,
+        options=merged_options,
+        on_validation_failure=on_vf,
+    )
+    new_state = state.with_named_source(source_name, source)
+    data = _vf_destination_note(new_state, on_vf) or {}
+    return _mutation_result(
+        new_state,
+        (_source_component_id(source_name),),
+        data={**data, "source_blobs": list(payloads)},
+    )
+
+
+_SET_SOURCE_FROM_BLOBS_DECLARATION = ToolDeclaration(
+    name="set_source_from_blobs",
+    handler=_execute_set_source_from_blobs,
+    kind=ToolKind.BLOB_MUTATION,
+    description=(
+        "Wire one or more READY session blobs as a blob_rows source: one blob becomes one row "
+        "carrying its payload hash and bounded metadata, in the given order. Every entry field "
+        "is resolved from the session's authoritative records — never pass document content. "
+        "Use this for pasted/uploaded binary documents (jpeg/png/pdf) feeding "
+        "aws_textract_inline_analysis; mixed formats need one homogeneous source per format."
+    ),
+    json_schema={
+        "type": "object",
+        "properties": {
+            "blob_ids": {
+                "type": "array",
+                "items": {"type": "string", "description": "Ready session blob ID."},
+                "minItems": 1,
+                "maxItems": 1000,
+                "description": "Blob IDs in authoring order (becomes source-row order). No duplicates.",
+            },
+            "source_name": {
+                "type": "string",
+                "description": "Source root name to bind. Defaults to 'source' for legacy single-source pipelines.",
+            },
+            "on_success": {
+                "type": "string",
+                "description": (
+                    "Connection-name string the source PUBLISHES. Some downstream consumer "
+                    "(node 'input' or output 'sink_name') MUST equal this value."
+                ),
+                "examples": ["documents"],
+            },
+            "on_validation_failure": {
+                "type": "string",
+                "description": _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
+                "default": _DEFAULT_SOURCE_VALIDATION_FAILURE,
+            },
+            "options": {
+                "type": "object",
+                "description": ("Optional blob_rows config (e.g. schema). The 'blobs' list is resolver-owned and must not appear here."),
+            },
+        },
+        "required": ["blob_ids", "on_success"],
+        "additionalProperties": False,
+    },
+    blob_store_only=False,
+    augments_on_failure=True,
+)
+
+
 _SET_SOURCE_FROM_BLOB_DECLARATION = ToolDeclaration(
     name="set_source_from_blob",
     handler=_execute_set_source_from_blob,
@@ -1287,6 +1519,7 @@ TOOLS_IN_MODULE: tuple[ToolDeclaration, ...] = (
     _PATCH_SOURCE_OPTIONS_DECLARATION,
     _CLEAR_SOURCE_DECLARATION,
     _SET_SOURCE_FROM_BLOB_DECLARATION,
+    _SET_SOURCE_FROM_BLOBS_DECLARATION,
     _INSPECT_SOURCE_DECLARATION,
 )
 """Every tool declared in this module, in stable order.

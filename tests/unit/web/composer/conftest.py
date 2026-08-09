@@ -92,6 +92,7 @@ from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     MANIFEST,
     SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
     ToolRedaction,
     _InlineBlobModel,
     _NodeTriggerModel,
@@ -182,6 +183,16 @@ def _set_source_from_blob_strategy() -> st.SearchStrategy[SetSourceFromBlobArgum
         blob_id=st.text(),
         on_success=st.text(),
         plugin=st.one_of(st.none(), st.text()),
+        on_validation_failure=st.one_of(st.none(), st.text()),
+        options=_OPTIONS_STRATEGY,
+    )
+
+
+def _set_source_from_blobs_strategy() -> st.SearchStrategy[SetSourceFromBlobsArgumentsModel]:
+    return st.builds(
+        SetSourceFromBlobsArgumentsModel,
+        blob_ids=st.lists(st.text(), min_size=1, max_size=5),
+        on_success=st.text(),
         on_validation_failure=st.one_of(st.none(), st.text()),
         options=_OPTIONS_STRATEGY,
     )
@@ -295,6 +306,7 @@ def _repair_tool_call_strategy() -> st.SearchStrategy[_RepairToolCallShadowModel
 
 
 st.register_type_strategy(SetSourceFromBlobArgumentsModel, _set_source_from_blob_strategy())
+st.register_type_strategy(SetSourceFromBlobsArgumentsModel, _set_source_from_blobs_strategy())
 st.register_type_strategy(_SetPipelineSourceModel, _set_pipeline_source_strategy())
 st.register_type_strategy(_SetPipelineNamedSourceModel, _set_pipeline_named_source_strategy())
 st.register_type_strategy(_PipelineNodeModel, _pipeline_node_strategy())
@@ -312,6 +324,7 @@ st.register_type_strategy(_RepairToolCallShadowModel, _repair_tool_call_strategy
 # the drift guard to raise at conftest import time.
 _OVERRIDE_REGISTERED_MODELS: tuple[type[BaseModel], ...] = (
     SetSourceFromBlobArgumentsModel,
+    SetSourceFromBlobsArgumentsModel,
     _SetPipelineSourceModel,
     _SetPipelineNamedSourceModel,
     _PipelineNodeModel,

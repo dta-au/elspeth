@@ -179,6 +179,11 @@
     "sensitive_path_count": 8,
     "shape": "type_driven"
   },
+  "set_source_from_blobs": {
+    "hash": "ab9c4231102aba99f74a55b92e9c482a0d6fb083cb729af3e53b47034b63bcbd",
+    "sensitive_path_count": 8,
+    "shape": "type_driven"
+  },
   "splice_transform": {
     "hash": "24b58c4915f1aa6bf55c6a9d053afcec6cf06891fc65912ac0734ac05dbd02b5",
     "sensitive_path_count": 8,
