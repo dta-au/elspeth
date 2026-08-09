@@ -2332,7 +2332,6 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     assert delete_roles["Condition"]["StringEquals"] == {"aws:ResourceTag/ACCEPTANCE_RUN_ID": values["run_id"]}
     assert {
         "iam:DeleteRole",
-        "iam:DeleteRolePermissionsBoundary",
         "iam:TagRole",
         "iam:UntagRole",
     }.issubset(delete_roles["Action"])
@@ -2340,6 +2339,7 @@ def test_iam_lifecycle_policy_and_provider_cannot_mutate_or_activate_role_permis
     forbidden = {
         "ecs:RunTask",
         "iam:AttachRolePolicy",
+        "iam:DeleteRolePermissionsBoundary",
         "iam:PassRole",
         "iam:PutRolePolicy",
         "iam:PutRolePermissionsBoundary",

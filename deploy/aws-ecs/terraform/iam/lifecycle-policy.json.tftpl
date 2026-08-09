@@ -64,7 +64,6 @@
       "Effect": "Allow",
       "Action": [
         "iam:DeleteRole",
-        "iam:DeleteRolePermissionsBoundary",
         "iam:TagRole",
         "iam:UntagRole"
       ],
@@ -88,6 +87,7 @@
       "Action": [
         "ecs:RunTask",
         "iam:AttachRolePolicy",
+        "iam:DeleteRolePermissionsBoundary",
         "iam:DeleteRolePolicy",
         "iam:DetachRolePolicy",
         "iam:PassRole",
