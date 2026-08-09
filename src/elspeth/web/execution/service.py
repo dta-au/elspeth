@@ -69,6 +69,7 @@ from elspeth.plugins.infrastructure.runtime_factory import (
     validate_landscape_export_settings_from_raw_config,
     validate_sink_effect_eligibility_from_raw_config,
 )
+from elspeth.plugins.sources.blob_rows import BlobRowsEntry
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
@@ -92,6 +93,7 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.execution.discard_summary import load_discard_summaries_from_db
 from elspeth.web.execution.errors import (
+    BlobRowsSourceAdmissionError,
     BlobSourcePathMismatchError,
     CompletionGateIntegrityError,
     ExecutionReadinessError,
@@ -377,6 +379,33 @@ def _build_web_plugin_policy_evidence(
 
 
 T = TypeVar("T")
+
+
+def _discover_blob_rows_sources(config: Mapping[str, Any]) -> list[tuple[str, Any]]:
+    """Return ``(source_label, raw_options)`` for every ``blob_rows`` source.
+
+    Walks the same YAML-shaped config surfaces as the inline-content
+    discovery: the legacy singular ``source`` block and the plural
+    ``sources`` mapping.  Labels use the canonical audit form (``source`` /
+    ``source:<name>``).  Options are returned raw — the admission block
+    parses each entry with the plugin-owned ``BlobRowsEntry`` model so both
+    surfaces share one definition of a well-formed entry.
+    """
+    found: list[tuple[str, Any]] = []
+    if "source" in config:
+        source = config["source"]
+        if type(source) is dict and cast(dict[str, Any], source).get("plugin") == "blob_rows":
+            found.append(("source", cast(dict[str, Any], source).get("options")))
+    if "sources" in config:
+        sources = config["sources"]
+        if type(sources) is dict:
+            for source_name, source in sources.items():
+                if type(source_name) is not str or type(source) is not dict:
+                    continue
+                if cast(dict[str, Any], source).get("plugin") != "blob_rows":
+                    continue
+                found.append((f"source:{source_name}", cast(dict[str, Any], source).get("options")))
+    return found
 
 
 def _sanitize_error_for_client(exc: BaseException) -> str:
@@ -1882,8 +1911,17 @@ class ExecutionServiceImpl:
                 if executable_config is not None
                 else "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml
             )
+            blob_rows_candidate = (
+                bool(_discover_blob_rows_sources(executable_config)) if executable_config is not None else "blob_rows" in pipeline_yaml
+            )
+            # blob ids and expected payload refs admitted for staging into the
+            # run's payload store after it is constructed below.
+            admitted_blob_rows: list[tuple[UUID, str]] = []
             needs_config_tree = (
-                executable_config is not None or (self._secret_service is not None and user_id is not None) or inline_blob_candidate
+                executable_config is not None
+                or (self._secret_service is not None and user_id is not None)
+                or inline_blob_candidate
+                or blob_rows_candidate
             )
             if needs_config_tree:
                 if resolved_dict is None:
@@ -2022,6 +2060,108 @@ class ExecutionServiceImpl:
                         )
                     )
 
+                blob_rows_bindings = _discover_blob_rows_sources(resolved_dict) if blob_rows_candidate else []
+                if blob_rows_bindings:
+                    if self._blob_service is None:
+                        raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
+                    rows_blob_service = self._blob_service
+
+                    # The persisted entries were authored by the trusted plural
+                    # resolver (set_source_from_blobs), but the sessions DB is
+                    # not the authority at run time — the blob records are.
+                    # Strict-parse every entry with the plugin-owned model,
+                    # then re-resolve each against the session's authoritative
+                    # record and fail admission on ANY divergence.
+                    parsed_entries: list[tuple[str, BlobRowsEntry]] = []
+                    for source_label, raw_options in blob_rows_bindings:
+                        if type(raw_options) is not dict:
+                            raise BlobRowsSourceAdmissionError(f"{source_label}.options must be a mapping")
+                        raw_blobs = cast(dict[str, Any], raw_options).get("blobs")
+                        if type(raw_blobs) is not list or not raw_blobs:
+                            raise BlobRowsSourceAdmissionError(f"{source_label}.options.blobs must be a non-empty list")
+                        for position, raw_entry in enumerate(raw_blobs):
+                            try:
+                                entry = BlobRowsEntry.model_validate(raw_entry)
+                            except PydanticValidationError as exc:
+                                raise BlobRowsSourceAdmissionError(f"{source_label}.options.blobs[{position}] failed validation") from exc
+                            parsed_entries.append((f"{source_label}.options.blobs[{position}]", entry))
+
+                    # IDOR contract (same as the inline-content block above):
+                    # resolve the run's owning session once and treat any blob
+                    # owned by another session exactly as missing, BEFORE any
+                    # status / hash / metadata comparison, linking, or read.
+                    rows_session_id = self._call_async(self._session_service.get_run(run_uuid)).session_id
+
+                    async def _get_blob_rows_scoped(blob_id: UUID) -> BlobRecord:
+                        record = await rows_blob_service.get_blob(blob_id)
+                        if record.session_id != rows_session_id:
+                            raise BlobNotFoundError(str(blob_id))
+                        return record
+
+                    unique_rows_blob_ids: list[UUID] = []
+                    seen_rows_blob_ids: set[UUID] = set()
+                    for _entry_path, entry in parsed_entries:
+                        entry_blob_id = UUID(entry.blob_id)
+                        if entry_blob_id not in seen_rows_blob_ids:
+                            seen_rows_blob_ids.add(entry_blob_id)
+                            unique_rows_blob_ids.append(entry_blob_id)
+
+                    async def _gather_blob_rows_records() -> list[Any]:
+                        return await asyncio.gather(*(_get_blob_rows_scoped(blob_id) for blob_id in unique_rows_blob_ids))
+
+                    rows_records_by_id: dict[UUID, BlobRecord] = {
+                        blob_id: cast(BlobRecord, record)
+                        for blob_id, record in zip(unique_rows_blob_ids, self._call_async(_gather_blob_rows_records()), strict=True)
+                    }
+
+                    for entry_path, entry in parsed_entries:
+                        record = rows_records_by_id[UUID(entry.blob_id)]
+                        if record.status != "ready":
+                            raise BlobStateError(
+                                entry.blob_id,
+                                message=(
+                                    f"Cannot bind blob {entry.blob_id} at {entry_path} — status is {record.status!r}, expected 'ready'"
+                                ),
+                            )
+                        if record.content_hash != entry.payload_ref:
+                            raise BlobIntegrityError(
+                                entry.blob_id,
+                                expected=entry.payload_ref,
+                                actual=record.content_hash or "<missing>",
+                            )
+                        diverged = [
+                            field_name
+                            for field_name, persisted, authoritative in (
+                                ("filename", entry.filename, record.filename),
+                                ("mime_type", entry.mime_type, record.mime_type),
+                                ("size_bytes", entry.size_bytes, record.size_bytes),
+                            )
+                            if persisted != authoritative
+                        ]
+                        if diverged:
+                            raise BlobRowsSourceAdmissionError(
+                                f"{entry_path} diverged from the session blob record on: {', '.join(diverged)}"
+                            )
+
+                    async def _link_blob_rows_to_run() -> None:
+                        await asyncio.gather(
+                            *(
+                                rows_blob_service.link_blob_to_run(
+                                    blob_id=blob_id,
+                                    run_id=run_uuid,
+                                    direction="input",
+                                )
+                                for blob_id in unique_rows_blob_ids
+                            )
+                        )
+
+                    self._call_async(_link_blob_rows_to_run())
+                    # content_hash == payload_ref was verified above, so the
+                    # non-None narrowing here is structural, not hopeful.
+                    admitted_blob_rows = [
+                        (blob_id, cast(str, rows_records_by_id[blob_id].content_hash)) for blob_id in unique_rows_blob_ids
+                    ]
+
             if frozen_run_settings is not None:
                 # Rebuild the principal snapshot after secret resolution and
                 # immediately before runtime config use. A queued run must not
@@ -2100,6 +2240,26 @@ class ExecutionServiceImpl:
             # instances have already earned admission above.
             landscape_db = open_landscape_db(self._settings)
             payload_store = FilesystemPayloadStore(base_path=self._settings.get_payload_store_path())
+
+            # Stage admitted blob_rows content into the run's payload store
+            # BEFORE the orchestrator runs: the blob_rows source validates
+            # every payload ref with ``exists()`` before emitting a row, and
+            # the consuming transform retrieves by content hash.
+            # ``read_blob_content`` re-verifies bytes against the blob's
+            # content_hash under the custody lock, and ``store()`` is
+            # content-addressed and idempotent, so re-staging an already
+            # present payload is a no-op.  The final equality check binds the
+            # two stores' identities: what the payload store now holds under
+            # ``expected_ref`` is byte-for-byte the session blob's content.
+            if admitted_blob_rows:
+                staging_blob_service = self._blob_service
+                if staging_blob_service is None:
+                    raise RuntimeError("blob_rows sources require BlobServiceProtocol wiring")
+                for staged_blob_id, expected_ref in admitted_blob_rows:
+                    staged_content = self._call_async(staging_blob_service.read_blob_content(staged_blob_id))
+                    stored_ref = payload_store.store(staged_content)
+                    if stored_ref != expected_ref:
+                        raise BlobIntegrityError(str(staged_blob_id), expected=expected_ref, actual=stored_ref)
 
             # Fold aggregations into transforms, assemble PipelineConfig, and
             # run the four orchestrator route-target validators. The
