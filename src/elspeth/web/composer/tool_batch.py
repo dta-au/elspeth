@@ -29,6 +29,9 @@ from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.blobs.protocol import BlobQuotaExceededError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedToolBatch,
+    _AdmittedToolCall,
+    _AdmittedToolFunction,
     _CallModelOutcome,
     _DispatchOutcome,
     _ToolBatchCancellationRequested,
@@ -72,7 +75,6 @@ from elspeth.web.composer.discovery_cache import (
 from elspeth.web.composer.discovery_cache import (
     tool_result_mutated_composition_state as _tool_result_mutated_composition_state,
 )
-from elspeth.web.composer.llm_response_parsing import safe_response_model
 from elspeth.web.composer.pipeline_custody import (
     finalize_pipeline_custody,
     inline_custody_audit_projection,
@@ -149,30 +151,6 @@ if TYPE_CHECKING:
 
 
 _MAX_PENDING_PROPOSALS_PER_TURN: Final[int] = 10
-
-
-@dataclass(frozen=True, slots=True)
-class _AdmittedToolFunction:
-    """Immutable copy of execution-relevant provider function metadata."""
-
-    name: str
-    arguments: str
-
-
-@dataclass(frozen=True, slots=True)
-class _AdmittedToolCall:
-    """Immutable provider call admitted for this dispatch batch."""
-
-    id: str
-    function: _AdmittedToolFunction
-
-
-@dataclass(frozen=True, slots=True)
-class _AdmittedToolBatch:
-    """Immutable batch used exclusively after provider-boundary admission."""
-
-    calls: tuple[_AdmittedToolCall, ...]
-    call_ids: frozenset[str]
 
 
 _MISSING_TOOL_CALL_FIELD = object()
@@ -550,12 +528,12 @@ async def run_tool_batch(
     last_runtime_preflight = acc.last_runtime_preflight
     advisor_calls_used = acc.advisor_calls_used
 
-    assistant_message = call_model.assistant_message
-    raw_assistant_content = call_model.raw_assistant_content
-    response = call_model.response
-
-    admitted_batch = _admit_tool_batch(call_model.assistant_tool_calls)
+    completion = call_model.completion
+    assistant_message = completion.message
+    raw_assistant_content = assistant_message.content
+    admitted_batch = completion.tool_batch
     assistant_tool_calls = admitted_batch.calls
+    provider_model_version = completion.provider_metadata.model_returned or ctx.service._model
     if (
         turn_sessions_service is not None
         and turn_session_uuid is not None
@@ -997,7 +975,7 @@ async def run_tool_batch(
                     user_message_id=user_message_id,
                     user_message_content=user_message_content,
                     composer_model_identifier=ctx.service._model,
-                    composer_model_version=safe_response_model(response) or ctx.service._model,
+                    composer_model_version=provider_model_version,
                     composer_provider=ctx.service._availability.provider or "unknown",
                     composer_skill_hash=ctx.service._composer_skill_hash,
                     tool_arguments_hash=audit.binding_arguments_hash,
@@ -1095,7 +1073,7 @@ async def run_tool_batch(
                             user_message_id=user_message_id,
                             user_message_content=user_message_content,
                             composer_model_identifier=ctx.service._model,
-                            composer_model_version=safe_response_model(response) or ctx.service._model,
+                            composer_model_version=provider_model_version,
                             composer_provider=ctx.service._availability.provider or "unknown",
                             composer_skill_hash=ctx.service._composer_skill_hash,
                             tool_arguments_hash=audit.binding_arguments_hash,
@@ -1254,7 +1232,7 @@ async def run_tool_batch(
                         user_message_id=user_message_id,
                         user_message_content=user_message_content,
                         composer_model_identifier=ctx.service._model,
-                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_model_version=provider_model_version,
                         composer_provider=ctx.service._availability.provider or "unknown",
                         composer_skill_hash=ctx.service._composer_skill_hash,
                         tool_arguments_hash=audit.binding_arguments_hash,
@@ -1333,7 +1311,7 @@ async def run_tool_batch(
                             tool_call_id=tool_call.id,
                             custody_result=pipeline_custody_result,
                             model_identifier=ctx.service._model,
-                            model_version=safe_response_model(response) or ctx.service._model,
+                            model_version=provider_model_version,
                             provider=ctx.service._availability.provider or "unknown",
                         ),
                         summary=proposal_summary.summary,
@@ -1343,7 +1321,7 @@ async def run_tool_batch(
                         actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
                         user_message_id=UUID(user_message_id) if user_message_id is not None else None,
                         composer_model_identifier=ctx.service._model,
-                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_model_version=provider_model_version,
                         composer_provider=ctx.service._availability.provider or "unknown",
                     )
                 else:
@@ -1360,7 +1338,7 @@ async def run_tool_batch(
                         actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
                         user_message_id=UUID(user_message_id) if user_message_id is not None else None,
                         composer_model_identifier=ctx.service._model,
-                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_model_version=provider_model_version,
                         composer_provider=ctx.service._availability.provider or "unknown",
                         composer_skill_hash=ctx.service._composer_skill_hash,
                         tool_arguments_hash=audit.binding_arguments_hash,
@@ -1770,7 +1748,7 @@ async def run_tool_batch(
                     recorder=recorder,
                     session_id=session_id,
                     current_state_id=current_state_id,
-                    response=response,
+                    composer_model_version=provider_model_version,
                     llm_messages=llm_messages,
                     anti_anchor=anti_anchor,
                     policy_catalog=ctx.policy_catalog,
@@ -1924,7 +1902,7 @@ async def run_tool_batch(
             _user_message_id: str | None = user_message_id,
             _user_message_content: str | None = user_message_content,
             _composer_model_identifier: str = ctx.service._model,
-            _composer_model_version: str = safe_response_model(response) or ctx.service._model,
+            _composer_model_version: str = provider_model_version,
             _composer_provider: str = ctx.service._availability.provider or "unknown",
             _composer_skill_hash: str = ctx.service._composer_skill_hash,
             _tool_arguments_hash: str = audit.binding_arguments_hash,

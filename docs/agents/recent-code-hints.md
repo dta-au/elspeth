@@ -21,7 +21,7 @@ consider a commit done — or at absolute minimum run the gates below.
 set of `getattr`/`hasattr`/`getattr_static`/`__getattr__` sites in
 `src/elspeth/web/sessions` and `src/elspeth/web/composer`. The contract:
 **only ADR-032 LiteLLM admission boundaries may use `getattr`** (the
-`_admit_*` parsers and `_call_llm`). Adding ANY dynamic attribute access
+`_admit_*` parsers and `_capture_composer_llm_completion_fields`). Adding ANY dynamic attribute access
 anywhere under those trees fails the gate repo-wide.
 
 - Owned type (a class ELSPETH defines)? Use direct attribute access. If the

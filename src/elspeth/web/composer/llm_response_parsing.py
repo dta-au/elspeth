@@ -46,6 +46,7 @@ from elspeth.contracts.composer_llm_audit import (
 )
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.core.canonical import stable_hash
+from elspeth.web.composer._compose_loop_carriers import _AdmittedLLMProviderMetadata
 from elspeth.web.composer.bounded_json import (
     PROVIDER_ARTIFACT_UNAVAILABLE,
     JsonBoundaryError,
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "PROVIDER_STRING_TRUNCATION_MARKER",
+    "admit_llm_provider_metadata",
     "apply_anthropic_cache_markers",
     "attach_llm_calls",
     "build_llm_call_record",
@@ -208,9 +210,15 @@ def token_usage_from_response(response: Any | None) -> TokenUsage:
     Each constructs ``PromptTokensDetailsWrapper(cached_tokens=cache_read_input_tokens)``
     and emits both fields on the returned ``Usage`` object.
     """
-    if response is None:
+    usage = None if response is None else _provider_field(response, "usage")
+    return _token_usage_from_usage(usage)
+
+
+def _token_usage_from_usage(usage: Any | None) -> TokenUsage:
+    """Normalize one already-captured provider usage value."""
+
+    if usage is None:
         return TokenUsage.unknown()
-    usage = _provider_field(response, "usage")
     if isinstance(usage, Mapping):
         details = usage.get("prompt_tokens_details")
         completion_details = usage.get("completion_tokens_details")
@@ -270,6 +278,15 @@ def _provider_cost_from_response(response: Any | None) -> tuple[float | None, Co
     if response is None:
         return None, PROVIDER_COST_SOURCE_NOT_AVAILABLE
     usage = _provider_field(response, "usage")
+    return _provider_cost_from_captured_usage(response, usage)
+
+
+def _provider_cost_from_captured_usage(
+    response: Any,
+    usage: Any | None,
+) -> tuple[float | None, ComposerLLMProviderCostSource]:
+    """Extract cost without resolving the response's usage field again."""
+
     usage_fields = _provider_field_map(usage)
     if usage_fields is not None and "cost" in usage_fields:
         return _validated_provider_cost(usage_fields["cost"], PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST)
@@ -616,6 +633,12 @@ def _json_safe_provider_artifact(value: Any) -> Any:
 
 def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadata:
     message = _first_response_message(response)
+    return _reasoning_metadata_from_message(message)
+
+
+def _reasoning_metadata_from_message(message: Any | None) -> _ReasoningMetadata:
+    """Normalize reasoning fields from one already-captured message."""
+
     if message is None:
         return {
             "reasoning_content": None,
@@ -643,6 +666,65 @@ def _reasoning_metadata_from_response(response: Any | None) -> _ReasoningMetadat
         "reasoning_details": _json_safe_provider_artifact(reasoning_details),
         "thinking_blocks": _json_safe_provider_artifact(_response_field(message, "thinking_blocks")),
     }
+
+
+def _captured_field(fields: Mapping[str, Any] | None, field: str) -> Any:
+    """Read one provider mapping field once, returning absence on KeyError."""
+
+    if fields is None:
+        return None
+    try:
+        return fields[field]
+    except KeyError:
+        return None
+
+
+def admit_llm_provider_metadata(
+    response: Any,
+    *,
+    choice: Any | None,
+    message: Any | None,
+) -> _AdmittedLLMProviderMetadata:
+    """Capture every retained provider fact exactly once into an owned carrier."""
+
+    response_fields = _provider_field_map(response)
+    usage = _captured_field(response_fields, "usage")
+    usage_projection = _token_usage_from_usage(usage)
+    provider_cost, provider_cost_source = _provider_cost_from_captured_usage(response, usage)
+
+    model_value = _captured_field(response_fields, "model")
+    model_returned = (
+        _bounded_provider_string(model_value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+        if isinstance(model_value, str) and model_value.strip()
+        else None
+    )
+
+    provider_request_id: str | None = None
+    for field in ("id", "request_id"):
+        identifier = _captured_field(response_fields, field)
+        if isinstance(identifier, str) and identifier.strip():
+            provider_request_id = _bounded_provider_string(identifier, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
+            break
+
+    choice_fields = _provider_field_map(choice)
+    finish_value = _captured_field(choice_fields, "finish_reason")
+    finish_reason = (
+        _bounded_provider_string(finish_value, limit=_PROVIDER_TOKEN_MAX_CHARS)
+        if type(finish_value) is str and finish_value.strip()
+        else None
+    )
+    reasoning_metadata = _reasoning_metadata_from_message(message)
+    return _AdmittedLLMProviderMetadata(
+        model_returned=model_returned,
+        finish_reason=finish_reason,
+        usage=usage_projection,
+        provider_cost=provider_cost,
+        provider_cost_source=provider_cost_source,
+        provider_request_id=provider_request_id,
+        reasoning_content=reasoning_metadata["reasoning_content"],
+        reasoning_details=reasoning_metadata["reasoning_details"],
+        thinking_blocks=reasoning_metadata["thinking_blocks"],
+    )
 
 
 def _llm_error_hash(raw_message: str) -> str:
@@ -701,20 +783,37 @@ def build_llm_call_record(
     temperature: float | None,
     seed: int | None,
     response: Any | None = None,
+    response_metadata: _AdmittedLLMProviderMetadata | None = None,
     error_class: str | None = None,
     error_message: str | None = None,
     max_completion_tokens_requested: int | None = None,
     planner_policy_hash: str | None = None,
     planner_call_ordinal: int | None = None,
 ) -> ComposerLLMCall:
-    usage = token_usage_from_response(response)
-    provider_cost, provider_cost_source = _provider_cost_from_response(response)
-    reasoning_metadata = _reasoning_metadata_from_response(response)
+    if response_metadata is None:
+        usage = token_usage_from_response(response)
+        provider_cost, provider_cost_source = _provider_cost_from_response(response)
+        reasoning_metadata = _reasoning_metadata_from_response(response)
+        model_returned = safe_response_model(response)
+        finish_reason = _finish_reason_from_response(response)
+        provider_request_id = _safe_provider_request_id(response)
+    else:
+        usage = response_metadata.usage
+        provider_cost = response_metadata.provider_cost
+        provider_cost_source = response_metadata.provider_cost_source
+        reasoning_metadata = {
+            "reasoning_content": response_metadata.reasoning_content,
+            "reasoning_details": response_metadata.reasoning_details,
+            "thinking_blocks": response_metadata.thinking_blocks,
+        }
+        model_returned = response_metadata.model_returned
+        finish_reason = response_metadata.finish_reason
+        provider_request_id = response_metadata.provider_request_id
     return ComposerLLMCall(
         model_requested=model_requested,
-        model_returned=safe_response_model(response),
+        model_returned=model_returned,
         status=status,
-        finish_reason=_finish_reason_from_response(response),
+        finish_reason=finish_reason,
         prompt_tokens=usage.prompt_tokens,
         completion_tokens=usage.completion_tokens,
         total_tokens=usage.total_tokens,
@@ -728,7 +827,7 @@ def build_llm_call_record(
         provider_cost=provider_cost,
         provider_cost_source=provider_cost_source,
         latency_ms=(time.monotonic_ns() - started_ns) // 1_000_000,
-        provider_request_id=_safe_provider_request_id(response),
+        provider_request_id=provider_request_id,
         messages_hash=stable_hash(messages),
         tools_spec_hash=stable_hash(tools) if tools is not None else None,
         declared_tool_names=tuple(tool["function"]["name"] for tool in tools) if tools is not None else (),

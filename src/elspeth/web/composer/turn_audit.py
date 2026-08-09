@@ -17,7 +17,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
-from elspeth.web.composer._compose_loop_carriers import _PersistOutcome, _ToolOutcome
+from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedAssistantMessage,
+    _AdmittedToolCall,
+    _PersistOutcome,
+    _ToolOutcome,
+)
 from elspeth.web.composer.bounded_json import bounded_json_loads
 from elspeth.web.composer.protocol import ComposerPluginCrashError
 from elspeth.web.composer.tool_error_payloads import (
@@ -35,9 +40,9 @@ async def persist_turn_audit(
     *,
     tool_outcomes: tuple[_ToolOutcome, ...],
     decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
-    assistant_message: Any,
+    assistant_message: _AdmittedAssistantMessage,
     raw_assistant_content: str | None,
-    assistant_tool_calls: tuple[Any, ...],
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...],
     plugin_crash: ComposerPluginCrashError | None,
     session_id: str | None,
     current_state_id: str | None,

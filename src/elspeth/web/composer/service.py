@@ -25,7 +25,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
@@ -66,6 +66,10 @@ from elspeth.web.composer import no_tool_policy as _no_tool_policy
 from elspeth.web.composer import tool_error_payloads as _tool_error_payloads
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer._compose_loop_carriers import (
+    _AdmittedAssistantMessage,
+    _AdmittedLLMCompletion,
+    _AdmittedLLMProviderMetadata,
+    _AdmittedToolCall,
     _AdvisorReviewState,
     _CallModelOutcome,
     _ClassifyOutcome,
@@ -99,6 +103,7 @@ from elspeth.web.composer.discovery_cache import (
 )
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.llm_response_parsing import (
+    admit_llm_provider_metadata,
     apply_anthropic_cache_markers,
     attach_llm_calls,
     build_llm_call_record,
@@ -529,11 +534,98 @@ def _preflight_verdict(result: ValidationResult) -> str:
 
 
 class _MalformedLLMResponseError(ComposerServiceError):
-    """Internal carrier for malformed provider responses after the call returned."""
+    """Malformed completion with only already-admitted provider facts."""
 
-    def __init__(self, message: str, *, response: Any) -> None:
+    def __init__(self, message: str, *, provider_metadata: _AdmittedLLMProviderMetadata) -> None:
         super().__init__(message)
-        self.response = response
+        self.provider_metadata = provider_metadata
+
+
+def _capture_composer_llm_completion_fields(
+    response: Any,
+) -> tuple[_AdmittedAssistantMessage, tuple[Any, ...], _AdmittedLLMProviderMetadata]:
+    """Read the response/message surface once, before validating its tool batch."""
+
+    missing = object()
+    choices = getattr(response, "choices", missing)
+    choice = choices[0] if isinstance(choices, list | tuple) and choices else None
+    message = getattr(choice, "message", missing) if choice is not None else missing
+    provider_metadata = admit_llm_provider_metadata(
+        response,
+        choice=choice,
+        message=None if message is missing else message,
+    )
+    if choices is missing or not isinstance(choices, list | tuple):
+        raise _MalformedLLMResponseError(
+            "LLM returned malformed choices — cannot continue composition",
+            provider_metadata=provider_metadata,
+        )
+    if not choices:
+        raise _MalformedLLMResponseError(
+            "LLM returned empty choices array — cannot continue composition",
+            provider_metadata=provider_metadata,
+        )
+    if message is missing:
+        raise _MalformedLLMResponseError(
+            "LLM response choice carries no message",
+            provider_metadata=provider_metadata,
+        )
+    content = getattr(message, "content", missing)
+    if content is missing or (content is not None and type(content) is not str):
+        raise _MalformedLLMResponseError(
+            "LLM message content is neither absent nor a string",
+            provider_metadata=provider_metadata,
+        )
+    tool_calls = getattr(message, "tool_calls", missing)
+    if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
+        raise _MalformedLLMResponseError(
+            "LLM message tool_calls is neither absent nor a sequence",
+            provider_metadata=provider_metadata,
+        )
+    return _AdmittedAssistantMessage(content=content), tuple(tool_calls or ()), provider_metadata
+
+
+def _admit_composer_llm_completion(
+    response: Any,
+    *,
+    wrap_tool_batch_error: bool = True,
+) -> _AdmittedLLMCompletion:
+    """Read one LiteLLM completion once and discard the provider objects."""
+
+    message, tool_calls, provider_metadata = _capture_composer_llm_completion_fields(response)
+    return _admit_captured_composer_llm_completion(
+        message,
+        tool_calls,
+        provider_metadata,
+        wrap_tool_batch_error=wrap_tool_batch_error,
+    )
+
+
+def _admit_captured_composer_llm_completion(
+    message: _AdmittedAssistantMessage,
+    tool_calls: tuple[Any, ...],
+    provider_metadata: _AdmittedLLMProviderMetadata,
+    *,
+    wrap_tool_batch_error: bool,
+) -> _AdmittedLLMCompletion:
+    """Validate captured calls and finish the fully owned completion."""
+
+    from elspeth.web.composer.tool_batch import _admit_tool_batch
+
+    try:
+        admitted_batch = _admit_tool_batch(tool_calls)
+    except AuditIntegrityError as exc:
+        if not wrap_tool_batch_error:
+            raise
+        raise _MalformedLLMResponseError(
+            f"LLM tool batch failed admission: {exc}",
+            provider_metadata=provider_metadata,
+        ) from exc
+    return _AdmittedLLMCompletion(
+        message=message,
+        tool_batch=admitted_batch,
+        provider_metadata=provider_metadata,
+    )
 
 
 class _BadRequestLLMError(ComposerServiceError):
@@ -2716,7 +2808,7 @@ class ComposerServiceImpl:
         self,
         *,
         state: CompositionState,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         blocking_diagnostics: tuple[Mapping[str, Any], ...],
         repair_turns_used: int,
@@ -4367,7 +4459,7 @@ class ComposerServiceImpl:
         turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
-        response = await self._call_llm_before_deadline(
+        returned = await self._call_llm_before_deadline(
             llm_messages,
             tools,
             state,
@@ -4378,17 +4470,10 @@ class ComposerServiceImpl:
             discovery_turns_used=discovery_turns_used,
             failed_turn=failed_turn,
         )
-        assistant_message = response.choices[0].message
-        raw_assistant_content = assistant_message.content
-        provider_tool_calls = assistant_message.tool_calls or ()
-        from elspeth.web.composer.tool_batch import _admit_tool_batch
-
-        try:
-            admitted_batch = _admit_tool_batch(provider_tool_calls)
-        except BaseException as exc:
-            attach_llm_calls(exc, recorder)
-            raise
-        assistant_tool_calls = admitted_batch.calls
+        completion = (
+            returned if type(returned) is _AdmittedLLMCompletion else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
+        )
+        assistant_tool_calls = completion.tool_batch.calls
         if len(assistant_tool_calls) > self._max_tool_calls_per_turn:
             self._telemetry.tool_call_cap_exceeded_total.add(1)
             raise ComposerConvergenceError.capture(
@@ -4405,22 +4490,16 @@ class ComposerServiceImpl:
                 },
             )
 
-        return _CallModelOutcome(
-            response=response,
-            assistant_message=assistant_message,
-            raw_assistant_content=raw_assistant_content,
-            assistant_tool_calls=tuple(assistant_tool_calls),
-            has_tool_calls=bool(assistant_tool_calls),
-        )
+        return _CallModelOutcome(completion=completion)
 
     async def _persist_turn_audit(
         self,
         *,
         tool_outcomes: tuple[_ToolOutcome, ...],
         decoded_args_by_call_id: Mapping[str, Mapping[str, Any]],
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         raw_assistant_content: str | None,
-        assistant_tool_calls: tuple[Any, ...],
+        assistant_tool_calls: tuple[_AdmittedToolCall, ...],
         plugin_crash: ComposerPluginCrashError | None,
         session_id: str | None,
         current_state_id: str | None,
@@ -4434,7 +4513,7 @@ class ComposerServiceImpl:
         persisted_assistant_message = assistant_message
         persisted_raw_assistant_content = raw_assistant_content
         if advisor_repair_context_introduced:
-            persisted_assistant_message = SimpleNamespace(
+            persisted_assistant_message = _AdmittedAssistantMessage(
                 content=_ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE,
             )
             persisted_raw_assistant_content = None
@@ -4663,7 +4742,7 @@ class ComposerServiceImpl:
 
             if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
                 result = await self._surface_and_finalize_no_tools(
-                    assistant_message=SimpleNamespace(content=dispatch.raw_assistant_content or ""),
+                    assistant_message=_AdmittedAssistantMessage(content=dispatch.raw_assistant_content or ""),
                     state=state,
                     session_id=session_id,
                     current_state_id=persist.current_state_id,
@@ -4732,7 +4811,7 @@ class ComposerServiceImpl:
                 # B-4D-3 fix: give the LLM one last chance to see the
                 # tool results and produce a text response.
                 await emit_progress(progress, model_call_progress_event(message))
-                response = await self._call_llm_before_deadline(
+                returned = await self._call_llm_before_deadline(
                     llm_messages,
                     tools,
                     state,
@@ -4746,8 +4825,13 @@ class ComposerServiceImpl:
                     discovery_turns_used=discovery_turns_used,
                     failed_turn=failed_turn,
                 )
-                assistant_message = response.choices[0].message
-                if not assistant_message.tool_calls:
+                completion = (
+                    returned
+                    if type(returned) is _AdmittedLLMCompletion
+                    else _admit_composer_llm_completion(returned, wrap_tool_batch_error=False)
+                )
+                assistant_message = completion.message
+                if not completion.tool_batch.calls:
                     try:
                         advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                             state=state,
@@ -4871,7 +4955,7 @@ class ComposerServiceImpl:
     async def _try_terminate_no_tools(
         self,
         *,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         message: str,
         llm_messages: list[dict[str, Any]],
         state: CompositionState,
@@ -5157,7 +5241,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
     ) -> ComposerResult | None:
@@ -5256,7 +5340,7 @@ class ComposerServiceImpl:
     async def _surface_and_finalize_no_tools(
         self,
         *,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
@@ -5400,7 +5484,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         llm_messages: list[dict[str, Any]],
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
@@ -5828,9 +5912,9 @@ class ComposerServiceImpl:
                 failed_turn=failed_turn,
             )
             # If no tool calls, the LLM is done — apply the final gate and return
-            if not call_model.has_tool_calls:
+            if not call_model.completion.tool_batch.calls:
                 terminate = await self._try_terminate_no_tools(
-                    assistant_message=call_model.assistant_message,
+                    assistant_message=call_model.completion.message,
                     message=message,
                     llm_messages=llm_messages,
                     state=state,
@@ -6330,8 +6414,8 @@ class ComposerServiceImpl:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
-    ) -> Any:
-        """Call the LLM via LiteLLM. Separated for test mocking."""
+    ) -> _AdmittedLLMCompletion:
+        """Call LiteLLM and return only the admitted, owned completion."""
         from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 
         try:
@@ -6357,38 +6441,9 @@ class ComposerServiceImpl:
                 provider_detail=str(exc) or None,
                 provider_status_code=exc.status_code,
             ) from exc
-        # Tier 3 boundary: LiteLLM can return empty choices on content-filter,
-        # rate-limit, or malformed upstream responses.  Validate before callers
-        # index into choices[0].
-        if not response.choices:
-            raise _MalformedLLMResponseError("LLM returned empty choices array — cannot continue composition", response=response)
-        # elspeth-b6be9e991f: validate every field the compose loop
-        # dereferences BEFORE _call_llm_with_audit classifies the call as
-        # SUCCESS. A malformed-but-nonempty response otherwise crashes after
-        # durable audit evidence already recorded the call as successful.
-        # Tool-batch admission runs here too so provider-authored malformed
-        # tool-call metadata classifies as MALFORMED_RESPONSE instead of
-        # escaping as a post-success AuditIntegrityError; the caller re-runs
-        # admission on the same response, which is pure and cannot diverge.
-        from elspeth.web.composer.tool_batch import _admit_tool_batch
-
-        missing = object()
-        try:
-            message = response.choices[0].message
-        except (AttributeError, IndexError, KeyError, TypeError):
-            raise _MalformedLLMResponseError("LLM response choice carries no message", response=response) from None
-        content = getattr(message, "content", missing)
-        if content is missing or (content is not None and type(content) is not str):
-            raise _MalformedLLMResponseError("LLM message content is neither absent nor a string", response=response)
-        tool_calls = getattr(message, "tool_calls", missing)
-        if tool_calls is missing or (tool_calls is not None and not isinstance(tool_calls, list | tuple)):
-            raise _MalformedLLMResponseError("LLM message tool_calls is neither absent nor a sequence", response=response)
-        if tool_calls:
-            try:
-                _admit_tool_batch(tool_calls)
-            except AuditIntegrityError as exc:
-                raise _MalformedLLMResponseError(f"LLM tool batch failed admission: {exc}", response=response) from exc
-        return response
+        # One Tier-3 admission owns every retained field. The raw response and
+        # message never cross this return boundary.
+        return _admit_composer_llm_completion(response)
 
     async def _call_text_llm(
         self,
@@ -6420,7 +6475,10 @@ class ComposerServiceImpl:
                 provider_status_code=exc.status_code,
             ) from exc
         if not response.choices:
-            raise _MalformedLLMResponseError("LLM returned empty choices array — cannot explain run diagnostics", response=response)
+            raise _MalformedLLMResponseError(
+                "LLM returned empty choices array — cannot explain run diagnostics",
+                provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
+            )
         return response
 
     def _validate_advisor_arguments(self, arguments: dict[str, Any]) -> dict[str, Any] | None:
@@ -6571,7 +6629,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         session_id: str | None,
         current_state_id: str | None,
-        response: Any,
+        composer_model_version: str,
         llm_messages: list[dict[str, Any]],
         anti_anchor: AntiAnchorTracker,
         policy_catalog: PolicyCatalogView,
@@ -6679,7 +6737,7 @@ class ComposerServiceImpl:
             session_id=session_id,
             current_state_id=current_state_id,
             tool_call_id=tool_call_id,
-            response=response,
+            composer_model_version=composer_model_version,
         )
 
         try:
@@ -6719,7 +6777,7 @@ class ComposerServiceImpl:
                     actor=audit.actor,
                     kind=_request_interpretation_review_kind_from_arguments(arguments),
                     model_identifier=self._model,
-                    model_version=safe_response_model(response) or self._model,
+                    model_version=composer_model_version,
                     provider=self._availability.provider or "unknown",
                     composer_skill_hash=self._composer_skill_hash,
                 )
@@ -6804,7 +6862,7 @@ class ComposerServiceImpl:
         session_id: str,
         current_state_id: str,
         tool_call_id: str,
-        response: Any,
+        composer_model_version: str,
     ) -> dict[str, Any]:
         """Build the kwarg dict for a session-aware tool handler.
 
@@ -6826,13 +6884,14 @@ class ComposerServiceImpl:
                 "per_session_day_cap": self._settings.composer_interpretation_rate_limit_per_session_day,
                 "model_identifier": self._model,
                 # ``model_version`` is the actual provider-returned model
-                # string (``response.model``) when available; LiteLLM
+                # string when available; the response boundary has already
+                # admitted and bounded it before this dispatch. LiteLLM
                 # populates this for Anthropic/OpenAI with the dated
                 # variant (e.g. ``claude-opus-4-7-20260101``). When the
                 # provider does not return one we fall back to the
                 # requested identifier — keeps the column NOT NULL
                 # without fabricating a value.
-                "model_version": safe_response_model(response) or self._model,
+                "model_version": composer_model_version,
                 "provider": self._availability.provider or "unknown",
                 "composer_skill_hash": self._composer_skill_hash,
                 "create_pending_interpretation_event": sessions_service.create_pending_interpretation_event,
@@ -6908,6 +6967,7 @@ class ComposerServiceImpl:
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
         response: Any = None
+        response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
         kwargs: dict[str, Any] = {
@@ -6929,7 +6989,7 @@ class ComposerServiceImpl:
             if not response.choices:
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty choices array",
-                    response=response,
+                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
                 )
             # F4: validate content BEFORE marking SUCCESS. None / empty /
             # whitespace-only content (content-filter triggered, malformed
@@ -6943,7 +7003,7 @@ class ComposerServiceImpl:
             except (AttributeError, IndexError, KeyError, TypeError):
                 raise _MalformedLLMResponseError(
                     "Advisor response carries no message content",
-                    response=response,
+                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
                 ) from None
             # elspeth-b6be9e991f: exact runtime type check, mirroring the
             # diagnostics path. The earlier ``str(raw_content).strip()``
@@ -6952,7 +7012,7 @@ class ComposerServiceImpl:
             if type(raw_content) is not str or not raw_content.strip():
                 raise _MalformedLLMResponseError(
                     "Advisor returned empty, whitespace-only, or non-string content",
-                    response=response,
+                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
                 )
             guidance = raw_content
             status = ComposerLLMCallStatus.SUCCESS
@@ -6992,7 +7052,7 @@ class ComposerServiceImpl:
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
-            response = exc.response
+            response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
             error_message = "malformed_response"
             raise
@@ -7024,6 +7084,7 @@ class ComposerServiceImpl:
                         temperature=self._settings.composer_temperature,
                         seed=self._settings.composer_seed,
                         response=response,
+                        response_metadata=response_metadata,
                         error_class=error_class,
                         error_message=error_message,
                     )
@@ -7148,7 +7209,7 @@ class ComposerServiceImpl:
         reason: str,
         verdict: AdvisorCheckpointVerdict,
         state: CompositionState,
-        assistant_message: Any,
+        assistant_message: _AdmittedAssistantMessage,
         recorder: BufferingRecorder,
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
@@ -7520,7 +7581,7 @@ class ComposerServiceImpl:
         *,
         timeout: float,
         recorder: BufferingRecorder | None,
-    ) -> Any:
+    ) -> _AdmittedLLMCompletion:
         """Call the composer LLM once and record an audit sidecar.
 
         For Anthropic-family providers, ``cache_control`` markers are
@@ -7546,16 +7607,31 @@ class ComposerServiceImpl:
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
-        response: Any | None = None
+        completion: _AdmittedLLMCompletion | None = None
+        response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
         try:
-            response = await asyncio.wait_for(
+            returned = await asyncio.wait_for(
                 self._call_llm(messages, tools),
                 timeout=timeout,
             )
+            # A large established test seam monkeypatches ``_call_llm`` with
+            # raw LiteLLM-shaped objects. Admit those at this immediate wrapper
+            # boundary; the real method already returns the owned carrier.
+            if type(returned) is _AdmittedLLMCompletion:
+                completion = returned
+                response_metadata = returned.provider_metadata
+            else:
+                message, tool_calls, response_metadata = _capture_composer_llm_completion_fields(returned)
+                completion = _admit_captured_composer_llm_completion(
+                    message,
+                    tool_calls,
+                    response_metadata,
+                    wrap_tool_batch_error=False,
+                )
             status = ComposerLLMCallStatus.SUCCESS
-            return response
+            return completion
         except TimeoutError:
             status = ComposerLLMCallStatus.TIMEOUT
             error_class = "TimeoutError"
@@ -7581,9 +7657,20 @@ class ComposerServiceImpl:
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
-            response = exc.response
+            response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
             error_message = "malformed_response"
+            attach_llm_calls(exc, recorder)
+            raise
+        except AuditIntegrityError as exc:
+            # Established monkeypatch seam: a raw completion can return
+            # successfully yet fail the post-success tool-identity guard.
+            # Preserve that audit status while attaching the already-admitted
+            # provider facts; production `_call_llm` converts this case to the
+            # malformed-response carrier before it reaches this wrapper.
+            status = ComposerLLMCallStatus.SUCCESS if response_metadata is not None else ComposerLLMCallStatus.API_ERROR
+            error_class = None if response_metadata is not None else type(exc).__name__
+            error_message = None if response_metadata is not None else type(exc).__name__
             attach_llm_calls(exc, recorder)
             raise
         except _BadRequestLLMError as exc:
@@ -7611,7 +7698,7 @@ class ComposerServiceImpl:
                         started_ns=started_ns,
                         temperature=self._settings.composer_temperature,
                         seed=self._settings.composer_seed,
-                        response=response,
+                        response_metadata=response_metadata,
                         error_class=error_class,
                         error_message=error_message,
                     )
@@ -7635,6 +7722,7 @@ class ComposerServiceImpl:
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
         response: Any | None = None
+        response_metadata: _AdmittedLLMProviderMetadata | None = None
         error_class: str | None = None
         error_message: str | None = None
         try:
@@ -7648,12 +7736,12 @@ class ComposerServiceImpl:
             except (AttributeError, IndexError, TypeError):
                 raise _MalformedLLMResponseError(
                     "LLM returned a malformed diagnostics explanation",
-                    response=response,
+                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
                 ) from None
             if type(content) is not str or not content.strip():
                 raise _MalformedLLMResponseError(
                     "LLM returned an empty diagnostics explanation",
-                    response=response,
+                    provider_metadata=admit_llm_provider_metadata(response, choice=None, message=None),
                 )
             status = ComposerLLMCallStatus.SUCCESS
             return content.strip()
@@ -7682,7 +7770,7 @@ class ComposerServiceImpl:
             raise
         except _MalformedLLMResponseError as exc:
             status = ComposerLLMCallStatus.MALFORMED_RESPONSE
-            response = exc.response
+            response_metadata = exc.provider_metadata
             error_class = type(exc).__name__
             error_message = "malformed_response"
             attach_llm_calls(exc, recorder)
@@ -7713,6 +7801,7 @@ class ComposerServiceImpl:
                         temperature=self._settings.composer_temperature,
                         seed=self._settings.composer_seed,
                         response=response,
+                        response_metadata=response_metadata,
                         error_class=error_class,
                         error_message=error_message,
                     )
@@ -7733,7 +7822,7 @@ class ComposerServiceImpl:
         composition_turns_used: int,
         discovery_turns_used: int,
         failed_turn: FailedTurnMetadata | None,
-    ) -> Any:
+    ) -> _AdmittedLLMCompletion:
         """Call the LLM with a per-call timeout derived from the deadline.
 
         LLM calls are pure network I/O with no side effects, so they

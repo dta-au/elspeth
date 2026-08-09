@@ -530,7 +530,7 @@ entries:
   classification: module-getattr
   justification: 'ADJUDICATED (lead, 2026-08-08): the getattr(import_module("elspeth.engine.orchestrator"),
     name) inside the PEP 562 facade, guarded by `if name in _ORCHESTRATOR_EXPORTS`
-    (a closed tuple) with a terminal raise AttributeError. Same idiom and same reasoning
+    (a closed set) with a terminal raise AttributeError. Same idiom and same reasoning
     as core/security and engine/orchestrator: module-owned name, module receiver,
     no masquerade surface.'
 - path: src/elspeth/engine/orchestrator/__init__.py
@@ -541,7 +541,7 @@ entries:
   - 7d43697f9d8c727f6d7d9bf51c40e6f5bab964949e7e41dca292f520ab60f87c
   classification: module-getattr
   justification: Module-level PEP 562 lazy-import facade gated on three closed export
-    tuples via an if/elif/elif/else chain. The gate is real but uses elif, which this
+    sets via an if/elif/elif/else chain. The gate is real but uses elif, which this
     rule's flat sequential-if recognizer does not match (PLAN.md Finding 4).
 - path: src/elspeth/engine/orchestrator/__init__.py
   qualname: __getattr__
@@ -729,15 +729,19 @@ entries:
   justification: Sentinel-parses LiteLLM repair-thread objects, validates every retained
     value, and constructs owned repair-thread carriers before downstream use.
 - path: src/elspeth/web/composer/service.py
-  qualname: ComposerServiceImpl._call_llm
+  qualname: _capture_composer_llm_completion_fields
   kind: getattr
-  occurrences: 2
+  occurrences: 4
   probe_shapes:
+  - 003c86d1099abf0b3dfa922585b895c6adea0e275a48e80b63653c16609c4b4b
   - 8db4dd38e8917a32cf84749b587527221cbc8312767ee17c50e0a4980ac562e4
+  - 9f646fbd5d363c11e29e145e250834754a3827fa6e8f2388c34a4e8c06988f9e
   - a7184e0fea70413ed933dc47e8d4e8670fc3cecea4269eeb725222321e2ff63e
   classification: external-parse
-  justification: Parses content and tool_calls from a LiteLLM message after the response
-    choice admission; raw-response custody is outside this ticket's scope.
+  justification: Sentinel-parses choices, message, content, and tool_calls from one
+    unowned LiteLLM completion, validates every retained value, and constructs frozen
+    ELSPETH-owned message, tool-batch, and provider-metadata carriers before the raw
+    provider objects are discarded.
 - path: src/elspeth/web/composer/tool_batch.py
   qualname: _admit_tool_batch
   kind: getattr

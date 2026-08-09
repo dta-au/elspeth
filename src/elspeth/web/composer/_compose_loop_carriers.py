@@ -40,8 +40,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from elspeth.contracts.composer_llm_audit import ComposerLLMProviderCostSource
 from elspeth.contracts.errors import FailedTurnMetadata
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
@@ -51,6 +53,64 @@ _ToolOutcomeResponse = ToolResult | Mapping[str, Any] | None
 
 class _ToolBatchCancellationRequested(Exception):
     """Internal sentinel: cancellation landed before any tool dispatched."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedAssistantMessage:
+    """Validated provider prose copied into an ELSPETH-owned message."""
+
+    content: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolFunction:
+    """Immutable copy of execution-relevant provider function metadata."""
+
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolCall:
+    """Immutable provider call admitted for this dispatch batch."""
+
+    id: str
+    function: _AdmittedToolFunction
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedToolBatch:
+    """Immutable batch used exclusively after provider-boundary admission."""
+
+    calls: tuple[_AdmittedToolCall, ...]
+    call_ids: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedLLMProviderMetadata:
+    """Minimal provider projection retained for audit and provenance."""
+
+    model_returned: str | None
+    finish_reason: str | None
+    usage: TokenUsage
+    provider_cost: float | None
+    provider_cost_source: ComposerLLMProviderCostSource
+    provider_request_id: str | None
+    reasoning_content: str | None
+    reasoning_details: Any | None
+    thinking_blocks: Any | None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "reasoning_details", "thinking_blocks")
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedLLMCompletion:
+    """Read-once, owned snapshot of one successful provider completion."""
+
+    message: _AdmittedAssistantMessage
+    tool_batch: _AdmittedToolBatch
+    provider_metadata: _AdmittedLLMProviderMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +143,11 @@ class _ToolOutcome:
     * ``None`` for argument-error and plugin-crash paths, where
       ``error_class`` / ``error_message`` carry the outcome.
 
-    ``call`` remains ``Any`` because it is a LiteLLM ToolCall object (or a
-    frozen mapping in tests) and this carrier deliberately avoids coupling to
-    provider-specific response classes.
+    ``call`` is the ELSPETH-owned tool-call projection admitted before the raw
+    provider response is discarded.
     """
 
-    call: Any  # ToolCall — typed in protocol module
+    call: _AdmittedToolCall
     response: _ToolOutcomeResponse
     error_class: str | None
     error_message: str | None
@@ -103,32 +162,13 @@ class _ToolOutcome:
 class _CallModelOutcome:
     """Result of one LLM call in the compose loop (Phase P1).
 
-    P2 (``_try_terminate_no_tools``) reads ``has_tool_calls`` and the full
-    ``assistant_message`` to decide whether to short-circuit. P3
-    (``_dispatch_tool_batch``) reads ``assistant_tool_calls`` and
-    ``raw_assistant_content``. P5's B-4D-3 last-chance path produces a
-    second instance per iteration.
-
-    ``response`` and ``assistant_message`` are LiteLLM-owned objects;
-    ELSPETH treats them as opaque Tier-3 values. ``assistant_tool_calls``
-    contains ELSPETH-owned immutable copies admitted immediately after the
-    provider returns, before any subsequent await. ``response`` is threaded
-    into the session-aware dispatch helper, which writes its ``model`` field
-    into interpretation events. ``raw_assistant_content`` is the assistant
-    text *before* any augmentation by ``_finalize_no_tool_response`` (scalar
-    string-or-None).
+    The sole field is the frozen completion admitted before the provider
+    object leaves the Tier-3 boundary. P2 reads its owned message, P3 consumes
+    its already-admitted tool batch and provider metadata, and P5's B-4D-3
+    last-chance path consumes the same carrier directly.
     """
 
-    response: Any
-    assistant_message: Any
-    raw_assistant_content: str | None
-    assistant_tool_calls: tuple[Any, ...]
-    has_tool_calls: bool
-
-    # No freeze_fields: response and assistant_message are opaque (Tier-3
-    # LiteLLM values), assistant_tool_calls is already a tuple of frozen
-    # admitted values, raw_assistant_content is str|None, and has_tool_calls
-    # is bool. frozen=True alone is sufficient.
+    completion: _AdmittedLLMCompletion
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,11 +248,10 @@ class _DispatchOutcome:
     # driver raises the ordinary convergence-timeout recovery carrier.
     advisor_compose_timeout: Literal["pre_call", "in_flight"] | None
 
-    # LLM call result threaded through — P4 reads .content and .tool_calls
-    # for redaction / persist; P5 unused.
-    assistant_message: Any
+    # Owned LLM completion fields threaded through for P4 persistence.
+    assistant_message: _AdmittedAssistantMessage
     raw_assistant_content: str | None
-    assistant_tool_calls: tuple[Any, ...]
+    assistant_tool_calls: tuple[_AdmittedToolCall, ...]
 
     # mutation_success_seen rebinds inside dispatch's success path; carry
     # the delta so the driver can fold it into its multi-iteration
