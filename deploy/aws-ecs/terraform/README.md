@@ -240,9 +240,10 @@ these policies in the dedicated disposable account; do not run Terraform with
 an account-administrator wildcard policy.
 
 Before Terraform uses those policies, retrieve the live default policy version
-for each recorded ARN in the cold-install runbook's exact `get-policy` then
-`get-policy-version` sequence and compare it with the freshly rendered template
-using `scripts/verify-iam-policy-actions.py`. The validator flattens every
+for each of the five recorded installer-policy ARNs in the cold-install
+runbook's exact `get-policy` then `get-policy-version` sequence and compare it
+with the freshly rendered template using
+`scripts/verify-iam-policy-actions.py`. The validator flattens every
 `Statement[].Action` and fails on missing or unexpected actions; the runbook
 adds a bounded IAM propagation quiet window and recheck.
 

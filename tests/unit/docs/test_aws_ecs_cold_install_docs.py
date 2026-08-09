@@ -199,12 +199,39 @@ def test_cold_install_refuses_root_or_collapsed_terraform_profiles() -> None:
     assert "arn:aws:iam::${AWS_ACCOUNT_ID}:root" in identity
 
 
-def test_cold_install_checks_all_four_live_default_installer_policy_action_sets() -> None:
+def test_cold_install_checks_all_five_live_default_installer_policy_action_sets() -> None:
     text = _read(RUNBOOK)
     policies = text[text.index("## 2. Install the installer and lifecycle policies") : text.index("## 3.")]
 
-    for name in ("control-plane", "regional-resources", "relationships", "runtime-observation"):
+    policy_names = (
+        "control-plane",
+        "regional-resources",
+        "relationships",
+        "runtime-observation",
+        "tagless-updates",
+    )
+    policy_arn_variables = (
+        "INSTALLER_CONTROL_PLANE_POLICY_ARN",
+        "INSTALLER_REGIONAL_RESOURCES_POLICY_ARN",
+        "INSTALLER_RELATIONSHIPS_POLICY_ARN",
+        "INSTALLER_RUNTIME_OBSERVATION_POLICY_ARN",
+        "INSTALLER_TAGLESS_UPDATES_POLICY_ARN",
+    )
+    for name in policy_names:
         assert name in policies
+    assert "bootstrap/.terraform/installer-${name}-policy.json" in policies
+    for variable in policy_arn_variables:
+        assert f': "${{{variable}:?set the recorded ' in policies
+        assert f'"${variable}"' in policies
+
+    render_loop = re.search(r"for policy in (?P<names>[a-z -]+); do", policies)
+    assert render_loop is not None
+    assert tuple(render_loop.group("names").split()) == policy_names
+    names_block = policies[policies.index("INSTALLER_POLICY_NAMES=(") : policies.index("\n)", policies.index("INSTALLER_POLICY_NAMES=("))]
+    arns_block = policies[policies.index("INSTALLER_POLICY_ARNS=(") : policies.index("\n)", policies.index("INSTALLER_POLICY_ARNS=("))]
+    assert tuple(re.findall(r"^  ([a-z-]+)$", names_block, re.MULTILINE)) == policy_names
+    assert tuple(re.findall(r'^  "\$([A-Z_]+)"$', arns_block, re.MULTILINE)) == policy_arn_variables
+
     for marker in (
         "render_installer_policies",
         "verify_installer_policy_currency",
@@ -220,8 +247,24 @@ def test_cold_install_checks_all_four_live_default_installer_policy_action_sets(
         assert marker in policies
     assert policies.index("aws iam get-policy") < policies.index("aws iam get-policy-version")
     assert policies.index("render_installer_policies") < policies.index("await_installer_policy_currency")
+    assert 'for index in "${!INSTALLER_POLICY_NAMES[@]}"; do' in policies
+    assert "name=${INSTALLER_POLICY_NAMES[$index]}" in policies
+    assert "arn=${INSTALLER_POLICY_ARNS[$index]}" in policies
+    assert "if verify_installer_policy_currency; then" in policies
+    assert 'test "${#INSTALLER_POLICY_NAMES[@]}" = 5' in policies
+    assert 'test "${#INSTALLER_POLICY_ARNS[@]}" = 5' in policies
+    assert 'test "$unique_count" = 5' in policies
+    assert "Inspect all six JSON files" in policies
+    assert "Attach the five" in policies
+    assert "Record all six policy ARNs" in policies
+    assert "account-level limitations" in policies
+    assert "one account-level CloudWatch Logs limitation" not in policies
     assert "bounded quiet window" in policies
     assert "fail closed" in policies
+
+    teardown = text[text.index("## Teardown") :]
+    assert "remove the six policies recorded" in teardown
+    assert "detach the five `installer-*` policies" in teardown
 
 
 def test_policy_currency_helpers_propagate_each_failure_even_when_polled_as_a_condition() -> None:
@@ -295,6 +338,9 @@ def test_terraform_package_reference_points_qualification_to_the_fail_closed_evi
         "verify-terraform-profiles.py backend",
         "verify-iam-policy-actions.py",
         "live default policy version",
+        "installer-tagless-updates-policy.json.tftpl",
+        "Render all five installer policies",
+        "attach all five installer documents",
         "aws-ecs-cold-install.md",
     ):
         assert marker in text

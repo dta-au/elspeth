@@ -25,7 +25,7 @@ release-evidence controller, not a prerequisite for deploying Scenario A.
 The installation sequence is:
 
 1. prove both AWS profiles resolve to the intended account and Region;
-2. render and attach the package's four narrow installer policies and its
+2. render and attach the package's five narrow installer policies and its
    separate IAM-lifecycle policy;
 3. apply `bootstrap/` to create remote state, ECR, and the task-role boundary;
 4. build, publish by digest, and scan the application and monitoring images;
@@ -198,7 +198,7 @@ installer_substitutions='${aws_account_id} ${aws_region} ${run_id} ${backend_sta
 render_installer_policies() {
   local policy
   mkdir -p bootstrap/.terraform || return
-  for policy in control-plane regional-resources relationships runtime-observation; do
+  for policy in control-plane regional-resources relationships runtime-observation tagless-updates; do
     envsubst "$installer_substitutions" \
       < "iam/installer-${policy}-policy.json.tftpl" \
       > "bootstrap/.terraform/installer-${policy}-policy.json" || return
@@ -213,21 +213,21 @@ render_installer_policies() {
 render_installer_policies
 ```
 
-Inspect all five JSON files. Attach the four
+Inspect all six JSON files. Attach the five
 `installer-*-policy.json` documents to the normal installer principal as
 separate customer-managed policies — their aggregate size exceeds IAM's
 inline-policy limit, so do not merge them — and attach
 `iam-lifecycle-policy.json` to the lifecycle principal through the account's
 trusted IAM administration path. Do not combine them into a wildcard
-administrator policy. Record all five policy ARNs in the operator change
+administrator policy. Record all six policy ARNs in the operator change
 record: these policies exist outside every Terraform state, so teardown
 detaches and deletes them by recorded ARN rather than by tag or state. The
-detailed authority split and its one account-level CloudWatch Logs
-limitation are documented in the
+detailed authority split and its account-level limitations for CloudWatch Logs
+and tagless EFS mount-target updates are documented in the
 [Terraform package README](../../deploy/aws-ecs/terraform/README.md#installer-policy-and-task-role-boundary).
 
-Export the four recorded installer policy ARNs. Presence is not currency: the
-gate below re-renders all four templates, retrieves each live policy's declared
+Export the five recorded installer policy ARNs. Presence is not currency: the
+gate below re-renders all five templates, retrieves each live policy's declared
 default version using the documented `get-policy` then `get-policy-version`
 sequence, and compares the complete flattened action sets in both directions.
 The source-free validator rejects malformed or ambiguous JSON and reports both
@@ -238,18 +238,21 @@ actions missing from live policy and actions unexpectedly present there.
 : "${INSTALLER_REGIONAL_RESOURCES_POLICY_ARN:?set the recorded regional-resources policy ARN}"
 : "${INSTALLER_RELATIONSHIPS_POLICY_ARN:?set the recorded relationships policy ARN}"
 : "${INSTALLER_RUNTIME_OBSERVATION_POLICY_ARN:?set the recorded runtime-observation policy ARN}"
+: "${INSTALLER_TAGLESS_UPDATES_POLICY_ARN:?set the recorded tagless-updates policy ARN}"
 
 INSTALLER_POLICY_NAMES=(
   control-plane
   regional-resources
   relationships
   runtime-observation
+  tagless-updates
 )
 INSTALLER_POLICY_ARNS=(
   "$INSTALLER_CONTROL_PLANE_POLICY_ARN"
   "$INSTALLER_REGIONAL_RESOURCES_POLICY_ARN"
   "$INSTALLER_RELATIONSHIPS_POLICY_ARN"
   "$INSTALLER_RUNTIME_OBSERVATION_POLICY_ARN"
+  "$INSTALLER_TAGLESS_UPDATES_POLICY_ARN"
 )
 
 verify_installer_policy_currency() (
@@ -257,10 +260,10 @@ verify_installer_policy_currency() (
   local index name arn metadata version_id live_path unique_count
 
   render_installer_policies || return
-  test "${#INSTALLER_POLICY_NAMES[@]}" = 4 || return
-  test "${#INSTALLER_POLICY_ARNS[@]}" = 4 || return
+  test "${#INSTALLER_POLICY_NAMES[@]}" = 5 || return
+  test "${#INSTALLER_POLICY_ARNS[@]}" = 5 || return
   unique_count=$(printf '%s\n' "${INSTALLER_POLICY_ARNS[@]}" | LC_ALL=C sort -u | wc -l) || return
-  test "$unique_count" = 4 || return
+  test "$unique_count" = 5 || return
   for index in "${!INSTALLER_POLICY_NAMES[@]}"; do
     name=${INSTALLER_POLICY_NAMES[$index]}
     arn=${INSTALLER_POLICY_ARNS[$index]}
@@ -1295,8 +1298,8 @@ all three grants live in the policies about to be deleted. Those policies had
 to outlive every one of those steps, which is why this is the first point at
 which they can go.
 
-Only now, remove the five policies recorded in the operator change record:
-detach the four `installer-*` policies from the normal installer principal
+Only now, remove the six policies recorded in the operator change record:
+detach the five `installer-*` policies from the normal installer principal
 and delete them, and detach and delete the lifecycle policy through the
 account's trusted IAM administration path. Do not rely on the tag query below
 to find them — they were created outside Terraform and may carry no run tag.
@@ -1334,8 +1337,9 @@ cannot see it — confirm separately with `aws logs describe-log-groups
 "/aws/ecs/containerinsights/${ECS_CLUSTER}"` and expect an empty
 `logGroups` list), **zero ACTIVE task-definition revisions under
 `$NAMESPACE`** — `sweep_run_task_definitions` exited 0 and reported
-`remaining_active=0` — none of the four Step 2 installer or lifecycle policies
-remaining, and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
+`remaining_active=0` — none of the five Step 2 installer policies or the
+lifecycle policy remaining;
+no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
 filesystems, Secrets Manager secrets, or retained ECR images owned by this run.
 
 `foreign_families` is reported, not gated. A task-definition family outside
