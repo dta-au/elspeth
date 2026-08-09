@@ -3828,14 +3828,16 @@ assistant_message_kind: "synthetic_failure",
     it("Retry resends the preceding user message under its RECORDED occurrence token", async () => {
       // elspeth-ea80e34fdc: the retry must submit the token the message was
       // originally submitted under — never the current one — so the server's
-      // stale-turn 409 owns the staleness verdict.
+      // stale-turn 409 owns the staleness verdict. The current turn MUST carry
+      // a different token here: with both defaulting to the same string, this
+      // assertion would pass even if the code sent the current token.
       const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
       useSessionStore.setState({
         activeSessionId: "session-guided",
         sessions: [guidedSessionFixture],
         messages: [],
         guidedSession: guidedSessionWithSyntheticFailure(),
-        guidedNextTurn: singleSelectTurn(),
+        guidedNextTurn: singleSelectTurn("b".repeat(64)),
         chatGuided: chatGuidedSpy,
       });
 
