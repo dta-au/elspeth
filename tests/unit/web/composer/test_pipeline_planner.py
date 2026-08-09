@@ -4582,6 +4582,57 @@ async def test_real_inline_custody_returns_only_blob_id_and_ready_row(
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    raises=AuditIntegrityError,
+    reason=(
+        "elspeth-282f392fae: the deferred blob is not materialized until "
+        "settlement, so the custody-safe revalidation rejects its blob_id "
+        "with Blob-not-found and the planner escalates AuditIntegrityError. "
+        "Remove this marker with the fix."
+    ),
+)
+async def test_defer_finalize_carries_custody_preparation_and_writes_no_blob_mid_plan(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    # elspeth-1e3ad83d89: guided-full defers inline-custody finalization into
+    # the atomic staging settlement, because the blob row's lineage FK needs
+    # the originating chat message that surface only inserts at settlement.
+    # Finalizing mid-plan here IS the defect, so the discriminating half of
+    # this test is the empty blobs table under a proposal that already
+    # references its blob_id.
+    engine, origin = await _session_context()
+    raw_content = "name,score\nada,42\n"
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _inline_pipeline(tmp_path)})))
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        originating_message=origin,
+        custody_config=PlannerCustodyConfig(
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            max_storage_per_session=1_000_000,
+            secret_service=None,
+            runtime_preflight=None,
+            defer_finalize=True,
+        ),
+    )
+
+    assert result.custody_result == "ready"
+    assert result.custody_preparation is not None
+    public = result.proposal.to_dict()
+    assert "inline_blob" not in canonical_json(public)
+    assert raw_content not in canonical_json(public)
+    assert public["pipeline"]["source"]["blob_id"]
+    with engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
+    assert tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file()) == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("model_returned", "expected_model_version"),
     [

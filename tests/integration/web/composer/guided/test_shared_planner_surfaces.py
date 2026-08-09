@@ -176,6 +176,12 @@ def test_guided_full_runtime_calls_the_shared_module_planner_exactly_once(
     assert call["rendered_skill"] == build_system_prompt(str(app.state.settings.data_dir))
     assert call["candidate_finalizer"](result.proposal.pipeline) is result.proposal.pipeline
     assert set(catalog_ids) == {"source", "transform", "sink"}
+    # elspeth-1e3ad83d89: guided-full MUST defer inline-custody finalization
+    # into the atomic staging settlement — its originating chat message only
+    # exists there, and finalizing mid-plan violates the blob lineage FK.
+    # This pins the real call site (service.py defer_finalize=True), which the
+    # custody integration tests cannot see because they fake the service.
+    assert call["custody_config"].defer_finalize is True
 
 
 def test_all_planner_surfaces_share_canonical_core_schema_and_tool_identity() -> None:
