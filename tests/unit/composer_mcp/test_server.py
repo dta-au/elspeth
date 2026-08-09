@@ -43,7 +43,7 @@ def _invalid_contract_state() -> CompositionState:
             plugin="csv",
             on_success="t1",
             options={"path": "/data/blobs/input.csv", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(
             NodeSpec(
@@ -86,7 +86,7 @@ def _valid_state_with_no_edge_contracts() -> CompositionState:
             plugin="csv",
             on_success="main",
             options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(),
         edges=(),
@@ -109,7 +109,7 @@ def _connection_valid_field_mapper_state_without_edges() -> CompositionState:
             plugin="text",
             on_success="mapper_in",
             options={"path": "/data/in.txt", "column": "text", "schema": {"mode": "observed"}},
-            on_validation_failure="quarantine",
+            on_validation_failure="discard",
         ),
         nodes=(
             NodeSpec(
@@ -744,7 +744,7 @@ class TestDispatchTool:
                     "mode": "bind_source",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             ),
             nodes=(),
             edges=(),

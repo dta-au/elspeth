@@ -705,7 +705,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -804,7 +804,7 @@ class TestComposerRuntimeAgreement:
                     "column": "text",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -900,7 +900,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema_config": {"mode": "observed", "guaranteed_fields": ["text"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -996,7 +996,7 @@ class TestComposerRuntimeAgreement:
                     "column": "class",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1095,7 +1095,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_output(
@@ -1198,7 +1198,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["line: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1286,7 +1286,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["line: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1376,7 +1376,7 @@ class TestComposerRuntimeAgreement:
                     "column": "line",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1493,7 +1493,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["id: int", "value: int"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1667,7 +1667,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["id: int", "value: int"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -1884,7 +1884,7 @@ class TestComposerRuntimeAgreement:
                     "path": str(csv_path),
                     "schema": {"mode": "fixed", "fields": ["value: str"]},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_output(
@@ -1968,7 +1968,7 @@ class TestComposerRuntimeAgreement:
                         "fields": ["customer_tier: str", "amount: float"],
                     },
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
@@ -4044,7 +4044,7 @@ class TestComposerRuntimeFixedModeImplicitRequiredAgreement:
                 plugin="csv",
                 on_success="t1",
                 options=source_options,
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             ),
         )
         state = state.with_node(
@@ -4307,7 +4307,7 @@ class TestComposerRuntimeFixedModeImplicitRequiredAgreement:
                     "column": "color",
                     "schema": {"mode": "observed"},
                 },
-                on_validation_failure="quarantine",
+                on_validation_failure="discard",
             )
         )
         state = state.with_node(
