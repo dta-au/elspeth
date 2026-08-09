@@ -92,13 +92,74 @@ locals {
     }
   }
 
+  # Loopback-only gateway sidecar (custom_gateway backend). Essential: its
+  # exit makes the whole task unhealthy and ECS replaces the complete unit.
+  # The Dockerfile ENTRYPOINT binds 0.0.0.0 for standalone use; this task
+  # definition overrides it to 127.0.0.1 so the awsvpc task ENI never serves
+  # the gateway port, and no portMappings entry exists for it. Only the
+  # inbound bearer and OAuth client credentials reach this container — no
+  # ELSPETH application or database secret, no EFS mount.
+  gateway_container = {
+    name                   = local.gateway_container_name
+    image                  = one(terraform_data.gateway_image_provenance[*].output)
+    essential              = true
+    readonlyRootFilesystem = true
+    user                   = "65532:65532"
+    cpu                    = 512
+    memory                 = 1024
+    entryPoint = [
+      "/venv/bin/python", "-m", "uvicorn", "elspeth_llm_gateway.core.app:build",
+      "--host", "127.0.0.1", "--port", tostring(local.gateway_port),
+      "--factory", "--timeout-graceful-shutdown", "30",
+    ]
+    environment = [
+      { name = "ELSPETH_LLM_GATEWAY_ADAPTER", value = var.gateway_adapter },
+      { name = "ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN", value = var.gateway_upstream_origin },
+      { name = "ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL", value = var.gateway_oauth_token_url },
+      { name = "ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS", value = var.gateway_model_mappings_json },
+    ]
+    secrets = [
+      { name = "ELSPETH_LLM_GATEWAY_INBOUND_BEARER", valueFrom = var.gateway_bearer_secret_arn },
+      { name = "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_ID", valueFrom = var.gateway_oauth_client_id_secret_arn },
+      { name = "ELSPETH_LLM_GATEWAY_OAUTH_CLIENT_SECRET", valueFrom = var.gateway_oauth_client_secret_secret_arn },
+    ]
+    healthCheck = {
+      command     = ["CMD", "/venv/bin/python", "-c", "import http.client,sys; c=http.client.HTTPConnection('127.0.0.1',${local.gateway_port},timeout=5); c.request('GET','/readyz'); sys.exit(0 if c.getresponse().status == 200 else 1)"]
+      interval    = 10
+      timeout     = 6
+      retries     = 6
+      startPeriod = 30
+    }
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.web.name
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "llm-gateway"
+      }
+    }
+  }
+
+  # Web waits for the gateway to validate configuration and adapter loading
+  # before it starts, so a misconfigured sidecar fails the deployment rather
+  # than the first user turn.
+  service_web_depends_on = concat(
+    [{ containerName = "cloudwatch-agent", condition = "HEALTHY" }],
+    local.bedrock_backend ? [] : [{ containerName = local.gateway_container_name, condition = "HEALTHY" }],
+  )
+
+  # Explicit task sizing: the sidecar's reservations are ADDED, never carved
+  # out of the Web allocation (integration design §Service task topology).
+  service_task_cpu    = local.bedrock_backend ? 1024 : 1536
+  service_task_memory = local.bedrock_backend ? 2048 : 3072
+
   candidate_web_container = {
     name       = local.web_container_name
     image      = terraform_data.candidate_image_provenance.output
     essential  = true
     entryPoint = ["/bin/sh", "-ceu", local.ecs_identity_wrapper, "--"]
     command    = ["web", "--host", "0.0.0.0", "--port", "8451"]
-    dependsOn  = [{ containerName = "cloudwatch-agent", condition = "HEALTHY" }]
+    dependsOn  = local.service_web_depends_on
     portMappings = [{
       containerPort = 8451
       hostPort      = 8451
@@ -198,11 +259,14 @@ resource "aws_ecs_task_definition" "candidate_web" {
   family                   = local.web_family
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 1024
-  memory                   = 2048
+  cpu                      = local.service_task_cpu
+  memory                   = local.service_task_memory
   task_role_arn            = aws_iam_role.task.arn
   execution_role_arn       = aws_iam_role.execution.arn
-  container_definitions    = jsonencode([local.cloudwatch_agent_container, local.candidate_web_container])
+  container_definitions = jsonencode(concat(
+    [local.cloudwatch_agent_container, local.candidate_web_container],
+    local.bedrock_backend ? [] : [local.gateway_container],
+  ))
 
   runtime_platform {
     operating_system_family = "LINUX"

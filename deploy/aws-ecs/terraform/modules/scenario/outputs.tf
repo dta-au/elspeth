@@ -167,12 +167,17 @@ output "resolved_inventory" {
     schema            = "elspeth.aws-ecs-scenario-inventory.v7"
     acceptance_run_id = var.run_id
     candidate_sha     = var.candidate_sha
-    aws_account_id    = var.aws_account_id
-    aws_region        = var.aws_region
-    scenario_id       = var.scenario_id
-    phase             = "resolved"
-    values            = local.scenario_values
-    orphan_sweep      = local.scenario_orphan_sweep
+    # Gateway sidecar identity (empty strings under the bedrock backend).
+    # Digest and revision only — secret names and values never appear here.
+    gateway_image   = var.gateway_image
+    gateway_sha     = var.gateway_sha
+    gateway_adapter = var.gateway_adapter
+    aws_account_id  = var.aws_account_id
+    aws_region      = var.aws_region
+    scenario_id     = var.scenario_id
+    phase           = "resolved"
+    values          = local.scenario_values
+    orphan_sweep    = local.scenario_orphan_sweep
   }
   sensitive = true
 }

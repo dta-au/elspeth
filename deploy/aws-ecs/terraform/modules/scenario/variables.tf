@@ -529,11 +529,37 @@ variable "plugin_control_modes" {
 
 variable "llm_profiles" {
   type = map(object({
-    model       = string
-    region_name = optional(string)
+    model                 = string
+    region_name           = optional(string)
+    required_capabilities = optional(list(string))
   }))
   default     = null
-  description = "Operator LLM profiles offered to web authors, keyed by the opaque alias an author selects. Bedrock-only here, so profiles are keyless. Null derives the standard/fast pair from the Composer models. Every model named here is added to the task role's bedrock:InvokeModel grant. max_tokens is not exposed yet: emitting it would put an explicit null in the rendered policy for every profile that omits it."
+  description = "Operator LLM profiles offered to web authors, keyed by the opaque alias an author selects. Null derives the standard/fast pair from the Composer models. Under the bedrock backend profiles are keyless and every model named here is added to the task role's bedrock:InvokeModel grant; region_name applies and required_capabilities must be omitted. Under custom_gateway profiles lower to gateway bindings (loopback endpoint + module-owned bearer ref); required_capabilities applies and region_name must be omitted. max_tokens is not exposed yet: emitting it would put an explicit null in the rendered policy for every profile that omits it."
+
+  validation {
+    # Each axis owns its fields: region_name is a Bedrock concern,
+    # required_capabilities is a gateway-contract concern.
+    condition = var.llm_profiles == null || alltrue([
+      for profile in values(var.llm_profiles) : (
+        var.llm_backend == "bedrock"
+        ? profile.required_capabilities == null
+        : profile.region_name == null
+      )
+    ])
+    error_message = "llm_profiles: required_capabilities is only valid under custom_gateway, and region_name is only valid under the bedrock backend."
+  }
+
+  validation {
+    condition = var.llm_profiles == null || alltrue([
+      for profile in values(var.llm_profiles) : (
+        profile.required_capabilities == null || alltrue([
+          for capability in profile.required_capabilities :
+          contains(["text", "tools", "json_object", "json_schema", "seed", "usage"], capability)
+        ])
+      )
+    ])
+    error_message = "llm_profiles required_capabilities entries must come from the gateway's closed capability vocabulary: text, tools, json_object, json_schema, seed, usage."
+  }
 
   validation {
     condition = var.llm_profiles == null || alltrue([
@@ -665,5 +691,185 @@ variable "content_guardrail" {
   validation {
     condition     = var.llm_backend == "bedrock" || var.content_guardrail == null
     error_message = "content_guardrail configures a Bedrock Guardrail resource and must be unset under custom_gateway."
+  }
+}
+
+# ── Gateway sidecar (custom_gateway backend only) ──────────────────────────
+#
+# Every gateway_* variable is required under llm_backend = "custom_gateway"
+# and must be unset under "bedrock" — the same reject-don't-ignore posture as
+# the Bedrock ARN variables in the other direction. Secrets arrive as
+# Secrets Manager ARNs only; Terraform never accepts the literal values and
+# does not create or rotate them (integration design §Secrets).
+
+variable "gateway_image" {
+  type        = string
+  default     = ""
+  description = "Digest-pinned ECR image for the elspeth-llm-gateway sidecar. Admission verifies registry, repository, and revision label before any credential-bearing task definition is registered."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex(
+        "^${var.aws_account_id}\\.dkr\\.ecr\\.${var.aws_region}\\.amazonaws\\.com/${replace(var.gateway_ecr_repository, ".", "\\.")}@sha256:[0-9a-f]{64}$",
+        var.gateway_image,
+      ))
+      : var.gateway_image == ""
+    )
+    error_message = "gateway_image must be a digest-pinned ECR image (…@sha256:…) under custom_gateway, and unset under the bedrock backend."
+  }
+}
+
+variable "gateway_sha" {
+  type        = string
+  default     = ""
+  description = "Expected org.opencontainers.image.revision label of the gateway image; admission fails on mismatch."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^[0-9a-f]{40}$", var.gateway_sha))
+      : var.gateway_sha == ""
+    )
+    error_message = "gateway_sha must be a 40-hex commit SHA under custom_gateway, and unset under the bedrock backend."
+  }
+}
+
+variable "gateway_ecr_repository" {
+  type        = string
+  default     = ""
+  description = "ECR repository name the gateway image must come from."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^[a-z0-9][a-z0-9._/-]{1,254}$", var.gateway_ecr_repository))
+      : var.gateway_ecr_repository == ""
+    )
+    error_message = "gateway_ecr_repository must be a valid ECR repository name under custom_gateway (gateway_image is pinned to it), and unset under bedrock."
+  }
+}
+
+variable "gateway_bearer_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN holding the static ELSPETH-to-gateway bearer. Injected into BOTH containers under their respective env names; never a literal value."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_bearer_secret_arn))
+      : var.gateway_bearer_secret_arn == ""
+    )
+    error_message = "gateway_bearer_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_oauth_client_id_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN holding the OAuth client ID. Injected into the gateway container ONLY; Web never receives it."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_oauth_client_id_secret_arn))
+      : var.gateway_oauth_client_id_secret_arn == ""
+    )
+    error_message = "gateway_oauth_client_id_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_oauth_client_secret_secret_arn" {
+  type        = string
+  default     = ""
+  description = "Secrets Manager ARN holding the OAuth client secret. Injected into the gateway container ONLY; Web never receives it."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(regex("^arn:[^:]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:", var.gateway_oauth_client_secret_secret_arn))
+      : var.gateway_oauth_client_secret_secret_arn == ""
+    )
+    error_message = "gateway_oauth_client_secret_secret_arn must be a Secrets Manager secret ARN under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_adapter" {
+  type        = string
+  default     = ""
+  description = "Adapter name the gateway must load (ELSPETH_LLM_GATEWAY_ADAPTER). The gateway fails readiness if the installed adapter does not match."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? length(var.gateway_adapter) > 0
+      : var.gateway_adapter == ""
+    )
+    error_message = "gateway_adapter must be set under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_upstream_origin" {
+  type        = string
+  default     = ""
+  description = "HTTPS origin of the agency upstream the gateway invokes (ELSPETH_LLM_GATEWAY_UPSTREAM_ORIGIN). Documented egress destination; never baked into the module."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? startswith(var.gateway_upstream_origin, "https://")
+      : var.gateway_upstream_origin == ""
+    )
+    error_message = "gateway_upstream_origin must be an https:// origin under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_oauth_token_url" {
+  type        = string
+  default     = ""
+  description = "HTTPS OAuth2 client-credentials token endpoint (ELSPETH_LLM_GATEWAY_OAUTH_TOKEN_URL)."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? startswith(var.gateway_oauth_token_url, "https://")
+      : var.gateway_oauth_token_url == ""
+    )
+    error_message = "gateway_oauth_token_url must be an https:// URL under custom_gateway, and unset under bedrock."
+  }
+}
+
+variable "gateway_model_mappings_json" {
+  type        = string
+  default     = ""
+  description = "Strict-JSON object rendered verbatim into ELSPETH_LLM_GATEWAY_MODEL_MAPPINGS: alias => adapter-defined mapping object. Aliases are what ELSPETH names; the mapping object's shape is owned by the installed adapter."
+
+  validation {
+    condition = (
+      var.llm_backend == "custom_gateway"
+      ? can(jsondecode(var.gateway_model_mappings_json)) && try(
+        length(jsondecode(var.gateway_model_mappings_json)) > 0 && alltrue([
+          for alias, mapping in jsondecode(var.gateway_model_mappings_json) :
+          can(regex("^[a-z0-9][a-z0-9._-]{0,63}$", alias)) && can(keys(mapping))
+        ]),
+        false,
+      )
+      : var.gateway_model_mappings_json == ""
+    )
+    error_message = "gateway_model_mappings_json must be a non-empty JSON object of alias => mapping-object under custom_gateway (aliases ^[a-z0-9][a-z0-9._-]{0,63}$), and unset under bedrock."
+  }
+
+  validation {
+    # The composer models must be invokable through the gateway: an alias
+    # miss here is a per-turn 4xx after deploy, so pin it at plan time.
+    condition = (
+      var.llm_backend != "custom_gateway" || try(
+        contains(keys(jsondecode(var.gateway_model_mappings_json)), var.composer_model) &&
+        contains(keys(jsondecode(var.gateway_model_mappings_json)), var.composer_advisor_model),
+        false,
+      )
+    )
+    error_message = "under custom_gateway both composer_model and composer_advisor_model must be aliases present in gateway_model_mappings_json."
   }
 }

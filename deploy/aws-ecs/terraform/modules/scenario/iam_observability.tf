@@ -53,11 +53,20 @@ data "aws_iam_policy_document" "execution_secrets" {
   statement {
     sid     = "ReadScenarioSecrets"
     actions = ["secretsmanager:GetSecretValue"]
-    resources = [
-      aws_secretsmanager_secret.runtime.arn,
-      aws_secretsmanager_secret.schema.arn,
-      aws_secretsmanager_secret.bootstrap.arn,
-    ]
+    # The gateway secrets are operator-created and referenced by ARN; the
+    # execution role reads them only under custom_gateway, at task launch.
+    resources = concat(
+      [
+        aws_secretsmanager_secret.runtime.arn,
+        aws_secretsmanager_secret.schema.arn,
+        aws_secretsmanager_secret.bootstrap.arn,
+      ],
+      local.bedrock_backend ? [] : [
+        var.gateway_bearer_secret_arn,
+        var.gateway_oauth_client_id_secret_arn,
+        var.gateway_oauth_client_secret_secret_arn,
+      ],
+    )
   }
 }
 

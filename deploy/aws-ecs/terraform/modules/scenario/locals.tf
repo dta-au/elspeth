@@ -303,11 +303,56 @@ locals {
       region_name = var.aws_region
     }
   }
+  # Bedrock-shaped bindings. Under custom_gateway this map is computed but
+  # unused (every consumer is bedrock_backend-guarded and the rendered
+  # profile JSON comes from gateway_llm_profile_bindings below); the two
+  # shapes stay in separate locals because their attribute sets cannot
+  # type-unify in one ternary, and rendering explicit nulls would trip the
+  # profile model's fields-set validation web-side.
   effective_llm_profile_bindings = var.llm_profiles == null ? local.default_llm_profile_bindings : {
     for alias, profile in var.llm_profiles : alias => {
       provider    = "bedrock"
       model       = profile.model
       region_name = coalesce(profile.region_name, var.aws_region)
+    }
+  }
+
+  # Gateway-shaped bindings (custom_gateway backend). credential_ref names
+  # the non-ELSPETH_ env var the module injects into Web from the operator's
+  # bearer secret and allowlists in ELSPETH_WEB__SERVER_SECRET_ALLOWLIST —
+  # ServerSecretStore refuses ELSPETH_-prefixed names, so the name is module-
+  # owned and fixed. endpoint is the loopback sidecar; no other provider's
+  # fields (region_name etc.) may appear on a gateway profile.
+  gateway_credential_ref                = "GATEWAY_BEARER"
+  gateway_default_required_capabilities = ["text", "tools", "json_schema", "usage"]
+  gateway_llm_profile_bindings = var.llm_profiles == null ? {
+    standard = {
+      provider              = "gateway"
+      model                 = var.composer_model
+      endpoint              = local.gateway_base_url
+      credential_scope      = "server"
+      credential_ref        = local.gateway_credential_ref
+      contract_major        = 1
+      required_capabilities = local.gateway_default_required_capabilities
+    }
+    fast = {
+      provider              = "gateway"
+      model                 = var.composer_advisor_model
+      endpoint              = local.gateway_base_url
+      credential_scope      = "server"
+      credential_ref        = local.gateway_credential_ref
+      contract_major        = 1
+      required_capabilities = local.gateway_default_required_capabilities
+    }
+    } : {
+    for alias, profile in var.llm_profiles : alias => {
+      provider              = "gateway"
+      model                 = profile.model
+      endpoint              = local.gateway_base_url
+      credential_scope      = "server"
+      credential_ref        = local.gateway_credential_ref
+      contract_major        = 1
+      required_capabilities = coalesce(profile.required_capabilities, local.gateway_default_required_capabilities)
     }
   }
   bedrock_profile_model_ids = local.bedrock_backend ? {
@@ -335,7 +380,7 @@ locals {
     local.bedrock_profile_inference_profile_arns,
     local.bedrock_cross_region_foundation_model_arns,
   ))
-  llm_profiles = jsonencode(local.effective_llm_profile_bindings)
+  llm_profiles = local.bedrock_backend ? jsonencode(local.effective_llm_profile_bindings) : jsonencode(local.gateway_llm_profile_bindings)
   # The tutorial needs A profile, not its OWN profile — it points at the ordinary
   # standard-tier one, the same way the systemd deployment points this at whichever
   # general profile it defines. An alias called "tutorial" made every non-tutorial
@@ -476,7 +521,20 @@ locals {
     { name = "ELSPETH_WEB__OIDC_TOKEN_ENDPOINT", value = "${local.oidc_authorization_origin}/oauth2/token" },
     { name = "ELSPETH_WEB__OIDC_AUTHORIZATION_ALLOWED_ORIGINS", value = jsonencode([local.oidc_authorization_origin]) },
     { name = "ELSPETH_WEB__OIDC_AUDIENCE_CLAIM", value = "client_id" },
+    ], local.bedrock_backend ? [] : [
+    # Both Composer roles target the loopback gateway sidecar. The paired
+    # API keys arrive via runtime_secrets, never as environment literals.
+    { name = "ELSPETH_WEB__COMPOSER_ENDPOINT_BASE_URL", value = local.gateway_base_url },
+    { name = "ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_BASE_URL", value = local.gateway_base_url },
+    # The gateway profiles' credential_ref resolves through ServerSecretStore,
+    # which only reads allowlisted, non-ELSPETH_ env names. Scenario C has no
+    # other third-party provider, so the allowlist is exactly the bearer ref.
+    { name = "ELSPETH_WEB__SERVER_SECRET_ALLOWLIST", value = jsonencode([local.gateway_credential_ref]) },
   ])
+
+  gateway_container_name = "elspeth-llm-gateway"
+  gateway_port           = 8787
+  gateway_base_url       = "http://127.0.0.1:8787/v1"
 
   application_secrets = [
     { name = "ELSPETH_WEB__SECRET_KEY", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:secret_key::" },
@@ -486,6 +544,15 @@ locals {
   runtime_secrets = concat(local.application_secrets, [
     { name = "ELSPETH_WEB__SESSION_DB_URL", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:session_url::" },
     { name = "ELSPETH_WEB__LANDSCAPE_URL", valueFrom = "${aws_secretsmanager_secret.runtime.arn}:landscape_url::" },
+    ], local.bedrock_backend ? [] : [
+    # Web receives ONLY the shared bearer (both roles pair with the loopback
+    # endpoint above); the OAuth client credentials go to the gateway
+    # container alone and never appear here. The same bearer is additionally
+    # injected under the ServerSecretStore ref name so pipeline gateway
+    # profiles can resolve it.
+    { name = "ELSPETH_WEB__COMPOSER_ENDPOINT_API_KEY", valueFrom = var.gateway_bearer_secret_arn },
+    { name = "ELSPETH_WEB__COMPOSER_ADVISOR_ENDPOINT_API_KEY", valueFrom = var.gateway_bearer_secret_arn },
+    { name = local.gateway_credential_ref, valueFrom = var.gateway_bearer_secret_arn },
   ])
 
   schema_owner_secrets = concat(local.application_secrets, [
