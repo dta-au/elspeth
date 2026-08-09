@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
@@ -164,6 +165,32 @@ def _writer_kwargs(method_name: str) -> dict[str, object]:
     raise AssertionError(f"unknown writer {method_name}")
 
 
+def _recorder_writer(recorder: AuthAuditRecorder, method_name: str) -> Callable[..., None]:
+    if method_name == "record_login_success_and_token_issued":
+        return recorder.record_login_success_and_token_issued
+    if method_name == "record_login_success":
+        return recorder.record_login_success
+    if method_name == "record_login_failure":
+        return recorder.record_login_failure
+    if method_name == "record_token_issued":
+        return recorder.record_token_issued
+    if method_name == "record_auth_failure":
+        return recorder.record_auth_failure
+    raise AssertionError(f"unknown writer {method_name}")
+
+
+def _repository_writer(repository: AuthAuditRepository, method_name: str) -> Any:
+    if method_name == "record_login_success_and_token_issued":
+        return repository.record_login_success_and_token_issued
+    if method_name == "record_login_outcome":
+        return repository.record_login_outcome
+    if method_name == "record_token_issued":
+        return repository.record_token_issued
+    if method_name == "record_auth_failure":
+        return repository.record_auth_failure
+    raise AssertionError(f"unknown repository writer {method_name}")
+
+
 @pytest.mark.parametrize(
     ("method_name", "repository_method"),
     [
@@ -209,7 +236,7 @@ def test_every_writer_forwards_required_create_tables_policy(
         create_tables=False,
     )
 
-    getattr(recorder, method_name)(_request(), **_writer_kwargs(method_name))
+    _recorder_writer(recorder, method_name)(_request(), **_writer_kwargs(method_name))
 
     assert open_calls == [
         (
@@ -217,7 +244,7 @@ def test_every_writer_forwards_required_create_tables_policy(
             {"passphrase": None, "create_tables": False},
         )
     ]
-    getattr(auth_repository, repository_method).assert_called_once()
+    _repository_writer(auth_repository, repository_method).assert_called_once()
 
 
 _OPERATION_NAMES = {
@@ -270,7 +297,7 @@ def test_every_writer_propagates_and_redacts_expected_database_failures(
 
     auth_repository = create_autospec(AuthAuditRepository, instance=True)
     if failure_location == "repository":
-        getattr(auth_repository, repository_method).side_effect = failure
+        _repository_writer(auth_repository, repository_method).side_effect = failure
     monkeypatch.setattr(audit_module, "LandscapeDB", _FakeLandscapeDB)
     monkeypatch.setattr(
         audit_module,
@@ -287,13 +314,15 @@ def test_every_writer_propagates_and_redacts_expected_database_failures(
     )
 
     with capture_logs() as logs, pytest.raises(type(failure)) as exc_info:
-        getattr(recorder, method_name)(_request(), **_writer_kwargs(method_name))
+        _recorder_writer(recorder, method_name)(_request(), **_writer_kwargs(method_name))
 
     assert exc_info.value is failure
     assert len(logs) == 1
     log = logs[0]
     assert log["event"] == "auth_audit_write_failed"
-    assert getattr(log["operation"], "value", log["operation"]) == _OPERATION_NAMES[method_name]
+    operation = log["operation"]
+    operation_value = operation.value if isinstance(operation, audit_module.AuthAuditOperation) else operation
+    assert operation_value == _OPERATION_NAMES[method_name]
     assert log["exception_class"] == type(failure).__name__
     assert set(log) == {"event", "operation", "exception_class", "log_level"}
     rendered = repr(logs)

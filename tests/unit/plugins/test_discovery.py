@@ -57,7 +57,7 @@ class TestDiscoverPlugins:
 
         # Should not crash or include base classes
         for cls in discovered:
-            assert hasattr(cls, "name"), f"{cls} has no name attribute"
+            assert isinstance(cls.name, str), f"{cls} has no string name attribute"
             assert cls.name != "", f"{cls} has empty name"
 
     def test_skips_abstract_classes(self) -> None:
@@ -540,7 +540,7 @@ class TestCreateDynamicHookimpl:
 
         hookimpl_obj = create_dynamic_hookimpl([FakePlugin], "elspeth_get_source")
 
-        assert hasattr(hookimpl_obj, "elspeth_get_source")
+        assert callable(hookimpl_obj.elspeth_get_source)  # type: ignore[attr-defined]
 
     def test_hookimpl_returns_plugin_list(self) -> None:
         """Verify hookimpl method returns the plugin classes."""
@@ -860,11 +860,12 @@ class TestDualSysModulesRegistration:
         synthetic = f"elspeth.plugins._discovered.transforms.{plugin_file.stem}"
         parent = importlib.import_module("elspeth.plugins.transforms")
         child_name = plugin_file.stem
+        parent_namespace = vars(parent)
 
         # Ensure neither name exists before discovery
         sys.modules.pop(canonical, None)
         sys.modules.pop(synthetic, None)
-        if child_name in vars(parent):
+        if child_name in parent_namespace:
             delattr(parent, child_name)
 
         try:
@@ -879,13 +880,13 @@ class TestDualSysModulesRegistration:
             # Standard import machinery also binds a child module on its parent
             # package.  Discovery must preserve that contract even though it
             # loads the file through a synthetic name first.
-            assert getattr(parent, child_name) is sys.modules[canonical]
+            assert parent_namespace[child_name] is sys.modules[canonical]
             namespace: dict[str, object] = {}
             exec(f"import {canonical} as imported", namespace)
             assert namespace["imported"] is sys.modules[canonical]
         finally:
             canonical_module = sys.modules.get(canonical)
-            if canonical_module is not None and getattr(parent, child_name, None) is canonical_module:
+            if canonical_module is not None and parent_namespace.get(child_name) is canonical_module:
                 delattr(parent, child_name)
             sys.modules.pop(canonical, None)
             sys.modules.pop(synthetic, None)

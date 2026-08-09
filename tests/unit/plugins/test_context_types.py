@@ -43,11 +43,10 @@ class TestPluginContextTypes:
 
         # There should be no locally-defined LandscapeRecorder class
         # that shadows the real one
-        local_items = dir(context_module)
+        local_items = vars(context_module)
 
         # The module should NOT have its own LandscapeRecorder class defined
-        for name in local_items:
-            obj = getattr(context_module, name)
+        for name, obj in local_items.items():
             is_local_recorder = (
                 isinstance(obj, type) and name == "LandscapeRecorder" and obj.__module__ == "elspeth.contracts.plugin_context"
             )

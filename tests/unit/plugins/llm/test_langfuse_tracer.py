@@ -201,9 +201,14 @@ class TestNoOpLangfuseTracer:
         """
         import inspect
 
-        for method_name in ("record_success", "record_error", "flush"):
-            protocol_sig = inspect.signature(getattr(LangfuseTracer, method_name))
-            impl_sig = inspect.signature(getattr(NoOpLangfuseTracer, method_name))
+        method_pairs = (
+            ("record_success", LangfuseTracer.record_success, NoOpLangfuseTracer.record_success),
+            ("record_error", LangfuseTracer.record_error, NoOpLangfuseTracer.record_error),
+            ("flush", LangfuseTracer.flush, NoOpLangfuseTracer.flush),
+        )
+        for method_name, protocol_method, impl_method in method_pairs:
+            protocol_sig = inspect.signature(protocol_method)
+            impl_sig = inspect.signature(impl_method)
 
             # Parameter names and kinds must match (ignoring self)
             protocol_params = [(name, p.kind, p.default) for name, p in protocol_sig.parameters.items() if name != "self"]

@@ -125,24 +125,32 @@ def test_assert_reference_text_rejects_missing_blank_or_generic_prose(
 
 
 @pytest.mark.parametrize(
-    ("first_field", "second_field"),
+    ("first_value", "second_field"),
     [
-        ("usage_when_to_use", "usage_when_not_to_use"),
-        ("usage_when_to_use", "example_use"),
-        ("usage_when_not_to_use", "example_use"),
+        pytest.param(
+            _ReferenceTransform.usage_when_to_use,
+            "usage_when_not_to_use",
+            id="when-to-use-vs-when-not-to-use",
+        ),
+        pytest.param(
+            _ReferenceTransform.usage_when_to_use,
+            "example_use",
+            id="when-to-use-vs-example",
+        ),
+        pytest.param(
+            _ReferenceTransform.usage_when_not_to_use,
+            "example_use",
+            id="when-not-to-use-vs-example",
+        ),
     ],
 )
 def test_assert_reference_text_rejects_duplicated_prose(
     monkeypatch: pytest.MonkeyPatch,
-    first_field: str,
+    first_value: str | None,
     second_field: str,
 ) -> None:
     testkit = _testkit()
-    monkeypatch.setattr(
-        _ReferenceTransform,
-        second_field,
-        getattr(_ReferenceTransform, first_field),
-    )
+    monkeypatch.setattr(_ReferenceTransform, second_field, first_value)
 
     with pytest.raises(AssertionError):
         testkit.assert_reference_text(_ReferenceTransform)

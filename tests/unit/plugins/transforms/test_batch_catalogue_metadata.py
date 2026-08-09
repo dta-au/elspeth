@@ -145,10 +145,15 @@ def test_batch_catalogue_reference_content_is_class_owned_specific_valid_and_tru
     node, aggregation = _declaring_aggregation(reference)
     assert node["plugin"] == plugin_cls.name
     assert aggregation.output_mode == "transform"
+    all_reference_text = (
+        cast(str, plugin_cls.usage_when_to_use)
+        + " "
+        + cast(str, plugin_cls.usage_when_not_to_use)
+        + " "
+        + cast(str, plugin_cls.example_use)
+    ).casefold()
     assert aggregation.trigger.count is not None or (
-        not aggregation.trigger.has_timeout
-        and not aggregation.trigger.has_condition
-        and "end-of-source" in " ".join(cast(str, getattr(plugin_cls, field_name)) for field_name in _REFERENCE_FIELDS[:-1]).casefold()
+        not aggregation.trigger.has_timeout and not aggregation.trigger.has_condition and "end-of-source" in all_reference_text
     )
 
     to_use_value = plugin_cls.usage_when_to_use
@@ -161,7 +166,6 @@ def test_batch_catalogue_reference_content_is_class_owned_specific_valid_and_tru
     assert all(term in to_use for term in required_use)
     assert all(term in not_to_use for term in required_avoid)
 
-    all_reference_text = " ".join(cast(str, getattr(plugin_cls, field_name)) for field_name in _REFERENCE_FIELDS[:-1]).casefold()
     assert not any(marker in all_reference_text for marker in _PLACEHOLDER_MARKERS)
     _assert_constructor_is_side_effect_free(reference, tmp_path, monkeypatch)
 

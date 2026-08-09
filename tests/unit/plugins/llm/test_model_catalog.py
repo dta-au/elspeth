@@ -74,8 +74,10 @@ def test_transform_model_catalog_preserves_public_api_as_identity_reexports() ->
 
     assert set(model_catalog.__all__) == expected_public_api
     assert set(neutral_model_catalog.__all__) == expected_public_api
+    transform_exports = vars(model_catalog)
+    neutral_exports = vars(neutral_model_catalog)
     for name in expected_public_api:
-        assert getattr(model_catalog, name) is getattr(neutral_model_catalog, name)
+        assert transform_exports[name] is neutral_exports[name]
 
 
 async def _prime_live_catalog(ids: list[str]) -> None:

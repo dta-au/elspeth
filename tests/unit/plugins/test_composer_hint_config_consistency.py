@@ -22,12 +22,15 @@ That requires parsing free prose for option keys and cannot be made zero-FP.
 from __future__ import annotations
 
 import re
-from typing import Literal, cast, get_args, get_origin
+from typing import Literal, get_args, get_origin
 
 from pydantic import BaseModel
 
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
+
+type _PluginClass = type[BaseSource] | type[BaseTransform] | type[BaseSink]
 
 # Quoted enum token inside a clause tail, e.g. 'fail_if_exists'.
 _QUOTED_LITERAL = re.compile(r"'([a-z][a-z0-9_]*)'")
@@ -61,23 +64,29 @@ def _literal_fields(config_model: type[BaseModel], prefix: str = "", depth: int 
     return result
 
 
+def _admit_discovered_plugin_class(plugin_kind: str, cls: type) -> _PluginClass:
+    if plugin_kind == "sources" and issubclass(cls, BaseSource):
+        return cls
+    if plugin_kind == "transforms" and issubclass(cls, BaseTransform):
+        return cls
+    if plugin_kind == "sinks" and issubclass(cls, BaseSink):
+        return cls
+    raise AssertionError(f"discovery returned {cls!r} for incompatible plugin kind {plugin_kind!r}")
+
+
 def _iter_hint_bearing_plugins() -> list[tuple[str, type[BaseModel], PluginAssistance]]:
     """All discovered plugin classes that expose discovery-time composer hints."""
     out: list[tuple[str, type[BaseModel], PluginAssistance]] = []
-    for classes in discover_all_plugins().values():
-        for cls in classes:
-            get_assistance = getattr(cls, "get_agent_assistance", None)
-            if get_assistance is None:
-                continue
-            assistance = get_assistance(issue_code=None)
+    for plugin_kind, classes in discover_all_plugins().items():
+        for discovered_cls in classes:
+            cls = _admit_discovered_plugin_class(plugin_kind, discovered_cls)
+            assistance = cls.get_agent_assistance(issue_code=None)
             if assistance is None or not assistance.composer_hints:
                 continue
-            get_config_model = getattr(cls, "get_config_model", None)
-            config_model = get_config_model() if get_config_model is not None else getattr(cls, "config_model", None)
+            config_model = cls.get_config_model()
             if config_model is None:  # e.g. NullSource
                 continue
-            plugin_name = cast(str, cls.name)  # type: ignore[attr-defined]  # plugin base declares name
-            out.append((plugin_name, config_model, assistance))
+            out.append((cls.name, config_model, assistance))
     return out
 
 

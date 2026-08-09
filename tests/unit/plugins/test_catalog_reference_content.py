@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from functools import cache
 from typing import Any, cast
 
@@ -292,16 +292,23 @@ def test_operator_profiled_builtin_examples_are_valid(identity: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "field_name",
-    ("usage_when_to_use", "usage_when_not_to_use", "example_use"),
+    ("field_name", "read_value"),
+    (
+        ("usage_when_to_use", lambda reference: reference.plugin_cls.usage_when_to_use),
+        ("usage_when_not_to_use", lambda reference: reference.plugin_cls.usage_when_not_to_use),
+        ("example_use", lambda reference: reference.plugin_cls.example_use),
+    ),
 )
-def test_user_visible_reference_content_is_exactly_unique(field_name: str) -> None:
+def test_user_visible_reference_content_is_exactly_unique(
+    field_name: str,
+    read_value: Callable[[BuiltinReference], str | None],
+) -> None:
     values: dict[str, list[str]] = defaultdict(list)
     for reference in REFERENCES:
         identity = _identity(reference)
         if identity in DOCUMENTED_HIDDEN_IDENTITIES:
             continue
-        value = getattr(reference.plugin_cls, field_name)
+        value = read_value(reference)
         assert isinstance(value, str)
         values[_normalize_reference_text(value)].append(identity)
 

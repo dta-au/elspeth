@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -15,6 +16,9 @@ from elspeth.contracts.aws_s3 import (
     s3_profiled_binding_fingerprint,
 )
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+if TYPE_CHECKING:
+    from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
 
 
 def _config(**overrides: Any) -> dict[str, Any]:
@@ -127,12 +131,34 @@ class TestAWSS3SourceConfig:
             AWSS3SourceConfig.from_dict(_config(endpoint_url=endpoint))
 
     @pytest.mark.parametrize(
-        "field,valid,invalid", [("max_object_bytes", 1024**3, 1024**3 + 1), ("max_record_chars", 8_000_000, 8_000_001)]
+        ("field", "valid", "invalid", "read_value"),
+        [
+            pytest.param(
+                "max_object_bytes",
+                1024**3,
+                1024**3 + 1,
+                lambda config: config.max_object_bytes,
+                id="max-object-bytes",
+            ),
+            pytest.param(
+                "max_record_chars",
+                8_000_000,
+                8_000_001,
+                lambda config: config.max_record_chars,
+                id="max-record-chars",
+            ),
+        ],
     )
-    def test_resource_limits_are_positive_and_capped(self, field: str, valid: int, invalid: int) -> None:
+    def test_resource_limits_are_positive_and_capped(
+        self,
+        field: str,
+        valid: int,
+        invalid: int,
+        read_value: Callable[[AWSS3SourceConfig], int],
+    ) -> None:
         from elspeth.plugins.sources.aws_s3_source import AWSS3SourceConfig
 
-        assert getattr(AWSS3SourceConfig.from_dict(_config(**{field: valid})), field) == valid
+        assert read_value(AWSS3SourceConfig.from_dict(_config(**{field: valid}))) == valid
         for value in (0, -1, invalid):
             with pytest.raises(PluginConfigError):
                 AWSS3SourceConfig.from_dict(_config(**{field: value}))

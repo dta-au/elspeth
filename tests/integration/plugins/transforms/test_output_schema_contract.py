@@ -71,7 +71,7 @@ def _invariant2_transforms():
     for plugin_cls in manager.get_transforms():
         transform = plugin_cls(plugin_cls.probe_config())
         if transform.declared_output_fields:
-            discovered.append((getattr(plugin_cls, "name", plugin_cls.__name__), transform))
+            discovered.append((plugin_cls.name, transform))
     return discovered
 
 

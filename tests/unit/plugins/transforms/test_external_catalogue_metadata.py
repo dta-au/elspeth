@@ -270,7 +270,13 @@ def test_external_catalogue_reference_content_is_class_owned_specific_valid_and_
     assert all(term in to_use for term in required_use)
     assert all(term in not_to_use for term in required_avoid)
 
-    all_reference_text = " ".join(cast(str, getattr(plugin_cls, name)) for name in _REFERENCE_FIELDS[:-1]).casefold()
+    all_reference_text = (
+        cast(str, plugin_cls.usage_when_to_use)
+        + " "
+        + cast(str, plugin_cls.usage_when_not_to_use)
+        + " "
+        + cast(str, plugin_cls.example_use)
+    ).casefold()
     assert not any(marker in all_reference_text for marker in _PLACEHOLDER_MARKERS)
     _assert_constructor_is_side_effect_free(reference, tmp_path, monkeypatch)
 

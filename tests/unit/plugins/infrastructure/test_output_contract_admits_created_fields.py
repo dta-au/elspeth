@@ -95,7 +95,7 @@ def _created_fields(transform: BaseTransform) -> frozenset[str]:
 
 def _output_forbids_extras(transform: BaseTransform) -> bool:
     """Whether the output model rejects a field it does not name."""
-    output: type[PluginSchema] | None = getattr(transform, "output_schema", None)
+    output: type[PluginSchema] | None = transform.output_schema
     return output is not None and output.model_config.get("extra") == "forbid"
 
 
@@ -128,7 +128,7 @@ def _output_contract_violations(transform: BaseTransform) -> dict[str, str]:
         return {}
 
     violations: dict[str, str] = {}
-    output: type[PluginSchema] | None = getattr(transform, "output_schema", None)
+    output: type[PluginSchema] | None = transform.output_schema
     if output is None:
         return {_ALIASED: "no output_schema was assigned"}
 
@@ -149,11 +149,17 @@ def _output_contract_violations(transform: BaseTransform) -> dict[str, str]:
 def _roster() -> list[type[BaseTransform]]:
     manager = PluginManager()
     manager.register_builtin_plugins()
-    return list(manager.get_transforms())
+    roster: list[type[BaseTransform]] = []
+    for manager_candidate in manager.get_transforms():
+        candidate: object = manager_candidate
+        if not isinstance(candidate, type) or not issubclass(candidate, BaseTransform):
+            raise AssertionError(f"plugin manager returned non-transform candidate {candidate!r}")
+        roster.append(candidate)
+    return roster
 
 
 def _label(cls: type[BaseTransform]) -> str:
-    return getattr(cls, "name", cls.__name__)
+    return cls.name
 
 
 class TestRegisteredTransformsPublishAnHonestOutputContract:
@@ -173,11 +179,8 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         unbuildable: dict[str, str] = {}
         checked = 0
         for cls in _roster():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
             try:
-                instance = cls(probe_config())
+                instance = cls(cls.probe_config())
             except Exception as exc:
                 # Recorded, never swallowed — see the assertion below.
                 unbuildable[_label(cls)] = type(exc).__name__
@@ -229,11 +232,8 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         rebuild_rejected: set[str] = set()
         forbid_checked = 0
         for cls in _roster():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
             try:
-                base = probe_config()
+                base = cls.probe_config()
                 instance = cls(base)
             except Exception as exc:
                 # Recorded, never swallowed — same discipline as the arm above.
@@ -324,10 +324,7 @@ class TestRegisteredTransformsPublishAnHonestOutputContract:
         unbuildable: set[str] = set()
         round_tripped = 0
         for cls in _roster():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
-            base = probe_config()
+            base = cls.probe_config()
             try:
                 bare = cls(base)
             except Exception:

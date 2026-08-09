@@ -1411,15 +1411,12 @@ class TestPromptShieldInternalProcessing:
             for the whole process during the test -- especially hazardous since
             threading internals also rely on those two. Rebinding the ``time``
             *name inside the base module's own namespace* keeps the fake clock
-            local to the code path under test; everything else delegates to the
-            real module.
+            local to the code path under test. The exercised production path
+            only needs these two explicit clock operations.
             """
 
             monotonic = staticmethod(fake_monotonic)
             sleep = staticmethod(fake_sleep)
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(time, name)
 
         monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time", _FakeClockTime())
         monkeypatch.setattr(transform._capacity_retry_shutdown, "wait", fake_wait)
@@ -1478,14 +1475,12 @@ class TestPromptShieldInternalProcessing:
             process during the test -- especially hazardous since threading
             internals also rely on it. Rebinding the ``time`` *name inside the
             base module's own namespace* keeps the assertion-raising sleep local
-            to the code path under test; everything else delegates to the real
-            module.
+            to the code path under test. The exercised production path also
+            needs the real monotonic clock, exposed explicitly below.
             """
 
+            monotonic = staticmethod(time.monotonic)
             sleep = staticmethod(fail_sleep)
-
-            def __getattr__(self, name: str) -> Any:
-                return getattr(time, name)
 
         monkeypatch.setattr("elspeth.plugins.transforms.azure.base.time", _NoSleepAllowedTime())
         monkeypatch.setattr(transform, "_analyze_field_once", fake_analyze_once)

@@ -18,12 +18,23 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.manager import PluginManager
 
 
 def _required_input_fields(transform: Any) -> set[str]:
     schema = transform.input_schema
     return {name for name, field in schema.model_fields.items() if field.is_required()}
+
+
+def _registered_transform_classes(manager: PluginManager) -> list[type[BaseTransform]]:
+    transforms: list[type[BaseTransform]] = []
+    for candidate in manager.get_transforms():
+        candidate_object: object = candidate
+        if not isinstance(candidate_object, type) or not issubclass(candidate_object, BaseTransform):
+            raise AssertionError(f"registered transform is not a BaseTransform: {candidate!r}")
+        transforms.append(candidate_object)
+    return transforms
 
 
 class TestClassBodyDeclarationStillDemotes:
@@ -193,10 +204,8 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
 
         trapped: dict[str, list[str]] = {}
         checked = 0
-        for cls in manager.get_transforms():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
+        for cls in _registered_transform_classes(manager):
+            probe_config = cls.probe_config
             try:
                 base = probe_config()
             except NotImplementedError:
@@ -240,7 +249,7 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
             checked += 1
             collisions = sorted(outputs & _required_input_fields(declared))
             if collisions:
-                trapped[getattr(cls, "name", cls.__name__)] = collisions
+                trapped[cls.name] = collisions
                 continue
 
             # Not just required-ness: a row carrying NONE of the created fields
@@ -295,10 +304,10 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
 
         misclassified: dict[str, str] = {}
         checked = 0
-        for cls in manager.get_transforms():
+        for cls in _registered_transform_classes(manager):
             declared_keys = cls.output_naming_config_keys
-            probe_config = getattr(cls, "probe_config", None)
-            if not declared_keys or probe_config is None:
+            probe_config = cls.probe_config
+            if not declared_keys:
                 continue
             try:
                 base = probe_config()
@@ -318,7 +327,7 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
                 output_contract = built._output_schema_config
                 created |= set(output_contract.guaranteed_fields or ()) if output_contract is not None else set()
                 if sentinel not in created:
-                    misclassified[f"{getattr(cls, 'name', cls.__name__)}.{key}"] = sentinel
+                    misclassified[f"{cls.name}.{key}"] = sentinel
 
         assert checked > 0, "no output-naming option was exercised — the declarations vanished"
         assert misclassified == {}, (
@@ -345,10 +354,8 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
 
         unprotected: dict[str, str] = {}
         checked = 0
-        for cls in manager.get_transforms():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
+        for cls in _registered_transform_classes(manager):
+            probe_config = cls.probe_config
             try:
                 base = probe_config()
                 transform = cls(base)
@@ -362,7 +369,7 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
                     continue
                 checked += 1
                 if value not in consumed:
-                    unprotected[f"{getattr(cls, 'name', cls.__name__)}.{key}"] = value
+                    unprotected[f"{cls.name}.{key}"] = value
 
         assert checked > 0, "no read-classified column option was exercised — probe shape changed"
         assert unprotected == {}, f"read columns missing from consumed_input_fields: {unprotected}"
@@ -382,10 +389,8 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
 
         lost: dict[str, str] = {}
         checked = 0
-        for cls in manager.get_transforms():
-            probe_config = getattr(cls, "probe_config", None)
-            if probe_config is None:
-                continue
+        for cls in _registered_transform_classes(manager):
+            probe_config = cls.probe_config
             try:
                 base = probe_config()
                 instance = cls(base)
@@ -414,7 +419,7 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
                     continue
                 checked += 1
                 if collide not in _required_input_fields(built):
-                    lost[f"{getattr(cls, 'name', cls.__name__)}.{knob}"] = collide
+                    lost[f"{cls.name}.{knob}"] = collide
 
         assert checked > 0, "sweep exercised no plugin/knob pair — the probe shape changed"
         assert lost == {}, f"configured input columns silently demoted: {lost}"

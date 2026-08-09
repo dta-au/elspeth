@@ -38,7 +38,7 @@ class TestNullSource:
         from elspeth.plugins.sources.null_source import NullSource
 
         source = NullSource({})
-        # Direct access - no hasattr() per CLAUDE.md
+        # Direct access through the nominal class contract.
         assert issubclass(source.output_schema, PluginSchema)
 
     def test_null_source_close_is_idempotent(self) -> None:
@@ -62,7 +62,6 @@ class TestNullSource:
         from elspeth.plugins.sources.null_source import NullSource
 
         source = NullSource({})
-        assert hasattr(source, "plugin_version")
         assert isinstance(source.plugin_version, str)
         assert source.plugin_version != ""
 
@@ -70,9 +69,11 @@ class TestNullSource:
         """Populated catalogue prose remains writable through SourceProtocol."""
         from elspeth.plugins.sources.null_source import NullSource
 
-        for attribute in ("usage_when_to_use", "usage_when_not_to_use", "example_use"):
-            assert NullSource.__annotations__[attribute] == str | None
-            value = getattr(NullSource, attribute)
+        annotations = NullSource.__annotations__
+        assert annotations["usage_when_to_use"] == str | None
+        assert annotations["usage_when_not_to_use"] == str | None
+        assert annotations["example_use"] == str | None
+        for value in (NullSource.usage_when_to_use, NullSource.usage_when_not_to_use, NullSource.example_use):
             assert isinstance(value, str)
             assert value.strip()
 
