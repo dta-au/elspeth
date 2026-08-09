@@ -45,10 +45,13 @@ admitted like the Web image, started and healthy before Web starts. It plans
 with **no Bedrock model or ARN input**; every `bedrock_*` variable is rejected.
 Differences from Scenario A an operator must supply:
 
-- The ten `gateway_*` inputs (image digest + revision + repository, three
+- The thirteen `gateway_*` inputs (image digest + revision + repository, three
   operator-created Secrets Manager ARNs — bearer to both containers, OAuth
-  client ID/secret to the gateway only — adapter name, upstream origin, token
-  URL, and the model-mappings JSON covering both composer models).
+  client ID/secret to the gateway only — the adapter identity quadruple the
+  admission gate verifies against the image's labels — name, version, API
+  major, and package fingerprint, all printed by the gateway image's offline
+  `image-identity` command — plus upstream origin, token URL, and the
+  model-mappings JSON covering both composer models).
 - Non-bedrock composer model aliases (the gateway's mappings translate them).
 - An **explicit control posture**: the module refuses its Bedrock-implemented
   `prompt_shield`/`content_safety` defaults, so `plugin_control_modes`,

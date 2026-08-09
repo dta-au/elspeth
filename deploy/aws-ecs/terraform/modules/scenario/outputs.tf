@@ -164,20 +164,27 @@ locals {
 
 output "resolved_inventory" {
   value = {
-    schema            = "elspeth.aws-ecs-scenario-inventory.v8"
+    schema            = "elspeth.aws-ecs-scenario-inventory.v9"
     acceptance_run_id = var.run_id
     candidate_sha     = var.candidate_sha
     # Gateway sidecar identity (explicit nulls under the bedrock backend).
-    # Digest and revision only — secret names and values never appear here.
-    gateway_image   = var.llm_backend == "custom_gateway" ? var.gateway_image : null
-    gateway_sha     = var.llm_backend == "custom_gateway" ? var.gateway_sha : null
-    gateway_adapter = var.llm_backend == "custom_gateway" ? var.gateway_adapter : null
-    aws_account_id  = var.aws_account_id
-    aws_region      = var.aws_region
-    scenario_id     = var.scenario_id
-    phase           = "resolved"
-    values          = local.scenario_values
-    orphan_sweep    = local.scenario_orphan_sweep
+    # The full admitted identity — image digest, revision, and the adapter
+    # quadruple the admission gate verified against the image's labels — is
+    # bound into the evidence (design acceptance criterion 10 names the
+    # fingerprint; elspeth-ef60d2ff3c review GAP-5). Secret names and
+    # values never appear here.
+    gateway_image               = var.llm_backend == "custom_gateway" ? var.gateway_image : null
+    gateway_sha                 = var.llm_backend == "custom_gateway" ? var.gateway_sha : null
+    gateway_adapter             = var.llm_backend == "custom_gateway" ? var.gateway_adapter : null
+    gateway_adapter_version     = var.llm_backend == "custom_gateway" ? var.gateway_adapter_version : null
+    gateway_adapter_api_major   = var.llm_backend == "custom_gateway" ? var.gateway_adapter_api_major : null
+    gateway_adapter_fingerprint = var.llm_backend == "custom_gateway" ? var.gateway_adapter_fingerprint : null
+    aws_account_id              = var.aws_account_id
+    aws_region                  = var.aws_region
+    scenario_id                 = var.scenario_id
+    phase                       = "resolved"
+    values                      = local.scenario_values
+    orphan_sweep                = local.scenario_orphan_sweep
   }
   sensitive = true
 }

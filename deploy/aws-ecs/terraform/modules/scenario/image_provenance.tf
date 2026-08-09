@@ -41,6 +41,36 @@ resource "terraform_data" "candidate_image_provenance" {
         <"$work/ecr-password" \
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$CANDIDATE_IMAGE" >"$work/docker-pull.out"
+      # A --platform pull is a selection preference, not an assertion: a
+      # single-manifest image of the wrong architecture still pulls. Assert
+      # the admitted bytes' architecture explicitly (elspeth-ef60d2ff3c
+      # review GAP-2).
+      architecture=$(docker image inspect --format '{{.Architecture}}' "$CANDIDATE_IMAGE")
+      test "$architecture" = "$EXPECTED_ARCHITECTURE" || {
+        printf '%s\n' candidate_image_architecture_mismatch >&2
+        exit 1
+      }
+      # The design's admission bar: an unavailable scan blocks before secret
+      # injection. COMPLETE = basic scanning finished; ACTIVE = enhanced
+      # continuous scanning. Severity policy stays an operator decision —
+      # this gate only refuses to admit an UNSCANNED image.
+      scan_status=$(aws ecr describe-image-scan-findings \
+        --profile "$AWS_PROFILE" \
+        --region "$AWS_REGION" \
+        --repository-name "$ECR_REPOSITORY" \
+        --image-id imageDigest="$${CANDIDATE_IMAGE#*@}" \
+        --query 'imageScanStatus.status' \
+        --output text 2>"$work/scan-status.err") || {
+        printf '%s\n' candidate_image_scan_unavailable >&2
+        exit 1
+      }
+      case "$scan_status" in
+        COMPLETE|ACTIVE) : ;;
+        *)
+          printf '%s\n' candidate_image_scan_unavailable >&2
+          exit 1
+          ;;
+      esac
       config_contract=$(docker image inspect \
         --format '{{ index .Config.Labels "io.elspeth.aws-ecs-config-contract" }}' \
         "$CANDIDATE_IMAGE")
@@ -63,6 +93,8 @@ resource "terraform_data" "candidate_image_provenance" {
       AWS_REGION               = var.aws_region
       CANDIDATE_IMAGE          = var.candidate_image
       CANDIDATE_SHA            = var.candidate_sha
+      ECR_REPOSITORY           = var.candidate_ecr_repository
+      EXPECTED_ARCHITECTURE    = split("/", var.target_platform)[1]
       EXPECTED_CONFIG_CONTRACT = local.candidate_image_config_contract
       TARGET_PLATFORM          = var.target_platform
     }
@@ -188,13 +220,18 @@ resource "terraform_data" "cloudwatch_agent_image_provenance" {
 # registry, revision-label match against the operator-claimed SHA, and exact
 # matches on the image's identity labels — base runtime identity, supported
 # gateway contract major, and the adapter's name, version, API major, and
-# package fingerprint. The task definition consumes this resource's output,
-# so any mismatch blocks before the gateway or OAuth secret selectors exist
-# anywhere. /readyz re-verifies adapter identity at runtime as defense in
-# depth, not as the admission boundary. The same candidate-gate caveat
-# applies: labels prove what the image declares, not who built it — the
-# supported pairing remains an image and expectations supplied together by
-# the operator.
+# package fingerprint. The service task definition consumes this resource's
+# output, and every other selector-bearing task definition (payload,
+# local_auth) depends on it, so any mismatch blocks before the gateway or
+# OAuth secret selectors exist anywhere. This gate is the ONLY place
+# adapter identity is compared against an operator expectation: /readyz
+# REPORTS the running adapter's identity and enforces the SDK's own
+# api-major self-consistency, but never compares against an expected
+# value (see gateway providers' gateway.py docstring) — treat runtime
+# identity reporting as evidence, not enforcement. The same candidate-gate
+# caveat applies: labels prove what the image declares, not who built it —
+# the supported pairing remains an image and expectations supplied
+# together by the operator.
 resource "terraform_data" "gateway_image_provenance" {
   count = local.bedrock_backend ? 0 : 1
 
@@ -233,6 +270,28 @@ resource "terraform_data" "gateway_image_provenance" {
         <"$work/ecr-password" \
         >"$work/docker-login.out"
       docker pull --platform "$TARGET_PLATFORM" "$GATEWAY_IMAGE" >"$work/docker-pull.out"
+      architecture=$(docker image inspect --format '{{.Architecture}}' "$GATEWAY_IMAGE")
+      test "$architecture" = "$EXPECTED_ARCHITECTURE" || {
+        printf '%s\n' gateway_image_architecture_mismatch >&2
+        exit 1
+      }
+      scan_status=$(aws ecr describe-image-scan-findings \
+        --profile "$AWS_PROFILE" \
+        --region "$AWS_REGION" \
+        --repository-name "$ECR_REPOSITORY" \
+        --image-id imageDigest="$${GATEWAY_IMAGE#*@}" \
+        --query 'imageScanStatus.status' \
+        --output text 2>"$work/scan-status.err") || {
+        printf '%s\n' gateway_image_scan_unavailable >&2
+        exit 1
+      }
+      case "$scan_status" in
+        COMPLETE|ACTIVE) : ;;
+        *)
+          printf '%s\n' gateway_image_scan_unavailable >&2
+          exit 1
+          ;;
+      esac
       revision=$(docker image inspect \
         --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
         "$GATEWAY_IMAGE")
@@ -266,6 +325,8 @@ resource "terraform_data" "gateway_image_provenance" {
       AWS_ACCOUNT_ID               = var.aws_account_id
       AWS_PROFILE                  = var.aws_profile
       AWS_REGION                   = var.aws_region
+      ECR_REPOSITORY               = var.gateway_ecr_repository
+      EXPECTED_ARCHITECTURE        = split("/", var.target_platform)[1]
       GATEWAY_IMAGE                = var.gateway_image
       GATEWAY_SHA                  = var.gateway_sha
       EXPECTED_RUNTIME_IDENTITY    = "elspeth-llm-gateway"

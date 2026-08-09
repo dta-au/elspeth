@@ -1296,47 +1296,194 @@ def test_application_image_contract_is_baked_verified_and_admitted() -> None:
     assert "--key" not in handoff
 
 
-@pytest.mark.parametrize("observed_contract", ["", "elspeth.aws-ecs.runtime.v0"])
-def test_candidate_image_admission_rejects_missing_or_wrong_config_contract(observed_contract: str) -> None:
+def _provenance_section_body(resource_name: str, next_resource: str | None) -> str:
+    """Extract one provisioner's shell body, rendered as terraform executes it.
+
+    ``$$`` is terraform's escape for a literal ``$`` inside the heredoc, so
+    the faithful bash rendering replaces it before execution.
+    """
     provenance = _text("modules/scenario/image_provenance.tf")
-    candidate = provenance[
-        provenance.index('resource "terraform_data" "candidate_image_provenance"') : provenance.index(
-            'resource "terraform_data" "rollback_image_provenance"'
-        )
-    ]
-    command_match = re.search(r"command\s*=\s*<<-SHELL\n(?P<body>.*?)\n\s*SHELL", candidate, re.DOTALL)
+    start = provenance.index(f'resource "terraform_data" "{resource_name}"')
+    section = provenance[start : provenance.index(f'resource "terraform_data" "{next_resource}"')] if next_resource else provenance[start:]
+    command_match = re.search(r"command\s*=\s*<<-SHELL\n(?P<body>.*?)\n\s*SHELL", section, re.DOTALL)
     assert command_match is not None
-    harness = f"""
-aws() {{ printf '%s' password; }}
-docker() {{
+    return command_match.group("body").replace("$$", "$")
+
+
+# Stubs dispatch on the observed command line: the scan call answers with
+# $OBSERVED_SCAN_STATUS (or fails outright on FAIL_CALL), every other aws
+# call is the login-password read; docker inspects answer from OBSERVED_*
+# variables so each admission check is independently steerable.
+_PROVENANCE_HARNESS_STUBS = """
+aws() {
   case "$*" in
-    *org.opencontainers.image.revision*) printf '%s\\n' "$CANDIDATE_SHA" ;;
+    *describe-image-scan-findings*)
+      if test "$OBSERVED_SCAN_STATUS" = "FAIL_CALL"; then return 254; fi
+      printf '%s\\n' "$OBSERVED_SCAN_STATUS" ;;
+    *) printf '%s' password ;;
+  esac
+}
+docker() {
+  case "$*" in
+    *.Architecture*) printf '%s\\n' "$OBSERVED_ARCHITECTURE" ;;
+    *org.opencontainers.image.revision*) printf '%s\\n' "$OBSERVED_REVISION" ;;
     *io.elspeth.aws-ecs-config-contract*) printf '%s\\n' "$OBSERVED_CONFIG_CONTRACT" ;;
+    *runtime-identity*) printf '%s\\n' "$OBSERVED_RUNTIME_IDENTITY" ;;
+    *contract-major*) printf '%s\\n' "$OBSERVED_CONTRACT_MAJOR" ;;
+    *adapter-name*) printf '%s\\n' "$OBSERVED_ADAPTER_NAME" ;;
+    *adapter-version*) printf '%s\\n' "$OBSERVED_ADAPTER_VERSION" ;;
+    *adapter-api-major*) printf '%s\\n' "$OBSERVED_ADAPTER_API_MAJOR" ;;
+    *adapter-fingerprint*) printf '%s\\n' "$OBSERVED_ADAPTER_FINGERPRINT" ;;
     *) return 0 ;;
   esac
-}}
-{command_match.group("body")}
+}
 """
-    result = subprocess.run(
-        ["bash", "-ceu", harness],
+
+
+def _candidate_harness_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "AWS_ACCOUNT_ID": "123456789012",
+        "AWS_PROFILE": "acceptance",
+        "AWS_REGION": "ap-southeast-2",
+        "CANDIDATE_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth@sha256:" + "d" * 64,
+        "CANDIDATE_SHA": "a" * 40,
+        "ECR_REPOSITORY": "elspeth",
+        "EXPECTED_ARCHITECTURE": "amd64",
+        "EXPECTED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
+        "OBSERVED_ARCHITECTURE": "amd64",
+        "OBSERVED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
+        "OBSERVED_REVISION": "a" * 40,
+        "OBSERVED_SCAN_STATUS": "COMPLETE",
+        "TARGET_PLATFORM": "linux/amd64",
+    }
+    env.update(overrides)
+    return env
+
+
+def _run_provenance_harness(body: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-ceu", _PROVENANCE_HARNESS_STUBS + body],
         check=False,
         capture_output=True,
         text=True,
-        env={
-            "PATH": "/usr/bin:/bin",
-            "AWS_ACCOUNT_ID": "123456789012",
-            "AWS_PROFILE": "acceptance",
-            "AWS_REGION": "ap-southeast-2",
-            "CANDIDATE_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth@sha256:" + "d" * 64,
-            "CANDIDATE_SHA": "a" * 40,
-            "EXPECTED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
-            "OBSERVED_CONFIG_CONTRACT": observed_contract,
-            "TARGET_PLATFORM": "linux/amd64",
-        },
+        env=env,
     )
+
+
+@pytest.mark.parametrize("observed_contract", ["", "elspeth.aws-ecs.runtime.v0"])
+def test_candidate_image_admission_rejects_missing_or_wrong_config_contract(observed_contract: str) -> None:
+    body = _provenance_section_body("candidate_image_provenance", "rollback_image_provenance")
+    result = _run_provenance_harness(body, _candidate_harness_env(OBSERVED_CONFIG_CONTRACT=observed_contract))
 
     assert result.returncode != 0
     assert "candidate_image_config_contract_mismatch" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_token"),
+    [
+        ({"OBSERVED_ARCHITECTURE": "arm64"}, "candidate_image_architecture_mismatch"),
+        ({"OBSERVED_SCAN_STATUS": "PENDING"}, "candidate_image_scan_unavailable"),
+        ({"OBSERVED_SCAN_STATUS": "FAILED"}, "candidate_image_scan_unavailable"),
+        ({"OBSERVED_SCAN_STATUS": "FAIL_CALL"}, "candidate_image_scan_unavailable"),
+    ],
+)
+def test_candidate_image_admission_rejects_unscanned_or_wrong_architecture(overrides: dict[str, str], expected_token: str) -> None:
+    """An unavailable scan blocks and a --platform pull is not an
+    architecture assertion (elspeth-ef60d2ff3c review GAP-2)."""
+    body = _provenance_section_body("candidate_image_provenance", "rollback_image_provenance")
+    result = _run_provenance_harness(body, _candidate_harness_env(**overrides))
+
+    assert result.returncode != 0
+    assert expected_token in result.stderr
+
+
+def test_candidate_image_admission_happy_path_passes() -> None:
+    body = _provenance_section_body("candidate_image_provenance", "rollback_image_provenance")
+    result = _run_provenance_harness(body, _candidate_harness_env())
+
+    assert result.returncode == 0, result.stderr
+
+
+def _gateway_harness_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "AWS_ACCOUNT_ID": "123456789012",
+        "AWS_PROFILE": "acceptance",
+        "AWS_REGION": "ap-southeast-2",
+        "ECR_REPOSITORY": "elspeth-llm-gateway",
+        "EXPECTED_ARCHITECTURE": "amd64",
+        "EXPECTED_RUNTIME_IDENTITY": "elspeth-llm-gateway",
+        "EXPECTED_CONTRACT_MAJOR": "1",
+        "EXPECTED_ADAPTER_NAME": "openai",
+        "EXPECTED_ADAPTER_VERSION": "1.2.3",
+        "EXPECTED_ADAPTER_API_MAJOR": "1",
+        "EXPECTED_ADAPTER_FINGERPRINT": "f" * 64,
+        "GATEWAY_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth-llm-gateway@sha256:" + "e" * 64,
+        "GATEWAY_SHA": "b" * 40,
+        "OBSERVED_ARCHITECTURE": "amd64",
+        "OBSERVED_REVISION": "b" * 40,
+        "OBSERVED_RUNTIME_IDENTITY": "elspeth-llm-gateway",
+        "OBSERVED_CONTRACT_MAJOR": "1",
+        "OBSERVED_ADAPTER_NAME": "openai",
+        "OBSERVED_ADAPTER_VERSION": "1.2.3",
+        "OBSERVED_ADAPTER_API_MAJOR": "1",
+        "OBSERVED_ADAPTER_FINGERPRINT": "f" * 64,
+        "OBSERVED_SCAN_STATUS": "COMPLETE",
+        "TARGET_PLATFORM": "linux/amd64",
+    }
+    env.update(overrides)
+    return env
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_token"),
+    [
+        ({"OBSERVED_REVISION": "0" * 40}, "gateway_image_revision_mismatch"),
+        ({"OBSERVED_RUNTIME_IDENTITY": "impostor-runtime"}, "gateway_image_runtime_identity_mismatch"),
+        ({"OBSERVED_CONTRACT_MAJOR": "2"}, "gateway_image_contract_major_mismatch"),
+        ({"OBSERVED_ADAPTER_NAME": "other-adapter"}, "gateway_image_adapter_name_mismatch"),
+        ({"OBSERVED_ADAPTER_VERSION": "9.9.9"}, "gateway_image_adapter_version_mismatch"),
+        ({"OBSERVED_ADAPTER_API_MAJOR": "2"}, "gateway_image_adapter_api_major_mismatch"),
+        ({"OBSERVED_ADAPTER_FINGERPRINT": "0" * 64}, "gateway_image_adapter_fingerprint_mismatch"),
+        ({"OBSERVED_ARCHITECTURE": "arm64"}, "gateway_image_architecture_mismatch"),
+        ({"OBSERVED_SCAN_STATUS": "PENDING"}, "gateway_image_scan_unavailable"),
+        ({"OBSERVED_SCAN_STATUS": "FAIL_CALL"}, "gateway_image_scan_unavailable"),
+    ],
+)
+def test_gateway_image_admission_rejects_each_identity_divergence(overrides: dict[str, str], expected_token: str) -> None:
+    """Execute the gateway admission script per divergence class.
+
+    This pins the FAILURE behavior of the pre-secret identity gate
+    (elspeth-ef60d2ff3c review GAP-4): deleting or hollowing the label
+    verification loop, the architecture assertion, or the scan gate turns
+    at least one of these red. The tftests cannot cover this — provisioners
+    never execute under `terraform test`.
+    """
+    body = _provenance_section_body("gateway_image_provenance", None)
+    result = _run_provenance_harness(body, _gateway_harness_env(**overrides))
+
+    assert result.returncode != 0
+    assert expected_token in result.stderr
+
+
+def test_gateway_image_admission_happy_path_passes() -> None:
+    body = _provenance_section_body("gateway_image_provenance", None)
+    result = _run_provenance_harness(body, _gateway_harness_env())
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_selector_bearing_task_definitions_depend_on_gateway_provenance() -> None:
+    """payload and local_auth carry the gateway bearer selector in
+    runtime_secrets under custom_gateway, so their registration must sit
+    behind the gateway identity gate (elspeth-ef60d2ff3c review GAP-1)."""
+    ecs = _text("modules/scenario/ecs.tf")
+    for family in ("payload", "local_auth"):
+        start = ecs.index(f'resource "aws_ecs_task_definition" "{family}"')
+        block = ecs[start : ecs.index("resource ", start + 1)]
+        assert "depends_on = [terraform_data.gateway_image_provenance]" in block, family
 
 
 def test_repository_regexes_escape_dots_before_interpolation() -> None:
@@ -1652,7 +1799,7 @@ def test_private_candidate_pulls_use_isolated_ecr_credentials_for_registry_comma
             assert block.index(login) < block.index(command)
 
 
-def test_inventory_v8_exactly_matches_the_runtime_validator_contract() -> None:
+def test_inventory_v9_exactly_matches_the_runtime_validator_contract() -> None:
     locals = _text("modules/scenario/locals.tf")
     ecs = _text("modules/scenario/ecs.tf")
     outputs = _text("modules/scenario/outputs.tf")
@@ -1666,6 +1813,9 @@ def test_inventory_v8_exactly_matches_the_runtime_validator_contract() -> None:
             "gateway_image",
             "gateway_sha",
             "gateway_adapter",
+            "gateway_adapter_version",
+            "gateway_adapter_api_major",
+            "gateway_adapter_fingerprint",
             "aws_account_id",
             "aws_region",
             "scenario_id",
@@ -1676,7 +1826,7 @@ def test_inventory_v8_exactly_matches_the_runtime_validator_contract() -> None:
     )
     assert _hcl_map_keys(outputs, "scenario_values") == scenario_inventory.SCENARIO_VALUE_FIELDS
     assert _hcl_map_keys(outputs, "scenario_orphan_sweep") == scenario_inventory.ORPHAN_INVENTORY_FIELDS
-    assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v8"', resolved_output)
+    assert re.search(r'schema\s+=\s+"elspeth\.aws-ecs-scenario-inventory\.v9"', resolved_output)
     assert re.search(r"acceptance_run_id\s+=\s+var\.run_id", resolved_output)
     assert re.search(r'tag_key\s+=\s+"ACCEPTANCE_RUN_ID"', outputs)
     assert re.search(r"cleanup_owner\s+=\s+var\.owner", outputs)

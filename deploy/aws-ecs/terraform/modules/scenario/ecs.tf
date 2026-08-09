@@ -417,6 +417,14 @@ resource "aws_ecs_task_definition" "payload" {
   execution_role_arn       = aws_iam_role.execution.arn
   container_definitions    = jsonencode([local.payload_container])
 
+  # Under custom_gateway this task's runtime_secrets carry the gateway
+  # bearer selector, so registration must sit behind the gateway identity
+  # gate like every other selector-bearing task definition — the pre-secret
+  # admission boundary covers ALL task definitions, not only those that run
+  # the gateway container (elspeth-ef60d2ff3c review GAP-1). Empty and
+  # therefore a no-op under bedrock.
+  depends_on = [terraform_data.gateway_image_provenance]
+
   runtime_platform {
     operating_system_family = "LINUX"
     cpu_architecture        = local.cpu_architecture
@@ -448,6 +456,11 @@ resource "aws_ecs_task_definition" "local_auth" {
   task_role_arn            = aws_iam_role.task.arn
   execution_role_arn       = aws_iam_role.execution.arn
   container_definitions    = jsonencode([local.local_auth_container])
+
+  # Same pre-secret boundary as the payload task definition above: the
+  # gateway bearer selector in runtime_secrets requires the gateway
+  # identity gate to have passed first (elspeth-ef60d2ff3c review GAP-1).
+  depends_on = [terraform_data.gateway_image_provenance]
 
   runtime_platform {
     operating_system_family = "LINUX"

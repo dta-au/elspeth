@@ -295,7 +295,7 @@ def _scenario_inventory(
         for profile in guardrail_profiles
     ]
     return {
-        "schema": "elspeth.aws-ecs-scenario-inventory.v8",
+        "schema": "elspeth.aws-ecs-scenario-inventory.v9",
         "acceptance_run_id": run_id,
         "candidate_sha": "c" * 40,
         "gateway_image": (
@@ -303,6 +303,9 @@ def _scenario_inventory(
         ),
         "gateway_sha": "d" * 40 if scenario_id == "C" else None,
         "gateway_adapter": "reference_v1" if scenario_id == "C" else None,
+        "gateway_adapter_version": "1.2.3" if scenario_id == "C" else None,
+        "gateway_adapter_api_major": 1 if scenario_id == "C" else None,
+        "gateway_adapter_fingerprint": "e" * 64 if scenario_id == "C" else None,
         "aws_account_id": account,
         "aws_region": region,
         "scenario_id": scenario_id,
@@ -411,7 +414,7 @@ def _validate_inventory_fixture(tmp_path: Path, scenario_id: str) -> dict[str, o
         pytest.param("C", "first", True, id="first-custom-gateway"),
     ],
 )
-def test_scenario_inventory_v8_admits_only_the_maintained_scenario_shapes(
+def test_scenario_inventory_v9_admits_only_the_maintained_scenario_shapes(
     tmp_path: Path,
     scenario_id: str,
     deployment_mode: str,
@@ -419,7 +422,7 @@ def test_scenario_inventory_v8_admits_only_the_maintained_scenario_shapes(
 ) -> None:
     inventory = _validate_inventory_fixture(tmp_path, scenario_id)
 
-    assert inventory["schema"] == "elspeth.aws-ecs-scenario-inventory.v8"
+    assert inventory["schema"] == "elspeth.aws-ecs-scenario-inventory.v9"
     values = inventory["values"]
     assert isinstance(values, dict)
     assert values["DEPLOYMENT_MODE"] == deployment_mode
@@ -427,10 +430,16 @@ def test_scenario_inventory_v8_admits_only_the_maintained_scenario_shapes(
         assert isinstance(inventory["gateway_image"], str)
         assert isinstance(inventory["gateway_sha"], str)
         assert isinstance(inventory["gateway_adapter"], str)
+        assert isinstance(inventory["gateway_adapter_version"], str)
+        assert isinstance(inventory["gateway_adapter_api_major"], int)
+        assert isinstance(inventory["gateway_adapter_fingerprint"], str)
     else:
         assert inventory["gateway_image"] is None
         assert inventory["gateway_sha"] is None
         assert inventory["gateway_adapter"] is None
+        assert inventory["gateway_adapter_version"] is None
+        assert inventory["gateway_adapter_api_major"] is None
+        assert inventory["gateway_adapter_fingerprint"] is None
 
 
 def test_scenario_c_namespace_matches_the_public_exact_derivation() -> None:
@@ -454,10 +463,21 @@ def test_scenario_c_namespace_matches_the_public_exact_derivation() -> None:
         pytest.param("C", "gateway_adapter", " ", id="gateway-adapter-not-blank"),
         pytest.param("C", "gateway_adapter", "x" * 257, id="gateway-adapter-bounded"),
         pytest.param("C", "gateway_adapter", "unsafe\nname", id="gateway-adapter-no-controls"),
+        pytest.param("A", "gateway_adapter_fingerprint", "e" * 64, id="bedrock-cannot-claim-fingerprint"),
+        pytest.param("C", "gateway_adapter_version", None, id="adapter-version-required"),
+        pytest.param("C", "gateway_adapter_version", " ", id="adapter-version-not-blank"),
+        pytest.param("C", "gateway_adapter_version", "x" * 257, id="adapter-version-bounded"),
+        pytest.param("C", "gateway_adapter_api_major", None, id="adapter-api-major-required"),
+        pytest.param("C", "gateway_adapter_api_major", "1", id="adapter-api-major-not-a-string"),
+        pytest.param("C", "gateway_adapter_api_major", True, id="adapter-api-major-not-a-bool"),
+        pytest.param("C", "gateway_adapter_api_major", 0, id="adapter-api-major-positive"),
+        pytest.param("C", "gateway_adapter_fingerprint", None, id="adapter-fingerprint-required"),
+        pytest.param("C", "gateway_adapter_fingerprint", "E" * 64, id="adapter-fingerprint-lowercase-hex"),
+        pytest.param("C", "gateway_adapter_fingerprint", "e" * 63, id="adapter-fingerprint-exact-length"),
         pytest.param("C", "orphan_sweep", None, id="malformed-custom-gateway-orphan-shape"),
     ],
 )
-def test_scenario_inventory_v8_rejects_invalid_gateway_identity_shape(
+def test_scenario_inventory_v9_rejects_invalid_gateway_identity_shape(
     tmp_path: Path,
     scenario_id: str,
     field: str,

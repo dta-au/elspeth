@@ -690,6 +690,9 @@ def _validate_scenario_inventory(
         "gateway_image",
         "gateway_sha",
         "gateway_adapter",
+        "gateway_adapter_version",
+        "gateway_adapter_api_major",
+        "gateway_adapter_fingerprint",
         "aws_account_id",
         "aws_region",
         "scenario_id",
@@ -699,7 +702,7 @@ def _validate_scenario_inventory(
     }:
         raise AcceptanceCheckError("scenario_inventory_schema")
     if (
-        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v8"
+        payload["schema"] != "elspeth.aws-ecs-scenario-inventory.v9"
         or payload["scenario_id"] != scenario_id
         or payload["phase"] != expected_phase
         or payload["acceptance_run_id"] != acceptance_run_id
@@ -711,6 +714,9 @@ def _validate_scenario_inventory(
     gateway_image = payload["gateway_image"]
     gateway_sha = payload["gateway_sha"]
     gateway_adapter = payload["gateway_adapter"]
+    gateway_adapter_version = payload["gateway_adapter_version"]
+    gateway_adapter_api_major = payload["gateway_adapter_api_major"]
+    gateway_adapter_fingerprint = payload["gateway_adapter_fingerprint"]
     if scenario_id == "C":
         expected_gateway_registry = f"{aws_account_id}.dkr.ecr.{aws_region}.amazonaws.com/"
         if (
@@ -724,10 +730,30 @@ def _validate_scenario_inventory(
             or not 1 <= len(gateway_adapter) <= 256
             or gateway_adapter != gateway_adapter.strip()
             or any(ord(character) < 32 or ord(character) == 127 for character in gateway_adapter)
+            # The adapter identity quadruple the Terraform admission gate
+            # verified against the image's labels (elspeth-ef60d2ff3c
+            # GAP-5): version mirrors the adapter-name shape, api-major is
+            # a small positive integer (bool is an int subclass — reject),
+            # fingerprint is the 64-hex package digest.
+            or type(gateway_adapter_version) is not str
+            or not 1 <= len(gateway_adapter_version) <= 256
+            or gateway_adapter_version != gateway_adapter_version.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in gateway_adapter_version)
+            or type(gateway_adapter_api_major) is not int
+            or not 1 <= gateway_adapter_api_major <= 1000
+            or type(gateway_adapter_fingerprint) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", gateway_adapter_fingerprint) is None
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     elif scenario_id in {"A", "B"}:
-        if gateway_image is not None or gateway_sha is not None or gateway_adapter is not None:
+        if (
+            gateway_image is not None
+            or gateway_sha is not None
+            or gateway_adapter is not None
+            or gateway_adapter_version is not None
+            or gateway_adapter_api_major is not None
+            or gateway_adapter_fingerprint is not None
+        ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     else:
         raise AcceptanceCheckError("scenario_inventory_binding")
