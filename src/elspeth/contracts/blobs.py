@@ -181,7 +181,7 @@ class BlobRecord:
     id: UUID
     session_id: UUID
     filename: str
-    mime_type: AllowedMimeType
+    mime_type: StorageMimeType
     size_bytes: int
     content_hash: str | None
     storage_path: str
@@ -457,7 +457,7 @@ class BlobServiceProtocol(Protocol):
         session_id: UUID,
         filename: str,
         content: bytes,
-        mime_type: AllowedMimeType,
+        mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
     ) -> BlobRecord:

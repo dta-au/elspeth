@@ -24,6 +24,14 @@ BinaryDocumentFormat = Literal["jpeg", "png", "pdf"]
 BINARY_DOCUMENT_FORMATS: frozenset[str] = frozenset(get_args(BinaryDocumentFormat))
 """Runtime view derived from ``BinaryDocumentFormat`` to prevent drift."""
 
+BINARY_DOCUMENT_MAX_BYTES: Final[int] = 5 * 1024 * 1024
+"""Hard 5 MiB ceiling for the Textract-inline authoring path.
+
+Shared by upload admission and the transform's ``max_document_bytes``
+upper bound: the design resolves AWS's inconsistent 5 MB / 10 MiB
+documentation conservatively, so this value may be reduced by
+configuration but never raised."""
+
 BINARY_DOCUMENT_MIME_BY_FORMAT: Final = MappingProxyType(
     {
         "jpeg": "image/jpeg",

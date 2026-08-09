@@ -32,6 +32,7 @@ from elspeth.web.blobs.protocol import (
     BLOB_RUN_LINK_DIRECTIONS,
     BLOB_STATUSES,
     FINALIZE_BLOB_STATUSES,
+    STORAGE_MIME_TYPES,
     AllowedMimeType,
     BlobActiveRunError,
     BlobContentMissingError,
@@ -57,6 +58,7 @@ from elspeth.web.blobs.protocol import (
     BlobStateError,
     FinalizeBlobStatus,
     InlineCustodyRequest,
+    StorageMimeType,
     fork_blob_id,
 )
 from elspeth.web.sessions.converters import pipeline_dict_from_record
@@ -113,7 +115,7 @@ class _NormalizedInlineCustodyFields(TypedDict):
 class _ExpectedBlobFields(TypedDict):
     session_id: str
     filename: str
-    mime_type: AllowedMimeType
+    mime_type: StorageMimeType
     source_description: str | None
     creation_modality: CreationModality
     created_from_message_id: str | None
@@ -909,7 +911,7 @@ def _persist_blob_content(
     session_id: UUID | str,
     filename: str,
     content: bytes,
-    mime_type: AllowedMimeType,
+    mime_type: StorageMimeType,
     created_by: BlobCreator,
     source_description: str | None,
     creation_modality: CreationModality,
@@ -936,8 +938,8 @@ def _persist_blob_content(
     untrusted_mime_type: object = mime_type
     if type(untrusted_mime_type) is not str:
         raise TypeError(f"mime_type must be str, got {type(untrusted_mime_type).__name__}")
-    if untrusted_mime_type not in ALLOWED_MIME_TYPES:
-        raise RuntimeError(f"Invalid mime_type {untrusted_mime_type!r} — not in the allowed MIME set")
+    if untrusted_mime_type not in STORAGE_MIME_TYPES:
+        raise RuntimeError(f"Invalid mime_type {untrusted_mime_type!r} — not in the storage MIME set")
     untrusted_created_by: object = created_by
     if type(untrusted_created_by) is not str:
         raise TypeError(f"created_by must be str, got {type(untrusted_created_by).__name__}")
@@ -1280,8 +1282,8 @@ def _guard_blob_row_literals(row: Any) -> None:
         raise AuditIntegrityError(f"Tier 1: blobs.status is {row.status!r}, expected one of {sorted(BLOB_STATUSES)}")
     if row.created_by not in BLOB_CREATORS:
         raise AuditIntegrityError(f"Tier 1: blobs.created_by is {row.created_by!r}, expected one of {sorted(BLOB_CREATORS)}")
-    if row.mime_type not in ALLOWED_MIME_TYPES:
-        raise AuditIntegrityError(f"Tier 1: blobs.mime_type is {row.mime_type!r}, not in the allowed MIME set")
+    if row.mime_type not in STORAGE_MIME_TYPES:
+        raise AuditIntegrityError(f"Tier 1: blobs.mime_type is {row.mime_type!r}, not in the storage MIME set")
     # Tier 1 guard for the closed CreationModality enum (Phase 5a Task 2.5).
     # Mirrors the ck_blobs_creation_modality DB CHECK; this Python guard
     # catches tampered or migration-bug-introduced rows that bypassed the
@@ -1484,15 +1486,21 @@ class BlobServiceImpl:
         session_id: UUID,
         filename: str,
         content: bytes,
-        mime_type: AllowedMimeType,
+        mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
     ) -> BlobRecord:
-        """Create a blob from content bytes."""
+        """Create a blob from content bytes.
+
+        Accepts the STORAGE union: which subset applies (text/data vs
+        binary document) is decided by the authenticated boundary that
+        received the bytes — the upload route enforces the binary
+        signature agreement before this method runs (elspeth-0c6a343921).
+        """
         if created_by not in BLOB_CREATORS:
             raise RuntimeError(f"Invalid created_by {created_by!r} — must be one of {sorted(BLOB_CREATORS)}")
-        if mime_type not in ALLOWED_MIME_TYPES:
-            raise RuntimeError(f"Invalid mime_type {mime_type!r} — not in the allowed MIME set")
+        if mime_type not in STORAGE_MIME_TYPES:
+            raise RuntimeError(f"Invalid mime_type {mime_type!r} — not in the storage MIME set")
         blob_id = uuid4()
         row = await self._run_sync(
             lambda: _persist_blob_content(
