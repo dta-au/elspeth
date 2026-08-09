@@ -7,8 +7,8 @@ description: >
   when a new tier-model suppression needs a judge verdict, when you must roll the
   ELSPETH_JUDGE_METADATA_HMAC_KEY, or any time you would otherwise hand-edit a
   judge_metadata_signature. Covers the agent-stages / operator-signs seam: the
-  key-free elspeth-judge MCP server (stage_scan / stage_status / verify_signatures
-  / stage_preview / stage_rekey) and the operator elspeth-lints CLI (sign-bundle /
+  key-free elspeth-judge MCP server (stage_scan / stage_status / stage_annotate /
+  verify_signatures / stage_preview / stage_rekey) and the operator elspeth-lints CLI (sign-bundle /
   rekey). Does NOT apply to ordinary lint runs (`elspeth-lints check`) or to
   non-tier-model allowlists.
 ---
@@ -76,16 +76,28 @@ bundles must be re-staged.
    four lanes: `drift_repair` (re-judge needed), `rotation` (mechanical, non-judge-
    gated keys only), `stale_delete` (orphan), `new_judgment` (uncovered finding).
    Optional `bundle_id`, `staged_by`.
-3. **`stage_preview`** (needs installed + authenticated Codex CLI and the
+3. **`stage_annotate`** — attach your site-specific written rationale to each
+   staged `justify` action (`rationales`: map of action key → text). The judge
+   policy requires a rationale that speaks to the flagged pattern, so skipping
+   this leaves the preview judging an empty string and the operator fire
+   storing a generic fallback. Annotating an action clears any existing
+   preview on it (a verdict for a different rationale is stale evidence).
+   Refuses stale bundles, unknown keys, and empty rationales. Args:
+   `bundle_id`, `rationales`.
+4. **`stage_preview`** (needs installed + authenticated Codex CLI and the
    `[mcp]` extra) — run the read-only Codex judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);
    surfaces BLOCKED reasons so you can fix the code or rationale *before* the
-   operator spends a real judge call. It fully verifies before judging and
-   reverifies before overwrite; stale bundles receive no judge call. Arg: `bundle_id`.
-4. **`stage_status`** — verify the source binding, refuse stale bundles, then
-   summarise the bundle (source identity, per-lane counts, preview outcomes)
-   and emit the **paste-ready operator `sign-bundle` command**. Arg: `bundle_id`.
-5. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
+   operator spends a real judge call. The previewed request carries the same
+   record as the fire-time call: your annotated rationale, the rule's own
+   definition, and duplicate-rationale evidence from the live allowlist. It
+   fully verifies before judging and reverifies before overwrite; stale
+   bundles receive no judge call. Arg: `bundle_id`.
+5. **`stage_status`** — verify the source binding, refuse stale bundles, then
+   summarise the bundle (source identity, per-lane counts, preview outcomes,
+   and which justify actions still lack a rationale) and emit the
+   **paste-ready operator `sign-bundle` command**. Arg: `bundle_id`.
+6. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
    entries and flag broken ones into a rekey bundle, recording env-var **names**
    only, never key bytes. Args: `old_key_env`, `new_key_env`.
 

@@ -286,6 +286,9 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         kind_counts[action.kind] = kind_counts.get(action.kind, 0) + 1
         outcome = action.preview.verdict if action.preview is not None else "none"
         preview_outcomes[outcome] = preview_outcomes.get(outcome, 0) + 1
+    justify_missing_rationale = sorted(
+        action.key for action in bundle.actions if action.kind == "justify" and not (action.draft_rationale or "").strip()
+    )
 
     payload = {
         "bundle_id": bundle.bundle_id,
@@ -301,6 +304,7 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "lane_counts": lane_counts,
         "kind_counts": kind_counts,
         "preview_outcomes": preview_outcomes,
+        "justify_missing_rationale": justify_missing_rationale,
         "has_rekey_plan": bundle.rekey is not None,
         "sign_bundle_command": _sign_bundle_command(ctx, bundle_path),
     }
@@ -487,6 +491,68 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
+def _tool_stage_annotate(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
+    """Attach agent-authored draft rationales to staged ``justify`` actions.
+
+    The key-free rationale-custody surface (elspeth-0502deb48c): ``stage_scan``
+    builds justify actions with ``draft_rationale=None`` and hand-editing the
+    bundle JSON is not an official mutator, so without this tool the preview
+    judge always rules on an empty rationale and the operator fire always
+    stores the generic fallback. Annotating binds the site-specific rationale
+    to the action; ``stage_preview`` then judges it and the operator
+    ``sign-bundle`` carries it into the authoritative judge call.
+
+    Setting a rationale CLEARS any existing preview on that action — a preview
+    verdict rendered for a different rationale is stale evidence.
+    """
+    _assert_no_hmac_key_in_env()
+    from dataclasses import replace
+
+    from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
+    from elspeth_lints.core.review_bundle import read_bundle, write_bundle
+
+    bundle_path = _resolve_bundle_path(ctx, arguments)
+    bundle = read_bundle(bundle_path)
+    verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if not verification.ok:
+        raise ValueError("staged bundle is stale; re-run stage_scan: " + "; ".join(verification.mismatches))
+
+    rationales_arg = arguments.get("rationales")
+    if not isinstance(rationales_arg, dict) or not rationales_arg:
+        raise ValueError("stage_annotate requires a non-empty 'rationales' object mapping action key -> rationale text")
+    justify_keys = {action.key for action in bundle.actions if action.kind == "justify"}
+    rationales: dict[str, str] = {}
+    for key, text in rationales_arg.items():
+        if not isinstance(key, str) or not isinstance(text, str) or not text.strip():
+            raise ValueError("stage_annotate rationales must map string action keys to non-empty rationale strings")
+        if key not in justify_keys:
+            raise ValueError(f"stage_annotate key does not name a staged justify action: {key!r}")
+        rationales[key] = text
+
+    new_actions: list[Any] = []
+    for action in bundle.actions:
+        text = rationales.get(action.key) if action.kind == "justify" else None
+        if text is None:
+            new_actions.append(action)
+            continue
+        new_actions.append(replace(action, draft_rationale=text, preview=None))
+
+    new_bundle = replace(bundle, actions=tuple(new_actions))
+    verification = verify_bundle_against_tree(new_bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if not verification.ok:
+        raise ValueError("staged bundle changed during annotate; refusing rewrite: " + "; ".join(verification.mismatches))
+    path = write_bundle(new_bundle, staged_dir=ctx.staged_dir)
+    missing = sorted(action.key for action in new_bundle.actions if action.kind == "justify" and not (action.draft_rationale or "").strip())
+    payload = {
+        "bundle_id": new_bundle.bundle_id,
+        "written_path": str(path),
+        "annotated": len(rationales),
+        "justify_missing_rationale": missing,
+        "sign_bundle_command": _sign_bundle_command(ctx, path),
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
 def _surrounding_code_for(ctx: _ServerContext, action: Any) -> str:
     """Scrubbed source excerpt for the preview prompt (trust-boundary gate).
 
@@ -562,6 +628,19 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     has_justify = any(action.kind == "justify" for action in bundle.actions)
     tool_scope = judge_mod.build_readonly_tool_scope(root=ctx.root, allowlist_dir=ctx.allowlist_dir) if has_justify else None
 
+    # Preview/fire parity (elspeth-0502deb48c): the real signing path feeds the
+    # judge the rule's own definition plus duplicate-rationale evidence
+    # (cli.py ``justify``). A preview judged without them rules on a poorer
+    # record than the authoritative call, so its verdict is a false signal.
+    allowlist_entries: tuple[Any, ...] = ()
+    if has_justify:
+        from elspeth_lints.core.allowlist import load_allowlist
+        from elspeth_lints.rules.trust_tier.tier_model.rule import RULES as _TIER_MODEL_RULES
+
+        allowlist_entries = tuple(load_allowlist(ctx.allowlist_dir, valid_rule_ids=frozenset(_TIER_MODEL_RULES)).entries)
+    from elspeth_lints.core.allowlist_similarity import find_similar_allowlist_entries
+    from elspeth_lints.rules.trust_tier.tier_model.rule import describe_rule
+
     new_actions: list[Any] = []
     blocked: list[dict[str, str]] = []
     previewed = 0
@@ -569,13 +648,22 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         if action.kind != "justify":
             new_actions.append(action)
             continue
+        rationale = action.draft_rationale or ""
+        rationale_duplicate_count, similar_entries = find_similar_allowlist_entries(
+            allowlist_entries,
+            rationale=rationale,
+            exclude_key=action.key,
+        )
         request = judge_mod.JudgeRequest(
             file_path=action.file_path or "",
             rule_id=action.rule or "",
+            rule_definition=describe_rule(action.rule or ""),
             symbol=action.symbol or "",
             fingerprint=action.fingerprint or "",
-            rationale=action.draft_rationale or "",
+            rationale=rationale,
             surrounding_code=_surrounding_code_for(ctx, action),
+            rationale_duplicate_count=rationale_duplicate_count,
+            similar_entries=similar_entries,
         )
         try:
             response = judge_mod.call_judge(request, transport=judge_mod.TRANSPORT_CODEX_CLI, tool_scope=tool_scope)
@@ -726,6 +814,27 @@ _TOOLS.update(
                 },
             },
             handler=_tool_stage_scan,
+        ),
+        "stage_annotate": _ToolSpec(
+            description=(
+                "Attach agent-authored draft rationales to staged justify actions (the key-free "
+                "rationale-custody surface: stage_preview judges them and the operator sign-bundle "
+                "carries them into the authoritative judge call). Clears any existing preview on "
+                "annotated actions; refuses stale bundles, unknown keys, and empty rationales."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "bundle_id": {"type": "string", "description": "Bundle id (file is <staged-dir>/<id>.json)"},
+                    "rationales": {
+                        "type": "object",
+                        "description": "Map of staged justify action key -> site-specific rationale text",
+                        "additionalProperties": {"type": "string"},
+                    },
+                },
+                "required": ["bundle_id", "rationales"],
+            },
+            handler=_tool_stage_annotate,
         ),
         "stage_preview": _ToolSpec(
             description=(

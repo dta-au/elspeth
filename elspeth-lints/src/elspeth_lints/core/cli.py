@@ -2380,43 +2380,21 @@ def _find_similar_allowlist_entries(
 ) -> tuple[int, tuple[Any, ...]]:
     """Return exact duplicate-rationale context for the judge prompt.
 
-    Exact normalized duplicates are a strong, auditable signal of
-    copy/paste rationale drift. Fuzzier similarity can be added later
-    without weakening this hard duplicate count.
+    Loads the allowlist and delegates to the shared derivation in
+    ``allowlist_similarity`` — the same one ``stage_preview`` and ``reaudit``
+    use, so the evidence the preview judge sees cannot drift from what the
+    fire-time judge sees (elspeth-0502deb48c).
     """
     from elspeth_lints.core.allowlist import load_allowlist
-    from elspeth_lints.core.judge import SimilarAllowlistEntry
-
-    normalized = _normalize_rationale_for_similarity(rationale)
-    if not normalized:
-        return 0, ()
+    from elspeth_lints.core.allowlist_similarity import find_similar_allowlist_entries
 
     allowlist = load_allowlist(allowlist_dir, valid_rule_ids=valid_rule_ids)
-    duplicates = [
-        entry for entry in allowlist.entries if entry.key != exclude_key and _normalize_rationale_for_similarity(entry.reason) == normalized
-    ]
-    similar_entries = tuple(
-        SimilarAllowlistEntry(
-            key=entry.key,
-            owner=entry.owner,
-            reason_excerpt=_reason_excerpt(entry.reason),
-        )
-        for entry in duplicates[:limit]
+    return find_similar_allowlist_entries(
+        allowlist.entries,
+        rationale=rationale,
+        exclude_key=exclude_key,
+        limit=limit,
     )
-    return len(duplicates), similar_entries
-
-
-def _normalize_rationale_for_similarity(text: str) -> str:
-    """Normalize rationale text for exact duplicate detection."""
-    return " ".join(text.casefold().split())
-
-
-def _reason_excerpt(text: str, *, limit: int = 240) -> str:
-    """Return a compact single-line rationale excerpt for prompt context."""
-    single_line = " ".join(text.split())
-    if len(single_line) <= limit:
-        return single_line
-    return single_line[: limit - 3] + "..."
 
 
 def _finding_symbol_matches(finding: Any, symbol_tuple: tuple[str, ...]) -> bool:

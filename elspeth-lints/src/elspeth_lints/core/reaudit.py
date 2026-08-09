@@ -53,6 +53,7 @@ from elspeth_lints.core.allowlist import (
     load_allowlist,
     verify_entry_binding_against_finding,
 )
+from elspeth_lints.core.allowlist_similarity import find_similar_allowlist_entries
 from elspeth_lints.core.judge import (
     TRANSPORT_OPENROUTER,
     AgentToolScope,
@@ -832,6 +833,7 @@ def reaudit_entries(
         try:
             outcome = _reaudit_one_entry(
                 entry=entry,
+                allowlist_entries=allowlist.entries,
                 root=root,
                 rule_filter=rule_filter,
                 findings_cache=findings_cache,
@@ -931,6 +933,7 @@ def _entry_matches_rule_filter(entry: AllowlistEntry, valid_rule_ids: frozenset[
 def _reaudit_one_entry(
     *,
     entry: AllowlistEntry,
+    allowlist_entries: Sequence[AllowlistEntry],
     root: Path,
     rule_filter: str,
     findings_cache: dict[str, list[Any]],
@@ -1107,6 +1110,15 @@ def _reaudit_one_entry(
     surrounding_code = safe_excerpt.text
     symbol_for_request = ".".join(symbol_part) if symbol_part else "_module_"
 
+    # Duplicate-rationale evidence, same derivation as the justify CLI and
+    # stage_preview (elspeth-0502deb48c): the re-judge should see the same
+    # copy/paste-drift signal the original signing judge saw, excluding the
+    # entry under re-audit itself.
+    rationale_duplicate_count, similar_entries = find_similar_allowlist_entries(
+        allowlist_entries,
+        rationale=entry.reason,
+        exclude_key=entry.key,
+    )
     request = JudgeRequest(
         file_path=file_path,
         rule_id=rule_id,
@@ -1115,6 +1127,8 @@ def _reaudit_one_entry(
         fingerprint=fingerprint,
         rationale=entry.reason,
         surrounding_code=surrounding_code,
+        rationale_duplicate_count=rationale_duplicate_count,
+        similar_entries=similar_entries,
     )
     # Per-entry judge-boundary isolation (closes elspeth-9a4e54cc01 /
     # C3-2). The judge call is a Tier-3 external boundary: a transient

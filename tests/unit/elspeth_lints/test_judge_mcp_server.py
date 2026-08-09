@@ -1111,3 +1111,132 @@ def test_stage_rekey_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest.M
     outcome = judge_server._run_tool(ctx, "stage_rekey", {"old_key_env": "OLD_JUDGE_KEY", "new_key_env": "NEW_JUDGE_KEY"})
     assert outcome.is_error is True
     assert _JUDGE_METADATA_SIGNATURE_ENV_VAR in outcome.text
+
+
+# --------------------------------------------------------------------------- #
+# stage_annotate -- key-free rationale custody (elspeth-0502deb48c)
+# --------------------------------------------------------------------------- #
+
+
+def test_stage_annotate_binds_rationale_and_clears_stale_preview(tmp_path: Path) -> None:
+    """Annotating writes ``draft_rationale`` AND clears the action's preview:
+    a preview verdict rendered for a different rationale is stale evidence."""
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    with (
+        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
+        patch(
+            "elspeth_lints.core.judge.call_judge",
+            return_value=_fake_response(JudgeVerdict.ACCEPTED, "boundary is genuine"),
+        ),
+    ):
+        assert judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id}).is_error is False
+    justify_key = next(a.key for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.kind == "justify")
+
+    outcome = judge_server._run_tool(
+        ctx,
+        "stage_annotate",
+        {"bundle_id": bundle_id, "rationales": {justify_key: "gadget parses an upstream tool-call payload at the boundary"}},
+    )
+
+    assert outcome.is_error is False, outcome.text
+    payload = json.loads(outcome.text)
+    assert payload["annotated"] == 1
+    assert payload["justify_missing_rationale"] == []
+    action = next(a for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.key == justify_key)
+    assert action.draft_rationale == "gadget parses an upstream tool-call payload at the boundary"
+    assert action.preview is None
+
+
+def test_stage_annotate_rejects_unknown_key_without_writing(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    bundle_path = staged_dir / f"{bundle_id}.json"
+    before = bundle_path.read_bytes()
+
+    outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle_id, "rationales": {"no-such-key": "text"}})
+
+    assert outcome.is_error is True
+    assert "does not name a staged justify action" in outcome.text
+    assert bundle_path.read_bytes() == before
+
+
+def test_stage_annotate_rejects_empty_rationale_without_writing(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    bundle_path = staged_dir / f"{bundle_id}.json"
+    before = bundle_path.read_bytes()
+    justify_key = next(a.key for a in read_bundle(bundle_path).actions if a.kind == "justify")
+
+    outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle_id, "rationales": {justify_key: "   \n"}})
+
+    assert outcome.is_error is True
+    assert "non-empty rationale" in outcome.text
+    assert bundle_path.read_bytes() == before
+
+
+def test_stage_annotate_rejects_stale_bundle_without_writing(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    bundle_path = staged_dir / f"{bundle_id}.json"
+    before = bundle_path.read_bytes()
+    justify_key = next(a.key for a in read_bundle(bundle_path).actions if a.kind == "justify")
+    source = ctx.root / "plugins/gadget.py"
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle_id, "rationales": {justify_key: "text"}})
+
+    assert outcome.is_error is True
+    assert "source snapshot" in outcome.text
+    assert bundle_path.read_bytes() == before
+
+
+def test_stage_status_reports_missing_justify_rationales(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    justify_key = next(a.key for a in read_bundle(staged_dir / f"{bundle_id}.json").actions if a.kind == "justify")
+
+    before = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle_id})
+    assert before.is_error is False, before.text
+    assert json.loads(before.text)["justify_missing_rationale"] == [justify_key]
+
+    annotate = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle_id, "rationales": {justify_key: "site-specific text"}})
+    assert annotate.is_error is False, annotate.text
+    after = judge_server._run_tool(ctx, "stage_status", {"bundle_id": bundle_id})
+    assert after.is_error is False, after.text
+    assert json.loads(after.text)["justify_missing_rationale"] == []
+
+
+def test_stage_preview_judges_annotated_rationale_with_rule_definition_and_similarity(tmp_path: Path) -> None:
+    """Preview/fire parity: the previewed JudgeRequest carries the annotated
+    rationale, the rule's own definition, and duplicate-rationale evidence --
+    the same record the authoritative sign-bundle judge call receives."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    _write_source(root, "plugins/gadget.py", "gadget")
+    # A second live finding, allowlisted pre-judge, whose reason will be the
+    # exact normalized duplicate of the annotated rationale. Seeded BEFORE
+    # stage_scan because the bundle binds every allowlist YAML byte.
+    _write_source(root, "plugins/widget.py", "widget")
+    other_key = _canonical_key(_live_finding(root, "plugins/widget.py"))
+    _write_pre_judge_entry(allowlist_dir, "widget.yaml", key=other_key)
+    ctx = _context(root, allowlist_dir, staged_dir)
+    bundle = _scan_and_read(ctx, "parity")
+    justify_key = next(a.key for a in bundle.actions if a.kind == "justify" and a.file_path == "plugins/gadget.py")
+
+    duplicate_rationale = "Payload is TIER-3 external data from upstream   tool-call"
+    annotate = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": "parity", "rationales": {justify_key: duplicate_rationale}})
+    assert annotate.is_error is False, annotate.text
+
+    with (
+        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
+        patch(
+            "elspeth_lints.core.judge.call_judge",
+            return_value=_fake_response(JudgeVerdict.ACCEPTED, "boundary is genuine"),
+        ) as mock_call,
+    ):
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": "parity"})
+
+    assert outcome.is_error is False, outcome.text
+    requests = {call.args[0].fingerprint: call.args[0] for call in mock_call.call_args_list}
+    annotated_request = next(r for r in requests.values() if r.rationale == duplicate_rationale)
+    assert annotated_request.rule_definition
+    assert annotated_request.rationale_duplicate_count == 1
+    assert [entry.key for entry in annotated_request.similar_entries] == [other_key]
+    assert "payload is Tier-3 external data" in annotated_request.similar_entries[0].reason_excerpt
