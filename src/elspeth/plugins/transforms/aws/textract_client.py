@@ -1,4 +1,11 @@
-"""Strict, audited adapter for asynchronous Amazon Textract operations."""
+"""Strict, audited adapters for Amazon Textract operations.
+
+Two row-scoped adapters share one SDK-construction helper, one sanitized
+error taxonomy, and one audit/telemetry discipline: ``TextractClient``
+drives the asynchronous StartDocumentAnalysis/GetDocumentAnalysis pair,
+and ``TextractInlineClient`` drives the synchronous AnalyzeDocument call
+used by the inline (payload-store bytes) transform.
+"""
 
 from __future__ import annotations
 
@@ -101,6 +108,14 @@ class TextractSDKClient(Protocol):
     def close(self) -> None: ...
 
 
+class TextractSyncSDKClient(Protocol):
+    """SDK operations used by the synchronous inline-analysis plugin."""
+
+    def analyze_document(self, **kwargs: Any) -> object: ...
+
+    def close(self) -> None: ...
+
+
 def _mapping(value: object) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or not all(type(key) is str for key in value):
         raise TextractResponseError
@@ -192,6 +207,7 @@ def build_textract_sdk_client(
     aws_access_key_id: str | None,
     aws_secret_access_key: str | None,
     aws_session_token: str | None,
+    read_timeout: float = 30.0,
 ) -> TextractSDKClient:
     """Build one shared SDK client with botocore as the sole retry owner."""
     import boto3
@@ -201,7 +217,7 @@ def build_textract_sdk_client(
         "region_name": region,
         "config": Config(
             connect_timeout=10,
-            read_timeout=30,
+            read_timeout=read_timeout,
             retries={"mode": "standard", "total_max_attempts": _SDK_TOTAL_MAX_ATTEMPTS},
         ),
     }
@@ -217,8 +233,33 @@ def build_textract_sdk_client(
     return cast("TextractSDKClient", client)
 
 
-class TextractClient(AuditedClientBase):
-    """Row-scoped audited wrapper around one shared Textract SDK client."""
+def build_textract_sync_sdk_client(
+    *,
+    region: str,
+    aws_access_key_id: str | None,
+    aws_secret_access_key: str | None,
+    aws_session_token: str | None,
+    read_timeout: float,
+) -> TextractSyncSDKClient:
+    """Build the shared SDK client typed for synchronous AnalyzeDocument use.
+
+    The one boto3 Textract client implements both operation surfaces; the two
+    protocols exist so each plugin depends only on the operations it calls.
+    """
+    return cast(
+        "TextractSyncSDKClient",
+        build_textract_sdk_client(
+            region=region,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_session_token=aws_session_token,
+            read_timeout=read_timeout,
+        ),
+    )
+
+
+class _TextractAuditedClient(AuditedClientBase):
+    """Shared audit/telemetry discipline for row-scoped Textract adapters."""
 
     def __init__(
         self,
@@ -228,7 +269,6 @@ class TextractClient(AuditedClientBase):
         telemetry_emit: TelemetryEmitCallback,
         *,
         region: str,
-        sdk_client: TextractSDKClient,
         max_response_bytes: int,
         limiter: LimiterProtocol | None = None,
         token_id: str | None = None,
@@ -237,8 +277,30 @@ class TextractClient(AuditedClientBase):
         if max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
         self._region = region
-        self._sdk_client = sdk_client
         self._max_response_bytes = max_response_bytes
+
+    def _bounded_semantic_response(
+        self,
+        response: Mapping[str, Any],
+        *,
+        exclude: frozenset[str],
+    ) -> tuple[dict[str, Any], Mapping[str, Any]]:
+        """Return the size-bounded semantic response and its frozen form."""
+        semantic = {key: value for key, value in response.items() if key not in exclude}
+        try:
+            semantic_size = len(canonical_json(semantic).encode("utf-8"))
+        except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+            raise TextractResponseError from error
+        if semantic_size > self._max_response_bytes:
+            raise TextractResponseError(
+                "Amazon Textract response exceeded the maximum response size",
+                category="response_too_large",
+            )
+        try:
+            frozen = cast("Mapping[str, Any]", deep_freeze(semantic))
+        except (TypeError, ValueError, RecursionError, UnicodeError) as error:
+            raise TextractResponseError from error
+        return semantic, frozen
 
     def _emit_after_audit(
         self,
@@ -281,6 +343,35 @@ class TextractClient(AuditedClientBase):
                 call_type="aws_textract",
                 exc_info=True,
             )
+
+
+class TextractClient(_TextractAuditedClient):
+    """Row-scoped audited wrapper around one shared asynchronous Textract SDK client."""
+
+    def __init__(
+        self,
+        execution: CallRecorder,
+        state_id: str,
+        run_id: str,
+        telemetry_emit: TelemetryEmitCallback,
+        *,
+        region: str,
+        sdk_client: TextractSDKClient,
+        max_response_bytes: int,
+        limiter: LimiterProtocol | None = None,
+        token_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            execution,
+            state_id,
+            run_id,
+            telemetry_emit,
+            region=region,
+            max_response_bytes=max_response_bytes,
+            limiter=limiter,
+            token_id=token_id,
+        )
+        self._sdk_client = sdk_client
 
     def start_document_analysis(
         self,
@@ -436,20 +527,10 @@ class TextractClient(AuditedClientBase):
             request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
             raw_next_token = response.get("NextToken")
             returned_next_token = None if raw_next_token is None else _bounded_string(raw_next_token, maximum=_MAX_NEXT_TOKEN_LENGTH)
-            semantic_response = {key: value for key, value in response.items() if key not in {"ResponseMetadata", "NextToken"}}
-            try:
-                semantic_size = len(canonical_json(semantic_response).encode("utf-8"))
-            except (TypeError, ValueError, RecursionError, UnicodeError) as error:
-                raise TextractResponseError from error
-            if semantic_size > self._max_response_bytes:
-                raise TextractResponseError(
-                    "Amazon Textract response exceeded the maximum response size",
-                    category="response_too_large",
-                )
-            try:
-                frozen_semantic = cast("Mapping[str, Any]", deep_freeze(semantic_response))
-            except (TypeError, ValueError, RecursionError, UnicodeError) as error:
-                raise TextractResponseError from error
+            semantic_response, frozen_semantic = self._bounded_semantic_response(
+                response,
+                exclude=frozenset({"ResponseMetadata", "NextToken"}),
+            )
             result_page: AnalysisResultPage | None = AnalysisResultPage(
                 semantic_response=frozen_semantic,
                 next_token=returned_next_token,
@@ -518,3 +599,155 @@ class TextractClient(AuditedClientBase):
             raise terminal_error
         assert result_page is not None
         return result_page
+
+
+class TextractInlineClient(_TextractAuditedClient):
+    """Row-scoped audited wrapper for one synchronous AnalyzeDocument call.
+
+    The audited request never contains document bytes or base64: the
+    payload SHA-256 already binds the call to the integrity-checked source
+    content held in the payload store, so the hash plus byte length is the
+    complete reproducible identity of what was sent.
+    """
+
+    def __init__(
+        self,
+        execution: CallRecorder,
+        state_id: str,
+        run_id: str,
+        telemetry_emit: TelemetryEmitCallback,
+        *,
+        region: str,
+        sdk_client: TextractSyncSDKClient,
+        max_response_bytes: int,
+        limiter: LimiterProtocol | None = None,
+        token_id: str | None = None,
+    ) -> None:
+        super().__init__(
+            execution,
+            state_id,
+            run_id,
+            telemetry_emit,
+            region=region,
+            max_response_bytes=max_response_bytes,
+            limiter=limiter,
+            token_id=token_id,
+        )
+        self._sdk_client = sdk_client
+
+    def analyze_document(
+        self,
+        *,
+        document_bytes: bytes,
+        document_sha256: str,
+        document_format: str,
+        feature_types: tuple[str, ...],
+        queries: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        """Run one audited AnalyzeDocument call and return the frozen semantic response.
+
+        AnalyzeDocument has no idempotency token, so botocore's standard
+        retry policy may repeat a billable attempt; the recorded attempt
+        count is the caller-visible evidence of that.
+        """
+        canonical_features = tuple(sorted(feature_types))
+        query_requests = _query_request(queries)
+        sdk_request: dict[str, Any] = {
+            "Document": {"Bytes": document_bytes},
+            "FeatureTypes": list(canonical_features),
+        }
+        if query_requests:
+            sdk_request["QueriesConfig"] = {"Queries": query_requests}
+
+        call_index = self._next_call_index()
+        request_payload = RawCallPayload(
+            {
+                "operation": "analyze_document",
+                "region": self._region,
+                "document_sha256": document_sha256,
+                "document_size_bytes": len(document_bytes),
+                "document_format": document_format,
+                "feature_types": canonical_features,
+                "queries": query_requests,
+            }
+        )
+        telemetry_request = RawCallPayload(
+            {
+                "operation": "analyze_document",
+                "region": self._region,
+                "document_size_bytes": len(document_bytes),
+                "feature_count": len(canonical_features),
+                "query_count": len(query_requests),
+            }
+        )
+        started = time.perf_counter()
+        terminal_error: Exception | None = None
+        attempts = 1
+        try:
+            self._acquire_rate_limit()
+            _reset_send_attempts()
+            raw_response = self._sdk_client.analyze_document(**sdk_request)
+            response = _mapping(raw_response)
+            request_id_present, attempts = _parse_response_metadata(response.get("ResponseMetadata"))
+            semantic_response, frozen_semantic = self._bounded_semantic_response(
+                response,
+                exclude=frozenset({"ResponseMetadata"}),
+            )
+            result: Mapping[str, Any] | None = frozen_semantic
+            response_payload = RawCallPayload(
+                {
+                    "operation": "analyze_document",
+                    "status": "success",
+                    "attempts": attempts,
+                    "request_id_present": request_id_present,
+                    "semantic_response": semantic_response,
+                }
+            )
+            call_status = CallStatus.SUCCESS
+            error_payload = None
+        except TextractResponseError as error:
+            terminal_error = error
+            result = None
+            response_payload = RawCallPayload({"operation": "analyze_document", "status": error.category, "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload({"type": error.category, "retryable": False})
+        except _textract_provider_exception_types() as error:
+            # AnalyzeDocument sends no idempotency token, so the mismatch
+            # classification cannot legitimately fire; if AWS returns it
+            # anyway it is an ordinary non-retryable service error here.
+            code, retryable, attempts, _idempotency_mismatch = _provider_error(error, observed_attempts=_observed_send_attempts())
+            result = None
+            terminal_error = TextractServiceError(code=code, retryable=retryable)
+            response_payload = RawCallPayload({"operation": "analyze_document", "status": "service_error", "attempts": attempts})
+            call_status = CallStatus.ERROR
+            error_payload = RawCallPayload({"type": "service_error", "code": code, "retryable": retryable})
+
+        latency_ms = (time.perf_counter() - started) * 1000
+        telemetry_response = RawCallPayload(
+            {
+                "operation": "analyze_document",
+                "status": response_payload.to_dict()["status"],
+                "attempts": attempts,
+            }
+        )
+        self._record_call(
+            call_index=call_index,
+            call_type=CallType.HTTP,
+            status=call_status,
+            request_data=request_payload,
+            response_data=response_payload,
+            error=error_payload,
+            latency_ms=latency_ms,
+        )
+        self._emit_after_audit(
+            status=call_status,
+            latency_ms=latency_ms,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            telemetry_request=telemetry_request,
+            telemetry_response=telemetry_response,
+        )
+        if terminal_error is not None:
+            raise terminal_error
+        assert result is not None
+        return result
