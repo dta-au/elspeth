@@ -1387,11 +1387,14 @@ def test_candidate_image_admission_rejects_missing_or_wrong_config_contract(obse
         ({"OBSERVED_SCAN_STATUS": "PENDING"}, "candidate_image_scan_unavailable"),
         ({"OBSERVED_SCAN_STATUS": "FAILED"}, "candidate_image_scan_unavailable"),
         ({"OBSERVED_SCAN_STATUS": "FAIL_CALL"}, "candidate_image_scan_unavailable"),
+        ({"OBSERVED_REVISION": "0" * 40}, "candidate_image_revision_mismatch"),
     ],
 )
-def test_candidate_image_admission_rejects_unscanned_or_wrong_architecture(overrides: dict[str, str], expected_token: str) -> None:
-    """An unavailable scan blocks and a --platform pull is not an
-    architecture assertion (elspeth-ef60d2ff3c review GAP-2)."""
+def test_candidate_image_admission_rejects_each_divergence(overrides: dict[str, str], expected_token: str) -> None:
+    """An unavailable scan blocks, a --platform pull is not an architecture
+    assertion (elspeth-ef60d2ff3c review GAP-2), and a wrong revision label
+    blocks (re-verification residual: this check was previously deletable
+    with a green suite)."""
     body = _provenance_section_body("candidate_image_provenance", "rollback_image_provenance")
     result = _run_provenance_harness(body, _candidate_harness_env(**overrides))
 
@@ -1402,6 +1405,75 @@ def test_candidate_image_admission_rejects_unscanned_or_wrong_architecture(overr
 def test_candidate_image_admission_happy_path_passes() -> None:
     body = _provenance_section_body("candidate_image_provenance", "rollback_image_provenance")
     result = _run_provenance_harness(body, _candidate_harness_env())
+
+    assert result.returncode == 0, result.stderr
+
+
+def _rollback_harness_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "AWS_ACCOUNT_ID": "123456789012",
+        "AWS_PROFILE": "acceptance",
+        "AWS_REGION": "ap-southeast-2",
+        "EXPECTED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
+        "OBSERVED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v1",
+        "OBSERVED_REVISION": "c" * 40,
+        "ROLLBACK_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth@sha256:" + "1" * 64,
+        "ROLLBACK_SHA": "c" * 40,
+        "TARGET_PLATFORM": "linux/amd64",
+    }
+    env.update(overrides)
+    return env
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_token"),
+    [
+        ({"OBSERVED_CONFIG_CONTRACT": "elspeth.aws-ecs.runtime.v0"}, "rollback_image_config_contract_mismatch"),
+        ({"OBSERVED_REVISION": "0" * 40}, "rollback_image_revision_mismatch"),
+    ],
+)
+def test_rollback_image_admission_rejects_each_divergence(overrides: dict[str, str], expected_token: str) -> None:
+    body = _provenance_section_body("rollback_image_provenance", "cloudwatch_agent_image_provenance")
+    result = _run_provenance_harness(body, _rollback_harness_env(**overrides))
+
+    assert result.returncode != 0
+    assert expected_token in result.stderr
+
+
+def test_rollback_image_admission_happy_path_passes() -> None:
+    body = _provenance_section_body("rollback_image_provenance", "cloudwatch_agent_image_provenance")
+    result = _run_provenance_harness(body, _rollback_harness_env())
+
+    assert result.returncode == 0, result.stderr
+
+
+def _cloudwatch_agent_harness_env(**overrides: str) -> dict[str, str]:
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "AWS_ACCOUNT_ID": "123456789012",
+        "AWS_PROFILE": "acceptance",
+        "AWS_REGION": "ap-southeast-2",
+        "CANDIDATE_SHA": "a" * 40,
+        "CLOUDWATCH_AGENT_IMAGE": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/cloudwatch-agent@sha256:" + "2" * 64,
+        "OBSERVED_REVISION": "a" * 40,
+        "TARGET_PLATFORM": "linux/amd64",
+    }
+    env.update(overrides)
+    return env
+
+
+def test_cloudwatch_agent_image_admission_rejects_wrong_revision() -> None:
+    body = _provenance_section_body("cloudwatch_agent_image_provenance", "gateway_image_provenance")
+    result = _run_provenance_harness(body, _cloudwatch_agent_harness_env(OBSERVED_REVISION="0" * 40))
+
+    assert result.returncode != 0
+    assert "cloudwatch_agent_image_revision_mismatch" in result.stderr
+
+
+def test_cloudwatch_agent_image_admission_happy_path_passes() -> None:
+    body = _provenance_section_body("cloudwatch_agent_image_provenance", "gateway_image_provenance")
+    result = _run_provenance_harness(body, _cloudwatch_agent_harness_env())
 
     assert result.returncode == 0, result.stderr
 
@@ -1449,6 +1521,7 @@ def _gateway_harness_env(**overrides: str) -> dict[str, str]:
         ({"OBSERVED_ADAPTER_FINGERPRINT": "0" * 64}, "gateway_image_adapter_fingerprint_mismatch"),
         ({"OBSERVED_ARCHITECTURE": "arm64"}, "gateway_image_architecture_mismatch"),
         ({"OBSERVED_SCAN_STATUS": "PENDING"}, "gateway_image_scan_unavailable"),
+        ({"OBSERVED_SCAN_STATUS": "FAILED"}, "gateway_image_scan_unavailable"),
         ({"OBSERVED_SCAN_STATUS": "FAIL_CALL"}, "gateway_image_scan_unavailable"),
     ],
 )
@@ -1478,9 +1551,13 @@ def test_gateway_image_admission_happy_path_passes() -> None:
 def test_selector_bearing_task_definitions_depend_on_gateway_provenance() -> None:
     """payload and local_auth carry the gateway bearer selector in
     runtime_secrets under custom_gateway, so their registration must sit
-    behind the gateway identity gate (elspeth-ef60d2ff3c review GAP-1)."""
+    behind the gateway identity gate (elspeth-ef60d2ff3c review GAP-1).
+    The rollback task definitions inherit runtime_secrets through their
+    merged container bases — unreachable under custom_gateway today via
+    the maintained-triple validation, but the boundary must not rest on
+    that coupling alone."""
     ecs = _text("modules/scenario/ecs.tf")
-    for family in ("payload", "local_auth"):
+    for family in ("payload", "local_auth", "rollback_web", "rollback_doctor"):
         start = ecs.index(f'resource "aws_ecs_task_definition" "{family}"')
         block = ecs[start : ecs.index("resource ", start + 1)]
         assert "depends_on = [terraform_data.gateway_image_provenance]" in block, family
@@ -1848,6 +1925,16 @@ def test_inventory_v9_exactly_matches_the_runtime_validator_contract() -> None:
     assert "elspeth.cloudwatch-agent.v1.json" in locals
     assert "elspeth.cloudwatch-agent.v1.otel.yaml" in locals
     assert "resolved_inventory" in outputs
+
+
+def test_inventory_schema_consumers_pin_the_producer_version() -> None:
+    outputs = _text("modules/scenario/outputs.tf")
+    producer = re.search(r'schema\s+=\s+"(elspeth\.aws-ecs-scenario-inventory\.v\d+)"', outputs)
+    assert producer is not None
+    runbook = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md").read_text(encoding="utf-8")
+    consumer_pins = re.findall(r"elspeth\.aws-ecs-scenario-inventory\.v\d+", runbook)
+    assert consumer_pins, "runbook no longer references the inventory schema"
+    assert set(consumer_pins) == {producer.group(1)}
 
 
 def test_scenario_a_codeblind_inputs_have_no_acceptance_coordinator_dependencies() -> None:

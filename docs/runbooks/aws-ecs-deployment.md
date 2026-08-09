@@ -616,7 +616,7 @@ and destroy use, and again when an approved apply is recorded; verification
 performed before expiry cannot authorize later use after expiry.
 
 Each protected scenario inventory uses
-`elspeth.aws-ecs-scenario-inventory.v7` and binds the run ID, candidate SHA,
+`elspeth.aws-ecs-scenario-inventory.v9` and binds the run ID, candidate SHA,
 account, region, scenario ID, Terraform binding, and the closed `values`
 assignment set, including the protected binding-receipt path. The initial
 immutable `preapply` document leaves provider-generated identities empty; a
@@ -1219,7 +1219,7 @@ render_resolved_inventory() (
   jq -e --arg run "$ACCEPTANCE_RUN_ID" --arg candidate "$CANDIDATE_SHA" \
     --arg account "$AWS_ACCOUNT_ID" --arg region "$AWS_REGION" --arg scenario "$scenario_id" '
       type == "object"
-      and .schema == "elspeth.aws-ecs-scenario-inventory.v7"
+      and .schema == "elspeth.aws-ecs-scenario-inventory.v9"
       and .phase == "resolved"
       and .acceptance_run_id == $run
       and .candidate_sha == $candidate

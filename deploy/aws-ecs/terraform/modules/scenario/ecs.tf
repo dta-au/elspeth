@@ -496,6 +496,15 @@ resource "aws_ecs_task_definition" "rollback_web" {
   execution_role_arn       = aws_iam_role.execution.arn
   container_definitions    = jsonencode([local.cloudwatch_agent_container, local.rollback_web_container])
 
+  # The rollback containers merge() the web/doctor bases and inherit
+  # runtime_secrets, so under custom_gateway they would carry the gateway
+  # bearer selector. Today upgrade + custom_gateway cannot co-occur (the
+  # maintained-triple validation in variables.tf pins scenario C to a
+  # first deployment), but the pre-secret admission boundary must not rest
+  # on that coupling alone (elspeth-ef60d2ff3c re-verification residual).
+  # Empty and therefore a no-op under bedrock.
+  depends_on = [terraform_data.gateway_image_provenance]
+
   runtime_platform {
     operating_system_family = "LINUX"
     cpu_architecture        = local.cpu_architecture
@@ -529,6 +538,10 @@ resource "aws_ecs_task_definition" "rollback_doctor" {
   task_role_arn            = aws_iam_role.task.arn
   execution_role_arn       = aws_iam_role.execution.arn
   container_definitions    = jsonencode([local.rollback_doctor_container])
+
+  # Same latent-selector boundary as rollback_web above
+  # (elspeth-ef60d2ff3c re-verification residual).
+  depends_on = [terraform_data.gateway_image_provenance]
 
   runtime_platform {
     operating_system_family = "LINUX"

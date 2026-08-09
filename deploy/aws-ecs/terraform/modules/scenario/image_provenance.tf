@@ -62,12 +62,13 @@ resource "terraform_data" "candidate_image_provenance" {
         --query 'imageScanStatus.status' \
         --output text 2>"$work/scan-status.err") || {
         printf '%s\n' candidate_image_scan_unavailable >&2
+        cat "$work/scan-status.err" >&2 || true
         exit 1
       }
       case "$scan_status" in
         COMPLETE|ACTIVE) : ;;
         *)
-          printf '%s\n' candidate_image_scan_unavailable >&2
+          printf '%s observed=%s\n' candidate_image_scan_unavailable "$scan_status" >&2
           exit 1
           ;;
       esac
@@ -224,11 +225,13 @@ resource "terraform_data" "cloudwatch_agent_image_provenance" {
 # output, and every other selector-bearing task definition (payload,
 # local_auth) depends on it, so any mismatch blocks before the gateway or
 # OAuth secret selectors exist anywhere. This gate is the ONLY place
-# adapter identity is compared against an operator expectation: /readyz
-# REPORTS the running adapter's identity and enforces the SDK's own
-# api-major self-consistency, but never compares against an expected
-# value (see gateway providers' gateway.py docstring) — treat runtime
-# identity reporting as evidence, not enforcement. The same candidate-gate
+# ADAPTER identity (name, version, api-major, fingerprint) is compared
+# against an operator expectation: the runtime does verify contract_major
+# against its own configuration when it reads /readyz, but it only
+# REPORTS the adapter quadruple and enforces the SDK's own api-major
+# self-consistency — it never compares the adapter's identity against an
+# expected value (see gateway providers' gateway.py docstring) — treat
+# runtime adapter-identity reporting as evidence, not enforcement. The same candidate-gate
 # caveat applies: labels prove what the image declares, not who built it —
 # the supported pairing remains an image and expectations supplied
 # together by the operator.
@@ -283,12 +286,13 @@ resource "terraform_data" "gateway_image_provenance" {
         --query 'imageScanStatus.status' \
         --output text 2>"$work/scan-status.err") || {
         printf '%s\n' gateway_image_scan_unavailable >&2
+        cat "$work/scan-status.err" >&2 || true
         exit 1
       }
       case "$scan_status" in
         COMPLETE|ACTIVE) : ;;
         *)
-          printf '%s\n' gateway_image_scan_unavailable >&2
+          printf '%s observed=%s\n' gateway_image_scan_unavailable "$scan_status" >&2
           exit 1
           ;;
       esac

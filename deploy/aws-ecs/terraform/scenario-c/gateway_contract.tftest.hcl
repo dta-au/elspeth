@@ -110,6 +110,11 @@ run "plans_as_first_custom_gateway_without_bedrock_inputs" {
   }
 
   assert {
+    condition     = output.resolved_inventory.gateway_adapter_version == "0.1.0" && output.resolved_inventory.gateway_adapter_api_major == 1 && output.resolved_inventory.gateway_adapter_fingerprint == "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    error_message = "the resolved inventory must bind the verified adapter version, API major, and package fingerprint (inventory schema v9)."
+  }
+
+  assert {
     condition     = output.resolved_inventory.values.ELSPETH_BEDROCK_LIVE_TEST_MODEL == ""
     error_message = "no Bedrock live-test model may be named under custom_gateway."
   }
