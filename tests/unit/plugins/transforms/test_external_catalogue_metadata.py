@@ -40,6 +40,7 @@ EXPECTED_EXTERNAL_TAGS = {
     "aws_bedrock_content_safety": ("aws", "bedrock", "content-safety"),
     "aws_bedrock_prompt_shield": ("aws", "bedrock", "prompt-shield"),
     "aws_textract_document_analysis": ("aws", "textract", "document", "ocr", "enrichment"),
+    "aws_textract_inline_analysis": ("aws", "textract", "ocr", "inline", "blob", "enrichment"),
     "azure_content_safety": ("azure", "content-safety", "moderation"),
     "azure_document_intelligence": ("azure", "document", "ocr", "enrichment", "http"),
     "azure_prompt_shield": ("azure", "prompt-shield", "security"),
@@ -65,6 +66,7 @@ _REMOTE_CONTENT_PRODUCERS = {
     "llm",
     "rag_retrieval",
     "aws_textract_document_analysis",
+    "aws_textract_inline_analysis",
     "azure_document_intelligence",
 }
 
@@ -96,6 +98,10 @@ _REQUIRED_GUIDANCE = {
     "aws_textract_document_analysis": (
         ("asynchronous", "s3", "ocr", "forms", "tables", "s3 read", "untrusted before llm"),
         ("inline bytes", "synchronous"),
+    ),
+    "aws_textract_inline_analysis": (
+        ("synchronous", "blob_rows", "payload-store", "ocr", "single-page", "5 mib", "untrusted before llm"),
+        ("multipage", "s3", "billable"),
     ),
     "azure_content_safety": (
         ("hate", "violence", "sexual", "self-harm", "threshold"),

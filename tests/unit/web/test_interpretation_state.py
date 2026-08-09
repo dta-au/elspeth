@@ -873,6 +873,32 @@ def test_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content()
     assert "consumes externally-fetched content from a aws_textract_document_analysis upstream" in message
 
 
+def test_inline_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
+    """The synchronous Textract sibling extracts the same attacker-controlled text."""
+    inline = NodeSpec(
+        id="extract",
+        node_type="transform",
+        plugin="aws_textract_inline_analysis",
+        input="rows",
+        on_success="inbound",
+        on_error="stop",
+        options={"document_format": "png", "feature_types": ["TABLES"], "text_field": "content"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = _state((inline, _llm()))
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(state)
+
+    assert warning_pairs
+    message = next(msg for component, msg in warning_pairs if component == "node:classify")
+    assert "consumes externally-fetched content from a aws_textract_inline_analysis upstream" in message
+
+
 def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> None:
     """The advisory must name the producer it found — never assert a web_scrape that is absent."""
     state = _state(

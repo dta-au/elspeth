@@ -144,15 +144,16 @@ def test_analyze_records_before_telemetry_and_returns_frozen_semantic_response()
 
     result = _analyze(client)
 
-    assert result["DocumentMetadata"] == {"Pages": 1}
-    assert "ResponseMetadata" not in result
+    assert result.semantic_response["DocumentMetadata"] == {"Pages": 1}
+    assert "ResponseMetadata" not in result.semantic_response
+    assert result.sdk_attempts == 1
     assert limiter.acquisitions == 1
     assert recorder.order == ["audit", "telemetry"]
     audited = recorder.calls[0]
     assert audited["status"] is CallStatus.SUCCESS
     assert events[0].provider == "aws-textract"
     with pytest.raises(TypeError):
-        cast(Any, result)["injected"] = "value"
+        cast(Any, result.semantic_response)["injected"] = "value"
 
 
 def test_analyze_sends_exact_bytes_and_sorted_features_without_base64() -> None:
@@ -340,7 +341,7 @@ def test_analyze_document_request_matches_the_service_model() -> None:
         result = _analyze(client)
         stubber.assert_no_pending_responses()
 
-    assert result["AnalyzeDocumentModelVersion"] == "1.0"
+    assert result.semantic_response["AnalyzeDocumentModelVersion"] == "1.0"
     assert execution.calls[0]["status"] is CallStatus.SUCCESS
     assert cast(Any, sdk).meta.config.read_timeout == 120.0
     assert cast(Any, sdk).meta.config.connect_timeout == 10

@@ -45,7 +45,7 @@ _IDEMPOTENCY_MISMATCH_CODE = "IdempotentParameterMismatchException"
 _MAX_ERROR_CODE_LENGTH = 128
 _MAX_JOB_ID_LENGTH = 64
 _MAX_NEXT_TOKEN_LENGTH = 1024
-_SDK_TOTAL_MAX_ATTEMPTS = 3
+SDK_TOTAL_MAX_ATTEMPTS = 3
 
 _send_attempts = threading.local()
 
@@ -96,6 +96,19 @@ class StartAnalysisReceipt:
 class AnalysisResultPage:
     semantic_response: Mapping[str, Any]
     next_token: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class InlineAnalysisResult:
+    """One frozen semantic AnalyzeDocument response plus its SDK attempt count.
+
+    ``sdk_attempts`` surfaces how many billable HTTP attempts botocore made
+    for this logical call — AnalyzeDocument has no idempotency token, so
+    every attempt may bill.
+    """
+
+    semantic_response: Mapping[str, Any]
+    sdk_attempts: int
 
 
 class TextractSDKClient(Protocol):
@@ -218,7 +231,7 @@ def build_textract_sdk_client(
         "config": Config(
             connect_timeout=10,
             read_timeout=read_timeout,
-            retries={"mode": "standard", "total_max_attempts": _SDK_TOTAL_MAX_ATTEMPTS},
+            retries={"mode": "standard", "total_max_attempts": SDK_TOTAL_MAX_ATTEMPTS},
         ),
     }
     if aws_access_key_id is not None:
@@ -643,7 +656,7 @@ class TextractInlineClient(_TextractAuditedClient):
         document_format: str,
         feature_types: tuple[str, ...],
         queries: Sequence[Mapping[str, Any]],
-    ) -> Mapping[str, Any]:
+    ) -> InlineAnalysisResult:
         """Run one audited AnalyzeDocument call and return the frozen semantic response.
 
         AnalyzeDocument has no idempotency token, so botocore's standard
@@ -693,7 +706,10 @@ class TextractInlineClient(_TextractAuditedClient):
                 response,
                 exclude=frozenset({"ResponseMetadata"}),
             )
-            result: Mapping[str, Any] | None = frozen_semantic
+            result: InlineAnalysisResult | None = InlineAnalysisResult(
+                semantic_response=frozen_semantic,
+                sdk_attempts=attempts,
+            )
             response_payload = RawCallPayload(
                 {
                     "operation": "analyze_document",

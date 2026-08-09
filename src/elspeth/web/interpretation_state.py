@@ -161,7 +161,9 @@ BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX: Final[str] = "backend_auto_surface:"
 # its own upstream). A new plugin that surfaces externally-controlled text
 # must be added here, or every downstream LLM silently reports that it
 # consumes no untrusted content.
-_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape", "aws_textract_document_analysis"})
+_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset(
+    {"web_scrape", "aws_textract_document_analysis", "aws_textract_inline_analysis"}
+)
 
 AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
     {
