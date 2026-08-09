@@ -354,11 +354,24 @@ resource "aws_ecs_task_definition" "runtime_doctor" {
   family                   = local.runtime_doctor_family
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = 512
-  memory                   = 1024
+  cpu                      = local.bedrock_backend ? 512 : 1024
+  memory                   = local.bedrock_backend ? 1024 : 2048
   task_role_arn            = aws_iam_role.task.arn
   execution_role_arn       = aws_iam_role.execution.arn
-  container_definitions    = jsonencode([local.runtime_doctor_container])
+  # The runtime doctor exercises LLM health, so under custom_gateway it
+  # launches the IDENTICAL pinned sidecar and waits for its readiness — it
+  # must never probe a host-side or substitute gateway. Schema-init and
+  # storage-only tasks make no LLM call and deliberately omit the sidecar.
+  container_definitions = (
+    local.bedrock_backend
+    ? jsonencode([local.runtime_doctor_container])
+    : jsonencode([
+      merge(local.runtime_doctor_container, {
+        dependsOn = [{ containerName = local.gateway_container_name, condition = "HEALTHY" }]
+      }),
+      local.gateway_container,
+    ])
+  )
 
   runtime_platform {
     operating_system_family = "LINUX"
