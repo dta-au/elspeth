@@ -1747,6 +1747,93 @@ class TestSetSource:
         assert _default_source(result.updated_state) is None
         assert "set_source_from_blob" in result.data["error"]
 
+    def test_set_source_rejects_manual_blobs_list_in_options(self) -> None:
+        """The plural blob_rows binding is resolver-owned (elspeth-0c6a343921
+        review): only set_source_from_blobs may author a ``blobs`` list, with
+        every entry field resolved from the session's blob records and
+        LLM-authored blobs refused. A generic set_source carrying ``blobs``
+        would skip that custody entirely, so the key is reserved."""
+        state = _empty_state()
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "t1",
+                "options": {
+                    "blobs": [
+                        {
+                            "blob_id": "0a274caf-6d51-44a4-b8ef-3d2f5f77a1f0",
+                            "payload_ref": "c" * 64,
+                            "filename": "doc.pdf",
+                            "mime_type": "application/pdf",
+                            "size_bytes": 10,
+                        }
+                    ],
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "quarantine",
+            },
+            state,
+            catalog,
+        )
+        assert result.success is False
+        assert _default_source(result.updated_state) is None
+        assert "set_source_from_blobs" in result.data["error"]
+
+    def test_patch_source_options_rejects_manual_blobs_list(self) -> None:
+        """Patching the authoritative blobs list directly would let the LLM
+        rewrite resolver-owned custody; rebinding goes through
+        set_source_from_blobs."""
+        state = _empty_state()
+        catalog = _mock_catalog()
+        seeded = execute_tool(
+            "set_source",
+            {
+                "plugin": "csv",
+                "on_success": "t1",
+                "options": {"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                "on_validation_failure": "quarantine",
+            },
+            state,
+            catalog,
+        )
+        assert seeded.success is True
+
+        result = execute_tool(
+            "patch_source_options",
+            {"patch": {"blobs": [{"blob_id": "0a274caf-6d51-44a4-b8ef-3d2f5f77a1f0"}]}},
+            seeded.updated_state,
+            catalog,
+        )
+        assert result.success is False
+        assert "set_source_from_blobs" in result.data["error"]
+
+    def test_set_pipeline_rejects_manual_blobs_list_in_source_options(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        result = execute_tool(
+            "set_pipeline",
+            {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "main",
+                    "options": {
+                        "blobs": [{"blob_id": "0a274caf-6d51-44a4-b8ef-3d2f5f77a1f0"}],
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_validation_failure": "quarantine",
+                },
+                "nodes": [],
+                "edges": [],
+                "outputs": [],
+            },
+            state,
+            catalog,
+        )
+        assert result.success is False
+        assert "set_source_from_blobs" in result.data["error"]
+
     def test_set_source_rejects_manual_source_authoring_in_options(self) -> None:
         """Caller-supplied source_authoring must not bypass blob provenance stamping."""
         state = _empty_state()

@@ -37,7 +37,7 @@ from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.cli import ProgressEvent
-from elspeth.contracts.enums import NodeStateStatus, RunStatus
+from elspeth.contracts.enums import NodeStateStatus, RunStatus, is_llm_authored_creation_modality
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
@@ -2141,6 +2141,20 @@ class ExecutionServiceImpl:
                         if diverged:
                             raise BlobRowsSourceAdmissionError(
                                 f"{entry_path} diverged from the session blob record on: {', '.join(diverged)}"
+                            )
+                        # Modality is checked at ADMISSION, not only in the
+                        # plural resolver: generic composer writers
+                        # (set_source/set_pipeline/patch_source_options) can
+                        # also author blob_rows options, and only this gate
+                        # holds for every authoring path. LLM-authored blobs
+                        # must flow through set_source_from_blob, whose
+                        # interpretation review stamps the invented-source
+                        # custody (elspeth-0c6a343921 review).
+                        if is_llm_authored_creation_modality(record.creation_modality):
+                            raise BlobRowsSourceAdmissionError(
+                                f"{entry_path} binds LLM-authored blob {entry.blob_id}; blob_rows admits only "
+                                "user-verbatim content — bind it through set_source_from_blob so its "
+                                "interpretation review is staged"
                             )
 
                     async def _link_blob_rows_to_run() -> None:

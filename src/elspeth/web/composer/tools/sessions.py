@@ -110,6 +110,7 @@ from elspeth.web.composer.tools.sources import (
     _options_with_source_blob_review,
     _reject_manual_source_authoring,
     _reject_manual_source_blob_ref,
+    _reject_manual_source_blobs,
     _resolve_source_blob,
     _ResolvedSourceBlob,
     _source_authoring_options,
@@ -708,6 +709,9 @@ def build_set_pipeline_candidate(
             manual_authoring_error = None if reviewed_source else _reject_manual_source_authoring(src_options, tool_name="set_pipeline")
             if manual_authoring_error is not None:
                 return _failure_result(state, f"Source '{source_name}': {manual_authoring_error}")
+            manual_blobs_error = None if reviewed_source else _reject_manual_source_blobs(src_options, tool_name="set_pipeline")
+            if manual_blobs_error is not None:
+                return _failure_result(state, f"Source '{source_name}': {manual_blobs_error}")
             credential_error = _credential_wiring_contract_failure(
                 state,
                 component_id=_source_component_id(source_name),
@@ -759,6 +763,9 @@ def build_set_pipeline_candidate(
         manual_authoring_error = _reject_manual_source_authoring(legacy_src_options, tool_name="set_pipeline")
         if manual_authoring_error is not None:
             return _failure_result(state, manual_authoring_error)
+        manual_blobs_error = _reject_manual_source_blobs(legacy_src_options, tool_name="set_pipeline")
+        if manual_blobs_error is not None:
+            return _failure_result(state, manual_blobs_error)
         review_metadata_error = (
             None
             if interpretation_requirements_are_internal

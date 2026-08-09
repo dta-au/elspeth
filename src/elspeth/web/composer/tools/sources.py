@@ -363,6 +363,29 @@ def _reject_manual_source_authoring(
     return _manual_source_authoring_error(tool_name=tool_name)
 
 
+def _reject_manual_source_blobs(
+    options: Mapping[str, Any],
+    *,
+    tool_name: str,
+) -> str | None:
+    """Reject a caller-supplied plural ``blobs`` list outside the resolver.
+
+    The plural blob_rows binding is resolver-owned (elspeth-0c6a343921):
+    ``set_source_from_blobs`` resolves every entry field from the session's
+    authoritative blob records and refuses LLM-authored blobs. A generic
+    writer carrying ``blobs`` would author that custody by assertion, so
+    the key is reserved everywhere except resolver output (run admission
+    independently re-verifies modality and entry facts as the backstop).
+    """
+    if "blobs" not in options:
+        return None
+    return (
+        f"{tool_name} must not be called with 'blobs' in source options. "
+        "The plural blob binding is resolved from session blob records by set_source_from_blobs; "
+        "bind or rebind blobs through that tool instead of authoring the list directly."
+    )
+
+
 def _source_component_id(source_name: str) -> str:
     """Return the legacy/default or named source component identifier."""
     return source_component_id(source_name)
@@ -607,6 +630,9 @@ def _execute_set_source(
     manual_authoring_error = _reject_manual_source_authoring(options, tool_name="set_source")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
+    manual_blobs_error = _reject_manual_source_blobs(options, tool_name="set_source")
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
     credential_error = _credential_wiring_contract_failure(
         state,
         component_id=_source_component_id(source_name),
@@ -1313,6 +1339,9 @@ def _execute_patch_source_options(
     manual_authoring_error = _reject_manual_source_authoring(patch, tool_name="patch_source_options")
     if manual_authoring_error is not None:
         return _failure_result(state, manual_authoring_error)
+    manual_blobs_error = _reject_manual_source_blobs(patch, tool_name="patch_source_options")
+    if manual_blobs_error is not None:
+        return _failure_result(state, manual_blobs_error)
     # Check the LLM-supplied PATCH delta (not the merged result): a patch that
     # carries a forged "resolved" INVENTED_SOURCE requirement is the live review
     # bypass vector. Checking the delta — mirroring patch_node_options — leaves a

@@ -198,6 +198,7 @@ def _blob_record_stub(
     content_hash: str | None = None,
     storage_path: str = "/tmp/data/blobs/blob.txt",
     status: str = "ready",
+    creation_modality: CreationModality = CreationModality.VERBATIM,
 ) -> BlobRecord:
     return BlobRecord(
         id=blob_id or uuid4(),
@@ -211,7 +212,7 @@ def _blob_record_stub(
         created_by="user",
         source_description=None,
         status=cast(Any, status),
-        creation_modality=CreationModality.VERBATIM,
+        creation_modality=creation_modality,
         created_from_message_id=None,
         creating_model_identifier=None,
         creating_model_version=None,
@@ -4298,6 +4299,12 @@ class TestBlobRowsRuntimeAdmission:
             ({"filename": "renamed.png"}, BlobRowsSourceAdmissionError, "filename"),
             ({"mime_type": "image/jpeg"}, BlobRowsSourceAdmissionError, "mime_type"),
             ({"size_bytes": 1}, BlobRowsSourceAdmissionError, "size_bytes"),
+            # The plural resolver refuses LLM-authored blobs at authoring
+            # time, but generic writers (set_source/set_pipeline/patch) can
+            # also produce blob_rows options — admission is the authority
+            # that holds for every authoring path (elspeth-0c6a343921 review).
+            ({"creation_modality": CreationModality.LLM_GENERATED}, BlobRowsSourceAdmissionError, "LLM-authored"),
+            ({"creation_modality": CreationModality.LLM_GENERATED_THEN_AMENDED}, BlobRowsSourceAdmissionError, "LLM-authored"),
         ],
     )
     @patch("elspeth.web.execution.service.Orchestrator")
