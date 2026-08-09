@@ -131,12 +131,12 @@ def _validate_gateway_profiles(values: Mapping[str, object]) -> None:
         profile_payload = json.loads(cast(str, values["ELSPETH_WEB__LLM_PROFILES"]))
     except json.JSONDecodeError:
         raise AcceptanceCheckError("scenario_inventory_schema") from None
-    if not isinstance(profile_payload, dict) or not profile_payload:
+    if type(profile_payload) is not dict or not profile_payload:
         raise AcceptanceCheckError("scenario_inventory_schema")
     admitted_profiles: dict[str, LLMProfileSettings] = {}
     try:
         for alias, profile in profile_payload.items():
-            if type(alias) is not str or not isinstance(profile, dict):
+            if type(alias) is not str or type(profile) is not dict:
                 raise AcceptanceCheckError("scenario_inventory_schema")
             admitted_profiles[validate_profile_alias(alias)] = LLMProfileSettings.model_validate(profile)
         default_alias = validate_profile_alias(cast(str, values["ELSPETH_WEB__DEFAULT_LLM_PROFILE"]))
@@ -732,7 +732,7 @@ def _validate_scenario_inventory(
     else:
         raise AcceptanceCheckError("scenario_inventory_binding")
     values = payload["values"]
-    if not isinstance(values, dict) or set(values) != SCENARIO_VALUE_FIELDS:
+    if type(values) is not dict or set(values) != SCENARIO_VALUE_FIELDS:
         raise AcceptanceCheckError("scenario_inventory_schema")
     for value in values.values():
         if type(value) is not str or len(value) > 16 * 1024 or any(ord(character) < 32 or ord(character) == 127 for character in value):

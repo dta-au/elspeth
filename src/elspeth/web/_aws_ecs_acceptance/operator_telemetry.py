@@ -224,7 +224,7 @@ class AWSOperatorTelemetryQueries:
                 raise ValueError
             values = result.get("Values")
             timestamps = result.get("Timestamps")
-            if not isinstance(values, list) or not isinstance(timestamps, list) or len(values) != len(timestamps) or len(values) > 100:
+            if type(values) is not list or type(timestamps) is not list or len(values) != len(timestamps) or len(values) > 100:
                 raise ValueError
             matched = False
             for value, timestamp in zip(values, timestamps, strict=True):
@@ -334,8 +334,10 @@ class AWSOperatorTelemetryQueries:
 
                 correlations: list[tuple[str, str | None]] = []
                 for store in stores:
-                    run_id = store.get("run_id")
-                    status = store.get("status")
+                    if "run_id" not in store:
+                        raise ValueError
+                    run_id = store["run_id"]
+                    status = store["status"] if "status" in store else None
                     if (
                         type(run_id) is not str
                         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", run_id) is None
@@ -376,7 +378,9 @@ class AWSOperatorTelemetryQueries:
                 status = lifecycle.status
                 if status is None:
                     raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid")
-                prior = self._trace_terminal_statuses.get(run_id)
+                prior = None
+                if run_id in self._trace_terminal_statuses:
+                    prior = self._trace_terminal_statuses[run_id]
                 if prior is not None and prior != status:
                     raise OperatorTelemetryAcceptanceError("X-Ray projection was invalid")
                 self._trace_terminal_statuses[run_id] = status

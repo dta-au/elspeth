@@ -65,7 +65,7 @@ def test_dashboard_and_alarms_cover_truthful_candidate_and_rollback_identities()
     assert "candidate_cloudwatch_dimension_map" in source
     assert "rollback_cloudwatch_dimension_map" in source
     assert "cloudwatch_dimension_maps" in source
-    assert 'var.scenario_id == "B"' in source
+    assert 'local.deployment_mode == "upgrade"' in source
     assert '"service.version"        = var.rollback_baseline_sha' in source
     assert '"aws.ecs.task.family"    = local.rollback_web_family' in source
     assert '"aws.ecs.task.revision"  = tostring(aws_ecs_task_definition.rollback_web[0].revision)' in source
