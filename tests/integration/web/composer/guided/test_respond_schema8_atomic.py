@@ -1495,6 +1495,157 @@ def test_respond_sink_preflight_uses_owned_session_record_for_path_namespace() -
     assert ast.unparse(chat_session_keyword.value) == "str(owned_session.id)"
 
 
+def _drive_manual_edit_to_sink_schema_form(client: TestClient) -> tuple[str, str, dict]:
+    """Seed a reviewed output and drive the manual respond route to its
+    Step-2 sink schema form via the review-components edit action."""
+    session_id = _create_session(client)
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "33333333-3333-4333-8333-333333333333"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={"path": "input.csv"},
+                observed_columns=("id", "name"),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="output",
+                plugin="json",
+                options={"path": "old.jsonl"},
+                required_fields=("id",),
+                schema_mode="observed",
+                on_write_failure="failures",
+            )
+        },
+    )
+    _persist_guided(client, session_id, guided)
+
+    review = client.get(f"/api/sessions/{session_id}/guided")
+    assert review.status_code == 200, review.json()
+    review_turn = review.json()["next_turn"]
+    assert review_turn["type"] == "review_components"
+    editing = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            review_turn,
+            component_action={"action": "edit", "target": {"kind": "output", "stable_id": output_id}},
+        ),
+    )
+    assert editing.status_code == 200, editing.json()
+    form_turn = editing.json()["next_turn"]
+    assert form_turn["type"] == "schema_form"
+    return session_id, output_id, form_turn
+
+
+_FOREIGN_SESSION_ID = "99999999-9999-4999-8999-999999999999"
+
+
+def _traversal_sink_path(data_dir: Path, session_id: str) -> str:
+    return "reports/../../../escape.jsonl"
+
+
+def _foreign_outputs_sink_path(data_dir: Path, session_id: str) -> str:
+    # Explicitly session-scoped FOREIGN relative path: resolve_sink_data_path
+    # must keep it foreign (never adopt it under the caller's directory) so
+    # the allowlist rejects it.
+    return f"outputs/{_FOREIGN_SESSION_ID}/hijack.jsonl"
+
+
+def _foreign_blob_sink_path(data_dir: Path, session_id: str) -> str:
+    return str(data_dir / "blobs" / _FOREIGN_SESSION_ID / "hijack.jsonl")
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [_traversal_sink_path, _foreign_outputs_sink_path, _foreign_blob_sink_path],
+    ids=["dot-dot-traversal", "cross-session-outputs-relative", "cross-session-blob-absolute"],
+)
+def test_manual_sink_form_answer_rejects_traversal_and_cross_session_paths(
+    composer_test_client: TestClient,
+    vector: object,
+) -> None:
+    """Deployment sink admission on the MANUAL respond lane (elspeth-ef92db3e16).
+
+    Traversal and cross-session paths must 400 at the form boundary — before
+    the transition runs — leaving the reviewed output and the pending edit
+    untouched. Pre-fix the admission ran only on the freeform set_output tool,
+    so a manual form submission carried these paths into reviewed authority.
+    """
+    client = composer_test_client
+    session_id, output_id, form_turn = _drive_manual_edit_to_sink_schema_form(client)
+    data_dir = Path(client.app.state.settings.data_dir)
+    rejected = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            form_turn,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": vector(data_dir, session_id),  # type: ignore[operator]
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "fail_if_exists",
+                },
+            },
+        ),
+    )
+    assert rejected.status_code == 400, rejected.json()
+    assert "allowed" in rejected.json()["detail"]
+    record = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None and record.composer_meta is not None
+    guided_after = GuidedSession.from_dict(deep_thaw(record.composer_meta)["guided_session"])
+    assert guided_after.reviewed_outputs[output_id].options == {"path": "old.jsonl"}
+    # begin_component_edit only marks the edit target; a pending intent is
+    # created by a SUCCESSFUL answer, so a rejected one must leave none.
+    assert guided_after.pending_output_intents == {}
+    assert guided_after.active_edit_target is not None
+    assert guided_after.active_edit_target.stable_id == output_id
+
+
+def test_manual_sink_form_answer_admits_own_session_blob_path(
+    composer_test_client: TestClient,
+) -> None:
+    """The caller's own ``blobs/<session_id>`` subtree is inside
+    ``allowed_sink_directories``: the manual lane must ADMIT it — the
+    over-rejection guard for elspeth-ef92db3e16's admission move."""
+    client = composer_test_client
+    session_id, output_id, form_turn = _drive_manual_edit_to_sink_schema_form(client)
+    data_dir = Path(client.app.state.settings.data_dir)
+    blob_path = data_dir / "blobs" / session_id / "derived.jsonl"
+    blob_path.parent.mkdir(parents=True, exist_ok=True)
+    staged = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            form_turn,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": str(blob_path),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        ),
+    )
+    assert staged.status_code == 200, staged.json()
+    assert staged.json()["next_turn"]["type"] == "multi_select_with_custom"
+    record = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None and record.composer_meta is not None
+    guided_after = GuidedSession.from_dict(deep_thaw(record.composer_meta)["guided_session"])
+    staged_options = guided_after.pending_output_intents[output_id].options
+    assert staged_options is not None
+    assert staged_options["path"] == str(blob_path)
+
+
 def test_respond_settlement_shares_chat_lock_and_never_polls_under_it() -> None:
     from elspeth.web.sessions.routes.composer import guided_chat_atomic
 

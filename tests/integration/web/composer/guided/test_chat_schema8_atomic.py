@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1612,16 +1612,20 @@ def _sink_form_answer_provider(options: dict[str, object]):
 def _drive_chat_to_sink_schema_form(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
-    options: dict[str, object],
+    options: dict[str, object] | Callable[[str, Path], dict[str, object]],
 ) -> tuple[str, dict]:
     """Create a session, reach the Step-2 sink schema form via chat.
 
     The plugin-selection step stages an admissible prefill — the SINGLE_SELECT
     lane now runs the deployment admission before staging, so an inadmissible
     ``options`` set can only be exercised as the *form answer*, which is what
-    the provider is swapped to before returning.
+    the provider is swapped to before returning. Session-dependent option
+    sets (own-session and cross-session path vectors) pass a callable that
+    receives the created session id and the deployment data_dir.
     """
     session_id = _create_session(client)
+    if callable(options):
+        options = options(session_id, Path(client.app.state.settings.data_dir))
     sink_state = _Step2Journey()._drive_to_step_2_single_select(client, session_id)
     sink_turn = sink_state["next_turn"]
     admissible_prefill: dict[str, object] = {
@@ -1723,6 +1727,110 @@ def test_chat_sink_form_answer_requires_explicit_collision_policy(
     intent = next(iter(guided_after["pending_output_intents"].values()))
     assert intent["phase"] == "plugin_options"
     assert guided_after["reviewed_outputs"] == {}
+
+
+_FOREIGN_SESSION_ID = "99999999-9999-4999-8999-999999999999"
+
+
+def _traversal_sink_options(session_id: str, data_dir: Path) -> dict[str, object]:
+    return {
+        "path": "reports/../../../escape.jsonl",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
+
+
+def _foreign_outputs_sink_options(session_id: str, data_dir: Path) -> dict[str, object]:
+    # Explicitly session-scoped FOREIGN relative path: resolution must keep it
+    # foreign (never adopt it under the caller's directory) so the allowlist
+    # rejects it.
+    return {
+        "path": f"outputs/{_FOREIGN_SESSION_ID}/hijack.jsonl",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
+
+
+def _foreign_blob_sink_options(session_id: str, data_dir: Path) -> dict[str, object]:
+    return {
+        "path": str(data_dir / "blobs" / _FOREIGN_SESSION_ID / "hijack.jsonl"),
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "fail_if_exists",
+    }
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [_traversal_sink_options, _foreign_outputs_sink_options, _foreign_blob_sink_options],
+    ids=["dot-dot-traversal", "cross-session-outputs-relative", "cross-session-blob-absolute"],
+)
+def test_chat_sink_form_answer_rejects_traversal_and_cross_session_paths(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    vector: Callable[[str, Path], dict[str, object]],
+) -> None:
+    """Deployment sink admission on the CHAT lane (elspeth-ef92db3e16):
+    traversal and cross-session paths in an LLM-authored form answer must
+    degrade to a safe not-applied response instead of entering reviewed
+    authority."""
+    session_id, form_turn = _drive_chat_to_sink_schema_form(composer_test_client, monkeypatch, vector)
+
+    form_chat = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(form_turn, message="Yes, apply those settings."),
+    )
+
+    assert form_chat.status_code == 200, form_chat.json()
+    body = form_chat.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert body["next_turn"]["type"] == "schema_form"
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    guided_after = record.composer_meta["guided_session"]
+    intent = next(iter(guided_after["pending_output_intents"].values()))
+    assert intent["phase"] == "plugin_options"
+    assert guided_after["reviewed_outputs"] == {}
+
+
+def test_chat_sink_form_answer_admits_own_session_blob_path(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's own ``blobs/<session_id>`` subtree is inside
+    ``allowed_sink_directories``: the chat lane must ADMIT it — the
+    over-rejection guard for elspeth-ef92db3e16's admission move."""
+
+    def own_blob_options(session_id: str, data_dir: Path) -> dict[str, object]:
+        blob_dir = data_dir / "blobs" / session_id
+        blob_dir.mkdir(parents=True, exist_ok=True)
+        return {
+            "path": str(blob_dir / "derived.jsonl"),
+            "schema": {"mode": "observed"},
+            "mode": "write",
+            "collision_policy": "auto_increment",
+        }
+
+    session_id, form_turn = _drive_chat_to_sink_schema_form(composer_test_client, monkeypatch, own_blob_options)
+
+    form_chat = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(form_turn, message="Yes, apply those settings."),
+    )
+
+    assert form_chat.status_code == 200, form_chat.json()
+    body = form_chat.json()
+    assert body["assistant_message_kind"] != "synthetic_failure"
+    assert body["next_turn"]["type"] == "multi_select_with_custom"
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    guided_after = record.composer_meta["guided_session"]
+    intent = next(iter(guided_after["pending_output_intents"].values()))
+    assert intent["options"] is not None
+    assert intent["options"]["path"].endswith("derived.jsonl")
 
 
 def test_inline_source_defers_to_existing_ready_uploaded_blob(
