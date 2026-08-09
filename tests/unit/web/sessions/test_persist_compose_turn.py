@@ -1575,6 +1575,9 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
                 provenance="session_seed",
             )
 
+    from elspeth.web.sessions.telemetry import observed_value
+
+    starting = observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total)
     outcome = service.persist_compose_turn(
         session_id="s_stale_unwind",
         assistant_content="crash unwind",
@@ -1588,6 +1591,10 @@ def test_persist_compose_turn_stale_state_during_unwind_preserves_crash_primacy(
 
     assert outcome.unwind_audit_failed is True
     assert outcome.assistant_id is None
+    # The secondary reconciliation context the ticket requires: the stale
+    # audit failure is retained via the unwind-failure counter (and slog),
+    # not silently dropped once crash primacy wins (elspeth-45f72a949c).
+    assert observed_value(service._telemetry.tool_row_persist_failed_during_unwind_total) == starting + 1
 
     with service._engine.begin() as conn:
         rows = conn.execute(text("SELECT role FROM chat_messages WHERE session_id='s_stale_unwind'")).fetchall()

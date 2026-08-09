@@ -2280,6 +2280,79 @@ async def test_plugin_crash_unwind_commit_failure_remains_unpersisted_and_retain
 
 
 @pytest.mark.asyncio
+async def test_plugin_crash_remains_primary_when_a_concurrent_writer_stales_the_unwind(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    fake_llm_runtime_error_on_second: Any,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """elspeth-45f72a949c at the compose-driver seam.
+
+    A concurrent writer advances the session's composition state while the
+    loop is unwinding a captured plugin crash, so the unwind persist trips
+    the step-4 stale-state guard INSIDE persist_compose_turn. The crash
+    must stay primary — the driver re-raises ComposerPluginCrashError, not
+    a retryable stale-state conflict — while the stale audit failure is
+    retained as secondary reconciliation context (the unwind-failure
+    counter). The sibling test above proves this chain for the
+    OperationalError arm; this one drives the StaleComposeStateError arm,
+    which the unit test pins only at the persistence seam.
+    """
+    from elspeth.web.sessions._persist_payload import StatePayload
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from elspeth.web.sessions.telemetry import observed_value
+
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    _patch_auto_commit_preferences(monkeypatch, sessions_service)
+    composer_service_with_real_sessions._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
+
+    original_persist = sessions_service.persist_compose_turn_async
+
+    async def _concurrent_advance_then_persist(**kwargs: Any) -> Any:
+        if kwargs.get("plugin_crash_pending"):
+            # The concurrent writer: advance the session's state head before
+            # the unwind write reaches its expected-state check.
+            with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+                head = conn.execute(
+                    text("SELECT id FROM composition_states WHERE session_id = :session_id ORDER BY version DESC LIMIT 1"),
+                    {"session_id": result_session_id},
+                ).scalar_one_or_none()
+                with sessions_service._session_write_lock(conn, result_session_id):  # type: ignore[attr-defined]
+                    sessions_service._insert_composition_state(  # type: ignore[attr-defined]
+                        conn,
+                        session_id=result_session_id,
+                        payload=StatePayload(
+                            data=CompositionStateData(),
+                            derived_from_state_id=head,
+                        ),
+                        provenance="session_seed",
+                    )
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(sessions_service, "persist_compose_turn_async", _concurrent_advance_then_persist)
+    starting = observed_value(sessions_service._telemetry.tool_row_persist_failed_during_unwind_total)  # type: ignore[attr-defined]
+
+    with pytest.raises(ComposerPluginCrashError) as excinfo:
+        await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=fake_llm_runtime_error_on_second,
+            session_id=result_session_id,
+        )
+
+    assert excinfo.value.failed_turn is not None
+    assert (
+        observed_value(sessions_service._telemetry.tool_row_persist_failed_during_unwind_total)  # type: ignore[attr-defined]
+        == starting + 1
+    ), "the stale audit failure must be retained as secondary reconciliation context"
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        rows = conn.execute(
+            text("SELECT role, tool_call_id FROM chat_messages WHERE session_id = :session_id AND role IN ('assistant', 'tool')"),
+            {"session_id": result_session_id},
+        ).fetchall()
+    assert rows == [], "a stale unwind must persist no partial turn rows"
+
+
+@pytest.mark.asyncio
 async def test_unwind_failure_retains_only_current_turn_after_committed_prefix(
     composer_service_with_real_sessions: ComposerServiceImpl,
     result_session_id: str,
