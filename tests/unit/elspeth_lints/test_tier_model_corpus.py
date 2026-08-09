@@ -74,6 +74,7 @@ def _bundle(actions: tuple[BundleAction, ...]) -> ReviewBundle:
         allowlist_dir="config/cicd/enforce_tier_model",
         source_rev=_HEAD,
         source_dirty=False,
+        source_snapshot_sha256=_SOURCE_SHA256,
         actions=actions,
     )
 

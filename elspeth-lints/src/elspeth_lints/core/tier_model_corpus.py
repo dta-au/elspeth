@@ -24,7 +24,6 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -34,6 +33,15 @@ from typing import Any
 from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR
 from elspeth_lints.core.atomic_io import AtomicWriteConflictError, atomic_update_text
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, load_bundle
+from elspeth_lints.core.source_snapshot import (
+    SourceSnapshotError,
+)
+from elspeth_lints.core.source_snapshot import (
+    current_git_head as _shared_current_git_head,
+)
+from elspeth_lints.core.source_snapshot import (
+    source_snapshot_sha256 as _shared_source_snapshot_sha256,
+)
 from elspeth_lints.core.strict_json import strict_json_loads
 from elspeth_lints.rules.trust_tier.tier_model.rule import iter_scannable_python_files
 
@@ -173,55 +181,20 @@ def action_scan_sha256(actions: Iterable[BundleAction]) -> str:
 
 
 def source_snapshot_sha256(*, source_root: Path, allowlist_dir: Path) -> str:
-    """Hash scanned Python and allowlist inputs without returning their bytes."""
-    source_root = Path(source_root)
-    allowlist_dir = Path(allowlist_dir)
-    if not source_root.is_dir():
-        raise ValueError(f"source_root is not a directory: {source_root}")
-    if not allowlist_dir.is_dir():
-        raise ValueError(f"allowlist_dir is not a directory: {allowlist_dir}")
-
-    inputs: list[tuple[str, Path]] = []
-    for path in sorted(iter_scannable_python_files(source_root)):
-        relative = path.relative_to(source_root)
-        inputs.append((f"source/{relative.as_posix()}", path))
-    for suffix in ("*.yaml", "*.yml"):
-        for path in sorted(allowlist_dir.rglob(suffix)):
-            relative = path.relative_to(allowlist_dir)
-            inputs.append((f"allowlist/{relative.as_posix()}", path))
-
-    records: list[dict[str, str]] = []
-    labels: set[str] = set()
-    for label, path in sorted(inputs, key=lambda item: item[0]):
-        if label in labels:
-            raise CorpusReconciliationError(f"source snapshot contains duplicate input label {label!r}")
-        labels.add(label)
-        records.append(
-            {
-                "path": label,
-                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-            }
-        )
-    canonical = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    """Re-export the shared scanner-input digest for corpus callers."""
+    return _shared_source_snapshot_sha256(
+        source_root=source_root,
+        allowlist_dir=allowlist_dir,
+        _iter_python_files=iter_scannable_python_files,
+    )
 
 
 def current_git_head(repo_root: Path) -> str:
-    """Return the exact Git HEAD for ``repo_root`` or fail closed."""
-    completed = subprocess.run(
-        ["git", "-C", str(Path(repo_root)), "rev-parse", "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if completed.returncode != 0:
-        message = completed.stderr.strip()
-        if message == "":
-            message = "git rev-parse returned no diagnostic"
-        raise CorpusStaleError(f"cannot bind classification corpus to Git HEAD: {message}")
-    head = completed.stdout.strip()
-    _validate_git_head(head)
-    return head
+    """Re-export shared HEAD capture with the corpus-specific stale error."""
+    try:
+        return _shared_current_git_head(repo_root)
+    except SourceSnapshotError as exc:
+        raise CorpusStaleError(f"cannot bind classification corpus to Git HEAD: {exc}") from exc
 
 
 def live_stage_scan_actions(*, root: Path, allowlist_dir: Path) -> tuple[BundleAction, ...]:

@@ -14,6 +14,8 @@ cross-test imports.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,7 +30,8 @@ from elspeth_lints.core.allowlist import (
     compute_judge_metadata_signature,
 )
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI, JudgeConfigurationError
-from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle, write_bundle
+from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.mcp import server as judge_server
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
@@ -165,7 +168,23 @@ def _write_pre_judge_entry(allowlist_dir: Path, yaml_name: str, *, key: str) -> 
 
 
 def _context(root: Path, allowlist_dir: Path, staged_dir: Path) -> Any:
-    return judge_server._ServerContext(root=root, allowlist_dir=allowlist_dir, staged_dir=staged_dir)
+    resolved_root = root.resolve()
+    resolved_allowlist = allowlist_dir.resolve()
+    repo = Path(os.path.commonpath((resolved_root, resolved_allowlist)))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "judge-server@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Judge Server Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    return judge_server._ServerContext(root=resolved_root, allowlist_dir=resolved_allowlist, staged_dir=staged_dir.resolve())
 
 
 # --------------------------------------------------------------------------- #
@@ -197,15 +216,17 @@ def test_assert_no_hmac_key_message_names_env_var(monkeypatch: pytest.MonkeyPatc
 
 
 def _status_bundle(root: Path, allowlist_dir: Path, actions: tuple[BundleAction, ...]) -> ReviewBundle:
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     return ReviewBundle(
         bundle_id="status-bundle",
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=actions,
     )
 
@@ -238,37 +259,20 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
     staged_dir = tmp_path / "staged"
-    bundle = _status_bundle(
-        root,
-        allowlist_dir,
-        (
-            BundleAction(
-                lane="new_judgment",
-                kind="justify",
-                key="plugins/a.py:R1:A:m:fp=aaaa",
-                file_path="plugins/a.py",
-                symbol="A.m",
-                rule="R1",
-                fingerprint="aaaa",
-            ),
-            BundleAction(lane="resign", kind="drift_repair", key="k1:fp=bbbb", diagnosis_status="AST_PATH_BINDING_DRIFT"),
-            BundleAction(lane="resign", kind="rotation", key="k2:fp=cccc", source_file="plugins.yaml"),
-            BundleAction(lane="resign", kind="stale_delete", key="k3:fp=dddd", source_file="plugins.yaml"),
-        ),
-    )
-    written = write_bundle(bundle, staged_dir=staged_dir)
-
+    _write_source(root, "plugins/gadget.py", "gadget")
     ctx = _context(root, allowlist_dir, staged_dir)
+    bundle = _scan_and_read(ctx, "status-bundle")
+    written = staged_dir / "status-bundle.json"
     outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": "status-bundle"})
     assert outcome.is_error is False
     payload = json.loads(outcome.text)
-    assert payload["actions_total"] == 4
+    assert payload["actions_total"] == 1
     assert payload["kind_counts"]["justify"] == 1
-    assert payload["kind_counts"]["drift_repair"] == 1
-    assert payload["kind_counts"]["rotation"] == 1
-    assert payload["kind_counts"]["stale_delete"] == 1
     assert payload["lane_counts"]["new_judgment"] == 1
-    assert payload["lane_counts"]["resign"] == 3
+    assert payload["source_rev"] == bundle.source_rev
+    assert payload["source_dirty"] is False
+    assert payload["source_snapshot_sha256"] == bundle.source_snapshot_sha256
+    assert payload["source_verification"] == "ok"
     # Paste-ready operator command names the sign-bundle subcommand + the bundle file.
     assert "sign-bundle" in payload["sign_bundle_command"]
     assert str(written) in payload["sign_bundle_command"]
@@ -276,6 +280,21 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "--judge-transport codex-cli" in payload["sign_bundle_command"]
     assert "--judge-tools readonly" in payload["sign_bundle_command"]
     assert "--dry-run" in payload["sign_bundle_command"]
+
+
+def test_stage_status_rejects_stale_bundle_without_command(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/gadget.py", "gadget")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    _scan_and_read(ctx, "stale-status")
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": "stale-status"})
+
+    assert outcome.is_error is True
+    assert "source snapshot" in outcome.text
+    assert "sign-bundle" not in outcome.text
 
 
 def test_stage_status_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,6 +378,18 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     assert "sign-bundle" in payload["sign_bundle_command"]
 
     bundle = read_bundle(Path(payload["written_path"]))
+    assert bundle.schema_version == 2
+    assert (
+        bundle.source_rev
+        == subprocess.run(
+            ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    assert bundle.source_dirty is False
+    assert len(bundle.source_snapshot_sha256) == 64
     drift = [a for a in bundle.actions if a.kind == "drift_repair"]
     new = [a for a in bundle.actions if a.kind == "justify"]
     assert len(drift) == 1 and len(new) == 1
@@ -370,6 +401,92 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     assert new[0].symbol == "Widget.lookup"
     # No rotation action -- the only judge-gated entry is filtered out of the scan.
     assert all(a.kind != "rotation" for a in bundle.actions)
+
+
+def test_stage_scan_records_tracked_dirty_source_snapshot(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    _write_source(root, "plugins/dirty.py", "dirty")
+    subprocess.run(["git", "-C", str(tmp_path), "add", str(root / "plugins/dirty.py")], check=True)
+
+    bundle = _scan_and_read(ctx, "dirty-source")
+
+    assert bundle.source_dirty is True
+
+
+@pytest.mark.parametrize("kind", ("python", "ignored_python", "allowlist"))
+def test_stage_scan_rejects_relevant_untracked_input_without_writing(tmp_path: Path, kind: str) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    if kind == "ignored_python":
+        (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    ctx = _context(root, allowlist_dir, staged_dir)
+    if kind == "python":
+        _write_source(root, "plugins/untracked.py", "untracked")
+    elif kind == "ignored_python":
+        _write_source(root, "plugins/ignored.py", "ignored")
+    else:
+        (allowlist_dir / "untracked.yaml").write_text("allow_hits: []\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(ctx, "stage_scan", {"bundle_id": "untracked"})
+
+    assert outcome.is_error is True
+    assert "tracked Git path" in outcome.text
+    assert not (staged_dir / "untracked.json").exists()
+
+
+@pytest.mark.parametrize("repository_state", ("missing", "unborn"))
+def test_stage_scan_rejects_missing_or_unborn_git_head_without_writing(tmp_path: Path, repository_state: str) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    if repository_state == "unborn":
+        subprocess.run(["git", "-C", str(tmp_path), "init", "-q"], check=True)
+    ctx = judge_server._ServerContext(root=root, allowlist_dir=allowlist_dir, staged_dir=staged_dir)
+
+    outcome = judge_server._run_tool(ctx, "stage_scan", {"bundle_id": "no-head"})
+
+    assert outcome.is_error is True
+    assert "Git" in outcome.text or "git" in outcome.text
+    assert not (staged_dir / "no-head.json").exists()
+
+
+def test_stage_scan_allows_irrelevant_untracked_input(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    (tmp_path / "notes.txt").write_text("irrelevant\n", encoding="utf-8")
+
+    bundle = _scan_and_read(ctx, "irrelevant")
+
+    assert bundle.source_dirty is False
+
+
+def test_stage_scan_rejects_binding_change_during_action_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = _write_source(root, "plugins/widget.py", "widget")
+    ctx = _context(root, allowlist_dir, staged_dir)
+    original = judge_server._build_scan_plan
+
+    def changing_plan(context: Any) -> Any:
+        result = original(context)
+        target.write_text(target.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(judge_server, "_build_scan_plan", changing_plan)
+
+    outcome = judge_server._run_tool(ctx, "stage_scan", {"bundle_id": "changed"})
+
+    assert outcome.is_error is True
+    assert "changed while deriving" in outcome.text
+    assert not (staged_dir / "changed.json").exists()
 
 
 def test_stage_scan_records_absolute_scope_from_relative_context(
@@ -800,6 +917,43 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     assert "hmac-sha256:" not in text
 
 
+def test_stage_preview_rejects_stale_bundle_before_judge_or_rewrite(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    bundle_path = staged_dir / f"{bundle_id}.json"
+    before = bundle_path.read_bytes()
+    source = ctx.root / "plugins/gadget.py"
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless\n", encoding="utf-8")
+
+    with patch("elspeth_lints.core.judge.call_judge") as mock_call:
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
+
+    assert outcome.is_error is True
+    assert "source snapshot" in outcome.text
+    mock_call.assert_not_called()
+    assert bundle_path.read_bytes() == before
+
+
+def test_stage_preview_rechecks_binding_before_rewrite(tmp_path: Path) -> None:
+    ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    bundle_path = staged_dir / f"{bundle_id}.json"
+    before = bundle_path.read_bytes()
+    source = ctx.root / "plugins/gadget.py"
+
+    def changing_judge(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        source.write_text(source.read_text(encoding="utf-8") + "# changed during preview\n", encoding="utf-8")
+        return _fake_response(JudgeVerdict.ACCEPTED, "boundary is genuine")
+
+    with (
+        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
+        patch("elspeth_lints.core.judge.call_judge", side_effect=changing_judge),
+    ):
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
+
+    assert outcome.is_error is True
+    assert "source snapshot" in outcome.text
+    assert bundle_path.read_bytes() == before
+
+
 def test_stage_preview_surfaces_blocked_reason(tmp_path: Path) -> None:
     ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
 
@@ -910,6 +1064,27 @@ def test_stage_rekey_lists_valid_and_flags_broken(tmp_path: Path) -> None:
     text = (staged_dir / "rekey-1.json").read_text(encoding="utf-8")
     assert "judge_metadata_signature" not in text
     assert "hmac-sha256:" not in text
+
+
+def test_stage_status_rejects_stale_rekey_source_binding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/ok.py", "ok")
+    finding = _live_finding(root, "plugins/ok.py")
+    _write_signed_v2_entry(allowlist_dir, "ok.yaml", finding=finding)
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    staged = judge_server._run_tool(
+        ctx,
+        "stage_rekey",
+        {"old_key_env": "OLD_JUDGE_KEY", "new_key_env": "NEW_JUDGE_KEY", "bundle_id": "stale-rekey"},
+    )
+    assert staged.is_error is False
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(ctx, "stage_status", {"bundle_id": "stale-rekey"})
+
+    assert outcome.is_error is True
+    assert "source binding is stale" in outcome.text
 
 
 def test_stage_rekey_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

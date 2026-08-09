@@ -33,6 +33,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -53,6 +54,7 @@ from elspeth_lints.core.review_bundle import (
     ReviewBundle,
     write_bundle,
 )
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 _HMAC_KEY = "x" * 32
@@ -246,15 +248,31 @@ def _bundle(
     *,
     bundle_id: str = "sign-bundle-under-test",
 ) -> ReviewBundle:
+    repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "sign-bundle@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Sign Bundle Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     return ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=actions,
     )
 
@@ -724,6 +742,28 @@ def test_sign_bundle_rotation_log_conflict_fails_before_active_publish(tmp_path:
     assert rc == 2
     assert _tree_bytes(allowlist_dir) == before
     assert _recovery_path(capsys.readouterr().err).is_dir()
+
+
+def test_sign_bundle_aborts_before_transaction_judge_or_write_on_harmless_source_drift(tmp_path: Path) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, ()))
+    before = _tree_bytes(allowlist_dir)
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless comment\n", encoding="utf-8")
+
+    with (
+        patch.object(sign_bundle_transaction, "create_transaction") as create_transaction,
+        patch("elspeth_lints.core.judge.call_judge") as call_judge,
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    create_transaction.assert_not_called()
+    call_judge.assert_not_called()
+    assert _tree_bytes(allowlist_dir) == before
 
 
 def test_sign_bundle_resume_replays_rotation_interrupted_before_audit_record(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -2507,7 +2547,7 @@ def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc == 0
-    assert calls == []  # never shelled the regen script
+    assert not any("regen_fingerprint_baseline.py" in str(call) for call in calls)
     assert "canonical-allowlist-only" in capsys.readouterr().out
 
 

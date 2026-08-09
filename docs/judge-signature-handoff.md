@@ -92,6 +92,14 @@ side is structurally key-free: the MCP server refuses to start a tool handler if
 checked *before* any optional import), so the agent surface can never co-locate
 with the key.
 
+Review bundles use schema v2 and are exact-source-bound at the envelope level:
+`source_rev` is the full Git HEAD, `source_dirty` records tracked source changes,
+and `source_snapshot_sha256` covers every scannable Python file plus every
+allowlist YAML byte. Every consumed input must map to a tracked Git path;
+relevant untracked inputs are rejected even when ignored. The envelope and
+whole-bundle hash bind all actions, so actions do not repeat these fields. V1
+and incomplete bundles are rejected and must be re-staged.
+
 ## The `elspeth-judge` MCP server (agent side)
 
 Registered in `.mcp.json` as `elspeth-judge`, launched as
@@ -105,8 +113,8 @@ present in the environment.
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
-| `stage_status` | yes | no | Summarise a staged bundle (per-lane/kind counts, preview outcomes) and emit the paste-ready operator `sign-bundle` command. Arg: `bundle_id` (required). |
-| `stage_preview` | yes | yes (read-only Codex CLI judge) | Run the sealed read-only Codex judge over each `new_judgment` action and record a **non-authoritative** preview verdict (`authoritative=False`); surfaces BLOCKED reasons. Never signs. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
+| `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, and preview outcomes) and emit the paste-ready operator command. Arg: `bundle_id` (required). |
+| `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
 `stage_scan` feeds the rotation planner only non-judge-gated entries
@@ -131,12 +139,15 @@ elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
 
 This is the **only** place a judge signature is minted from a bundle. The verify
 phase first binds the CLI roots to the roots recorded in the bundle, then runs a
-full empty-allowlist census over every scannable Python file. Every uncovered
+stable exact-source check before and after a full empty-allowlist census over
+every scannable Python file. Git HEAD, tracked-source dirty state, the exact
+Python/YAML digest, input tracking, and repository/root identity must all match.
+Every uncovered
 target must have a staged `new_judgment` action, and every live signed-entry
 drift or orphan and every non-judge rotation must have its corresponding
 repair/delete/rotation action. This catches an incomplete or deliberately
 narrowed bundle even when every action it did include is individually valid.
-Bundles carrying legacy relative root paths are rejected and must be re-staged;
+Bundles carrying v1, incomplete, or legacy relative root paths are rejected and must be re-staged;
 otherwise changing the operator's working directory could silently retarget the
 census.
 The whole-bundle re-check is the all-or-nothing gate; on any mismatch it aborts
@@ -284,6 +295,11 @@ active contents drifted, when directory identities or contents cannot be
 reconciled to one of those two authenticated orientations, or when the original
 preflight itself rejected the bundle. A bundle is a point-in-time assertion
 about the tree. The verify gate aborts in two expected situations:
+
+- **Relevant byte or Git identity drift.** A harmless comment, allowlist byte
+  change, HEAD advance, newly relevant untracked input, or tracked-dirty-state
+  change invalidates the v2 binding even if the action inventory is unchanged.
+  `stage_status` and `stage_preview` refuse the same stale bundle.
 
 - **AST-position cascade staleness (by design).** A bundle staged *before* an
   edit that shifts AST positions in a covered `src/elspeth` source — for example

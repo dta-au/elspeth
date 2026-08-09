@@ -22,6 +22,7 @@ so the from-tree verify only ever sees structurally valid actions.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,10 @@ from typing import Any
 from elspeth_lints.core.atomic_io import atomic_update_text
 from elspeth_lints.core.strict_json import strict_json_loads
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_FULL_GIT_REVISION = re.compile(r"[0-9a-f]{40,64}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 # A bundle ``kind`` fully determines its ``lane`` -- the two can never drift.
 _KIND_TO_LANE: dict[str, str] = {
@@ -75,6 +79,7 @@ _BUNDLE_FIELDS = (
     "allowlist_dir",
     "source_rev",
     "source_dirty",
+    "source_snapshot_sha256",
     "actions",
     "rekey",
 )
@@ -196,10 +201,21 @@ class ReviewBundle:
     staged_by: str
     root: str
     allowlist_dir: str
-    source_rev: str | None
+    source_rev: str
     source_dirty: bool
+    source_snapshot_sha256: str
     actions: tuple[BundleAction, ...]
     rekey: RekeyPlan | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema_version) is not int or self.schema_version != SCHEMA_VERSION:
+            raise ValueError(f"ReviewBundle.schema_version must be {SCHEMA_VERSION}; got {self.schema_version!r}")
+        if not isinstance(self.source_rev, str) or _FULL_GIT_REVISION.fullmatch(self.source_rev) is None:
+            raise ValueError("ReviewBundle.source_rev must be a full lowercase 40-64 hex Git revision")
+        if not isinstance(self.source_dirty, bool):
+            raise ValueError(f"ReviewBundle.source_dirty must be a boolean; got {type(self.source_dirty).__name__}")
+        if not isinstance(self.source_snapshot_sha256, str) or _SHA256.fullmatch(self.source_snapshot_sha256) is None:
+            raise ValueError("ReviewBundle.source_snapshot_sha256 must be a lowercase SHA-256 hex digest")
 
 
 def dump_bundle(bundle: ReviewBundle) -> str:
@@ -249,8 +265,9 @@ def load_bundle(text: str) -> ReviewBundle:
         staged_by=_require_str(data, "staged_by", "bundle"),
         root=_require_str(data, "root", "bundle"),
         allowlist_dir=_require_str(data, "allowlist_dir", "bundle"),
-        source_rev=_optional_str(data, "source_rev", "bundle"),
+        source_rev=_require_str(data, "source_rev", "bundle"),
         source_dirty=_require_bool(data, "source_dirty", "bundle"),
+        source_snapshot_sha256=_require_str(data, "source_snapshot_sha256", "bundle"),
         actions=actions,
         rekey=rekey,
     )
@@ -282,6 +299,7 @@ def _bundle_to_dict(bundle: ReviewBundle) -> dict[str, Any]:
         "allowlist_dir": bundle.allowlist_dir,
         "source_rev": bundle.source_rev,
         "source_dirty": bundle.source_dirty,
+        "source_snapshot_sha256": bundle.source_snapshot_sha256,
         "actions": [_action_to_dict(action) for action in bundle.actions],
         "rekey": _rekey_to_dict(bundle.rekey) if bundle.rekey is not None else None,
     }

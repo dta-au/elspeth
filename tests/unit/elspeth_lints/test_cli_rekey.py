@@ -26,6 +26,8 @@ precedent.
 from __future__ import annotations
 
 import io
+import os
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,7 @@ from elspeth_lints.core.allowlist import (
 from elspeth_lints.core.cli import main
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 from elspeth_lints.core.review_bundle import RekeyPlan, ReviewBundle, write_bundle
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rule import RULES
 
 _OLD_KEY = "o" * 32
@@ -205,15 +208,31 @@ def _rekey_bundle(
     new_key_env: str = _NEW_ENV,
     bundle_id: str = "rekey-under-test",
 ) -> Path:
+    repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "rekey@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Rekey Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     bundle = ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=(),
         rekey=RekeyPlan(old_key_env=old_key_env, new_key_env=new_key_env, keys=keys, broken_keys=broken_keys),
     )
@@ -341,6 +360,23 @@ def test_rekey_reseals_under_new_key(tmp_path: Path, monkeypatch: pytest.MonkeyP
     # Production loader: verifies under NEW, fails under OLD.
     assert _production_verify(allowlist_dir, key, hmac_key=_NEW_KEY, monkeypatch=monkeypatch)
     assert not _production_verify(allowlist_dir, key, hmac_key=_OLD_KEY, monkeypatch=monkeypatch)
+
+
+def test_rekey_rejects_stale_source_binding_before_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding, hmac_key=_OLD_KEY)
+    bundle_path = _rekey_bundle(tmp_path, root, allowlist_dir, keys=(key,))
+    before = (allowlist_dir / "widget.yaml").read_bytes()
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless\n", encoding="utf-8")
+    _set_keys(monkeypatch)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert (allowlist_dir / "widget.yaml").read_bytes() == before
 
 
 def test_rekey_refuses_nonverifying_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

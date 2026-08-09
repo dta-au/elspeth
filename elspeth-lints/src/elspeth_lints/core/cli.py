@@ -4682,6 +4682,35 @@ def _run_rekey(args: argparse.Namespace) -> int:
         )
         return 2
 
+    from elspeth_lints.core.source_snapshot import capture_source_snapshot
+
+    root = Path(args.root).resolve()
+    live_allowlist_dir = allowlist_dir.resolve()
+    if (
+        not Path(bundle.root).is_absolute()
+        or not Path(bundle.allowlist_dir).is_absolute()
+        or Path(bundle.root).resolve() != root
+        or Path(bundle.allowlist_dir).resolve() != live_allowlist_dir
+    ):
+        sys.stderr.write("rekey: staged bundle root/allowlist scope does not match the requested tree; re-run stage_rekey.\n")
+        return 2
+    try:
+        source = capture_source_snapshot(source_root=root, allowlist_dir=live_allowlist_dir)
+    except ValueError as exc:
+        sys.stderr.write(f"rekey: cannot verify staged source binding: {exc}\n")
+        return 2
+    if (
+        bundle.source_rev,
+        bundle.source_dirty,
+        bundle.source_snapshot_sha256,
+    ) != (
+        source.source_rev,
+        source.source_dirty,
+        source.source_snapshot_sha256,
+    ):
+        sys.stderr.write("rekey: staged source binding is stale; re-run stage_rekey before writing.\n")
+        return 2
+
     # --- Enumerate the FULL judge-gated set from the tree (source-less load) ---
     # Source-less load skips the production HMAC + file-fingerprint gates (the
     # entries are signed under the OLD key, which may already be retired from the

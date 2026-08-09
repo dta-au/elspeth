@@ -13,6 +13,9 @@ Fixtures are replicated locally (rather than imported from
 
 from __future__ import annotations
 
+import os
+import subprocess
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +26,7 @@ from elspeth_lints.core.allowlist import JudgeVerdict, compute_judge_metadata_si
 from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
+from elspeth_lints.core.source_snapshot import capture_source_snapshot
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 _HMAC_KEY = "x" * 32
@@ -146,15 +150,31 @@ def _write_pre_judge_entry(allowlist_dir: Path, yaml_name: str, *, key: str) -> 
 
 
 def _bundle(root: Path, allowlist_dir: Path, actions: tuple[BundleAction, ...]) -> ReviewBundle:
+    repo = Path(os.path.commonpath((root.resolve(), allowlist_dir.resolve())))
+    if (
+        subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "HEAD"],
+            check=False,
+            capture_output=True,
+        ).returncode
+        != 0
+    ):
+        subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "bundle-verify@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Bundle Verify Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+    binding = capture_source_snapshot(source_root=root, allowlist_dir=allowlist_dir)
     return ReviewBundle(
         bundle_id="verify-bundle",
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root=str(root),
         allowlist_dir=str(allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=binding.source_rev,
+        source_dirty=binding.source_dirty,
+        source_snapshot_sha256=binding.source_snapshot_sha256,
         actions=actions,
     )
 
@@ -197,6 +217,73 @@ def test_verify_passes_when_claims_match_tree(tmp_path: Path) -> None:
     assert report.ok is True
     assert report.mismatches == ()
     assert report.rotation_plan is None  # no rotation action
+
+
+def test_verify_rejects_harmless_relevant_byte_drift_with_same_action_inventory(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    source.write_text(source.read_text(encoding="utf-8") + "# harmless comment\n", encoding="utf-8")
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("source snapshot" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_head_advance_with_identical_relevant_bytes(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    (tmp_path / "irrelevant.txt").write_text("advance HEAD only\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "irrelevant.txt"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "advance"], check=True)
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("source_rev" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_accepts_unchanged_tracked_dirty_snapshot(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    _bundle(root, allowlist_dir, ())
+    source.write_text(source.read_text(encoding="utf-8") + "# tracked dirty\n", encoding="utf-8")
+    dirty_bundle = _bundle(root, allowlist_dir, ())
+
+    report = verify_bundle_against_tree(dirty_bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert dirty_bundle.source_dirty is True
+    assert report.ok is True
+
+
+def test_verify_rechecks_source_binding_after_action_derivation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth_lints.core import bundle_verify as verify_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/clean.py", "clean", active=False)
+    bundle = _bundle(root, allowlist_dir, ())
+    original = verify_module.diagnose_judge_signatures
+
+    def changing_diagnosis(*args: Any, **kwargs: Any) -> Any:
+        report = original(*args, **kwargs)
+        source.write_text(source.read_text(encoding="utf-8") + "# changed during verify\n", encoding="utf-8")
+        return report
+
+    monkeypatch.setattr(verify_module, "diagnose_judge_signatures", changing_diagnosis)
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("changed while verifying" in mismatch for mismatch in report.mismatches)
 
 
 def test_verify_passes_with_cli_style_relative_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -343,17 +430,7 @@ def test_verify_accepts_judgment_for_second_same_prefix_finding(tmp_path: Path) 
 def test_verify_rejects_relative_paths_recorded_in_bundle(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
-    relative_bundle = ReviewBundle(
-        bundle_id="relative-scope",
-        schema_version=1,
-        created_at="2026-08-02T00:00:00+00:00",
-        staged_by="agent-x",
-        root="src_root",
-        allowlist_dir="allowlist",
-        source_rev=None,
-        source_dirty=False,
-        actions=(),
-    )
+    relative_bundle = replace(_bundle(root, allowlist_dir, ()), root="src_root", allowlist_dir="allowlist")
 
     report = verify_bundle_against_tree(relative_bundle, root=root, allowlist_dir=allowlist_dir)
 
@@ -425,6 +502,7 @@ def test_verify_rejects_substituted_scan_scope_before_signing(tmp_path: Path) ->
     substituted_root = _build_root(tmp_path / "substituted")
     substituted_allowlist = _build_allowlist_dir(tmp_path / "substituted")
     bundle = _bundle(staged_root, staged_allowlist, ())
+    _bundle(substituted_root, substituted_allowlist, ())
 
     report = verify_bundle_against_tree(
         bundle,

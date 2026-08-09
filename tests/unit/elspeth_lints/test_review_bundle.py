@@ -51,13 +51,14 @@ def _new_judgment_action(**overrides: Any) -> BundleAction:
 def _bundle(actions: tuple[BundleAction, ...], *, rekey: RekeyPlan | None = None) -> ReviewBundle:
     return ReviewBundle(
         bundle_id="sample-bundle",
-        schema_version=1,
+        schema_version=2,
         created_at="2026-06-28T00:00:00+00:00",
         staged_by="agent-x",
         root="src/elspeth",
         allowlist_dir="config/cicd/enforce_tier_model",
-        source_rev="deadbeef",
+        source_rev="a" * 40,
         source_dirty=True,
+        source_snapshot_sha256="b" * 64,
         actions=actions,
         rekey=rekey,
     )
@@ -121,6 +122,44 @@ def test_load_bundle_rejects_malformed_action_per_kind() -> None:
     }
     with pytest.raises(ValueError):
         load_bundle(_serialize_with_actions([justify]))
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("source_rev", None),
+        ("source_rev", ""),
+        ("source_rev", "DEADBEEF" * 5),
+        ("source_rev", "deadbeef"),
+        ("source_snapshot_sha256", None),
+        ("source_snapshot_sha256", ""),
+        ("source_snapshot_sha256", "A" * 64),
+        ("source_snapshot_sha256", "a" * 63),
+    ],
+)
+def test_load_bundle_rejects_incomplete_or_invalid_source_binding(field: str, invalid: Any) -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    data[field] = invalid
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
+
+
+def test_load_bundle_rejects_v1() -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    data["schema_version"] = 1
+
+    with pytest.raises(ValueError, match="schema_version=1"):
+        load_bundle(json.dumps(data))
+
+
+@pytest.mark.parametrize("field", ("source_rev", "source_dirty", "source_snapshot_sha256"))
+def test_load_bundle_rejects_missing_source_binding_field(field: str) -> None:
+    data = json.loads(dump_bundle(_bundle(())))
+    del data[field]
+
+    with pytest.raises(ValueError, match=field):
+        load_bundle(json.dumps(data))
 
 
 def test_load_bundle_rejects_incoherent_lane_kind() -> None:
@@ -247,13 +286,14 @@ def _serialize_with_actions(action_dicts: list[dict[str, Any]]) -> str:
     return json.dumps(
         {
             "bundle_id": "sample-bundle",
-            "schema_version": 1,
+            "schema_version": 2,
             "created_at": "2026-06-28T00:00:00+00:00",
             "staged_by": "agent-x",
             "root": "src/elspeth",
             "allowlist_dir": "config/cicd/enforce_tier_model",
-            "source_rev": None,
+            "source_rev": "a" * 40,
             "source_dirty": False,
+            "source_snapshot_sha256": "b" * 64,
             "actions": action_dicts,
             "rekey": None,
         }

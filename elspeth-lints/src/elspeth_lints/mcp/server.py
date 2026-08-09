@@ -250,6 +250,33 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     bundle_path = _resolve_bundle_path(ctx, arguments)
     bundle = read_bundle(bundle_path)
+    if bundle.rekey is not None and not bundle.actions:
+        from elspeth_lints.core.source_snapshot import capture_source_snapshot
+
+        if (
+            not Path(bundle.root).is_absolute()
+            or not Path(bundle.allowlist_dir).is_absolute()
+            or Path(bundle.root).resolve() != ctx.root.resolve()
+            or Path(bundle.allowlist_dir).resolve() != ctx.allowlist_dir.resolve()
+        ):
+            raise ValueError("staged rekey bundle root/allowlist scope is stale; re-run stage_rekey")
+        live_source = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+        if (
+            bundle.source_rev,
+            bundle.source_dirty,
+            bundle.source_snapshot_sha256,
+        ) != (
+            live_source.source_rev,
+            live_source.source_dirty,
+            live_source.source_snapshot_sha256,
+        ):
+            raise ValueError("staged rekey bundle source binding is stale; re-run stage_rekey")
+    else:
+        from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
+
+        verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+        if not verification.ok:
+            raise ValueError("staged bundle is stale; re-run stage_scan: " + "; ".join(verification.mismatches))
 
     lane_counts: dict[str, int] = {}
     kind_counts: dict[str, int] = {}
@@ -266,6 +293,10 @@ def _tool_stage_status(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "allowlist_dir": bundle.allowlist_dir,
         "staged_by": bundle.staged_by,
         "created_at": bundle.created_at,
+        "source_rev": bundle.source_rev,
+        "source_dirty": bundle.source_dirty,
+        "source_snapshot_sha256": bundle.source_snapshot_sha256,
+        "source_verification": "ok",
         "actions_total": len(bundle.actions),
         "lane_counts": lane_counts,
         "kind_counts": kind_counts,
@@ -406,23 +437,29 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     import uuid
     from datetime import datetime
 
-    from elspeth_lints.core.review_bundle import ReviewBundle, write_bundle
+    from elspeth_lints.core.review_bundle import SCHEMA_VERSION, ReviewBundle, write_bundle
+    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, capture_source_snapshot
 
     bundle_id_arg = arguments.get("bundle_id")
     bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-scan-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
+    source_before = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     actions, target_census = _build_scan_plan(ctx)
+    source_after = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if source_before != source_after:
+        raise SourceSnapshotChangedError("source binding changed while deriving stage_scan actions")
     bundle = ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         created_at=datetime.now(UTC).isoformat(),
         staged_by=staged_by,
         root=str(ctx.root),
         allowlist_dir=str(ctx.allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=source_after.source_rev,
+        source_dirty=source_after.source_dirty,
+        source_snapshot_sha256=source_after.source_snapshot_sha256,
         actions=tuple(actions),
     )
     path = write_bundle(bundle, staged_dir=ctx.staged_dir)
@@ -517,6 +554,11 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     bundle_path = _resolve_bundle_path(ctx, arguments)
     bundle = read_bundle(bundle_path)
+    from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
+
+    verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if not verification.ok:
+        raise ValueError("staged bundle is stale; re-run stage_scan: " + "; ".join(verification.mismatches))
 
     has_justify = any(action.kind == "justify" for action in bundle.actions)
     tool_scope = judge_mod.build_readonly_tool_scope(root=ctx.root, allowlist_dir=ctx.allowlist_dir) if has_justify else None
@@ -556,6 +598,9 @@ def _tool_stage_preview(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             blocked.append({"key": action.key, "rationale": response.judge_rationale})
 
     new_bundle = replace(bundle, actions=tuple(new_actions))
+    verification = verify_bundle_against_tree(bundle, root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if not verification.ok:
+        raise ValueError("staged bundle changed during preview; refusing rewrite: " + "; ".join(verification.mismatches))
     path = write_bundle(new_bundle, staged_dir=ctx.staged_dir)
     payload = {
         "bundle_id": new_bundle.bundle_id,
@@ -586,7 +631,8 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     from datetime import datetime
 
     from elspeth_lints.core.judge_signature_diagnosis import _OK_STATUSES, diagnose_judge_signatures
-    from elspeth_lints.core.review_bundle import RekeyPlan, ReviewBundle, write_bundle
+    from elspeth_lints.core.review_bundle import SCHEMA_VERSION, RekeyPlan, ReviewBundle, write_bundle
+    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, capture_source_snapshot
 
     old_key_env = _require_str_arg(arguments, "old_key_env")
     new_key_env = _require_str_arg(arguments, "new_key_env")
@@ -595,6 +641,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
+    source_before = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     diagnosis = diagnose_judge_signatures(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     valid_keys: list[str] = []
     broken_keys: list[str] = []
@@ -607,6 +654,10 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             # is not part of the rekey set.)
             broken_keys.append(item.key)
 
+    source_after = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    if source_before != source_after:
+        raise SourceSnapshotChangedError("source binding changed while deriving stage_rekey diagnosis")
+
     rekey = RekeyPlan(
         old_key_env=old_key_env,
         new_key_env=new_key_env,
@@ -615,13 +666,14 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     )
     bundle = ReviewBundle(
         bundle_id=bundle_id,
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         created_at=datetime.now(UTC).isoformat(),
         staged_by=staged_by,
         root=str(ctx.root),
         allowlist_dir=str(ctx.allowlist_dir),
-        source_rev=None,
-        source_dirty=False,
+        source_rev=source_after.source_rev,
+        source_dirty=source_after.source_dirty,
+        source_snapshot_sha256=source_after.source_snapshot_sha256,
         actions=(),
         rekey=rekey,
     )
@@ -650,8 +702,8 @@ _TOOLS.update(
         ),
         "stage_status": _ToolSpec(
             description=(
-                "Summarise a staged review bundle (per-lane/kind counts, preview outcomes) and emit "
-                "the paste-ready operator sign-bundle command."
+                "Verify the exact source binding, refuse stale bundles, then summarise per-lane/kind "
+                "counts and preview outcomes and emit the paste-ready operator command."
             ),
             input_schema={
                 "type": "object",
@@ -678,8 +730,9 @@ _TOOLS.update(
         ),
         "stage_preview": _ToolSpec(
             description=(
-                "Run the read-only Codex CLI judge over each new_judgment action and record a "
-                "NON-authoritative preview verdict (never signs; surfaces BLOCKED reasons). "
+                "Fully verify the sign bundle, run the read-only Codex CLI judge over each "
+                "new_judgment action, reverify before overwrite, and record a NON-authoritative "
+                "preview verdict (never signs; stale bundles receive no judge call). "
                 "Requires an installed + authenticated Codex CLI and the [mcp] extra."
             ),
             input_schema={

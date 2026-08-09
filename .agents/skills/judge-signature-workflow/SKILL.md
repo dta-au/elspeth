@@ -62,6 +62,12 @@ deliberate fallback.
 
 Bundles land in `.elspeth/staged-reviews/<bundle_id>.json`.
 
+Bundles are schema v2 and exact-source-bound: the envelope records the full Git
+HEAD, tracked-source dirty state, and a deterministic digest of every scannable
+Python file plus every allowlist YAML byte. All consumed inputs must map to
+tracked Git paths, so relevant untracked or ignored files fail staging. V1 or
+incomplete bundles must be re-staged.
+
 1. **`verify_signatures`** — read-only, *always shape-only* diagnosis. Use to see
    what drifted without the key. (Authoritative HMAC recompute is the operator
    `diagnose`, not this.)
@@ -73,8 +79,10 @@ Bundles land in `.elspeth/staged-reviews/<bundle_id>.json`.
    `[mcp]` extra) — run the read-only Codex judge over each `new_judgment`
    action and record a **non-authoritative** preview (`authoritative=False`);
    surfaces BLOCKED reasons so you can fix the code or rationale *before* the
-   operator spends a real judge call. Arg: `bundle_id`.
-4. **`stage_status`** — summarise the bundle (per-lane counts, preview outcomes)
+   operator spends a real judge call. It fully verifies before judging and
+   reverifies before overwrite; stale bundles receive no judge call. Arg: `bundle_id`.
+4. **`stage_status`** — verify the source binding, refuse stale bundles, then
+   summarise the bundle (source identity, per-lane counts, preview outcomes)
    and emit the **paste-ready operator `sign-bundle` command**. Arg: `bundle_id`.
 5. **`stage_rekey`** — for a key roll: enumerate currently-valid judge-gated
    entries and flag broken ones into a rekey bundle, recording env-var **names**
@@ -139,6 +147,9 @@ reconciled, or initial preflight rejected the bundle. Expected cases include:
 - **AST-position cascade staleness** — the bundle was staged before an edit that
   shifted AST positions (e.g. a new `import`) in a covered `src/elspeth` source.
 - **Dup-key in the target file** — resolve the duplicate in the YAML first.
+- **Exact-source drift** — any relevant Python/YAML byte change, Git HEAD
+  advance, tracked-source dirty-state change, or relevant untracked/ignored
+  input invalidates the bundle even when its action inventory is unchanged.
 
 In those cases re-stage; never force, hand-edit signatures, or edit a transaction
 journal.
