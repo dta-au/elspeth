@@ -11,6 +11,9 @@
 # image is built FROM.
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS builder
 
+ARG GATEWAY_REVISION
+RUN test -n "$GATEWAY_REVISION"
+
 RUN python -m venv /venv
 
 COPY pyproject.toml /build/pyproject.toml
@@ -19,6 +22,16 @@ COPY src /build/src
 RUN /venv/bin/pip install --no-cache-dir /build
 
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+ARG GATEWAY_REVISION
+LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
+    io.elspeth.llm-gateway.runtime-identity="elspeth-llm-gateway" \
+    io.elspeth.llm-gateway.runtime-version="0.1.0" \
+    io.elspeth.llm-gateway.contract-major="1" \
+    io.elspeth.llm-gateway.adapter-name="reference_v1_invoke" \
+    io.elspeth.llm-gateway.adapter-version="0.1.0" \
+    io.elspeth.llm-gateway.adapter-api-major="1" \
+    io.elspeth.llm-gateway.adapter-fingerprint="d51d14e3696236892fecd0436681ab105872558a9ab43a0d545cc725b3d8ab6b"
 
 # PYTHONDONTWRITEBYTECODE: this image runs read-only (no writes outside
 # /tmp); the interpreter must never attempt to write .pyc files next to the

@@ -144,10 +144,11 @@ gateway:
    error bodies from your real upstream into your copy of the scaffold's
    `fixtures/`, and write real assertions in `tests/test_adapter.py` (renamed
    from the shipped `.template`) against them.
-4. **Build an immutable derived image with a pinned package.** See
+4. **Build an immutable derived image from an exact adapter artifact.** See
    "Derived images" below — `FROM` this gateway's image *by digest*, and
-   `pip install` your adapter package at a pinned version, at build time
-   only.
+   install a pre-built adapter wheel whose SHA-256 digest you verified, at
+   build time only. Do not let the image build resolve a version from an
+   index.
 5. **Run the complete conformance suite against the derived image.** See
    "Conformance against a running gateway" below — point the conformance
    kit's `GATEWAY_CONFORMANCE_URL` at a running container of your derived
@@ -222,7 +223,9 @@ validate its own targets does not qualify.
 Build it:
 
 ```bash
-docker build gateway/ -t elspeth-llm-gateway:dev
+docker build \
+  --build-arg GATEWAY_REVISION="$(git rev-parse HEAD)" \
+  gateway/ -t elspeth-llm-gateway:dev
 ```
 
 The image is read-only-rootfs compatible: it never writes anything outside
@@ -252,12 +255,74 @@ container start:
 # against — never a floating tag.
 FROM elspeth-llm-gateway@sha256:<digest>
 
-# Build-time only: pip install runs here, in the derived image's own build,
-# never in a running container's entrypoint or an init step.
-RUN /venv/bin/pip install --no-cache-dir yourorg-adapter==X.Y.Z
+# The admitted base runs as an unprivileged user. Elevate only for the
+# build-time package installation, then restore the fixed runtime identity.
+USER root
+
+# Copy and verify the exact, pre-built adapter artifact. The build must not
+# contact an index or silently resolve transitive dependencies.
+COPY yourorg_adapter-X.Y.Z-py3-none-any.whl /build/yourorg_adapter-X.Y.Z-py3-none-any.whl
+ARG ADAPTER_WHEEL_SHA256
+RUN test -n "$ADAPTER_WHEEL_SHA256" \
+    && printf '%s  %s\n' "$ADAPTER_WHEEL_SHA256" /build/yourorg_adapter-X.Y.Z-py3-none-any.whl \
+       | sha256sum -c - \
+    && /venv/bin/pip install --no-cache-dir --no-deps /build/yourorg_adapter-X.Y.Z-py3-none-any.whl \
+    && rm -f /build/yourorg_adapter-X.Y.Z-py3-none-any.whl
 
 ENV ELSPETH_LLM_GATEWAY_ADAPTER=yourorg_adapter
+
+USER 65532:65532
+
+# The base image labels describe the in-tree reference adapter. A derived
+# image must stamp its own source revision and replace all four adapter labels
+# with the installed adapter's code-owned descriptor and the fingerprint
+# reported by the offline command below.
+ARG GATEWAY_REVISION
+RUN test -n "$GATEWAY_REVISION"
+LABEL org.opencontainers.image.revision="${GATEWAY_REVISION}" \
+      io.elspeth.llm-gateway.adapter-name="yourorg_adapter" \
+      io.elspeth.llm-gateway.adapter-version="X.Y.Z" \
+      io.elspeth.llm-gateway.adapter-api-major="1" \
+      io.elspeth.llm-gateway.adapter-fingerprint="REPLACE_WITH_64_LOWERCASE_HEX"
 ```
+
+The placeholder makes this a deliberate two-build procedure. First build a
+provisional local image, run the offline identity command below against it,
+and copy its 64-character fingerprint into the Dockerfile. Never sign or
+publish that provisional image. Build the final image from the same base digest,
+wheel, wheel digest, and install path, then re-run the offline command and
+compare its document with every final label before signing that final image
+digest. A mismatch means the build inputs were not reproducible and the image
+is ineligible.
+
+If the adapter has dependencies beyond the gateway SDK, install each one from
+an exact, separately hash-verified artifact before the adapter. `--no-deps` is
+intentional: it prevents `pip` from turning an apparently pinned adapter into
+an unreviewed dependency-resolution step.
+
+Before signing or deploying the derived digest, inspect the installed identity
+without supplying credentials or network access. The container invocation runs
+`python -m elspeth_llm_gateway.image_identity` through its absolute venv
+interpreter:
+
+```bash
+docker run --rm --network none \
+  --entrypoint /venv/bin/python \
+  yourorg-gateway@sha256:<digest> \
+  -m elspeth_llm_gateway.image_identity --adapter yourorg_adapter
+```
+
+The canonical JSON is the comparison source for the derived image labels and
+the deployment's expected runtime/adapter identity. It reads neither gateway
+configuration nor runtime secrets. A label mismatch, missing label, or command
+failure makes the image ineligible for secret-bearing deployment.
+
+The revision and identity labels are producer assertions, not provenance by
+themselves. Do not stamp a clean commit revision onto an image built from a
+dirty worktree. Admission still has to bind the resulting image digest to a
+trusted producer attestation, an acceptable scan result, and the exact
+runtime/adapter identity expected by Terraform before any secret selector is
+placed in a task definition.
 
 Runtime code mounts (bind-mounting adapter source into a running container)
 and container-start package installs are forbidden: the whole point of a

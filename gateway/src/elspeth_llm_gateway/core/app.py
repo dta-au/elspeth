@@ -11,9 +11,6 @@ header and an ``X-Request-ID``; every error response is the same
 """
 
 import copy
-import hashlib
-import importlib.metadata
-import inspect
 import logging
 import os
 import re
@@ -29,8 +26,9 @@ from starlette._utils import get_route_path
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from elspeth_llm_gateway import ADAPTER_API_MAJOR, CONTRACT_MAJOR
+from elspeth_llm_gateway.core.adapter_identity import compute_adapter_fingerprint, resolve_adapter
 from elspeth_llm_gateway.core.auth import check_bearer
-from elspeth_llm_gateway.core.config import ConfigError, GatewayConfig, load_config
+from elspeth_llm_gateway.core.config import GatewayConfig, load_config
 from elspeth_llm_gateway.core.contract import ChatRequest
 from elspeth_llm_gateway.core.errors import GatewayError, GatewayErrorCode, error_envelope
 from elspeth_llm_gateway.core.events import log_event
@@ -38,14 +36,11 @@ from elspeth_llm_gateway.core.oauth import TokenManager
 from elspeth_llm_gateway.core.parsing import StrictJsonError, parse_strict_json
 from elspeth_llm_gateway.core.service import CompletionService
 from elspeth_llm_gateway.core.transport import UpstreamClient
-from elspeth_llm_gateway.reference.adapter import ReferenceV1InvokeAdapter
 from elspeth_llm_gateway.sdk.protocol import AdapterProtocol
 
 CONTRACT_HEADER = "X-ELSPETH-LLM-Gateway-Contract"
 REQUEST_ID_HEADER = "X-Request-ID"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
-_ADAPTER_ENTRY_POINT_GROUP = "elspeth_llm_gateway.adapters"
-_REFERENCE_ADAPTER_NAME = "reference_v1_invoke"
 _MAX_MODEL_TARGET_ERRORS = 10
 
 logger = logging.getLogger("elspeth_llm_gateway")
@@ -164,38 +159,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 def _resolve_adapter(config: GatewayConfig) -> AdapterProtocol:
-    """Resolve the configured adapter by name: the reference adapter, or an entry point.
-
-    ``"reference_v1_invoke"`` always resolves to the in-tree
-    ``ReferenceV1InvokeAdapter`` without consulting entry points at all;
-    anything else is looked up in the ``elspeth_llm_gateway.adapters`` entry
-    point group. A name that matches neither raises ``ConfigError`` — an
-    unresolvable adapter is a startup failure, not a deferred runtime one.
-    """
-    if config.adapter_name == _REFERENCE_ADAPTER_NAME:
-        return ReferenceV1InvokeAdapter()
-
-    entry_points = importlib.metadata.entry_points(group=_ADAPTER_ENTRY_POINT_GROUP)
-    matches = [entry_point for entry_point in entry_points if entry_point.name == config.adapter_name]
-    if not matches:
-        raise ConfigError([f"unknown_adapter:{config.adapter_name}"])
-
-    adapter_cls = matches[0].load()
-    return adapter_cls()
-
-
-def _compute_adapter_fingerprint(adapter: AdapterProtocol) -> str:
-    """``sha256`` of the adapter module's own source file, first 16 hex chars.
-
-    Computed once at startup (not per-request): this is a static identity
-    check for "which adapter code is actually running", not something that
-    can change mid-process.
-    """
-    source_file = inspect.getsourcefile(type(adapter))
-    if source_file is None:
-        return "0" * 16
-    with open(source_file, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()[:16]
+    return resolve_adapter(config.adapter_name)
 
 
 def _model_target_validator(adapter: AdapterProtocol) -> Callable[[dict], None] | None:
@@ -282,7 +246,11 @@ def create_app(
     token_manager = TokenManager(config, http_client)
     upstream = UpstreamClient(config, token_manager, http_client)
     service = CompletionService(config, resolved_adapter, upstream, logger)
-    adapter_fingerprint = _compute_adapter_fingerprint(resolved_adapter)
+    adapter_fingerprint = compute_adapter_fingerprint(
+        resolved_adapter,
+        adapter_name=config.adapter_name if adapter is None else None,
+        require_package=adapter is None,
+    )
 
     @asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
