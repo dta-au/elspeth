@@ -146,6 +146,7 @@ locals {
     "transform:web_scrape",
   ]
   default_plugin_preferences = {
+    llm            = ["transform:llm", "source:llm"]
     prompt_shield  = ["transform:aws_bedrock_prompt_shield"]
     content_safety = ["transform:aws_bedrock_content_safety"]
   }

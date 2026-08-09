@@ -707,6 +707,20 @@ def test_web_plugin_policy_is_operator_configurable() -> None:
     assert "var.content_guardrail == null ? local.default_content_guardrail" in locals_text
 
 
+def test_default_plugin_preferences_select_the_acceptance_llm_transform() -> None:
+    """The live acceptance receipt requires the transform implementation.
+
+    Both source:llm and transform:llm are authorized by the default allowlist,
+    so leaving the LLM capability unordered lets registry order choose the
+    source implementation and makes the deployed guardrail check fail closed.
+    """
+
+    locals_text = _text("modules/scenario/locals.tf")
+    preferences = locals_text[locals_text.index("default_plugin_preferences = {") : locals_text.index("default_plugin_control_modes = {")]
+
+    assert re.search(r'llm\s*=\s*\["transform:llm", "source:llm"\]', preferences) is not None
+
+
 def test_bedrock_invoke_grant_is_backend_gated_and_follows_the_configured_llm_profiles() -> None:
     """The IAM grant must be derived from the profiles, not just the Composer pair.
 
@@ -1550,9 +1564,12 @@ def test_service_rollout_proof_binds_primary_task_and_platform_digest() -> None:
         ".failedTasks == 0",
         "(.tasks | length == 1)",
         ".taskDefinitionArn == $candidate_task_definition",
-        ".imageDigest == $candidate_platform_digest",
+        "candidate_parent_digest=${candidate_image##*@}",
+        "(.imageDigest == $candidate_parent_digest or .imageDigest == $candidate_platform_digest)",
+        "containers[?name==`elspeth-web`] | [0].managedAgents[?name==`ExecuteCommandAgent`] | [0].lastStatus",
     ):
         assert marker in source_free
+    assert "containers[?name==`elspeth-web`].managedAgents[?name==`ExecuteCommandAgent`]" not in source_free
     assert source_free.count("verify_candidate_service ") >= 2
     assert readme.count("verify_candidate_service ") >= 3
 
@@ -1752,8 +1769,8 @@ def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit(
         "installer-control-plane-policy.json.tftpl": 6_017,
         "installer-regional-resources-policy.json.tftpl": 5_921,
         "installer-relationships-policy.json.tftpl": 6_014,
-        "installer-runtime-observation-policy.json.tftpl": 6_073,
-        "installer-tagless-updates-policy.json.tftpl": 688,
+        "installer-runtime-observation-policy.json.tftpl": 6_057,
+        "installer-tagless-updates-policy.json.tftpl": 2_543,
     }
     assert all(size <= 6_144 for size in rendered_sizes.values()), rendered_sizes
     assert len(documents) == 5
@@ -1847,6 +1864,60 @@ def test_installer_policy_splits_ecs_tag_drift_by_available_condition_context() 
     assert "aws:ResourceTag/ACCEPTANCE_RUN_ID" not in json.dumps(task_definitions)
 
 
+def test_installer_policy_lists_tasks_through_run_cluster_container_instances() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    task_list = statements["ListTasksInRunScenarioClusters"]
+
+    assert {sid for sid, statement in statements.items() if "ecs:ListTasks" in statement["Action"]} == {"ListTasksInRunScenarioClusters"}
+    assert task_list["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:container-instance/acceptance-a-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:container-instance/acceptance-b-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:container-instance/acceptance-c-0123456789abcdefabcd-cluster/*",
+    ]
+    assert task_list["Condition"] == {
+        "ArnEquals": {
+            "ecs:cluster": [
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
+            ]
+        },
+        "StringEquals": {"aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"]},
+    }
+
+
+def test_installer_policy_executes_only_in_run_scenario_web_containers() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    execute = statements["ExecuteCommandsInRunScenarioTasks"]
+
+    assert {sid for sid, statement in statements.items() if "ecs:ExecuteCommand" in statement["Action"]} == {
+        "ExecuteCommandsInRunScenarioTasks"
+    }
+    assert execute["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-a-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-b-0123456789abcdefabcd-cluster/*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task/acceptance-c-0123456789abcdefabcd-cluster/*",
+    ]
+    assert execute["Condition"] == {
+        "ArnEquals": {
+            "ecs:cluster": [
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+                "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
+            ]
+        },
+        "StringEquals": {
+            "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+            "ecs:container-name": "elspeth-web",
+        },
+    }
+
+
 def test_installer_policy_grants_exact_run_tagged_cognito_child_update_path() -> None:
     documents = _render_installer_policy_documents()
     statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
@@ -1933,7 +2004,11 @@ def test_installer_policy_covers_pinned_provider_update_calls_without_lifecycle_
     assert "aws:ResourceTag/ACCEPTANCE_RUN_ID" not in json.dumps(region_scoped_provider_resources)
     tagless_updates = [document for path, _rendered, document in documents if path.name == "installer-tagless-updates-policy.json.tftpl"]
     assert len(tagless_updates) == 1
-    assert tagless_updates[0]["Statement"] == [region_scoped_provider_resources]
+    assert tagless_updates[0]["Statement"] == [
+        region_scoped_provider_resources,
+        statements["ListTasksInRunScenarioClusters"],
+        statements["ExecuteCommandsInRunScenarioTasks"],
+    ]
 
     discovery_actions = statements["ReadDiscovery"]["Action"]
     assert "cognito-idp:GetUserPoolMfaConfig" in discovery_actions

@@ -7,8 +7,7 @@
       "Action": [
         "ecs:Describe*",
         "ecs:ListServices",
-        "ecs:ListTagsForResource",
-        "ecs:ListTasks"
+        "ecs:ListTagsForResource"
       ],
       "Resource": [
         "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",

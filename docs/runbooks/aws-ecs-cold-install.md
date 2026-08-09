@@ -771,8 +771,9 @@ section states the required bundle digest, CA label, and
 Inspect Terraform's generated command, then enable the service explicitly:
 Define `resolve_target_ecr_digest` and `verify_candidate_service` exactly as
 shown in the Terraform package README's source-free acceptance section; those
-helpers admit the ECR parent index, selected platform child, service, task, and
-container response shapes before comparing them.
+helpers admit the ECR parent index, its selected platform child, the service,
+the task, and the container response shapes before accepting ECS's exact parent
+or child `imageDigest` representation.
 
 ```bash
 SERVICE_ENABLE_COMMAND="$(terraform -chdir=scenario-a output -raw service_enable_command)"

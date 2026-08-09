@@ -75,8 +75,8 @@ run "unset_variables_render_the_shipped_policy" {
   }
 
   assert {
-    condition     = output.resolved_inventory.values.ELSPETH_WEB__PLUGIN_PREFERENCES == "{\"content_safety\":[\"transform:aws_bedrock_content_safety\"],\"prompt_shield\":[\"transform:aws_bedrock_prompt_shield\"]}"
-    error_message = "the default plugin preferences must select the two Bedrock control implementations."
+    condition     = output.resolved_inventory.values.ELSPETH_WEB__PLUGIN_PREFERENCES == "{\"content_safety\":[\"transform:aws_bedrock_content_safety\"],\"llm\":[\"transform:llm\",\"source:llm\"],\"prompt_shield\":[\"transform:aws_bedrock_prompt_shield\"]}"
+    error_message = "the default plugin preferences must select the transform LLM and the two Bedrock control implementations."
   }
 
   assert {
