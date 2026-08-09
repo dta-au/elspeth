@@ -1133,6 +1133,12 @@ def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -
     if type(value) is dict:
         if "blob_ref" in value and value["blob_ref"] == blob_id:
             return True
+        # blob_rows persists custody as blobs[].blob_id (elspeth-0c6a343921);
+        # without this the delete guard misses the window between run
+        # creation and _link_blob_rows_to_run, when only this composition
+        # scan protects a pending run's inputs.
+        if "blob_id" in value and value["blob_id"] == blob_id:
+            return True
         if any(key in value and value[key] == storage_path for key in ("path", "file")):
             return True
         return any(_option_value_references_blob(child, blob_id, storage_path) for child in value.values())
