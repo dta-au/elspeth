@@ -8,10 +8,12 @@ This module preserves the historical web-layer import path.
 from __future__ import annotations
 
 from elspeth.contracts.blobs import ALLOWED_MIME_TYPES as ALLOWED_MIME_TYPES
+from elspeth.contracts.blobs import BINARY_DOCUMENT_MIME_TYPES as BINARY_DOCUMENT_MIME_TYPES
 from elspeth.contracts.blobs import BLOB_CREATORS as BLOB_CREATORS
 from elspeth.contracts.blobs import BLOB_RUN_LINK_DIRECTIONS as BLOB_RUN_LINK_DIRECTIONS
 from elspeth.contracts.blobs import BLOB_STATUSES as BLOB_STATUSES
 from elspeth.contracts.blobs import FINALIZE_BLOB_STATUSES as FINALIZE_BLOB_STATUSES
+from elspeth.contracts.blobs import STORAGE_MIME_TYPES as STORAGE_MIME_TYPES
 from elspeth.contracts.blobs import AllowedMimeType as AllowedMimeType
 from elspeth.contracts.blobs import BlobActiveRunError as BlobActiveRunError
 from elspeth.contracts.blobs import BlobContentMissingError as BlobContentMissingError
@@ -39,4 +41,5 @@ from elspeth.contracts.blobs import BlobStateError as BlobStateError
 from elspeth.contracts.blobs import BlobStatus as BlobStatus
 from elspeth.contracts.blobs import FinalizeBlobStatus as FinalizeBlobStatus
 from elspeth.contracts.blobs import InlineCustodyRequest as InlineCustodyRequest
+from elspeth.contracts.blobs import StorageMimeType as StorageMimeType
 from elspeth.contracts.blobs import fork_blob_id as fork_blob_id

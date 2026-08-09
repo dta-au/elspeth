@@ -125,6 +125,19 @@ class MalformedBlobRefError(ExecuteRequestValidationError):
     """Raised when caller-supplied blob_ref is not a UUID."""
 
 
+class BlobRowsSourceAdmissionError(Exception):
+    """Persisted ``blob_rows`` source options failed run-admission re-resolution.
+
+    Raised when a ``blob_rows`` source's persisted entries are malformed or
+    diverge from the session's authoritative blob records on a metadata field
+    (``filename`` / ``mime_type`` / ``size_bytes``).  The rest of the
+    divergence taxonomy keeps its established types: content-hash divergence
+    raises ``BlobIntegrityError``, non-ready blobs raise ``BlobStateError``,
+    and cross-session blobs are indistinguishable from genuinely-missing ones
+    (``BlobNotFoundError``) so no foreign metadata is ever an oracle.
+    """
+
+
 class UnresolvedInterpretationPlaceholderError(Exception):
     """Raised when /execute encounters an LLM transform whose prompt_template
     still carries one or more unresolved ``{{interpretation:<term>}}``

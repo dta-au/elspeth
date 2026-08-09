@@ -255,8 +255,8 @@ class TestDiscoverAllPlugins:
         from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 
         # Expected counts verified during migration from hookimpl files
-        EXPECTED_SOURCE_COUNT = 8  # Existing seven sources plus llm
-        EXPECTED_TRANSFORM_COUNT = 32  # Existing 29 plus two AWS Bedrock Guardrails and Amazon Textract
+        EXPECTED_SOURCE_COUNT = 9  # Seven original sources plus llm plus blob_rows (elspeth-0c6a343921)
+        EXPECTED_TRANSFORM_COUNT = 33  # Existing 29 plus two AWS Bedrock Guardrails and two Amazon Textract (async + inline)
         EXPECTED_SINK_COUNT = 9  # csv, json, text, document, database, aws_s3, azure_blob, dataverse, chroma_sink
 
         discovered = discover_all_plugins()

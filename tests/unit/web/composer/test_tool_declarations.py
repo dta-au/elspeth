@@ -315,6 +315,7 @@ class TestStep2RegistryAggregation:
             "update_blob",
             "delete_blob",
             "set_source_from_blob",
+            "set_source_from_blobs",
             "wire_blob_inline_ref",
         }
         assert declared == expected

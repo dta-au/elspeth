@@ -24,6 +24,7 @@ Some examples need setup or use multiple configurations:
 | `chroma_rag` | `./examples/chroma_rag/run.sh` |
 | `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
 | `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
+| `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
 | `multi_worker` | `./examples/multi_worker/run.sh` |
 | `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
 | `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
@@ -114,6 +115,12 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 | [`azure_blob_sentiment`](azure_blob_sentiment/) | Azure Blob Storage source with LLM processing |
 | [`azure_keyvault_secrets`](azure_keyvault_secrets/) | Secret resolution from Azure Key Vault |
 | [`multi_query_assessment`](multi_query_assessment/) | Azure-backed multi-query assessment matrix |
+
+### AWS (requires AWS credentials)
+
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`textract_inline`](textract_inline/) | Synchronous Amazon Textract analysis of local documents: stage JPEG/PNG/single-page PDF blobs, `blob_rows` custody rows, one billable audited `AnalyzeDocument` per row |
 
 ### ChaosLLM / ChaosWeb (local fault injection — no provider API keys needed)
 

@@ -550,6 +550,101 @@ def normalize_textract_result(
     assert page_count is not None
     assert model_version is not None
 
+    return _normalize_block_graph(
+        blocks,
+        page_count=page_count,
+        max_result_bytes=max_result_bytes,
+        native_result_head={
+            "JobStatus": "SUCCEEDED",
+            "DocumentMetadata": {"Pages": page_count},
+            "AnalyzeDocumentModelVersion": model_version,
+            "Warnings": native_warnings,
+        },
+        metadata={
+            "job_id": job_id,
+            "job_status": "SUCCEEDED",
+            "page_count": page_count,
+            "block_count": len(blocks),
+            "model_version": model_version,
+            "warnings": metadata_warnings,
+            "feature_types": list(feature_types),
+            "s3_version": s3_version,
+        },
+    )
+
+
+def normalize_analyze_document_result(
+    *,
+    response: Mapping[str, Any],
+    feature_types: tuple[str, ...],
+    max_blocks: int,
+    max_result_bytes: int,
+) -> NormalizedTextractResult:
+    """Validate one synchronous ``AnalyzeDocument`` response and normalize it.
+
+    The synchronous response carries no job identity, ``JobStatus``, or
+    ``Warnings`` member. ``HumanLoopActivationOutput`` is a malformed known
+    response rather than an ignorable unknown: the inline plugin never sends
+    ``HumanLoopConfig``, so its presence means this is not the response to the
+    request the plugin constructed. Other unknown top-level members are
+    omitted because their stable output meaning is undefined. Page-count
+    policy (the inline plugin's ``Pages == 1`` rule) belongs to the caller;
+    this parser stays general so both Textract plugins share one graph
+    validator.
+    """
+    result = _mapping(response, "response")
+    if "HumanLoopActivationOutput" in result:
+        _malformed("response.HumanLoopActivationOutput", "human-loop activation output is unsupported")
+    document_metadata = _mapping(result.get("DocumentMetadata"), "response.DocumentMetadata")
+    if "Pages" not in document_metadata:
+        _malformed("response.DocumentMetadata", "missing required key Pages")
+    page_count = _bounded_int(
+        document_metadata["Pages"],
+        "response.DocumentMetadata.Pages",
+        maximum=_MAX_DOCUMENT_PAGES,
+    )
+    model_version = _required_str(result, "AnalyzeDocumentModelVersion", "response", max_length=128)
+    raw_blocks = _sequence(result.get("Blocks"), "response.Blocks")
+    blocks: list[Mapping[str, Any]] = []
+    for block_offset, raw_block in enumerate(raw_blocks):
+        blocks.append(_mapping(raw_block, f"response.Blocks[{block_offset}]"))
+        if len(blocks) > max_blocks:
+            _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
+
+    return _normalize_block_graph(
+        blocks,
+        page_count=page_count,
+        max_result_bytes=max_result_bytes,
+        native_result_head={
+            "DocumentMetadata": {"Pages": page_count},
+            "AnalyzeDocumentModelVersion": model_version,
+        },
+        metadata={
+            "page_count": page_count,
+            "block_count": len(blocks),
+            "model_version": model_version,
+            "feature_types": list(feature_types),
+        },
+    )
+
+
+def _normalize_block_graph(
+    blocks: list[Mapping[str, Any]],
+    *,
+    page_count: int,
+    max_result_bytes: int,
+    native_result_head: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+) -> NormalizedTextractResult:
+    """Shared block-graph validation, projection, and native-aggregate core.
+
+    Both entry points collect their operation-specific envelope (job pages vs
+    the single synchronous response) and delegate here, so the graph rules —
+    duplicate IDs, dangling relationships, child-graph acyclicity, PAGE
+    numbering, byte bounds — cannot drift between the two Textract plugins.
+    ``native_result_head`` carries the operation-shaped members in insertion
+    order; ``Blocks`` is always appended last.
+    """
     block_index: dict[str, Mapping[str, Any]] = {}
     for index, block in enumerate(blocks):
         path = f"Blocks[{index}]"
@@ -572,13 +667,7 @@ def normalize_textract_result(
         _malformed("Blocks", "PAGE block numbering does not match DocumentMetadata.Pages")
 
     copied_blocks = [deep_thaw(block) for block in blocks]
-    native_result: dict[str, Any] = {
-        "JobStatus": "SUCCEEDED",
-        "DocumentMetadata": {"Pages": page_count},
-        "AnalyzeDocumentModelVersion": model_version,
-        "Warnings": native_warnings,
-        "Blocks": copied_blocks,
-    }
+    native_result: dict[str, Any] = {**native_result_head, "Blocks": copied_blocks}
     try:
         result_size = len(canonical_json(native_result).encode("utf-8"))
     except (TypeError, ValueError, RecursionError, UnicodeError) as error:
@@ -593,16 +682,6 @@ def normalize_textract_result(
     signatures = _project_signatures(blocks)
     layout = _project_layout(blocks, block_index)
     text = "\n\f\n".join(page["text"] for page in pages)
-    metadata = {
-        "job_id": job_id,
-        "job_status": "SUCCEEDED",
-        "page_count": page_count,
-        "block_count": len(blocks),
-        "model_version": model_version,
-        "warnings": metadata_warnings,
-        "feature_types": list(feature_types),
-        "s3_version": s3_version,
-    }
     return NormalizedTextractResult(
         text=text,
         page_count=page_count,

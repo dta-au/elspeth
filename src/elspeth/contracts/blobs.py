@@ -29,10 +29,47 @@ AllowedMimeType = Literal[
     "application/jsonl",
     "text/jsonl",
 ]
-"""Closed set of MIME types accepted for data-oriented blob uploads."""
+"""Closed set of MIME types accepted for data-oriented blob uploads.
+
+Deliberately EXCLUDES the binary document set: every text consumer —
+decoders, the string-content ``create_blob``/``update_blob`` tools, inline
+content resolution — keeps rejecting binary MIME values by construction.
+Binary documents enter only through the authenticated upload/paste
+boundary (elspeth-0c6a343921)."""
 
 ALLOWED_MIME_TYPES: frozenset[str] = frozenset(get_args(AllowedMimeType))
 """Runtime view derived from ``AllowedMimeType`` to prevent drift."""
+
+BinaryDocumentMimeType = Literal[
+    "image/jpeg",
+    "image/png",
+    "application/pdf",
+]
+"""Closed set of MIME types for binary document blobs (Textract inline)."""
+
+BINARY_DOCUMENT_MIME_TYPES: frozenset[str] = frozenset(get_args(BinaryDocumentMimeType))
+"""Runtime view derived from ``BinaryDocumentMimeType`` to prevent drift."""
+
+StorageMimeType = Literal[
+    "text/csv",
+    "text/plain",
+    "application/json",
+    "application/x-jsonlines",
+    "application/jsonl",
+    "text/jsonl",
+    "image/jpeg",
+    "image/png",
+    "application/pdf",
+]
+"""Storage-level union: what a persisted managed blob may declare.
+
+Mirrors the blobs-table MIME CHECK constraint. Kept as an explicit Literal
+(rather than a type alias union) so ``get_args`` yields the flat member
+set; the derivation test pins it equal to the union of the two derived
+closed sets."""
+
+STORAGE_MIME_TYPES: frozenset[str] = frozenset(get_args(StorageMimeType))
+"""Runtime view derived from ``StorageMimeType`` to prevent drift."""
 
 BlobStatus = Literal["ready", "pending", "error"]
 FinalizeBlobStatus = Literal["ready", "error"]
@@ -144,7 +181,7 @@ class BlobRecord:
     id: UUID
     session_id: UUID
     filename: str
-    mime_type: AllowedMimeType
+    mime_type: StorageMimeType
     size_bytes: int
     content_hash: str | None
     storage_path: str
@@ -420,7 +457,7 @@ class BlobServiceProtocol(Protocol):
         session_id: UUID,
         filename: str,
         content: bytes,
-        mime_type: AllowedMimeType,
+        mime_type: StorageMimeType,
         created_by: BlobCreator = "user",
         source_description: str | None = None,
     ) -> BlobRecord:

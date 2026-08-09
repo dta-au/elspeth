@@ -24,7 +24,7 @@ from tests.fixtures.catalog_reference import (
     parse_and_validate_example,
 )
 
-EXPECTED_SOURCE_NAMES = {"aws_s3", "azure_blob", "csv", "dataverse", "json", "llm", "null", "text"}
+EXPECTED_SOURCE_NAMES = {"aws_s3", "azure_blob", "blob_rows", "csv", "dataverse", "json", "llm", "null", "text"}
 SOURCE_REFERENCES = tuple(reference for reference in discover_builtin_references() if reference.kind == "source")
 SOURCES_BY_NAME = {reference.plugin_cls.name: reference for reference in SOURCE_REFERENCES}
 

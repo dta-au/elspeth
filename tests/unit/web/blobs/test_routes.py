@@ -183,14 +183,16 @@ class TestUploadBlob:
         assert "storage_path" not in body
 
     def test_upload_blob_rejects_disallowed_mime_type(self, tmp_path) -> None:
-        """MIME allowlist: image/jpeg is not a data format."""
+        """MIME allowlist: image/gif is neither a data format nor an
+        approved binary document (jpeg/png/pdf are admitted since
+        elspeth-0c6a343921 through the signature-verified binary branch)."""
         app, _, _ = _make_app(tmp_path)
         client = TestClient(app)
         session_id = _create_session(client)
 
         resp = client.post(
             f"/api/sessions/{session_id}/blobs",
-            files={"file": ("photo.jpg", io.BytesIO(b"\xff\xd8\xff"), "image/jpeg")},
+            files={"file": ("anim.gif", io.BytesIO(b"GIF89a\x00"), "image/gif")},
         )
         assert resp.status_code == 415
 
@@ -815,3 +817,129 @@ class TestUTF16Uploads:
         )
         assert resp.status_code == 201, resp.text
         assert resp.json()["mime_type"] == "text/plain"
+
+
+# ---------------------------------------------------------------------------
+# Binary-document admission (elspeth-0c6a343921): jpeg/png/pdf uploads under
+# normal blob custody, signature-verified against the DECLARED MIME type.
+# ---------------------------------------------------------------------------
+
+_JPEG_BYTES = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_PDF_BYTES = b"%PDF-1.7\n1 0 obj\n%%EOF"
+
+
+class TestBinaryDocumentUpload:
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "content"),
+        [
+            ("page-1.jpg", "image/jpeg", _JPEG_BYTES),
+            ("page-1.png", "image/png", _PNG_BYTES),
+            ("doc.pdf", "application/pdf", _PDF_BYTES),
+        ],
+    )
+    def test_valid_binary_upload_admitted_with_full_provenance(self, tmp_path, filename: str, content_type: str, content: bytes) -> None:
+        import hashlib
+
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        body = _upload_blob(client, session_id, content=content, filename=filename, content_type=content_type)
+
+        assert body["mime_type"] == content_type
+        assert body["size_bytes"] == len(content)
+        assert body["content_hash"] == hashlib.sha256(content).hexdigest()
+        assert body["status"] == "ready"
+        assert body["created_by"] == "user"
+        assert body["source_description"] == "uploaded"
+
+    def test_empty_binary_body_rejected(self, tmp_path) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("empty.png", io.BytesIO(b""), "image/png")},
+        )
+        assert resp.status_code == 422
+
+    def test_binary_over_textract_inline_ceiling_rejected(self, tmp_path) -> None:
+        from elspeth.contracts.binary_documents import BINARY_DOCUMENT_MAX_BYTES
+
+        # App-level limit above the binary ceiling so THIS gate is the one
+        # that fires (the general limit is a separate 413).
+        app, _, _ = _make_app(tmp_path, max_upload_bytes=BINARY_DOCUMENT_MAX_BYTES + 1024)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        oversized = _PNG_BYTES + b"\x00" * BINARY_DOCUMENT_MAX_BYTES
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("big.png", io.BytesIO(oversized), "image/png")},
+        )
+        assert resp.status_code == 413
+        assert "Textract inline ceiling" in resp.json()["detail"]
+
+    @pytest.mark.parametrize(
+        ("filename", "content_type", "content"),
+        [
+            # A different known signature is a mismatch, never a reclassification.
+            ("fake.png", "image/png", _JPEG_BYTES),
+            ("fake.jpg", "image/jpeg", _PNG_BYTES),
+            # Leading bytes defeat the offset-zero rule.
+            ("bom.pdf", "application/pdf", b"\xef\xbb\xbf" + _PDF_BYTES),
+            ("space.pdf", "application/pdf", b" " + _PDF_BYTES),
+            # An embedded signature later in the payload does not count.
+            ("embedded.pdf", "application/pdf", b"garbage" + _PDF_BYTES),
+            # Truncated signature.
+            ("short.jpg", "image/jpeg", b"\xff\xd8"),
+        ],
+    )
+    def test_signature_disagreement_rejected(self, tmp_path, filename: str, content_type: str, content: bytes) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": (filename, io.BytesIO(content), content_type)},
+        )
+        assert resp.status_code == 415
+        assert "signature" in resp.json()["detail"].lower()
+
+    def test_unsupported_binary_mime_stays_rejected(self, tmp_path) -> None:
+        """TIFF is a non-goal: it falls through to the text path's 415."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs",
+            files={"file": ("doc.tiff", io.BytesIO(b"II*\x00rest"), "image/tiff")},
+        )
+        assert resp.status_code == 415
+
+    def test_inline_text_route_rejects_binary_mime(self, tmp_path) -> None:
+        """The string-content inline route keeps its text-only vocabulary."""
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "x.png", "mime_type": "image/png", "content": "not really binary"},
+        )
+        assert resp.status_code == 422
+
+    def test_binary_blob_downloads_byte_identical(self, tmp_path) -> None:
+        app, _, _ = _make_app(tmp_path)
+        client = TestClient(app)
+        session_id = _create_session(client)
+        body = _upload_blob(client, session_id, content=_PDF_BYTES, filename="doc.pdf", content_type="application/pdf")
+
+        resp = client.get(f"/api/sessions/{session_id}/blobs/{body['id']}/content")
+        assert resp.status_code == 200
+        assert resp.content == _PDF_BYTES
+        assert resp.headers["content-type"].startswith("application/pdf")

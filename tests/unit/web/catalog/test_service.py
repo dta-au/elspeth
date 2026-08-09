@@ -57,7 +57,7 @@ class TestCatalogService:
             ("transform", catalog.list_transforms(), plugin_manager.get_transforms()),
             ("sink", catalog.list_sinks(), plugin_manager.get_sinks()),
         )
-        assert sum(len(summaries) for _, summaries, _ in groups) == 49
+        assert sum(len(summaries) for _, summaries, _ in groups) == 51
 
         for kind, summaries, plugin_classes in groups:
             classes_by_name = {plugin_cls.name: plugin_cls for plugin_cls in plugin_classes}

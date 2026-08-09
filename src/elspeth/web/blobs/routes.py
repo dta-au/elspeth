@@ -14,10 +14,16 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import Response
 
+from elspeth.contracts.binary_documents import (
+    BINARY_DOCUMENT_FORMAT_BY_MIME,
+    BINARY_DOCUMENT_MAX_BYTES,
+    binary_document_signature_matches,
+)
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.protocol import (
     ALLOWED_MIME_TYPES,
+    BINARY_DOCUMENT_MIME_TYPES,
     AllowedMimeType,
     BlobActiveRunError,
     BlobContentMissingError,
@@ -28,6 +34,7 @@ from elspeth.web.blobs.protocol import (
     BlobQuotaExceededError,
     BlobRecord,
     BlobStateError,
+    StorageMimeType,
 )
 from elspeth.web.blobs.schemas import BlobMetadataResponse, CreateInlineBlobRequest
 from elspeth.web.blobs.service import BlobServiceImpl, sanitize_filename
@@ -150,6 +157,39 @@ def create_blobs_router() -> APIRouter:
                 )
             chunks.append(chunk)
         content = b"".join(chunks)
+
+        if mime_type in BINARY_DOCUMENT_MIME_TYPES:
+            # Binary-document admission (elspeth-0c6a343921). The DECLARED
+            # MIME type chooses the signature rule; the byte signature
+            # proves agreement — it never reclassifies. No text sniffing,
+            # no local PDF parsing (the successful Textract response is the
+            # page-count authority).
+            if not content:
+                raise HTTPException(status_code=422, detail="Binary document upload must not be empty")
+            if total_size > BINARY_DOCUMENT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Binary document exceeds the {BINARY_DOCUMENT_MAX_BYTES}-byte Textract inline ceiling",
+                )
+            declared_format = BINARY_DOCUMENT_FORMAT_BY_MIME[mime_type]
+            if not binary_document_signature_matches(declared_format, content):
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"Content signature does not match declared type '{mime_type}'",
+                )
+            binary_mime_typed = cast(StorageMimeType, mime_type)
+            try:
+                record = await blob_service.create_blob(
+                    session_id=session_id,
+                    filename=original_filename,
+                    content=content,
+                    mime_type=binary_mime_typed,
+                    created_by="user",
+                    source_description="uploaded",
+                )
+            except BlobQuotaExceededError as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from None
+            return _blob_response(record)
 
         # Server-side MIME detection — reject if declared type doesn't
         # match detected content (defense-in-depth, client MIME is untrusted)

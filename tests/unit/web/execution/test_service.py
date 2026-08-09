@@ -57,10 +57,22 @@ from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_attributions_table, runs_table
 from elspeth.telemetry.manager import TelemetryManager
-from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobNotFoundError, BlobRecord, BlobServiceProtocol
+from elspeth.web.blobs.protocol import (
+    BlobFinalizationResult,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobRecord,
+    BlobServiceProtocol,
+    BlobStateError,
+)
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
-from elspeth.web.execution.errors import CompletionGateIntegrityError, ExecutionReadinessError, PipelineValidationError
+from elspeth.web.execution.errors import (
+    BlobRowsSourceAdmissionError,
+    CompletionGateIntegrityError,
+    ExecutionReadinessError,
+    PipelineValidationError,
+)
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.schemas import (
@@ -4083,6 +4095,367 @@ sinks:
         blob_service.link_blob_to_run.assert_not_awaited()
         blob_service.read_blob_content.assert_not_awaited()
         mock_session_service.record_blob_inline_resolutions.assert_not_called()
+
+
+def _blob_rows_pipeline_yaml(entries: list[dict[str, Any]], *, singular: bool = False) -> str:
+    """Build a blob_rows pipeline config as JSON (a YAML subset)."""
+    source_block = {
+        "plugin": "blob_rows",
+        "on_success": "docs",
+        "options": {
+            "blobs": entries,
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    }
+    config: dict[str, Any] = {
+        "sinks": {"primary": {"plugin": "json", "options": {"path": "output.jsonl"}}},
+    }
+    if singular:
+        config["source"] = source_block
+    else:
+        config["sources"] = {"documents": source_block}
+    return json.dumps(config)
+
+
+def _blob_rows_entry(content: bytes, *, blob_id: UUID, filename: str = "page-1.png", mime_type: str = "image/png") -> dict[str, Any]:
+    return {
+        "blob_id": str(blob_id),
+        "payload_ref": hashlib.sha256(content).hexdigest(),
+        "filename": filename,
+        "mime_type": mime_type,
+        "size_bytes": len(content),
+    }
+
+
+def _blob_rows_record_for_entry(entry: dict[str, Any], *, session_id: UUID, **overrides: Any) -> BlobRecord:
+    values: dict[str, Any] = {
+        "blob_id": UUID(entry["blob_id"]),
+        "session_id": session_id,
+        "filename": entry["filename"],
+        "mime_type": entry["mime_type"],
+        "size_bytes": entry["size_bytes"],
+        "content_hash": entry["payload_ref"],
+        "status": "ready",
+    }
+    values.update(overrides)
+    return _blob_record_stub(**values)
+
+
+@pytest.mark.usefixtures("mock_pipeline_config_assembly")
+class TestBlobRowsRuntimeAdmission:
+    """Run admission re-resolves persisted blob_rows entries and stages bytes.
+
+    The sessions DB persists the plural binding's entries, but the session's
+    blob records stay the run-time authority: every entry is re-resolved
+    session-scoped (foreign == missing), any divergence fails admission
+    before linking, and admitted content is staged into the run's payload
+    store — integrity-checked at read and hash-bound at store — before the
+    orchestrator runs (elspeth-0c6a343921).
+    """
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_admits_links_and_stages_blob_rows_in_order(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls
+        owner_session = uuid4()
+        run_id = uuid4()
+        contents = [b"\x89PNG\r\n\x1a\npayload-one", b"\xff\xd8\xff\xe0payload-two"]
+        blob_ids = [uuid4(), uuid4()]
+        entries = [
+            _blob_rows_entry(contents[0], blob_id=blob_ids[0], filename="page-1.png", mime_type="image/png"),
+            _blob_rows_entry(contents[1], blob_id=blob_ids[1], filename="page-2.jpg", mime_type="image/jpeg"),
+        ]
+        records_by_id = {blob_ids[i]: _blob_rows_record_for_entry(entries[i], session_id=owner_session) for i in range(2)}
+        content_by_id = dict(zip(blob_ids, contents, strict=True))
+        order: list[str] = []
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+
+        async def get_blob(blob_id: UUID) -> BlobRecord:
+            order.append("metadata")
+            return records_by_id[blob_id]
+
+        async def link_blob_to_run(**_kwargs: Any) -> None:
+            order.append("link")
+
+        async def read_blob_content(blob_id: UUID) -> bytes:
+            order.append("read")
+            return content_by_id[blob_id]
+
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.side_effect = get_blob
+        blob_service.link_blob_to_run.side_effect = link_blob_to_run
+        blob_service.read_blob_content.side_effect = read_blob_content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        stored_contents: list[bytes] = []
+
+        def store(content: bytes) -> str:
+            order.append("store")
+            stored_contents.append(content)
+            return hashlib.sha256(content).hexdigest()
+
+        mock_payload_cls.return_value.store.side_effect = store
+
+        def load_settings(_config_dict: dict[str, Any], *, expand_env_vars: bool = True) -> SimpleNamespace:
+            del expand_env_vars
+            order.append("load")
+            return _mock_pipeline_settings()
+
+        mock_load.side_effect = load_settings
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        mock_orch_cls.return_value = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=2, rows_succeeded=2))
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(str(run_id), _blob_rows_pipeline_yaml(entries), threading.Event())
+
+        # Both blobs linked as inputs, both staged, in authoring order.
+        assert blob_service.link_blob_to_run.await_count == 2
+        linked_ids = [call.kwargs["blob_id"] for call in blob_service.link_blob_to_run.await_args_list]
+        assert sorted(linked_ids, key=str) == sorted(blob_ids, key=str)
+        assert all(call.kwargs["direction"] == "input" for call in blob_service.link_blob_to_run.await_args_list)
+        assert all(call.kwargs["run_id"] == run_id for call in blob_service.link_blob_to_run.await_args_list)
+        assert stored_contents == contents
+        # Admission (metadata + link) precedes settings/plugin construction;
+        # staging (read + store) happens after, against the run's own store.
+        assert max(i for i, step in enumerate(order) if step == "link") < order.index("load")
+        assert order.index("load") < order.index("read") < order.index("store")
+
+    @pytest.mark.parametrize("case", ["missing", "cross_session"])
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_cross_session_blob_rows_entry_reads_as_missing(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        case: str,
+    ) -> None:
+        """IDOR contract: a foreign blob is byte-identical in *type* to a
+        genuinely-missing one, and no foreign metadata (status/hash/size) is
+        ever compared, linked, or read — so nothing about another session's
+        blob is an oracle."""
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\nforeign-payload"
+        blob_id = uuid4()
+        entry = _blob_rows_entry(content, blob_id=blob_id)
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        if case == "missing":
+
+            async def get_blob(_blob_id: UUID) -> BlobRecord:
+                raise BlobNotFoundError(str(_blob_id))
+
+            blob_service.get_blob.side_effect = get_blob
+        else:
+            # Fully consistent record — hash, filename, size all match — but
+            # owned by a DIFFERENT session. Must be indistinguishable from missing.
+            blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=uuid4())
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(BlobNotFoundError):
+            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("overrides", "expected_error", "match"),
+        [
+            ({"content_hash": "b" * 64}, BlobIntegrityError, None),
+            ({"status": "pending"}, BlobStateError, "expected 'ready'"),
+            ({"filename": "renamed.png"}, BlobRowsSourceAdmissionError, "filename"),
+            ({"mime_type": "image/jpeg"}, BlobRowsSourceAdmissionError, "mime_type"),
+            ({"size_bytes": 1}, BlobRowsSourceAdmissionError, "size_bytes"),
+        ],
+    )
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_divergent_blob_rows_entry_fails_admission_before_link(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        overrides: dict[str, Any],
+        expected_error: type[Exception],
+        match: str | None,
+    ) -> None:
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\ndiverged-payload"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session, **overrides)
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(expected_error, match=match):
+            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+
+        blob_service.link_blob_to_run.assert_not_awaited()
+        blob_service.read_blob_content.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_malformed_blob_rows_entry_fails_before_any_blob_access(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls, mock_load, mock_runtime_graph, mock_orch_cls
+        content = b"\x89PNG\r\n\x1a\nmalformed-entry"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+        del entry["payload_ref"]
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=uuid4())
+        blob_service = _blob_service_stub()
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+
+        with pytest.raises(BlobRowsSourceAdmissionError, match=r"blobs\[0\] failed validation"):
+            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+
+        blob_service.get_blob.assert_not_awaited()
+        blob_service.link_blob_to_run.assert_not_awaited()
+        mock_payload_cls.return_value.store.assert_not_called()
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_singular_source_form_is_admitted(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        del mock_landscape_cls
+        owner_session = uuid4()
+        run_id = uuid4()
+        content = b"\x89PNG\r\n\x1a\nsingular-form"
+        blob_id = uuid4()
+        entry = _blob_rows_entry(content, blob_id=blob_id)
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session)
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+        mock_payload_cls.return_value.store.return_value = hashlib.sha256(content).hexdigest()
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        mock_orch_cls.return_value = _orchestrator_stub(_orchestrator_result_stub(run_id=str(run_id), rows_processed=1, rows_succeeded=1))
+
+        with patch(
+            "elspeth.web.execution.service.load_run_accounting_from_db",
+            return_value=_run_accounting_for_status(RunStatus.COMPLETED),
+        ):
+            service._run_pipeline(str(run_id), _blob_rows_pipeline_yaml([entry], singular=True), threading.Event())
+
+        blob_service.link_blob_to_run.assert_awaited_once_with(blob_id=blob_id, run_id=run_id, direction="input")
+        mock_payload_cls.return_value.store.assert_called_once_with(content)
+
+    @patch("elspeth.web.execution.service.Orchestrator")
+    @patch("elspeth.web.execution.service.build_validated_runtime_graph")
+    @patch("elspeth.web.execution.service.load_settings_from_config_dict")
+    @patch("elspeth.web.execution.service.open_landscape_db")
+    @patch("elspeth.web.execution.service.FilesystemPayloadStore")
+    def test_store_hash_divergence_fails_the_run(
+        self,
+        mock_payload_cls: MagicMock,
+        mock_landscape_cls: MagicMock,
+        mock_load: MagicMock,
+        mock_runtime_graph: MagicMock,
+        mock_orch_cls: MagicMock,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Tier-1 bind between the two stores: if the payload store reports a
+        different content hash than the admitted payload_ref, the run fails
+        before the orchestrator ever starts."""
+        owner_session = uuid4()
+        content = b"\x89PNG\r\n\x1a\nstore-divergence"
+        entry = _blob_rows_entry(content, blob_id=uuid4())
+
+        mock_session_service.get_run.return_value = _run_record_stub(status="running", session_id=owner_session)
+        blob_service = _blob_service_stub()
+        blob_service.get_blob.return_value = _blob_rows_record_for_entry(entry, session_id=owner_session)
+        blob_service.link_blob_to_run.return_value = None
+        blob_service.read_blob_content.return_value = content
+        blob_service.finalize_run_output_blobs.return_value = BlobFinalizationResult(finalized=(), errors=())
+        cast(Any, service)._blob_service = blob_service
+        mock_payload_cls.return_value.store.return_value = "c" * 64
+        mock_load.return_value = _mock_pipeline_settings()
+        mock_runtime_graph.return_value = SimpleNamespace(
+            plugin_bundle=_plugin_bundle_stub(),
+            graph=_execution_graph_stub(),
+        )
+        orchestrator = _orchestrator_stub()
+        mock_orch_cls.return_value = orchestrator
+
+        with pytest.raises(BlobIntegrityError):
+            service._run_pipeline(str(uuid4()), _blob_rows_pipeline_yaml([entry]), threading.Event())
+
+        orchestrator.run.assert_not_called()
 
 
 class TestWebRuntimeConfigLoading:

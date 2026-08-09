@@ -69,6 +69,10 @@ _EXAMPLES_WITH_FILE_REFS: frozenset[str] = frozenset(
 _EXAMPLES_WITHOUT_SETTINGS: frozenset[str] = frozenset(
     {
         "chaosllm",  # Contains only responses.jsonl (replay data)
+        # settings.generated.yaml is produced (and gitignored) by
+        # scripts/prepare_document_blobs.py from operator-staged documents;
+        # there is no meaningful static pipeline to ship.
+        "textract_inline",
     }
 )
 
