@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -368,6 +368,110 @@ def _apply_runtime_expression(expression: ast.AST, bindings: dict[str, BindingTa
         _apply_runtime_expression(child, bindings)
 
 
+def _walk_assignment_target(
+    target: ast.expr,
+    value: ast.expr | None,
+    *,
+    visit_expression: Callable[[ast.expr], None],
+    bind_name: Callable[[ast.Name, ast.expr | None], None],
+) -> None:
+    if isinstance(target, (ast.Tuple, ast.List)):
+        value_elements = value.elts if isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(target.elts) else None
+        for index, element in enumerate(target.elts):
+            element_value = value_elements[index] if value_elements is not None else None
+            _walk_assignment_target(element, element_value, visit_expression=visit_expression, bind_name=bind_name)
+        return
+    if isinstance(target, ast.Starred):
+        _walk_assignment_target(target.value, None, visit_expression=visit_expression, bind_name=bind_name)
+        return
+    if isinstance(target, ast.Name):
+        bind_name(target, value)
+        return
+    _walk_store_target_expressions(target, visit_expression=visit_expression)
+
+
+def _walk_store_target_expressions(
+    target: ast.expr,
+    *,
+    visit_expression: Callable[[ast.expr], None],
+) -> None:
+    if isinstance(target, ast.Attribute):
+        visit_expression(target.value)
+        return
+    if isinstance(target, ast.Subscript):
+        visit_expression(target.value)
+        visit_expression(target.slice)
+        return
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _walk_store_target_expressions(element, visit_expression=visit_expression)
+        return
+    if isinstance(target, ast.Starred):
+        _walk_store_target_expressions(target.value, visit_expression=visit_expression)
+
+
+def _walk_control_target(
+    target: ast.expr,
+    *,
+    visit_expression: Callable[[ast.expr], None],
+    bind_name: Callable[[ast.Name], None],
+) -> None:
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            _walk_control_target(element, visit_expression=visit_expression, bind_name=bind_name)
+        return
+    if isinstance(target, ast.Starred):
+        _walk_control_target(target.value, visit_expression=visit_expression, bind_name=bind_name)
+        return
+    if isinstance(target, ast.Name):
+        bind_name(target)
+        return
+    _walk_store_target_expressions(target, visit_expression=visit_expression)
+
+
+def _apply_runtime_assignment_target(
+    target: ast.expr,
+    value: ast.expr | None,
+    bindings: dict[str, BindingTargets],
+    value_bindings: dict[str, BindingTargets],
+) -> None:
+    def bind_name(name: ast.Name, assigned_value: ast.expr | None) -> None:
+        if assigned_value is None:
+            bindings[name.id] = frozenset({_SHADOWED_BINDING})
+        else:
+            targets = _resolve_binding_expression(assigned_value, value_bindings)
+            bindings[name.id] = targets or frozenset({_SHADOWED_BINDING})
+
+    _walk_assignment_target(
+        target,
+        value,
+        visit_expression=lambda expression: _apply_runtime_expression(expression, bindings),
+        bind_name=bind_name,
+    )
+
+
+def _apply_runtime_store_target_expressions(target: ast.expr, bindings: dict[str, BindingTargets]) -> None:
+    _walk_store_target_expressions(
+        target,
+        visit_expression=lambda expression: _apply_runtime_expression(expression, bindings),
+    )
+
+
+def _apply_runtime_control_target(
+    target: ast.expr,
+    target_bindings: dict[str, BindingTargets],
+    bindings: dict[str, BindingTargets],
+) -> None:
+    def bind_name(name: ast.Name) -> None:
+        bindings[name.id] = target_bindings.get(name.id, frozenset({_SHADOWED_BINDING}))
+
+    _walk_control_target(
+        target,
+        visit_expression=lambda expression: _apply_runtime_expression(expression, bindings),
+        bind_name=bind_name,
+    )
+
+
 def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, BindingTargets]) -> dict[str, BindingTargets]:
     bindings = dict(incoming)
     for node in nodes:
@@ -384,11 +488,15 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
                 bindings[name] = frozenset({import_target})
         elif isinstance(node, ast.Assign):
             _apply_runtime_expression(node.value, bindings)
+            value_bindings = dict(bindings)
             for assignment_target in node.targets:
-                _bind_runtime_value(assignment_target, node.value, bindings)
-        elif isinstance(node, ast.AnnAssign) and node.value is not None:
-            _apply_runtime_expression(node.value, bindings)
-            _bind_runtime_value(node.target, node.value, bindings)
+                _apply_runtime_assignment_target(assignment_target, node.value, bindings, value_bindings)
+        elif isinstance(node, ast.AnnAssign):
+            if node.value is None:
+                _apply_runtime_store_target_expressions(node.target, bindings)
+            else:
+                _apply_runtime_expression(node.value, bindings)
+                _apply_runtime_assignment_target(node.target, node.value, bindings, dict(bindings))
         elif isinstance(node, ast.Delete):
             for deletion_target in node.targets:
                 for name in assignment_target_names(deletion_target):
@@ -418,9 +526,8 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
             _apply_runtime_expression(node.iter if isinstance(node, (ast.For, ast.AsyncFor)) else node.test, bindings)
             body_entry = dict(bindings)
             if isinstance(node, (ast.For, ast.AsyncFor)):
-                for name in assignment_target_names(node.target):
-                    body_entry[name] = frozenset({_SHADOWED_BINDING})
-                body_entry.update(_target_bindings_from_iterable(node.target, node.iter, bindings))
+                target_bindings = _target_bindings_from_iterable(node.target, node.iter, bindings)
+                _apply_runtime_control_target(node.target, target_bindings, body_entry)
             body = _runtime_bindings_after(node.body, body_entry)
             joined = _join_binding_states((bindings, body))
             orelse = _runtime_bindings_after(node.orelse, joined) if node.orelse else body
@@ -433,6 +540,12 @@ def _runtime_bindings_after(nodes: Sequence[ast.stmt], incoming: dict[str, Bindi
             bindings = _join_binding_states(states)
             if node.finalbody:
                 bindings = _runtime_bindings_after(node.finalbody, bindings)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                _apply_runtime_expression(item.context_expr, bindings)
+                if item.optional_vars is not None:
+                    _apply_runtime_control_target(item.optional_vars, {}, bindings)
+            bindings = _runtime_bindings_after(node.body, bindings)
         else:
             _apply_runtime_expression(node, bindings)
     return bindings
@@ -623,15 +736,13 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         outer_mutations: set[str] = set()
         self._comprehension_mutation_stack.append(outer_mutations)
         try:
-            self._bind_unknown(assignment_target_names(first.target))
-            self._bindings.update(first_bindings)
+            self._visit_control_target(first.target, first_bindings)
             for condition in first.ifs:
                 self.visit(condition)
             for generator in remaining:
                 self.visit(generator.iter)
                 generator_bindings = _target_bindings_from_iterable(generator.target, generator.iter, self._bindings)
-                self._bind_unknown(assignment_target_names(generator.target))
-                self._bindings.update(generator_bindings)
+                self._visit_control_target(generator.target, generator_bindings)
                 for condition in generator.ifs:
                     self.visit(condition)
             if isinstance(node, ast.DictComp):
@@ -755,15 +866,18 @@ class _MasqueradeVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
+        value_bindings = dict(self._bindings)
+        value_sources = set(self._source_names)
         for target in node.targets:
-            self._bind_assignment(target, node.value)
+            self._visit_assignment_target(target, node.value, value_bindings, value_sources)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         self.visit(node.annotation)
         if node.value is None:
-            return
-        self.visit(node.value)
-        self._bind_assignment(node.target, node.value)
+            self._visit_store_target_expressions(node.target)
+        else:
+            self.visit(node.value)
+            self._visit_assignment_target(node.target, node.value, dict(self._bindings), set(self._source_names))
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.target)
@@ -806,6 +920,44 @@ class _MasqueradeVisitor(ast.NodeVisitor):
             if source_value:
                 self._source_names.add(target.id)
 
+    def _visit_assignment_target(
+        self,
+        target: ast.expr,
+        value: ast.expr | None,
+        value_bindings: dict[str, BindingTargets],
+        value_sources: set[str],
+    ) -> None:
+        """Evaluate and apply one assignment target in CPython store order."""
+
+        def bind_name(name: ast.Name, assigned_value: ast.expr | None) -> None:
+            if assigned_value is None:
+                self._bind_unknown((name.id,))
+                return
+            targets = _resolve_binding_expression(assigned_value, value_bindings)
+            source_value = isinstance(assigned_value, ast.Name) and assigned_value.id in value_sources
+            self._bind_unknown((name.id,))
+            if targets:
+                self._bindings[name.id] = targets
+            if source_value:
+                self._source_names.add(name.id)
+
+        _walk_assignment_target(target, value, visit_expression=self.visit, bind_name=bind_name)
+
+    def _visit_control_target(self, target: ast.expr, bindings: dict[str, BindingTargets]) -> None:
+        """Evaluate a for/with target and apply its stores left to right."""
+
+        def bind_name(name: ast.Name) -> None:
+            self._bind_unknown((name.id,))
+            targets = bindings.get(name.id)
+            if targets:
+                self._bindings[name.id] = targets
+
+        _walk_control_target(target, visit_expression=self.visit, bind_name=bind_name)
+
+    def _visit_store_target_expressions(self, target: ast.expr) -> None:
+        """Visit only expressions Python evaluates while storing ``target``."""
+        _walk_store_target_expressions(target, visit_expression=self.visit)
+
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
         start = self._snapshot_state()
@@ -828,8 +980,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         start = self._snapshot_state()
         if target is not None:
             target_bindings = _target_bindings_from_iterable(target, header, self._bindings)
-            self._bind_unknown(assignment_target_names(target))
-            self._bindings.update(target_bindings)
+            self._visit_control_target(target, target_bindings)
         self._visit_statements(node.body)
         body_state = self._snapshot_state()
         body_transfers = _suite_transfer_kinds(node.body)
@@ -899,7 +1050,7 @@ class _MasqueradeVisitor(ast.NodeVisitor):
         for item in node.items:
             self.visit(item.context_expr)
             if item.optional_vars is not None:
-                self._bind_unknown(assignment_target_names(item.optional_vars))
+                self._visit_control_target(item.optional_vars, {})
         self._visit_statements(node.body)
 
     def visit_With(self, node: ast.With) -> None:

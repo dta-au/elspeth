@@ -62,6 +62,14 @@ sites against `config/cicd/masquerade_baseline.yaml`. Traps that have fired:
   reachable builtin target is still inventoried. Aliasing a builtin is not an
   escape hatch, and a rebound `@trust_boundary` source parameter no longer
   receives boundary amnesty.
+- Assignment targets are executable syntax: attribute receivers, subscript
+  containers and indices (including slices), and target-side named
+  expressions must be inventoried for ordinary/annotated assignments,
+  `for`/`async for`, `with`/`async with`, and comprehensions. Preserve CPython
+  order with the shared target walkers. For chained or destructured
+  assignment, freeze RHS binding/source evidence once before the first target
+  store; re-resolving the RHS after a target-side walrus creates paired false
+  positives and false negatives.
 
 ### 3. Trust-tier lint corpus (standing)
 

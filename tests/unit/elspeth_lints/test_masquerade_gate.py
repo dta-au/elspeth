@@ -743,6 +743,146 @@ def test_builtin_probe_aliases_cannot_escape_through_expression_bindings(source:
     assert [site.kind for site in iter_masquerade_sites(ast.parse(source), "src/elspeth/expression_alias.py")] == ["getattr"]
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "table[getattr(obj, 'field')] = value\n",
+        "getattr(repository, method_name).side_effect = failure\n",
+        "table[getattr(obj, 'field')]: int = value\n",
+        "table[getattr(obj, 'field')]: int\n",
+        "for table[getattr(obj, 'field')] in rows:\n    pass\n",
+        "async def run():\n    async for table[getattr(obj, 'field')] in rows:\n        pass\n",
+        "with manager() as table[getattr(obj, 'field')]:\n    pass\n",
+        "async def run():\n    async with manager() as table[getattr(obj, 'field')]:\n        pass\n",
+        "values = [value for table[getattr(obj, 'field')] in rows]\n",
+        "values = {value for table[getattr(obj, 'field')] in rows}\n",
+        "values = {key: value for table[getattr(obj, 'field')] in rows}\n",
+        "values = (value for table[getattr(obj, 'field')] in rows)\n",
+        "async def run():\n    return [value async for table[getattr(obj, 'field')] in rows]\n",
+    ],
+)
+def test_runtime_evaluated_store_targets_are_inventoried(source: str) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/store_target.py")
+
+    assert [site.kind for site in sites] == ["getattr"]
+
+
+def test_the_five_live_missed_store_target_shapes_are_all_inventoried() -> None:
+    targets = (
+        'trapped[getattr(cls, "name", cls.__name__)] = collisions',
+        "misclassified[f\"{getattr(cls, 'name', cls.__name__)}.{key}\"] = sentinel",
+        "unprotected[f\"{getattr(cls, 'name', cls.__name__)}.{key}\"] = value",
+        "lost[f\"{getattr(cls, 'name', cls.__name__)}.{knob}\"] = collide",
+        "getattr(auth_repository, repository_method).side_effect = failure",
+    )
+
+    builtin_sites = iter_masquerade_sites(ast.parse("\n".join(targets)), "tests/live_missed_targets.py")
+    shadowed_sites = iter_masquerade_sites(
+        ast.parse("from foreign import getattr\n" + "\n".join(targets)),
+        "tests/shadowed_live_missed_targets.py",
+    )
+
+    assert [(site.kind, site.line) for site in builtin_sites] == [("getattr", line) for line in range(1, 6)]
+    assert shadowed_sites == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_kinds"),
+    [
+        (
+            "from foreign import getattr as foreign_probe\ngetattr, table[getattr(obj, 'field')] = foreign_probe, value\n",
+            [],
+        ),
+        (
+            "from foreign import getattr\nimport builtins\ngetattr, table[getattr(obj, 'field')] = builtins.getattr, value\n",
+            ["getattr"],
+        ),
+        (
+            "from foreign import getattr as foreign_probe\n"
+            "first[(probe := getattr)(obj, 'first')] = second[probe(obj, 'second')] = value\n",
+            ["getattr", "getattr"],
+        ),
+    ],
+)
+def test_assignment_targets_apply_stores_in_runtime_order(source: str, expected_kinds: list[str]) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/store_order.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "table[(probe := target_probe)] = alias = probe",
+        "table[(probe := target_probe)], alias = 0, probe",
+    ],
+)
+@pytest.mark.parametrize(
+    ("initial_import", "target_import", "expected_kinds"),
+    [
+        ("from builtins import getattr as probe", "from foreign import getattr as target_probe", ["getattr"]),
+        ("from foreign import getattr as probe", "from builtins import getattr as target_probe", []),
+    ],
+)
+def test_assignment_rhs_probe_identity_is_captured_before_target_side_effects(
+    deferred: bool,
+    assignment: str,
+    initial_import: str,
+    target_import: str,
+    expected_kinds: list[str],
+) -> None:
+    declaration = "def inspect():\n    return alias(obj, 'field')\n" if deferred else ""
+    call = "" if deferred else "alias(obj, 'field')\n"
+    source = f"{initial_import}\n{target_import}\n{declaration}{assignment}\n{call}"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/rhs_capture.py")
+
+    assert [site.kind for site in sites] == expected_kinds
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_count"),
+    [
+        ("table[getattr(obj, 'lower'):getattr(obj, 'upper'):getattr(obj, 'step')] = value\n", 3),
+        ("first, *rest, table[getattr(obj, 'field')] = values\n", 1),
+        (
+            "from foreign import getattr as probe\ntable[(probe := getattr)(obj, 'lower'):probe(obj, 'upper')] = value\n",
+            2,
+        ),
+    ],
+)
+def test_store_target_subexpressions_are_visited_left_to_right(source: str, expected_count: int) -> None:
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/store_shape.py")
+
+    assert [site.kind for site in sites] == ["getattr"] * expected_count
+    assert [(site.line, site.column) for site in sites] == sorted((site.line, site.column) for site in sites)
+
+
+def test_each_with_target_precedes_the_next_context_expression() -> None:
+    source = "with first() as table[getattr(obj, 'target')], getattr(obj, 'context'):\n    pass\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/with_order.py")
+
+    assert [(site.line, site.column) for site in sites] == [(1, 22), (1, 47)]
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "table[(probe := getattr)(obj, 'target')] = value",
+        "table[(probe := getattr)(obj, 'target')]: int = value",
+        "for table[(probe := getattr)(obj, 'target')] in rows:\n    pass",
+    ],
+)
+def test_store_target_walrus_is_visible_to_an_earlier_deferred_body(statement: str) -> None:
+    source = f"from foreign import getattr as probe\ndef inspect():\n    return probe(obj, 'body')\n{statement}\n"
+
+    sites = iter_masquerade_sites(ast.parse(source), "src/elspeth/deferred_store_target.py")
+
+    assert [site.kind for site in sites] == ["getattr", "getattr"]
+
+
 def test_possible_builtin_alias_survives_an_abrupt_control_flow_join() -> None:
     source = (
         "from builtins import getattr as probe\n"
