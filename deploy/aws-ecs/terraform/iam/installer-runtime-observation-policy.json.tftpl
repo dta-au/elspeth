@@ -26,6 +26,28 @@
       ]
     },
     {
+      "Sid": "MutateRunTaggedEcsResources",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:TagResource",
+        "ecs:UntagResource"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_a_namespace}-cluster/acceptance-${scenario_a_namespace}-service",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_b_namespace}-cluster/acceptance-${scenario_b_namespace}-service",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:service/acceptance-${scenario_c_namespace}-cluster/acceptance-${scenario_c_namespace}-service"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
       "Sid": "ReadRunLogs",
       "Effect": "Allow",
       "Action": [

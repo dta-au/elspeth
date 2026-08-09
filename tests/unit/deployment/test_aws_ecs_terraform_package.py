@@ -1744,6 +1744,12 @@ def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit(
     assert documents
 
     rendered_sizes = {path.name: len(json.dumps(document, separators=(",", ":"))) for path, _rendered, document in documents}
+    assert rendered_sizes == {
+        "installer-control-plane-policy.json.tftpl": 6_017,
+        "installer-regional-resources-policy.json.tftpl": 6_102,
+        "installer-relationships-policy.json.tftpl": 5_865,
+        "installer-runtime-observation-policy.json.tftpl": 5_767,
+    }
     assert all(size <= 6_144 for size in rendered_sizes.values()), rendered_sizes
     assert len(documents) == 4
 
@@ -1762,6 +1768,101 @@ def test_installer_customer_managed_policy_documents_stay_within_iam_size_limit(
     assert statement["Condition"]["StringEquals"] == {
         "aws:RequestTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
         "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+
+
+def test_installer_named_bucket_permissions_use_exact_s3_iam_actions() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+
+    assert statements["ManageElspethNamedBuckets"]["Action"] == [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:DeleteBucketPolicy",
+        "s3:DeleteBucketWebsite",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:PutBucketOwnershipControls",
+        "s3:PutBucketPolicy",
+        "s3:PutEncryptionConfiguration",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:PutBucketTagging",
+        "s3:PutBucketVersioning",
+    ]
+
+
+def test_installer_policy_grants_only_run_tagged_guardrail_and_event_rule_updates() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    mutating = statements["MutateRunTaggedRegionalResources"]
+
+    assert mutating["Resource"] == "*"
+    assert mutating["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+    assert {sid for sid, statement in statements.items() if "bedrock:UpdateGuardrail" in statement["Action"]} == {
+        "MutateRunTaggedRegionalResources"
+    }
+    assert {sid for sid, statement in statements.items() if "events:PutRule" in statement["Action"]} == {
+        "CreateRunTaggedRegionalResources",
+        "MutateRunTaggedRegionalResources",
+    }
+
+
+def test_installer_policy_splits_ecs_tag_drift_by_available_condition_context() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    tagged_resources = statements["MutateRunTaggedEcsResources"]
+    task_definitions = statements["MutateTaskDefinitionTagsRegionScopedOnly"]
+
+    assert not {"ecs:TagResource", "ecs:UntagResource"}.intersection(statements["MutateRunTaggedRegionalResources"]["Action"])
+    assert tagged_resources["Action"] == ["ecs:TagResource", "ecs:UntagResource"]
+    assert tagged_resources["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-a-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-a-0123456789abcdefabcd-cluster/acceptance-a-0123456789abcdefabcd-service",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-b-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-b-0123456789abcdefabcd-cluster/acceptance-b-0123456789abcdefabcd-service",
+        "arn:aws:ecs:ap-southeast-1:123456789012:cluster/acceptance-c-0123456789abcdefabcd-cluster",
+        "arn:aws:ecs:ap-southeast-1:123456789012:service/acceptance-c-0123456789abcdefabcd-cluster/acceptance-c-0123456789abcdefabcd-service",
+    ]
+    assert tagged_resources["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+    assert task_definitions["Action"] == ["ecs:TagResource", "ecs:UntagResource"]
+    assert task_definitions["Resource"] == [
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/a-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/b-0123456789abcdefabcd-*:*",
+        "arn:aws:ecs:ap-southeast-1:123456789012:task-definition/c-0123456789abcdefabcd-*:*",
+    ]
+    assert task_definitions["Condition"]["StringEquals"] == {
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+    assert "aws:ResourceTag/ACCEPTANCE_RUN_ID" not in json.dumps(task_definitions)
+
+
+def test_installer_policy_grants_exact_run_tagged_cognito_child_update_path() -> None:
+    documents = _render_installer_policy_documents()
+    statements = {statement["Sid"]: statement for _path, _rendered, document in documents for statement in document["Statement"]}
+    cognito_children = statements["ManageRunCognitoChildren"]
+
+    assert cognito_children["Action"] == [
+        "cognito-idp:AdminCreateUser",
+        "cognito-idp:AdminGetUser",
+        "cognito-idp:CreateUserPoolClient",
+        "cognito-idp:CreateUserPoolDomain",
+        "cognito-idp:DeleteUserPoolClient",
+        "cognito-idp:DeleteUserPoolDomain",
+        "cognito-idp:UpdateUserPoolClient",
+    ]
+    assert cognito_children["Resource"] == "arn:aws:cognito-idp:ap-southeast-1:123456789012:userpool/*"
+    assert cognito_children["Condition"]["StringEquals"] == {
+        "aws:ResourceTag/ACCEPTANCE_RUN_ID": _INSTALLER_POLICY_VALUES["run_id"],
+        "aws:RequestedRegion": _INSTALLER_POLICY_VALUES["aws_region"],
+    }
+    assert {sid for sid, statement in statements.items() if "cognito-idp:UpdateUserPoolClient" in statement["Action"]} == {
+        "ManageRunCognitoChildren"
     }
 
 
@@ -1851,7 +1952,13 @@ def test_installer_policy_is_renderable_scoped_and_boundary_enforced() -> None:
         statements["MutateRunTaggedRegionalResources"]["Action"]
     )
     named_buckets = statements["ManageElspethNamedBuckets"]
-    assert {"s3:ListBucket", "s3:ListBucketVersions", "s3:DeleteBucketPublicAccessBlock"}.issubset(named_buckets["Action"])
+    assert {
+        "s3:DeleteBucketPolicy",
+        "s3:DeleteBucketWebsite",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:PutBucketPublicAccessBlock",
+    }.issubset(named_buckets["Action"])
     assert named_buckets["Resource"] == [
         "arn:aws:s3:::elspeth-state-example",
         "arn:aws:s3:::elspeth-a-example",

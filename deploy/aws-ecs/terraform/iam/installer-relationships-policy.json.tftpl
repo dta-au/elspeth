@@ -7,10 +7,7 @@
       "Action": [
         "s3:CreateBucket",
         "s3:DeleteBucket",
-        "s3:DeleteBucketOwnershipControls",
         "s3:DeleteBucketPolicy",
-        "s3:DeleteBucketPublicAccessBlock",
-        "s3:DeleteBucketTagging",
         "s3:DeleteBucketWebsite",
         "s3:ListBucket",
         "s3:ListBucketVersions",
@@ -172,7 +169,8 @@
         "cognito-idp:CreateUserPoolClient",
         "cognito-idp:CreateUserPoolDomain",
         "cognito-idp:DeleteUserPoolClient",
-        "cognito-idp:DeleteUserPoolDomain"
+        "cognito-idp:DeleteUserPoolDomain",
+        "cognito-idp:UpdateUserPoolClient"
       ],
       "Resource": "arn:aws:cognito-idp:${aws_region}:${aws_account_id}:userpool/*",
       "Condition": {
