@@ -27,11 +27,16 @@ resource "aws_internet_gateway" "scenario" {
 resource "aws_subnet" "public" {
   count = 2
 
-  vpc_id                  = aws_vpc.scenario.id
-  cidr_block              = local.public_subnet_cidrs[count.index]
-  availability_zone       = data.aws_availability_zones.available.names[count.index]
-  map_public_ip_on_launch = true
+  vpc_id     = aws_vpc.scenario.id
+  cidr_block = local.public_subnet_cidrs[count.index]
 
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  # Deliberately no map_public_ip_on_launch: every workload that needs a public
+  # address requests one itself (the service and the database_bootstrap task
+  # both set assign_public_ip / assignPublicIp), and the EFS mount targets need
+  # none. Defaulting the subnet to auto-assign would hand a public address to
+  # whatever is placed here next, silently.
   tags = merge(local.tags, { Name = "${local.namespace}-public-${count.index + 1}" })
 }
 
