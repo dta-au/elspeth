@@ -18,6 +18,16 @@ import {
 } from "@/config/composer";
 import type { BlobMetadata } from "@/types/api";
 
+/**
+ * The sentence appended to the composer after a successful upload. Exported
+ * so ChatPanel's freeform ownership fence (elspeth-341a3e2fc4) can append
+ * the same sentence into the ORIGINATING session's draft slot when the
+ * upload completes after a session switch.
+ */
+export function uploadedBlobPromptSentence(filename: string): string {
+  return `I've uploaded "${filename}"; please use it as the pipeline input.`;
+}
+
 interface ChatInputProps {
   onSend: (content: string) => void;
   disabled: boolean;
@@ -265,7 +275,7 @@ export function ChatInput({
       const newText =
         currentText +
         (currentText ? "\n" : "") +
-        `I've uploaded "${blob.filename}"; please use it as the pipeline input.`;
+        uploadedBlobPromptSentence(blob.filename);
       if (isControlled) {
         controlledOnChange?.(newText);
       } else {

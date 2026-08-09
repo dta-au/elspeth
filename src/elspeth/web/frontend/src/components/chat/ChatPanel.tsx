@@ -27,7 +27,7 @@ import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turn
 import { ComposingIndicator } from "./ComposingIndicator";
 import { AuthorityChip } from "./AuthorityChip";
 import { ModelChip } from "./ModelChip";
-import { ChatInput } from "./ChatInput";
+import { ChatInput, uploadedBlobPromptSentence } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
@@ -1000,6 +1000,44 @@ export function ChatPanel({
         withSessionDraftSlot(drafts, draftSessionKey, action),
       ),
     [draftSessionKey],
+  );
+  // Freeform upload ownership fence (elspeth-341a3e2fc4): a slow upload
+  // started in session A may complete after the user switches to session B.
+  // Without the fence ChatInput appends the LIVE (B) text plus the upload
+  // sentence through its session-A-bound onChange closure — mixing B's
+  // typed draft into A's slot. Accepting (true) keeps ChatInput's normal
+  // live append (still on A); refusing (false) suppresses it, and the
+  // slot-targeted append below carries the retention duty into the
+  // originating session's draft instead — the same doctrine as the
+  // failed-send restore (elspeth-49b467d91a).
+  const handleFreeformBlobUploadCompleted = useCallback(
+    (_requestId: string, sessionId: string, blob: BlobMetadata): boolean => {
+      if (blob.session_id !== sessionId) {
+        // Custody mismatch — never surface the blob anywhere.
+        return false;
+      }
+      const liveSessionId = useSessionStore.getState().activeSessionId ?? "";
+      if (liveSessionId === sessionId) {
+        return true;
+      }
+      setFreeformDraftsBySession((drafts) =>
+        withSessionDraftSlot(drafts, sessionId, (current) =>
+          current +
+          (current ? "\n" : "") +
+          uploadedBlobPromptSentence(blob.filename),
+        ),
+      );
+      return false;
+    },
+    [],
+  );
+  // A late failure belongs to the originating session too: suppress the
+  // in-composer alert when another session is active (the blob manager
+  // retains the failure detail for the owning session).
+  const handleFreeformBlobUploadRejected = useCallback(
+    (_requestId: string, sessionId: string): boolean =>
+      (useSessionStore.getState().activeSessionId ?? "") === sessionId,
+    [],
   );
   const [guidedSourceBlobCandidateSet, setGuidedSourceBlobCandidateSet] =
     useState<GuidedSourceBlobCandidateSet | null>(null);
@@ -3049,6 +3087,8 @@ export function ChatPanel({
         onOpenSecrets={onOpenSecrets}
         value={inputText}
         onChange={setInputText}
+        onBlobUploadCompleted={handleFreeformBlobUploadCompleted}
+        onBlobUploadRejected={handleFreeformBlobUploadRejected}
       />
     </div>
   );

@@ -126,7 +126,10 @@ vi.mock("./MessageBubble", () => ({
 // data-value / data-read-only expose the tutorial locked-prompt contract
 // (value prefilled per stage + readOnly) so the bare-composer tests can pin
 // it — before these attrs the lock was unpinned at the ChatPanel level.
-vi.mock("./ChatInput", () => ({
+vi.mock("./ChatInput", async (importOriginal) => ({
+  // Pass real non-component exports through (uploadedBlobPromptSentence is
+  // consumed by ChatPanel's freeform upload fence).
+  ...(await importOriginal<typeof import("./ChatInput")>()),
   ChatInput: ({
     placeholder,
     onSend,
@@ -7201,5 +7204,180 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     expect(
       header?.querySelector(".chat-model-chip"),
     ).not.toBeNull();
+  });
+});
+
+describe("freeform upload session fence (elspeth-341a3e2fc4)", () => {
+  // A slow upload started in session A may complete while session B is
+  // active. The upload sentence and the blob belong to A: B's composer must
+  // never receive them, and A's draft slot must hold the sentence when the
+  // user returns (the same slot-targeted retention doctrine as the
+  // failed-send restore, elspeth-49b467d91a).
+  beforeEach(() => {
+    vi.resetAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+    mockedChatInputUpload.blob = null;
+    mockedChatInputUpload.requests = [];
+    mockedChatInputUpload.completedRequestIds = [];
+    mockedChatInputUpload.acceptedRequestIds = [];
+    mockedChatInputUpload.settledRequestIds = [];
+    mockedChatInputUpload.acceptedFailureRequestIds = [];
+    mockedChatInputUpload.immediateRequestSeq = 0;
+  });
+
+  function freeformSession(id: string, title: string): Session {
+    return {
+      id,
+      title,
+      created_at: "2026-08-09T10:00:00Z",
+      updated_at: "2026-08-09T10:00:00Z",
+    };
+  }
+
+  function freeformBlob(sessionId: string, filename: string): BlobMetadata {
+    return {
+      id: "00000000-0000-4000-8000-00000000341a",
+      session_id: sessionId,
+      filename,
+      mime_type: "text/csv",
+      size_bytes: 16,
+      content_hash: "f".repeat(64),
+      created_at: "2026-08-09T10:00:00Z",
+      created_by: "user",
+      source_description: null,
+      status: "ready",
+      creation_modality: "verbatim",
+      created_from_message_id: null,
+      creating_model_identifier: null,
+      creating_model_version: null,
+      creating_provider: null,
+      creating_composer_skill_hash: null,
+      creating_arguments_hash: null,
+    };
+  }
+
+  it("routes a slow upload's sentence to the originating session's draft, never the live composer", async () => {
+    const upload = deferred<BlobMetadata>();
+    useSessionStore.setState({
+      activeSessionId: "session-a",
+      sessions: [
+        freeformSession("session-a", "Session A"),
+        freeformSession("session-b", "Session B"),
+      ],
+      messages: [],
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-fence-1",
+        sessionId: "session-a",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+
+    // The user switches to session B while A's upload is still in flight.
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-b", messages: [] });
+    });
+
+    await act(async () => {
+      upload.resolve(freeformBlob("session-a", "slow.csv"));
+      await upload.promise;
+    });
+
+    // The fence must REFUSE the foreign-session completion — the real
+    // ChatInput otherwise appends the live (B) text plus the sentence
+    // through a stale session-A-bound onChange closure.
+    expect(mockedChatInputUpload.acceptedRequestIds).toEqual([]);
+
+    // B's composer must not receive A's upload sentence.
+    expect(
+      screen.getByTestId("chat-input").getAttribute("data-value"),
+    ).not.toContain("I've uploaded");
+
+    // Returning to A finds the sentence waiting in A's draft slot.
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-a", messages: [] });
+    });
+    expect(
+      screen.getByTestId("chat-input").getAttribute("data-value"),
+    ).toContain('I\'ve uploaded "slow.csv"');
+  });
+
+  it("keeps the live append when the originating session is still active (control)", async () => {
+    const upload = deferred<BlobMetadata>();
+    useSessionStore.setState({
+      activeSessionId: "session-a",
+      sessions: [freeformSession("session-a", "Session A")],
+      messages: [],
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-fence-2",
+        sessionId: "session-a",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    await act(async () => {
+      upload.resolve(freeformBlob("session-a", "fast.csv"));
+      await upload.promise;
+    });
+
+    expect(
+      screen.getByTestId("chat-input").getAttribute("data-value"),
+    ).toContain('I\'ve uploaded "fast.csv"');
+  });
+
+  it("suppresses a foreign-session upload failure alert but keeps the owning session's", async () => {
+    const upload = deferred<BlobMetadata>();
+    useSessionStore.setState({
+      activeSessionId: "session-a",
+      sessions: [
+        freeformSession("session-a", "Session A"),
+        freeformSession("session-b", "Session B"),
+      ],
+      messages: [],
+    });
+    mockedChatInputUpload.requests = [
+      {
+        requestId: "upload-fence-3",
+        sessionId: "session-a",
+        completion: upload.promise,
+      },
+    ];
+
+    render(<ChatPanel />);
+    await act(async () => {
+      screen.getByTestId("chat-input-upload").click();
+    });
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "session-b", messages: [] });
+    });
+    await act(async () => {
+      upload.reject(new Error("boom"));
+      await upload.promise.catch(() => undefined);
+    });
+
+    // The rejection was NOT accepted by the fence: the mock records accepted
+    // failures, so an empty list proves the foreign-session alert was fenced.
+    expect(mockedChatInputUpload.acceptedFailureRequestIds).toEqual([]);
   });
 });
