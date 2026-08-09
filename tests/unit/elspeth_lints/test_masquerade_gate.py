@@ -165,14 +165,17 @@ def test_live_scan_visits_files_and_sites_in_every_covered_root() -> None:
 
 
 def test_live_scan_visits_more_than_zero_files_and_sites_in_aggregate() -> None:
-    """Coarse sanity check on top of the per-root assertions above."""
+    """Coarse, corpus-size-independent sanity check on top of the per-root assertions."""
     files_visited = 0
     for subdir in SCAN_SUBDIRS:
         files_visited += sum(1 for _ in walk_python_files(REPO_ROOT / subdir))
     assert files_visited > 1000, "expected the four scan roots to contain well over 1000 Python files"
 
     sites = collect_sites(REPO_ROOT)
-    assert len(sites) > 500, "expected several hundred candidate masquerade sites in the live tree"
+    baseline = load_baseline(REPO_ROOT / "config" / "cicd" / "masquerade_baseline.yaml")
+    baselined_occurrences = sum(entry.occurrences for entry in baseline.entries)
+    assert baselined_occurrences > 0, "expected the live baseline to retain tracked candidate sites"
+    assert len(sites) >= baselined_occurrences, "live inventory omitted one or more baselined occurrences"
 
 
 def test_occurrence_count_drift_fires_when_a_probe_is_added(tmp_path: Path) -> None:
