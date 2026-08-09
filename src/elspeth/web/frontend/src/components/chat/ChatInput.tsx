@@ -416,6 +416,12 @@ export function ChatInput({
             <input
               ref={fileInputRef}
               type="file"
+              // Mirrors the server's closed storage MIME vocabulary
+              // (contracts/blobs.py StorageMimeType): data uploads plus the
+              // binary document set admitted for Textract inline analysis.
+              // The server remains the authority — this only filters the
+              // picker.
+              accept=".csv,.txt,.json,.jsonl,.png,.jpg,.jpeg,.pdf,text/csv,text/plain,application/json,application/x-jsonlines,application/jsonl,text/jsonl,image/png,image/jpeg,application/pdf"
               onChange={handleFileSelect}
               disabled={!activeSessionId || uploadDisabled}
               style={{ display: "none" }}

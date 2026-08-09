@@ -182,6 +182,12 @@ If a pipeline is interrupted, resume with the command shown in the output.
 | `azure_openai_sentiment` | Azure OpenAI endpoint |
 | `multi_query_assessment` | Azure OpenAI multi-query (settings say `provider: azure`) |
 
+### AWS (skip unless AWS credentials configured — billable)
+
+| Example | Notes |
+|---------|-------|
+| `textract_inline` | Copy JPEG/PNG/single-page PDF files into `input/`, run `python examples/textract_inline/scripts/prepare_document_blobs.py` (stages blobs, writes `settings.generated.yaml`), then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute`. Each row is one billable `AnalyzeDocument` call. |
+
 ### Not a runnable pipeline
 
 | Directory | Contents |

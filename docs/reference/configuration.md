@@ -932,6 +932,7 @@ hosted server, which is why the web boundary pins `base_url` separately.
 | `aws_bedrock_content_safety` | Detect configured harmful-content categories through Bedrock Guardrails |
 | `aws_bedrock_prompt_shield` | Detect prompt attacks through Bedrock Guardrails |
 | `aws_textract_document_analysis` | Extract text, tables, forms, and layout from S3-hosted documents through Amazon Textract |
+| `aws_textract_inline_analysis` | Synchronously analyze payload-store documents (managed blobs) through Amazon Textract `AnalyzeDocument` |
 | `rag_retrieval` | Enriches rows with retrieval-augmented context from search providers |
 
 ### AWS Bedrock LLM
@@ -1275,6 +1276,54 @@ a scraped web page. Put a prompt shield between this transform and any `llm`
 node that consumes its output. When `ELSPETH_WEB__PLUGIN_CONTROL_MODES` sets
 `prompt_shield` to `required`, web-authored pipelines cannot omit that shield;
 under `recommend` it is the author's responsibility.
+
+### AWS Textract inline analysis
+
+`aws_textract_inline_analysis` is the synchronous sibling: each row names a
+payload-store content hash (`blob_ref_field`, default `blob_ref` — the field
+the `blob_rows` source emits), and the transform retrieves the bytes with
+integrity checking, verifies the byte signature of the **required, explicit**
+`document_format` (`jpeg`, `png`, or `pdf` — no `jpg` alias, runtime never
+infers), and sends them as inline bytes to one audited `AnalyzeDocument` call.
+Output projections (`text_field`, `page_count_field`, `metadata_field`,
+`extract`, `result_field`) match the asynchronous plugin, so downstream nodes
+can switch between S3 and blob ingestion unchanged.
+
+```yaml
+transforms:
+  - name: analyze
+    plugin: aws_textract_inline_analysis
+    input: documents
+    on_success: results
+    on_error: failures
+    options:
+      region: ap-southeast-2
+      auth_mode: default_chain
+      document_format: png
+      feature_types: [TABLES, FORMS]
+      text_field: textract_text
+      schema: {mode: observed}
+```
+
+**Bounds.** Documents are capped at 5 MiB (`max_document_bytes` may lower but
+never raise that provider bound), PDF support is single-page only, and a
+response proving any page count other than one fails the row. Queries are
+limited to Textract's synchronous ceiling of 15, with page selectors
+restricted to `["1"]` or `["*"]`. Larger, multipage, or already-S3 documents
+belong in `aws_textract_document_analysis`.
+
+**Billing.** Synchronous `AnalyzeDocument` has no idempotency token: botocore's
+standard retries and any engine-level row retry each place another billable
+call. The per-row success metadata records the SDK attempt count as evidence.
+
+**IAM.** The calling identity needs `textract:AnalyzeDocument` (no ARN-scoped
+resource exists). No S3 access is involved — the document bytes travel in the
+request, and the call audit records their SHA-256 hash and length, never the
+bytes.
+
+The untrusted-content guidance above applies identically: inline-extracted
+text taints downstream `llm` nodes, and the web surface counts this plugin
+among untrusted remote-content producers.
 
 ### Required controls and error routing
 
