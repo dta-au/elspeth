@@ -756,6 +756,41 @@ def test_analyze_document_multi_page_response_normalizes() -> None:
     assert result.text == "Invoice\nTotal $42\n\f\nThank you"
 
 
+def test_analyze_document_blocks_without_page_default_to_page_one() -> None:
+    """The live synchronous API omits Page on every block of a single-page
+    response (observed live 2026-08-10, elspeth-0c6a343921 acceptance run
+    815a0162: 38 blocks, zero carrying Page, rejected as malformed). AWS
+    semantics: Page values greater than 1 appear only in multipage
+    responses, so absence means page 1. A present Page still validates
+    against the document page count."""
+    response = _sync_response()
+    for block in response["Blocks"]:
+        del block["Page"]
+
+    result = _normalize_sync(response)
+
+    assert result.page_count == 1
+    assert result.text == "Invoice\nTotal $42"
+    assert [page["page"] for page in result.pages] == [1]
+    assert all(block["Page"] == 1 for block in result.native_result["Blocks"])
+
+
+def test_analyze_document_multipage_missing_page_still_fails_closed() -> None:
+    """Materializing page 1 must not admit a multipage response that lost its
+    page numbers: the defaulted blocks collide on page 1 and the PAGE
+    numbering cross-check rejects the graph."""
+    first = _first_page()
+    second = _second_page()
+    response = {
+        "DocumentMetadata": {"Pages": 2},
+        "AnalyzeDocumentModelVersion": "1.0",
+        "Blocks": [{key: value for key, value in block.items() if key != "Page"} for block in (*first["Blocks"], *second["Blocks"])],
+    }
+
+    with pytest.raises(MalformedTextractResponse, match="PAGE block numbering"):
+        _normalize_sync(response)
+
+
 def test_analyze_document_duplicate_block_id_fails_closed() -> None:
     response = _sync_response()
     response["Blocks"].append(dict(response["Blocks"][1]))

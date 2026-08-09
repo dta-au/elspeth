@@ -607,7 +607,21 @@ def normalize_analyze_document_result(
     raw_blocks = _sequence(result.get("Blocks"), "response.Blocks")
     blocks: list[Mapping[str, Any]] = []
     for block_offset, raw_block in enumerate(raw_blocks):
-        blocks.append(_mapping(raw_block, f"response.Blocks[{block_offset}]"))
+        block = _mapping(raw_block, f"response.Blocks[{block_offset}]")
+        if "Page" not in block:
+            # The live synchronous API omits Page on every block of a
+            # single-page response (observed live 2026-08-10; the API
+            # reference's "returned by synchronous and asynchronous
+            # operations" does not hold on the wire). AWS semantics make
+            # absence mean page 1 — Page values greater than 1 appear only
+            # in multipage responses — so materialize it here, at the sync
+            # entry only, keeping the shared block-graph rules and the
+            # stored native aggregate uniform across both Textract plugins.
+            # A multipage response that lost its numbering still fails
+            # closed: defaulted blocks collide on page 1 and the PAGE
+            # numbering cross-check rejects the graph.
+            block = {**block, "Page": 1}
+        blocks.append(block)
         if len(blocks) > max_blocks:
             _malformed("Blocks", f"block count exceeds max_blocks={max_blocks}")
 
