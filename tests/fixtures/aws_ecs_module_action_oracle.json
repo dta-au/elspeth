@@ -1,0 +1,377 @@
+{
+  "schema": "elspeth.aws-ecs-module-action-oracle.v1",
+  "reviewed_on": "2026-08-09",
+  "scope": "Every aws_* resource type declared by deploy/aws-ecs/terraform/modules/scenario, mapped to reviewed lifecycle actions exercised by this module's configured create/read/update/delete paths.",
+  "review_basis": [
+    "deploy/aws-ecs/terraform/modules/scenario resource declarations and configured lifecycle fields",
+    "tests/fixtures/aws_iam_action_vocabulary_2026-08-09.jsonl canonical IAM action names",
+    "docs-archive/acceptance/aws-install-policy-rca.md section 6.2(d)"
+  ],
+  "limitations": [
+    "This hand-maintained oracle catches missing grants only for actions named here; it does not infer provider behavior or unknown dependent actions.",
+    "Condition satisfiability is outside this mapping and is protected only for the separately declared known traps.",
+    "The disputed ec2:CreateNetworkInterface dependency of aws_efs_mount_target remains contingent on the least-privilege verification apply tracked by elspeth-acc2ce713b; it is not asserted or pre-granted."
+  ],
+  "resources": {
+    "aws_acm_certificate": [
+      "acm:AddTagsToCertificate",
+      "acm:DeleteCertificate",
+      "acm:DescribeCertificate",
+      "acm:GetCertificate",
+      "acm:ImportCertificate",
+      "acm:ListTagsForCertificate",
+      "acm:RemoveTagsFromCertificate"
+    ],
+    "aws_bedrock_guardrail": [
+      "bedrock:CreateGuardrail",
+      "bedrock:DeleteGuardrail",
+      "bedrock:GetGuardrail",
+      "bedrock:ListTagsForResource",
+      "bedrock:TagResource",
+      "bedrock:UntagResource",
+      "bedrock:UpdateGuardrail"
+    ],
+    "aws_bedrock_guardrail_version": [
+      "bedrock:CreateGuardrailVersion",
+      "bedrock:GetGuardrail"
+    ],
+    "aws_cloudwatch_dashboard": [
+      "cloudwatch:DeleteDashboards",
+      "cloudwatch:GetDashboard",
+      "cloudwatch:PutDashboard"
+    ],
+    "aws_cloudwatch_event_rule": [
+      "events:DeleteRule",
+      "events:DescribeRule",
+      "events:ListTagsForResource",
+      "events:PutRule",
+      "events:TagResource",
+      "events:UntagResource"
+    ],
+    "aws_cloudwatch_event_target": [
+      "events:ListTargetsByRule",
+      "events:PutTargets",
+      "events:RemoveTargets"
+    ],
+    "aws_cloudwatch_log_group": [
+      "logs:CreateLogGroup",
+      "logs:DeleteLogGroup",
+      "logs:DescribeLogGroups",
+      "logs:ListTagsForResource",
+      "logs:PutRetentionPolicy",
+      "logs:TagResource",
+      "logs:UntagResource"
+    ],
+    "aws_cloudwatch_log_resource_policy": [
+      "logs:DeleteResourcePolicy",
+      "logs:DescribeResourcePolicies",
+      "logs:PutResourcePolicy"
+    ],
+    "aws_cloudwatch_metric_alarm": [
+      "cloudwatch:DeleteAlarms",
+      "cloudwatch:DescribeAlarms",
+      "cloudwatch:ListTagsForResource",
+      "cloudwatch:PutMetricAlarm",
+      "cloudwatch:TagResource",
+      "cloudwatch:UntagResource"
+    ],
+    "aws_cognito_user_pool": [
+      "cognito-idp:CreateUserPool",
+      "cognito-idp:DeleteUserPool",
+      "cognito-idp:DescribeUserPool",
+      "cognito-idp:ListTagsForResource",
+      "cognito-idp:TagResource",
+      "cognito-idp:UntagResource",
+      "cognito-idp:UpdateUserPool"
+    ],
+    "aws_cognito_user_pool_client": [
+      "cognito-idp:CreateUserPoolClient",
+      "cognito-idp:DeleteUserPoolClient",
+      "cognito-idp:DescribeUserPoolClient",
+      "cognito-idp:UpdateUserPoolClient"
+    ],
+    "aws_cognito_user_pool_domain": [
+      "cognito-idp:CreateUserPoolDomain",
+      "cognito-idp:DeleteUserPoolDomain",
+      "cognito-idp:DescribeUserPoolDomain"
+    ],
+    "aws_db_subnet_group": [
+      "rds:AddTagsToResource",
+      "rds:CreateDBSubnetGroup",
+      "rds:DeleteDBSubnetGroup",
+      "rds:DescribeDBSubnetGroups",
+      "rds:ListTagsForResource",
+      "rds:ModifyDBSubnetGroup",
+      "rds:RemoveTagsFromResource"
+    ],
+    "aws_ecs_cluster": [
+      "ecs:CreateCluster",
+      "ecs:DeleteCluster",
+      "ecs:DescribeClusters",
+      "ecs:ListTagsForResource",
+      "ecs:TagResource",
+      "ecs:UntagResource",
+      "ecs:UpdateClusterSettings"
+    ],
+    "aws_ecs_service": [
+      "ecs:CreateService",
+      "ecs:DeleteService",
+      "ecs:DescribeServices",
+      "ecs:ListTagsForResource",
+      "ecs:TagResource",
+      "ecs:UntagResource",
+      "ecs:UpdateService"
+    ],
+    "aws_ecs_task_definition": [
+      "ecs:DeregisterTaskDefinition",
+      "ecs:DescribeTaskDefinition",
+      "ecs:ListTagsForResource",
+      "ecs:RegisterTaskDefinition",
+      "ecs:TagResource",
+      "ecs:UntagResource"
+    ],
+    "aws_efs_access_point": [
+      "elasticfilesystem:CreateAccessPoint",
+      "elasticfilesystem:DeleteAccessPoint",
+      "elasticfilesystem:DescribeAccessPoints",
+      "elasticfilesystem:TagResource",
+      "elasticfilesystem:UntagResource"
+    ],
+    "aws_efs_file_system": [
+      "elasticfilesystem:CreateFileSystem",
+      "elasticfilesystem:DeleteFileSystem",
+      "elasticfilesystem:DescribeFileSystems",
+      "elasticfilesystem:DescribeLifecycleConfiguration",
+      "elasticfilesystem:PutLifecycleConfiguration",
+      "elasticfilesystem:TagResource",
+      "elasticfilesystem:UntagResource"
+    ],
+    "aws_efs_mount_target": [
+      "elasticfilesystem:CreateMountTarget",
+      "elasticfilesystem:DeleteMountTarget",
+      "elasticfilesystem:DescribeMountTargets"
+    ],
+    "aws_iam_role": [
+      "iam:CreateRole",
+      "iam:DeleteRole",
+      "iam:DeleteRolePermissionsBoundary",
+      "iam:GetRole",
+      "iam:ListRoleTags",
+      "iam:TagRole",
+      "iam:UntagRole"
+    ],
+    "aws_iam_role_policy": [
+      "iam:DeleteRolePolicy",
+      "iam:GetRolePolicy",
+      "iam:PutRolePolicy"
+    ],
+    "aws_iam_role_policy_attachment": [
+      "iam:AttachRolePolicy",
+      "iam:DetachRolePolicy",
+      "iam:ListAttachedRolePolicies"
+    ],
+    "aws_internet_gateway": [
+      "ec2:AttachInternetGateway",
+      "ec2:CreateInternetGateway",
+      "ec2:CreateTags",
+      "ec2:DeleteInternetGateway",
+      "ec2:DeleteTags",
+      "ec2:DescribeInternetGateways",
+      "ec2:DetachInternetGateway"
+    ],
+    "aws_lb": [
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:CreateLoadBalancer",
+      "elasticloadbalancing:DeleteLoadBalancer",
+      "elasticloadbalancing:DescribeLoadBalancerAttributes",
+      "elasticloadbalancing:DescribeLoadBalancers",
+      "elasticloadbalancing:DescribeTags",
+      "elasticloadbalancing:ModifyLoadBalancerAttributes",
+      "elasticloadbalancing:RemoveTags"
+    ],
+    "aws_lb_listener": [
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:CreateListener",
+      "elasticloadbalancing:DeleteListener",
+      "elasticloadbalancing:DescribeListeners",
+      "elasticloadbalancing:DescribeTags",
+      "elasticloadbalancing:ModifyListener",
+      "elasticloadbalancing:RemoveTags"
+    ],
+    "aws_lb_listener_rule": [
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:CreateRule",
+      "elasticloadbalancing:DeleteRule",
+      "elasticloadbalancing:DescribeRules",
+      "elasticloadbalancing:DescribeTags",
+      "elasticloadbalancing:ModifyRule",
+      "elasticloadbalancing:RemoveTags"
+    ],
+    "aws_lb_target_group": [
+      "elasticloadbalancing:AddTags",
+      "elasticloadbalancing:CreateTargetGroup",
+      "elasticloadbalancing:DeleteTargetGroup",
+      "elasticloadbalancing:DescribeTags",
+      "elasticloadbalancing:DescribeTargetGroupAttributes",
+      "elasticloadbalancing:DescribeTargetGroups",
+      "elasticloadbalancing:DescribeTargetHealth",
+      "elasticloadbalancing:ModifyTargetGroup",
+      "elasticloadbalancing:ModifyTargetGroupAttributes",
+      "elasticloadbalancing:RemoveTags"
+    ],
+    "aws_rds_cluster": [
+      "rds:AddTagsToResource",
+      "rds:CreateDBCluster",
+      "rds:DeleteDBCluster",
+      "rds:DescribeDBClusters",
+      "rds:ListTagsForResource",
+      "rds:ModifyDBCluster",
+      "rds:RemoveTagsFromResource"
+    ],
+    "aws_rds_cluster_instance": [
+      "rds:AddTagsToResource",
+      "rds:CreateDBInstance",
+      "rds:DeleteDBInstance",
+      "rds:DescribeDBInstances",
+      "rds:ListTagsForResource",
+      "rds:ModifyDBInstance",
+      "rds:RemoveTagsFromResource"
+    ],
+    "aws_route_table": [
+      "ec2:CreateRoute",
+      "ec2:CreateRouteTable",
+      "ec2:CreateTags",
+      "ec2:DeleteRoute",
+      "ec2:DeleteRouteTable",
+      "ec2:DeleteTags",
+      "ec2:DescribeRouteTables"
+    ],
+    "aws_route_table_association": [
+      "ec2:AssociateRouteTable",
+      "ec2:DescribeRouteTables",
+      "ec2:DisassociateRouteTable"
+    ],
+    "aws_s3_bucket": [
+      "s3:CreateBucket",
+      "s3:DeleteBucket",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetAnalyticsConfiguration",
+      "s3:GetBucketAcl",
+      "s3:GetBucketCORS",
+      "s3:GetBucketLocation",
+      "s3:GetBucketLogging",
+      "s3:GetBucketObjectLockConfiguration",
+      "s3:GetBucketPolicy",
+      "s3:GetBucketPublicAccessBlock",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketTagging",
+      "s3:GetBucketVersioning",
+      "s3:GetBucketWebsite",
+      "s3:GetEncryptionConfiguration",
+      "s3:GetIntelligentTieringConfiguration",
+      "s3:GetInventoryConfiguration",
+      "s3:GetLifecycleConfiguration",
+      "s3:GetMetricsConfiguration",
+      "s3:GetReplicationConfiguration",
+      "s3:ListAllMyBuckets",
+      "s3:ListBucket",
+      "s3:ListBucketVersions"
+    ],
+    "aws_s3_bucket_ownership_controls": [
+      "s3:GetBucketOwnershipControls",
+      "s3:PutBucketOwnershipControls"
+    ],
+    "aws_s3_bucket_public_access_block": [
+      "s3:GetBucketPublicAccessBlock",
+      "s3:PutBucketPublicAccessBlock"
+    ],
+    "aws_s3_bucket_server_side_encryption_configuration": [
+      "s3:GetEncryptionConfiguration",
+      "s3:PutEncryptionConfiguration"
+    ],
+    "aws_secretsmanager_secret": [
+      "secretsmanager:CreateSecret",
+      "secretsmanager:DeleteSecret",
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:GetResourcePolicy",
+      "secretsmanager:ListSecretVersionIds",
+      "secretsmanager:TagResource",
+      "secretsmanager:UntagResource",
+      "secretsmanager:UpdateSecret"
+    ],
+    "aws_secretsmanager_secret_version": [
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:ListSecretVersionIds",
+      "secretsmanager:PutSecretValue"
+    ],
+    "aws_security_group": [
+      "ec2:CreateSecurityGroup",
+      "ec2:CreateTags",
+      "ec2:DeleteSecurityGroup",
+      "ec2:DeleteTags",
+      "ec2:DescribeSecurityGroups",
+      "ec2:RevokeSecurityGroupEgress"
+    ],
+    "aws_sns_topic": [
+      "sns:CreateTopic",
+      "sns:DeleteTopic",
+      "sns:GetTopicAttributes",
+      "sns:ListTagsForResource",
+      "sns:SetTopicAttributes",
+      "sns:TagResource",
+      "sns:UntagResource"
+    ],
+    "aws_subnet": [
+      "ec2:CreateSubnet",
+      "ec2:CreateTags",
+      "ec2:DeleteSubnet",
+      "ec2:DeleteTags",
+      "ec2:DescribeSubnets",
+      "ec2:ModifySubnetAttribute"
+    ],
+    "aws_vpc": [
+      "ec2:CreateTags",
+      "ec2:CreateVpc",
+      "ec2:DeleteTags",
+      "ec2:DeleteVpc",
+      "ec2:DescribeVpcs",
+      "ec2:ModifyVpcAttribute"
+    ],
+    "aws_vpc_security_group_egress_rule": [
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:CreateTags",
+      "ec2:DeleteTags",
+      "ec2:DescribeSecurityGroupRules",
+      "ec2:RevokeSecurityGroupEgress"
+    ],
+    "aws_vpc_security_group_ingress_rule": [
+      "ec2:AuthorizeSecurityGroupIngress",
+      "ec2:CreateTags",
+      "ec2:DeleteTags",
+      "ec2:DescribeSecurityGroupRules",
+      "ec2:RevokeSecurityGroupIngress"
+    ],
+    "aws_xray_group": [
+      "xray:CreateGroup",
+      "xray:DeleteGroup",
+      "xray:GetGroup",
+      "xray:GetGroups",
+      "xray:ListTagsForResource",
+      "xray:TagResource",
+      "xray:UntagResource",
+      "xray:UpdateGroup"
+    ],
+    "aws_xray_sampling_rule": [
+      "xray:CreateSamplingRule",
+      "xray:DeleteSamplingRule",
+      "xray:GetSamplingRules",
+      "xray:ListTagsForResource",
+      "xray:TagResource",
+      "xray:UntagResource",
+      "xray:UpdateSamplingRule"
+    ]
+  }
+}
