@@ -107,6 +107,42 @@ Several suites pin content hashes, golden files, and byte-exact corpora
 a producer can still change pinned bytes. Grep for hashes/golden files near
 what you touch, or run the full suite.
 
+### 6. New-plugin exact inventories (2026-08-09)
+
+Adding ANY builtin plugin fires a fixed set of whole-tree exact pins. For a
+new TRANSFORM the full list (all hit while landing
+`aws_textract_inline_analysis`, d181ee569) is:
+
+- `tests/unit/plugins/test_discovery.py` `EXPECTED_TRANSFORM_COUNT`;
+- `tests/unit/plugins/test_catalog_reference_content.py` — total reference
+  count, per-kind `Counter`, `EXPECTED_BUILTIN_IDENTITIES`, and (for a
+  non-profiled plugin) the `DIRECT_CONFIG_REFERENCES` count;
+- `tests/unit/plugins/transforms/test_external_catalogue_metadata.py` — an
+  EXTERNAL_CALL/NON_DETERMINISTIC transform must appear in
+  `EXPECTED_EXTERNAL_TAGS` (exact tuple), `_REQUIRED_GUIDANCE` (casefolded
+  substrings of the usage strings), and, when it surfaces
+  externally-controlled text, `_REMOTE_CONTENT_PRODUCERS`
+  ("untrusted before llm" must appear in its guidance);
+- `tests/unit/plugins/test_validation_path_agreement.py` — any config with a
+  `@model_validator` needs a rejection case in `_TRANSFORM_REJECTION_CASES`;
+- `tests/unit/web/catalog/test_service.py` serialized-summary total and the
+  knob-schema golden `tests/golden/web/catalog/knob_schema/<kind>__<name>.json`
+  (generate via `CatalogServiceImpl._schema_cache`);
+- `config/cicd/contracts-whitelist.yaml` for `__init__:config` /
+  `probe_config:return` `dict[str, Any]` params (pre-commit Check Contracts);
+- `capability_tags` gate: tuple of 2–6 lowercase kebab tags — a 7th tag fails;
+- `PluginAssistance` text is scanned for credential-shaped patterns:
+  "…token: SDK…" trips `token\s*:` — phrase around it;
+- an untrusted-content producer also joins
+  `_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS`
+  (`src/elspeth/web/interpretation_state.py`) — that set is FAIL-OPEN, an
+  unlisted producer silently reads as trusted;
+- pin `source_file_hash` LAST (ruff/format edits restale it), via
+  `scripts/cicd/plugin_hash.py`.
+
+Sources have the same shape (see 0ec120e2d for the blob_rows list: source
+count/names, registry, catalog, golden, contracts whitelist).
+
 ## Recent conventions (prune when archived)
 
 - **2026-08-09 — plugin config unions use nominal admission plus owned MRO evidence**:

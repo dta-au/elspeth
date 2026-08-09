@@ -50,7 +50,6 @@ from elspeth.plugins.transforms.aws.textract_client import (
     build_textract_sync_sdk_client,
 )
 from elspeth.plugins.transforms.aws.textract_config_shared import (
-    FACET_NAMES,
     FEATURE_TYPES,
     AuthMode,
     FeatureType,
@@ -203,8 +202,8 @@ class AWSTextractInlineAnalysisConfig(TransformDataConfig):
 
     @model_validator(mode="after")
     def _consistency(self) -> Self:
-        for facet_name in FACET_NAMES:
-            require_non_whitespace(getattr(self.extract, facet_name), field_name=f"extract.{facet_name}")
+        for facet_name, facet_value in self.extract.facet_items():
+            require_non_whitespace(facet_value, field_name=f"extract.{facet_name}")
 
         has_queries = bool(self.queries)
         has_query_feature = "QUERIES" in self.feature_types
@@ -230,7 +229,7 @@ class AWSTextractInlineAnalysisConfig(TransformDataConfig):
 
     def configured_output_fields(self) -> dict[str, str]:
         """Map configured normalized facet names to their output-row fields."""
-        return {facet_name: field_name for facet_name in FACET_NAMES if (field_name := getattr(self.extract, facet_name)) is not None}
+        return {facet_name: field_name for facet_name, field_name in self.extract.facet_items() if field_name is not None}
 
     def all_output_field_names(self) -> list[str]:
         """Return every configured output row field in stable projection order."""
@@ -256,7 +255,7 @@ class AWSTextractInlineAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_inline_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:5e2ae444ad07b1ee"
+    source_file_hash: str | None = "sha256:7beadca2550f4b0f"
     config_model = AWSTextractInlineAnalysisConfig
     passes_through_input = True
     creates_tokens = False

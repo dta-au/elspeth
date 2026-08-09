@@ -113,3 +113,18 @@ class TextractExtractFields(BaseModel):
     queries: str | None = None
     signatures: str | None = None
     layout: str | None = None
+
+    def facet_items(self) -> tuple[tuple[str, str | None], ...]:
+        """Facet name/output-field pairs in ``FACET_NAMES`` order via direct access.
+
+        This model is ELSPETH-owned, so consumers enumerate its fields
+        nominally (ADR-032) instead of probing with ``getattr``.
+        """
+        return (
+            ("pages", self.pages),
+            ("tables", self.tables),
+            ("forms", self.forms),
+            ("queries", self.queries),
+            ("signatures", self.signatures),
+            ("layout", self.layout),
+        )
