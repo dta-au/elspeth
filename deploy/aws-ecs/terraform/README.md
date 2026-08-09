@@ -433,10 +433,12 @@ unset GITHUB_TOKEN
 
 Copy the printed `candidate_image` assignment into the selected scenario
 tfvars and retain `candidate_platform_digest` as rollout evidence. The former
-names the multi-platform parent index; ECS reports the selected child manifest
-in `imageDigest`. Do not substitute the GHCR reference: both scenario roots
-intentionally reject any candidate outside the bootstrap-created ECR
-repository.
+names the multi-platform parent index. ECS may report either that pinned parent
+index or the selected child manifest in `imageDigest`; the source-free verifier
+admits only those two exact digests after resolving the one target-platform
+child from the parent index. Do not substitute the GHCR reference: both
+scenario roots intentionally reject any candidate outside the bootstrap-created
+ECR repository.
 
 ## Backend inputs
 
@@ -597,6 +599,7 @@ verify_candidate_service() (
   candidate_task_definition=$3
   candidate_image=$4
   candidate_platform_digest=$5
+  candidate_parent_digest=${candidate_image##*@}
 
   service_json=$(aws ecs describe-services \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
@@ -629,6 +632,7 @@ verify_candidate_service() (
   jq -e \
     --arg candidate_task_definition "$candidate_task_definition" \
     --arg candidate_image "$candidate_image" \
+    --arg candidate_parent_digest "$candidate_parent_digest" \
     --arg candidate_platform_digest "$candidate_platform_digest" '
       (.failures == [])
       and (.tasks | length == 1)
@@ -638,7 +642,7 @@ verify_candidate_service() (
       and ([.tasks[0].containers[] | select(.name == "elspeth-web")][0]
         | .lastStatus == "RUNNING"
         and .image == $candidate_image
-        and .imageDigest == $candidate_platform_digest)
+        and (.imageDigest == $candidate_parent_digest or .imageDigest == $candidate_platform_digest))
     ' <<<"$task_json"
 )
 
@@ -821,7 +825,7 @@ test "$(aws ecs describe-tasks \
 test "$(aws ecs describe-tasks \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" \
   --cluster "$ECS_CLUSTER" --tasks "$RUNNING_TASK" \
-  --query 'tasks[0].containers[?name==`elspeth-web`].managedAgents[?name==`ExecuteCommandAgent`].lastStatus | [0]' \
+  --query 'tasks[0].containers[?name==`elspeth-web`] | [0].managedAgents[?name==`ExecuteCommandAgent`] | [0].lastStatus' \
   --output text)" = RUNNING
 for check in verify-s3 verify-bedrock verify-textract; do
   aws ecs execute-command \

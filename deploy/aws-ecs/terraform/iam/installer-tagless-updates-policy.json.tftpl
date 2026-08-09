@@ -19,6 +19,58 @@
           "aws:RequestedRegion": "${aws_region}"
         }
       }
+    },
+    {
+      "Sid": "ListTasksInRunScenarioClusters",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ListTasks"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_a_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:container-instance/acceptance-${scenario_c_namespace}-cluster/*"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "ExecuteCommandsInRunScenarioTasks",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:ExecuteCommand"
+      ],
+      "Resource": [
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_a_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_b_namespace}-cluster/*",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster",
+        "arn:aws:ecs:${aws_region}:${aws_account_id}:task/acceptance-${scenario_c_namespace}-cluster/*"
+      ],
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": [
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_a_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_b_namespace}-cluster",
+            "arn:aws:ecs:${aws_region}:${aws_account_id}:cluster/acceptance-${scenario_c_namespace}-cluster"
+          ]
+        },
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}",
+          "ecs:container-name": "elspeth-web"
+        }
+      }
     }
   ]
 }

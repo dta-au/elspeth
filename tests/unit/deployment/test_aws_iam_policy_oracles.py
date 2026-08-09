@@ -491,7 +491,11 @@ def test_pinned_provider_update_actions_have_reviewed_resource_and_condition_sco
         "arn:aws:elasticloadbalancing:ap-southeast-1:123456789012:listener-rule/app/c-0123456789abcdefabcd-alb/*/*/*",
     ]
     assert tagless["Condition"] == {"StringEquals": {"aws:RequestedRegion": _TEMPLATE_VALUES["aws_region"]}}
-    assert documents["installer-tagless-updates-policy.json.tftpl"]["Statement"] == [tagless]
+    assert documents["installer-tagless-updates-policy.json.tftpl"]["Statement"] == [
+        tagless,
+        statements["ListTasksInRunScenarioClusters"],
+        statements["ExecuteCommandsInRunScenarioTasks"],
+    ]
 
     discovery = statements["ReadDiscovery"]
     assert "cognito-idp:GetUserPoolMfaConfig" in _statement_actions(discovery)
