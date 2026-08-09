@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -70,9 +71,126 @@ def test_capture_source_snapshot_rejects_relevant_untracked_python(tmp_path: Pat
 
 def test_capture_source_snapshot_rejects_relevant_untracked_allowlist(tmp_path: Path) -> None:
     _repo_path, source_root, allowlist_dir = _repo(tmp_path)
-    (allowlist_dir / "new.yml").write_text("allow_hits: []\n", encoding="utf-8")
+    (allowlist_dir / "new.yaml").write_text("allow_hits: []\n", encoding="utf-8")
 
     with pytest.raises(SourceSnapshotError, match="tracked Git path"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+@pytest.mark.parametrize("ignored", (False, True))
+def test_capture_source_snapshot_rejects_untracked_python_symlink_alias(tmp_path: Path, ignored: bool) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    alias = source_root / "alias.py"
+    if ignored:
+        (repo / ".gitignore").write_text("alias.py\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-qm", "ignore alias")
+    alias.symlink_to("widget.py")
+
+    with pytest.raises(SourceSnapshotError, match="symbolic link"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+@pytest.mark.parametrize("ignored", (False, True))
+def test_capture_source_snapshot_rejects_untracked_allowlist_symlink_alias(tmp_path: Path, ignored: bool) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    alias = allowlist_dir / "alias.yaml"
+    if ignored:
+        (repo / ".gitignore").write_text("alias.yaml\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-qm", "ignore alias")
+    alias.symlink_to("_defaults.yaml")
+
+    with pytest.raises(SourceSnapshotError, match="symbolic link"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_rejects_tracked_scanner_symlink(tmp_path: Path) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path)
+    alias = source_root / "alias.py"
+    alias.symlink_to("widget.py")
+    _git(repo, "add", "src/elspeth/alias.py")
+    _git(repo, "commit", "-qm", "track alias")
+
+    with pytest.raises(SourceSnapshotError, match="symbolic link"):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_ignores_yaml_not_consumed_by_allowlist_loader(tmp_path: Path) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    before = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+    nested = allowlist_dir / "nested" / "ignored.yaml"
+    nested.parent.mkdir()
+    nested.write_text("allow_hits: []\n", encoding="utf-8")
+    yml = allowlist_dir / "ignored.yml"
+    yml.write_text("allow_hits: []\n", encoding="utf-8")
+
+    after = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+    assert after == before
+
+
+def test_capture_source_snapshot_ignores_ambient_git_index_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    expected = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "empty-alternate-index"))
+
+    assert capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir) == expected
+
+
+def test_capture_source_snapshot_ignores_ambient_git_retargeting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo, source_root, allowlist_dir = _repo(tmp_path / "target")
+    other_repo, _other_source, _other_allowlist = _repo(tmp_path / "other")
+    (other_repo / "other.txt").write_text("different history\n", encoding="utf-8")
+    _git(other_repo, "add", "other.txt")
+    _git(other_repo, "commit", "-qm", "different head")
+    expected_head = _git(repo, "rev-parse", "HEAD")
+    assert _git(other_repo, "rev-parse", "HEAD") != expected_head
+    monkeypatch.setenv("GIT_DIR", str(other_repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo))
+
+    binding = capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+    assert binding.source_rev == expected_head
+
+
+def test_capture_source_snapshot_supports_linked_worktree_metadata(tmp_path: Path) -> None:
+    repo, _source_root, _allowlist_dir = _repo(tmp_path)
+    linked = tmp_path / "linked"
+    _git(repo, "worktree", "add", "-q", "--detach", str(linked), "HEAD")
+
+    binding = capture_source_snapshot(
+        source_root=linked / "src" / "elspeth",
+        allowlist_dir=linked / "config" / "cicd" / "enforce_tier_model",
+    )
+
+    assert binding.source_rev == _git(repo, "rev-parse", "HEAD")
+    assert binding.source_dirty is False
+
+
+def test_capture_source_snapshot_wraps_input_read_oserror(tmp_path: Path) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+    original = Path.read_bytes
+
+    def fail_widget(path: Path) -> bytes:
+        if path.name == "widget.py":
+            raise OSError("simulated read failure")
+        return original(path)
+
+    with (
+        patch.object(Path, "read_bytes", fail_widget),
+        pytest.raises(SourceSnapshotError, match=r"cannot read scanner input.*widget.py"),
+    ):
+        capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
+
+
+def test_capture_source_snapshot_wraps_git_launch_oserror(tmp_path: Path) -> None:
+    _repo_path, source_root, allowlist_dir = _repo(tmp_path)
+
+    with (
+        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        pytest.raises(SourceSnapshotError, match="cannot execute Git"),
+    ):
         capture_source_snapshot(source_root=source_root, allowlist_dir=allowlist_dir)
 
 

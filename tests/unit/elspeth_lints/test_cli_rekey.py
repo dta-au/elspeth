@@ -31,6 +31,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -376,6 +377,30 @@ def test_rekey_rejects_stale_source_binding_before_write(tmp_path: Path, monkeyp
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc == 2
+    assert (allowlist_dir / "widget.yaml").read_bytes() == before
+
+
+def test_rekey_source_observation_oserror_is_normal_failure_without_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding, hmac_key=_OLD_KEY)
+    bundle_path = _rekey_bundle(tmp_path, root, allowlist_dir, keys=(key,))
+    before = (allowlist_dir / "widget.yaml").read_bytes()
+    _set_keys(monkeypatch)
+
+    with patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    stderr = capsys.readouterr().err
+    assert rc == 2
+    assert "rekey: cannot verify staged source binding:" in stderr
+    assert "Traceback" not in stderr
     assert (allowlist_dir / "widget.yaml").read_bytes() == before
 
 

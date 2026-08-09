@@ -31,6 +31,17 @@ _MAX_ALLOWLIST_YAML_BYTES = 5 * 1024 * 1024
 _MIN_AUDIT_ANCHOR_ALNUM_CHARS = 2
 
 
+def iter_allowlist_yaml_paths(directory: Path) -> tuple[Path, ...]:
+    """Return exactly the directory YAML paths consumed by ``load_allowlist``.
+
+    The production loader is intentionally non-recursive and accepts only the
+    canonical ``.yaml`` suffix.  Snapshot binding shares this iterator so its
+    byte inventory cannot silently drift to include inert ``.yml`` files or
+    nested documents that the scanner never reads.
+    """
+    return tuple(sorted(directory.glob("*.yaml")))
+
+
 class JudgeMetadataKeyUnavailableError(ValueError):
     """Raised when judge-metadata verification is requested without the signing key.
 
@@ -356,7 +367,9 @@ def load_allowlist(
         defaults = _load_defaults(path / "_defaults.yaml")
         entries: list[AllowlistEntry] = []
         per_file_rules: list[PerFileRule] = []
-        for yaml_file in sorted(file for file in path.glob("*.yaml") if file.name != "_defaults.yaml"):
+        for yaml_file in iter_allowlist_yaml_paths(path):
+            if yaml_file.name == "_defaults.yaml":
+                continue
             data = _load_yaml_file(yaml_file)
             entries.extend(_parse_allow_hits(data, source_file=yaml_file.name, source_root=source_root))
             per_file_rules.extend(_parse_per_file_rules(data, valid_rule_ids=valid_rule_ids, source_file=yaml_file.name))

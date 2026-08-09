@@ -95,8 +95,9 @@ with the key.
 Review bundles use schema v2 and are exact-source-bound at the envelope level:
 `source_rev` is the full Git HEAD, `source_dirty` records tracked source changes,
 and `source_snapshot_sha256` covers every scannable Python file plus every
-allowlist YAML byte. Every consumed input must map to a tracked Git path;
-relevant untracked inputs are rejected even when ignored. The envelope and
+top-level `*.yaml` byte consumed by the allowlist loader. Every consumed input
+must map lexically to a tracked Git path and must not be a symlink; relevant
+untracked inputs are rejected even when ignored. The envelope and
 whole-bundle hash bind all actions, so actions do not repeat these fields. V1
 and incomplete bundles are rejected and must be re-staged.
 

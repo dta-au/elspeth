@@ -64,9 +64,10 @@ Bundles land in `.elspeth/staged-reviews/<bundle_id>.json`.
 
 Bundles are schema v2 and exact-source-bound: the envelope records the full Git
 HEAD, tracked-source dirty state, and a deterministic digest of every scannable
-Python file plus every allowlist YAML byte. All consumed inputs must map to
-tracked Git paths, so relevant untracked or ignored files fail staging. V1 or
-incomplete bundles must be re-staged.
+Python file plus every top-level `*.yaml` byte consumed by the allowlist loader.
+All consumed inputs must map lexically to tracked Git paths and must not be
+symlinks, so relevant untracked or ignored files fail staging. V1 or incomplete
+bundles must be re-staged.
 
 1. **`verify_signatures`** — read-only, *always shape-only* diagnosis. Use to see
    what drifted without the key. (Authoritative HMAC recompute is the operator

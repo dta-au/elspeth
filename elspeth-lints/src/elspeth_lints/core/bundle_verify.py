@@ -45,7 +45,7 @@ from elspeth_lints.core.judge_signature_diagnosis import (
     diagnose_judge_signatures,
 )
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
-from elspeth_lints.core.source_snapshot import capture_source_snapshot
+from elspeth_lints.core.source_snapshot import observe_source_snapshot
 from elspeth_lints.core.tier_model_scan import (
     TargetCensus,
     census_tree_targets,
@@ -119,7 +119,7 @@ def verify_bundle_against_tree(
             f"bundle allowlist_dir {recorded_allowlist_path.resolve()} does not match signing allowlist_dir {expected_bundle_allowlist_dir}"
         )
 
-    source_before = capture_source_snapshot(
+    source_before = observe_source_snapshot(
         source_root=root,
         allowlist_dir=allowlist_dir,
         logical_allowlist_dir=expected_bundle_allowlist_dir,
@@ -214,7 +214,7 @@ def verify_bundle_against_tree(
         else:  # pragma: no cover - BundleAction.__post_init__ rejects unknown kinds
             mismatches.append(f"action {action.key!r}: unknown kind {action.kind!r}")
 
-    source_after = capture_source_snapshot(
+    source_after = observe_source_snapshot(
         source_root=root,
         allowlist_dir=allowlist_dir,
         logical_allowlist_dir=expected_bundle_allowlist_dir,

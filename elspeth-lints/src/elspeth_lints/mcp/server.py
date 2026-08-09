@@ -438,16 +438,16 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     from datetime import datetime
 
     from elspeth_lints.core.review_bundle import SCHEMA_VERSION, ReviewBundle, write_bundle
-    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, capture_source_snapshot
+    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, observe_source_snapshot
 
     bundle_id_arg = arguments.get("bundle_id")
     bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-scan-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
-    source_before = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    source_before = observe_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     actions, target_census = _build_scan_plan(ctx)
-    source_after = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    source_after = observe_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     if source_before != source_after:
         raise SourceSnapshotChangedError("source binding changed while deriving stage_scan actions")
     bundle = ReviewBundle(
@@ -632,7 +632,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     from elspeth_lints.core.judge_signature_diagnosis import _OK_STATUSES, diagnose_judge_signatures
     from elspeth_lints.core.review_bundle import SCHEMA_VERSION, RekeyPlan, ReviewBundle, write_bundle
-    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, capture_source_snapshot
+    from elspeth_lints.core.source_snapshot import SourceSnapshotChangedError, observe_source_snapshot
 
     old_key_env = _require_str_arg(arguments, "old_key_env")
     new_key_env = _require_str_arg(arguments, "new_key_env")
@@ -641,7 +641,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
-    source_before = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    source_before = observe_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     diagnosis = diagnose_judge_signatures(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     valid_keys: list[str] = []
     broken_keys: list[str] = []
@@ -654,7 +654,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
             # is not part of the rekey set.)
             broken_keys.append(item.key)
 
-    source_after = capture_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    source_after = observe_source_snapshot(source_root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     if source_before != source_after:
         raise SourceSnapshotChangedError("source binding changed while deriving stage_rekey diagnosis")
 

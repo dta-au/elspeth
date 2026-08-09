@@ -2169,6 +2169,34 @@ def test_sign_bundle_resume_rejects_stale_source_before_publish(tmp_path: Path, 
     assert "staged claims no longer match" in capsys.readouterr().err
 
 
+def test_sign_bundle_source_observation_oserror_is_normal_verify_failure_without_write(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(root, allowlist_dir, (_new_judgment_action(finding, "plugins/widget.py"),)),
+    )
+    before = _tree_bytes(allowlist_dir)
+
+    with (
+        patch("elspeth_lints.core.source_snapshot.subprocess.run", side_effect=OSError("git unavailable")),
+        patch("elspeth_lints.core.sign_bundle_transaction.create_transaction") as create_transaction,
+    ):
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    stderr = capsys.readouterr().err
+    assert rc == 2
+    assert "sign-bundle: verify error:" in stderr
+    assert "Traceback" not in stderr
+    create_transaction.assert_not_called()
+    assert _tree_bytes(allowlist_dir) == before
+
+
 def test_sign_bundle_rolls_back_if_source_changes_at_directory_exchange(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

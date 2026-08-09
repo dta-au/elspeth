@@ -917,6 +917,24 @@ def test_stage_preview_fills_non_authoritative_verdicts(tmp_path: Path) -> None:
     assert "hmac-sha256:" not in text
 
 
+def test_stage_preview_uses_four_source_observations_for_two_bracketed_verifications(tmp_path: Path) -> None:
+    ctx, _staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
+    from elspeth_lints.core import source_snapshot
+
+    with (
+        patch.object(source_snapshot, "_observe_source_snapshot", wraps=source_snapshot._observe_source_snapshot) as observe,
+        patch("elspeth_lints.core.judge.build_readonly_tool_scope", return_value=object()),
+        patch(
+            "elspeth_lints.core.judge.call_judge",
+            return_value=_fake_response(JudgeVerdict.ACCEPTED, "boundary is genuine"),
+        ),
+    ):
+        outcome = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle_id})
+
+    assert outcome.is_error is False, outcome.text
+    assert observe.call_count == 4
+
+
 def test_stage_preview_rejects_stale_bundle_before_judge_or_rewrite(tmp_path: Path) -> None:
     ctx, staged_dir, bundle_id = _staged_new_judgment_bundle(tmp_path)
     bundle_path = staged_dir / f"{bundle_id}.json"

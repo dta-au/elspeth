@@ -111,11 +111,15 @@ what you touch, or run the full suite.
 
 - **2026-08-09 — review bundles are v2 exact-source assertions**: staging and
   firing bind full Git HEAD, tracked-source dirty state, and every scanner
-  Python/YAML byte. Relevant untracked inputs (ignored included), harmless byte
-  drift, or a HEAD advance invalidate the bundle even when its action list is
-  unchanged. Transaction candidates supply physical allowlist bytes but retain
-  the public allowlist path as their logical Git identity; never hash the
-  candidate under its private transaction path.
+  Python/YAML byte. The YAML set is the production loader's non-recursive
+  top-level `*.yaml` inventory (not nested YAML or `.yml`). Relevant untracked
+  inputs (ignored included), harmless byte drift, or a HEAD advance invalidate
+  the bundle even when its action list is unchanged. Scanner inputs must be
+  non-symlink lexical Git paths: reject symlinks rather than resolving an alias to
+  a tracked target, and strip ambient `GIT_*` variables from evidence commands.
+  Transaction candidates supply physical allowlist bytes but retain the public
+  allowlist path as their logical Git identity; never hash the candidate under
+  its private transaction path.
 - **2026-08-09 — `CompositionState._content_hash_memo`**: write-once memo
   slot read by `composition_content_hash` via DIRECT access. Every mutation
   constructor resets it in `__init__`. If you add a mutation path, reset the
