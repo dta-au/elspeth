@@ -83,6 +83,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.pool import StaticPool
 
+from elspeth.core.config import validate_runtime_node_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
@@ -247,10 +248,18 @@ def _pipeline_output_strategy() -> st.SearchStrategy[_PipelineOutputModel]:
     )
 
 
+def _is_runtime_node_name(value: str) -> bool:
+    try:
+        validate_runtime_node_name(value, field_label="Transform name")
+    except ValueError:
+        return False
+    return True
+
+
 def _splice_transform_node_strategy() -> st.SearchStrategy[_SpliceTransformNodeModel]:
     return st.builds(
         _SpliceTransformNodeModel,
-        id=st.text(),
+        id=st.from_regex(r"[a-zA-Z][a-zA-Z0-9_-]{0,37}", fullmatch=True).filter(_is_runtime_node_name),
         plugin=st.text(),
         options=_OPTIONS_STRATEGY,
         on_error=st.one_of(st.none(), st.text()),

@@ -20,11 +20,11 @@ import re
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_CHUNK_BYTES,
@@ -191,6 +191,17 @@ _VALID_NODE_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]*$")
 # underscore (checked separately).
 _VALID_CONNECTION_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*$")
 
+RuntimeNodeName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=_MAX_NODE_NAME_LENGTH,
+        pattern=_VALID_NODE_NAME_RE.pattern,
+    ),
+]
+"""Runtime-owned processing-node identifier shape shared by authoring boundaries."""
+
 
 def _validate_node_name_chars(value: str, *, field_label: str) -> None:
     """Enforce character-class restriction on processing node names.
@@ -204,6 +215,20 @@ def _validate_node_name_chars(value: str, *, field_label: str) -> None:
             f"{field_label} '{value}' contains invalid characters. "
             "Node names must start with a letter and contain only letters, digits, underscores, and hyphens."
         )
+
+
+def validate_runtime_node_name(value: str, *, field_label: str) -> str:
+    """Validate and normalize a processing-node name against runtime settings."""
+    if not value or not value.strip():
+        raise ValueError(f"{field_label} must not be empty")
+    normalized = value.strip()
+    _validate_max_length(normalized, field_label=field_label, max_length=_MAX_NODE_NAME_LENGTH)
+    _validate_node_name_chars(normalized, field_label=field_label)
+    if normalized in _RESERVED_EDGE_LABELS:
+        raise ValueError(f"{field_label} '{normalized}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+    if normalized.startswith("__"):
+        raise ValueError(f"{field_label} '{normalized}' starts with '__', which is reserved for system edges")
+    return normalized
 
 
 def _validate_connection_name_chars(value: str, *, field_label: str) -> None:
@@ -1308,16 +1333,7 @@ class TransformSettings(BaseModel):
     @classmethod
     def validate_name(cls, v: str) -> str:
         """Validate transform name is not empty or reserved."""
-        if not v or not v.strip():
-            raise ValueError("Transform name must not be empty")
-        v = v.strip()
-        _validate_max_length(v, field_label="Transform name", max_length=_MAX_NODE_NAME_LENGTH)
-        _validate_node_name_chars(v, field_label="Transform name")
-        if v in _RESERVED_EDGE_LABELS:
-            raise ValueError(f"Transform name '{v}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
-        if v.startswith("__"):
-            raise ValueError(f"Transform name '{v}' starts with '__', which is reserved for system edges")
-        return v
+        return validate_runtime_node_name(v, field_label="Transform name")
 
     @field_validator("input")
     @classmethod

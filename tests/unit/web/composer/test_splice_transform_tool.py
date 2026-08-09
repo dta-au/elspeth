@@ -7,15 +7,19 @@ from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
+from pydantic import TypeAdapter
 
 from elspeth.contracts import NodeType
+from elspeth.core.config import RuntimeNodeName, load_settings_from_yaml_string
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import MANIFEST, SpliceTransformArgumentsModel, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools._common import ToolContext
-from elspeth.web.composer.tools._dispatch import get_tool_definitions
+from elspeth.web.composer.tools._dispatch import execute_tool, get_tool_definitions
 from elspeth.web.composer.tools.transforms import _execute_splice_transform
+from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -113,6 +117,20 @@ def test_splice_transform_is_declared_through_the_public_registry() -> None:
         "successor_id",
         "node",
     ]
+
+
+def test_splice_transform_public_node_id_schema_matches_runtime_contract() -> None:
+    definitions = {definition["name"]: definition for definition in get_tool_definitions()}
+    node_id_schema = definitions["splice_transform"]["parameters"]["properties"]["node"]["properties"]["id"]
+    runtime_schema = TypeAdapter(RuntimeNodeName).json_schema()
+
+    assert runtime_schema == {
+        "maxLength": 38,
+        "minLength": 1,
+        "pattern": r"^[a-zA-Z][a-zA-Z0-9_-]*$",
+        "type": "string",
+    }
+    assert {key: node_id_schema[key] for key in runtime_schema} == runtime_schema
 
 
 def test_splice_transform_manifest_is_type_driven() -> None:
@@ -358,18 +376,99 @@ def test_splice_transform_same_id_non_transform_retry_is_atomic() -> None:
     assert replay.updated_state.version == noncanonical.version
 
 
-def test_splice_transform_bounds_derived_edge_identity() -> None:
-    long_id = "inserted" * 40
+def test_splice_transform_accepts_max_length_runtime_node_id_and_round_trips() -> None:
+    max_length_id = "a" * 38
     arguments = {
         **_arguments(),
-        "node": {**_arguments()["node"], "id": long_id},
+        "node": {**_arguments()["node"], "id": max_length_id},
     }
+    state = _state()
+    context = _context()
 
-    result = _execute_splice_transform(arguments, _state(), _context())
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
 
     assert result.success, result.data
-    assert len(result.data["new_edge_id"]) <= 160
+    settings = load_settings_from_yaml_string(generate_public_yaml(result.updated_state), expand_env_vars=False)
+    assert settings.transforms[1].name == max_length_id
+
+
+def test_splice_transform_bounds_derived_edge_identity_with_long_direct_edge_id() -> None:
+    state = _state()
+    long_direct_edge = replace(state.edges[1], id="e" * 160)
+    state = replace(state, edges=(state.edges[0], long_direct_edge, state.edges[2]))
+
+    result = _execute_splice_transform(_arguments(), state, _context())
+
+    assert result.success, result.data
+    assert len(result.data["new_edge_id"]) == 160
+    assert result.data["new_edge_id"].endswith("__splice__inserted")
     assert result.updated_state.edges[2].id == result.data["new_edge_id"]
+
+
+@pytest.mark.parametrize(
+    "node_id",
+    (
+        "",
+        "   ",
+        "1bad",
+        "é",
+        "bad.name",
+        "_bad",
+        "continue",
+        "fork",
+        "on_success",
+        "a" * 39,
+    ),
+)
+def test_splice_transform_public_dispatch_rejects_runtime_invalid_node_id_atomically(node_id: str) -> None:
+    state = _state()
+    state_before = state.to_dict()
+    context = _context()
+    arguments = {
+        **_arguments(),
+        "node": {**_arguments()["node"], "id": node_id},
+    }
+
+    with pytest.raises(ToolArgumentError, match="splice_transform arguments"):
+        execute_tool(
+            "splice_transform",
+            arguments,
+            state,
+            context.catalog,
+            plugin_snapshot=context.plugin_snapshot,
+        )
+
+    assert state.to_dict() == state_before
+    assert state.version == 4
+
+
+@pytest.mark.parametrize("node_id", ("a", "valid_id-1", "Z9"))
+def test_splice_transform_public_dispatch_accepts_runtime_valid_node_id_and_round_trips(node_id: str) -> None:
+    state = _state()
+    context = _context()
+    arguments = {
+        **_arguments(),
+        "node": {**_arguments()["node"], "id": node_id},
+    }
+
+    result = execute_tool(
+        "splice_transform",
+        arguments,
+        state,
+        context.catalog,
+        plugin_snapshot=context.plugin_snapshot,
+    )
+
+    assert result.success, result.data
+    assert result.updated_state.nodes[1].id == node_id
+    settings = load_settings_from_yaml_string(generate_public_yaml(result.updated_state), expand_env_vars=False)
+    assert settings.transforms[1].name == node_id
 
 
 @pytest.mark.parametrize(

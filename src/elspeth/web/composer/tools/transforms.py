@@ -6,9 +6,10 @@ from collections.abc import Mapping
 from dataclasses import replace
 from typing import Annotated, Any, Final, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.core.config import RuntimeNodeName
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchNodeOptionsArgumentsModel,
@@ -698,9 +699,6 @@ def _execute_upsert_node(
 
 
 def _splice_connection_name(node_id: str, state: CompositionState) -> str | None:
-    fragment = "".join(character if character.isalnum() or character in "_-" else "_" for character in node_id).strip("_-")
-    if not fragment:
-        fragment = "transform"
     reserved = (
         _reserved_connection_names(state)
         | set(state.sources)
@@ -710,7 +708,7 @@ def _splice_connection_name(node_id: str, state: CompositionState) -> str | None
     for attempt in range(1, _SPLICE_CONNECTION_ATTEMPTS + 1):
         suffix = "" if attempt == 1 else f"_{attempt}"
         stem_length = _SPLICE_CONNECTION_MAX_LENGTH - len("_out") - len(suffix)
-        candidate = f"{fragment[:stem_length]}_out{suffix}"
+        candidate = f"{node_id[:stem_length]}_out{suffix}"
         if candidate not in reserved:
             return candidate
     return None
@@ -1602,7 +1600,10 @@ _SPLICE_TRANSFORM_DECLARATION = ToolDeclaration(
             "node": {
                 "type": "object",
                 "properties": {
-                    "id": {"type": "string", "description": "Unique ID for the inserted transform."},
+                    "id": {
+                        **TypeAdapter(RuntimeNodeName).json_schema(),
+                        "description": "Unique ID for the inserted transform.",
+                    },
                     "plugin": {"type": "string", "description": "Transform plugin name."},
                     "options": {"type": "object", "description": "Plugin-specific authored options."},
                     "on_error": {

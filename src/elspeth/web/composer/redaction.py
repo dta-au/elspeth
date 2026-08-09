@@ -21,12 +21,13 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, ValidationError, field_validator
 
 from elspeth.contracts.blobs import AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
     GuidedReviewedBlobBinding,
@@ -482,8 +483,8 @@ class TraversalNode:
         2. TraversalNode is produced inside walk_model_schema and discarded
            after iteration - there is no long-lived reference path that
            would expose mutation of a marker;
-        3. All other metadata entries are either pydantic.FieldInfo (built-in
-           immutable for our usage) or scalar/None.
+        3. All other metadata entries are either immutable Pydantic metadata
+           (for example FieldInfo or StringConstraints) or scalar/None.
       If a future change introduces stateful metadata objects, ADD a
       freeze_fields() call here AND a deep_freeze() of `metadata` - do not
       rely on the type signature alone, which `tuple[Any, ...]` does not
@@ -4227,11 +4228,16 @@ def redact_guided_snapshot_storage_paths(
 class _AuthoringNodeOptionsModel(BaseModel):
     """Shared redaction-bearing surface for authored transform options."""
 
-    id: str
+    id: RuntimeNodeName
     options: _LlmJsonObject = Field(default_factory=dict)
     on_error: str | None = None
 
     model_config = ConfigDict(extra="forbid")
+
+    @field_validator("id")
+    @classmethod
+    def validate_id(cls, value: str) -> str:
+        return validate_runtime_node_name(value, field_label="Transform name")
 
 
 class _SpliceTransformNodeModel(_AuthoringNodeOptionsModel):
