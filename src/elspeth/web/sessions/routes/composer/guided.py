@@ -2039,7 +2039,7 @@ def _schema8_only_response_fields(body: GuidedRespondRequest, *allowed: str) -> 
 
 
 def _schema8_permitted_plugins(turn: Turn) -> tuple[str, ...]:
-    options = turn["payload"].get("options")
+    options = turn["payload"]["options"]
     if type(options) is not list:
         raise InvariantError("single-select turn has no server-held option list")
     plugins: list[str] = []
@@ -2150,8 +2150,8 @@ def _schema8_schema_authority(
     catalog: PolicyCatalogView,
 ) -> SchemaFormAuthority:
     payload = turn["payload"]
-    knobs = payload.get("knobs")
-    prefilled = payload.get("prefilled")
+    knobs = payload["knobs"]
+    prefilled = payload["prefilled"]
     if not isinstance(knobs, Mapping) or not isinstance(prefilled, Mapping):
         raise InvariantError("schema-form turn is missing server-held form authority")
     server_options = _schema8_server_options(prefilled)
@@ -2311,7 +2311,7 @@ def _schema8_transition(
     if body.component_action is not None:
         if turn_type is not TurnType.REVIEW_COMPONENTS:
             raise ValueError("component_action is legal only for a component review turn")
-        review_kind = turn["payload"].get("component_kind")
+        review_kind = turn["payload"]["component_kind"]
         if type(review_kind) is not str or review_kind not in {"source", "output"}:
             raise InvariantError("component review turn has no valid server-held component kind")
         action = body.component_action
@@ -2790,7 +2790,7 @@ async def post_guided_respond(
 
         if body.edit_target is None:
             raise AuditIntegrityError("guided proposal revision is missing its target")
-        raw_targets = current_turn["payload"].get("edit_targets")
+        raw_targets = current_turn["payload"]["edit_targets"]
         requested = {
             "kind": body.edit_target.kind,
             "stable_id": body.edit_target.stable_id,
@@ -2812,7 +2812,7 @@ async def post_guided_respond(
             "edge": "connections",
             "output": "outputs",
         }[body.edit_target.kind]
-        raw_components = payload.get(collection_key)
+        raw_components = payload[collection_key]
         if type(raw_components) is not list:
             raise AuditIntegrityError("guided wire projection lost its component collection")
         matches = [

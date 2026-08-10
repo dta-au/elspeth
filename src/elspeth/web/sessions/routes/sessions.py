@@ -188,9 +188,10 @@ def _rewrite_source_blob_options(
             old_blob_id = UUID(old_ref)
         except ValueError as exc:
             raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{key} is not a UUID string") from exc
-        copied = blob_map.get(old_blob_id)
-        if copied is None:
-            raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{key} was absent from the frozen fork plan")
+        try:
+            copied = blob_map[old_blob_id]
+        except KeyError:
+            raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{key} was absent from the frozen fork plan") from None
         targets[old_blob_id] = copied
         rebuilt[key] = str(copied.id)
     for carrier in ("path", "file"):
@@ -204,11 +205,12 @@ def _rewrite_source_blob_options(
                 old_blob_id = UUID(value.removeprefix(BLOB_REF_PATH_PREFIX))
             except ValueError as exc:
                 raise AuditIntegrityError(f"Tier 1 audit anomaly: {field_path}.{carrier} has malformed blob sentinel") from exc
-            copied = blob_map.get(old_blob_id)
-            if copied is None:
+            try:
+                copied = blob_map[old_blob_id]
+            except KeyError:
                 raise AuditIntegrityError(
                     f"Tier 1 audit anomaly: {field_path}.{carrier} blob sentinel was absent from the frozen fork plan"
-                )
+                ) from None
             targets[old_blob_id] = copied
             rebuilt[carrier] = f"{BLOB_REF_PATH_PREFIX}{copied.id}"
         elif value in source_blob_path_map:
@@ -324,11 +326,12 @@ def _rewrite_guided_blob_custody(
                     old_blob_id = UUID(old_ref)
                 except (TypeError, ValueError) as exc:
                     raise AuditIntegrityError("Tier 1 audit anomaly: pending source inspection blob_id is not a UUID string") from exc
-                copied = blob_map.get(old_blob_id)
-                if copied is None:
+                try:
+                    copied = blob_map[old_blob_id]
+                except KeyError:
                     raise AuditIntegrityError(
                         "Tier 1 audit anomaly: pending source inspection blob_id was absent from the frozen fork plan"
-                    )
+                    ) from None
                 identity["blob_id"] = str(copied.id)
                 rewritten = True
     for stable_id, reviewed in rebuilt["reviewed_outputs"].items():

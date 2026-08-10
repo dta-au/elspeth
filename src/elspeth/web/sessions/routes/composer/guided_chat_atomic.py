@@ -690,7 +690,7 @@ def _step_1_uploaded_bind_form_options(form_turn: Turn) -> dict[str, object]:
     ``transition_source_schema_form`` then validate exactly what a user
     pressing Continue on that form would have submitted.
     """
-    prefilled = form_turn["payload"].get("prefilled")
+    prefilled = form_turn["payload"]["prefilled"]
     if not isinstance(prefilled, Mapping):
         raise AuditIntegrityError("source schema form has no server-held prefill to bind")
     options = deep_thaw(prefilled)

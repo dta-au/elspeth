@@ -1471,7 +1471,7 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         assert isinstance(connection["from_endpoint"], Mapping) and isinstance(connection["to_endpoint"], Mapping)
         for endpoint_name in ("from_endpoint", "to_endpoint"):
             endpoint = connection[endpoint_name]
-            if endpoint.get("kind") != "discard" and component_ids.get(endpoint.get("stable_id")) != endpoint.get("kind"):
+            if endpoint["kind"] != "discard" and component_ids.get(endpoint["stable_id"]) != endpoint["kind"]:
                 return f"{path}.{endpoint_name} does not resolve to its advertised component kind"
         if (error := _validate_proposal_flow(connection["flow"], f"{path}.flow")) is not None:
             return error
@@ -1585,7 +1585,7 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         return f"{path}.behavior must be a mapping"
     if "kind" not in behavior:
         return f"{path}.behavior missing required keys: ['kind']"
-    if behavior.get("kind") != node_type:
+    if behavior["kind"] != node_type:
         return f"{path}.behavior.kind must match node_type"
     behavior_path = f"{path}.behavior"
     if node_type in ("transform", "queue"):
