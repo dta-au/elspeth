@@ -32,6 +32,7 @@ from typing import Any, Final, NotRequired, Required, TypedDict
 
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSummary
 
@@ -901,6 +902,18 @@ class _SchemaContractProjectionUnsupported(ValueError):
     """A schema carries semantics this bounded projection cannot preserve."""
 
 
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared JSON Schema 'discriminator' fragment (raw ConfigModel.model_json_schema() output)",
+    source_param="raw",
+    suppresses=("R5",),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported unless raw is a dict containing only "
+        "propertyName (str) and/or mapping (dict[str, str]) keys"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_discriminator_rejects_unknown_key",
+    test_fingerprint="4b5ad940600ffcc92ca815af3d0415e09da1dc9df7104550cae9f0a41be917f6",
+)
 def _contract_discriminator(raw: object) -> dict[str, object]:
     if not isinstance(raw, dict) or set(raw) - {"propertyName", "mapping"}:
         raise _SchemaContractProjectionUnsupported
@@ -918,6 +931,21 @@ def _contract_discriminator(raw: object) -> dict[str, object]:
     return projected
 
 
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared JSON Schema fragment (raw ConfigModel.model_json_schema() output; recursive)",
+    source_param="raw",
+    suppresses=("R5",),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported on any JSON Schema KEYWORD outside the closed "
+        "projected vocabulary, and on any container-valued keyword whose value shape is wrong; the "
+        "boolean schema forms (true/false) pass through unchanged. Deliberately NOT claimed: values of "
+        "_JSON_SCHEMA_SCALAR_KEYS keywords (type/const/enum/default/pattern/minimum/uniqueItems/...) are "
+        "deep-copied through WITHOUT a type check, so e.g. pattern=12345 or minimum='x' is accepted"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_json_schema_rejects_non_dict_non_bool",
+    test_fingerprint="88f4d910a5b39715fd50c60330e587e198eddfef3263c5101ed6461593ef561c",
+)
 def _contract_json_schema(raw: object) -> dict[str, object] | bool:
     """Project all known JSON Schema semantics while excluding only prose."""
     if isinstance(raw, bool):
@@ -979,6 +1007,19 @@ def _contract_json_schema(raw: object) -> dict[str, object] | bool:
     return projected
 
 
+@trust_boundary(
+    tier=3,
+    source="Plugin-declared ELSPETH knob-schema fragment (PolicyCatalogView.get_schema knob_schema; recursive)",
+    source_param="raw",
+    suppresses=("R5",),
+    invariant=(
+        "raises _SchemaContractProjectionUnsupported on any field shape outside the closed "
+        "{name,kind,type,required,nullable,default,enum,choices,item_kind,visible_when,required_when,"
+        "item_schema,items} plus prose-key vocabulary, or when the top-level shape is not exactly {'fields'}"
+    ),
+    test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_knob_schema_rejects_missing_fields_key",
+    test_fingerprint="7cd806e3678d6f8e15df19954921cf662441218973bd39795dbb74726592442e",
+)
 def _contract_knob_schema(raw: object) -> dict[str, object]:
     """Project the one-knob schema to executable field facts, excluding UI prose."""
     if not isinstance(raw, dict) or set(raw) != {"fields"}:

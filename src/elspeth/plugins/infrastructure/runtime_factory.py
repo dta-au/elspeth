@@ -20,6 +20,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectExecutionPurpose,
     SinkEffectRuntimeBinding,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.engine.orchestrator.preflight import (
     validate_audit_export_sink_type_capability,
     validate_sink_effect_type_capability,
@@ -252,6 +253,18 @@ def _expand_env_placeholders_for_raw_preflight(
     return _expand_value(value), fully_resolved
 
 
+@trust_boundary(
+    tier=3,
+    source="web/CLI-authored raw pipeline configuration mapping (untrusted, pre-pydantic YAML/JSON)",
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError for every raw_config-derived shape deviation across 'sinks', its "
+        "named entries, their 'plugin' and 'options'; never silently defaults or skips a malformed entry"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_validate_sink_effect_eligibility_rejects_non_mapping_sinks",
+    test_fingerprint="e54d5759fd061a58136b1da749152d310620cd074d2c34641e9ed7aeb6340767",
+)
 def validate_sink_effect_eligibility_from_raw_config(
     raw_config: Mapping[str, object],
     *,
@@ -363,6 +376,18 @@ def validate_sink_effect_eligibility_from_raw_config(
     return modes
 
 
+@trust_boundary(
+    tier=3,
+    source="web/CLI-authored raw pipeline configuration mapping (untrusted, pre-pydantic YAML/JSON)",
+    source_param="raw_config",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError unless 'landscape' and 'landscape.export', when present, are mappings; "
+        "never silently defaults a malformed section"
+    ),
+    test_ref="tests/unit/plugins/infrastructure/test_runtime_factory.py::test_validate_landscape_export_settings_rejects_non_mapping_landscape",
+    test_fingerprint="00ad72be64f927816212e8328687e5d7fc78a80c757a5ee5997cb5dd60acc5b6",
+)
 def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, object]) -> LandscapeExportSettings:
     """Normalize bounded raw export settings through the authoritative model."""
     from elspeth.core.config import LandscapeExportSettings

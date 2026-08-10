@@ -383,6 +383,17 @@ def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str
     return list(branches)
 
 
+@observation_boundary(
+    tier=3,
+    source="a NodeSpec.timeout_seconds value re-read from a persisted session payload via NodeSpec.from_dict",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns True (invalid) for any value that is not int/float, is bool, or converts to a "
+        "non-finite/non-positive magnitude; float()'s OverflowError on an arbitrary-precision JSON "
+        "int is caught, so this boundary never raises"
+    ),
+)
 def _timeout_seconds_is_invalid(value: object) -> bool:
     """Return whether a structural barrier timeout violates runtime bounds.
 
@@ -405,6 +416,16 @@ def _timeout_seconds_is_invalid(value: object) -> bool:
     return not isfinite(normalized) or normalized <= 0
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying composer/LLM/user-authored options (untrusted options.description value)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns an error string only for a concretely malformed queue shape; a non-string "
+        "options.description is one such violation, and the function never raises"
+    ),
+)
 def queue_node_contract_error(node: NodeSpec) -> str | None:
     """Return the intrinsic (topology-free) contract violation for a queue node.
 
@@ -2176,6 +2197,17 @@ def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]
     return find_runtime_unbound_variables(ast), usage.fields
 
 
+@observation_boundary(
+    tier=3,
+    source="node.options['queries'] (web-authored multi-query definitions)",
+    source_param="queries",
+    suppresses=("R5",),
+    invariant=(
+        "returns only well-formed (label, entry) pairs; malformed queries or entries are silently "
+        "dropped (QueryDefinition's contract is reported by plugin schema validation, not here), and "
+        "this boundary never raises"
+    ),
+)
 def _well_formed_query_entries(queries: Any) -> tuple[tuple[str, Mapping[str, Any]], ...]:
     """Extract (label, entry) pairs from an untrusted ``queries`` option.
 

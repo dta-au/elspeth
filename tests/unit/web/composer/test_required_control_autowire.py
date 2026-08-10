@@ -1149,3 +1149,30 @@ class TestImplicitDecisionDisclosure:
         report = build_implicit_decisions_report(state)
 
         assert [entry for entry in report["entries"] if entry["category"] == "policy_control"] == []
+
+
+class TestParseBoundaryHonesty:
+    """Raising-shape honesty tests for the ``@trust_boundary``-decorated candidate parsers.
+
+    ``_parse_node`` and ``_parse_source`` project one untrusted set_pipeline
+    candidate block into an owned dataclass and raise ``TypeError`` on any
+    malformed field shape (elspeth-lints rule R5 disposition, R2-Fx trust-tier
+    sweep). These tests are the ``trust_boundary.tests`` honesty-gate evidence
+    the decorators on both functions reference by ``test_ref``: each calls the
+    decorated function through its declared ``source_param`` inside a
+    ``pytest.raises(TypeError)`` block.
+    """
+
+    def test_parse_node_rejects_non_string_id(self) -> None:
+        """A non-string node id is a malformed-shape rejection, not a KeyError."""
+        from elspeth.web.composer.required_controls import _parse_node
+
+        with pytest.raises(TypeError):
+            _parse_node({"id": 123, "node_type": "transform"})
+
+    def test_parse_source_rejects_non_string_plugin(self) -> None:
+        """A non-string source plugin name is a malformed-shape rejection."""
+        from elspeth.web.composer.required_controls import _parse_source
+
+        with pytest.raises(TypeError):
+            _parse_source({"plugin": 123})

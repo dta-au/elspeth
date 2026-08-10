@@ -39,6 +39,7 @@ from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -464,6 +465,16 @@ class _FinalizerOwnedRefs:
 _FINALIZER_OWNS_NOTHING: Final[_FinalizerOwnedRefs] = _FinalizerOwnedRefs()
 
 
+@observation_boundary(
+    tier=3,
+    source="a set_pipeline candidate mapping (LLM tool-call arguments or its finalized projection)",
+    source_param="candidate",
+    suppresses=("R5",),
+    invariant=(
+        "silently skips any block that cannot carry a well-formed component ref (non-Mapping source/"
+        "node/output block, or a missing/empty/non-string id); never raises"
+    ),
+)
 def _candidate_component_blocks(candidate: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
     """Map validation-component refs to their raw blocks in one candidate.
 
@@ -856,6 +867,20 @@ def _assert_planner_call_matches_manifest(
         raise AuditIntegrityError("planner call inputs changed after capability manifest construction")
 
 
+@observation_boundary(
+    tier=3,
+    source="a litellm/provider response object of unpinned vendor shape (dict, dataclass, or pydantic model)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns a field-name-to-value mapping merged from vars() and pydantic __pydantic_extra__ "
+        "when derivable, or None when the value is not a Mapping and has no accessible __dict__; "
+        "never raises (TypeError from vars() and AttributeError from the extras probe are both caught). "
+        "The isinstance(extra, Mapping) site is reached only through object.__getattribute__(value, ...), "
+        "a call that launders the suppression root, so it stays outside this decorator's suppressed scope "
+        "by the analyzer's own model even though extra is semantically still value-derived"
+    ),
+)
 def _provider_fields(value: Any) -> Mapping[str, Any] | None:
     if isinstance(value, Mapping):
         return value
@@ -1918,6 +1943,19 @@ def _serialize_closed_provider_discovery_payload(payload: Mapping[str, Any]) -> 
     return json.dumps(payload, default=pydantic_default)
 
 
+@observation_boundary(
+    tier=3,
+    source="ToolResult.data from executing a model-requested discovery tool call (unpinned payload shape)",
+    source_param="result",
+    suppresses=("R5",),
+    invariant=(
+        "dispatches on result.data's shape (an authoritative-state component echo) and falls closed "
+        "to the leak-safe surface_projection_unavailable payload for anything unrecognized; never "
+        "raises. Two of this function's isinstance sites root at provider_current_state (a separate, "
+        "policy-owned server-computed projection, not this boundary) and are outside this decorator's "
+        "scope by design"
+    ),
+)
 def _serialize_provider_discovery_result(
     *,
     call: _ParsedToolCall,

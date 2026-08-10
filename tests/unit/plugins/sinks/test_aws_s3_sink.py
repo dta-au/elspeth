@@ -176,6 +176,20 @@ class TestAWSS3SinkConfig:
 
         assert run_id.multiplied is False
 
+    def test_compile_key_template_rejects_expression_nodes(self) -> None:
+        """Direct honesty-gate test for the ``@trust_boundary`` on ``_compile_key_template``.
+
+        ``test_key_template_rejects_expressions_before_rendering`` above exercises the same
+        rejection through ``_render_key_template``, one call removed from the decorated
+        symbol; this test invokes ``_compile_key_template`` itself with the boundary's
+        ``source_param`` (``template_source``) so the trust-boundary honesty gate has a
+        direct raising assertion to bind to.
+        """
+        from elspeth.plugins.sinks.aws_s3_sink import _compile_key_template
+
+        with pytest.raises(ValueError, match="approved variables"):
+            _compile_key_template("{{ run_id * 1000000000 }}")
+
     def test_sink_compiles_key_template_once_during_initialization(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import elspeth.plugins.sinks.aws_s3_sink as module
         from elspeth.contracts.sink_effects import RestrictedSinkEffectContext

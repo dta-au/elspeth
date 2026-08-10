@@ -19,6 +19,7 @@ from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields, requ
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.results import ArtifactDescriptor, require_no_artifact_uri_credentials
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit, scrub_text_for_audit
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS
 
 if TYPE_CHECKING:
@@ -246,6 +247,22 @@ def _reject_credential_bearing_reference(value: str, field_name: str) -> None:
         raise ValueError(f"{field_name} must be credential-free (known secret form detected)")
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "sink-plugin-returned evidence payloads (SinkEffectCommitResult/SinkEffectReconcileResult/"
+        "SinkEffectInspection.evidence) — constructed by third-party sink plugin code ELSPETH does not own"
+    ),
+    source_param="evidence",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError when evidence is not a Mapping or contains a RestrictedAuditExportSnapshotReader; "
+        "raises ValueError when its canonical JSON exceeds the 64 KiB bound or is not credential-free; "
+        "never truncates or silently drops content"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_freeze_bounded_evidence_rejects_non_mapping",
+    test_fingerprint="e69dee2ea35162d11d9edb59c032e81549c02f221d3fa9d6144f8afbe8440797",
+)
 def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) -> Mapping[str, object]:
     if not isinstance(evidence, Mapping):
         raise TypeError(f"{field_name} must be a mapping")
@@ -263,6 +280,22 @@ def _freeze_bounded_evidence(evidence: Mapping[str, object], field_name: str) ->
     return frozen
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "pipeline row values assembled by source/transform plugin code ELSPETH does not own, forwarded here "
+        "via SinkEffectMember/SinkEffectMemberCandidate row construction"
+    ),
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError on any value outside the canonical JSON-safe type set (str, bool, int, float, None, "
+        "Mapping, list/tuple) or on an embedded RestrictedAuditExportSnapshotReader, and raises ValueError on "
+        "an out-of-safe-range int or a non-finite float; never coerces or silently drops a value"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_freeze_canonical_row_value_rejects_unsupported_type",
+    test_fingerprint="6ccb739c009146c8f17fb813ae38e6060d8739887045a0b14cf33e98263aabc3",
+)
 def _freeze_canonical_row_value(value: object, path: str) -> object:
     """Detach one JSON/RFC-8785-safe value tree and reject authority objects."""
     if value is None or isinstance(value, (str, bool)):
@@ -923,6 +956,18 @@ class RestrictedAuditExportSnapshotReader:
         raise TypeError("RestrictedAuditExportSnapshotReader cannot be serialized")
 
 
+@trust_boundary(
+    tier=3,
+    source="bytes returned by an injected audit-export blob-storage resolver (store_resolver) — external storage content",
+    source_param="content",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError when content is not bytes; raises ValueError when its length or SHA-256 hash does "
+        "not match the bound descriptor; never accepts content it cannot verify"
+    ),
+    test_ref="tests/unit/contracts/test_sink_effect_contract.py::test_verify_content_bytes_rejects_non_bytes_content",
+    test_fingerprint="9b22a8a8729263f8e7c7f7e86eec3a716c1cc8389f3fe13bd725493d138935d4",
+)
 def _verify_content_bytes(content: object, expected_hash: str, expected_size: int, label: str) -> None:
     if not isinstance(content, bytes):
         raise TypeError(f"{label} resolver must return bytes")

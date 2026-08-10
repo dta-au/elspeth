@@ -44,6 +44,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInputKind,
     SinkEffectRuntimeBinding,
 )
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.types import AggregationName
 from elspeth.contracts.value_source import (
     CatalogValueSource,
@@ -147,6 +148,21 @@ class _SinkEffectCapabilityAdmission:
         return "<SinkEffectCapabilityAdmission validator-issued>"
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "sink plugin instance's declared capability class attributes "
+        "(supported_effect_modes, supported_effect_input_kinds) — plugin code ELSPETH does not own the shape of"
+    ),
+    source_param="sink",
+    suppresses=("R5",),
+    invariant=(
+        "raises SinkEffectCapabilityError on any missing, malformed, or unsupported capability declaration; "
+        "never defaults or silently accepts an unrecognized mode or input kind"
+    ),
+    test_ref="tests/unit/engine/test_sink_effect_preflight.py::test_preflight_fails_closed_on_inexact_declarations",
+    test_fingerprint="f4cc038a0328585428bd5f1d712e1ff1924669af2a3c244f172cbc418962143d",
+)
 def validate_sink_effect_capability(
     sink: object,
     mode: str,
@@ -226,6 +242,21 @@ def validate_sink_effect_capability(
     _validate_instance_extension_capabilities(sink, sink_name)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "sink plugin class's declared capability class attributes "
+        "(supported_effect_modes, supported_effect_input_kinds) — plugin code ELSPETH does not own the shape of"
+    ),
+    source_param="sink_type",
+    suppresses=("R5",),
+    invariant=(
+        "raises SinkEffectCapabilityError on any missing, malformed, or unsupported capability declaration; "
+        "never defaults or silently accepts an unrecognized mode or input kind"
+    ),
+    test_ref="tests/unit/engine/test_sink_effect_preflight.py::test_nominal_member_capability_requires_concrete_methods",
+    test_fingerprint="07b5578aabeb7012896fb2578e7d4e9a8504a4a7e0c0c21e41da735f885539a5",
+)
 def validate_sink_effect_type_capability(
     sink_type: type[object],
     mode: str,
@@ -290,6 +321,19 @@ def validate_sink_effect_type_capability(
     _validate_type_extension_capabilities(sink_type, sink_name)
 
 
+@trust_boundary(
+    tier=3,
+    source="sink plugin class's declared supported_audit_export_formats attribute — plugin code ELSPETH does not own the shape of",
+    source_param="sink_type",
+    suppresses=("R5",),
+    invariant=(
+        "raises SinkEffectCapabilityError when supported_audit_export_formats is not an exact frozenset of "
+        "AuditExportFormat, or when the requested export_format is not among the declared formats; never "
+        "defaults to a permissive or partial format set"
+    ),
+    test_ref="tests/unit/engine/test_sink_effect_preflight.py::test_audit_export_type_capability_rejects_non_frozenset_declaration",
+    test_fingerprint="e064196acdc75a10becc1df357eff0b129a651535528ce0bb0c7f8e702f4f77e",
+)
 def validate_audit_export_sink_type_capability(
     sink_type: type[object],
     export_format: AuditExportFormat,

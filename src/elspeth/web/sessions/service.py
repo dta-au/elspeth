@@ -43,6 +43,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -3061,6 +3062,18 @@ def _resolve_vague_term(
     return state_record.sources, final_nodes, resolved_prompt_template_hash
 
 
+@observation_boundary(
+    tier=3,
+    source="composer/LLM-authored composition state re-read from session storage (CompositionStateRecord)",
+    source_param="surfacing_state_record",
+    suppresses=("R5",),
+    invariant=(
+        "returns the live options.prompt_template_parts structure hash only when the node and a "
+        "mapping-shaped options are both present; returns None (never raises) when the surfacing "
+        "state, the node, or its options are absent or malformed — the documented legacy-node "
+        "fallback contract, with the rendered-text comparison owned by the caller"
+    ),
+)
 def _surfacing_prompt_structure_hash(
     surfacing_state_record: CompositionStateRecord | None,
     *,

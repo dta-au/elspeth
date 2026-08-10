@@ -41,6 +41,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.infrastructure.base import BaseSink
@@ -661,6 +662,17 @@ def _s3_client_error_type() -> type[Exception]:
     return cast("type[Exception]", ClientError)
 
 
+@observation_boundary(
+    tier=3,
+    source="botocore ClientError.response payload (AWS API error shape, not ELSPETH-owned)",
+    source_param="error",
+    suppresses=("R5",),
+    invariant=(
+        "returns None unless error is a genuine botocore ClientError whose response carries "
+        "a Mapping Error.Code (str) and a Mapping ResponseMetadata.HTTPStatusCode (int); "
+        "never raises on a malformed or foreign exception shape"
+    ),
+)
 def _client_error_evidence(error: Exception) -> tuple[str, int] | None:
     """Validate the response owned by a real botocore ``ClientError``."""
     if not isinstance(error, _s3_client_error_type()):
@@ -695,6 +707,16 @@ def _provider_failure_kind(error: Exception) -> Literal["conditional", "rejected
     return "unknown"
 
 
+@observation_boundary(
+    tier=3,
+    source="AWS S3 API response payload (HeadObject/PutObject/etc., not ELSPETH-owned)",
+    source_param="response",
+    suppresses=("R5",),
+    invariant=(
+        "returns None unless ETag is present, an exact str, non-empty, bounded, and printable-ASCII; "
+        "never raises on a malformed or absent ETag"
+    ),
+)
 def _validated_etag(response: Mapping[str, Any]) -> str | None:
     if "ETag" not in response:
         return None
@@ -714,7 +736,7 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:87b13a837e37cce9"
+    source_file_hash: str | None = "sha256:29fc4f64bc3de354"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

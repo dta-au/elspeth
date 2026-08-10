@@ -24,6 +24,7 @@ from referencing.exceptions import Unresolvable
 from referencing.jsonschema import DRAFT202012
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError, ExpressionSyntaxError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -1859,6 +1860,20 @@ class _DeferredCoverageContext:
         return _SubjectResolution(components=matches)
 
     @staticmethod
+    @observation_boundary(
+        tier=3,
+        source=(
+            "candidate (planner/LLM-authored) plugin option values on the guided deferred-intent-coverage "
+            "candidate pipeline (_coverage_context builds _CandidateComponent.options from the untrusted "
+            "candidate CompositionState's sources/nodes/outputs, not from reviewed/operator-approved authority)"
+        ),
+        source_param="component",
+        suppresses=("R5",),
+        invariant=(
+            "returns (False, None) for any path segment whose current value is not a Mapping, or whose key is "
+            "absent from that Mapping; never raises on malformed or absent nested option structure"
+        ),
+    )
     def option_value(component: _CandidateComponent, path: tuple[str, ...]) -> tuple[bool, Any]:
         value: Any = component.options
         for segment in path:

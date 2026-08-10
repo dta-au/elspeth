@@ -42,6 +42,7 @@ from elspeth.engine.orchestrator.preflight import (
     assemble_and_validate_pipeline_config,
     execution_sinks_for_runtime,
     require_sink_effect_admission,
+    validate_audit_export_sink_type_capability,
     validate_pipeline_sink_effect_capabilities,
     validate_sink_effect_capability,
     validate_sink_effect_type_capability,
@@ -442,6 +443,28 @@ def test_nominal_member_capability_requires_concrete_methods() -> None:
             "write",
             SinkEffectInputKind.PIPELINE_MEMBERS,
         )
+
+
+def test_audit_export_type_capability_rejects_non_frozenset_declaration() -> None:
+    sink_type = type(
+        "SetDeclaredAuditExportSink",
+        (EffectCapableSink,),
+        {"supported_audit_export_formats": {AuditExportFormat.JSON}},
+    )
+
+    with pytest.raises(SinkEffectCapabilityError, match="supported_audit_export_formats"):
+        validate_audit_export_sink_type_capability(sink_type, AuditExportFormat.JSON)
+
+
+def test_audit_export_type_capability_rejects_undeclared_format() -> None:
+    sink_type = type(
+        "JsonOnlyAuditExportSink",
+        (EffectCapableSink,),
+        {"supported_audit_export_formats": frozenset({AuditExportFormat.JSON})},
+    )
+
+    with pytest.raises(SinkEffectCapabilityError, match="does not support audit export format"):
+        validate_audit_export_sink_type_capability(sink_type, AuditExportFormat.CSV)
 
 
 @pytest.mark.parametrize("capability", ["member", "restaging"])

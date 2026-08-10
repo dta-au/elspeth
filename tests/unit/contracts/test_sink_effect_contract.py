@@ -45,7 +45,12 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
     SinkEffectRole,
     SinkEffectState,
+    _AuditExportReaderBinding,
     _create_restricted_audit_export_snapshot_reader,
+    _freeze_bounded_evidence,
+    _freeze_canonical_row_value,
+    _verify_content_bytes,
+    _verify_signed_manifest_bytes,
 )
 
 EXACT_DESCRIPTOR = ArtifactDescriptor(
@@ -481,6 +486,68 @@ def test_member_row_rejects_non_string_keys_and_nested_reader_smuggling() -> Non
         replace(_member(), row={1: "bad"})  # type: ignore[dict-item]
     with pytest.raises(TypeError, match="reader"):
         replace(_member(), row={"nested": [{"reader": _export_input().reader}]})
+
+
+def test_freeze_canonical_row_value_rejects_unsupported_type() -> None:
+    """Direct trust-boundary characterization for ``_freeze_canonical_row_value``.
+
+    ``SinkEffectMember``/``SinkEffectMemberCandidate`` delegate row canonicalization
+    to this function via ``self.row`` (see ``test_member_row_rejects_noncanonical_or_
+    authority_values`` above for the indirect coverage); this test instead calls the
+    boundary function itself through its ``value`` parameter, which the trust-boundary
+    honesty gate requires.
+    """
+    with pytest.raises(TypeError, match="unsupported non-canonical value"):
+        _freeze_canonical_row_value(object(), "row")
+
+
+def test_freeze_bounded_evidence_rejects_non_mapping() -> None:
+    """Direct trust-boundary characterization for ``_freeze_bounded_evidence``."""
+    with pytest.raises(TypeError, match="must be a mapping"):
+        _freeze_bounded_evidence(object(), "evidence")  # type: ignore[arg-type]
+
+
+def test_verify_content_bytes_rejects_non_bytes_content() -> None:
+    """Direct trust-boundary characterization for ``_verify_content_bytes``."""
+    with pytest.raises(TypeError, match="resolver must return bytes"):
+        _verify_content_bytes("not-bytes", _sha256(b"x"), 1, "chunk")
+
+
+def test_verify_signed_manifest_bytes_rejects_non_dict_json() -> None:
+    """Direct trust-boundary characterization for ``_verify_signed_manifest_bytes``."""
+    binding = _AuditExportReaderBinding(
+        snapshot_id="1" * 64,
+        source_run_id="source-run-1",
+        registry_key_hash="2" * 64,
+        manifest_hash="3" * 64,
+        snapshot_hash="4" * 64,
+        export_format=AuditExportFormat.JSON,
+        signing_mode=AuditExportSigningMode.UNSIGNED,
+        signer_key_id="UNSIGNED",
+        record_count=1,
+        total_bytes=10,
+        serialization_version="audit-export-v2",
+        exported_at="2026-07-16T01:02:03.456789Z",
+        source_completed_at="2026-07-16T01:02:03.456789Z",
+        source_status="completed",
+        last_chunk_seal_hash="7" * 64,
+        snapshot_seal_hash="8" * 64,
+    )
+    descriptor = AuditExportSignedManifestInput(
+        content_ref=f"sha256:{'9' * 64}",
+        content_hash="9" * 64,
+        size_bytes=2,
+        manifest_schema="elspeth.audit-export-manifest.v2",
+        derivation_version="audit-export-derivation-v1",
+        signature_algorithm=AuditExportSigningMode.UNSIGNED,
+        signature_key_id="UNSIGNED",
+        record_chain_algorithm="sha256_concat_record_sha256_v1",
+        final_hash="6" * 64,
+        signature=None,
+    )
+
+    with pytest.raises(ValueError, match="exact canonical JSON bytes"):
+        _verify_signed_manifest_bytes(b"[]", binding, descriptor, 1)
 
 
 def test_all_evidence_fields_enforce_the_64_kib_canonical_json_bound() -> None:

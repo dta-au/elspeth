@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.web.composer.guided._display import plugin_display_label
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
@@ -284,6 +285,24 @@ def _guided_chat_endpoint_kwargs(settings: Any) -> tuple[str | None, str | None]
     return settings.composer_endpoint_base_url, (api_key.get_secret_value() if api_key is not None else None)
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided-chat current turn record (Turn = Mapping[str, Any]); durable-load/replay-reconstructed, per "
+        "validate_current_turn's own docstring shared custody boundary for construction, durable load, and "
+        "replay"
+    ),
+    source_param="current_turn",
+    suppresses=("R5",),
+    invariant=(
+        "raises AuditIntegrityError unless current_turn is a Mapping accepted by validate_current_turn for "
+        "the given step, whose 'payload' is itself a Mapping whose content hash matches the durable "
+        "current_payload custody record; never substitutes a default or proceeds past a malformed or "
+        "mismatched turn"
+    ),
+    test_ref="tests/unit/web/sessions/test_guided_atomic_settlement.py::test_guided_chat_advisory_authority_fails_closed_on_binding_mismatch",
+    test_fingerprint="f84c28f8ea0aac1fc229e9e413474ce763ab0a32b6c64f4f8d95a3b7d197d2f1",
+)
 def _guided_advisory_graph_authority(
     *,
     step: GuidedStep,

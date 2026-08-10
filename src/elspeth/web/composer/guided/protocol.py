@@ -12,6 +12,7 @@ from enum import StrEnum
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.knob_schema import SchemaFormPayload as SchemaFormPayload
 
 # Wire sentinel for a blob-backed source's ``path`` knob in a schema_form payload.
@@ -613,6 +614,25 @@ _STEP_INDEX: Mapping[GuidedStep, int] = {
 }
 
 
+@trust_boundary(
+    tier=3,
+    source="guided-protocol turn: LLM tool-call output or client-submitted wire payload, admitted at construction, durable load, and replay",
+    source_param="turn",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError on any deviation from the current turn schema — non-mapping turn, wrong top-level key set, "
+        "non-string type discriminator, a type outside the closed TurnType vocabulary, a step_index that does not match "
+        "the step, a turn type illegal for the step, or a non-mapping/invalid payload; never coerces or defaults silently. "
+        "Deliberately NOT claimed: on CONFIRM_WIRING, the business_schema, structured_output_fields, semantic_contracts, "
+        "warnings and blockers fields are checked only as bounded JSON via _public_json_error, NOT against their declared "
+        "TypedDict shapes, so e.g. business_schema.mode=123 is accepted despite being declared str"
+    ),
+    test_ref=(
+        "tests/unit/web/composer/guided/test_protocol.py::TestPayloadValidation::"
+        "test_validate_current_turn_rejects_recursively_malformed_nonproposal_payloads"
+    ),
+    test_fingerprint="3b25f11a2e6f12ef74d3c18e79a053c43cd43dfaf5e9d4d4687594721273e31b",
+)
 def validate_current_turn(step: GuidedStep, turn: Mapping[str, Any]) -> TurnType:
     """Validate one exact current-schema turn and return its discriminator.
 

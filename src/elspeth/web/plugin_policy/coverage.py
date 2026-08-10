@@ -11,6 +11,7 @@ from jinja2 import TemplateSyntaxError
 from elspeth.contracts.enums import Determinism
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.composer._producer_resolver import source_producer_id
@@ -153,6 +154,16 @@ def node_has_blocking_control(
     return protected_fields is None or _control_covers_fields(node, protected_fields)
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored control options (untrusted 'fields' scope value)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (not credited) for any 'fields' scope value other than the literal string 'all' or a "
+        "well-formed sequence of non-empty strings; never raises on a malformed scope"
+    ),
+)
 def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
     """Return whether a control scans every field whose content it protects.
 
@@ -182,6 +193,16 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
     return protected_fields.issubset(scanned_fields)
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored LLM 'queries' options (untrusted query definitions and field names)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns a _ProtectedFields with provable=False whenever 'queries' or any query definition, its "
+        "input_fields mapping, or a row-field name deviates from the expected shape; never raises on malformed queries"
+    ),
+)
 def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
     """Return known prompt fields without erasing whether the set is complete."""
     prompt_fields = _template_input_fields(node.options.get("prompt_template"))
@@ -243,6 +264,16 @@ def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
     return _llm_output_fields_from_options(node.options)
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec.options for a web-authored LLM node (untrusted response_field/queries values)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant=(
+        "returns an empty frozenset whenever response_field, or 'queries' (its keys, entries, or a query's "
+        "'name'), deviates from the expected shape; never raises on malformed options"
+    ),
+)
 def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[str]:
     """Return only raw model-response fields, excluding operational diagnostics."""
     response_field = options.get("response_field", "llm_response")
@@ -270,6 +301,13 @@ def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[
     return frozenset(f"{name}_{response_field}" for name in query_names)
 
 
+@observation_boundary(
+    tier=3,
+    source="SourceSpec carrying web-authored/deserialized LLM source options (untrusted response_field value)",
+    source_param="source",
+    suppresses=("R5",),
+    invariant="returns None whenever source.options or its response_field deviates from the expected shape; never raises on malformed options",
+)
 def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
     """Return the one generated field, or ``None`` when options are malformed."""
     options: object = source.options
@@ -532,6 +570,16 @@ def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
     return (node.input,) if node.input else ()
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored field_mapper options (untrusted mapping/select_only values)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns None whenever node.options['mapping'] or node.options['select_only'], or a mapping entry's "
+        "source/target, deviates from the expected shape; never raises on a malformed mapper config"
+    ),
+)
 def _translate_protected_fields_through_mapper(
     node: NodeSpec,
     protected_fields: frozenset[str],
@@ -606,6 +654,16 @@ def _translate_protected_fields_through_mapper(
     return frozenset(translated)
 
 
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored value_transform options (untrusted operations list)",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns None whenever node.options['operations'] or an operation's 'target' deviates from the expected "
+        "shape; never raises on a malformed operations list"
+    ),
+)
 def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
     """Return the top-level row fields a deterministic transform writes.
 

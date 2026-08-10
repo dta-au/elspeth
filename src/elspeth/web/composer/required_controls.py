@@ -41,6 +41,7 @@ from typing import Any, Final, Literal, cast
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import ControlMode, ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 
@@ -152,6 +153,16 @@ def _disclosure_draft(
     return draft
 
 
+@observation_boundary(
+    tier=3,
+    source="set_pipeline candidate source containers (LLM tool-call arguments or a server-derived pipeline dict, not yet validated)",
+    source_param="candidate",
+    suppresses=("R5",),
+    invariant=(
+        "returns None on any malformed source-container shape (both 'source' and 'sources' present, "
+        "a non-Mapping source block, or a non-string source name); never raises"
+    ),
+)
 def _candidate_sources(candidate: Mapping[str, Any]) -> tuple[_CandidateSource, ...] | None:
     """Return authored sources without collapsing singular/plural provenance.
 
@@ -180,6 +191,18 @@ def _candidate_sources(candidate: Mapping[str, Any]) -> tuple[_CandidateSource, 
     return tuple(sources)
 
 
+@trust_boundary(
+    tier=3,
+    source="one set_pipeline candidate node block (LLM tool-call arguments or a server-derived pipeline dict)",
+    source_param="raw",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError on any malformed node field shape (wrong scalar type, unknown node_type, "
+        "or a malformed routes/fork_to/branches container); never coerces silently"
+    ),
+    test_ref="tests/unit/web/composer/test_required_control_autowire.py::TestParseBoundaryHonesty::test_parse_node_rejects_non_string_id",
+    test_fingerprint="b120f67ef107270566f841b1d7c33620ff1e8138d73c1e1dc7c90caba0d96bcd",
+)
 def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
     """Tolerant NodeSpec projection of one set_pipeline node dict."""
     node_id = raw["id"]
@@ -245,6 +268,18 @@ def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="a set_pipeline candidate mapping (LLM tool-call arguments or a server-derived pipeline dict, not yet validated)",
+    source_param="candidate",
+    suppresses=("R5",),
+    invariant=(
+        "returns None on any candidate shape that does not project into a CompositionState (malformed "
+        "nodes/outputs list or entries, duplicate node ids); the KeyError/TypeError/ValueError a nested "
+        "field parser raises is caught here and folded into the same None sentinel, so this boundary "
+        "itself never raises"
+    ),
+)
 def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | None:
     """Project a set_pipeline candidate into a CompositionState for coverage.
 
@@ -314,6 +349,18 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
         return None
 
 
+@trust_boundary(
+    tier=3,
+    source="one set_pipeline candidate source block (LLM tool-call arguments or a server-derived pipeline dict)",
+    source_param="block",
+    suppresses=("R5",),
+    invariant=(
+        "raises TypeError on any malformed source field shape (non-string plugin/on_success/"
+        "on_validation_failure, or non-Mapping options); never coerces silently"
+    ),
+    test_ref="tests/unit/web/composer/test_required_control_autowire.py::TestParseBoundaryHonesty::test_parse_source_rejects_non_string_plugin",
+    test_fingerprint="9c966f6a0a40904a7b205f4d97483aee896fb4bacade4c5219393fde9c8e3f46",
+)
 def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
     options = block.get("options")
     plugin = block["plugin"]

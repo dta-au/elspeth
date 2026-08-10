@@ -19,6 +19,7 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
 from elspeth.web.composer.guided.protocol import (
@@ -812,6 +813,26 @@ class GuidedCandidateBindingRejected(AuditIntegrityError):
         self.connectivity: dict[str, JsonValue] = dict(connectivity)
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "guided-planner LLM-authored candidate topology, after server-side deep_thaw and (at the second call "
+        "site) partial source/output rebinding; 'nodes' and node 'branches' are not yet shape-validated when "
+        "this reads them"
+    ),
+    source_param="bound",
+    suppresses=("R5",),
+    invariant=(
+        "returns only the node ids, connection names, and branch connection names actually present in "
+        "well-formed list/dict entries under bound['nodes']; a candidate whose 'nodes' (or a node's "
+        "'branches') is not the expected list/dict shape contributes nothing for that dimension instead of "
+        "raising. This function never raises on malformed source_param shape. Its result feeding a caller's "
+        "dangling-reference check narrows known targets (fail-closed there), but the same empty result "
+        "feeding an alias-collision check widens what is treated as non-colliding (fail-open there) — this "
+        "function itself makes no fail-closed guarantee; callers must not treat an empty/partial result as "
+        "proof that no such names exist in the candidate."
+    ),
+)
 def _candidate_topology_reference_names(bound: Mapping[str, Any]) -> tuple[set[str], set[str], set[str]]:
     """Collect the candidate's node ids, consumed connections, and branch values.
 

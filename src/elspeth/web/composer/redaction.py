@@ -27,6 +27,7 @@ from elspeth.contracts.blobs import AllowedMimeType
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.config import RuntimeNodeName, validate_runtime_node_name
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -42,6 +43,15 @@ REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
 
 
+@trust_boundary(
+    tier=3,
+    source="LLM/composer-authored tool-call timeout_seconds value (pydantic BeforeValidator input)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises ValueError unless value is None or a non-bool int/float; never coerces a numeric string or bool",
+    test_ref="tests/unit/web/composer/test_redaction_trust_boundaries.py::test_reject_coerced_timeout_seconds_rejects_bool",
+    test_fingerprint="df8c4ca47144fd7c4eb24e8253baed9666e1e44b1636afad2bfebaec2a0a0d5b",
+)
 def _reject_coerced_timeout_seconds(value: object) -> object:
     """Accept only actual JSON numbers at the Tier-3 boundary.
 
@@ -224,6 +234,16 @@ _STABLE_RESPONSE_SENTINELS = frozenset(
 )
 
 
+@observation_boundary(
+    tier=3,
+    source="Raw tool/LLM-provider response payload (redact_tool_call_response's response arg)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "returns False (never raises) when the response structure's depth, node count, or any "
+        "container width exceeds the fixed projection budget; True otherwise"
+    ),
+)
 def _response_within_projection_budget(value: object) -> bool:
     """Iteratively reject response structures that exceed persistence budgets."""
     stack: list[tuple[object, int]] = [(value, 0)]
@@ -252,6 +272,17 @@ def _bounded_projection_result(result: Mapping[str, object]) -> dict[str, object
     return projected
 
 
+@trust_boundary(
+    tier=3,
+    source="Raw tool/LLM-provider response value (Sensitive() summarizer input, and shared by callers below)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; returns value unchanged only for a recognized stable sentinel, otherwise returns a "
+        "fixed value-free shape/type sentinel (mapping/sequence/text/boolean/integer/number/null/generic)"
+    ),
+    non_raising=True,
+)
 def _summarize_external_response_value(value: object) -> str:
     """Return a deterministic, value-free summary for one response value.
 
@@ -284,6 +315,17 @@ def _summarize_arg_error_text(value: str | None, *, label: str) -> str | None:
     return f"<redacted-arg-error-{label}>"
 
 
+@trust_boundary(
+    tier=3,
+    source="Raw ARG_ERROR result payload from a failed tool-call argument parse (caller-controlled)",
+    source_param="result",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; result['error'] and result['validation_errors'] are summarized to bounded counts/"
+        "sentinels and dropped entirely from the projection when not str / list-or-tuple respectively"
+    ),
+    non_raising=True,
+)
 def redact_arg_error_response(
     *,
     error_class: str | None,
@@ -358,6 +400,18 @@ def _preserve_external_response_summary(value: str | None) -> str:
     return _REDACTED_RESPONSE_NULL if value is None else value
 
 
+@trust_boundary(
+    tier=3,
+    source="Provider/operator-supplied scalar values inside a schema-validated ToolResult response model",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; model validation only proves field NAMES, so every leaf scalar is still summarized "
+        "to a value-free sentinel unless it is a closed public constant, an already-stable sentinel, or a "
+        "declared-safe integer field"
+    ),
+    non_raising=True,
+)
 def _project_validated_response_scalars(
     value: object,
     *,
@@ -400,6 +454,17 @@ def _project_validated_response_scalars(
     return _REDACTED_RESPONSE_VALUE
 
 
+@trust_boundary(
+    tier=3,
+    source="Raw declarative-manifest tool response value with no pydantic model at all (fully unvalidated)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; unknown mapping keys are renamed to a fixed positional sentinel and every scalar is "
+        "summarized to a value-free sentinel unless it is a declared-safe integer field"
+    ),
+    non_raising=True,
+)
 def _project_untrusted_response_structure(
     value: object,
     *,
@@ -1231,6 +1296,14 @@ def _summarize_option_shape(value: object) -> object:
     }
 
 
+@trust_boundary(
+    tier=3,
+    source="LLM-authored set_source/node/output 'options' tool-call argument (open plugin-defined surface)",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="never raises; returns the canonical-JSON shape summary for a mapping, else the fixed '<invalid-options>' marker",
+    non_raising=True,
+)
 def _summarize_set_source_options(options: object) -> str:
     """Summarizer for ``set_source.options`` (spec §4.2.6).
 
@@ -1259,6 +1332,14 @@ def _summarize_set_source_options(options: object) -> str:
     )
 
 
+# NOT a declared trust boundary: ``non_raising=True`` would be false here.
+# ``json.loads`` raises ``RecursionError`` (a ``RuntimeError``, so not caught by
+# the ``(json.JSONDecodeError, ValueError)`` handler below) on deeply nested
+# input — reproduced with a ~20KB string of 9999 nested ``[``. The honesty
+# gate's mechanical check cannot see this, because the raise comes from a called
+# stdlib function rather than a ``raise`` statement in this body. Declaring the
+# boundary would permanently shield a live defect from R5. Fix the recursion
+# exposure first, then declare.
 def _coerce_stringified_json_object(value: Any) -> Any:
     """Tier-3 boundary deserialisation for LLM-supplied object arguments.
 
@@ -1883,6 +1964,14 @@ class _PipelineOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+@trust_boundary(
+    tier=3,
+    source="LLM-authored set_pipeline.metadata / set_metadata.patch tool-call argument",
+    source_param="patch",
+    suppresses=("R5",),
+    invariant="never raises; returns the fixed '<metadata-patch:invalid>' marker for a non-mapping, else a closed key-name summary",
+    non_raising=True,
+)
 def _summarize_set_metadata_patch(patch: object) -> str:
     """Summarize metadata mutations without retaining authored values.
 
@@ -3819,6 +3908,17 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
 )
 
 
+@trust_boundary(
+    tier=3,
+    source="Raw declarative-manifest tool response value for a known-but-not-sensitive key (no pydantic model)",
+    source_param="value",
+    suppresses=("R5",),
+    invariant=(
+        "never raises; every disposition falls back to a value-free summary or a nested structural projection "
+        "unless the value matches a closed per-field public constant or a validated nested model"
+    ),
+    non_raising=True,
+)
 def _redact_declarative_known_response_value(
     value: Any,
     *,
