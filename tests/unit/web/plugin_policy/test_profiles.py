@@ -147,6 +147,45 @@ def test_llm_public_profile_schema_accepts_observed_schema_without_fields() -> N
     assert list(Draft202012Validator(public_schema).iter_errors(options)) == []
 
 
+def test_llm_public_schema_rejects_malformed_defs_shape() -> None:
+    """A malformed LLM plugin JSON Schema ($defs not a mapping) must raise, not silently narrow.
+
+    The discriminated-union $defs/discriminator/mapping/properties shape is
+    generated deterministically by pydantic's TypeAdapter for every built-in
+    LLM provider config; a schema that deviates from it signals a genuine
+    contract break upstream and must surface loudly rather than degrade into
+    a silently narrower (or, worse, internally-inconsistent) public schema.
+    """
+    settings = _settings(
+        llm_profiles={
+            "tutorial": {
+                "provider": "bedrock",
+                "model": "bedrock/apac.amazon.nova-micro-v1:0",
+                "region_name": "ap-southeast-1",
+            }
+        },
+        default_llm_profile="tutorial",
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    malformed = PluginSchemaInfo(
+        name="llm",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={"type": "object", "properties": {}, "$defs": []},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        profiles.public_schema(
+            PluginId("transform", "llm"),
+            full_schema=malformed,
+            available_aliases=("tutorial",),
+        )
+
+
 def test_runtime_conversion_is_frozen_and_canonical() -> None:
     settings = _settings(
         plugin_allowlist=("sink:database",),
@@ -435,6 +474,21 @@ def _fail_missing_assistance() -> Any:
     raise AssertionError("textract assistance must exist")
 
 
+def test_textract_public_schema_rejects_non_mapping_properties() -> None:
+    registry, plugin_id = _textract_registry()
+    malformed = PluginSchemaInfo(
+        name="aws_textract_document_analysis",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={"type": "object", "properties": ["not", "a", "mapping"], "required": []},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(plugin_id, full_schema=malformed, available_aliases=("acceptance-docs",))
+
+
 def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
     settings = _settings(
         deployment_aws_region="ap-southeast-1",
@@ -561,6 +615,30 @@ def test_s3_source_profile_rejects_noncanonical_or_escaping_relative_key(key: st
                 "on_validation_failure": "discard",
             },
         )
+
+
+def test_s3_public_schema_rejects_non_mapping_properties() -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+    malformed = PluginSchemaInfo(
+        name="aws_s3",
+        plugin_type="source",
+        description="test schema",
+        json_schema={"type": "object", "properties": ["not", "a", "mapping"], "required": []},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(PluginId("source", "aws_s3"), full_schema=malformed, available_aliases=("demo-input",))
 
 
 @pytest.mark.parametrize("key", ["/secret.csv", "C:/secret.csv", "s3://other-bucket/secret.csv", "records/../secret.csv"])
@@ -976,6 +1054,47 @@ def test_bedrock_profile_resolver_exposes_only_alias_and_safe_options() -> None:
         "schema": {"mode": "observed"},
     }
     assert lowered.executable_options["guardrail_identifier"] == "privateguardrail"
+
+
+def test_bedrock_public_schema_rejects_non_mapping_properties() -> None:
+    """A malformed Bedrock Guardrail plugin schema (properties not a mapping) must raise.
+
+    The prior behaviour silently omitted 'fields'/'schema' from the public
+    properties while still listing them in 'required', emitting an
+    internally-inconsistent schema that no input could satisfy.
+    """
+    runtime = RuntimeWebPluginConfig.from_settings(
+        _settings(
+            bedrock_guardrail_profiles=(
+                {
+                    "alias": "prompt-default",
+                    "plugin": "aws_bedrock_prompt_shield",
+                    "guardrail_identifier": "privateguardrail",
+                    "guardrail_version": "7",
+                    "region": "us-east-1",
+                },
+            ),
+        )
+    )
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+    plugin_id = PluginId("transform", "aws_bedrock_prompt_shield")
+    malformed = PluginSchemaInfo(
+        name="aws_bedrock_prompt_shield",
+        plugin_type="transform",
+        description="test schema",
+        json_schema={
+            "type": "object",
+            "properties": ["not", "a", "mapping"],
+            "required": [],
+            "additionalProperties": False,
+        },
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+    )
+
+    with pytest.raises(ValueError, match="malformed_profile_schema"):
+        registry.public_schema(plugin_id, full_schema=malformed, available_aliases=("prompt-default",))
 
 
 def test_bedrock_profile_resolver_returns_only_an_authorized_exact_approved_binding() -> None:

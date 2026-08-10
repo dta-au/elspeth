@@ -2500,3 +2500,124 @@ def test_gate_condition_authored_artifact_hash_survives_the_persistence_bridge()
     reloaded = pipeline_decision_artifact_hash(round_tripped, (round_tripped,), user_term=GATE_CONDITION_AUTHORED_USER_TERM)
 
     assert reloaded == in_memory
+
+
+# --- Direct trust-boundary characterization tests --------------------------
+#
+# These call a @trust_boundary-decorated function directly through its
+# declared source_param and assert the exact raise its invariant promises.
+# They exist to satisfy the elspeth-lints `trust_boundary.tests` honesty gate
+# (TBE1-4): every raising boundary must carry a test_ref to a pytest node
+# whose own body contains a raising assertion invoking the decorated symbol
+# through source_param — a test that only exercises the boundary indirectly
+# (e.g. through interpretation_sites()) does not satisfy it.
+
+
+def test_source_authoring_metadata_rejects_non_string_modality() -> None:
+    from elspeth.web.interpretation_state import _source_authoring_metadata
+
+    options = {SOURCE_AUTHORING_KEY: {"modality": 123, "content_hash": "abc"}}
+    with pytest.raises(TypeError, match=r"source_authoring\.modality must be a non-empty string"):
+        _source_authoring_metadata(options=options)
+
+
+def test_prompt_parts_rejects_non_list_value() -> None:
+    from elspeth.web.interpretation_state import _prompt_parts
+
+    options = {PROMPT_TEMPLATE_PARTS_KEY: "not-a-list"}
+    with pytest.raises(TypeError, match="prompt_template_parts must be a list"):
+        _prompt_parts(options=options)
+
+
+def test_requirements_rejects_non_list_value() -> None:
+    from elspeth.web.interpretation_state import _requirements
+
+    options = {INTERPRETATION_REQUIREMENTS_KEY: "not-a-list"}
+    with pytest.raises(TypeError, match="interpretation_requirements must be a list"):
+        _requirements(options=options)
+
+
+def test_coerce_requirement_rejects_non_string_id() -> None:
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement id must be a non-empty string"):
+        _coerce_requirement(value={"id": 123, "user_term": "x", "status": "pending"})
+
+
+def test_coerce_requirement_rejects_non_string_draft() -> None:
+    """Regression: draft previously passed through _coerce_requirement unchecked.
+
+    InterpretationRequirement.draft is typed str | None, but the constructor
+    read it straight from the input mapping with no validation — unlike every
+    other field on the TypedDict. A non-string draft silently violated the
+    declared type with no error anywhere. Closed alongside event_id below.
+    """
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement draft must be a string or None"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "pending", "draft": 123})
+
+
+def test_coerce_requirement_rejects_non_string_event_id() -> None:
+    from elspeth.web.interpretation_state import _coerce_requirement
+
+    with pytest.raises(TypeError, match="interpretation requirement event_id must be a string or None"):
+        _coerce_requirement(value={"id": "req-1", "user_term": "x", "status": "pending", "event_id": 123})
+
+
+def test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping() -> None:
+    from elspeth.web.interpretation_state import (
+        WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+        validate_pipeline_decision_semantics,
+    )
+
+    with pytest.raises(ValueError, match=r"requires options\.http"):
+        validate_pipeline_decision_semantics(
+            node_id="scrape",
+            plugin="web_scrape",
+            node_type="transform",
+            options={"http": "not-a-mapping"},
+            condition=None,
+            routes=None,
+            user_term=WEB_SCRAPE_HTTP_IDENTITY_USER_TERM,
+            draft=None,
+            context="test",
+            web_scrape_raw_fields=frozenset(),
+        )
+
+
+def test_web_scrape_http_identity_artifact_hash_rejects_malformed_http_mapping() -> None:
+    from elspeth.web.interpretation_state import _web_scrape_http_identity_artifact_hash
+
+    node = _web_scrape("scrape", input_stream="rows", on_success="inbound")
+    node = replace(node, options={"http": "not-a-mapping"})
+
+    with pytest.raises(ValueError, match=r"requires options\.http"):
+        _web_scrape_http_identity_artifact_hash(node=node)
+
+
+def test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape() -> None:
+    """Regression: a present-but-malformed field_mapper.mapping used to be
+    silently coerced to {} instead of raising, unlike the identically-shaped
+    check in validate_pipeline_decision_semantics and the sibling
+    _web_scrape_http_identity_artifact_hash boundary."""
+    from elspeth.web.interpretation_state import _raw_html_cleanup_artifact_hash
+
+    node = NodeSpec(
+        id="cleanup",
+        node_type="transform",
+        plugin="field_mapper",
+        input="scraped",
+        on_success="output",
+        on_error="stop",
+        options={"mapping": "not-a-mapping", "select_only": True},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+    with pytest.raises(ValueError, match=r"requires field_mapper\.mapping to be a mapping"):
+        _raw_html_cleanup_artifact_hash(node, ())

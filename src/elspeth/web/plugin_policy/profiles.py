@@ -31,6 +31,7 @@ from elspeth.contracts.aws_textract import (
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.core.llm_profiles import (
     LLM_PROFILE_PRIVATE_FIELDS,
@@ -247,35 +248,59 @@ class _LLMProfileResolver:
             return self._preferred_alias
         return None
 
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for an LLM plugin: a pydantic-discriminated-union JSON Schema whose $defs/discriminator/properties shape is generated from plugin-author-owned provider config models",
+        source_param="full_schema",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') when $defs, discriminator, discriminator['mapping'], a "
+            "mapped provider definition, its properties, or its required list deviates from the pydantic-generated "
+            "discriminated-union shape (dict / list[str]) — the section that decides public-vs-LLM_PROFILE_PRIVATE_FIELDS "
+            "exposure never silently narrows there. The downstream $ref-closure walk that assembles public $defs, and "
+            "the source knob-field projection, are unchanged pre-existing best-effort behaviour and are not covered "
+            "by this invariant."
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_llm_public_schema_rejects_malformed_defs_shape",
+        test_fingerprint="f928c6402915f48bb128fb96c52cdfeb92158270a966f155555f0d4d163013c7",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 
         safe_properties: dict[str, Any] = {}
         definitions = full_schema.json_schema.get("$defs", {})
+        if not isinstance(definitions, dict):
+            raise ValueError("malformed_profile_schema")
         discriminator = full_schema.json_schema.get("discriminator", {})
-        mapping = discriminator.get("mapping", {}) if isinstance(discriminator, dict) else {}
+        if not isinstance(discriminator, dict):
+            raise ValueError("malformed_profile_schema")
+        mapping = discriminator.get("mapping", {})
+        if not isinstance(mapping, dict):
+            raise ValueError("malformed_profile_schema")
         provider_definitions: list[dict[str, Any]] = []
-        if isinstance(definitions, dict) and isinstance(mapping, dict):
-            for definition_ref in mapping.values():
-                if not isinstance(definition_ref, str) or not definition_ref.startswith("#/$defs/"):
+        for definition_ref in mapping.values():
+            if not isinstance(definition_ref, str) or not definition_ref.startswith("#/$defs/"):
+                raise ValueError("malformed_profile_schema")
+            definition = definitions.get(definition_ref.removeprefix("#/$defs/"))
+            if not isinstance(definition, dict):
+                raise ValueError("malformed_profile_schema")
+            provider_definitions.append(definition)
+            properties = definition.get("properties", {})
+            if not isinstance(properties, dict):
+                raise ValueError("malformed_profile_schema")
+            for name, property_schema in properties.items():
+                if name in LLM_PROFILE_PRIVATE_FIELDS:
                     continue
-                definition = definitions.get(definition_ref.removeprefix("#/$defs/"))
-                if not isinstance(definition, dict):
-                    continue
-                provider_definitions.append(definition)
-                properties = definition.get("properties", {})
-                if not isinstance(properties, dict):
-                    continue
-                for name, property_schema in properties.items():
-                    if name not in LLM_PROFILE_PRIVATE_FIELDS and isinstance(property_schema, dict):
-                        safe_properties.setdefault(name, deepcopy(property_schema))
-        required_in_all_variants = (
-            set.intersection(
-                *({name for name in definition.get("required", ()) if isinstance(name, str)} for definition in provider_definitions)
-            )
-            if provider_definitions
-            else set()
-        )
+                if not isinstance(property_schema, dict):
+                    raise ValueError("malformed_profile_schema")
+                safe_properties.setdefault(name, deepcopy(property_schema))
+        required_by_variant: list[set[str]] = []
+        for definition in provider_definitions:
+            required_names = definition.get("required", ())
+            if not isinstance(required_names, list) or any(not isinstance(name, str) for name in required_names):
+                raise ValueError("malformed_profile_schema")
+            required_by_variant.append(set(required_names))
+        required_in_all_variants = set.intersection(*required_by_variant) if required_by_variant else set()
         safe_properties = {
             "profile": {
                 "type": "string",
@@ -475,11 +500,26 @@ class _BedrockGuardrailProfileResolver:
             (default_alias, *(alias for alias in aliases if alias != default_alias)) if default_alias in self._profiles else aliases
         )
 
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for a Bedrock Guardrail plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a mapping, "
+            "or if the always-required 'fields'/'schema' properties are present but not mappings — never emits a "
+            "'required' list naming a property absent from 'properties', which would be an unsatisfiable schema"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_bedrock_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="82d3df90d265a3917b84b2d81fee12f51901c7a4d02e3e520f18802acdefdf02",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 
         safe_names = ("fields", "schema") if full_schema.name == "aws_bedrock_prompt_shield" else ("fields", "schema", "source")
         full_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(full_properties, dict):
+            raise ValueError("malformed_profile_schema")
         safe_properties: dict[str, Any] = {
             "profile": {
                 "type": "string",
@@ -487,12 +527,16 @@ class _BedrockGuardrailProfileResolver:
                 "description": "Operator-approved Bedrock Guardrail profile alias",
             }
         }
-        if isinstance(full_properties, dict):
-            for name in safe_names:
-                value = full_properties.get(name)
-                if isinstance(value, dict):
-                    safe_properties[name] = deepcopy(value)
         required = ["profile", "fields", "schema"]
+        for name in safe_names:
+            value = full_properties.get(name)
+            if value is None:
+                if name in required:
+                    raise ValueError("malformed_profile_schema")
+                continue
+            if not isinstance(value, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(value)
         public_json_schema: dict[str, Any] = {
             "type": "object",
             "properties": safe_properties,
@@ -619,6 +663,19 @@ class _S3SourceProfileResolver:
         self._profiles = {profile.alias: profile for profile in profiles}
         self._region = region
 
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for the aws_s3 source plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
+            "mapping or if any S3_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never silently "
+            "narrows the profiled-author-visible option set"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_s3_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="6f9badc98dd0792eff53aec2be28faf9c37559b33a1eb53e57971e0db540a54b",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 
@@ -795,6 +852,19 @@ class _TextractProfileResolver:
         self._profiles = {profile.alias: profile for profile in profiles}
         self._region = region
 
+    @trust_boundary(
+        tier=3,
+        source="PluginSchemaInfo.json_schema for the aws_textract_document_analysis transform plugin: a plugin-author-owned JSON Schema whose properties shape is generated from the plugin's config model",
+        source_param="full_schema",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError('malformed_profile_schema') if full_schema.json_schema['properties'] is not a "
+            "mapping or if any TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES entry is present but not a mapping; never "
+            "silently narrows the profiled-author-visible option set"
+        ),
+        test_ref="tests/unit/web/plugin_policy/test_profiles.py::test_textract_public_schema_rejects_non_mapping_properties",
+        test_fingerprint="dc39b7f294827d1d0246039a501cc9ba37632d557507d59bd08d95b2756ed9da",
+    )
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
 

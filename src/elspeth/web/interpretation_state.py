@@ -21,6 +21,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
@@ -249,6 +250,20 @@ def strip_authoring_options(options: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in options.items() if key not in AUTHORING_METADATA_OPTION_KEYS}
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options, an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage, a composer LLM tool call, or YAML import; condition/"
+    "routes are typed NodeSpec fields handled nominally, not through this boundary — see the docstring "
+    "note above the gate-condition arm",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises ValueError on every malformed field read from options across the web_scrape http "
+    "identity and raw-html-cleanup mapping arms; never substitutes a default for a present-but-malformed "
+    "field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping",
+    test_fingerprint="d5179a003c906832896c34eb9547082348d99065f8996d5405126fdcedefd5ab",
+)
 def validate_pipeline_decision_semantics(
     *,
     node_id: str,
@@ -605,6 +620,16 @@ def prompt_shield_state_for_node(
     return "B" if shield_available else "C"
 
 
+@trust_boundary(
+    tier=3,
+    source="warnings, a Sequence[Mapping[str, Any]] of already-serialised confirm_wiring wire-turn "
+    "payload entries authored by the composer LLM tool call",
+    source_param="warnings",
+    suppresses=("R5",),
+    invariant="a non-string 'message' entry passes through unmodified rather than raising; this is a "
+    "cosmetic wording-refinement pass, not a security gate, so a malformed entry is inert",
+    non_raising=True,
+)
 def refine_prompt_shield_warnings_for_availability(
     warnings: Sequence[Mapping[str, Any]],
     *,
@@ -1147,6 +1172,18 @@ def _requirements_by_id(options: Mapping[str, Any]) -> dict[str, InterpretationR
     return by_id
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] / SourceSpec.options['interpretation_requirements'], "
+    "an untyped Mapping[str, Any] entry persisted on composer state and round-tripped through sessions.db "
+    "storage, a composer LLM tool call, or YAML import",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError on a non-list value or a non-mapping list item; delegates per-item field "
+    "validation to _coerce_requirement, itself a separately-declared boundary",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_requirements_rejects_non_list_value",
+    test_fingerprint="c545bfa9b28f31378cf25bc76e022cd8d17239dedbf922fb4b36892b1e60a4c7",
+)
 def _requirements(options: Mapping[str, Any]) -> tuple[InterpretationRequirement, ...] | None:
     value = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     if value is None:
@@ -1176,6 +1213,20 @@ def parse_interpretation_requirements(options: Mapping[str, Any]) -> tuple[Inter
     return _requirements(options)
 
 
+@trust_boundary(
+    tier=3,
+    source="one interpretation_requirements list item: an untyped Mapping[str, Any] item extracted by "
+    "_requirements from composer state (NodeSpec.options / SourceSpec.options) round-tripped through "
+    "sessions.db storage, a composer LLM tool call, or YAML import",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises TypeError/ValueError on any malformed field (id, user_term, status, kind, "
+    "accepted_value, accepted_artifact_hash, resolved_prompt_template_hash, draft, event_id) and "
+    "constructs the owned InterpretationRequirement TypedDict only from validated fields; never "
+    "substitutes a default for a present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_coerce_requirement_rejects_non_string_id",
+    test_fingerprint="b1707a07d542960abbfdee200a95198c176e4132cd9e14fe0800bddb4298ae2b",
+)
 def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     requirement_id = value["id"]
     user_term = value["user_term"]
@@ -1202,19 +1253,37 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     resolved_prompt_template_hash = value["resolved_prompt_template_hash"] if "resolved_prompt_template_hash" in value else None
     if resolved_prompt_template_hash is not None and not isinstance(resolved_prompt_template_hash, str):
         raise TypeError("interpretation requirement resolved_prompt_template_hash must be a string or None")
+    draft = value["draft"] if "draft" in value else None
+    if draft is not None and not isinstance(draft, str):
+        raise TypeError("interpretation requirement draft must be a string or None")
+    event_id = value["event_id"] if "event_id" in value else None
+    if event_id is not None and not isinstance(event_id, str):
+        raise TypeError("interpretation requirement event_id must be a string or None")
     return InterpretationRequirement(
         id=requirement_id,
         kind=kind.value,
         user_term=user_term,
         status=status,
-        draft=value["draft"] if "draft" in value else None,
-        event_id=value["event_id"] if "event_id" in value else None,
+        draft=draft,
+        event_id=event_id,
         accepted_value=accepted_value,
         accepted_artifact_hash=accepted_artifact_hash,
         resolved_prompt_template_hash=resolved_prompt_template_hash,
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="SourceSpec.options['source_authoring'], an untyped Mapping[str, Any] persisted on the "
+    "composer state and round-tripped through sessions.db storage or YAML import",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError on any malformed field (modality/content_hash/review_event_id/"
+    "resolved_kind shape) and ValueError on an unknown resolved_kind enum value; never substitutes "
+    "a default for a present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_source_authoring_metadata_rejects_non_string_modality",
+    test_fingerprint="9fd4eab9eac768c48b7b98996e1163effb4f15d1a119894c66444647574937a6",
+)
 def _source_authoring_metadata(options: Mapping[str, Any]) -> SourceAuthoringMetadata | None:
     value = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
     if value is None:
@@ -1420,6 +1489,19 @@ def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="node.options, an untyped Mapping[str, Any] persisted on the composer node and round-tripped "
+    "through sessions.db storage; only options.http is parsed here — node's other, typed fields are "
+    "nominal ELSPETH-owned data, not part of this boundary",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="raises ValueError when options.http is present but not a Mapping, or when its "
+    "abuse_contact/scraping_reason fields are missing or non-string; never substitutes a default for a "
+    "present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_web_scrape_http_identity_artifact_hash_rejects_malformed_http_mapping",
+    test_fingerprint="5680c42934ed6166bdd4eb574658c04e36b4a06d8a2439858d9e3c844d24efb6",
+)
 def _web_scrape_http_identity_artifact_hash(node: NodeSpec) -> str:
     """Material-scoped hash for the web_scrape HTTP identity review."""
 
@@ -1515,6 +1597,18 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
     return [(head, *sub) for sub in _prompt_shield_upstream_paths(producer.input, graph, visited)]
 
 
+@trust_boundary(
+    tier=3,
+    source="node.options['mapping'], an untyped Mapping[str, Any] persisted on the composer node and "
+    "round-tripped through sessions.db storage",
+    source_param="node",
+    suppresses=("R5",),
+    invariant="raises ValueError when options['mapping'] is present but not a Mapping; an absent key "
+    "defaults to {} (matching field_mapper's own FieldMapperConfig.mapping default_factory=dict), so "
+    "only genuine absence — never a present-but-malformed shape — is treated as empty",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape",
+    test_fingerprint="d9fcb5f5889194c8274a64cad6411ba1079977a4513962cfe3660af0c060ab6e",
+)
 def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec]) -> str:
     """Material-scoped hash for the raw-html cleanup review.
 
@@ -1533,7 +1627,12 @@ def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec
 
     upstream_raw_fields = sorted(_web_scrape_raw_fields(all_nodes))
     raw_mapping = node.options["mapping"] if "mapping" in node.options else None
-    mapping: dict[str, Any] = dict(raw_mapping) if isinstance(raw_mapping, Mapping) else {}
+    if raw_mapping is not None and not isinstance(raw_mapping, Mapping):
+        raise ValueError(
+            f"pipeline_decision_artifact_hash: raw_html_cleanup requires field_mapper.mapping to be a "
+            f"mapping on node {node.id!r}, got {type(raw_mapping).__name__}"
+        )
+    mapping: dict[str, Any] = dict(raw_mapping) if raw_mapping is not None else {}
     select_only = "select_only" in node.options and node.options["select_only"] is True
     return stable_hash(
         {
@@ -1563,6 +1662,18 @@ def _validate_pipeline_decision_review(node: NodeSpec, all_nodes: Sequence[NodeS
         raise ValueError(f"node {node.id!r} pipeline-decision review hash drifted")
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['prompt_template_parts'], an untyped Mapping[str, Any] entry persisted on "
+    "the composer node and round-tripped through sessions.db storage or a composer LLM tool call",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="raises TypeError/ValueError on any malformed part shape (non-list value, non-mapping "
+    "item, unknown/missing kind, non-string text or requirement_id); never substitutes a default for a "
+    "present-but-malformed field",
+    test_ref="tests/unit/web/test_interpretation_state.py::test_prompt_parts_rejects_non_list_value",
+    test_fingerprint="f336e86a56c756420ac391c350cbf8c1e9a768284669286d103a4575dcefcb2f",
+)
 def _prompt_parts(options: Mapping[str, Any]) -> tuple[PromptPart, ...] | None:
     value = options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in options else None
     if value is None:
@@ -1661,6 +1772,18 @@ def _legacy_terms(prompt_template: str) -> tuple[str, ...]:
     return tuple(match.group(1).strip() for match in INTERPRETATION_PLACEHOLDER_RE.finditer(prompt_template))
 
 
+@trust_boundary(
+    tier=3,
+    source="NodeSpec.options['interpretation_requirements'] / ['prompt_template_parts'] / "
+    "['prompt_template'], untyped Mapping[str, Any] entries persisted on composer state and "
+    "round-tripped through sessions.db storage",
+    source_param="options",
+    suppresses=("R5",),
+    invariant="returns 0 for any malformed sub-shape rather than raising (the Tier-3 staging idiom "
+    "documented in this function's own docstring); every caller treats a result != 1 as unresolvable "
+    "and rejects/blocks the mutation rather than accepting it, so the sentinel is fail-closed",
+    non_raising=True,
+)
 def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> int:
     """Count the resolvable ``vague_term`` wirings for ``user_term`` in a node's options.
 
