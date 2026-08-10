@@ -1338,3 +1338,45 @@ def test_validation_entry_shadow_model_accepts_every_structured_detail() -> None
         payload = entry.to_dict()
         validated = _ValidationEntryShadowModel.model_validate(payload)
         assert validated.component == entry.component
+
+
+def test_response_projection_depth_guard_counts_list_nesting() -> None:
+    """The projectors' depth guard must count list/tuple nesting, not only mappings.
+
+    Regression: the guard read ``len(path)``, but ``path`` was extended only on
+    the ``Mapping`` recursion branch — the ``list``/``tuple`` branches recursed
+    with ``path`` unchanged. A deeply nested pure-list payload therefore
+    recursed without bound and raised ``RecursionError`` (a ``RuntimeError``,
+    so not caught by any ``except (TypeError, ValueError)`` in the chain).
+    """
+    from elspeth.web.composer.redaction import (
+        _project_untrusted_response_structure,
+        _project_validated_response_scalars,
+    )
+
+    deep_list: list[Any] = []
+    cursor = deep_list
+    for _ in range(3000):
+        nested: list[Any] = []
+        cursor.append(nested)
+        cursor = nested
+
+    # Neither projector may raise; both must fall back to the redaction sentinel.
+    assert _project_untrusted_response_structure(deep_list, path=("field",)) is not None
+    assert _project_validated_response_scalars(deep_list, path=("field",)) is not None
+
+
+def test_response_projection_depth_guard_preserves_safe_integer_field_name() -> None:
+    """Counting depth must not disturb ``path[-1]``, which selects the safe-integer allowlist.
+
+    A naive fix (appending a stub segment on the list branch) would make
+    ``path[-1]`` the stub rather than the enclosing key, silently redacting
+    public counters that appear inside a list.
+    """
+    from elspeth.web.composer.redaction import (
+        _SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS,
+        _project_validated_response_scalars,
+    )
+
+    safe_field = sorted(_SAFE_PUBLIC_RESPONSE_INTEGER_FIELDS)[0]
+    assert _project_validated_response_scalars({safe_field: [1, 2, 3]}, path=()) == {safe_field: [1, 2, 3]}

@@ -416,6 +416,7 @@ def _project_validated_response_scalars(
     value: object,
     *,
     path: tuple[str, ...] = (),
+    depth: int = 0,
 ) -> object:
     """Scrub free-form scalars after a response model validates structure.
 
@@ -424,14 +425,14 @@ def _project_validated_response_scalars(
     arbitrary provider/operator value safe. Closed booleans, public counters,
     and validated status discriminants survive; other scalars are summarized.
     """
-    if len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+    if depth > RESPONSE_PROJECTION_MAX_DEPTH or len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
         return _REDACTED_RESPONSE_VALUE
     if isinstance(value, Mapping):
-        return {key: _project_validated_response_scalars(child, path=(*path, str(key))) for key, child in value.items()}
+        return {key: _project_validated_response_scalars(child, path=(*path, str(key)), depth=depth + 1) for key, child in value.items()}
     if isinstance(value, list):
-        return [_project_validated_response_scalars(child, path=path) for child in value]
+        return [_project_validated_response_scalars(child, path=path, depth=depth + 1) for child in value]
     if isinstance(value, tuple):
-        return tuple(_project_validated_response_scalars(child, path=path) for child in value)
+        return tuple(_project_validated_response_scalars(child, path=path, depth=depth + 1) for child in value)
     if value is None or type(value) is bool:
         return value
 
@@ -469,9 +470,10 @@ def _project_untrusted_response_structure(
     value: object,
     *,
     path: tuple[str, ...] = (),
+    depth: int = 0,
 ) -> object:
     """Retain container shape without trusting arbitrary keys or scalars."""
-    if len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
+    if depth > RESPONSE_PROJECTION_MAX_DEPTH or len(path) > RESPONSE_PROJECTION_MAX_DEPTH:
         return _REDACTED_RESPONSE_VALUE
     if isinstance(value, Mapping):
         projected: dict[str, object] = {}
@@ -486,12 +488,13 @@ def _project_untrusted_response_structure(
             projected[projected_key] = _project_untrusted_response_structure(
                 child,
                 path=(*path, projected_key),
+                depth=depth + 1,
             )
         return projected
     if isinstance(value, list):
-        return [_project_untrusted_response_structure(child, path=path) for child in value]
+        return [_project_untrusted_response_structure(child, path=path, depth=depth + 1) for child in value]
     if isinstance(value, tuple):
-        return tuple(_project_untrusted_response_structure(child, path=path) for child in value)
+        return tuple(_project_untrusted_response_structure(child, path=path, depth=depth + 1) for child in value)
     if value is None or type(value) is bool:
         return value
     field_name = path[-1] if path else ""
