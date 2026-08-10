@@ -24,6 +24,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json as primitive_canonical_json
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -145,7 +146,26 @@ class PipelineDispatchAuditBinding:
             result_hash=invocation.result_hash,
         )
 
+    # ``@classmethod`` must stay OUTERMOST: ``trust_boundary`` reads the wrapped
+    # function's signature to resolve ``source_param``, and a ``classmethod``
+    # object is not callable for ``inspect.signature``. Inverting these two
+    # raises TypeError at import time, which breaks collection tree-wide.
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="persisted redacted pipeline-dispatch envelope re-read from chat audit storage",
+        source_param="envelope",
+        suppresses=("R1", "R5"),
+        invariant=(
+            "raises AuditIntegrityError on any envelope with missing required fields or fields of incorrect type; "
+            "every dict.get() value is type-checked before use and missing keys result in explicit type-check failures that raise AuditIntegrityError; "
+            "auxiliary validation functions (_validate_pipeline_authority_binding, _validate_exact_canonical_json) also raise AuditIntegrityError on malformed payloads; "
+            "never returns a binding without fully validating and type-checking all required fields. "
+            "Deliberately NOT claimed: RecursionError from deeply nested JSON in result_canonical or authority_arguments_canonical would escape the except block"
+        ),
+        test_ref="tests/unit/web/composer/test_row_union_authority_hashing.py::test_persisted_set_pipeline_binding_rejects_recomputed_authority_member_tampering",
+        test_fingerprint="0e0b81af35de756ada81baa144209802092142c1adf9f5312f9fccd360c4cf78",
+    )
     def from_persisted_envelope(cls, envelope: Mapping[str, Any]) -> PipelineDispatchAuditBinding:
         """Restore the binding from the exact redacted envelope written to chat audit."""
         if type(envelope) is not dict or envelope.get("_kind") != "audit":

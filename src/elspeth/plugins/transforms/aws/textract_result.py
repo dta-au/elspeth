@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import canonical_json
 
 
@@ -487,6 +488,15 @@ def _project_layout(blocks: Sequence[Mapping[str, Any]], index: Mapping[str, Map
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS Textract GetDocumentAnalysis paginated SUCCEEDED responses (externally derived)",
+    source_param="result_pages",
+    suppresses=("R1", "R5"),
+    invariant="raises MalformedTextractResponse unless all response pages have JobStatus SUCCEEDED, DocumentMetadata with Pages, AnalyzeDocumentModelVersion, and valid Blocks; never silently defaults or skips a malformed response page",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_missing_required_result_key_fails_closed",
+    test_fingerprint="fdaf02d9a0623a4de3d1854e1b1191580a48c7e5e0ad169b60338fb42975bb84",
+)
 def normalize_textract_result(
     *,
     job_id: str,
@@ -573,6 +583,15 @@ def normalize_textract_result(
     )
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS Textract AnalyzeDocument synchronous response (externally derived)",
+    source_param="response",
+    suppresses=("R1", "R5"),
+    invariant="raises MalformedTextractResponse unless response has DocumentMetadata with Pages, AnalyzeDocumentModelVersion, and valid Blocks; materializes missing Page on single-page responses; rejects HumanLoopActivationOutput; never silently defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_result.py::test_analyze_document_missing_required_member_fails_closed",
+    test_fingerprint="cae23556b7529080ce399988c8a58f16d3acd040e610fcc50ee1d4fb0228caa8",
+)
 def normalize_analyze_document_result(
     *,
     response: Mapping[str, Any],

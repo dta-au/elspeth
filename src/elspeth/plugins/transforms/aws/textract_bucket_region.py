@@ -15,6 +15,7 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.plugins.infrastructure.clients.base import AuditedClientBase, TelemetryEmitCallback
 from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
@@ -121,6 +122,15 @@ def _metadata(value: object) -> tuple[int | None, Mapping[str, Any], int]:
     return status, headers, attempts
 
 
+@trust_boundary(
+    tier=3,
+    source="AWS S3 HeadBucket success response (externally derived)",
+    source_param="raw_response",
+    suppresses=("R1",),
+    invariant="raises BucketRegionUnverifiedError unless response is mapping with status 200, ResponseMetadata, and valid region from 'BucketRegion' field or 'x-amz-bucket-region' header; never silently defaults",
+    test_ref="tests/unit/plugins/transforms/aws/test_textract_bucket_region.py::test_success_response_rejects_missing_disagreeing_or_malformed_region",
+    test_fingerprint="3e3e2591154513eea657efa33439ed6e08970aaf803851ecaa97a12ef6b4dd30",
+)
 def _success_proof(raw_response: object) -> tuple[BucketRegionProof, int]:
     response = _strict_mapping(raw_response)
     status, headers, attempts = _metadata(response.get("ResponseMetadata", {}))

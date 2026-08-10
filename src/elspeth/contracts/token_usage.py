@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from elspeth.contracts.freeze import require_int
+from elspeth.contracts.trust_boundary import trust_boundary
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +178,14 @@ class TokenUsage:
         return cls(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
     @classmethod
+    @trust_boundary(
+        tier=3,
+        source="LLM API provider response (OpenAI, Anthropic, OpenRouter, etc.)",
+        source_param="data",
+        suppresses=("R1",),
+        invariant="Coerces all input to TokenUsage with None sentinels for missing/malformed fields; never raises on external data. Silently converts unknown types, negative values, and absent keys to None per CLAUDE.md fabrication policy.",
+        non_raising=True,
+    )
     def from_dict(cls, data: Any) -> TokenUsage:
         """Reconstruct from external (Tier 3) data.
 
