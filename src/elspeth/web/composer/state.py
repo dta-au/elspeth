@@ -2671,10 +2671,19 @@ def _check_schema_contracts(
                 # aggregate. When any arm abstains the vote collapses to
                 # abstention: the runtime defers to per-row enforcement, and
                 # the skip warning stays the honest "not yet checked" signal.
-                queue_participates, _queue_fields = _producer_entry_propagation_vote(
-                    current_producer,
-                    visited_fan_in_ids=frozenset(),
-                )
+                try:
+                    queue_participates, _queue_fields = _producer_entry_propagation_vote(
+                        current_producer,
+                        visited_fan_in_ids=frozenset(),
+                    )
+                except ValueError:
+                    # A fan-in ARM may sit later in ``nodes`` than the consumer
+                    # being checked, so this vote can be the first parse of that
+                    # arm's ``options["schema"]`` — ordinary recoverable external
+                    # input, not a defect in our own code. Abstain exactly as the
+                    # ``_union_coalesce_merged_guarantees`` sibling already does
+                    # rather than crashing /validate with an unhandled ValueError.
+                    queue_participates = False
                 if queue_participates:
                     return current_producer
                 warnings.append(
@@ -2698,10 +2707,17 @@ def _check_schema_contracts(
                 # abstains the vote collapses to abstention: the runtime defers
                 # to per-row enforcement, and the skip warning stays the honest
                 # "not yet checked" signal.
-                union_participates, _union_fields = _producer_entry_propagation_vote(
-                    current_producer,
-                    visited_fan_in_ids=frozenset(),
-                )
+                try:
+                    union_participates, _union_fields = _producer_entry_propagation_vote(
+                        current_producer,
+                        visited_fan_in_ids=frozenset(),
+                    )
+                except ValueError:
+                    # Same reason as the queue branch above and the
+                    # ``_union_coalesce_merged_guarantees`` sibling: a branch may
+                    # sit later in ``nodes``, so this can be the first parse of
+                    # its schema block. Abstain rather than crash /validate.
+                    union_participates = False
                 if union_participates:
                     return current_producer
                 warnings.append(

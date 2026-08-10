@@ -1814,15 +1814,23 @@ def vague_term_wiring_count(options: Mapping[str, Any], *, user_term: str) -> in
     requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
     matching_ids: list[Any] = []
     if isinstance(requirements, (list, tuple)):
-        matching_ids = [
-            requirement["id"]
-            for requirement in requirements
-            if isinstance(requirement, Mapping)
-            and requirement.get("status") == "pending"
-            and isinstance(requirement.get("user_term"), str)
-            and requirement["user_term"].strip() == normalized_user_term
-            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-        ]
+        for requirement in requirements:
+            if not isinstance(requirement, Mapping):
+                continue
+            if requirement.get("status") != "pending":
+                continue
+            if not isinstance(requirement.get("user_term"), str):
+                continue
+            if requirement["user_term"].strip() != normalized_user_term:
+                continue
+            if requirement.get("kind", InterpretationKind.VAGUE_TERM.value) != InterpretationKind.VAGUE_TERM.value:
+                continue
+            if "id" not in requirement:
+                continue
+            requirement_id = requirement["id"]
+            if not isinstance(requirement_id, str) or not requirement_id:
+                continue
+            matching_ids.append(requirement_id)
     if len(matching_ids) == 1:
         requirement_id = matching_ids[0]
         if not isinstance(requirement_id, str) or not requirement_id:

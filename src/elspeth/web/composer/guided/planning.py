@@ -229,8 +229,17 @@ def _wire_target_fingerprint(
             identities[(component_kind, value["stable_id"])] = keys[position]
 
     def normalize_endpoint(value: object) -> object:
+        # An absent endpoint must fail the same way a malformed one does. Both
+        # ``from_endpoint`` and ``to_endpoint`` are required on every wire
+        # connection (``_ProposalEndpoint`` is a non-``NotRequired`` field and
+        # ``validate_current_turn`` enforces the exact connection key set), so a
+        # non-mapping here is an integrity violation, not an optional field.
+        # Returning it unchanged would let an omitted key bypass the identity
+        # binding check below — the very check that ties an LLM-authored
+        # endpoint back to reviewed authority — while a merely wrong endpoint
+        # raises.
         if type(value) is not dict:
-            return value
+            raise AuditIntegrityError("guided correction wire edge has a missing or malformed endpoint")
         kind = value.get("kind")
         endpoint_id = value.get("stable_id")
         if kind == "discard":
@@ -240,8 +249,14 @@ def _wire_target_fingerprint(
         return {"kind": kind, "key": identities[(kind, endpoint_id)]}
 
     if collection == "connections":
-        component["from_endpoint"] = normalize_endpoint(component.get("from_endpoint"))
-        component["to_endpoint"] = normalize_endpoint(component.get("to_endpoint"))
+        from_ep = component.get("from_endpoint")
+        to_ep = component.get("to_endpoint")
+        if from_ep is None:
+            raise AuditIntegrityError("guided correction wire connection is missing from_endpoint")
+        if to_ep is None:
+            raise AuditIntegrityError("guided correction wire connection is missing to_endpoint")
+        component["from_endpoint"] = normalize_endpoint(from_ep)
+        component["to_endpoint"] = normalize_endpoint(to_ep)
     else:
         connections = payload.get("connections")
         if type(connections) is not list:
@@ -1628,6 +1643,10 @@ def _projection_ids_from_payload(payload: Mapping[str, Any]) -> tuple[list[str],
     edge_ids = [edge.get("stable_id") for edge in graph["edges"] if type(edge) is dict]
     if len(node_ids) != len(nodes) or len(edge_ids) != len(graph["edges"]):
         raise AuditIntegrityError("guided proposal projection has malformed stable IDs")
+    if not all(type(i) is str and i for i in node_ids):
+        raise AuditIntegrityError("guided proposal projection has malformed node stable IDs")
+    if not all(type(i) is str and i for i in edge_ids):
+        raise AuditIntegrityError("guided proposal projection has malformed edge stable IDs")
     return cast(list[str], node_ids), cast(list[str], edge_ids)
 
 

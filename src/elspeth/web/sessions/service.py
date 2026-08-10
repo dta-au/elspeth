@@ -653,7 +653,7 @@ def _pipeline_dispatch_recovery_from_envelope(
     if status is not ComposerToolStatus.SUCCESS:
         return None
     binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
-    result_canonical = invocation.get("result_canonical")
+    result_canonical = invocation["result_canonical"]
     assert type(result_canonical) is str
     try:
         result_payload = json.loads(result_canonical)
@@ -3095,11 +3095,43 @@ def _surfacing_prompt_structure_hash(
     """
     if surfacing_state_record is None:
         return None
-    for node in surfacing_state_record.nodes or ():
-        if node["id"] == affected_node_id:
-            options = node["options"] if "options" in node else None
-            if isinstance(options, Mapping):
-                return prompt_structure_hash_from_options(options)
+    nodes = surfacing_state_record.nodes or ()
+    if not nodes:
+        return None
+    # Widened to ``object`` deliberately. ``nodes`` is ANNOTATED as a sequence of
+    # mappings, but ``_row_to_state_record`` builds it straight from the session
+    # storage JSON column with no shape validation, so that annotation is a
+    # contract this Tier-3 boundary must parse rather than a guarantee it may
+    # trust (ADR-032). Without the widening mypy proves the guard below
+    # unreachable from the annotation alone — which is exactly the assumption
+    # being checked.
+    for node in cast("Sequence[object]", nodes):
+        # ``Mapping``, NOT ``dict``: composition state is deep-frozen on the way
+        # in (``deep_freeze`` rewrites every dict to ``MappingProxyType``, which
+        # is not a ``dict`` subclass). Testing for ``dict`` here skips every
+        # frozen node, silently yielding ``None`` and failing the skeleton
+        # comparison the caller makes against it.
+        if not isinstance(node, Mapping):
+            continue
+        if "id" not in node or node["id"] != affected_node_id:
+            continue
+        options = node["options"] if "options" in node else None
+        if not isinstance(options, Mapping):
+            # Options absent or not a mapping
+            return None
+        try:
+            return prompt_structure_hash_from_options(options)
+        except (TypeError, KeyError, ValueError):
+            # Malformed ``prompt_template_parts`` is exactly the "prompt parts
+            # unavailable" case this function's docstring and its
+            # ``@observation_boundary`` invariant both promise to answer with
+            # ``None``: the caller then falls back to rendered-text equality.
+            # ``_prompt_parts`` raises TypeError/ValueError on a bad part shape
+            # and KeyError on a part missing ``text``/``requirement_id``, and
+            # none of that is reachable by the caller as a typed failure — it
+            # would surface as an unhandled 500 on a composer review flow that
+            # has a documented soft fallback. Returning the sentinel here is the
+            # explicit error result, not a swallowed error.
             return None
     return None
 
