@@ -262,7 +262,7 @@ def strip_authoring_options(options: Mapping[str, Any]) -> dict[str, Any]:
     "identity and raw-html-cleanup mapping arms; never substitutes a default for a present-but-malformed "
     "field",
     test_ref="tests/unit/web/test_interpretation_state.py::test_validate_pipeline_decision_semantics_rejects_malformed_http_mapping",
-    test_fingerprint="d5179a003c906832896c34eb9547082348d99065f8996d5405126fdcedefd5ab",
+    test_fingerprint="2a5d50996e14068729a406e3abc8872a5afc35ff8cff068a81a2e7cfca3e74ff",
 )
 def validate_pipeline_decision_semantics(
     *,
@@ -1282,7 +1282,7 @@ def _coerce_requirement(value: Mapping[str, Any]) -> InterpretationRequirement:
     "resolved_kind shape) and ValueError on an unknown resolved_kind enum value; never substitutes "
     "a default for a present-but-malformed field",
     test_ref="tests/unit/web/test_interpretation_state.py::test_source_authoring_metadata_rejects_non_string_modality",
-    test_fingerprint="9fd4eab9eac768c48b7b98996e1163effb4f15d1a119894c66444647574937a6",
+    test_fingerprint="9c397610a6013437a0ba59a8e4f6fc8a53dfd24925a29b3f84e4f9b99b1b0f4e",
 )
 def _source_authoring_metadata(options: Mapping[str, Any]) -> SourceAuthoringMetadata | None:
     value = options[SOURCE_AUTHORING_KEY] if SOURCE_AUTHORING_KEY in options else None
@@ -1500,7 +1500,7 @@ def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:
     "abuse_contact/scraping_reason fields are missing or non-string; never substitutes a default for a "
     "present-but-malformed field",
     test_ref="tests/unit/web/test_interpretation_state.py::test_web_scrape_http_identity_artifact_hash_rejects_malformed_http_mapping",
-    test_fingerprint="5680c42934ed6166bdd4eb574658c04e36b4a06d8a2439858d9e3c844d24efb6",
+    test_fingerprint="57fc3b74a14f0820f42cc7735a67a824da839a868c12c6ae960772b83678d154",
 )
 def _web_scrape_http_identity_artifact_hash(node: NodeSpec) -> str:
     """Material-scoped hash for the web_scrape HTTP identity review."""
@@ -1607,7 +1607,7 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
     "defaults to {} (matching field_mapper's own FieldMapperConfig.mapping default_factory=dict), so "
     "only genuine absence — never a present-but-malformed shape — is treated as empty",
     test_ref="tests/unit/web/test_interpretation_state.py::test_raw_html_cleanup_artifact_hash_rejects_malformed_mapping_shape",
-    test_fingerprint="d9fcb5f5889194c8274a64cad6411ba1079977a4513962cfe3660af0c060ab6e",
+    test_fingerprint="92b3cd5feff4db8445cc652f50da44578206ac25d813b479c601ad314d9fb908",
 )
 def _raw_html_cleanup_artifact_hash(node: NodeSpec, all_nodes: Sequence[NodeSpec]) -> str:
     """Material-scoped hash for the raw-html cleanup review.
