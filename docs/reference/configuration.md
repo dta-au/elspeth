@@ -1842,7 +1842,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 31
+### Landscape schema epoch 32
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -1857,16 +1857,21 @@ canonical sidecar owner so another worker or path cannot publish or acknowledge
 it. Epoch 30 adds `token_work_items.row_union_name` so a recovered scheduler can
 attribute a blocked work item to its declared row_union barrier. Epoch 31
 closes `token_work_items.status` over the public scheduler status enum so a
-removed state such as `waiting` cannot be reintroduced through direct SQL. See the
+removed state such as `waiting` cannot be reintroduced through direct SQL.
+Epoch 32 adds normalized, content-addressed aggregation result receipts. For a
+successful non-empty transform-mode flush, node completion, batch completion, the exact
+ordered outputs, and every member disposition commit in one transaction; resume
+can create the pending expansion without invoking the aggregation plugin again.
+See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-31, either automatically at startup or through an operator migration command.
+32, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-31 database.
+an older epoch must not be rolled back over an epoch-32 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

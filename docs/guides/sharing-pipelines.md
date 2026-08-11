@@ -69,7 +69,7 @@ accept this trade-off.
 
 For 0.7.2, shareable-review state is part of the broader web session database
 contract. The release expects `SESSION_SCHEMA_EPOCH=47` and
-`SQLITE_SCHEMA_EPOCH=31`. Session epoch 29 introduced durable guided
+`SQLITE_SCHEMA_EPOCH=32`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
@@ -78,7 +78,9 @@ persisted coalesce timeout metadata and the projected node option summary, and
 run-diagnostics writer-principal attribution and operator-profiled
 Textract document authoring. Landscape epoch 30 adds durable row_union barrier
 attribution, and epoch 31 closes scheduler work-item status over the public
-six-state vocabulary. A Landscape store below epoch 31 is stale and must be recreated. When
+six-state vocabulary. Epoch 32 adds atomic, durable non-empty transform-mode aggregation
+result receipts so recovery does not replay a completed plugin call. A
+Landscape store below epoch 32 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and
 uninstall the web service, archive/export evidence when required, recreate each
 configured database whose epoch is stale, then reinstall and initialize this

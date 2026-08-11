@@ -48,7 +48,12 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Batch, CommittedAggregationResidual, CommittedCoalesceResidual
+    from elspeth.contracts import (
+        Batch,
+        CommittedAggregationOutputReceipt,
+        CommittedAggregationResidual,
+        CommittedCoalesceResidual,
+    )
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.config import AggregationSettings
@@ -60,6 +65,7 @@ if TYPE_CHECKING:
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
+    from elspeth.engine.processor import _PreparedTransformRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -837,6 +843,10 @@ class BarrierRecoveryCoordinator:
         complete_row_union_fire: Callable[..., None] | None = None,
         emit_token_completed: Callable[..., None] | None = None,
         complete_committed_aggregation_residual: Callable[[CommittedAggregationResidual, Sequence[TokenWorkItem]], None] | None = None,
+        prepare_committed_aggregation_output: (
+            Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedTransformRoute] | None
+        ) = None,
+        complete_committed_aggregation_output: Callable[[_PreparedTransformRoute], None] | None = None,
         complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
     ) -> None:
         self._run_id = run_id
@@ -856,6 +866,8 @@ class BarrierRecoveryCoordinator:
         self._complete_row_union_fire = complete_row_union_fire
         self._emit_token_completed = emit_token_completed
         self._complete_committed_aggregation_residual = complete_committed_aggregation_residual
+        self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
+        self._complete_committed_aggregation_output = complete_committed_aggregation_output
         self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
@@ -989,6 +1001,7 @@ class BarrierRecoveryCoordinator:
         # Per-node batch metadata for every configured aggregation node.
         agg_plans: list[_AggregationRestorePlan] = []
         committed_aggregation_plans: list[tuple[CommittedAggregationResidual, tuple[TokenWorkItem, ...]]] = []
+        committed_aggregation_output_plans: list[_PreparedTransformRoute] = []
         committed_coalesce_plans: list[tuple[CommittedCoalesceResidual, tuple[TokenWorkItem, ...]]] = []
         if self._aggregation_settings:
             members_by_batch: dict[str, list[str]] = {}
@@ -1060,6 +1073,28 @@ class BarrierRecoveryCoordinator:
                                 "does not match its exact BLOCKED journal snapshot"
                             )
                         committed_aggregation_plans.append((aggregation_residual, residual_items))
+                        node_items = [item for item in node_items if item.token_id not in member_ids]
+
+                if node_items:
+                    output_receipts = self._barrier_restore_reads.list_committed_aggregation_output_receipts(
+                        self._run_id,
+                        aggregation_node_id=str(node_id),
+                        blocked_token_ids=[item.token_id for item in node_items],
+                    )
+                    for output_receipt in output_receipts:
+                        if self._prepare_committed_aggregation_output is None or self._complete_committed_aggregation_output is None:
+                            raise OrchestrationInvariantError(
+                                "Committed aggregation output recovery requires prepare and completion callbacks"
+                            )
+                        member_ids = frozenset(output_receipt.member_token_ids)
+                        residual_items = tuple(item for item in node_items if item.token_id in member_ids)
+                        if len(residual_items) != len(output_receipt.member_token_ids):
+                            raise AuditIntegrityError(
+                                f"Committed aggregation output {output_receipt.batch_id!r} at node {node_id!r} "
+                                "does not match its exact BLOCKED journal snapshot"
+                            )
+                        prepared_route = self._prepare_committed_aggregation_output(output_receipt, residual_items)
+                        committed_aggregation_output_plans.append(prepared_route)
                         node_items = [item for item in node_items if item.token_id not in member_ids]
 
                 # Scoped to (FAILURE, UNROUTED): this has no output receipt;
@@ -1464,6 +1499,10 @@ class BarrierRecoveryCoordinator:
             if self._complete_committed_aggregation_residual is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed aggregation residual recovery requires the processor continuation callback")
             self._complete_committed_aggregation_residual(aggregation_residual, residual_items)
+        for prepared_route in committed_aggregation_output_plans:
+            if self._complete_committed_aggregation_output is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Committed aggregation output recovery requires the completion callback")
+            self._complete_committed_aggregation_output(prepared_route)
         for coalesce_residual, residual_items in committed_coalesce_plans:
             if self._complete_committed_coalesce_residual is None:  # pragma: no cover - checked while planning
                 raise OrchestrationInvariantError("Committed coalesce residual recovery requires the processor continuation callback")

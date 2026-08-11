@@ -12,6 +12,12 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 from testcontainers.postgres import PostgresContainer  # type: ignore[import-untyped]
+from tests.fixtures.plugins import CollectSink
+from tests.integration.pipeline.test_aggregation_recovery import (
+    _build_eof_aggregation_pipeline,
+    _LoadCountingSource,
+    _SumBatchTransform,
+)
 from tests.integration.pipeline.test_barrier_intake_dispositions import (
     _T0,
     _arrive_via_intake,
@@ -22,14 +28,19 @@ from tests.integration.pipeline.test_barrier_intake_dispositions import (
     _work_item_row,
 )
 
-from elspeth.contracts import NodeType
+from elspeth.contracts import NodeType, RunStatus
+from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
+from elspeth.core.config import CheckpointSettings
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import coalesce_effects_table
+from elspeth.core.landscape.schema import batches_table, coalesce_effects_table, tokens_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.clock import MockClock
+from elspeth.engine.executors.aggregation import AggregationExecutor
+from elspeth.engine.orchestrator import Orchestrator
 from elspeth.engine.processor import BarrierJournalRestoreContext, RowProcessor
 
 pytestmark = pytest.mark.testcontainer
@@ -104,3 +115,60 @@ def test_postgres_recovers_completed_coalesce_effect_without_remerge(
     assert _work_item_row(db, "tok-branch-b")["status"] == TokenWorkStatus.TERMINAL.value
     merged_work = _work_item_row(db, str(effect["result_token_id"]))
     assert merged_work["status"] == TokenWorkStatus.PENDING_SINK.value
+
+
+@pytest.mark.timeout(120)
+def test_postgres_recovers_committed_aggregation_result_without_plugin_replay(
+    postgres_url: str,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PostgreSQL uses the epoch-32 receipt at the pre-expansion death seam."""
+    db = LandscapeDB.from_url(postgres_url)
+    payload_store = FilesystemPayloadStore(tmp_path / "aggregation-payloads")
+    checkpoint_manager = CheckpointManager(db)
+    source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+    transform = _SumBatchTransform()
+    sink = CollectSink("output")
+    config, graph = _build_eof_aggregation_pipeline(source, transform, sink)
+    orchestrator = Orchestrator(
+        db=db,
+        checkpoint_manager=checkpoint_manager,
+        checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+    )
+    real_execute_flush = AggregationExecutor.execute_flush
+
+    def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+        real_execute_flush(self, *args, **kwargs)
+        raise RuntimeError("injected postgres death before aggregation output routing")
+
+    monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+    with pytest.raises(RuntimeError, match="injected postgres death before aggregation output routing"):
+        orchestrator.run(config, graph=graph, payload_store=payload_store)
+    monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+
+    with db.connection() as conn:
+        batch = conn.execute(select(batches_table.c.run_id, batches_table.c.status)).one()
+        assert batch.status == "completed"
+        assert (
+            conn.execute(
+                select(tokens_table.c.token_id)
+                .where(tokens_table.c.run_id == batch.run_id)
+                .where(tokens_table.c.expand_group_id.isnot(None))
+            ).all()
+            == []
+        )
+
+    resume_point = RecoveryManager(db, checkpoint_manager).get_resume_point(str(batch.run_id), graph)
+    assert resume_point is not None
+    resumed = orchestrator.resume(
+        resume_point=resume_point,
+        config=config,
+        graph=graph,
+        payload_store=payload_store,
+    )
+
+    assert resumed.status is RunStatus.COMPLETED
+    assert sink.results == [{"value": 60, "count": 3}]
+    assert transform.batch_calls == 1
+    assert source.load_invocations == 1

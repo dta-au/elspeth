@@ -617,6 +617,62 @@ class TestFlushOutputJournalDurability:
             ).scalars()
         assert set(remaining_statuses) <= {"terminal"}
 
+    def test_committed_result_before_expansion_resumes_without_plugin_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A durable result receipt closes death after node/batch completion.
+
+        The injected failure runs after ``execute_flush`` has completed the
+        aggregation node and batch but before transform-mode routing creates
+        any expanded child. Resume must materialize the persisted output and
+        complete the barrier without invoking either source or plugin again.
+        """
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _SumBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+
+        real_execute_flush = AggregationExecutor.execute_flush
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before aggregation output routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        with pytest.raises(RuntimeError, match="injected crash before aggregation output routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            assert conn.execute(select(batches_table.c.status)).scalar_one() == "completed"
+            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id.isnot(None))).all() == []
+
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        resume_point = recovery.get_resume_point(run_id, graph)
+        assert resume_point is not None
+        result = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert result.status == RunStatus.COMPLETED
+        assert output_sink.results == [{"value": 60, "count": 3}]
+        assert transform.batch_calls == 1
+        assert source.load_invocations == 1
+
 
 class _FailBatchTransform(BaseTransform):
     """Batch transform that FAILS its EOF flush by returning an error-status result.

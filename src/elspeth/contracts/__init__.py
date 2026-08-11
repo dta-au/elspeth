@@ -143,9 +143,11 @@ from elspeth.contracts.data import (
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
 from elspeth.contracts.engine import (
     AggregationParentDisposition,
+    AggregationResultReceipt,
     BufferEntry,
     CoalesceParentCompletion,
     CommittedAggregationChild,
+    CommittedAggregationOutputReceipt,
     CommittedAggregationResidual,
     CommittedCoalesceResidual,
     PendingOutcome,
@@ -556,10 +558,12 @@ __all__ = [  # Grouped by category for readability
     "validate_row",
     # engine
     "AggregationParentDisposition",
+    "AggregationResultReceipt",
     "BufferEntry",
     "CoalesceParentCompletion",
     "CommittedAggregationChild",
     "CommittedAggregationResidual",
+    "CommittedAggregationOutputReceipt",
     "CommittedCoalesceResidual",
     "PendingOutcome",
     "RetryPolicy",

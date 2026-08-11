@@ -2734,7 +2734,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return (
                 TransformResult.error({"reason": "flush_failed"}, retryable=False),
                 [captured["token"]],
@@ -2781,7 +2781,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return (
                 TransformResult.error({"reason": "flush_failed"}, retryable=False),
                 [captured["token"]],
@@ -2826,7 +2826,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return bad_result, [captured["token"]], "batch-1"
 
         with (
@@ -2861,7 +2861,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             other_token = make_token_info(data={"value": 20})
             return mismatch_result, [captured["token"], other_token], "batch-1"
 
@@ -2991,7 +2991,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [valid_buffered_token, captured["token"]], "batch-1"
 
         with (
@@ -3051,7 +3051,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (
@@ -3109,7 +3109,7 @@ class TestAggregationFailureMatrix:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [valid_buffered_token, captured["token"]], "batch-1"
 
         with (
@@ -3284,7 +3284,7 @@ class TestTransformModeOutcomeOrdering:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (
@@ -3332,7 +3332,7 @@ class TestTransformModeOutcomeOrdering:
         def accept_side_effect(node_id: NodeID, token: TokenInfo, *, accept_time: float | None = None) -> None:
             captured["token"] = token
 
-        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type):
+        def execute_flush_side_effect(*, node_id, transform, ctx, trigger_type, **kwargs):
             return flush_result, [captured["token"]], "batch-1"
 
         with (

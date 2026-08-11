@@ -31,6 +31,20 @@ class AggregationParentDisposition:
 
 
 @dataclass(frozen=True, slots=True)
+class AggregationResultReceipt:
+    """Durable successful non-empty transform-mode output authority."""
+
+    batch_id: str
+    run_id: str
+    aggregation_state_id: str
+    output_shape: str
+    output_hash: str
+    output_refs: tuple[str, ...]
+    member_dispositions: tuple[AggregationParentDisposition, ...]
+    expansion_parent_token_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class CommittedAggregationChild:
     """One ordered child from a committed transform-mode aggregation receipt."""
 
@@ -52,6 +66,21 @@ class CommittedAggregationResidual:
     output_hash: str
     member_token_ids: tuple[str, ...]
     children: tuple[CommittedAggregationChild, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationOutputReceipt:
+    """Completed aggregation output not yet materialized as an expansion."""
+
+    batch_id: str
+    aggregation_node_id: str
+    aggregation_state_id: str
+    output_shape: str
+    output_hash: str
+    output_refs: tuple[str, ...]
+    member_token_ids: tuple[str, ...]
+    member_dispositions: tuple[AggregationParentDisposition, ...]
+    expansion_parent_token_id: str
 
 
 @dataclass(frozen=True, slots=True)

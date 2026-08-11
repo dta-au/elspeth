@@ -184,6 +184,16 @@ count/names, registry, catalog, golden, contracts whitelist).
   cannot prove this protocol because `FOR UPDATE` is inert there; retain the
   independent PostgreSQL race tests for both lock winners.
 
+- **2026-08-12 — non-empty transform aggregation completion owns an epoch-32
+  result receipt**: validate the plugin output and declaration contract before
+  completing anything, then commit the node, batch, ordered payload refs, and
+  exact member dispositions in one transaction. PostgreSQL writers lock
+  member tokens first, then node state, then batch. Restore must load and
+  purely validate every candidate receipt before it expands any candidate;
+  payload retention and affected-run accounting must include the receipt refs.
+  Empty-output and passthrough aggregation do not use this receipt yet and
+  remain separate recovery work.
+
 - **2026-08-12 — completed barrier effects are continuations, not late
   arrivals**: aggregation expansion receipts and completed coalesce-effect
   receipts can exist while their exact input scheduler rows are still

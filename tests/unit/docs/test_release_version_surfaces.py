@@ -89,7 +89,7 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing
     assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
-    assert "SQLITE_SCHEMA_EPOCH=31" in sharing
+    assert "SQLITE_SCHEMA_EPOCH=32" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")
     assert "elspeth:ecs-0.7.2-closeout" in aws

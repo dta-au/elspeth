@@ -18,11 +18,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime
-from typing import TYPE_CHECKING, Literal, overload
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Literal, overload
 
+from sqlalchemy import select
 from sqlalchemy.engine import Connection
+from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
+    AggregationParentDisposition,
+    AggregationResultReceipt,
     Artifact,
     ArtifactPublicationEvidenceKind,
     Batch,
@@ -45,13 +50,20 @@ from elspeth.contracts import (
     RoutingReason,
     RoutingSpec,
     RowUnionFailureReason,
+    TerminalOutcome,
+    TerminalPath,
     TriggerType,
 )
 from elspeth.contracts.call_data import CallPayload
 from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import ExecutionError, TransformErrorReason
+from elspeth.contracts.errors import AuditIntegrityError, ExecutionError, TransformErrorReason
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.execution import (
     ArtifactRepository,
     BatchRepository,
@@ -74,6 +86,16 @@ from elspeth.core.landscape.model_loaders import (
     SinkEffectStreamLoader,
 )
 from elspeth.core.landscape.row_data import CallDataResult
+from elspeth.core.landscape.schema import (
+    aggregation_result_members_table,
+    aggregation_result_outputs_table,
+    aggregation_results_table,
+    batch_members_table,
+    batches_table,
+    node_states_table,
+    token_outcomes_table,
+    tokens_table,
+)
 
 if TYPE_CHECKING:
     from elspeth.contracts.errors import TransformSuccessReason
@@ -111,6 +133,7 @@ class ExecutionRepository:
     ) -> None:
         self._db = db
         self._ops = ops
+        self._payload_store = payload_store
         self.node_states = NodeStateRepository(
             db,
             ops,
@@ -593,6 +616,331 @@ class ExecutionRepository:
             trigger_reason=trigger_reason,
             state_id=state_id,
         )
+
+    def complete_aggregation_result(
+        self,
+        *,
+        batch_id: str,
+        run_id: str,
+        aggregation_node_id: str,
+        state_id: str,
+        trigger_type: TriggerType,
+        output_rows: Sequence[PipelineRow],
+        output_shape: str,
+        output_hash: str,
+        member_dispositions: Sequence[AggregationParentDisposition],
+        expansion_parent_token_id: str,
+        duration_ms: float,
+        success_reason: TransformSuccessReason | None,
+        context_after: NodeStateContext,
+    ) -> AggregationResultReceipt:
+        """Atomically complete node, batch, and durable aggregation output."""
+        if self._payload_store is None:
+            raise AuditIntegrityError("successful transform-mode aggregation requires a payload store")
+        rows = tuple(output_rows)
+        dispositions = tuple(member_dispositions)
+        if output_shape not in {"single", "multi"} or not rows:
+            raise AuditIntegrityError("aggregation result receipt requires a non-empty single or multi output")
+        if output_shape == "single" and len(rows) != 1:
+            raise AuditIntegrityError("single aggregation result receipt requires exactly one output row")
+        if not dispositions:
+            raise AuditIntegrityError("aggregation result receipt requires ordered member dispositions")
+        if any(item.parent_ref.run_id != run_id for item in dispositions):
+            raise AuditIntegrityError("aggregation result receipt dispositions cross run identity")
+        disposition_token_ids = tuple(item.parent_ref.token_id for item in dispositions)
+        if len(set(disposition_token_ids)) != len(disposition_token_ids):
+            raise AuditIntegrityError("aggregation result receipt contains duplicate member dispositions")
+        for ordinal, item in enumerate(dispositions):
+            consumed = item.outcome is TerminalOutcome.TRANSIENT and item.path is TerminalPath.BATCH_CONSUMED and item.error_hash is None
+            expected_error_hash = sha256(f"quarantined_in_batch:{batch_id}:{ordinal}".encode()).hexdigest()[:16]
+            quarantined = (
+                item.outcome is TerminalOutcome.FAILURE
+                and item.path is TerminalPath.QUARANTINED_AT_SOURCE
+                and item.error_hash == expected_error_hash
+            )
+            if not (consumed or quarantined):
+                raise AuditIntegrityError("aggregation result receipt contains an illegal or divergent member disposition")
+        first_consumed_token_id = next(
+            (item.parent_ref.token_id for item in dispositions if item.path is TerminalPath.BATCH_CONSUMED),
+            None,
+        )
+        if expansion_parent_token_id != first_consumed_token_id:
+            raise AuditIntegrityError("aggregation result receipt expansion parent is not its first consumed batch member")
+
+        output_data: Mapping[str, object] | list[Mapping[str, object]]
+        if output_shape == "single":
+            output_data = rows[0].to_dict()
+        else:
+            output_data = [row.to_dict() for row in rows]
+        if stable_hash(output_data) != output_hash:
+            raise AuditIntegrityError("aggregation result receipt output hash disagrees with output rows")
+
+        payload_bytes = tuple(
+            checkpoint_dumps({"data": row.to_dict(), "contract": row.contract.to_checkpoint_format()}).encode("utf-8") for row in rows
+        )
+        expected_refs = tuple(sha256(payload).hexdigest() for payload in payload_bytes)
+        stored_refs = tuple(self._payload_store.store(payload) for payload in payload_bytes)
+        if stored_refs != expected_refs:
+            raise AuditIntegrityError("aggregation result payload store violated its SHA-256 content-address contract")
+
+        expected_member_rows = tuple(
+            (ordinal, item.parent_ref.token_id, item.outcome.value, item.path.value, item.error_hash)
+            for ordinal, item in enumerate(dispositions)
+        )
+        expected_success_reason_json = canonical_json(success_reason) if success_reason is not None else None
+        expected_context_after_json = canonical_json(context_after.to_dict())
+
+        def existing_receipt_is_exact(conn: Connection, *, state: Any, batch: Any) -> bool:
+            header = conn.execute(select(aggregation_results_table).where(aggregation_results_table.c.batch_id == batch_id)).one_or_none()
+            if header is None:
+                return False
+            exact_header = (
+                header.run_id == run_id
+                and header.aggregation_state_id == state_id
+                and header.output_mode == "transform"
+                and header.output_shape == output_shape
+                and header.output_hash == output_hash
+                and header.expansion_parent_token_id == expansion_parent_token_id
+            )
+            exact_completion = (
+                state.status == NodeStateStatus.COMPLETED.value
+                and state.output_hash == output_hash
+                and state.duration_ms == duration_ms
+                and state.success_reason_json == expected_success_reason_json
+                and state.context_after_json == expected_context_after_json
+                and batch.status == BatchStatus.COMPLETED.value
+                and batch.aggregation_state_id == state_id
+                and batch.trigger_type == trigger_type.value
+                and batch.trigger_reason is None
+            )
+            output_rows = tuple(
+                (int(row.ordinal), str(row.token_data_ref))
+                for row in conn.execute(
+                    select(aggregation_result_outputs_table)
+                    .where(aggregation_result_outputs_table.c.batch_id == batch_id)
+                    .order_by(aggregation_result_outputs_table.c.ordinal)
+                )
+            )
+            member_rows = tuple(
+                (int(row.ordinal), str(row.token_id), str(row.outcome), str(row.path), row.error_hash)
+                for row in conn.execute(
+                    select(aggregation_result_members_table)
+                    .where(aggregation_result_members_table.c.batch_id == batch_id)
+                    .order_by(aggregation_result_members_table.c.ordinal)
+                )
+            )
+            if not (
+                exact_header and exact_completion and output_rows == tuple(enumerate(expected_refs)) and member_rows == expected_member_rows
+            ):
+                raise AuditIntegrityError(f"aggregation result receipt retry diverges for batch_id={batch_id}")
+            return True
+
+        receipt = AggregationResultReceipt(
+            batch_id=batch_id,
+            run_id=run_id,
+            aggregation_state_id=state_id,
+            output_shape=output_shape,
+            output_hash=output_hash,
+            output_refs=expected_refs,
+            member_dispositions=dispositions,
+            expansion_parent_token_id=expansion_parent_token_id,
+        )
+        write_body_completed = False
+        try:
+            with self._db.write_connection() as conn:
+                token_rows = conn.execute(
+                    select(tokens_table.c.token_id, tokens_table.c.run_id)
+                    .where(tokens_table.c.token_id.in_(disposition_token_ids))
+                    .order_by(tokens_table.c.token_id)
+                    .with_for_update(of=tokens_table)
+                ).all()
+                if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {
+                    (token_id, run_id) for token_id in disposition_token_ids
+                }:
+                    raise AuditIntegrityError("aggregation result receipt references a missing or foreign member token")
+                state = conn.execute(
+                    select(
+                        node_states_table.c.run_id,
+                        node_states_table.c.node_id,
+                        node_states_table.c.status,
+                        node_states_table.c.output_hash,
+                        node_states_table.c.duration_ms,
+                        node_states_table.c.success_reason_json,
+                        node_states_table.c.context_after_json,
+                    )
+                    .where(node_states_table.c.state_id == state_id)
+                    .with_for_update(of=node_states_table)
+                ).one_or_none()
+                if state is None or state.run_id != run_id or state.node_id != aggregation_node_id:
+                    raise AuditIntegrityError("aggregation result receipt references a missing, foreign, or wrong-node state")
+                batch = conn.execute(
+                    select(
+                        batches_table.c.run_id,
+                        batches_table.c.aggregation_node_id,
+                        batches_table.c.status,
+                        batches_table.c.aggregation_state_id,
+                        batches_table.c.expansion_group_id,
+                        batches_table.c.trigger_type,
+                        batches_table.c.trigger_reason,
+                    )
+                    .where(batches_table.c.batch_id == batch_id)
+                    .with_for_update(of=batches_table)
+                ).one_or_none()
+                if batch is None or batch.run_id != run_id or batch.aggregation_node_id != aggregation_node_id:
+                    raise AuditIntegrityError("aggregation result receipt references a missing, foreign, or wrong-node batch")
+                member_ids = tuple(
+                    str(row.token_id)
+                    for row in conn.execute(
+                        select(batch_members_table.c.token_id)
+                        .where(batch_members_table.c.batch_id == batch_id)
+                        .where(batch_members_table.c.run_id == run_id)
+                        .order_by(batch_members_table.c.ordinal)
+                    )
+                )
+                if member_ids != disposition_token_ids:
+                    raise AuditIntegrityError("aggregation result receipt dispositions do not match exact ordered batch membership")
+                if not existing_receipt_is_exact(conn, state=state, batch=batch):
+                    if (
+                        state.status != NodeStateStatus.OPEN.value
+                        or batch.status != BatchStatus.EXECUTING.value
+                        or batch.aggregation_state_id not in (None, state_id)
+                        or batch.expansion_group_id is not None
+                    ):
+                        raise AuditIntegrityError("aggregation result receipt requires an OPEN state and unclaimed EXECUTING batch")
+                    live_rows = conn.execute(
+                        select(token_outcomes_table.c.token_id)
+                        .where(token_outcomes_table.c.run_id == run_id)
+                        .where(token_outcomes_table.c.token_id.in_(disposition_token_ids))
+                        .where(token_outcomes_table.c.completed == 0)
+                        .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
+                        .where(token_outcomes_table.c.batch_id == batch_id)
+                    ).all()
+                    if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(disposition_token_ids)):
+                        raise AuditIntegrityError("aggregation result receipt requires one live BUFFERED outcome for every member")
+                    terminal_rows = conn.execute(
+                        select(token_outcomes_table.c.token_id)
+                        .where(token_outcomes_table.c.run_id == run_id)
+                        .where(token_outcomes_table.c.token_id.in_(disposition_token_ids))
+                        .where(token_outcomes_table.c.completed == 1)
+                    ).all()
+                    if terminal_rows:
+                        terminal_token_ids = sorted(str(row.token_id) for row in terminal_rows)
+                        raise AuditIntegrityError(
+                            f"aggregation result receipt members already have terminal outcomes: {terminal_token_ids!r}"
+                        )
+
+                    self.node_states.complete_node_state(
+                        state_id=state_id,
+                        status=NodeStateStatus.COMPLETED,
+                        output_data=output_data,
+                        duration_ms=duration_ms,
+                        success_reason=success_reason,
+                        context_after=context_after,
+                        conn=conn,
+                    )
+                    self.batches.complete_batch(
+                        batch_id=batch_id,
+                        status=BatchStatus.COMPLETED,
+                        trigger_type=trigger_type,
+                        state_id=state_id,
+                        conn=conn,
+                    )
+                    inserted_batch_id = conn.execute(
+                        aggregation_results_table.insert()
+                        .values(
+                            batch_id=batch_id,
+                            run_id=run_id,
+                            aggregation_state_id=state_id,
+                            output_mode="transform",
+                            output_shape=output_shape,
+                            output_hash=output_hash,
+                            expansion_parent_token_id=expansion_parent_token_id,
+                            created_at=now(),
+                        )
+                        .returning(aggregation_results_table.c.batch_id)
+                    ).scalar_one()
+                    if inserted_batch_id != batch_id:
+                        raise AuditIntegrityError("aggregation result receipt INSERT returned the wrong batch identity")
+                    for ordinal, token_data_ref in enumerate(expected_refs):
+                        inserted_ordinal = conn.execute(
+                            aggregation_result_outputs_table.insert()
+                            .values(
+                                batch_id=batch_id,
+                                run_id=run_id,
+                                ordinal=ordinal,
+                                token_data_ref=token_data_ref,
+                            )
+                            .returning(aggregation_result_outputs_table.c.ordinal)
+                        ).scalar_one()
+                        if inserted_ordinal != ordinal:
+                            raise AuditIntegrityError("aggregation result output INSERT returned the wrong ordinal")
+                    for ordinal, item in enumerate(dispositions):
+                        inserted_ordinal = conn.execute(
+                            aggregation_result_members_table.insert()
+                            .values(
+                                batch_id=batch_id,
+                                run_id=run_id,
+                                ordinal=ordinal,
+                                token_id=item.parent_ref.token_id,
+                                outcome=item.outcome.value,
+                                path=item.path.value,
+                                error_hash=item.error_hash,
+                            )
+                            .returning(aggregation_result_members_table.c.ordinal)
+                        ).scalar_one()
+                        if inserted_ordinal != ordinal:
+                            raise AuditIntegrityError("aggregation result member INSERT returned the wrong ordinal")
+                write_body_completed = True
+        except SQLAlchemyError as exc:
+            try:
+                with self._db.read_only_connection() as conn:
+                    state = conn.execute(
+                        select(
+                            node_states_table.c.status,
+                            node_states_table.c.output_hash,
+                            node_states_table.c.duration_ms,
+                            node_states_table.c.success_reason_json,
+                            node_states_table.c.context_after_json,
+                        ).where(node_states_table.c.state_id == state_id)
+                    ).one_or_none()
+                    batch = conn.execute(
+                        select(
+                            batches_table.c.status,
+                            batches_table.c.aggregation_state_id,
+                            batches_table.c.trigger_type,
+                            batches_table.c.trigger_reason,
+                        ).where(batches_table.c.batch_id == batch_id)
+                    ).one_or_none()
+                    if state is not None and batch is not None and existing_receipt_is_exact(conn, state=state, batch=batch):
+                        return receipt
+            except (SQLAlchemyError, AuditIntegrityError):
+                pass
+            error_type = LandscapePostCommitError if write_body_completed else LandscapeRecordError
+            raise error_type(f"complete_aggregation_result failed for batch_id={batch_id}: {type(exc).__name__}: {exc}") from exc
+        try:
+            with self._db.read_only_connection() as conn:
+                state = conn.execute(
+                    select(
+                        node_states_table.c.status,
+                        node_states_table.c.output_hash,
+                        node_states_table.c.duration_ms,
+                        node_states_table.c.success_reason_json,
+                        node_states_table.c.context_after_json,
+                    ).where(node_states_table.c.state_id == state_id)
+                ).one()
+                batch = conn.execute(
+                    select(
+                        batches_table.c.status,
+                        batches_table.c.aggregation_state_id,
+                        batches_table.c.trigger_type,
+                        batches_table.c.trigger_reason,
+                    ).where(batches_table.c.batch_id == batch_id)
+                ).one()
+                if not existing_receipt_is_exact(conn, state=state, batch=batch):  # pragma: no cover - receipt must exist
+                    raise AuditIntegrityError("aggregation result receipt disappeared after commit")
+        except (SQLAlchemyError, AuditIntegrityError) as exc:
+            raise LandscapePostCommitError(f"aggregation result receipt {batch_id!r} failed exact post-commit readback") from exc
+        return receipt
 
     def get_batch(self, batch_id: str) -> Batch | None:
         """Get a batch by ID."""

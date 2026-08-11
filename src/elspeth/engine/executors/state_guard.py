@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts import ExecutionError, NodeStateOpen
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
-from elspeth.contracts.enums import NodeStateStatus
+from elspeth.contracts.enums import NodeStateStatus, TriggerType
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
@@ -36,6 +36,9 @@ from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRec
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from elspeth.contracts import AggregationParentDisposition, PipelineRow
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
 
@@ -384,6 +387,45 @@ class NodeStateGuard:
             self._terminal_persisted = True
             raise
 
+        self._terminal_persisted = True
+        self._completed = True
+
+    def complete_aggregation_result(
+        self,
+        *,
+        batch_id: str,
+        run_id: str,
+        aggregation_node_id: str,
+        trigger_type: TriggerType,
+        output_rows: Sequence[PipelineRow],
+        output_shape: str,
+        output_hash: str,
+        member_dispositions: Sequence[AggregationParentDisposition],
+        expansion_parent_token_id: str,
+        duration_ms: float,
+        success_reason: TransformSuccessReason | None,
+        context_after: NodeStateContext,
+    ) -> None:
+        """Complete node, batch, and transform output receipt atomically."""
+        try:
+            self._execution.complete_aggregation_result(
+                batch_id=batch_id,
+                run_id=run_id,
+                aggregation_node_id=aggregation_node_id,
+                state_id=self.state_id,
+                trigger_type=trigger_type,
+                output_rows=output_rows,
+                output_shape=output_shape,
+                output_hash=output_hash,
+                member_dispositions=member_dispositions,
+                expansion_parent_token_id=expansion_parent_token_id,
+                duration_ms=duration_ms,
+                success_reason=success_reason,
+                context_after=context_after,
+            )
+        except LandscapePostCommitError:
+            self._terminal_persisted = True
+            raise
         self._terminal_persisted = True
         self._completed = True
 
