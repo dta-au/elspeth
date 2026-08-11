@@ -49,6 +49,7 @@ export type WorkspaceScenario = (typeof WORKSPACE_SCENARIOS)[number];
 
 export interface WorkspaceScenarioTelemetry {
   runHistoryRequests: number;
+  tallDialogLivePreflightChecked: boolean;
 }
 
 interface DeferredSignal {
@@ -71,6 +72,7 @@ interface InstallWorkspaceScenarioOptions {
 const INSTALLED_SCENARIOS = new WeakMap<Page, InstalledScenario>();
 const SOURCE_FILENAME = "workspace-geometry.csv";
 const FIXED_TIME = "2026-08-11T08:00:00.000Z";
+const TALL_DIALOG_NODE_COUNT = 80;
 
 function deferredSignal(): DeferredSignal {
   let release: (() => void) | undefined;
@@ -104,9 +106,9 @@ async function seedCanonicalComposition(
       "id,category\n1,alpha\n2,beta\n",
     );
     const tallDialogNodeIds = scenario === "tall-confirmation-dialog"
-      ? Array.from({ length: 48 }, (_, index) => {
+      ? Array.from({ length: TALL_DIALOG_NODE_COUNT }, (_, index) => {
           const stage = String(index + 1).padStart(3, "0");
-          return `llm_stage_${stage}_${"deterministic_review_".repeat(4)}fixture`;
+          return `llm_stage_${stage}_${"deterministic_review_".repeat(6)}fixture`;
         })
       : [];
     const tallDialogNodes: NodeSpec[] = tallDialogNodeIds.map((id, index) => ({
@@ -119,7 +121,18 @@ async function seedCanonicalComposition(
           ? "results"
           : tallDialogNodeIds[index + 1]!,
       on_error: "discard",
-      options: { model: "fixture/deterministic-model" },
+      options: {
+        // The Web Composer's public LLM contract is profile-bound: this
+        // operator profile supplies the Bedrock provider and model declared in
+        // playwright.config.ts. Authoring provider/model alongside a profile
+        // is correctly rejected by live preflight.
+        profile: "e2e-bedrock",
+        prompt_template:
+          "Review category {{ row.category }} and return a concise classification.",
+        required_input_fields: ["category"],
+        response_field: "review",
+        schema: { mode: "observed" },
+      },
     }));
     return await seedCompositionState(ctx, sessionId, {
       version: 1,
@@ -250,10 +263,11 @@ function validationIssues(): ValidationResult {
   };
 }
 
-function validValidation(): ValidationResult {
+function tallDialogAcceptedValidation(): ValidationResult {
   return {
     is_valid: true,
-    summary: "The deterministic tall-dialog composition is runnable.",
+    summary:
+      "Post-acceptance projection for the deterministic tall-dialog composition.",
     checks: [],
     errors: [],
     warnings: [],
@@ -281,7 +295,16 @@ function auditIssues(
       { id: "plugin_trust", label: "Plugin trust", status: valid ? "ok" : "warning", summary: valid ? "Plugin trust checks passed." : "Review the fixed plugin trust warning.", detail: null, component_ids: valid ? [] : ["source"] },
       { id: "provenance", label: "Provenance", status: "ok", summary: "Source provenance is recorded.", detail: null, component_ids: [] },
       { id: "retention", label: "Retention", status: "not_applicable", summary: "No completed run retention yet.", detail: null, component_ids: [] },
-      { id: "llm_interpretations", label: "LLM interpretations", status: "not_applicable", summary: "No interpretation events.", detail: null, component_ids: [] },
+      {
+        id: "llm_interpretations",
+        label: "LLM interpretations",
+        status: valid ? "ok" : "not_applicable",
+        summary: valid
+          ? `All ${TALL_DIALOG_NODE_COUNT} deterministic prompt reviews are accepted in this dialog projection.`
+          : "No interpretation events.",
+        detail: null,
+        component_ids: [],
+      },
       { id: "secrets", label: "Secrets", status: "ok", summary: "No secret bindings are required.", detail: null, component_ids: [] },
     ],
     validation_result: validationResult,
@@ -388,7 +411,7 @@ async function fulfillWorkspaceRoute(
   ) {
     const result = scenario === "validation-audit-issues"
       ? validationIssues()
-      : validValidation();
+      : tallDialogAcceptedValidation();
     if (pathname === `/api/sessions/${sessionId}/validate` && method === "POST") {
       await route.fulfill({ json: result });
       return true;
@@ -443,6 +466,50 @@ async function fulfillWorkspaceRoute(
   return false;
 }
 
+async function assertTallDialogLivePreflight(
+  page: Page,
+  sessionId: string,
+  compositionState: CompositionState,
+): Promise<void> {
+  const token = tokenFromStorageState(await page.context().storageState());
+  const ctx = await authedContext(token);
+  try {
+    const response = await ctx.post(
+      `/api/sessions/${sessionId}/validate?state_id=${encodeURIComponent(compositionState.id)}`,
+    );
+    if (!response.ok()) {
+      throw new Error(
+        `tall-dialog live preflight failed (${response.status()}): ${(await response.text()).slice(0, 500)}`,
+      );
+    }
+    const result = (await response.json()) as ValidationResult;
+    const nodeIds = new Set(compositionState.nodes.map((node) => node.id));
+    const errorNodeIds = new Set(result.errors.map((error) => error.component_id));
+    const unexpectedErrors = result.errors.filter(
+      (error) => error.error_code !== "interpretation_review_pending",
+    );
+    const unexpectedBlockers = result.readiness.blockers.filter(
+      (blocker) => blocker.code !== "interpretation_review_pending",
+    );
+    const allNodesCovered =
+      errorNodeIds.size === nodeIds.size &&
+      [...nodeIds].every((nodeId) => errorNodeIds.has(nodeId));
+    if (
+      result.is_valid ||
+      result.errors.length !== compositionState.nodes.length ||
+      unexpectedErrors.length > 0 ||
+      unexpectedBlockers.length > 0 ||
+      !allNodesCovered
+    ) {
+      throw new Error(
+        `tall-dialog live preflight must have only one pending prompt review per node: ${JSON.stringify(result)}`,
+      );
+    }
+  } finally {
+    await ctx.dispose();
+  }
+}
+
 export async function installWorkspaceScenario(
   page: Page,
   scenario: WorkspaceScenario,
@@ -460,10 +527,16 @@ export async function installWorkspaceScenario(
     const compositionState = scenario === "empty-freeform"
       ? null
       : await seedCanonicalComposition(page, sessionId, scenario);
+    if (scenario === "tall-confirmation-dialog" && compositionState !== null) {
+      await assertTallDialogLivePreflight(page, sessionId, compositionState);
+    }
     const installed: InstalledScenario = {
       sessionId,
       pendingAcknowledgement: scenario === "pending-acknowledgement" ? deferredSignal() : null,
-      telemetry: { runHistoryRequests: 0 },
+      telemetry: {
+        runHistoryRequests: 0,
+        tallDialogLivePreflightChecked: scenario === "tall-confirmation-dialog",
+      },
       noticeMode: options.noticeMode ?? "long-content",
       noticeBackendRecovered: false,
     };

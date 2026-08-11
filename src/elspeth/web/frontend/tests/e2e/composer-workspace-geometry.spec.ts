@@ -22,6 +22,49 @@ import {
 } from "./helpers/workspace-fixtures";
 import { ComposerPage } from "./page-objects/composer-page";
 
+interface RunPollingProbe {
+  activeIntervalIds: Set<number>;
+}
+
+async function installRunPollingClockProbe(page: ComposerPage["page"]): Promise<void> {
+  await page.clock.install();
+  const currentBrowserTime = await page.evaluate(() => Date.now());
+  await page.clock.pauseAt(currentBrowserTime + 100);
+  await page.evaluate(() => {
+    const originalSetInterval = window.setInterval.bind(window);
+    const originalClearInterval = window.clearInterval.bind(window);
+    const activeIntervalIds = new Set<number>();
+    const probedWindow = window as typeof window & {
+      __workspaceRunPollingProbe?: RunPollingProbe;
+    };
+    probedWindow.__workspaceRunPollingProbe = { activeIntervalIds };
+    window.setInterval = ((
+      handler: TimerHandler,
+      timeout?: number,
+      ...arguments_: unknown[]
+    ) => {
+      const intervalId = originalSetInterval(handler, timeout, ...arguments_);
+      if (timeout === 3_000) activeIntervalIds.add(intervalId);
+      return intervalId;
+    }) as typeof window.setInterval;
+    window.clearInterval = ((intervalId?: number) => {
+      if (intervalId !== undefined) activeIntervalIds.delete(intervalId);
+      originalClearInterval(intervalId);
+    }) as typeof window.clearInterval;
+  });
+}
+
+async function activeRunPollingIntervals(page: ComposerPage["page"]): Promise<number> {
+  return await page.evaluate(() => {
+    const probedWindow = window as typeof window & {
+      __workspaceRunPollingProbe?: RunPollingProbe;
+    };
+    const probe = probedWindow.__workspaceRunPollingProbe;
+    if (probe === undefined) throw new Error("run polling probe is not installed");
+    return probe.activeIntervalIds.size;
+  });
+}
+
 async function assertScenario(
   scenario: WorkspaceScenario,
   composer: ComposerPage,
@@ -99,6 +142,13 @@ async function assertScenario(
       await page.keyboard.press("Escape");
       break;
     case "tall-confirmation-dialog": {
+      expect(
+        workspaceScenarioTelemetry(page).tallDialogLivePreflightChecked,
+      ).toBe(true);
+      await expect(composer.validationStatus()).toHaveAccessibleName(
+        "Validation: Passed",
+      );
+      await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
       const invoker = composer.runPipeline();
       await expect(invoker).toBeEnabled();
       await invoker.focus();
@@ -160,6 +210,57 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
+  test("Keyboard Shortcuts stays scrollable and restores its exact invoker", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      const invoker = page.getByRole("button", {
+        name: "Session switcher: workspace empty-freeform",
+      });
+      await invoker.focus();
+      await page.evaluate(() => {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", {
+            key: "?",
+            shiftKey: true,
+            bubbles: true,
+          }),
+        );
+      });
+
+      const dialog = page.getByRole("dialog", { name: "Keyboard Shortcuts" });
+      await expect(dialog).toBeVisible();
+      await expect(
+        dialog.getByRole("heading", { name: "Keyboard Shortcuts" }),
+      ).toBeVisible();
+      const close = dialog.getByRole("button", { name: "Close" });
+      await expect(close).toBeVisible();
+      const body = dialog.locator(":scope > .confirm-dialog-body");
+      const scrollGeometry = await body.evaluate((element) => ({
+        overflowY: window.getComputedStyle(element).overflowY,
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+      }));
+      expect(scrollGeometry.overflowY).toBe("auto");
+      expect(scrollGeometry.scrollHeight).toBeGreaterThan(
+        scrollGeometry.clientHeight,
+      );
+      const editing = dialog.getByRole("region", { name: "Editing" });
+      await editing.scrollIntoViewIfNeeded();
+      await expect(editing).toBeVisible();
+      await close.click();
+      await expect(dialog).toBeHidden();
+      await expect(invoker).toBeFocused();
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
   test("long notices use a bounded internal scroll surface without consuming the workspace", async ({
     page,
   }) => {
@@ -174,6 +275,46 @@ test.describe("Composer deterministic workspace geometry", () => {
 
       const primary = page.getByTestId("app-notice-primary");
       await expect(primary).toContainText("Preferences:");
+      const header = page.getByRole("banner");
+      const main = page.locator("#composer-main");
+      const version = page.getByRole("button", {
+        name: /Composition history \(currently v\d+\)/,
+      });
+      const primaryBounds = await primary.boundingBox();
+      const headerBounds = await header.boundingBox();
+      const mainBounds = await main.boundingBox();
+      expect(primaryBounds).not.toBeNull();
+      expect(headerBounds).not.toBeNull();
+      expect(mainBounds).not.toBeNull();
+      expect(headerBounds!.y).toBeGreaterThanOrEqual(
+        primaryBounds!.y + primaryBounds!.height,
+      );
+      expect(mainBounds!.y).toBeGreaterThanOrEqual(
+        headerBounds!.y + headerBounds!.height,
+      );
+      for (const control of [
+        page.getByRole("button", { name: /Session switcher:/ }),
+        version,
+        page.getByRole("button", { name: "account menu" }),
+      ]) {
+        const bounds = await control.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.height).toBeGreaterThanOrEqual(36);
+        expect(bounds!.y).toBeGreaterThanOrEqual(headerBounds!.y);
+        expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(
+          headerBounds!.y + headerBounds!.height,
+        );
+      }
+      const versionHitTarget = await version.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + bounds.height / 2,
+        );
+        return hit === element || (hit !== null && element.contains(hit));
+      });
+      expect(versionHitTarget).toBe(true);
+
       await page.getByRole("button", { name: "1 more notice" }).click();
       const popover = page.getByRole("region", { name: "All notices" });
       await expect(popover).toContainText("Couldn't load your preferences");
@@ -242,18 +383,24 @@ test.describe("Composer deterministic workspace geometry", () => {
     try {
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      await installRunPollingClockProbe(page);
       await composer.artifactTab("Run").click();
       await expect(page.getByText("Pipeline running.", { exact: true })).toBeVisible();
+      await expect.poll(() => activeRunPollingIntervals(page)).toBe(1);
       resetWorkspaceScenarioTelemetry(page);
+      await page.clock.fastForward(3_000);
       await expect
         .poll(() => workspaceScenarioTelemetry(page).runHistoryRequests, {
           timeout: 5_000,
         })
-        .toBeGreaterThanOrEqual(1);
+        .toBe(1);
+      await page.clock.fastForward(2_999);
+      expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(1);
 
       await composer.artifactTab("Graph").click();
+      await expect.poll(() => activeRunPollingIntervals(page)).toBe(0);
       resetWorkspaceScenarioTelemetry(page);
-      await page.waitForTimeout(3_250);
+      await page.clock.fastForward(6_001);
       expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(0);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
