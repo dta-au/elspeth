@@ -295,6 +295,45 @@ documentation and `docs/README.md`; absolute paths, repository escapes, and
 symlink inputs/escapes are invalid for inline links and reference definitions.
 These are direct assessment operations, not unit tests for a document package.
 
+## Schema 3 protected-live ingestion
+
+Catalog v3 uses assessment schema 3. Before any evidence run, freeze executable
+commit `F` and enumerate every prospective docs file in
+`baseline.publication_paths`, including `assessment.json` and the deterministic
+per-lane evidence filenames. Validation accepts either the exact prospective
+docs overlay while `HEAD == F`, or a clean publication commit whose sole parent
+is `F` and whose complete changed-path set equals `publication_paths`.
+
+A downloaded workflow artifact is untrusted input. It must contain exactly
+`manifest.json`, `junit.xml`, `profile.json`, `nodes.txt`, and
+`scrub-report.json`; raw stdout and stderr are not evidence-envelope members.
+Use a read-only token with Actions and repository metadata access, then ingest
+one frozen selector lane:
+
+```bash
+export ELSPETH_GITHUB_ACTIONS_READ_TOKEN="<read-only token>"
+PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
+  ingest-live-evidence "$STATE_ASSESSMENT_PATH" /path/to/downloaded-artifact \
+  --lane protected-live-aws
+unset ELSPETH_GITHUB_ACTIONS_READ_TOKEN
+```
+
+The operation queries GitHub independently for the repository, protected
+default branch, workflow-dispatch run and attempt, successful job, and named
+artifact. It downloads the API-selected archive, verifies the API-reported
+digest over those bytes, safely checks the exact five regular archive members,
+and byte-compares them with the supplied directory. It also re-derives the
+workflow digest at `F`, requires the exact selector profile, resources, nodes,
+and proof cells, validates JUnit/profile counts, and requires a successful
+canary scrub. The manifest may describe these facts but cannot authenticate
+them. No credential value, resource URL, provider body, stdout, or stderr is
+written to the assessment.
+
+The command writes `live-<lane-id>.*` files only at paths frozen in
+`publication_paths` and appends one schema-3 evidence record. It does not run a
+workflow, prove that an unavailable lane passed, or substitute local
+testcontainers for the PostgreSQL 16 AWS Landscape profile.
+
 ## Historical rerun
 
 ### Strict v1 rerun

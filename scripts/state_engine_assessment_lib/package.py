@@ -251,6 +251,8 @@ def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
         "submodules",
         "worktrees_at_capture",
     }
+    if assessment.get("schema_version") == 3 and mode == "current":
+        current_fields.add("publication_paths")
     expected_fields = current_fields if mode == "current" else identity_fields
     _require(set(baseline) == expected_fields, f"baseline {mode} schema has unexpected fields")
     for field in expected_fields:
@@ -282,14 +284,13 @@ def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    _require(baseline["commit"] == head, "baseline current commit does not match live HEAD")
-    live_tree = subprocess.run(
-        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+    frozen_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", f"{baseline['commit']}^{{tree}}"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    _require(baseline["tree"] == live_tree, "baseline current tree does not match live HEAD")
+    _require(baseline["tree"] == frozen_tree, "baseline current tree does not match frozen commit")
     _require(Path(repository_root).resolve() == root, "baseline current repository_root does not match the checkout")
     branch = subprocess.run(
         ["git", "-C", str(root), "branch", "--show-current"],
@@ -308,6 +309,10 @@ def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
         remote.returncode == 0 and baseline["remote"] == remote.stdout.strip(),
         "baseline current remote does not match origin",
     )
+    if assessment.get("schema_version") == 3:
+        _validate_schema3_publication_state(baseline, root, head)
+        return
+    _require(baseline["commit"] == head, "baseline current commit does not match live HEAD")
     committed_diff = subprocess.run(
         [
             "git",
@@ -342,6 +347,69 @@ def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
     _require(not status, f"non-document overlay is not clean: {status}")
 
 
+def _git_changed_paths(root: Path, *arguments: str) -> list[str]:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        capture_output=True,
+    )
+    return [item.decode("utf-8") for item in result.stdout.split(b"\0") if item]
+
+
+def _schema3_publication_paths(baseline: dict[str, Any], root: Path) -> list[str]:
+    paths = _strings(baseline.get("publication_paths"), "baseline publication_paths")
+    _require(bool(paths), "baseline publication_paths must not be empty")
+    _unique(paths, "baseline publication_paths")
+    for value in paths:
+        path = Path(value)
+        _require(not path.is_absolute(), "baseline publication path must be repository-relative")
+        _require(".." not in path.parts, "baseline publication path cannot traverse parents")
+        _require(not any(character in value for character in "*?["), "baseline publication path cannot contain a glob")
+        _require(len(path.parts) > 1 and path.parts[0] == "docs", "baseline publication paths must be under docs/")
+        _require(not value.endswith("/"), "baseline publication path must name a file")
+        resolved = _repository_path(root, value, "baseline publication path")
+        _require(not resolved.is_dir(), "baseline publication path must name a file")
+    return paths
+
+
+def _schema3_dirty_paths(root: Path) -> list[str]:
+    raw = _git_changed_paths(root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    paths: list[str] = []
+    for item in raw:
+        _require(len(item) >= 4 and item[2] == " ", "schema-3 publication overlay has an unsupported Git status record")
+        status = item[:2]
+        _require("R" not in status and "C" not in status, "schema-3 publication overlay cannot contain renames or copies")
+        paths.append(item[3:])
+    return sorted(paths)
+
+
+def _validate_schema3_publication_state(baseline: dict[str, Any], root: Path, head: str) -> None:
+    publication_paths = _schema3_publication_paths(baseline, root)
+    frozen = _string(baseline.get("commit"), "baseline commit")
+    if head == frozen:
+        _require(
+            _schema3_dirty_paths(root) == sorted(publication_paths),
+            "schema-3 prospective overlay must match baseline publication paths exactly",
+        )
+        return
+    _require(not _schema3_dirty_paths(root), "schema-3 published checkout must be clean")
+    parents = (
+        subprocess.run(
+            ["git", "-C", str(root), "show", "-s", "--format=%P", head],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        .stdout.strip()
+        .split()
+    )
+    changed = sorted(_git_changed_paths(root, "diff", "--name-only", "-z", frozen, head, "--"))
+    _require(
+        parents == [frozen] and changed == sorted(publication_paths),
+        "schema-3 HEAD must be the single docs-only publication child of the frozen commit",
+    )
+
+
 def _offset_datetime(value: Any, context: str) -> datetime:
     _require(isinstance(value, str), f"{context} must be an offset-aware timestamp")
     try:
@@ -350,6 +418,61 @@ def _offset_datetime(value: Any, context: str) -> datetime:
         _fail(f"{context} must be an offset-aware timestamp")
     _require(parsed.utcoffset() is not None, f"{context} must be an offset-aware timestamp")
     return parsed
+
+
+def _validate_evidence_provenance(record: dict[str, Any], assessment: dict[str, Any]) -> None:
+    evidence_id = _string(record.get("id"), "evidence id")
+    runner = _string(record.get("runner"), f"evidence {evidence_id} runner")
+    provenance = _dict(record.get("provenance"), f"evidence {evidence_id} provenance")
+    if runner == "local":
+        _require(
+            set(provenance) == {"python_executable", "platform"},
+            f"evidence {evidence_id} local provenance has unexpected fields",
+        )
+        environment = _dict(assessment.get("environment"), "environment")
+        _require(
+            provenance.get("python_executable") == environment.get("python_executable"),
+            f"evidence {evidence_id} local provenance does not bind the checkout Python",
+        )
+        _require(
+            provenance.get("platform") == environment.get("kernel"),
+            f"evidence {evidence_id} local provenance does not bind the captured platform",
+        )
+        return
+    _require(runner == "github_actions", f"evidence {evidence_id} has unsupported runner")
+    fields = {
+        "repository",
+        "workflow_path",
+        "workflow_sha256",
+        "baseline_sha",
+        "run_id",
+        "run_attempt",
+        "job_id",
+        "runner_image",
+        "selector_lane_id",
+        "artifact_sha256",
+        "scrub_report_sha256",
+    }
+    _require(set(provenance) == fields, f"evidence {evidence_id} GitHub Actions provenance has unexpected fields")
+    for field in ("repository", "workflow_path", "runner_image", "selector_lane_id"):
+        _require(
+            isinstance(provenance.get(field), str) and bool(provenance[field].strip()),
+            f"evidence {evidence_id} provenance {field} must be non-empty text",
+        )
+    for field in ("workflow_sha256", "artifact_sha256", "scrub_report_sha256"):
+        _require(
+            isinstance(provenance.get(field), str) and SHA256_PATTERN.fullmatch(provenance[field]) is not None,
+            f"evidence {evidence_id} provenance {field} must be SHA-256",
+        )
+    _require(
+        provenance.get("baseline_sha") == _dict(assessment.get("baseline"), "baseline").get("commit"),
+        f"evidence {evidence_id} provenance baseline does not match the assessment",
+    )
+    for field in ("run_id", "run_attempt", "job_id"):
+        _require(
+            type(provenance.get(field)) is int and provenance[field] > 0,
+            f"evidence {evidence_id} provenance {field} must be a positive integer",
+        )
 
 
 def _validate_environment(assessment: dict[str, Any]) -> None:
@@ -420,10 +543,19 @@ def _validate_environment(assessment: dict[str, Any]) -> None:
 
 
 def _semantic_cases(leg: dict[str, Any]) -> list[str]:
-    return _strings(leg.get("required_cases", ["leg-contract"]), f"catalog leg {leg['id']} cases")
+    cases = _list(leg.get("required_cases", ["leg-contract"]), f"catalog leg {leg['id']} cases")
+    if all(isinstance(item, str) for item in cases):
+        return cast(list[str], cases)
+    return [_string(_dict(item, f"catalog leg {leg['id']} case").get("case_id"), f"catalog leg {leg['id']} case_id") for item in cases]
 
 
 def _profile_cases(catalog: dict[str, Any], leg: dict[str, Any]) -> list[str]:
+    if catalog["catalog_id"] == "elspeth-state-engine-v3":
+        profiles = _dict(catalog.get("execution_profiles"), "execution_profiles")
+        return [
+            _string(_dict(item, "execution profile case").get("id"), "execution profile case id")
+            for item in _list(profiles.get("profile_cases"), "execution profile cases")
+        ]
     profile = catalog["applicability_profiles"][leg["applicability_profile"]]
     if catalog["catalog_id"] == "elspeth-state-engine-v2":
         applicability = _dict(profile["profile_case_applicability"], "profile-case applicability")
@@ -436,7 +568,19 @@ def _cell_is_applicable(
     leg: dict[str, Any],
     dimension: str,
     profile_case: str,
+    case_id: str,
 ) -> bool:
+    if catalog["catalog_id"] == "elspeth-state-engine-v3":
+        matches = [
+            _dict(item, f"catalog leg {leg['id']} case")
+            for item in _list(leg.get("required_cases"), f"catalog leg {leg['id']} cases")
+            if isinstance(item, dict) and item.get("case_id") == case_id
+        ]
+        _require(len(matches) == 1, f"catalog leg {leg['id']} has no unique case {case_id}")
+        applicability = _dict(matches[0].get("cell_applicability"), "cell applicability")
+        dimensions = _dict(applicability.get(profile_case), f"cell applicability {profile_case}")
+        cell = _dict(dimensions.get(dimension), f"cell applicability {profile_case}/{dimension}")
+        return cell.get("status") == "required"
     profile = catalog["applicability_profiles"][leg["applicability_profile"]]
     if profile[dimension] != "required":
         return False
@@ -769,6 +913,116 @@ def _validate_profile_report(
     }
 
 
+def _validate_schema3_github_evidence(
+    record: dict[str, Any],
+    assessment: dict[str, Any],
+    root: Path,
+    artifacts_by_kind: dict[str, tuple[dict[str, Any], Path]],
+) -> list[str]:
+    evidence_id = record["id"]
+    provenance = _dict(record.get("provenance"), f"evidence {evidence_id} provenance")
+    manifest_path = artifacts_by_kind["manifest"][1]
+    manifest = load_unique_json(manifest_path)
+    expected_manifest_fields = {
+        "schema_version",
+        "producer",
+        "evidence_id",
+        "lane_id",
+        "catalog_id",
+        "catalog_sha256",
+        "repository",
+        "workflow_path",
+        "workflow_sha256",
+        "baseline_sha",
+        "run_id",
+        "run_attempt",
+        "runner_image",
+        "ref",
+        "head_sha",
+        "artifact_name",
+        "started_at",
+        "ended_at",
+        "duration_seconds",
+        "timeout_seconds",
+        "argv",
+        "resources",
+        "result_counts",
+        "files",
+    }
+    _require(set(manifest) == expected_manifest_fields, f"evidence {evidence_id} manifest has unexpected fields")
+    _require(
+        manifest.get("schema_version") == 1
+        and manifest.get("producer") == "elspeth-state-engine-live-evidence-v1"
+        and manifest.get("evidence_id") == evidence_id,
+        f"evidence {evidence_id} manifest identity is invalid",
+    )
+    catalog_record = _dict(assessment.get("catalog"), "assessment catalog")
+    _require(
+        manifest.get("catalog_id") == catalog_record.get("catalog_id")
+        and manifest.get("catalog_sha256") == catalog_record.get("sha256_at_evidence_capture"),
+        f"evidence {evidence_id} manifest catalog identity is stale",
+    )
+    for manifest_field, provenance_field in (
+        ("repository", "repository"),
+        ("workflow_path", "workflow_path"),
+        ("workflow_sha256", "workflow_sha256"),
+        ("baseline_sha", "baseline_sha"),
+        ("run_id", "run_id"),
+        ("run_attempt", "run_attempt"),
+        ("runner_image", "runner_image"),
+        ("lane_id", "selector_lane_id"),
+    ):
+        _require(
+            manifest.get(manifest_field) == provenance.get(provenance_field),
+            f"evidence {evidence_id} manifest/provenance {manifest_field} mismatch",
+        )
+    _require(
+        manifest.get("argv") == record.get("argv")
+        and manifest.get("resources") == record.get("resources")
+        and manifest.get("result_counts") == record.get("result_counts"),
+        f"evidence {evidence_id} manifest execution facts mismatch",
+    )
+    workflow = subprocess.run(
+        ["git", "-C", str(root), "show", f"{provenance['baseline_sha']}:{provenance['workflow_path']}"],
+        check=False,
+        capture_output=True,
+    )
+    _require(
+        workflow.returncode == 0 and hashlib.sha256(workflow.stdout).hexdigest() == provenance.get("workflow_sha256"),
+        f"evidence {evidence_id} workflow digest is stale or transplanted",
+    )
+    scrub_path = artifacts_by_kind["scrub_report"][1]
+    _require(
+        _sha256(scrub_path) == provenance.get("scrub_report_sha256"),
+        f"evidence {evidence_id} scrub-report provenance digest mismatch",
+    )
+    selector_path = root / "docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json"
+    _require(selector_path.is_file(), "v3 evidence selector manifest is missing")
+    selector = load_unique_json(selector_path)
+    lanes = _list(selector.get("lanes"), "v3 evidence selector lanes")
+    lane_matches = [
+        _dict(item, "v3 evidence selector lane")
+        for item in lanes
+        if isinstance(item, dict) and item.get("lane_id") == provenance.get("selector_lane_id")
+    ]
+    _require(len(lane_matches) == 1, f"evidence {evidence_id} selector lane is stale or ambiguous")
+    lane = lane_matches[0]
+    nodes = _strings(lane.get("node_ids"), f"evidence {evidence_id} selector nodes")
+    _require(record.get("resources") == lane.get("resource_variables"), f"evidence {evidence_id} resources drifted from its lane")
+    expected_coverage = [
+        {**_dict(cell, f"evidence {evidence_id} selector cell"), "node_ids": [nodes[index]]}
+        for index, cell in enumerate(_list(lane.get("cells"), f"evidence {evidence_id} selector cells"))
+    ]
+    _require(len(expected_coverage) == len(nodes), f"evidence {evidence_id} selector does not map one node per proof subject")
+    _require(record.get("coverage") == expected_coverage, f"evidence {evidence_id} coverage drifted from its selector lane")
+    argv = _strings(record.get("argv"), f"evidence {evidence_id} argv")
+    _require(
+        len(argv) >= 3 and argv[1:3] == ["-m", "pytest"] and all(node in argv for node in nodes),
+        f"evidence {evidence_id} argv does not execute every selector-lane node",
+    )
+    return nodes
+
+
 def _validate_evidence(
     assessment: dict[str, Any],
     catalog: dict[str, Any],
@@ -779,7 +1033,8 @@ def _validate_evidence(
     set[str],
 ]:
     catalog_by_id = {leg["id"]: leg for leg in catalog["legs"]}
-    v2 = catalog["catalog_id"] == "elspeth-state-engine-v2"
+    modern = catalog["catalog_id"] in {"elspeth-state-engine-v2", "elspeth-state-engine-v3"}
+    schema3 = catalog["catalog_id"] == "elspeth-state-engine-v3"
     records = _list(assessment.get("evidence"), "evidence")
     evidence_by_id: dict[str, dict[str, Any]] = {}
     coverage_by_evidence: dict[str, set[tuple[str, str, str, str]]] = {}
@@ -804,7 +1059,7 @@ def _validate_evidence(
     )
     pytest_only_fields = ("collected_node_index", "collected_nodes")
     pytest_result_keys = ["passed", "failed", "errors", "skipped", "xfailed", "xpassed", "warnings"]
-    allowed_kinds = {"pytest", "documentation"} if v2 else {"pytest"}
+    allowed_kinds = {"pytest", "documentation"} if modern else {"pytest"}
     profile_case_by_id = {
         profile["id"]: profile for profile in _dict(catalog.get("execution_profiles"), "execution_profiles").get("profile_cases", [])
     }
@@ -820,24 +1075,27 @@ def _validate_evidence(
         _require(kind in allowed_kinds, f"evidence {evidence_id} has unsupported kind: {kind}")
         for field in required_fields:
             _require(field in record, f"evidence {evidence_id} is missing {field}")
-        if kind == "pytest" and v2:
+        versioned_fields = {"runner", "provenance"} if schema3 else set()
+        if kind == "pytest" and modern:
             _require(
-                set(record) == {"id", *required_fields, *pytest_only_fields},
+                set(record) == {"id", *required_fields, *pytest_only_fields, *versioned_fields},
                 f"pytest evidence {evidence_id} has unexpected fields",
             )
             _require(
                 type(record.get("collected_nodes")) is int and record["collected_nodes"] > 0,
                 f"pytest evidence {evidence_id} must have a positive collected-node count",
             )
-        elif kind == "documentation" and v2:
+        elif kind == "documentation" and modern:
             _require(
-                set(record) == {"id", *required_fields},
+                set(record) == {"id", *required_fields, *versioned_fields},
                 f"documentation evidence {evidence_id} has unexpected fields",
             )
             _require(
                 record["result_counts"] is None,
                 f"documentation evidence {evidence_id} result_counts must be null",
             )
+        if schema3:
+            _validate_evidence_provenance(record, assessment)
         _require(
             record["reproducibility_class"] in {"deterministic", "semantic_comparison", "external_observation"},
             f"evidence {evidence_id} has invalid reproducibility_class",
@@ -877,14 +1135,14 @@ def _validate_evidence(
         node_subject: dict[str, tuple[str, str, str]] = {}
         for raw_item in raw_coverage:
             item = _dict(raw_item, f"evidence {evidence_id} coverage item")
-            if v2:
+            if modern:
                 _require(
                     set(item) == {"leg_id", "dimension_id", "case_id", "profile_case", "node_ids"},
                     f"evidence {evidence_id} coverage item has unexpected fields",
                 )
-            coverage_key = _coverage_key(item, v2)
+            coverage_key = _coverage_key(item, modern)
             coverage.add(coverage_key)
-            if kind == "pytest" and v2:
+            if kind == "pytest" and modern:
                 node_ids = _strings(item.get("node_ids"), f"evidence {evidence_id} coverage node_ids")
                 _require(bool(node_ids), f"pytest evidence {evidence_id} coverage must cite node_ids")
                 _unique(node_ids, f"evidence {evidence_id} coverage node_ids")
@@ -908,13 +1166,13 @@ def _validate_evidence(
         artifacts_by_kind: dict[str, tuple[dict[str, Any], Path]] = {}
         for raw_artifact in artifacts:
             artifact = _dict(raw_artifact, f"evidence {evidence_id} artifact")
-            expected_artifact_fields = {"kind", "path", "sha256"} if v2 else {"path", "sha256"}
+            expected_artifact_fields = {"kind", "path", "sha256"} if modern else {"path", "sha256"}
             _require(set(artifact) == expected_artifact_fields, f"evidence {evidence_id} artifact has unexpected fields")
             artifact_path = _repository_path(root, artifact.get("path"), f"evidence {evidence_id} artifact path")
             _require(artifact_path.is_file(), f"evidence artifact does not exist: {artifact_path}")
             _require(not artifact_path.is_symlink(), f"evidence artifact cannot be a symlink: {artifact_path}")
             _require(_sha256(artifact_path) == artifact.get("sha256"), f"evidence artifact digest mismatch: {artifact_path}")
-            if v2:
+            if modern:
                 artifact_kind = _string(artifact.get("kind"), f"evidence {evidence_id} artifact kind")
                 _require(artifact_kind not in artifacts_by_kind, f"evidence {evidence_id} has duplicate artifact kind")
                 artifacts_by_kind[artifact_kind] = (artifact, artifact_path)
@@ -928,10 +1186,10 @@ def _validate_evidence(
             _require(type(record.get("collected_nodes")) is int, f"pytest evidence {evidence_id} collected_nodes must be an integer")
             index_record = _dict(record.get("collected_node_index"), f"evidence {evidence_id} collected_node_index")
             _require(
-                set(index_record) == ({"kind", "path", "sha256"} if v2 else {"path", "sha256"}),
+                set(index_record) == ({"kind", "path", "sha256"} if modern else {"path", "sha256"}),
                 f"pytest evidence {evidence_id} collected_node_index has unexpected fields",
             )
-            if v2:
+            if modern:
                 _require(index_record.get("kind") == "node_index", f"pytest evidence {evidence_id} node index has wrong kind")
             node_path = _repository_path(root, index_record.get("path"), f"evidence {evidence_id} node index")
             _require(node_path.is_file(), f"pytest node index does not exist: {node_path}")
@@ -946,20 +1204,29 @@ def _validate_evidence(
                 set(node_subject) <= set(nodes),
                 f"pytest evidence {evidence_id} coverage cites a node outside its collected-node index",
             )
-            if v2:
-                expected_artifact_kinds = {"junit_xml", "stdout", "stderr", "profile_report"}
+            if modern:
+                runner = record.get("runner", "local")
+                expected_artifact_kinds = (
+                    {"manifest", "junit_xml", "profile_report", "scrub_report"}
+                    if runner == "github_actions"
+                    else {"junit_xml", "stdout", "stderr", "profile_report"}
+                )
                 _require(
                     set(artifacts_by_kind) == expected_artifact_kinds and len(artifacts) == len(expected_artifact_kinds),
                     f"pytest evidence {evidence_id} must retain exactly the four typed result artifacts",
                 )
                 junit_record, junit_path = artifacts_by_kind["junit_xml"]
                 profile_record, profile_path = artifacts_by_kind["profile_report"]
-                selectors = _validate_pytest_command(
-                    record,
-                    assessment,
-                    root,
-                    junit_relative=_string(junit_record.get("path"), "JUnit artifact path"),
-                    profile_relative=_string(profile_record.get("path"), "profile artifact path"),
+                selectors = (
+                    _validate_schema3_github_evidence(record, assessment, root, artifacts_by_kind)
+                    if runner == "github_actions"
+                    else _validate_pytest_command(
+                        record,
+                        assessment,
+                        root,
+                        junit_relative=_string(junit_record.get("path"), "JUnit artifact path"),
+                        profile_relative=_string(profile_record.get("path"), "profile artifact path"),
+                    )
                 )
                 junit_nodes, junit_outcomes = _junit_node_ids(junit_path, evidence_id)
                 _require(junit_nodes == nodes, f"pytest evidence {evidence_id} JUnit node identities do not match the retained index")
@@ -1174,7 +1441,9 @@ def _normalized_cells(
             for case_id in _semantic_cases(catalog_leg):
                 for profile_case in _profile_cases(catalog, catalog_leg):
                     status = (
-                        leg["default_status"] if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case) else "not_applicable"
+                        leg["default_status"]
+                        if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case, case_id)
+                        else "not_applicable"
                     )
                     result[(leg["id"], dimension, case_id, profile_case)] = (status, ())
         for override in leg.get("overrides", []):
@@ -1266,18 +1535,19 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     evidence_by_id, coverage_by_evidence, promotable_evidence = _validate_evidence(assessment, catalog, root)
     evidence_ids = set(evidence_by_id)
     catalog_by_id = {leg["id"]: leg for leg in catalog["legs"]}
-    v2 = catalog["catalog_id"] == "elspeth-state-engine-v2"
+    modern = catalog["catalog_id"] in {"elspeth-state-engine-v2", "elspeth-state-engine-v3"}
+    schema3 = catalog["catalog_id"] == "elspeth-state-engine-v3"
 
     raw_changed = _list(assessment.get("changed_tuples", []), "changed_tuples")
     changed_keys: set[tuple[str, str, str, str]] = set()
     for raw_item in raw_changed:
         item = _dict(raw_item, "changed tuple")
-        if v2:
+        if modern:
             _require(
                 set(item) == {"leg_id", "dimension_id", "case_id", "profile_case"},
                 "changed tuple has unexpected fields",
             )
-        changed_keys.add(_changed_key(item, v2))
+        changed_keys.add(_changed_key(item, modern))
     _require(len(changed_keys) == len(raw_changed), "changed_tuples contains duplicates")
     for leg_id, dimension, case_id, profile_case in changed_keys:
         _require(leg_id in catalog_by_id, "changed_tuples names an unknown leg")
@@ -1327,7 +1597,9 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
             for case_id in _semantic_cases(catalog_leg):
                 for profile_case in _profile_cases(catalog, catalog_leg):
                     status = (
-                        leg["default_status"] if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case) else "not_applicable"
+                        leg["default_status"]
+                        if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case, case_id)
+                        else "not_applicable"
                     )
                     cell_status[(dimension, case_id, profile_case)] = status
                     cell_evidence[(dimension, case_id, profile_case)] = []
@@ -1345,15 +1617,20 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
             _require(key in cell_status, f"leg {leg_id} override names an unknown proof cell")
             status = _string(override.get("status"), "override status")
             _require(status in CELL_STATUSES, f"leg {leg_id} override has invalid status")
-            if v2:
+            if modern:
                 base_fields = {"dimension", "case", "profile_case", "status", "evidence"}
                 unresolved_fields = {"reason", "owner_issue", "exit_gate"} if status in {"partial", "fail", "unknown"} else set()
                 _require(
                     set(override) == base_fields | unresolved_fields,
                     f"leg {leg_id} {status} override has unexpected fields",
                 )
+            if schema3:
+                _require(
+                    status != "not_applicable",
+                    f"leg {leg_id} schema-3 not_applicable status must be derived from the catalog",
+                )
             cited = _strings(override.get("evidence", []), f"leg {leg_id} override evidence")
-            cell_is_applicable = _cell_is_applicable(catalog, catalog_leg, key[0], key[2])
+            cell_is_applicable = _cell_is_applicable(catalog, catalog_leg, key[0], key[2], key[1])
             if not cell_is_applicable:
                 _require(
                     status == "not_applicable",
