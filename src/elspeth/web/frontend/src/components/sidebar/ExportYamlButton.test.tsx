@@ -4,7 +4,11 @@ import {
   ExportYamlButton,
   EXPORT_YAML_EMPTY_PIPELINE_TITLE,
 } from "./ExportYamlButton";
-import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
+import {
+  OPEN_YAML_MODAL_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -60,19 +64,28 @@ describe("ExportYamlButton", () => {
     ).toBeInTheDocument();
   });
 
-  it("dispatches OPEN_YAML_MODAL_EVENT on click when the pipeline has content", () => {
+  it("selects the active session's persistent YAML artifact without opening a modal", () => {
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: nonEmptyState(),
     } as never);
-    const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    const legacyHandler = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    window.addEventListener(OPEN_YAML_MODAL_EVENT, legacyHandler);
 
     render(<ExportYamlButton />);
     fireEvent.click(screen.getByRole("button", { name: /export yaml/i }));
 
-    expect(handler).toHaveBeenCalled();
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    expect(requests).toEqual([
+      { tab: "yaml", focusMode: false, sessionId: "sess-1" },
+    ]);
+    expect(legacyHandler).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    window.removeEventListener(OPEN_YAML_MODAL_EVENT, legacyHandler);
   });
 
   // elspeth-bff8043d33: Export must be disabled — with a stated reason —

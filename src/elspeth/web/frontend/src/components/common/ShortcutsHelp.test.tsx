@@ -106,12 +106,17 @@ describe("ShortcutsHelp — four-group structure", () => {
     expect(actionsSection?.textContent).toMatch(/validate pipeline/i);
   });
 
-  it("places 'Ctrl+Shift+G Open graph view' and 'Ctrl+Shift+Y Export YAML' in Actions", () => {
+  it("places persistent Graph and YAML artifact shortcuts in Navigation", () => {
     render(<ShortcutsHelp onClose={vi.fn()} />);
-    const actionsSection = document
-      .querySelector("section[aria-label='Actions']");
-    expect(actionsSection?.textContent).toMatch(/open graph view/i);
-    expect(actionsSection?.textContent).toMatch(/export yaml/i);
+    const actionsSection = document.querySelector(
+      "section[aria-label='Actions']",
+    );
+    const navSection = document.querySelector(
+      "section[aria-label='Navigation']",
+    );
+    expect(actionsSection?.textContent).not.toMatch(/graph|yaml/i);
+    expect(navSection?.textContent).toMatch(/show graph/i);
+    expect(navSection?.textContent).toMatch(/show yaml/i);
   });
 
   it("places 'Alt+1-3 Switch catalog tab' in Navigation", () => {

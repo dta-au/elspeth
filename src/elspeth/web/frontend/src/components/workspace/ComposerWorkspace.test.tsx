@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSessionStore } from "@/stores/sessionStore";
 import { ComposerWorkspace } from "./ComposerWorkspace";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
+import { useCollapsedAuthoringStatus } from "./useCollapsedAuthoringStatus";
 import { WORKSPACE_LAYOUT_STORAGE_KEY } from "./useWorkspacePaneState";
 
 class ControllableResizeObserver implements ResizeObserver {
@@ -358,6 +359,42 @@ describe("ComposerWorkspace", () => {
         localStorage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY) ?? "null",
       ),
     ).toMatchObject({ authoringCollapsed: false });
+  });
+
+  it("renders an App-owned collapsed projection inside the pane provider and resets it on restore", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "session-1", messages: [] });
+
+    function ContextStatus() {
+      const { state } = useWorkspacePaneController();
+      const status = useCollapsedAuthoringStatus({
+        activeSessionId: "session-1",
+        authoringCollapsed: state.authoringCollapsed,
+      });
+      return <span data-tone={status.tone}>{status.text}</span>;
+    }
+
+    renderWorkspace({ collapsedStatus: <ContextStatus /> as never });
+    emitWidth(1280);
+    await user.click(
+      screen.getByRole("button", { name: "Collapse authoring pane" }),
+    );
+    act(() =>
+      useSessionStore.setState({
+        messages: [{ id: "message-1", role: "assistant" } as never],
+      }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent("1 new message");
+
+    await user.click(
+      screen.getByRole("button", { name: "Restore authoring pane" }),
+    );
+    await user.click(
+      screen.getByRole("button", { name: "Collapse authoring pane" }),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Authoring pane collapsed",
+    );
   });
 
   it.each([

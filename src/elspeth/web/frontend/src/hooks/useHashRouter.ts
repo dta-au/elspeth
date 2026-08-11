@@ -2,8 +2,10 @@
  * Hash-based router for session deep linking.
  *
  * Format: #/{sessionId}                 -> canonical
- *         #/{sessionId}/graph           -> open graph modal, then rewrite
- *         #/{sessionId}/yaml            -> open YAML modal, then rewrite
+ *         #/{sessionId}/graph           -> select Graph artifact, then rewrite
+ *         #/{sessionId}/spec            -> select Spec artifact, then rewrite
+ *         #/{sessionId}/yaml            -> select YAML artifact, then rewrite
+ *         #/{sessionId}/runs            -> select Run artifact, then rewrite
  *         #/{sessionId}/{anything-else} -> silently strip the verb
  *         #/shared/{token}              -> IGNORED — owned by useSharedToken
  *                                          (Phase 6B Task 8); the hook below
@@ -15,14 +17,14 @@
  * The fragment is an arrival action, not steady-state URL state.
  */
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
-import type { CompositionState } from "@/types/api";
+import type { ArtifactTab } from "@/components/workspace/workspaceTypes";
 
 interface HashState {
   sessionId: string | null;
@@ -34,9 +36,11 @@ interface RedirectToast {
   dismiss: () => void;
 }
 
-const ACTION_VERBS: Record<string, string> = {
-  graph: OPEN_GRAPH_MODAL_EVENT,
-  yaml: OPEN_YAML_MODAL_EVENT,
+const ACTION_VERBS: Record<string, ArtifactTab> = {
+  graph: "graph",
+  spec: "spec",
+  yaml: "yaml",
+  runs: "run",
 };
 
 /**
@@ -44,10 +48,7 @@ const ACTION_VERBS: Record<string, string> = {
  * When detected, a one-time dismissible toast is shown to the user.
  * All other unrecognized verbs are silently stripped (backward compat).
  */
-const RETIRED_VERBS: Record<string, string> = {
-  runs: "The Runs tab was removed in this update. Showing Graph instead.",
-  spec: "The Spec tab was removed in this update. Showing Graph instead.",
-};
+const RETIRED_VERBS: Record<string, string> = {};
 
 const TOAST_DISMISSED_KEY = "elspeth_redirect_toast_dismissed";
 
@@ -72,44 +73,6 @@ function buildCanonicalHash(sessionId: string | null): string {
   return sessionId ? `#/${sessionId}` : "";
 }
 
-/**
- * Dispatch the Export-YAML open event once `sessionId`'s composition state
- * is KNOWN, and only when the pipeline has content — the same
- * hasCompositionContent gate ExportYamlButton applies
- * (elspeth-bff8043d33 residual: the #/{id}/yaml deep link could open the
- * near-empty modal on a pipeline with nothing to export).
- *
- * The deferral matters: on a fresh #/{id}/yaml arrival, selectSession's
- * fetch is still in flight when the verb is parsed, so gating on the
- * instantaneous compositionState would break the deep link for every
- * non-empty pipeline. `compositionStateLoaded` disambiguates "still
- * fetching" from "loaded and empty"; the one-shot subscription resolves
- * when the fetch settles and aborts if the user switches sessions first.
- */
-function dispatchYamlWhenCompositionKnown(sessionId: string): void {
-  const dispatchIfContent = (state: {
-    compositionState: CompositionState | null;
-  }) => {
-    if (hasCompositionContent(state.compositionState)) {
-      window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
-    }
-  };
-  const snapshot = useSessionStore.getState();
-  if (snapshot.activeSessionId === sessionId && snapshot.compositionStateLoaded) {
-    queueMicrotask(() => dispatchIfContent(useSessionStore.getState()));
-    return;
-  }
-  const unsub = useSessionStore.subscribe((state) => {
-    if (state.activeSessionId !== sessionId) {
-      unsub();
-      return;
-    }
-    if (!state.compositionStateLoaded) return;
-    unsub();
-    dispatchIfContent(state);
-  });
-}
-
 interface UseHashRouterOptions {
   enabled?: boolean;
 }
@@ -120,6 +83,76 @@ export function useHashRouter(
   const enabled = options.enabled ?? true;
   const lastWrittenHash = useRef<string>("");
   const applying = useRef(false);
+  const pendingArtifactIntent = useRef<{
+    sessionId: string;
+    tab: "spec" | "yaml";
+  } | null>(null);
+  const pendingIntentUnsubscribe = useRef<(() => void) | null>(null);
+
+  const cancelPendingArtifactIntent = useCallback((): void => {
+    pendingArtifactIntent.current = null;
+    pendingIntentUnsubscribe.current?.();
+    pendingIntentUnsubscribe.current = null;
+  }, []);
+
+  const dispatchArtifactIntent = useCallback((
+    sessionId: string,
+    tab: ArtifactTab,
+  ): void => {
+    window.dispatchEvent(
+      new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
+        detail: { tab, focusMode: false, sessionId },
+      }),
+    );
+  }, []);
+
+  const requestArtifact = useCallback((sessionId: string, tab: ArtifactTab): void => {
+    cancelPendingArtifactIntent();
+    if (tab !== "spec" && tab !== "yaml") {
+      queueMicrotask(() => dispatchArtifactIntent(sessionId, tab));
+      return;
+    }
+
+    const dispatchIfAvailable = (): boolean => {
+      const state = useSessionStore.getState();
+      if (
+        state.activeSessionId !== sessionId ||
+        !state.compositionStateLoaded
+      ) {
+        return false;
+      }
+      if (hasCompositionContent(state.compositionState)) {
+        dispatchArtifactIntent(sessionId, tab);
+      }
+      return true;
+    };
+    if (dispatchIfAvailable()) return;
+
+    const intent = { sessionId, tab };
+    pendingArtifactIntent.current = intent;
+    pendingIntentUnsubscribe.current = useSessionStore.subscribe((state) => {
+      if (pendingArtifactIntent.current !== intent) return;
+      if (state.activeSessionId !== sessionId) {
+        cancelPendingArtifactIntent();
+        return;
+      }
+      if (!state.compositionStateLoaded) return;
+      pendingIntentUnsubscribe.current?.();
+      pendingIntentUnsubscribe.current = null;
+      queueMicrotask(() => {
+        if (pendingArtifactIntent.current !== intent) return;
+        const committedState = useSessionStore.getState();
+        cancelPendingArtifactIntent();
+        if (
+          committedState.activeSessionId === sessionId &&
+          committedState.compositionStateLoaded &&
+          hasCompositionContent(committedState.compositionState)
+        ) {
+          dispatchArtifactIntent(sessionId, tab);
+        }
+      });
+    });
+  }, [cancelPendingArtifactIntent, dispatchArtifactIntent]);
 
   // Read dismissal flag once at mount. Using a ref rather than reading
   // localStorage on every applyHash invocation avoids repeated storage reads.
@@ -132,7 +165,7 @@ export function useHashRouter(
     null,
   );
 
-  const applyHash = (state: HashState) => {
+  const applyHash = useCallback((state: HashState) => {
     // Phase 6B Task 8: when the live hash is a shared-inspect route the
     // session router is dormant — SharedInspectView owns the URL. Apply
     // is a no-op in that mode so the hash is preserved verbatim and the
@@ -159,12 +192,8 @@ export function useHashRouter(
       // `new CustomEvent(fn)` would coerce it to a garbage event name.
       // Object.prototype.hasOwnProperty.call() is the ES2020-compatible guard.
       const hasOwn = Object.prototype.hasOwnProperty;
-      if (verb === "yaml" && sessionId) {
-        // Export YAML is content-gated; see dispatchYamlWhenCompositionKnown.
-        dispatchYamlWhenCompositionKnown(sessionId);
-      } else if (verb && hasOwn.call(ACTION_VERBS, verb)) {
-        const eventName = ACTION_VERBS[verb];
-        queueMicrotask(() => window.dispatchEvent(new CustomEvent(eventName)));
+      if (verb && sessionId && hasOwn.call(ACTION_VERBS, verb)) {
+        requestArtifact(sessionId, ACTION_VERBS[verb]);
       }
 
       // Fix C: retired-verb redirect toast. Only "runs" and "spec" trigger
@@ -196,7 +225,7 @@ export function useHashRouter(
       // subscription (useEffect #3) becomes a no-op until page reload.
       applying.current = false;
     }
-  };
+  }, [requestArtifact]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -216,7 +245,14 @@ export function useHashRouter(
         );
       }
     }
-  }, [enabled]);
+  }, [applyHash, enabled]);
+
+  useEffect(
+    () => () => {
+      cancelPendingArtifactIntent();
+    },
+    [cancelPendingArtifactIntent],
+  );
 
   useEffect(() => {
     if (!enabled) return;
@@ -233,7 +269,7 @@ export function useHashRouter(
       window.removeEventListener("popstate", handleHashChange);
       window.removeEventListener("hashchange", handleHashChange);
     };
-  }, [enabled]);
+  }, [applyHash, enabled]);
 
   useEffect(() => {
     if (!enabled) return;

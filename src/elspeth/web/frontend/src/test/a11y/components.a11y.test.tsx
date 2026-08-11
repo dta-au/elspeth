@@ -42,9 +42,7 @@ const AUDITED_COMPONENTS = [
   "AppHeader",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
-  "SideRail",
   "GraphMiniView",
-  "ExportYamlModal",
   "InlineSourceCreatedTurn",
   "InlineSourceDisambiguationTurn",
   "InlineSourceFallbackPrompt",
@@ -103,7 +101,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ConfirmDialog",
   "DefaultModeChangedBanner",
   "ExplainDialog",
-  "ExportYamlModal",
   "FilterChipStrip",
   "GraphMiniView",
   "GraphModal",
@@ -125,7 +122,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "RecoveryPanel",
   "RunsHistoryDrawer",
   "SchemaFormTurn",
-  "SideRail",
   "ShortcutsHelp",
   "FreeformIntroduction",
   "TutorialGuidedShell",
@@ -274,10 +270,7 @@ import { ExplainDialog } from "@/components/audit/ExplainDialog";
 import { AppHeader } from "@/components/common/AppHeader";
 import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitcher";
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
-import { SideRail } from "@/components/sidebar/SideRail";
 import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
-import { ExportYamlModal } from "@/components/sidebar/ExportYamlModal";
-import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { InlineSourceCreatedTurn } from "@/components/chat/InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "@/components/chat/InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "@/components/chat/InlineSourceFallbackPrompt";
@@ -685,21 +678,6 @@ describe("HeaderVersionSelector", () => {
   });
 });
 
-describe("SideRail", () => {
-  it("has no axe violations", async () => {
-    const { container } = render(
-      <SideRail
-        auditReadinessSlot={<div>readiness</div>}
-        validationBannerSlot={<div>banner</div>}
-        graphMiniSlot={<div>mini</div>}
-        catalogSlot={<div>catalog</div>}
-        completionBarSlot={<div>completion</div>}
-      />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
 describe("GraphMiniView", () => {
   it("has no axe violations", async () => {
     const { container } = render(<GraphMiniView />);
@@ -711,16 +689,6 @@ describe("GraphMiniView", () => {
     expect(
       screen.getByRole("button", { name: /pipeline graph/i }),
     ).toBeInTheDocument();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("ExportYamlModal", () => {
-  it("has no axe violations", async () => {
-    const { container, rerender } = render(<ExportYamlModal />);
-    // Modal only renders when the open event fires.
-    window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
-    rerender(<ExportYamlModal />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1655,9 +1623,8 @@ describe("GraphModal", () => {
       compositionProposals: [],
     } as never);
     const { container } = render(<GraphModal />);
-    // Modal only renders once the open event fires (the ExportYamlModal
-    // idiom above, with the dispatch act()-wrapped so the listener's
-    // setState commits before the assertion).
+    // The dispatch is act()-wrapped so the listener's setState commits before
+    // the assertion.
     act(() => {
       window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
     });

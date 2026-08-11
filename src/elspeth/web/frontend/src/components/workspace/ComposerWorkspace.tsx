@@ -26,10 +26,23 @@ export interface ComposerWorkspaceProps {
   inspector: ReactNode;
   actionBar: ReactNode;
   authoringStatus?: ReactNode;
-  collapsedStatus?: {
+  collapsedStatus?: ReactNode | {
     text: string;
     tone: "neutral" | "busy" | "error";
   };
+}
+
+function isCollapsedStatusProjection(
+  value: ComposerWorkspaceProps["collapsedStatus"],
+): value is { text: string; tone: "neutral" | "busy" | "error" } {
+  if (typeof value !== "object" || value === null) return false;
+  const projection = value as { text?: unknown; tone?: unknown };
+  return (
+    typeof projection.text === "string" &&
+    (projection.tone === "neutral" ||
+      projection.tone === "busy" ||
+      projection.tone === "error")
+  );
 }
 
 function layoutMode(workspaceWidth: number):
@@ -85,6 +98,12 @@ export function ComposerWorkspace({
   const artifactViewHidden = narrow && narrowView === "compose";
   const authoringHidden = paneState.authoringCollapsed || authoringViewHidden;
   const previousNarrowRef = useRef(narrow);
+  const projectedCollapsedStatus = isCollapsedStatusProjection(collapsedStatus)
+    ? collapsedStatus
+    : null;
+  const collapsedStatusContent: ReactNode = projectedCollapsedStatus
+    ? projectedCollapsedStatus.text
+    : (collapsedStatus as ReactNode);
 
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -274,10 +293,10 @@ export function ComposerWorkspace({
           {paneState.authoringCollapsed && (
             <div
               className="workspace-collapsed-affordance"
-              data-tone={collapsedStatus.tone}
+              data-tone={projectedCollapsedStatus?.tone}
             >
               <div id="workspace-collapsed-status" role="status">
-                {collapsedStatus.text}
+                {collapsedStatusContent}
               </div>
               <button
                 ref={restoreControlRef}

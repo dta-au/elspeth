@@ -19,9 +19,9 @@ import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { fuzzyMatch } from "@/utils/fuzzyScore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
-  OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -149,13 +149,26 @@ export function CommandPalette({
     }
 
     cmds.push({
-      id: "open-graph-modal",
-      title: "Open graph view",
+      id: "show-graph",
+      title: "Show Graph",
       category: "navigation",
       shortcut: "Ctrl+Shift+G",
       action: () => {
-        window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
         onClose();
+        queueMicrotask(() => {
+          window.dispatchEvent(
+            new CustomEvent<RequestArtifactViewDetail>(
+              REQUEST_ARTIFACT_VIEW_EVENT,
+              {
+                detail: {
+                  tab: "graph",
+                  focusMode: false,
+                  sessionId: activeSessionId,
+                },
+              },
+            ),
+          );
+        });
       },
     });
 
@@ -169,8 +182,21 @@ export function CommandPalette({
       // path into the near-empty modal (elspeth-bff8043d33 residual).
       enabled: hasCompositionContent(compositionState),
       action: () => {
-        window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
         onClose();
+        queueMicrotask(() => {
+          window.dispatchEvent(
+            new CustomEvent<RequestArtifactViewDetail>(
+              REQUEST_ARTIFACT_VIEW_EVENT,
+              {
+                detail: {
+                  tab: "yaml",
+                  focusMode: false,
+                  sessionId: activeSessionId,
+                },
+              },
+            ),
+          );
+        });
       },
     });
 

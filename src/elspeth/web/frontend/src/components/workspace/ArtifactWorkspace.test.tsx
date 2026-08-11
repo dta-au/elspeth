@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import {
   act,
   fireEvent,
@@ -151,6 +154,26 @@ describe("ArtifactWorkspace", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+  });
+
+  it("fills the artifact body with one active-panel scroll owner", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.artifact-workspace\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;[^}]*height:\s*100%;[^}]*min-height:\s*0;[^}]*overflow:\s*hidden;/s,
+    );
+    expect(css).toMatch(
+      /\.artifact-workspace-toolbar\s*\{[^}]*flex:\s*0 0 auto;/s,
+    );
+    expect(css).toMatch(
+      /\.artifact-workspace-panel\s*\{[^}]*flex:\s*1 1 auto;[^}]*min-height:\s*0;[^}]*overflow:\s*auto;/s,
+    );
+    expect(css).toMatch(
+      /\.artifact-workspace-panel\[hidden\]\s*\{[^}]*display:\s*none;/s,
+    );
   });
 
   it("starts on Graph with one complete named tab relationship and the real empty state", () => {
@@ -903,7 +926,7 @@ describe("ArtifactWorkspace", () => {
     consoleError.mockRestore();
   });
 
-  it("unmounts Run polling on session switch", async () => {
+  it("owns one Run polling stream only while Run is active", async () => {
     vi.useFakeTimers();
     const loadRuns = vi.fn().mockResolvedValue("loaded");
     useExecutionStore.setState({
@@ -919,6 +942,14 @@ describe("ArtifactWorkspace", () => {
     act(() => vi.advanceTimersByTime(3000));
     expect(loadRuns).toHaveBeenCalledTimes(2);
 
+    fireEvent.click(screen.getByRole("tab", { name: "Graph" }));
+    act(() => vi.advanceTimersByTime(6000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Run" }));
+    await act(async () => Promise.resolve());
+    expect(loadRuns).toHaveBeenCalledTimes(3);
+
     act(() => {
       useSessionStore.setState({
         activeSessionId: "session-2",
@@ -933,6 +964,6 @@ describe("ArtifactWorkspace", () => {
       "true",
     );
     act(() => vi.advanceTimersByTime(6000));
-    expect(loadRuns).toHaveBeenCalledTimes(2);
+    expect(loadRuns).toHaveBeenCalledTimes(3);
   });
 });

@@ -30,7 +30,6 @@ import { ModelChip } from "./ModelChip";
 import { ChatInput, uploadedBlobPromptSentence } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
-import { InlineRunResults } from "@/components/execution/InlineRunResults";
 import { CompletionSummary } from "./guided/CompletionSummary";
 import { ModeSwitchButton } from "./guided/ModeSwitchButton";
 import { PendingProposalsBanner } from "./PendingProposalsBanner";
@@ -2123,7 +2122,6 @@ export function ChatPanel({
         />
         {isTutorial && <PipelineValidationSummary isTutorial />}
         <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
-        <InlineRunResults />
       </div>
     );
   }
@@ -2656,7 +2654,6 @@ export function ChatPanel({
                   tabIndex={0}
                 >
                   {transcript}
-                  <InlineRunResults />
                   {ackStack}
                   {/* The decision rides LAST in the scroll region — the
                       action zone between the reply and the composer. */}
@@ -3038,8 +3035,6 @@ export function ChatPanel({
 
       {/* Blob manager drawer */}
       {showBlobManager && <BlobManager onUseAsInput={handleUseAsInput} />}
-
-      <InlineRunResults />
 
       {/* Pending-proposal banner — surfaces composer proposals that need
           operator approval, co-located with the input so the user does not

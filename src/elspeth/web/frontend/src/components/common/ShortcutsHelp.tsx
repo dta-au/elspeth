@@ -19,7 +19,7 @@ interface ShortcutGroup {
 // / Reference) layout from Phase 7B. Distribution rationale:
 //
 //   Actions    — things that change state (new session, run, validate).
-//   Navigation — things that move focus or switch view (palette, chat, catalog tabs).
+//   Navigation — things that move focus or switch view (palette, chat, artifacts, catalog tabs).
 //   Reference  — things that surface static information (catalog, this dialog).
 //   Editing    — modal-management gestures (Escape).
 //
@@ -38,8 +38,6 @@ const GROUPS: ShortcutGroup[] = [
       { keys: "Ctrl+N", action: "New session" },
       { keys: "Ctrl+E", action: "Run pipeline" },
       { keys: "Ctrl+Shift+V", action: "Validate pipeline" },
-      { keys: "Ctrl/Cmd+Shift+G", action: "Open graph view" },
-      { keys: "Ctrl/Cmd+Shift+Y", action: "Export YAML" },
     ],
   },
   {
@@ -47,6 +45,8 @@ const GROUPS: ShortcutGroup[] = [
     items: [
       { keys: "Ctrl+K", action: "Command palette" },
       { keys: "Ctrl+/", action: "Focus chat input" },
+      { keys: "Ctrl/Cmd+Shift+G", action: "Show Graph" },
+      { keys: "Ctrl/Cmd+Shift+Y", action: "Show YAML" },
       { keys: "Alt+1-3", action: "Switch catalog tab (Sources / Transforms / Sinks)" },
     ],
   },

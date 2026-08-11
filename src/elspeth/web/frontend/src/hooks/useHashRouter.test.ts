@@ -1,11 +1,9 @@
-import { act, fireEvent, render, renderHook, screen } from "@testing-library/react";
-import { createElement } from "react";
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { GraphModal } from "@/components/sidebar/GraphModal";
 import {
-  OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { resetStore } from "@/test/store-helpers";
 import * as apiClient from "@/api/client";
@@ -22,10 +20,6 @@ vi.mock("@/api/client", async (importOriginal) => {
     fetchMessages: vi.fn(),
   };
 });
-
-vi.mock("@/components/inspector/GraphView", () => ({
-  GraphView: () => createElement("div", { "data-testid": "graph-view-stub" }),
-}));
 
 /** Minimal composition with content (one source) — export is meaningful. */
 function nonEmptyCompositionState() {
@@ -77,22 +71,30 @@ describe("useHashRouter Phase 3B fragment migration", () => {
     expect(window.location.hash).toBe("#/sess-1");
   });
 
-  it("opens the graph modal event and rewrites #/{id}/graph", async () => {
-    const handler = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+  it("requests Graph and rewrites #/{id}/graph", async () => {
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
     window.history.replaceState(null, "", "#/sess-1/graph");
 
     renderHook(() => useHashRouter());
     await act(async () => {});
 
-    expect(handler).toHaveBeenCalled();
+    expect(requests).toEqual([
+      { tab: "graph", focusMode: false, sessionId: "sess-1" },
+    ]);
     expect(window.location.hash).toBe("#/sess-1");
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 
-  it("opens the yaml modal event and rewrites #/{id}/yaml when the pipeline has content", async () => {
-    const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
+  it("requests YAML and rewrites #/{id}/yaml when the pipeline has content", async () => {
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
     window.history.replaceState(null, "", "#/sess-1/yaml");
     // Session already active with a KNOWN, non-empty composition — the
     // yaml verb is content-gated (elspeth-bff8043d33 residual).
@@ -105,14 +107,16 @@ describe("useHashRouter Phase 3B fragment migration", () => {
     renderHook(() => useHashRouter());
     await act(async () => {});
 
-    expect(handler).toHaveBeenCalled();
+    expect(requests).toEqual([
+      { tab: "yaml", focusMode: false, sessionId: "sess-1" },
+    ]);
     expect(window.location.hash).toBe("#/sess-1");
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 
-  it("does NOT open the yaml modal for #/{id}/yaml on an empty pipeline", async () => {
+  it("does NOT request YAML for #/{id}/yaml on an empty pipeline", async () => {
     const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
     window.history.replaceState(null, "", "#/sess-1/yaml");
     useSessionStore.setState({
       activeSessionId: "sess-1",
@@ -124,37 +128,9 @@ describe("useHashRouter Phase 3B fragment migration", () => {
     await act(async () => {});
 
     expect(handler).not.toHaveBeenCalled();
-    // The hash is still canonicalised — only the modal open is withheld.
+    // The hash is still canonicalised — only artifact selection is withheld.
     expect(window.location.hash).toBe("#/sess-1");
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
-  });
-
-  it("defers the yaml modal until the composition state loads, then gates on content", async () => {
-    const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
-    window.history.replaceState(null, "", "#/sess-1/yaml");
-    // Fresh deep-link arrival: selectSession's fetch is still in flight, so
-    // the composition is not yet known.
-    useSessionStore.setState({
-      activeSessionId: "sess-1",
-      compositionStateLoaded: false,
-      compositionState: null,
-    } as never);
-
-    renderHook(() => useHashRouter());
-    await act(async () => {});
-    expect(handler).not.toHaveBeenCalled();
-
-    // The fetch settles with content — the deferred dispatch fires.
-    await act(async () => {
-      useSessionStore.setState({
-        compositionStateLoaded: true,
-        compositionState: nonEmptyCompositionState(),
-      } as never);
-    });
-
-    expect(handler).toHaveBeenCalledTimes(1);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 
   it("strips any unrecognized verb", () => {
@@ -165,25 +141,9 @@ describe("useHashRouter Phase 3B fragment migration", () => {
     expect(window.location.hash).toBe("#/sess-1");
   });
 
-  it("cold-loads the graph modal when the graph hash exists before mount", async () => {
-    window.history.replaceState(null, "", "#/sess-1/graph");
-
-    function HarnessTree() {
-      useHashRouter();
-      return createElement(GraphModal);
-    }
-
-    render(createElement(HarnessTree));
-    await act(async () => {});
-
-    expect(
-      screen.getByRole("dialog", { name: /pipeline graph/i }),
-    ).toBeInTheDocument();
-  });
-
   it("defers cold-load graph actions until enabled", async () => {
     const handler = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
     window.history.replaceState(null, "", "#/sess-1/graph");
 
     const { rerender } = renderHook(
@@ -200,19 +160,182 @@ describe("useHashRouter Phase 3B fragment migration", () => {
 
     expect(handler).toHaveBeenCalled();
     expect(window.location.hash).toBe("#/sess-1");
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+  });
+});
+
+describe("useHashRouter persistent artifact intents", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    window.history.replaceState(null, "", window.location.pathname);
+    useSessionStore.setState({
+      sessions: [
+        { id: "sess-1", title: "Session 1" } as never,
+        { id: "sess-2", title: "Session 2" } as never,
+      ],
+      activeSessionId: "sess-1",
+      compositionStateLoaded: true,
+      compositionState: nonEmptyCompositionState(),
+      selectSession: vi.fn(),
+    } as never);
+  });
+
+  it.each([
+    ["graph", "graph"],
+    ["spec", "spec"],
+    ["yaml", "yaml"],
+    ["runs", "run"],
+  ] as const)("routes /%s to the matching artifact tab", async (verb, tab) => {
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    window.history.replaceState(null, "", `#/sess-1/${verb}`);
+
+    renderHook(() => useHashRouter());
+    await act(async () => {});
+
+    expect(requests).toEqual([
+      { tab, focusMode: false, sessionId: "sess-1" },
+    ]);
+    expect(window.location.hash).toBe("#/sess-1");
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+  });
+
+  it.each(["spec", "yaml"] as const)(
+    "retains one /%s intent until the matching session content loads",
+    async (tab) => {
+      const requests: RequestArtifactViewDetail[] = [];
+      const handler = (event: Event) => {
+        requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+      };
+      window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+      useSessionStore.setState({
+        compositionStateLoaded: false,
+        compositionState: null,
+      } as never);
+      window.history.replaceState(null, "", `#/sess-1/${tab}`);
+
+      renderHook(() => useHashRouter());
+      await act(async () => {});
+      expect(requests).toEqual([]);
+      expect(window.location.hash).toBe("#/sess-1");
+
+      await act(async () => {
+        useSessionStore.setState({
+          compositionStateLoaded: true,
+          compositionState: nonEmptyCompositionState(),
+        } as never);
+      });
+      expect(requests).toEqual([
+        { tab, focusMode: false, sessionId: "sess-1" },
+      ]);
+      window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    },
+  );
+
+  it("fulfills a loaded-content intent after the store notification completes", async () => {
+    const deliveryPhases: string[] = [];
+    let phase = "idle";
+    const handler = () => deliveryPhases.push(phase);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: null,
+    } as never);
+    window.history.replaceState(null, "", "#/sess-1/yaml");
+    renderHook(() => useHashRouter());
+
+    phase = "notifying";
+    act(() => {
+      useSessionStore.setState({
+        compositionStateLoaded: true,
+        compositionState: nonEmptyCompositionState(),
+      } as never);
+    });
+    phase = "committed";
+
+    expect(deliveryPhases).toEqual([]);
+    await act(async () => Promise.resolve());
+    expect(deliveryPhases).toEqual(["committed"]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+  });
+
+  it("supersedes a pending Spec intent with a newer Graph intent", async () => {
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: null,
+    } as never);
+    window.history.replaceState(null, "", "#/sess-1/spec");
+    renderHook(() => useHashRouter());
+
+    await act(async () => {
+      window.history.replaceState(null, "", "#/sess-1/graph");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      useSessionStore.setState({
+        compositionStateLoaded: true,
+        compositionState: nonEmptyCompositionState(),
+      } as never);
+    });
+
+    expect(requests).toEqual([
+      { tab: "graph", focusMode: false, sessionId: "sess-1" },
+    ]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+  });
+
+  it("discards a pending intent when navigation selects another session", async () => {
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: null,
+      selectSession: vi.fn((sessionId: string) => {
+        useSessionStore.setState({ activeSessionId: sessionId });
+        return Promise.resolve();
+      }),
+    } as never);
+    window.history.replaceState(null, "", "#/sess-1/spec");
+    renderHook(() => useHashRouter());
+
+    await act(async () => {
+      window.history.replaceState(null, "", "#/sess-2/graph");
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      useSessionStore.setState({
+        activeSessionId: "sess-1",
+        compositionStateLoaded: true,
+        compositionState: nonEmptyCompositionState(),
+      } as never);
+    });
+
+    expect(requests).toEqual([
+      { tab: "graph", focusMode: false, sessionId: "sess-2" },
+    ]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 });
 
 describe("useHashRouter — Batch 2 fixes", () => {
-  const TOAST_KEY = "elspeth_redirect_toast_dismissed";
-
   beforeEach(() => {
     resetStore(useSessionStore);
     vi.mocked(apiClient.fetchComposerProgress).mockReset();
     vi.mocked(apiClient.fetchMessages).mockReset();
     window.history.replaceState(null, "", window.location.pathname);
-    localStorage.removeItem(TOAST_KEY);
     useSessionStore.setState({
       sessions: [{ id: "sess-1", title: "Session 1" } as never],
       activeSessionId: null,
@@ -263,50 +386,16 @@ describe("useHashRouter — Batch 2 fixes", () => {
     expect(window.location.hash).toBe("#/sess-1");
   });
 
-  // ── Fix C: retired-verb redirect toast ─────────────────────────────────
+  it.each(["runs", "spec"])(
+    "does not show a retired-view toast for restored /%s navigation",
+    (verb) => {
+      window.history.replaceState(null, "", `#/sess-1/${verb}`);
 
-  it("shows redirect toast on first visit to #/{id}/runs", () => {
-    window.history.replaceState(null, "", "#/sess-1/runs");
+      const { result } = renderHook(() => useHashRouter());
 
-    const { result } = renderHook(() => useHashRouter());
-
-    expect(result.current.redirectToast).not.toBeNull();
-    expect(result.current.redirectToast?.message).toMatch(/Runs tab was removed/i);
-  });
-
-  it("shows redirect toast on first visit to #/{id}/spec", () => {
-    window.history.replaceState(null, "", "#/sess-1/spec");
-
-    const { result } = renderHook(() => useHashRouter());
-
-    expect(result.current.redirectToast).not.toBeNull();
-    expect(result.current.redirectToast?.message).toMatch(/Spec tab was removed/i);
-  });
-
-  it("dismiss clears toast state and writes localStorage flag", async () => {
-    window.history.replaceState(null, "", "#/sess-1/runs");
-
-    const { result } = renderHook(() => useHashRouter());
-    expect(result.current.redirectToast).not.toBeNull();
-
-    await act(async () => {
-      result.current.redirectToast!.dismiss();
-    });
-
-    expect(result.current.redirectToast).toBeNull();
-    expect(localStorage.getItem(TOAST_KEY)).toBe("1");
-  });
-
-  it("does not show toast after dismiss flag is set in localStorage (cross-path)", () => {
-    // Simulate: user dismissed on /runs, now arrives at /spec in a fresh hook
-    localStorage.setItem(TOAST_KEY, "1");
-
-    window.history.replaceState(null, "", "#/sess-1/spec");
-
-    const { result } = renderHook(() => useHashRouter());
-
-    expect(result.current.redirectToast).toBeNull();
-  });
+      expect(result.current.redirectToast).toBeNull();
+    },
+  );
 
   it("unrecognized non-retired verb does NOT show a toast", () => {
     // "nonsense" is not a retired verb — it is silently stripped with no toast
@@ -315,41 +404,6 @@ describe("useHashRouter — Batch 2 fixes", () => {
     const { result } = renderHook(() => useHashRouter());
 
     expect(result.current.redirectToast).toBeNull();
-  });
-
-  // ── Fix C: redirect toast renders in the DOM via App integration ────────
-
-  it("redirect toast banner renders above the alert region when visiting #/{id}/runs", async () => {
-    window.history.replaceState(null, "", "#/sess-1/runs");
-
-    // Render a minimal harness that surfaces the toast DOM
-    function ToastHarness() {
-      const { redirectToast } = useHashRouter();
-      if (!redirectToast) return null;
-      return createElement(
-        "div",
-        { role: "alert", "data-testid": "toast-banner" },
-        createElement("span", null, redirectToast.message),
-        createElement(
-          "button",
-          { type: "button", onClick: redirectToast.dismiss, "aria-label": "Dismiss" },
-          "Dismiss",
-        ),
-      );
-    }
-
-    render(createElement(ToastHarness));
-
-    const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent(/Runs tab was removed/i);
-
-    // Dismiss via the button
-    fireEvent.click(screen.getByRole("button", { name: /Dismiss/i }));
-
-    await act(async () => {});
-
-    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    expect(localStorage.getItem(TOAST_KEY)).toBe("1");
   });
 
   // ── Fix B: try/finally guard on applying.current ────────────────────────
@@ -438,12 +492,12 @@ describe("useHashRouter — Batch 2 fixes", () => {
 
   // ── popstate triggers reapply ────────────────────────────────────────────
 
-  it("popstate event triggers graph modal dispatch when hash is #/{id}/graph", async () => {
+  it("popstate requests Graph when hash is #/{id}/graph", async () => {
     window.history.replaceState(null, "", "#/sess-1");
     renderHook(() => useHashRouter());
 
     const handler = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
 
     await act(async () => {
       // Simulate navigating back to a graph URL via popstate
@@ -454,7 +508,11 @@ describe("useHashRouter — Batch 2 fixes", () => {
     });
 
     expect(handler).toHaveBeenCalled();
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    expect(
+      (handler.mock.calls[0]?.[0] as CustomEvent<RequestArtifactViewDetail>)
+        .detail,
+    ).toEqual({ tab: "graph", focusMode: false, sessionId: "sess-1" });
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 
   it("popstate to an empty hash clears the active session", async () => {
@@ -631,7 +689,7 @@ describe("useHashRouter — Batch 2 fixes", () => {
 
   // ── Two rapid hashchanges ────────────────────────────────────────────────
 
-  it("two rapid hashchanges both fire their respective modal events in order", async () => {
+  it("two rapid hashchanges request both persistent artifacts", async () => {
     window.history.replaceState(null, "", "#/sess-1");
     // The yaml verb is content-gated: give the active session a KNOWN,
     // non-empty composition so its dispatch fires (elspeth-bff8043d33).
@@ -642,10 +700,11 @@ describe("useHashRouter — Batch 2 fixes", () => {
     } as never);
     renderHook(() => useHashRouter());
 
-    const graphHandler = vi.fn();
-    const yamlHandler = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, graphHandler);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, yamlHandler);
+    const requests: RequestArtifactViewDetail[] = [];
+    const handler = (event: Event) => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
 
     await act(async () => {
       // Fire two hashchanges synchronously; both handlers are queued as microtasks
@@ -658,12 +717,14 @@ describe("useHashRouter — Batch 2 fixes", () => {
       await Promise.resolve();
     });
 
-    // Both events should have fired (each hashchange triggers its own applyHash
-    // which queues its own microtask; the hook processes each event independently)
-    expect(graphHandler).toHaveBeenCalled();
-    expect(yamlHandler).toHaveBeenCalled();
+    expect(requests).toEqual(
+      expect.arrayContaining([
+        { tab: "graph", focusMode: false, sessionId: "sess-1" },
+        { tab: "yaml", focusMode: false, sessionId: "sess-1" },
+      ]),
+    );
+    expect(requests).toHaveLength(2);
 
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, graphHandler);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, yamlHandler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 });

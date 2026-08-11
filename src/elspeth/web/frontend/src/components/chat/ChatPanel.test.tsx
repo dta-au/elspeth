@@ -268,10 +268,6 @@ vi.mock("@/components/blobs/BlobManager", () => ({
   BlobManager: () => <div data-testid="blob-manager" />,
 }));
 
-vi.mock("@/components/execution/InlineRunResults", () => ({
-  InlineRunResults: () => <div data-testid="inline-run-results" />,
-}));
-
 describe("ChatPanel", () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -285,6 +281,17 @@ describe("ChatPanel", () => {
       compositionState: null,
       error: null,
     });
+  });
+
+  it("does not mount run results in the freeform authoring pane", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
   });
 
   it("passes backend composer progress to the composing indicator", () => {
@@ -1775,7 +1782,7 @@ describe("ChatPanel mode discriminator", () => {
     // "docks ... BELOW the decision" test above. This test asserts presence
     // only; per-step placeholder + onSend wiring are exercised below.
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
-    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
   });
 
   it("shows the composer model chip in the GUIDED chat header too (elspeth-e9f7678de8)", async () => {
@@ -4545,7 +4552,7 @@ assistant_message_kind: "synthetic_failure",
 
     // Freeform surface suppressed.
     expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
-    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
   });
 
   it("renders pending interpretation Accept cards on the completed surface", () => {
