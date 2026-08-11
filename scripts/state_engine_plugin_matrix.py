@@ -11,6 +11,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
+from elspeth.contracts.plugin_capabilities import WebConfigAuthority
+from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.plugins.infrastructure.azure_auth import AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
@@ -20,6 +22,7 @@ from elspeth.plugins.infrastructure.clients.retrieval.azure_search import (
 )
 from elspeth.plugins.infrastructure.clients.retrieval.chroma import ChromaSearchProviderConfig
 from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSinkConfig
@@ -35,9 +38,14 @@ from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.plugins.transforms.rag.config import RAGRetrievalConfig, RetrievalProviderName
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 UNCLASSIFIED = "UNCLASSIFIED"
 EXPECTED_COUNTS = {"source": 9, "transform": 33, "sink": 9}
 EXPECTED_VARIANT_COUNT = 72
+ALLOWED_PB_BOUNDARIES = frozenset({"PB-01", "PB-02", "PB-04", "PB-06", "PB-07", "PB-09"})
+ALLOWED_LOCAL_FIXTURES = frozenset({"hermetic", "provider-contract-fake", "real-process-http"})
+ALLOWED_RELEASE_LANES = frozenset({"local", "live-aws", "live-azure", "live-chroma", "live-dataverse", "live-provider"})
+_SECRET_VALIDATION_SENTINEL = "elspeth-state-engine-matrix-secret-placeholder"
 MECHANICAL_FIELDS = (
     "plugin_key",
     "kind",
@@ -246,78 +254,156 @@ def _textract_auth(mode: str) -> dict[str, object]:
     raise ValueError(f"unsupported Textract auth mode {mode!r}")
 
 
-def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> None:
+def _find_declaring_plugin_nodes(value: object, *, plugin_name: str) -> list[Mapping[str, Any]]:
+    nodes: list[Mapping[str, Any]] = []
+    if isinstance(value, Mapping):
+        if value.get("plugin") == plugin_name:
+            nodes.append(cast("Mapping[str, Any]", value))
+        for child in value.values():
+            nodes.extend(_find_declaring_plugin_nodes(child, plugin_name=plugin_name))
+    elif isinstance(value, list):
+        for child in value:
+            nodes.extend(_find_declaring_plugin_nodes(child, plugin_name=plugin_name))
+    return nodes
+
+
+def _replace_secret_refs_for_validation(value: object) -> object:
+    if isinstance(value, Mapping):
+        if set(value) == {"secret_ref"} and isinstance(value["secret_ref"], str) and value["secret_ref"].strip():
+            return _SECRET_VALIDATION_SENTINEL
+        return {key: _replace_secret_refs_for_validation(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_replace_secret_refs_for_validation(child) for child in value]
+    return value
+
+
+def _live_plugin_types_by_key() -> dict[str, PluginType]:
+    discovered = discover_all_plugins()
+    plugin_types: dict[str, PluginType] = {}
+    for discovery_kind, kind in (("sources", "source"), ("transforms", "transform"), ("sinks", "sink")):
+        for discovered_type in discovered[discovery_kind]:
+            plugin_type = cast("PluginType", discovered_type)
+            key = f"{kind}:{plugin_type.name}"
+            if key in plugin_types:
+                raise ValueError(f"live plugin discovery contains duplicate plugin key {key!r}")
+            plugin_types[key] = plugin_type
+    if len(plugin_types) != sum(EXPECTED_COUNTS.values()):
+        raise ValueError(f"expected 51 plugins, discovered {len(plugin_types)}")
+    return plugin_types
+
+
+def _validate_default_config(plugin_key: str, plugin_type: PluginType) -> None:
+    example = plugin_type.example_use
+    if not isinstance(example, str) or not example.strip():
+        raise ValueError(f"{plugin_key} example_use must be a nonblank YAML fragment")
+    parsed = load_bounded_pipeline_yaml(example)
+    declaring_nodes = _find_declaring_plugin_nodes(parsed, plugin_name=plugin_type.name)
+    if len(declaring_nodes) != 1:
+        raise ValueError(f"{plugin_key} example_use must declare plugin {plugin_type.name!r} exactly once; found {len(declaring_nodes)}")
+    options = declaring_nodes[0].get("options", {})
+    if not isinstance(options, Mapping):
+        raise ValueError(f"{plugin_key} example_use options must be a mapping")
+    if plugin_type.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED and "profile" in options:
+        if issubclass(plugin_type, BaseTransform):
+            resolved: object = plugin_type.probe_config()
+        elif issubclass(plugin_type, BaseSink):
+            resolved = plugin_type.probe_config()
+        else:
+            raise ValueError(f"{plugin_key} has a profiled example but no production probe seam")
+    else:
+        resolved = _replace_secret_refs_for_validation(options)
+    if not isinstance(resolved, dict):
+        raise ValueError(f"{plugin_key} resolved example options must be a dictionary")
+    config_model = plugin_type.get_config_model(resolved)
+    if config_model is None:
+        if resolved:
+            raise ValueError(f"{plugin_key} supplies example options but has no config model")
+        plugin_type(resolved)
+        return
+    config_model.from_dict(resolved, plugin_name=plugin_type.name)
+
+
+def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> set[tuple[str, str]]:
+    validated_subjects: set[tuple[str, str]] = set()
     schema = {"mode": "observed"}
-    for mode in variants["source:azure_blob"]:
-        AzureBlobSourceConfig.from_dict(
-            {
-                **_azure_auth_fields(mode),
-                "container": "matrix-container",
-                "blob_path": "input.jsonl",
-                "format": "jsonl",
-                "schema": schema,
-                "on_validation_failure": "discard",
-            }
-        )
-    for mode in variants["sink:azure_blob"]:
-        AzureBlobSinkConfig.from_dict(
-            {
-                **_azure_auth_fields(mode),
-                "container": "matrix-container",
-                "blob_path": "output.jsonl",
-                "format": "jsonl",
-                "schema": schema,
-            }
-        )
-    for provider, config_model in LLMSource.discriminated_variants()[1].items():
-        config_model.model_validate(_llm_config(provider, source=True))
-    for provider, config_model in LLMTransform.discriminated_variants()[1].items():
-        config_model.model_validate(_llm_config(provider, source=False))
-    for mode in variants["source:dataverse"]:
-        DataverseSourceConfig.from_dict(
-            {
-                "environment_url": "https://matrix.crm.dynamics.com",
-                "auth": _dataverse_auth(mode),
-                "entity": "contacts",
-                "schema": schema,
-                "on_validation_failure": "discard",
-            }
-        )
-    for mode in variants["sink:dataverse"]:
-        DataverseSinkConfig.from_dict(
-            {
-                "environment_url": "https://matrix.crm.dynamics.com",
-                "auth": _dataverse_auth(mode),
-                "entity": "contacts",
-                "field_mapping": {"id": "contactid"},
-                "alternate_key": "contactid",
-                "schema": schema,
-            }
-        )
-    for mode in variants["transform:aws_textract_document_analysis"]:
-        AWSTextractDocumentAnalysisConfig.from_dict(
-            {
-                **_textract_auth(mode),
-                "region": "us-east-1",
-                "bucket": "matrix-bucket",
-                "key_field": "object_key",
-                "feature_types": ["TABLES"],
-                "text_field": "text",
-                "schema": schema,
-            }
-        )
-    for mode in variants["transform:aws_textract_inline_analysis"]:
-        AWSTextractInlineAnalysisConfig.from_dict(
-            {
-                **_textract_auth(mode),
-                "region": "us-east-1",
-                "document_format": "png",
-                "feature_types": ["TABLES"],
-                "text_field": "text",
-                "schema": schema,
-            }
-        )
     with plugin_preflight_mode(True):
+        for mode in variants["source:azure_blob"]:
+            AzureBlobSourceConfig.from_dict(
+                {
+                    **_azure_auth_fields(mode),
+                    "container": "matrix-container",
+                    "blob_path": "input.jsonl",
+                    "format": "jsonl",
+                    "schema": schema,
+                    "on_validation_failure": "discard",
+                }
+            )
+            validated_subjects.add(("source:azure_blob", mode))
+        for mode in variants["sink:azure_blob"]:
+            AzureBlobSinkConfig.from_dict(
+                {
+                    **_azure_auth_fields(mode),
+                    "container": "matrix-container",
+                    "blob_path": "output.jsonl",
+                    "format": "jsonl",
+                    "schema": schema,
+                }
+            )
+            validated_subjects.add(("sink:azure_blob", mode))
+        for provider, config_model in LLMSource.discriminated_variants()[1].items():
+            config_model.model_validate(_llm_config(provider, source=True))
+            validated_subjects.add(("source:llm", provider))
+        for provider, config_model in LLMTransform.discriminated_variants()[1].items():
+            config_model.model_validate(_llm_config(provider, source=False))
+            validated_subjects.add(("transform:llm", provider))
+        for mode in variants["source:dataverse"]:
+            DataverseSourceConfig.from_dict(
+                {
+                    "environment_url": "https://matrix.crm.dynamics.com",
+                    "auth": _dataverse_auth(mode),
+                    "entity": "contacts",
+                    "schema": schema,
+                    "on_validation_failure": "discard",
+                }
+            )
+            validated_subjects.add(("source:dataverse", mode))
+        for mode in variants["sink:dataverse"]:
+            DataverseSinkConfig.from_dict(
+                {
+                    "environment_url": "https://matrix.crm.dynamics.com",
+                    "auth": _dataverse_auth(mode),
+                    "entity": "contacts",
+                    "field_mapping": {"id": "contactid"},
+                    "alternate_key": "contactid",
+                    "schema": schema,
+                }
+            )
+            validated_subjects.add(("sink:dataverse", mode))
+        for mode in variants["transform:aws_textract_document_analysis"]:
+            AWSTextractDocumentAnalysisConfig.from_dict(
+                {
+                    **_textract_auth(mode),
+                    "region": "us-east-1",
+                    "bucket": "matrix-bucket",
+                    "key_field": "object_key",
+                    "feature_types": ["TABLES"],
+                    "text_field": "text",
+                    "schema": schema,
+                }
+            )
+            validated_subjects.add(("transform:aws_textract_document_analysis", mode))
+        for mode in variants["transform:aws_textract_inline_analysis"]:
+            AWSTextractInlineAnalysisConfig.from_dict(
+                {
+                    **_textract_auth(mode),
+                    "region": "us-east-1",
+                    "document_format": "png",
+                    "feature_types": ["TABLES"],
+                    "text_field": "text",
+                    "schema": schema,
+                }
+            )
+            validated_subjects.add(("transform:aws_textract_inline_analysis", mode))
         for mode in get_args(AzureSearchAuthMode):
             provider_config: dict[str, object] = {
                 "endpoint": "https://matrix.search.windows.net",
@@ -338,6 +424,7 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> None:
                     "schema": schema,
                 }
             )
+            validated_subjects.add(("transform:rag_retrieval", f"azure-search-{mode.replace('_', '-')}"))
         for mode in get_args(ChromaSearchMode):
             provider_config = {"collection": "matrix-collection", "mode": mode}
             if mode == "persistent":
@@ -354,6 +441,7 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> None:
                     "schema": schema,
                 }
             )
+            validated_subjects.add(("transform:rag_retrieval", f"chroma-{mode}"))
         for mode in variants["sink:chroma_sink"]:
             config: dict[str, object] = {
                 "collection": "matrix-collection",
@@ -366,6 +454,16 @@ def _validate_variant_configs(variants: Mapping[str, tuple[str, ...]]) -> None:
             else:
                 config.update(host="localhost", ssl=False)
             ChromaSinkConfig.from_dict(config)
+            validated_subjects.add(("sink:chroma_sink", mode))
+        for plugin_key, plugin_type in _live_plugin_types_by_key().items():
+            if plugin_key in variants:
+                continue
+            try:
+                _validate_default_config(plugin_key, plugin_type)
+            except (PluginConfigError, ValueError) as exc:
+                raise ValueError(f"{plugin_key} default config validation failed: {exc}") from exc
+            validated_subjects.add((plugin_key, "default"))
+    return validated_subjects
 
 
 def _contains_unclassified(value: object) -> bool:
@@ -385,6 +483,16 @@ def _load_matrix(path: Path) -> dict[str, Any]:
     return value
 
 
+def _validate_reviewed_boundary_references() -> None:
+    catalog = json.loads(V3_CATALOG_PATH.read_text(encoding="utf-8"))
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("legs"), list):
+        raise ValueError("v3 proof catalog must contain a legs list")
+    catalog_ids = {leg["id"] for leg in catalog["legs"] if isinstance(leg, dict) and type(leg.get("id")) is str}
+    missing = sorted(ALLOWED_PB_BOUNDARIES - catalog_ids)
+    if missing:
+        raise ValueError(f"reviewed applicable_pb_boundaries are absent from the v3 proof catalog: {missing}")
+
+
 def _validate_reviewed_entry(entry: Mapping[str, object]) -> None:
     key = entry["plugin_key"]
     if set(entry) != ENTRY_FIELDS:
@@ -397,10 +505,12 @@ def _validate_reviewed_entry(entry: Mapping[str, object]) -> None:
     boundaries = entry["applicable_pb_boundaries"]
     if not isinstance(boundaries, list) or not boundaries or any(type(item) is not str or not item for item in boundaries):
         raise ValueError(f"matrix entry {key!r} applicable_pb_boundaries must be a non-empty string list")
-    if entry["local_fixture"] is not None and type(entry["local_fixture"]) is not str:
-        raise ValueError(f"matrix entry {key!r} local_fixture must be string or null")
-    if type(entry["release_lane"]) is not str or not entry["release_lane"]:
-        raise ValueError(f"matrix entry {key!r} release_lane must be a non-empty string")
+    if len(boundaries) != len(set(boundaries)) or not set(boundaries).issubset(ALLOWED_PB_BOUNDARIES):
+        raise ValueError(f"matrix entry {key!r} applicable_pb_boundaries must be unique members of {sorted(ALLOWED_PB_BOUNDARIES)}")
+    if entry["local_fixture"] not in ALLOWED_LOCAL_FIXTURES:
+        raise ValueError(f"matrix entry {key!r} local_fixture must be one of {sorted(ALLOWED_LOCAL_FIXTURES)}")
+    if entry["release_lane"] not in ALLOWED_RELEASE_LANES:
+        raise ValueError(f"matrix entry {key!r} release_lane must be one of {sorted(ALLOWED_RELEASE_LANES)}")
 
 
 def check(path: Path) -> None:
@@ -412,6 +522,7 @@ def check(path: Path) -> None:
         raise ValueError("plugin matrix plugins must be a list")
     if _contains_unclassified(matrix):
         raise ValueError("plugin matrix contains UNCLASSIFIED reviewed fields")
+    _validate_reviewed_boundary_references()
     mechanical = _mechanical_projection()
     if len(entries) != len(mechanical):
         raise ValueError(f"plugin matrix has {len(entries)} entries; expected {len(mechanical)}")
@@ -438,7 +549,12 @@ def check(path: Path) -> None:
     variant_count = sum(len(variants.get(key, ("default",))) for key in actual_by_key)
     if variant_count != EXPECTED_VARIANT_COUNT:
         raise ValueError(f"expected {EXPECTED_VARIANT_COUNT} PB-09 variants, derived {variant_count}")
-    _validate_variant_configs(variants)
+    expected_subjects = {(plugin_key, variant) for plugin_key in actual_by_key for variant in variants.get(plugin_key, ("default",))}
+    validated_subjects = _validate_variant_configs(variants)
+    if validated_subjects != expected_subjects:
+        missing = sorted(expected_subjects - validated_subjects)
+        unexpected = sorted(validated_subjects - expected_subjects)
+        raise ValueError(f"production config validation subject drift: missing={missing}, unexpected={unexpected}")
     for key, entry in actual_by_key.items():
         expected_variants = list(variants.get(key, ("default",)))
         if entry["variants"] != expected_variants:
