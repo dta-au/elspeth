@@ -51,6 +51,24 @@ describe("ReadOnlyPipelineGraph", () => {
 
     const viewBoxWidth = Number(svg!.getAttribute("viewBox")!.split(/\s+/)[2]);
     expect(136 / viewBoxWidth).toBeLessThan(0.5);
+
+    const validationLabel = container.querySelector(
+      'text[data-edge-id="source-validation-failure"]',
+    );
+    expect(validationLabel).not.toBeNull();
+    expect(validationLabel).toHaveAttribute("text-anchor", "end");
+    expect(Number(validationLabel!.getAttribute("x"))).toBeLessThan(103.5);
+    const validationLines = Array.from(
+      validationLabel!.querySelectorAll("tspan"),
+      (line) => line.textContent ?? "",
+    );
+    expect(validationLines).toEqual([
+      "source-1 on",
+      "validation",
+      "failure →",
+      "discard",
+    ]);
+    expect(validationLines.every((line) => line.length <= 14)).toBe(true);
   });
 
   it("lays a linear pipeline out from top to bottom inside the inline review", () => {

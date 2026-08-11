@@ -43,10 +43,20 @@ const GRAPH_PADDING = 32;
 const EDGE_LABEL_HORIZONTAL_PADDING = 12;
 const EDGE_LABEL_VERTICAL_PADDING = 12;
 const EDGE_LABEL_DY = -5;
+const EDGE_LABEL_LINE_HEIGHT = 12;
+const EDGE_LABEL_MAX_CHARACTERS = 14;
+const EDGE_LABEL_APPROX_CHARACTER_WIDTH = 6;
+const EDGE_LABEL_NODE_GAP = 8;
 
 interface PositionedNode extends ReadOnlyPipelineGraphNode {
   x: number;
   y: number;
+}
+
+interface EdgeLabelPlacement {
+  x: number;
+  y: number;
+  textAnchor: "middle" | "end";
 }
 
 function layoutGraph(
@@ -124,6 +134,50 @@ function edgeMidpointX(
   return (source.x + target.x) / 2 + laneOffset * 0.75;
 }
 
+function edgeLabelLines(label: string): string[] {
+  const lines: string[] = [];
+  let current = "";
+  const words = label.trim().split(/\s+/);
+  for (const word of words) {
+    const chunks = word.match(new RegExp(`.{1,${EDGE_LABEL_MAX_CHARACTERS}}`, "g")) ?? [word];
+    for (const chunk of chunks) {
+      const candidate = current === "" ? chunk : `${current} ${chunk}`;
+      if (candidate.length <= EDGE_LABEL_MAX_CHARACTERS) {
+        current = candidate;
+      } else {
+        lines.push(current);
+        current = chunk;
+      }
+    }
+  }
+  if (current !== "") lines.push(current);
+  return lines.length > 0 ? lines : [""];
+}
+
+function edgeLabelPlacement(
+  source: PositionedNode,
+  target: PositionedNode,
+  laneOffset: number,
+  nodes: Iterable<PositionedNode>,
+): EdgeLabelPlacement {
+  const x = edgeMidpointX(source, target, laneOffset);
+  const y = edgeMidpointY(source, target);
+  for (const node of nodes) {
+    if (node.id === source.id || node.id === target.id) continue;
+    const overlapsNode =
+      Math.abs(x - node.x) <= NODE_WIDTH / 2
+      && Math.abs(y - node.y) <= NODE_HEIGHT / 2;
+    if (overlapsNode) {
+      return {
+        x: node.x - NODE_WIDTH / 2 - EDGE_LABEL_NODE_GAP,
+        y,
+        textAnchor: "end",
+      };
+    }
+  }
+  return { x, y, textAnchor: "middle" };
+}
+
 function graphVerticalBounds(
   layoutHeight: number,
   edges: ReadOnlyPipelineGraphEdge[],
@@ -137,13 +191,17 @@ function graphVerticalBounds(
     if (source === undefined || target === undefined) continue;
 
     const labelY = edgeMidpointY(source, target) + EDGE_LABEL_DY;
+    const labelLines = edgeLabelLines(edge.label);
+    const labelHalfHeight =
+      ((labelLines.length - 1) * EDGE_LABEL_LINE_HEIGHT) / 2
+      + EDGE_LABEL_VERTICAL_PADDING;
     minY = Math.min(
       minY,
-      labelY - EDGE_LABEL_VERTICAL_PADDING,
+      labelY - labelHalfHeight,
     );
     maxY = Math.max(
       maxY,
-      labelY + EDGE_LABEL_VERTICAL_PADDING,
+      labelY + labelHalfHeight,
     );
   }
   return { minY, height: maxY - minY };
@@ -163,18 +221,27 @@ function graphHorizontalBounds(
     if (source === undefined || target === undefined) continue;
 
     const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
-    const labelX = edgeMidpointX(source, target, laneOffset);
+    const label = edgeLabelPlacement(source, target, laneOffset, nodesById.values());
+    const labelWidth =
+      Math.max(...edgeLabelLines(edge.label).map((line) => line.length))
+      * EDGE_LABEL_APPROX_CHARACTER_WIDTH;
+    const labelMinX = label.textAnchor === "end"
+      ? label.x - labelWidth
+      : label.x - labelWidth / 2;
+    const labelMaxX = label.textAnchor === "end"
+      ? label.x
+      : label.x + labelWidth / 2;
     minX = Math.min(
       minX,
       source.x + laneOffset,
       target.x + laneOffset,
-      labelX - EDGE_LABEL_HORIZONTAL_PADDING,
+      labelMinX - EDGE_LABEL_HORIZONTAL_PADDING,
     );
     maxX = Math.max(
       maxX,
       source.x + laneOffset,
       target.x + laneOffset,
-      labelX + EDGE_LABEL_HORIZONTAL_PADDING,
+      labelMaxX + EDGE_LABEL_HORIZONTAL_PADDING,
     );
   }
   return { minX, width: maxX - minX };
@@ -236,8 +303,11 @@ export function ReadOnlyPipelineGraph({
               throw new Error(`ReadOnlyPipelineGraph edge ${edge.id} has an unresolved endpoint`);
             }
             const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
-            const labelX = edgeMidpointX(source, target, laneOffset);
-            const labelY = edgeMidpointY(source, target);
+            const label = edgeLabelPlacement(source, target, laneOffset, byId.values());
+            const labelLines = edgeLabelLines(edge.label);
+            const firstLineDy =
+              EDGE_LABEL_DY
+              - ((labelLines.length - 1) * EDGE_LABEL_LINE_HEIGHT) / 2;
             return (
               <g key={edge.id}>
                 <path
@@ -252,12 +322,19 @@ export function ReadOnlyPipelineGraph({
                 <text
                   data-edge-id={edge.id}
                   className="guided-readonly-graph__edge-label"
-                  x={labelX}
-                  y={labelY}
-                  dy={EDGE_LABEL_DY}
-                  textAnchor="middle"
+                  x={label.x}
+                  y={label.y}
+                  textAnchor={label.textAnchor}
                 >
-                  {edge.label}
+                  {labelLines.map((line, index) => (
+                    <tspan
+                      key={`${edge.id}-line-${index + 1}`}
+                      x={label.x}
+                      dy={index === 0 ? firstLineDy : EDGE_LABEL_LINE_HEIGHT}
+                    >
+                      {line}
+                    </tspan>
+                  ))}
                 </text>
               </g>
             );
