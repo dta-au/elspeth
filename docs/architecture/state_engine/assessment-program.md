@@ -31,8 +31,9 @@ PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
 ```
 
 The initializer creates a fully materialized 73-leg v2 manifest plus readable
-README, evidence, and review templates. It refuses to overwrite an existing
-`assessment.json`.
+README, evidence, and review templates. It refuses any pre-existing destination
+(including a symlink), stages the complete package in a sibling directory, and
+renames it into place only after every write succeeds.
 
 Use `full` when the catalog, architecture, state vocabulary, transaction
 boundaries, support profiles, or global verdict may change. A delta is also a
@@ -246,10 +247,15 @@ and a human proof matrix that contradicts the manifest. It resolves the
 recorded baseline commit/tree and refuses any committed or uncommitted
 difference outside `docs/` before live plugin discovery.
 
-`collect-evidence` strips only JUnit output arguments, adds `--collect-only`,
-applies the record's safe environment, and requires the resulting exact node
-list to equal the retained index. `check-links` checks repository-relative
-Markdown links under the state-engine documentation and `docs/README.md`.
+`collect-evidence` accepts only a literal `sys.executable -m pytest` command
+with allowlisted collection options and explicit `tests/` selectors. It strips
+JUnit output and `-n 0` arguments, clears ambient pytest options, disables
+third-party plugin autoload, applies only the closed safe-environment
+allowlist, enforces the positive timeout, and kills the collection process
+group on expiry. The exact resulting node list must equal the retained index.
+`check-links` checks repository-relative Markdown links under the state-engine
+documentation and `docs/README.md`; absolute paths, repository escapes, and
+symlink inputs/escapes are invalid.
 These are direct assessment operations, not unit tests for a document package.
 
 ## Historical rerun

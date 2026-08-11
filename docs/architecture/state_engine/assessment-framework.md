@@ -63,6 +63,11 @@ Every execution record contains:
 Warnings, skips, xfails, missing credentials, and partial platform coverage are
 evidence facts. Do not omit them to make a run appear cleaner.
 
+Collection replays only the recorded trusted Python/pytest vector with explicit
+`tests/` selectors. Ambient pytest options and credential-bearing environment
+variables are not inherited; only the validator's closed safe-environment
+allowlist may be applied, under the record's positive timeout.
+
 Only a successful `pytest` record with a positive pass count, no
 fail/error/skip/xfail/xpass result, matching collection/JUnit totals, and
 one proof subject per cited node can promote a behavioral cell. A node may

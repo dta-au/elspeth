@@ -7,6 +7,7 @@ import re
 import runpy
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -162,9 +163,11 @@ def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
 def _run_assessment_cli(
     *arguments: str,
     cwd: Path = REPOSITORY_ROOT,
+    environment_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(REPOSITORY_ROOT / "src")
+    environment.update(environment_overrides or {})
     return subprocess.run(
         [sys.executable, str(ASSESSMENT_SCRIPT_PATH), *arguments],
         cwd=cwd,
@@ -499,6 +502,35 @@ def _ts00_coverage(profile_case: str, node_ids: list[str]) -> list[dict[str, Any
     ]
 
 
+def _write_collection_manifest(
+    repository: Path,
+    assessment_path: Path,
+    *,
+    argv: list[str],
+    nodes: list[str],
+    safe_environment: dict[str, str | None] | None = None,
+    timeout_seconds: int = 30,
+) -> None:
+    assessment = json.loads(assessment_path.read_text())
+    node_index = _artifact_record(
+        repository,
+        "docs/architecture/state_engine/assessments/minimal-assessment/evidence/collector.nodes",
+        "".join(f"{node}\n" for node in nodes),
+    )
+    assessment["evidence"] = [
+        {
+            "id": "EV-COLLECTOR",
+            "kind": "pytest",
+            "argv": argv,
+            "cwd_relative": ".",
+            "timeout_seconds": timeout_seconds,
+            "safe_environment": safe_environment or {},
+            "collected_node_index": node_index,
+        }
+    ]
+    _write_json(assessment_path, assessment)
+
+
 @pytest.fixture
 def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
@@ -509,6 +541,7 @@ def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
         repository / "docs/architecture/state_engine/proof-matrix.md",
         catalog,
     )
+    (repository / "docs/README.md").write_text("# Documentation\n")
     _git(repository, "init", "-q")
     _git(repository, "config", "user.name", "State Engine Test")
     _git(repository, "config", "user.email", "state-engine-test@example.invalid")
@@ -1131,3 +1164,247 @@ def test_collect_evidence_cli_validates_empty_pytest_inventory(
 
     assert result.returncode == 0, result.stderr
     assert "evidence collection: valid (0 pytest records)" in result.stdout
+
+
+def test_init_full_rejects_preexisting_destination(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    destination = repository / "docs/architecture/state_engine/assessments/preexisting"
+    destination.mkdir()
+
+    result = _run_assessment_cli("init-full", "preexisting", str(destination), cwd=repository)
+
+    assert result.returncode == 1
+    assert "destination already exists" in result.stderr
+    assert list(destination.iterdir()) == []
+
+
+def test_init_full_rejects_symlink_destination_without_touching_target(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    assessments = repository / "docs/architecture/state_engine/assessments"
+    target = assessments / "symlink-target"
+    target.mkdir()
+    destination = assessments / "symlink-destination"
+    destination.symlink_to(target, target_is_directory=True)
+
+    result = _run_assessment_cli("init-full", "symlink", str(destination), cwd=repository)
+
+    assert result.returncode == 1
+    assert "destination already exists" in result.stderr
+    assert list(target.iterdir()) == []
+
+
+def test_init_full_cleans_staged_directory_after_write_failure(
+    assessment_repository: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, _assessment_path = assessment_repository
+    destination = repository / "docs/architecture/state_engine/assessments/write-failure"
+    initialize_full = _assessment_namespace()["initialize_full"]
+    original_write_text = Path.write_text
+
+    def fail_evidence_write(path: Path, data: str, *args: Any, **kwargs: Any) -> int:
+        if path.name == "evidence.md":
+            raise OSError("injected template write failure")
+        return original_write_text(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_evidence_write)
+
+    with pytest.raises(OSError, match="injected template write failure"):
+        initialize_full("write-failure", destination)
+
+    assert not destination.exists()
+    assert list(destination.parent.glob(".write-failure.tmp-*")) == []
+
+
+def test_collect_evidence_rejects_python_wrapper_execution(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    marker = repository / "wrapper-executed"
+    code = f"from pathlib import Path; Path({str(marker)!r}).write_text('executed')"
+    _write_collection_manifest(
+        repository,
+        assessment_path,
+        argv=[sys.executable, "-c", code, "pytest"],
+        nodes=[],
+    )
+
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "trusted pytest invocation" in result.stderr
+    assert not marker.exists()
+
+
+def test_collect_evidence_rejects_credential_environment_override(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    test_path = repository / "tests/test_collector.py"
+    test_path.parent.mkdir()
+    test_path.write_text("def test_collector():\n    pass\n")
+    node = "tests/test_collector.py::test_collector"
+    _write_collection_manifest(
+        repository,
+        assessment_path,
+        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector.py"],
+        nodes=[node],
+        safe_environment={"AWS_SECRET_ACCESS_KEY": "fixture-value"},
+    )
+
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "safe_environment name is not permitted" in result.stderr
+
+
+def test_collect_evidence_scrubs_ambient_pytest_and_credential_environment(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    test_path = repository / "tests/test_collector_env.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "import os\n"
+        "assert 'PYTEST_ADDOPTS' not in os.environ\n"
+        "assert 'AWS_SECRET_ACCESS_KEY' not in os.environ\n\n"
+        "def test_environment():\n"
+        "    pass\n"
+    )
+    node = "tests/test_collector_env.py::test_environment"
+    _write_collection_manifest(
+        repository,
+        assessment_path,
+        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector_env.py"],
+        nodes=[node],
+    )
+
+    result = _run_assessment_cli(
+        "collect-evidence",
+        str(assessment_path),
+        cwd=repository,
+        environment_overrides={
+            "PYTEST_ADDOPTS": "--definitely-not-a-valid-pytest-option",
+            "AWS_SECRET_ACCESS_KEY": "ambient-fixture-value",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_collect_evidence_times_out_and_kills_pytest_process_group(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    marker = repository / "orphan-child-escaped"
+    child_code = f"import time; from pathlib import Path; time.sleep(1.5); Path({str(marker)!r}).write_text('escaped')"
+    test_path = repository / "tests/test_collector_timeout.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "import subprocess\n"
+        "import sys\n"
+        "import time\n\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "time.sleep(3)\n\n"
+        "def test_timeout():\n"
+        "    pass\n"
+    )
+    _write_collection_manifest(
+        repository,
+        assessment_path,
+        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector_timeout.py"],
+        nodes=["tests/test_collector_timeout.py::test_timeout"],
+        timeout_seconds=1,
+    )
+
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+    time.sleep(2)
+
+    assert result.returncode == 1
+    assert "timed out after 1 seconds" in result.stderr
+    assert not marker.exists()
+
+
+def test_check_links_rejects_absolute_local_target(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    attack = repository / "docs/architecture/state_engine/absolute-link.md"
+    attack.write_text("[host file](/etc/passwd)\n")
+
+    result = _run_assessment_cli("check-links", cwd=repository)
+
+    assert result.returncode == 1
+    assert "link target must be repository-relative" in result.stderr
+
+
+def test_check_links_rejects_traversal_outside_repository(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    outside = repository.parent / "outside.md"
+    outside.write_text("outside\n")
+    attack = repository / "docs/architecture/state_engine/traversal-link.md"
+    attack.write_text("[outside](../../../../outside.md)\n")
+
+    result = _run_assessment_cli("check-links", cwd=repository)
+
+    assert result.returncode == 1
+    assert "link target escapes the repository" in result.stderr
+
+
+def test_check_links_rejects_symlink_escape(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    outside = repository.parent / "external-docs"
+    outside.mkdir()
+    (outside / "target.md").write_text("outside\n")
+    state_engine = repository / "docs/architecture/state_engine"
+    (state_engine / "external").symlink_to(outside, target_is_directory=True)
+    (state_engine / "symlink-link.md").write_text("[outside](external/target.md)\n")
+
+    result = _run_assessment_cli("check-links", cwd=repository)
+
+    assert result.returncode == 1
+    assert "link target escapes through a symlink" in result.stderr
+
+
+def test_check_links_rejects_symlink_document_escape(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    outside = repository.parent / "external-document.md"
+    outside.write_text("outside\n")
+    attack = repository / "docs/architecture/state_engine/symlink-document.md"
+    attack.symlink_to(outside)
+
+    result = _run_assessment_cli("check-links", cwd=repository)
+
+    assert result.returncode == 1
+    assert "documentation input cannot be a symlink" in result.stderr
+
+
+def test_main_reports_unexpected_failures_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    namespace = _assessment_namespace()
+    main = namespace["main"]
+
+    def fail_unexpectedly(_root: Path) -> int:
+        raise RuntimeError("injected internal failure\nprivate detail")
+
+    monkeypatch.setitem(main.__globals__, "check_links", fail_unexpectedly)
+
+    result = main(["check-links"])
+    captured = capsys.readouterr()
+
+    assert result == 1
+    assert captured.out == ""
+    assert captured.err == "state-engine assessment: internal error (RuntimeError): injected internal failure\n"
+    assert "Traceback" not in captured.err
