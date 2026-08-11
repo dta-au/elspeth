@@ -1260,15 +1260,18 @@ describe("ChatPanelTutorialWorkspace", () => {
       />,
     );
 
-    // Guard against a vacuous pass: the named scroll group, the artifact
-    // rail, both role=log regions (transcript + wizard step), the rail's
-    // decision history, and the Sent composer state must all be mounted.
+    // Guard against a vacuous pass: the named authoring scroll group, both
+    // role=log regions (transcript + wizard step), and the Sent composer state
+    // must all be mounted. Artifact and history content belongs to the common
+    // workspace/Inspector, not this authoring component.
     screen.getByRole("group", { name: "Conversation" });
-    screen.getByRole("complementary", { name: "Pipeline summary" });
     screen.getByRole("log", { name: "Step chat history" });
     screen.getByRole("log", { name: "Guided wizard step" });
-    screen.getByRole("heading", { name: /decisions so far/i });
     screen.getByText(/your request is in the transcript above/i);
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
+    expect(screen.queryByRole("heading", { name: /decisions so far/i })).toBeNull();
 
     expect(await axe(container)).toHaveNoViolations();
   });
@@ -1307,7 +1310,7 @@ describe("ChatPanelTutorialWorkspace", () => {
     // no longer swapped out from under the typing area).
     const strip = container.querySelector(".guided-pending-strip");
     expect(strip).not.toBeNull();
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
     expect(scroll!.contains(strip)).toBe(true);
     screen.getByRole("button", { name: "Stop composing" });

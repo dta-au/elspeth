@@ -131,9 +131,15 @@ test.describe("composer-guided — source/output live walk", () => {
         await composer.waitForChatReady();
         await page.getByRole("button", { name: "Switch to guided" }).click();
         await expect(page.getByRole("button", { name: "CSV", exact: true })).toBeVisible();
+        const authoringPane = page.getByRole("region", { name: "Authoring pane" });
+        await expect(authoringPane.getByRole("log", { name: "Guided wizard step" })).toBeVisible();
+        await expect(page.getByRole("tab", { name: "Graph" })).toBeVisible();
+        await expect(
+          page.getByRole("complementary", { name: "Pipeline summary" }),
+        ).toHaveCount(0);
 
         const geometry = await page
-          .locator(".guided-workspace-scroll")
+          .locator(".guided-authoring-scroll")
           .evaluate((scroll) => {
             const decision = scroll.querySelector(".guided-current-decision");
             if (!(decision instanceof HTMLElement)) {
