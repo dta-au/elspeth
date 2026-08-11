@@ -8,16 +8,16 @@ current verdict, and historical assessments.
 
 | Field | Current value |
 | --- | --- |
-| Assessment | [2026-08-12 02:39 AEST](assessments/2026-08-12-0239/README.md) |
-| Code baseline | `codex/state-engine-completion-plan` at `af79b34040f5ce5fd989aa0d42a1b80ad8366829` |
+| Assessment | [2026-08-12 04:25 AEST](assessments/2026-08-12-0425/README.md) |
+| Code baseline | `codex/state-engine-completion-plan` at `9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba` |
 | Catalog | `elspeth-state-engine-v2`, schema 1, 73 legs, explicit semantic cases and required execution profiles |
 | Verdict | **Not complete** |
-| Current observations | 128 focused SQLite checks and 4 PostgreSQL 16 testcontainer checks pass on Python 3.13.1; no v2 cell is promoted without reporter-bound case/profile evidence |
+| Current observations | 113 reporter-bound Task 5 checks pass on SQLite single-process; four exact cells are promoted while PostgreSQL 16 AWS and follower cells remain unknown |
 | Primary gaps | Independent-process recovery, complete read-model/refusal truth tables, barrier families, external sink ambiguity, `ABANDONED`, first-party plugin lifecycles, and complete PostgreSQL semantics |
 
-This assessment pins the current contract rather than inheriting historical
-passes. All 73 v2 legs are `unknown`: each retains at least one mandatory cell
-without current reporter-bound evidence. The v2 contract adds `ABANDONED`, row
+This assessment extends the full pinning parent without inheriting historical
+passes. All 73 v2 legs remain `unknown`: each retains at least one mandatory
+cell without current reporter-bound evidence. The v2 contract adds `ABANDONED`, row
 union, RM-14, F-14, current first-party plugin inventory, and PostgreSQL 16 as
 a required first-class backend for the maintained AWS single-leader Landscape
 profile. Multi-replica scheduling remains outside that claim.
@@ -114,6 +114,7 @@ code.
 
 | Date | Baseline | Mode | Verdict | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-08-12 | `9f78d2b2a` | Task 5 SQLite delta assessment | Not complete | Promotes four reporter-bound SQLite single-process cells for queue rollback, TS-02 entry, and F-11 guard refusal; required PostgreSQL 16 AWS and follower cells remain unknown. |
 | 2026-08-12 | `af79b3404` | Full v2 pinning assessment | Not complete | Pins 73 current legs, PostgreSQL 16 AWS single-leader support, fresh structural/tracker context, focused current observations, and live cohort ownership without inheriting v1 passes. |
 | 2026-07-18 | `3c782ac3c` | Full contract refresh and source-ingress evidence | Not complete | Adds the exact source `COMPLETED` witness to TS-02/PB-01, records strict pre-fix reconciliation, and attaches 13 fresh focused checks without promoting the broader legs or hard gates. |
 | 2026-07-18 | `422415009` | Full framework reset and conservative evidence import | Not complete | Introduces the 68-leg v1 catalog, explicit coordination state, sink-effect architecture, reproducibility contract, and reviewed authority model. |
