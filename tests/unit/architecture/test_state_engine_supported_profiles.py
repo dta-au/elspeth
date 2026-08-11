@@ -23,9 +23,13 @@ def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() ->
     assert catalog["catalog_id"] == "elspeth-state-engine-v2"
 
     execution_profiles = catalog["execution_profiles"]
-    state_stores = {profile["id"]: profile for profile in execution_profiles["state_store"]}
-    assert set(state_stores) == {"sqlite-wal", "postgresql-16"}
-    assert all(profile["required"] is True for profile in state_stores.values())
+    state_store_profiles = execution_profiles["state_store"]
+    state_store_ids = [profile["id"] for profile in state_store_profiles]
+    assert len(state_store_ids) == 2
+    assert len(state_store_ids) == len(set(state_store_ids))
+    assert set(state_store_ids) == {"sqlite-wal", "postgresql-16"}
+    assert all(profile["required"] is True for profile in state_store_profiles)
+    state_stores = {profile["id"]: profile for profile in state_store_profiles}
 
     sqlite_deployments = state_stores["sqlite-wal"]["deployments"]
     postgresql_deployments = state_stores["postgresql-16"]["deployments"]
