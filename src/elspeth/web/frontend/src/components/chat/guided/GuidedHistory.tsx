@@ -44,8 +44,8 @@ export function projectCompletedGuidedHistory(
 /**
  * Read-only plain-language list of completed guided-mode decisions.
  *
- * Returns null when history is empty — the parent should not render this
- * widget unless there are completed steps to show.
+ * Returns null whenever the shared projection finds no completed, summarised
+ * prior-step rows, including current-step-only and summary-null history.
  */
 export function GuidedHistory({ history, currentStep }: Props): React.ReactElement | null {
   const rows = projectCompletedGuidedHistory(history, currentStep);

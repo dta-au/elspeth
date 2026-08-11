@@ -1790,25 +1790,16 @@
    GuidedHistory (Task 7.9)
    Classes prefixed guided-history-*.
 
-   Collapsible read-only list of completed wizard steps.  Rendered above the
-   active turn widget so the user can see what was decided in prior steps.
+   Always-visible read-only card within the Inspector History tab. The shared
+   completed-history projection controls whether the tab/card is available, so
+   a mounted card always contains at least one summarised prior-step decision.
 
    Visual design:
      - Muted appearance (secondary text colour) to avoid competing with the
-       active turn widget.
-     - Toggle button matches the ExitToFreeformButton secondary style
-       (transparent background, border, muted text) but is visually lighter.
-     - List items use small text with separator dots between step name,
-       turn type, and emitter.
-
-   Collapsible region contract (Task 7.5 I2):
-     The region is ALWAYS rendered (hidden attribute toggles, not conditional
-     mounting) so the toggle's aria-controls always resolves.  Native browser
-     `[hidden] { display: none; }` handles both visual and AT-tree hiding —
-     no additional CSS required for the hidden state.
-
-   Sized to WCAG 2.5.8 minimum target (min-height: 44px on toggle button).
-   Focus ring and hover match the guided-* family convention.
+       active Inspector surfaces.
+     - List items pair a compact step label with its plain-language summary.
+     - The card has no collapse control or independent focus target; the
+       surrounding Inspector tab owns disclosure and keyboard navigation.
    --------------------------------------------------------------------------- */
 
 .guided-history {
