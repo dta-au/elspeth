@@ -4,6 +4,36 @@ import { describe, expect, it } from "vitest";
 import { ReadOnlyPipelineGraph } from "./ReadOnlyPipelineGraph";
 
 describe("ReadOnlyPipelineGraph", () => {
+  it("lays a linear pipeline out from top to bottom inside the inline review", () => {
+    const { container } = render(
+      <ReadOnlyPipelineGraph
+        ariaLabel="Vertical pipeline"
+        nodes={[
+          { id: "source", label: "source", kind: "source", subtitle: null },
+          { id: "transform", label: "transform", kind: "transform", subtitle: null },
+          { id: "output", label: "output", kind: "output", subtitle: null },
+        ]}
+        edges={[
+          { id: "source-transform", source: "source", target: "transform", label: "next", isError: false },
+          { id: "transform-output", source: "transform", target: "output", label: "write", isError: false },
+        ]}
+      />,
+    );
+
+    const positions = ["source", "transform", "output"].map((id) => {
+      const transform = container
+        .querySelector(`[data-node-id="${id}"]`)
+        ?.getAttribute("transform");
+      expect(transform).toBeTruthy();
+      return transform!.match(/-?\d+(?:\.\d+)?/g)!.map(Number);
+    });
+
+    expect(positions[0][1]).toBeLessThan(positions[1][1]);
+    expect(positions[1][1]).toBeLessThan(positions[2][1]);
+    expect(positions[0][0]).toBeCloseTo(positions[1][0]);
+    expect(positions[1][0]).toBeCloseTo(positions[2][0]);
+  });
+
   it("renders parallel identity fork branches in distinct lanes with visible labels", () => {
     const { container } = render(
       <ReadOnlyPipelineGraph
@@ -91,14 +121,21 @@ describe("ReadOnlyPipelineGraph", () => {
 
     const viewBox = container.querySelector("svg")?.getAttribute("viewBox");
     expect(viewBox).not.toBeNull();
-    const [, minY, , height] = viewBox!.split(/\s+/).map(Number);
+    const [minX, minY, width, height] = viewBox!.split(/\s+/).map(Number);
+    const maxX = minX + width;
     const maxY = minY + height;
+    const labelXs = Array.from(
+      container.querySelectorAll("text[data-edge-id]"),
+      (label) => Number(label.getAttribute("x")),
+    );
     const labelYs = Array.from(
       container.querySelectorAll("text[data-edge-id]"),
       (label) => Number(label.getAttribute("y")),
     );
 
     expect(labelYs).toHaveLength(64);
+    expect(minX).toBeLessThan(Math.min(...labelXs));
+    expect(maxX).toBeGreaterThan(Math.max(...labelXs));
     expect(minY).toBeLessThan(Math.min(...labelYs));
     expect(maxY).toBeGreaterThan(Math.max(...labelYs));
   });

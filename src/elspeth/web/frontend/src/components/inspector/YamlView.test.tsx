@@ -86,6 +86,24 @@ describe("YamlView", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces a pending pipeline proposal instead of an empty YAML panel", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: null,
+      compositionProposals: [makeProposal()],
+    });
+
+    render(<YamlView />);
+
+    expect(screen.getByText(/Pending YAML change/)).toBeInTheDocument();
+    expect(screen.getByText(/not been applied yet/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Accept YAML proposal: Replace the pipeline.",
+      }),
+    ).toBeEnabled();
+  });
+
   it("does not fetch YAML for a metadata-only guided exit state", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({
