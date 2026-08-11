@@ -32,8 +32,13 @@ interface ReadOnlyPipelineGraphProps {
   ariaLabel: string;
 }
 
-const NODE_WIDTH = 168;
-const NODE_HEIGHT = 62;
+// Keep Dagre's established slots stable so compact cards do not get scaled
+// back up by a smaller SVG viewBox. The unused slot space is intentional: it
+// is the label gutter in the fixed-width proposal panel.
+const LAYOUT_NODE_WIDTH = 168;
+const LAYOUT_NODE_HEIGHT = 62;
+const NODE_WIDTH = 136;
+const NODE_HEIGHT = 54;
 const GRAPH_PADDING = 32;
 const EDGE_LABEL_HORIZONTAL_PADDING = 12;
 const EDGE_LABEL_VERTICAL_PADDING = 12;
@@ -52,7 +57,7 @@ function layoutGraph(
   graph.setDefaultEdgeLabel(() => ({}));
   graph.setGraph({ rankdir: "TB", nodesep: 34, ranksep: 72, marginx: GRAPH_PADDING, marginy: GRAPH_PADDING });
   for (const node of nodes) {
-    graph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+    graph.setNode(node.id, { width: LAYOUT_NODE_WIDTH, height: LAYOUT_NODE_HEIGHT });
   }
   for (const edge of edges) {
     graph.setEdge(edge.source, edge.target, {}, edge.id);
@@ -63,8 +68,8 @@ function layoutGraph(
       const position = graph.node(node.id);
       return { ...node, x: position.x, y: position.y };
     }),
-    width: Math.max(graph.graph().width ?? 0, NODE_WIDTH + GRAPH_PADDING * 2),
-    height: Math.max(graph.graph().height ?? 0, NODE_HEIGHT + GRAPH_PADDING * 2),
+    width: Math.max(graph.graph().width ?? 0, LAYOUT_NODE_WIDTH + GRAPH_PADDING * 2),
+    height: Math.max(graph.graph().height ?? 0, LAYOUT_NODE_HEIGHT + GRAPH_PADDING * 2),
   };
 }
 
