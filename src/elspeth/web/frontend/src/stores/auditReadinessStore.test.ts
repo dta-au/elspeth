@@ -6,6 +6,7 @@ import type { AuditReadinessSnapshot, AuditReadinessExplain } from "../types/api
 vi.mock("../api/auditReadiness");
 
 const SESSION_ID = "00000000-0000-0000-0000-000000000001";
+const OTHER_SESSION_ID = "00000000-0000-0000-0000-000000000002";
 const READY_READINESS = {
   authoring_valid: true,
   execution_ready: true,
@@ -62,6 +63,50 @@ describe("useAuditReadinessStore", () => {
 
     expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
   });
+
+  it("refetches and recovers when a same-version cache entry belongs to another session", async () => {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        [SESSION_ID]: {
+          ...snapshot(2),
+          session_id: OTHER_SESSION_ID,
+        },
+      },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(2));
+
+    await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 2);
+
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
+    expect(
+      useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID]
+        ?.session_id,
+    ).toBe(SESSION_ID);
+    expect(useAuditReadinessStore.getState().errorBySession[SESSION_ID]).toBeNull();
+  });
+
+  it.each([
+    ["session", { session_id: OTHER_SESSION_ID }],
+    ["composition version", { composition_version: 3 }],
+  ] as const)(
+    "rejects a fetched snapshot with mismatched %s and exposes a settled retryable error",
+    async (_identity, mismatch) => {
+      vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce({
+        ...snapshot(2),
+        ...mismatch,
+      });
+
+      await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 2);
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingBySession[SESSION_ID]).toBe(false);
+      expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBe(
+        "Audit readiness response did not match the requested composition.",
+      );
+    },
+  );
 
   it("loadSnapshot force option bypasses a matching-version cached snapshot", async () => {
     vi.mocked(api.fetchAuditReadiness)

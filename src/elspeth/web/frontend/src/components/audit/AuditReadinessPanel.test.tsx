@@ -325,7 +325,7 @@ describe("AuditReadinessPanel", () => {
     expect(screen.queryByRole("button", { name: /Audit ready/i })).not.toBeInTheDocument();
   });
 
-  it("does not render a version-matching snapshot belonging to another session", () => {
+  it("refetches and recovers from a version-matching cache entry belonging to another session", async () => {
     useAuditReadinessStore.setState({
       snapshotsBySession: {
         [SESSION_ID]: {
@@ -334,11 +334,45 @@ describe("AuditReadinessPanel", () => {
         },
       },
     });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
+    );
     render(<AuditReadinessPanel />);
 
+    expect(screen.getByText(/Checking audit readiness/i)).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /Audit ready/i }),
-    ).not.toBeInTheDocument();
+      await screen.findByRole("button", { name: /Audit ready/i }),
+    ).toBeInTheDocument();
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a mismatched response as retryable and recovers on Retry", async () => {
+    vi.mocked(api.fetchAuditReadiness)
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(
+          { ...allGreenSnapshot(1), session_id: OTHER_SESSION_ID },
+          { signal },
+        ),
+      )
+      .mockImplementationOnce((_sid, signal) =>
+        makeAbortablePromise(allGreenSnapshot(1), { signal }),
+      );
+    const user = userEvent.setup();
+
+    render(<AuditReadinessPanel />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Audit readiness response did not match the requested composition.",
+    );
+    const retry = screen.getByRole("button", {
+      name: "Retry audit readiness check",
+    });
+    expect(retry).toBeEnabled();
+    await user.click(retry);
+    expect(
+      await screen.findByRole("button", { name: /Audit ready/i }),
+    ).toBeInTheDocument();
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(2);
   });
 
   it("projects an OK validation row into the execution validation state", async () => {

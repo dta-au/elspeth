@@ -149,12 +149,21 @@ describe("WorkspaceActionBar", () => {
     const user = userEvent.setup();
     renderActionBar({ completion: false, importYaml: true, catalog: true });
     const more = screen.getByRole("button", { name: "More actions" });
+    expect(more).not.toHaveAttribute("aria-haspopup");
+    expect(more).toHaveAttribute(
+      "aria-controls",
+      "workspace-more-actions-panel",
+    );
     more.focus();
 
     await user.keyboard("{ArrowDown}");
     const importYaml = screen.getByRole("button", { name: "Import YAML" });
     const catalog = screen.getByRole("button", { name: "Plugin catalog" });
     expect(more).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("group", { name: "More actions" })).toHaveAttribute(
+      "id",
+      "workspace-more-actions-panel",
+    );
     expect(importYaml).toHaveFocus();
     await user.keyboard("{ArrowDown}");
     expect(catalog).toHaveFocus();

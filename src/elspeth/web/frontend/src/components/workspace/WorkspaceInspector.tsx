@@ -43,6 +43,8 @@ export function WorkspaceInspector(): JSX.Element {
     audit: null,
     history: null,
   });
+  const historyPanelRef = useRef<HTMLDivElement>(null);
+  const historyOwnedFocusRef = useRef(false);
   const inspectorWasOpenRef = useRef(false);
   const hasHistory = (guidedSession?.history.length ?? 0) > 0;
   const availableTabs: readonly InspectorTab[] = hasHistory
@@ -60,18 +62,35 @@ export function WorkspaceInspector(): JSX.Element {
     return () => window.removeEventListener("resize", updateOverlay);
   }, []);
 
+  useEffect(() => {
+    const trackHistoryFocus = (event: FocusEvent): void => {
+      const target = event.target;
+      historyOwnedFocusRef.current =
+        target instanceof Node &&
+        (tabRefs.current.history?.contains(target) === true ||
+          historyPanelRef.current?.contains(target) === true);
+    };
+    document.addEventListener("focusin", trackHistoryFocus);
+    return () => document.removeEventListener("focusin", trackHistoryFocus);
+  }, []);
+
   useLayoutEffect(() => {
     if (
       state.inspectorOpen &&
       state.activeInspectorTab === "history" &&
       !hasHistory
     ) {
+      const shouldRestoreTabFocus = historyOwnedFocusRef.current;
+      historyOwnedFocusRef.current = false;
       actions.openInspector(
         "validation",
         inspectorInvokerRef.current ??
           document.getElementById("workspace-status-controls") ??
           document.body,
       );
+      if (shouldRestoreTabFocus) {
+        tabRefs.current.validation?.focus({ preventScroll: true });
+      }
       return;
     }
     if (state.inspectorOpen && !inspectorWasOpenRef.current) {
@@ -169,7 +188,7 @@ export function WorkspaceInspector(): JSX.Element {
       aria-labelledby="workspace-inspector-heading"
       hidden={!state.inspectorOpen}
       onKeyDown={(event) => {
-        if (event.key !== "Escape") return;
+        if (event.key !== "Escape" || event.defaultPrevented) return;
         event.preventDefault();
         closeInspector();
       }}
@@ -242,6 +261,7 @@ export function WorkspaceInspector(): JSX.Element {
         </div>
         {hasHistory && guidedSession !== null && (
           <div
+            ref={historyPanelRef}
             role="tabpanel"
             id="workspace-inspector-panel-history"
             aria-labelledby="workspace-inspector-tab-history"

@@ -17,6 +17,7 @@ import {
   fetchAuditReadiness,
   fetchAuditReadinessExplain,
 } from "../api/auditReadiness";
+import { matchingAuditReadinessSnapshot } from "../components/audit/auditReadinessFreshness";
 import type {
   AuditReadinessSnapshot,
   AuditReadinessExplain,
@@ -86,7 +87,14 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
     options: LoadSnapshotOptions = { force: false },
   ) {
     const cached = get().snapshotsBySession[sessionId];
-    if (!options.force && cached && cached.composition_version === compositionVersion) {
+    if (
+      !options.force &&
+      matchingAuditReadinessSnapshot(
+        cached,
+        sessionId,
+        compositionVersion,
+      ) !== undefined
+    ) {
       return;
     }
 
@@ -102,6 +110,33 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const snapshot = await fetchAuditReadiness(sessionId, controller.signal);
+      if (
+        matchingAuditReadinessSnapshot(
+          snapshot,
+          sessionId,
+          compositionVersion,
+        ) === undefined
+      ) {
+        set((state) => {
+          if (state.abortControllers[sessionId] !== controller) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
+          return {
+            abortControllers: restCtrl,
+            isLoadingBySession: {
+              ...state.isLoadingBySession,
+              [sessionId]: false,
+            },
+            errorBySession: {
+              ...state.errorBySession,
+              [sessionId]:
+                "Audit readiness response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       // Monotonic write guard: discard the response if a newer version has
       // already been stored while this fetch was in flight.
       set((state) => {

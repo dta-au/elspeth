@@ -188,7 +188,7 @@ export function WorkspaceActionBar({
             ref={moreButtonRef}
             type="button"
             aria-label="More actions"
-            aria-haspopup="true"
+            aria-controls="workspace-more-actions-panel"
             aria-expanded={menuOpen}
             onClick={() => setMenuOpen((open) => !open)}
             onKeyDown={handleMoreKeyDown}
@@ -197,6 +197,7 @@ export function WorkspaceActionBar({
           </button>
           {menuOpen && (
             <div
+              id="workspace-more-actions-panel"
               ref={menuRef}
               className="workspace-more-actions-menu"
               role="group"

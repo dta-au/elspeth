@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useEffect, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,7 +9,12 @@ import {
 } from "@/lib/composer-events";
 import { makeComposition } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
+import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useInlineSourceStore } from "@/stores/inlineSourceStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import type { AuditReadinessSnapshot } from "@/types/api";
 import {
   useWorkspacePaneController,
   WorkspacePaneProvider,
@@ -24,33 +29,51 @@ const panelState = vi.hoisted(() => ({
   auditUnmounts: 0,
   validationMounts: 0,
   validationUnmounts: 0,
+  useRealAudit: false,
 }));
 
-vi.mock("@/components/audit/AuditReadinessPanel", () => ({
-  AuditReadinessPanel: ({
-    onSelectComponent,
-  }: {
-    onSelectComponent?: (componentId: string) => void;
-  }) => {
-    useEffect(() => {
-      panelState.auditMounts += 1;
-      return () => {
-        panelState.auditUnmounts += 1;
-      };
-    }, []);
-    if (panelState.auditThrows) throw new Error("audit exploded");
-    return (
-      <div>
-        Audit panel
-        <button
-          type="button"
-          onClick={() => onSelectComponent?.("select_columns")}
-        >
-          Audit component
-        </button>
-      </div>
-    );
-  },
+vi.mock("@/components/audit/AuditReadinessPanel", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("@/components/audit/AuditReadinessPanel")
+  >();
+  return {
+    AuditReadinessPanel: (props: {
+      onSelectComponent?: (componentId: string) => void;
+    }) => {
+      useEffect(() => {
+        if (panelState.useRealAudit) return;
+        panelState.auditMounts += 1;
+        return () => {
+          panelState.auditUnmounts += 1;
+        };
+      }, []);
+      if (panelState.useRealAudit) {
+        const ActualAuditReadinessPanel = actual.AuditReadinessPanel;
+        return <ActualAuditReadinessPanel {...props} />;
+      }
+      const { onSelectComponent } = props;
+      if (panelState.auditThrows) throw new Error("audit exploded");
+      return (
+        <div>
+          Audit panel
+          <button
+            type="button"
+            onClick={() => onSelectComponent?.("select_columns")}
+          >
+            Audit component
+          </button>
+        </div>
+      );
+    },
+  };
+});
+
+vi.mock("@/components/chat/guided/GuidedHistory", () => ({
+  GuidedHistory: () => (
+    <div>
+      History panel <button type="button">History detail action</button>
+    </div>
+  ),
 }));
 
 vi.mock("@/components/sidebar/SideRailValidationBanner", () => ({
@@ -149,6 +172,56 @@ function OpenInspectorButton({
   );
 }
 
+function activeGuidedSession() {
+  return {
+    step: "step_3_transforms" as const,
+    history: [
+      {
+        step: "step_1_source" as const,
+        turn_type: "single_select" as const,
+        payload_hash: "payload",
+        response_hash: "response",
+        summary: "Use a CSV source",
+        emitter: "server" as const,
+      },
+    ],
+    terminal: null,
+    chat_history: [],
+    chat_turn_seq: 0,
+    profile: null,
+  };
+}
+
+function actionableAuditSnapshot(): AuditReadinessSnapshot {
+  return {
+    session_id: "session-1",
+    composition_version: 4,
+    checked_at: "2026-08-11T00:00:00Z",
+    rows: [
+      {
+        id: "provenance",
+        label: "Provenance",
+        status: "warning",
+        summary: "Review provenance",
+        detail: "Provenance detail",
+        component_ids: ["select_columns"],
+      },
+    ],
+    validation_result: {
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: {
+        authoring_valid: true,
+        execution_ready: true,
+        completion_ready: true,
+        blockers: [],
+      },
+    },
+  };
+}
+
 describe("WorkspaceInspector", () => {
   beforeEach(() => {
     resetStore(useSessionStore);
@@ -163,7 +236,12 @@ describe("WorkspaceInspector", () => {
       auditUnmounts: 0,
       validationMounts: 0,
       validationUnmounts: 0,
+      useRealAudit: false,
     });
+    useAuditReadinessStore.getState().reset();
+    useExecutionStore.getState().reset();
+    resetStore(useInlineSourceStore);
+    resetStore(useInterpretationEventsStore);
     Object.defineProperty(window, "innerWidth", {
       configurable: true,
       value: 1920,
@@ -194,23 +272,7 @@ describe("WorkspaceInspector", () => {
   it("renders Validation, Audit, and conditional History as roving tabs", async () => {
     const user = userEvent.setup();
     useSessionStore.setState({
-      guidedSession: {
-        step: "step_3_transforms",
-        history: [
-          {
-            step: "step_1_source",
-            turn_type: "single_select",
-            payload_hash: "payload",
-            response_hash: "response",
-            summary: "Use a CSV source",
-            emitter: "server",
-          },
-        ],
-        terminal: null,
-        chat_history: [],
-        chat_turn_seq: 0,
-        profile: null,
-      },
+      guidedSession: activeGuidedSession(),
     } as never);
     render(<InspectorHarness />);
     await user.click(screen.getByRole("button", { name: "Open validation" }));
@@ -231,6 +293,57 @@ describe("WorkspaceInspector", () => {
     expect(history).toHaveFocus();
     await user.keyboard("{Home}");
     expect(validation).toHaveFocus();
+  });
+
+  it.each([
+    ["History tab", "tab"],
+    ["History panel descendant", "panel"],
+  ] as const)(
+    "moves focus to Validation when the active %s disappears",
+    async (_label, focusOwner) => {
+      const user = userEvent.setup();
+      useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+      render(<InspectorHarness />);
+      await user.click(screen.getByRole("button", { name: "Open validation" }));
+      await user.click(screen.getByRole("tab", { name: "History" }));
+      if (focusOwner === "panel") {
+        screen.getByRole("button", { name: "History detail action" }).focus();
+      }
+
+      act(() => {
+        useSessionStore.setState({
+          guidedSession: { ...activeGuidedSession(), history: [] },
+        } as never);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByRole("tab", { name: "Validation" })).toHaveFocus();
+      });
+      expect(
+        screen.queryByRole("tab", { name: "History" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("does not steal unrelated focus when active History disappears", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+    render(<InspectorHarness />);
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+    await user.click(screen.getByRole("tab", { name: "History" }));
+    const unrelated = screen.getByRole("button", { name: "Open audit" });
+    unrelated.focus();
+
+    act(() => {
+      useSessionStore.setState({
+        guidedSession: { ...activeGuidedSession(), history: [] },
+      } as never);
+    });
+
+    expect(unrelated).toHaveFocus();
+    expect(
+      screen.getByRole("tab", { name: "Validation" }),
+    ).toHaveAttribute("aria-selected", "true");
   });
 
   it("restores focus to the exact invoker on Close and Escape", async () => {
@@ -327,5 +440,72 @@ describe("WorkspaceInspector", () => {
       window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
       window.removeEventListener("elspeth-open-graph-modal", graphModal);
     }
+  });
+
+  it("lets ReadinessRowDetail consume the first Escape before the inspector closes", async () => {
+    panelState.useRealAudit = true;
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { "session-1": actionableAuditSnapshot() },
+    });
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    const invoker = screen.getByRole("button", { name: "Open audit" });
+    await user.click(invoker);
+    await user.click(screen.getByRole("button", { name: /Provenance/ }));
+    expect(screen.getByRole("dialog", { name: "Provenance" })).toBeVisible();
+
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("dialog", { name: "Provenance" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Inspector" }),
+    ).toBeVisible();
+    expect(invoker).not.toHaveFocus();
+
+    screen.getByRole("tab", { name: "Audit" }).focus();
+    await user.keyboard("{Escape}");
+    expect(invoker).toHaveFocus();
+  });
+
+  it("lets ExplainDialog consume the first Escape and restore its own opener", async () => {
+    panelState.useRealAudit = true;
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { "session-1": actionableAuditSnapshot() },
+      explainsBySession: {
+        "session-1": {
+          session_id: "session-1",
+          composition_version: 4,
+          narrative: "Audit narrative",
+        },
+      },
+    });
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    const invoker = screen.getByRole("button", { name: "Open audit" });
+    await user.click(invoker);
+    const explain = screen.getByRole("button", { name: /Explain/ });
+    await user.click(explain);
+    expect(
+      screen.getByRole("dialog", {
+        name: "What this pipeline will record",
+      }),
+    ).toBeVisible();
+
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("dialog", {
+        name: "What this pipeline will record",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Inspector" }),
+    ).toBeVisible();
+    await waitFor(() => expect(explain).toHaveFocus());
+
+    await user.keyboard("{Escape}");
+    expect(invoker).toHaveFocus();
   });
 });
