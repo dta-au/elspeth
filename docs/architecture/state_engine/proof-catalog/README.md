@@ -22,6 +22,8 @@ assessments must use v2.
 - `execution_profiles` closes the state-store, deployment, lifecycle,
   state-vocabulary, and first-party plugin inventory. A changed inventory
   requires a catalog revision.
+- `evidence_contract` closes behavioral promotion to all-passing executable
+  pytest records and reserves documentation records for support only.
 - A v2 proof cell is identified by
   `(leg_id, dimension_id, case_id, profile_case)`. The profile case binds one
   supported state store to one deployment and its lifecycle modes; evidence
@@ -45,6 +47,8 @@ assessments must use v2.
   PB-11 names PostgreSQL server-time, row-lock order, isolation, schema
   admission/migration, and ambiguous connection-loss cases.
 - `maintenance` is always required.
+- Every hard gate declares the dimensions from which its status, affected legs,
+  and evidence support are mechanically derived.
 
 ## Assessment overlay
 
@@ -64,10 +68,15 @@ explicitly unknown through the default.
   observable exit gate, and an explicit `owner_issue` key.
 - `unknown` requires a reason, exit gate, and explicit owner key; `null` means
   visibly unowned.
-- Documentary, decision, source-inspection, and tracker evidence may support a
-  result but cannot independently produce behavioral `pass`.
+- `pytest` is the only behavioral promotion kind. It requires positive passing
+  node counts, exact JUnit/count agreement, no failed/error/skipped/xfail/xpass
+  result, and matching execution-profile provenance.
+- `documentation` evidence may support a result but cannot independently
+  produce behavioral `pass` or `partial`.
 - Evidence coverage names exact
-  `(leg_id, dimension_id, case_id, profile_case)` tuples.
+  `(leg_id, dimension_id, case_id, profile_case)` tuples and the retained node
+  IDs that establish them. One node may span dimensions, but only for one
+  leg/case/profile proof subject.
 - The assessment records both `establishes` and `does_not_establish`.
 
 ## Direct validation

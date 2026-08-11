@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -248,6 +249,256 @@ def _write_unknown_proof_matrix(path: Path, catalog: dict[str, Any]) -> None:
     path.write_text("\n".join(rows) + "\n", encoding="utf-8")
 
 
+def _write_complete_proof_matrix(path: Path, catalog: dict[str, Any]) -> None:
+    labels = {
+        "transition": "Token transitions",
+        "auxiliary": "Auxiliary state",
+        "run_coordination": "Run coordination",
+        "production_boundary": "Production boundaries",
+        "read_model": "Read models",
+        "forbidden": "Forbidden paths",
+    }
+    counts = {family: sum(leg["family"] == family for leg in catalog["legs"]) for family in labels}
+    rows = [
+        "# State Engine Proof Matrix",
+        "",
+        "| Family | Legs | Confirmed | Gap | Unknown | Main unresolved proof |",
+        "| --- | ---: | ---: | ---: | ---: | --- |",
+    ]
+    rows.extend(f"| {label} | {counts[family]} | {counts[family]} | 0 | 0 | None |" for family, label in labels.items())
+    total = len(catalog["legs"])
+    rows.append(f"| **Total** | **{total}** | **{total}** | **0** | **0** | None |")
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+
+def _artifact_record(repository: Path, path: str, content: str) -> dict[str, str]:
+    artifact_path = repository / path
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(content, encoding="utf-8")
+    return {"path": path, "sha256": hashlib.sha256(content.encode()).hexdigest()}
+
+
+def _profile_provenance(profile_case: str) -> dict[str, str]:
+    if profile_case == "postgresql-16-aws-single-leader-landscape":
+        return {
+            "profile_case_id": profile_case,
+            "state_store": "postgresql-16",
+            "deployment": "aws-single-leader-landscape",
+            "backend_version": "16.13",
+        }
+    return {
+        "profile_case_id": profile_case,
+        "state_store": "sqlite-wal",
+        "deployment": profile_case.removeprefix("sqlite-wal-"),
+        "backend_version": "3.47.1",
+    }
+
+
+def _pytest_evidence(
+    repository: Path,
+    *,
+    evidence_id: str,
+    profile_case: str,
+    coverage: list[dict[str, Any]],
+    nodes: list[str],
+    counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    result_counts = counts or {
+        "passed": len(nodes),
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "warnings": 0,
+    }
+    stem = f"docs/architecture/state_engine/assessments/minimal-assessment/evidence/{evidence_id.lower()}"
+    junit_tests = sum(result_counts[key] for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
+    artifacts = [
+        _artifact_record(
+            repository,
+            f"{stem}.junit.xml",
+            (
+                f'<testsuite tests="{junit_tests}" failures="{result_counts["failed"]}" '
+                f'errors="{result_counts["errors"]}" '
+                f'skipped="{result_counts["skipped"] + result_counts["xfailed"]}" />\n'
+            ),
+        ),
+        _artifact_record(repository, f"{stem}.stdout", "pytest fixture output\n"),
+        _artifact_record(repository, f"{stem}.stderr", ""),
+    ]
+    node_index_content = "".join(f"{node}\n" for node in nodes)
+    node_index = _artifact_record(repository, f"{stem}.nodes", node_index_content)
+    return {
+        "id": evidence_id,
+        "kind": "pytest",
+        "reproducibility_class": "deterministic",
+        "argv": [sys.executable, "-m", "pytest", "-q", "tests/unit/test_state_engine_contract.py"],
+        "cwd_relative": ".",
+        "timeout_seconds": 30,
+        "safe_environment": {"PYTHONHASHSEED": "0"},
+        "resources": [],
+        "started_at": "2026-08-11T00:00:00+10:00",
+        "ended_at": "2026-08-11T00:00:01+10:00",
+        "duration_seconds": 1.0,
+        "exit_code": 0,
+        "result_counts": result_counts,
+        "execution_profile": _profile_provenance(profile_case),
+        "coverage": coverage,
+        "retained_artifacts": artifacts,
+        "collected_node_index": node_index,
+        "collected_nodes": len(nodes),
+        "establishes": ["Executable state-engine behavior for the declared proof cells."],
+        "does_not_establish": [],
+    }
+
+
+def _required_cells(catalog: dict[str, Any]) -> list[tuple[dict[str, Any], str, str, str]]:
+    cells: list[tuple[dict[str, Any], str, str, str]] = []
+    for leg in catalog["legs"]:
+        applicability = catalog["applicability_profiles"][leg["applicability_profile"]]
+        cases = leg.get("required_cases", [applicability["default_case_id"]])
+        for profile_case, policy in applicability["profile_case_applicability"].items():
+            if policy != "required":
+                continue
+            for case_id in cases:
+                for dimension in catalog["dimensions"]:
+                    if applicability[dimension] == "required":
+                        cells.append((leg, dimension, case_id, profile_case))
+    return cells
+
+
+def _materialize_complete_assessment(
+    repository: Path,
+    assessment_path: Path,
+    *,
+    one_node_per_profile: bool,
+) -> None:
+    catalog = json.loads((repository / "docs/architecture/state_engine/proof-catalog/v2/catalog.json").read_text())
+    assessment = json.loads(assessment_path.read_text())
+    cells = _required_cells(catalog)
+    evidence_by_profile: dict[str, str] = {}
+    records: list[dict[str, Any]] = []
+    for profile_index, profile_case in enumerate(
+        [profile["id"] for profile in catalog["execution_profiles"]["profile_cases"]],
+        start=1,
+    ):
+        profile_cells = [cell for cell in cells if cell[3] == profile_case]
+        subjects = list(dict.fromkeys((cell[0]["id"], cell[2], profile_case) for cell in profile_cells))
+        if one_node_per_profile:
+            nodes = [f"tests/unit/test_state_engine_contract.py::test_profile_{profile_index}"]
+            node_by_subject = dict.fromkeys(subjects, nodes[0])
+        else:
+            node_by_subject = {
+                subject: (
+                    "tests/unit/test_state_engine_contract.py::test_"
+                    + re.sub(r"[^a-z0-9]+", "_", f"{subject[0]}_{subject[1]}_{profile_index}".lower()).strip("_")
+                )
+                for subject in subjects
+            }
+            nodes = list(node_by_subject.values())
+        coverage = [
+            {
+                "leg_id": leg["id"],
+                "dimension_id": dimension,
+                "case_id": case_id,
+                "profile_case": profile_case,
+                "node_ids": [node_by_subject[(leg["id"], case_id, profile_case)]],
+            }
+            for leg, dimension, case_id, profile_case in profile_cells
+        ]
+        evidence_id = f"EV-PROFILE-{profile_index:02d}"
+        evidence_by_profile[profile_case] = evidence_id
+        records.append(
+            _pytest_evidence(
+                repository,
+                evidence_id=evidence_id,
+                profile_case=profile_case,
+                coverage=coverage,
+                nodes=nodes,
+            )
+        )
+    assessment["evidence"] = records
+    cells_by_leg: dict[str, list[tuple[dict[str, Any], str, str, str]]] = {}
+    for cell in cells:
+        cells_by_leg.setdefault(cell[0]["id"], []).append(cell)
+    for leg in assessment["legs"]:
+        leg["derived_verdict"] = "confirmed"
+        leg["reason"] = "Every required cell has executable passing evidence."
+        leg["owner_issue"] = None
+        leg["exit_gate"] = "Retain the passing executable selectors."
+        leg["overrides"] = [
+            {
+                "dimension": dimension,
+                "case": case_id,
+                "profile_case": profile_case,
+                "status": "pass",
+                "evidence": [evidence_by_profile[profile_case]],
+            }
+            for _catalog_leg, dimension, case_id, profile_case in cells_by_leg[leg["id"]]
+        ]
+    evidence_ids = list(evidence_by_profile.values())
+    for gate in assessment["hard_gates"]:
+        gate["status"] = "closed"
+        gate["support"] = evidence_ids
+        gate["affected_leg_ids"] = []
+        gate["reason"] = "All mapped mandatory proof cells have executable passing evidence."
+    family_counts = {
+        family: {
+            "confirmed": sum(leg["family"] == family for leg in catalog["legs"]),
+            "gap": 0,
+            "unknown": 0,
+        }
+        for family in (
+            "transition",
+            "auxiliary",
+            "run_coordination",
+            "production_boundary",
+            "read_model",
+            "forbidden",
+        )
+    }
+    assessment["derived"] = {
+        "family_counts": family_counts,
+        "total": {"confirmed": 73, "gap": 0, "unknown": 0},
+        "overall_verdict": "complete",
+        "reason": "All mandatory proof cells and hard gates are resolved.",
+    }
+    _write_json(assessment_path, assessment)
+    _write_complete_proof_matrix(repository / "docs/architecture/state_engine/proof-matrix.md", catalog)
+
+
+def _attach_ts00_pass(
+    assessment: dict[str, Any],
+    record: dict[str, Any],
+    *,
+    profile_case: str,
+) -> None:
+    assessment["evidence"] = [record]
+    ts00 = next(leg for leg in assessment["legs"] if leg["id"] == "TS-00")
+    ts00["overrides"] = [
+        {
+            "dimension": "production_entry",
+            "case": "leg-contract",
+            "profile_case": profile_case,
+            "status": "pass",
+            "evidence": [record["id"]],
+        }
+    ]
+
+
+def _ts00_coverage(profile_case: str, node_ids: list[str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "leg_id": "TS-00",
+            "dimension_id": "production_entry",
+            "case_id": "leg-contract",
+            "profile_case": profile_case,
+            "node_ids": node_ids,
+        }
+    ]
+
+
 @pytest.fixture
 def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
@@ -261,6 +512,7 @@ def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     _git(repository, "init", "-q")
     _git(repository, "config", "user.name", "State Engine Test")
     _git(repository, "config", "user.email", "state-engine-test@example.invalid")
+    _git(repository, "remote", "add", "origin", "fixture://state-engine")
     _git(repository, "add", "docs")
     _git(repository, "commit", "-qm", "fixture baseline")
 
@@ -451,6 +703,286 @@ def test_validate_package_accepts_complete_minimal_manifest(
     assert "state-engine assessment contract: valid" in result.stdout
     assert "73 legs" in result.stdout
     assert "not_complete" in result.stdout
+
+
+def test_validate_package_accepts_honest_complete_executable_manifest(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 0, result.stderr
+    assert "complete" in result.stdout
+
+
+def test_validate_package_rejects_one_node_fabricated_complete(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=True)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "one proof subject" in result.stderr
+
+
+def test_validate_package_rejects_documentary_evidence_for_behavioral_pass(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_documented_behavior"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-DOCUMENT",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+    )
+    record["kind"] = "documentation"
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "documentation evidence cannot promote" in result.stderr
+
+
+def test_validate_package_rejects_documentary_evidence_for_behavioral_fail(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_documented_failure"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-DOCUMENT-FAIL",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+    )
+    record["kind"] = "documentation"
+    assessment["evidence"] = [record]
+    ts00 = next(leg for leg in assessment["legs"] if leg["id"] == "TS-00")
+    ts00["derived_verdict"] = "gap"
+    ts00["overrides"] = [
+        {
+            "dimension": "production_entry",
+            "case": "leg-contract",
+            "profile_case": profile_case,
+            "status": "fail",
+            "evidence": [record["id"]],
+            "reason": "A document claims the behavior fails.",
+            "owner_issue": None,
+            "exit_gate": "Execute the behavioral proof.",
+        }
+    ]
+    hg09 = next(gate for gate in assessment["hard_gates"] if gate["id"] == "HG-09-mandatory-leg-unresolved")
+    hg09["support"] = [record["id"]]
+    assessment["derived"]["family_counts"]["transition"] = {"confirmed": 0, "gap": 1, "unknown": 19}
+    assessment["derived"]["total"] = {"confirmed": 0, "gap": 1, "unknown": 72}
+    _write_json(assessment_path, assessment)
+    matrix_path = repository / "docs/architecture/state_engine/proof-matrix.md"
+    matrix = matrix_path.read_text()
+    matrix = matrix.replace("| Token transitions | 20 | 0 | 0 | 20 |", "| Token transitions | 20 | 0 | 1 | 19 |")
+    matrix = matrix.replace("| **Total** | **73** | **0** | **0** | **73** |", "| **Total** | **73** | **0** | **1** | **72** |")
+    matrix_path.write_text(matrix)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "documentation evidence cannot establish behavioral fail" in result.stderr
+
+
+def test_validate_package_rejects_zero_node_pytest_promotion(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-ZERO-NODES",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, []),
+        nodes=[],
+    )
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "positive collected-node count" in result.stderr
+
+
+def test_validate_package_rejects_skipped_only_pytest_promotion(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_skipped_behavior"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-SKIPPED",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+        counts={"passed": 0, "failed": 0, "errors": 0, "skipped": 1, "xfailed": 0, "xpassed": 0, "warnings": 0},
+    )
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "skipped pytest evidence cannot promote" in result.stderr
+
+
+def test_validate_package_rejects_profile_provenance_mismatch(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    coverage_profile = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_profile_mismatch"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-PROFILE-MISMATCH",
+        profile_case="postgresql-16-aws-single-leader-landscape",
+        coverage=_ts00_coverage(coverage_profile, [node]),
+        nodes=[node],
+    )
+    _attach_ts00_pass(assessment, record, profile_case=coverage_profile)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "execution profile does not match coverage" in result.stderr
+
+
+def test_validate_package_rejects_non_postgresql_16_provenance(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "postgresql-16-aws-single-leader-landscape"
+    node = "tests/unit/test_state_engine_contract.py::test_postgresql_behavior"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-POSTGRES-15",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+    )
+    record["execution_profile"]["backend_version"] = "15.9"
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "PostgreSQL backend version must be 16.x" in result.stderr
+
+
+def test_validate_package_rejects_bool_execution_scalars(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_scalar_behavior"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-BOOL-SCALAR",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+    )
+    record["timeout_seconds"] = False
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "timeout_seconds must be a positive integer" in result.stderr
+
+
+def test_validate_package_rejects_malformed_evidence_timestamps(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    profile_case = "sqlite-wal-single-process-leader"
+    node = "tests/unit/test_state_engine_contract.py::test_timestamp_behavior"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-BAD-TIME",
+        profile_case=profile_case,
+        coverage=_ts00_coverage(profile_case, [node]),
+        nodes=[node],
+    )
+    record["started_at"] = "not-a-timestamp"
+    _attach_ts00_pass(assessment, record, profile_case=profile_case)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "started_at must be an offset-aware timestamp" in result.stderr
+
+
+def test_validate_package_rejects_current_live_repository_root_mismatch(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    assessment["baseline"]["repository_root"] = "/tmp/not-this-repository"
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "current-live repository_root" in result.stderr
+
+
+def test_validate_package_rejects_closed_gate_without_derived_support(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    hg01 = next(gate for gate in assessment["hard_gates"] if gate["id"] == "HG-01-invalid-subtype")
+    hg01["status"] = "closed"
+    hg01["reason"] = "Claimed closed without cell evidence."
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "hard gate HG-01-invalid-subtype does not match derived proof cells" in result.stderr
+
+
+def test_validate_package_rejects_non_string_gate_reason(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text())
+    assessment["hard_gates"][0]["reason"] = 7
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "hard gate HG-01-invalid-subtype reason must be a non-empty string" in result.stderr
 
 
 def test_validate_package_rejects_dangling_evidence(

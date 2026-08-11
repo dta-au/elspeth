@@ -33,7 +33,7 @@ Use this order when documents disagree:
 2. [Completeness criteria](completeness-criteria.md) define the claim bar.
 3. [Current architecture](architecture.md) describes the maintained model and
    known durable seams.
-4. The [v1 proof catalog](proof-catalog/v1/catalog.json) defines the finite leg,
+4. The [v2 proof catalog](proof-catalog/v2/catalog.json) defines the finite leg,
    dimension, case, and hard-gate universe.
 5. The current dated `assessment.json` binds evidence and findings to one code
    baseline.
@@ -72,7 +72,8 @@ docs/architecture/state_engine/
 ├── assessment-framework.md
 ├── proof-catalog/
 │   ├── README.md
-│   └── v1/catalog.json
+│   ├── v1/catalog.json         # frozen historical contract
+│   └── v2/catalog.json         # current contract
 ├── templates/
 │   ├── assessment-readme.md
 │   ├── verification-run.md

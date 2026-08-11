@@ -277,17 +277,22 @@
       "maintenance": "Refusal/reachability selectors and the deliberate-absence decision remain maintained."
     }
   },
+  "evidence_contract": {
+    "behavioral_promotion_kinds": ["pytest"],
+    "support_only_kinds": ["documentation"],
+    "pytest_result_count_keys": ["passed", "failed", "errors", "skipped", "xfailed", "xpassed", "warnings"]
+  },
   "hard_gates": [
-    {"id": "HG-01-invalid-subtype", "title": "Malformed state/subtype bundles are never admitted"},
-    {"id": "HG-02-authority-downgrade", "title": "Missing authority never selects a weaker production write"},
-    {"id": "HG-03-double-winner", "title": "Contention cannot produce two effective winners"},
-    {"id": "HG-04-refusal-mutation", "title": "Refusal preserves the complete durable image"},
-    {"id": "HG-05-state-evidence-atomicity", "title": "State and mandatory evidence commit or roll back together"},
-    {"id": "HG-06-restart-loss-or-duplicate", "title": "Restart loses or duplicates neither work nor external effect"},
-    {"id": "HG-07-read-model-unproved-arm", "title": "Orchestration decisions have no unproved state/subtype arm"},
-    {"id": "HG-08-plugin-lifecycle-durability", "title": "Supported plugin lifecycle paths preserve the durable contract"},
-    {"id": "HG-09-mandatory-leg-unresolved", "title": "Every mandatory catalog case is resolved"},
-    {"id": "HG-10-normative-contract-drift", "title": "Source, architecture, catalog, assessment, and tracker agree"}
+    {"id": "HG-01-invalid-subtype", "title": "Malformed state/subtype bundles are never admitted", "dimensions": ["guard_refusal"]},
+    {"id": "HG-02-authority-downgrade", "title": "Missing authority never selects a weaker production write", "dimensions": ["guard_refusal"]},
+    {"id": "HG-03-double-winner", "title": "Contention cannot produce two effective winners", "dimensions": ["concurrency"]},
+    {"id": "HG-04-refusal-mutation", "title": "Refusal preserves the complete durable image", "dimensions": ["zero_mutation_rollback"]},
+    {"id": "HG-05-state-evidence-atomicity", "title": "State and mandatory evidence commit or roll back together", "dimensions": ["success_effects", "zero_mutation_rollback"]},
+    {"id": "HG-06-restart-loss-or-duplicate", "title": "Restart loses or duplicates neither work nor external effect", "dimensions": ["crash_restart"]},
+    {"id": "HG-07-read-model-unproved-arm", "title": "Orchestration decisions have no unproved state/subtype arm", "dimensions": ["read_model_truth_table"]},
+    {"id": "HG-08-plugin-lifecycle-durability", "title": "Supported plugin lifecycle paths preserve the durable contract", "dimensions": ["boundary_composition"]},
+    {"id": "HG-09-mandatory-leg-unresolved", "title": "Every mandatory catalog case is resolved", "dimensions": ["production_entry", "precondition_image", "success_effects", "guard_refusal", "zero_mutation_rollback", "concurrency", "crash_restart", "boundary_composition", "read_model_truth_table", "maintenance"]},
+    {"id": "HG-10-normative-contract-drift", "title": "Source, architecture, catalog, assessment, and tracker agree", "dimensions": ["maintenance"]}
   ],
   "required_leg_ids": [
     "TS-00", "TS-01", "TS-02", "TS-03", "TS-04", "TS-05", "TS-06", "TS-07", "TS-08", "TS-09",

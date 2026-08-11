@@ -121,6 +121,14 @@ Source inspection, architecture documents, decisions, plans, tracker state,
 and test names support mapping and interpretation. They cannot independently
 make a behavioral case pass.
 
+The v2 catalog makes that boundary executable: `pytest` is the only behavioral
+promotion kind and `documentation` is support-only. A promoting pytest record
+must bind every coverage tuple to retained node IDs, use one
+leg/case/profile proof subject per node, match one catalog execution profile,
+and report a positive all-passing result with no skip, xfail, or xpass.
+PostgreSQL evidence reports a semantic 16.x backend version; SQLite evidence
+reports a semantic 3.x version.
+
 Concurrency claims require independent connections and, where the contract is
 process-scoped, independent operating-system processes. In-process exception
 handling does not establish process-death recovery.
@@ -146,15 +154,16 @@ The catalog defines these hard gates:
 - `HG-10-normative-contract-drift` — source, architecture, catalog, assessment,
   and tracker do not contradict one another.
 
-Any open or unknown hard gate prevents a `complete` verdict.
+Each gate declares the dimensions from which its status, affected legs, and
+evidence support are derived. Any open or unknown hard gate prevents a
+`complete` verdict.
 
 ## Derived verdicts
 
 Leg verdicts derive from their expanded cases and assessment gate mapping:
 
 - `confirmed`: every required case passes and every N/A is catalog-approved;
-- `gap`: at least one required case fails or an open hard gate's
-  `affected_leg_ids` names the leg;
+- `gap`: at least one required case fails;
 - `unknown`: no known failure exists, but required evidence is missing.
 
 Overall verdicts:

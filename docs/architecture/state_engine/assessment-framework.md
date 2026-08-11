@@ -7,14 +7,14 @@ This framework explains how to interpret evidence. Follow the executable
 
 ### Full
 
-A full assessment inventories all 68 catalog legs, every required case, and all
+A full assessment inventories all 73 catalog legs, every required case, and all
 hard gates. It may change the global verdict.
 
 ### Delta
 
 A delta assessment names the changed legs/cases, establishes change impact,
 reruns their evidence and adjacent invariants, and changes only those cells. Its
-manifest still materializes all 68 legs, names the parent digest, and lists the
+manifest still materializes all 73 legs, names the parent digest, and lists the
 changed tuples. It inherits unresolved cells from the preceding full assessment
 and cannot declare the whole engine complete.
 
@@ -28,7 +28,7 @@ report; it never overwrites the original assessment.
 
 1. Fix the code baseline and capture the complete worktree identity.
 2. Verify Loomweave freshness and record structural-query limitations.
-3. Load the exact catalog version and verify all 68 legs are present.
+3. Load the exact catalog version and verify all 73 legs are present.
 4. Discover production writers, callers, read models, external-effect
    boundaries, and cross-transaction seams.
 5. Reconcile live Filigree issues without treating issue closure as proof.
@@ -49,15 +49,25 @@ Every execution record contains:
 - repository-relative working directory;
 - safe environment additions/removals and required resources;
 - start/end times, timeout, exit code, and duration;
-- collected node IDs and pass/fail/error/skip/xfail counts;
+- one catalog execution profile with its state store, deployment, and semantic
+  backend version;
+- positive, unique collected node IDs and exact
+  pass/fail/error/skip/xfail/xpass/warning counts;
 - stdout, stderr, JUnit, and retained artifact paths with SHA-256 when stored;
-- catalog coverage tuples: leg, dimension, and case;
+- catalog coverage tuples: leg, dimension, semantic case, profile case, and the
+  exact node IDs that establish that tuple;
 - `establishes` and `does_not_establish` statements;
 - reproducibility class: `deterministic`, `semantic_comparison`, or
   `external_observation`.
 
 Warnings, skips, xfails, missing credentials, and partial platform coverage are
 evidence facts. Do not omit them to make a run appear cleaner.
+
+Only a successful `pytest` record with a positive pass count, no
+fail/error/skip/xfail/xpass result, matching collection/JUnit totals, and
+one proof subject per cited node can promote a behavioral cell. A node may
+cover several dimensions of that one leg/case/profile subject. Documentation
+records are support-only and cannot promote behavioral cells.
 
 ## Classification rules
 
@@ -72,6 +82,10 @@ evidence facts. Do not omit them to make a run appear cleaner.
 - Record an explicit `owner_issue` key for every active gap. `null` means
   visibly unowned; it does not make the gap disappear.
 - State an observable exit gate. “Add more tests” is not an exit gate.
+
+Hard-gate status, affected legs, and support are derived from the catalog's
+gate-to-dimension mappings and the validated cell evidence. Assessors explain
+the result; they do not independently close a gate.
 
 ## Proof boundaries
 
