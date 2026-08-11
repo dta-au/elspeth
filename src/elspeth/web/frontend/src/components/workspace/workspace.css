@@ -115,8 +115,8 @@
   top: 0;
   bottom: 0;
   left: calc(50% - 0.5px);
-  width: 1px;
-  background: var(--color-border, currentcolor);
+  width: 0;
+  border-left: 1px solid var(--color-border, currentcolor);
   content: "";
 }
 
