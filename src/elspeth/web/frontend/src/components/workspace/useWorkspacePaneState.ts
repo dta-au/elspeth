@@ -1,4 +1,11 @@
-import { useCallback, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useInsertionEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import {
   ARTIFACT_TABS,
@@ -70,15 +77,21 @@ function isMeasuredWidth(width: number): boolean {
   return Number.isFinite(width) && width > 0;
 }
 
-function artifactTabsWithGraph(
+function artifactTabsKeyWithGraph(
   availableArtifactTabs: readonly ArtifactTab[],
-): AvailableArtifactTabs {
-  if (availableArtifactTabs[0] === "graph") {
-    return availableArtifactTabs as AvailableArtifactTabs;
-  }
+): string {
+  return ARTIFACT_TABS.filter(
+    (tab) => tab === "graph" || availableArtifactTabs.includes(tab),
+  ).join("|");
+}
+
+function artifactTabsFromKey(key: string): AvailableArtifactTabs {
+  const available = new Set(key.split("|"));
   return [
     "graph",
-    ...availableArtifactTabs.filter((tab) => tab !== "graph"),
+    ...ARTIFACT_TABS.filter(
+      (tab) => tab !== "graph" && available.has(tab),
+    ),
   ];
 }
 
@@ -112,7 +125,21 @@ export function clampAuthoringWidth(
   preferred: number,
   bounds: PaneBounds,
 ): number {
-  return Math.min(bounds.max, Math.max(bounds.min, preferred));
+  // Bounds describe owned layout geometry. If that contract is corrupt, fail
+  // closed to the global minimum; an invalid preference uses the bounded
+  // default and is never allowed to propagate NaN into state or persistence.
+  if (
+    !Number.isFinite(bounds.min) ||
+    !Number.isFinite(bounds.max) ||
+    bounds.max < bounds.min
+  ) {
+    return AUTHORING_MIN;
+  }
+  const boundedDefault = Number.isFinite(bounds.defaultWidth)
+    ? Math.min(bounds.max, Math.max(bounds.min, bounds.defaultWidth))
+    : bounds.min;
+  const candidate = Number.isFinite(preferred) ? preferred : boundedDefault;
+  return Math.min(bounds.max, Math.max(bounds.min, candidate));
 }
 
 export function nearestAvailableArtifactTab(
@@ -202,8 +229,12 @@ export function useWorkspacePaneState({
   sessionId,
   availableArtifactTabs = ARTIFACT_TABS,
 }: UseWorkspacePaneStateOptions): WorkspacePaneState {
-  const normalizedAvailableArtifactTabs = artifactTabsWithGraph(
+  const availableArtifactTabsKey = artifactTabsKeyWithGraph(
     availableArtifactTabs,
+  );
+  const normalizedAvailableArtifactTabs = useMemo(
+    () => artifactTabsFromKey(availableArtifactTabsKey),
+    [availableArtifactTabsKey],
   );
   const workspaceMeasured = isMeasuredWidth(workspaceWidth);
   const [initialLayout] = useState(() => initialWorkspaceLayout(workspaceWidth));
@@ -219,7 +250,10 @@ export function useWorkspacePaneState({
   const [ephemeralPaneState, setEphemeralPaneState] =
     useState<EphemeralPaneState>(() => defaultEphemeralPaneState(sessionId));
 
-  const paneBounds = paneBoundsForWidth(workspaceWidth);
+  const paneBounds = useMemo(
+    () => paneBoundsForWidth(workspaceWidth),
+    [workspaceWidth],
+  );
   const effectiveCandidate =
     transientAuthoringWidth ?? preferredAuthoringWidth;
   const effectiveAuthoringWidth =
@@ -275,7 +309,10 @@ export function useWorkspacePaneState({
   const commitResize = useCallback(
     (finalWidth: number): void => {
       const committed = committedValuesRef.current;
-      if (!committed.workspaceMeasured || !isMeasuredWidth(finalWidth)) return;
+      if (!committed.workspaceMeasured || !isMeasuredWidth(finalWidth)) {
+        setTransientAuthoringWidth(null);
+        return;
+      }
       const committedWidth = clampAuthoringWidth(
         finalWidth,
         committed.paneBounds,
@@ -350,7 +387,10 @@ export function useWorkspacePaneState({
     });
   }, []);
 
-  useLayoutEffect(() => {
+  // Stable actions can run from descendant layout effects. Publish only the
+  // newly committed values here, before those effects; state normalization
+  // stays in the layout effect below and speculative renders never write it.
+  useInsertionEffect(() => {
     committedValuesRef.current = {
       paneBounds,
       workspaceMeasured,
@@ -359,6 +399,16 @@ export function useWorkspacePaneState({
       availableArtifactTabs: normalizedAvailableArtifactTabs,
       sessionId,
     };
+  }, [
+    authoringCollapsed,
+    normalizedAvailableArtifactTabs,
+    paneBounds,
+    preferredAuthoringWidth,
+    sessionId,
+    workspaceMeasured,
+  ]);
+
+  useLayoutEffect(() => {
     setEphemeralPaneState((current) => {
       if (current.sessionId !== sessionId) {
         return defaultEphemeralPaneState(sessionId);
@@ -374,12 +424,8 @@ export function useWorkspacePaneState({
       };
     });
   }, [
-    authoringCollapsed,
     normalizedAvailableArtifactTabs,
-    paneBounds,
-    preferredAuthoringWidth,
     sessionId,
-    workspaceMeasured,
   ]);
 
   return {

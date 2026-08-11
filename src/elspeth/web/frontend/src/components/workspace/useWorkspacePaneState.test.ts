@@ -188,6 +188,54 @@ describe("workspace pane state", () => {
       ["NaN", Number.NaN],
       ["positive infinity", Number.POSITIVE_INFINITY],
       ["negative infinity", Number.NEGATIVE_INFINITY],
+    ])("uses the bounded default for a non-finite preferred width: %s", (
+      _label,
+      preferred,
+    ) => {
+      const bounds = paneBoundsForWidth(1536);
+
+      expect(clampAuthoringWidth(preferred, bounds)).toBe(bounds.defaultWidth);
+    });
+
+    it.each([
+      [
+        "a non-finite minimum",
+        { min: Number.NaN, max: 640, defaultWidth: 420 },
+      ],
+      [
+        "a non-finite maximum",
+        { min: 360, max: Number.POSITIVE_INFINITY, defaultWidth: 420 },
+      ],
+      ["an inverted range", { min: 640, max: 360, defaultWidth: 420 }],
+    ])("falls back to the authoring minimum for %s", (_label, partialBounds) => {
+      expect(
+        clampAuthoringWidth(500, { ...partialBounds, resizable: true }),
+      ).toBe(AUTHORING_MIN);
+    });
+
+    it("uses the lower bound when the fallback default is non-finite", () => {
+      expect(
+        clampAuthoringWidth(500, {
+          min: 360,
+          max: 460,
+          defaultWidth: Number.NaN,
+          resizable: true,
+        }),
+      ).toBe(460);
+      expect(
+        clampAuthoringWidth(Number.NaN, {
+          min: 360,
+          max: 460,
+          defaultWidth: Number.NaN,
+          resizable: true,
+        }),
+      ).toBe(360);
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["positive infinity", Number.POSITIVE_INFINITY],
+      ["negative infinity", Number.NEGATIVE_INFINITY],
       ["a negative width", -1],
       ["zero", 0],
     ])("treats %s workspace width as unmeasured", (_label, width) => {
@@ -548,6 +596,76 @@ describe("workspace pane state", () => {
       expect(storedLayout()?.preferredAuthoringWidth).toBe(620);
     });
 
+    it("publishes the new session before descendant layout-effect actions", () => {
+      interface DescendantProps {
+        paneState: WorkspacePaneState;
+        sessionId: string;
+      }
+
+      function SessionLayoutAction({ paneState, sessionId }: DescendantProps) {
+        const { selectArtifactTab } = paneState;
+        useLayoutEffect(() => {
+          if (sessionId === "s2") selectArtifactTab("run");
+        }, [selectArtifactTab, sessionId]);
+        return createElement(
+          "output",
+          { "data-testid": "active-artifact" },
+          paneState.activeArtifactTab,
+        );
+      }
+
+      function SessionHarness({ sessionId }: { sessionId: string }) {
+        const paneState = useWorkspacePaneState({
+          workspaceWidth: 1536,
+          sessionId,
+        });
+        return createElement(SessionLayoutAction, { paneState, sessionId });
+      }
+
+      const view = render(createElement(SessionHarness, { sessionId: "s1" }));
+      view.rerender(createElement(SessionHarness, { sessionId: "s2" }));
+
+      expect(
+        view.getByTestId("active-artifact").textContent,
+      ).toBe("run");
+    });
+
+    it("publishes new bounds before descendant layout-effect resize commits", () => {
+      interface DescendantProps {
+        paneState: WorkspacePaneState;
+        workspaceWidth: number;
+      }
+
+      function ResizeLayoutAction({
+        paneState,
+        workspaceWidth,
+      }: DescendantProps) {
+        const { commitResize } = paneState;
+        useLayoutEffect(() => {
+          if (workspaceWidth === 1100) commitResize(620);
+        }, [commitResize, workspaceWidth]);
+        return null;
+      }
+
+      function ResizeHarness({ workspaceWidth }: { workspaceWidth: number }) {
+        const paneState = useWorkspacePaneState({
+          workspaceWidth,
+          sessionId: "s1",
+        });
+        return createElement(ResizeLayoutAction, {
+          paneState,
+          workspaceWidth,
+        });
+      }
+
+      const view = render(
+        createElement(ResizeHarness, { workspaceWidth: 1536 }),
+      );
+      view.rerender(createElement(ResizeHarness, { workspaceWidth: 1100 }));
+
+      expect(storedLayout()?.preferredAuthoringWidth).toBe(460);
+    });
+
     it.each([
       ["NaN", Number.NaN],
       ["positive infinity", Number.POSITIVE_INFINITY],
@@ -570,8 +688,26 @@ describe("workspace pane state", () => {
       });
 
       expect(result.current.preferredAuthoringWidth).toBe(620);
-      expect(result.current.effectiveAuthoringWidth).toBe(500);
+      expect(result.current.effectiveAuthoringWidth).toBe(620);
       expect(storedLayout()).toEqual(VALID_LAYOUT);
+    });
+
+    it("keeps derived bounds and availability stable during transient resize", () => {
+      const availableArtifactTabs: readonly ArtifactTab[] = ["run"];
+      const { result } = renderHook(() =>
+        useWorkspacePaneState({
+          workspaceWidth: 1536,
+          sessionId: "s1",
+          availableArtifactTabs,
+        }),
+      );
+      const paneBounds = result.current.paneBounds;
+      const normalizedTabs = result.current.availableArtifactTabs;
+
+      act(() => result.current.resizeTransient(500));
+
+      expect(result.current.paneBounds).toBe(paneBounds);
+      expect(result.current.availableArtifactTabs).toBe(normalizedTabs);
     });
 
     it.each([
