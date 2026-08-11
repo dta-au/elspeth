@@ -301,14 +301,37 @@ export async function expectDialogGeometry(
       bottom: bounds.bottom,
       bodyOverflowY: getComputedStyle(body).overflowY,
       bodyScrolls: body.scrollHeight > body.clientHeight,
-      titleVisible: title.getBoundingClientRect().top >= bounds.top,
-      actionsVisible: actions.getBoundingClientRect().bottom <= bounds.bottom,
+      bodyHorizontalOverflow: body.scrollWidth - body.clientWidth,
+      maxContentHorizontalOverflow: Math.max(
+        0,
+        ...[...body.querySelectorAll<HTMLElement>("*")].map(
+          (content) => content.scrollWidth - content.clientWidth,
+        ),
+      ),
+      titleVisible: (() => {
+        const titleBounds = title.getBoundingClientRect();
+        return (
+          titleBounds.top >= bounds.top &&
+          titleBounds.left >= bounds.left &&
+          titleBounds.right <= bounds.right
+        );
+      })(),
+      actionsVisible: (() => {
+        const actionBounds = actions.getBoundingClientRect();
+        return (
+          actionBounds.bottom <= bounds.bottom &&
+          actionBounds.left >= bounds.left &&
+          actionBounds.right <= bounds.right
+        );
+      })(),
     };
   });
   expect(geometry.top).toBeGreaterThanOrEqual(16);
   expect(geometry.bottom).toBeLessThanOrEqual(page.viewportSize()!.height - 16);
   expect(geometry.bodyOverflowY).toBe("auto");
   expect(geometry.bodyScrolls).toBe(true);
+  expect(geometry.bodyHorizontalOverflow).toBeLessThanOrEqual(0);
+  expect(geometry.maxContentHorizontalOverflow).toBeLessThanOrEqual(0);
   expect(geometry.titleVisible).toBe(true);
   expect(geometry.actionsVisible).toBe(true);
 }

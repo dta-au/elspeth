@@ -48,6 +48,8 @@ async function expectUncoveredWhenFocused(
   locator: Locator,
 ): Promise<void> {
   await locator.scrollIntoViewIfNeeded();
+  await expect(locator).toBeEnabled();
+  await locator.click({ trial: true });
   await locator.focus();
   await expect(locator).toBeFocused();
   const geometry = await locator.evaluate((element) => {
@@ -100,15 +102,17 @@ test.describe("Composer workspace browser accessibility", () => {
       ]);
 
       const authoring = await composer.authoringPane().boundingBox();
-      const separator = await composer.separator().boundingBox();
+      // Measure the zero-width grid boundary, not the separator's intentional
+      // 24px pointer target that straddles it for motor accessibility.
+      const separator = await composer.workspace()
+        .locator(':scope > [data-workspace-part="separator"]')
+        .boundingBox();
       const artifact = await composer.artifactRegion().boundingBox();
       expect(authoring).not.toBeNull();
       expect(separator).not.toBeNull();
       expect(artifact).not.toBeNull();
-      expect(authoring!.x + authoring!.width).toBeLessThanOrEqual(
-        separator!.x + separator!.width,
-      );
-      expect(separator!.x).toBeLessThan(artifact!.x + artifact!.width);
+      expect(authoring!.x + authoring!.width).toBeLessThanOrEqual(separator!.x);
+      expect(separator!.x + separator!.width).toBeLessThanOrEqual(artifact!.x);
       expect(artifact!.x).toBeGreaterThan(authoring!.x);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);

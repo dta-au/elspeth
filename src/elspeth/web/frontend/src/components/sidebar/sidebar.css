@@ -360,14 +360,18 @@
    reach (sources, LLM/model, network fetches, sinks), derived from the
    live composition. */
 .run-disclosure-summary {
+  min-width: 0;
   margin: 0 0 var(--space-md);
   padding-left: var(--space-lg);
   font-size: var(--font-size-sm);
   color: var(--color-text);
+  overflow-wrap: anywhere;
 }
 
 .run-disclosure-summary li {
+  min-width: 0;
   margin-bottom: var(--space-xs);
+  overflow-wrap: anywhere;
 }
 
 .run-disclosure-opt-out {

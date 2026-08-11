@@ -23,6 +23,10 @@ export type CompositionStateSeed = Pick<
   "version" | "metadata" | "sources" | "nodes" | "edges" | "outputs"
 >;
 
+export interface SeedCompositionStateOptions {
+  timeout?: number;
+}
+
 export async function authedContext(token: string): Promise<APIRequestContext> {
   return request.newContext({
     baseURL: BACKEND_BASE_URL,
@@ -73,13 +77,11 @@ export async function seedCompositionState(
   ctx: APIRequestContext,
   sessionId: string,
   state: CompositionStateSeed,
+  options: SeedCompositionStateOptions = {},
 ): Promise<CompositionState> {
   const resp = await ctx.post(`/api/sessions/${sessionId}/state/e2e-seed`, {
     data: { state },
-    // Tall workspace fixtures intentionally seed dozens of graph nodes. Give
-    // that setup request room to persist while keeping the suite's normal
-    // 10-second interaction timeout unchanged.
-    timeout: 30_000,
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
   });
   if (!resp.ok()) {
     throw new Error(

@@ -134,39 +134,44 @@ async function seedCanonicalComposition(
         schema: { mode: "observed" },
       },
     }));
-    return await seedCompositionState(ctx, sessionId, {
-      version: 1,
-      metadata: {
-        name: "Deterministic workspace pipeline",
-        description: "Fixed geometry acceptance composition.",
-      },
-      sources: {
-        source: {
-          plugin: "csv",
-          on_success:
-            tallDialogNodes.length > 0 ? tallDialogNodes[0]!.id : "results",
-          options: {
-            path: sourcePath(sessionId, blob.id),
-            blob_ref: blob.id,
-            schema: { mode: "observed" },
-          },
-          on_validation_failure: "discard",
+    return await seedCompositionState(
+      ctx,
+      sessionId,
+      {
+        version: 1,
+        metadata: {
+          name: "Deterministic workspace pipeline",
+          description: "Fixed geometry acceptance composition.",
         },
-      },
-      nodes: tallDialogNodes,
-      edges: [],
-      outputs: [
-        {
-          name: "results",
-          plugin: "csv",
-          options: {
-            path: "outputs/deterministic-workspace.csv",
-            schema: { mode: "observed" },
+        sources: {
+          source: {
+            plugin: "csv",
+            on_success:
+              tallDialogNodes.length > 0 ? tallDialogNodes[0]!.id : "results",
+            options: {
+              path: sourcePath(sessionId, blob.id),
+              blob_ref: blob.id,
+              schema: { mode: "observed" },
+            },
+            on_validation_failure: "discard",
           },
-          on_write_failure: "discard",
         },
-      ],
-    });
+        nodes: tallDialogNodes,
+        edges: [],
+        outputs: [
+          {
+            name: "results",
+            plugin: "csv",
+            options: {
+              path: "outputs/deterministic-workspace.csv",
+              schema: { mode: "observed" },
+            },
+            on_write_failure: "discard",
+          },
+        ],
+      },
+      scenario === "tall-confirmation-dialog" ? { timeout: 30_000 } : {},
+    );
   } finally {
     await ctx.dispose();
   }
@@ -567,6 +572,14 @@ export async function installWorkspaceScenario(
 export async function deleteWorkspaceScenario(page: Page, sessionId: string): Promise<void> {
   INSTALLED_SCENARIOS.get(page)?.pendingAcknowledgement?.release();
   const token = tokenFromStorageState(await page.context().storageState());
+  if (!page.isClosed()) {
+    // Stop the mounted Composer before deleting its backing session/blob.
+    // Navigation cancels old document fetches; networkidle plus unrouteAll's
+    // wait mode proves no route handler can continue into cleanup afterwards.
+    await page.goto("about:blank", { waitUntil: "load" });
+    await page.waitForLoadState("networkidle");
+    await page.unrouteAll({ behavior: "wait" });
+  }
   const ctx = await authedContext(token);
   try {
     await deleteSession(ctx, sessionId);

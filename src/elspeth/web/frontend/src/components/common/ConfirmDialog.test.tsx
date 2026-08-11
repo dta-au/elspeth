@@ -60,7 +60,14 @@ describe("ConfirmDialog", () => {
       /\.confirm-dialog\s*\{[^}]*max-height:\s*calc\(100dvh - 32px\);[^}]*overflow:\s*hidden;/s,
     );
     expect(css).toMatch(
-      /\.confirm-dialog-body\s*\{[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s,
+      /\.confirm-dialog-body\s*\{[^}]*min-width:\s*0;[^}]*min-height:\s*0;[^}]*overflow-y:\s*auto;/s,
+    );
+    const sidebarCss = readFileSync("src/components/sidebar/sidebar.css", "utf8");
+    expect(sidebarCss).toMatch(
+      /\.run-disclosure-summary\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/s,
+    );
+    expect(sidebarCss).toMatch(
+      /\.run-disclosure-summary li\s*\{[^}]*min-width:\s*0;[^}]*overflow-wrap:\s*anywhere;/s,
     );
     expect(css).toMatch(/\.confirm-dialog-header[^}]*flex-shrink:\s*0;/s);
     expect(css).toMatch(/\.confirm-dialog-actions[^}]*flex-shrink:\s*0;/s);
