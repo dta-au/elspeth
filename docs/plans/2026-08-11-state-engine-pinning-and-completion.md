@@ -663,7 +663,7 @@ git commit -m "test(state-engine): close queue and plugin disposition contracts"
 
 **Definition of Done:**
 
-- [ ] TS-00/01/02, PB-01/02/03, and F-11 cells are promoted only where all required dimensions pass.
+- [ ] TS-00/01/02/07/08/09/10, PB-01/02/03, and F-11 cells are promoted only where all required dimensions pass.
 - [ ] State and mandatory evidence rollback together.
 - [ ] Production plugin calls, not helper-only calls, own boundary evidence.
 - [ ] Existing issue closure matches current assessment cells.
@@ -842,11 +842,15 @@ git commit -m "test(state-engine): close read-model and refusal matrices"
 - Modify: `tests/integration/pipeline/test_row_union_ab_experiment.py`
 - Modify: `tests/integration/pipeline/test_row_union_branch_loss.py`
 - Create: `tests/e2e/recovery/test_barrier_process_death_matrix.py`
+- Create: `tests/testcontainer/core/test_barrier_recovery_postgres.py`
 - Modify as defects require: `src/elspeth/core/landscape/scheduler/barrier.py`
 - Modify as defects require: `src/elspeth/engine/barrier_coordination.py`
 - Modify as defects require: `src/elspeth/engine/coalesce_executor.py`
+- Modify as defects require: `src/elspeth/engine/executors/aggregation.py`
 - Modify as defects require: `src/elspeth/engine/row_union_executor.py`
+- Modify as defects require: `src/elspeth/engine/processor.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/aggregation.py`
+- Modify as contract changes require: `docs/architecture/state_engine/architecture.md`
 
 **Step 1: Define seam cases before implementation**
 
@@ -863,6 +867,8 @@ For aggregation, coalesce, and row union, kill the process:
 
 Pin member identities, branch loss reason, release order, parent/child tokens, result/effect identity, scheduler events, outcome rows, and downstream artifact count. Compare recovered runs to uninterrupted semantic controls, allowing only named recovery-claim provenance differences.
 
+In particular, make the aggregation image with a committed batch/result and terminal input outcomes, but BLOCKED scheduler rows and no continuation, executable. Recovery must reconstruct the continuation without replaying the committed aggregation transform or effect.
+
 **Step 3: Run RED**
 
 ```bash
@@ -875,6 +881,33 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/e2e/recovery/test_barrier_process_death_matrix.py
 ```
 
+Run PostgreSQL 16 separately with a live profile reporter; these assertions cover the AWS single-leader backend semantics and do not claim multi-replica scheduling:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
+  -p scripts.state_engine_profile_reporter \
+  --state-engine-profile-report=<assessment>/evidence/task8-postgresql.profile.json \
+  tests/testcontainer/core/test_barrier_recovery_postgres.py
+```
+
+Define one genuinely exercised process-matrix selector for each SQLite deployment profile and retain them in separate reporter sessions:
+
+```bash
+for deployment in \
+  single_process_leader \
+  same_host_leader_plus_claim_only_followers \
+  web_hosted_leader_plus_same_host_cli_followers
+do
+  PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
+    -p scripts.state_engine_profile_reporter \
+    --state-engine-profile-report="<assessment>/evidence/task8-${deployment}.profile.json" \
+    tests/e2e/recovery/test_barrier_process_death_matrix.py \
+    -k "$deployment"
+done
+```
+
+The named selector must call `observe_sqlite` with the matching live deployment boundary; relabelling one generic SQLite run does not satisfy this step.
+
 **Step 4: Fix only demonstrated continuation gaps**
 
 All state/evidence needed after a crash must commit in the barrier completion transaction or be named by a durable continuation that a fresh leader deterministically claims. Never repair by replaying plugin work whose committed result/effect already exists.
@@ -885,21 +918,26 @@ All state/evidence needed after a crash must commit in the barrier completion tr
 git add src/elspeth/core/landscape/scheduler/barrier.py \
   src/elspeth/engine/barrier_coordination.py \
   src/elspeth/engine/coalesce_executor.py \
+  src/elspeth/engine/executors/aggregation.py \
   src/elspeth/engine/row_union_executor.py \
+  src/elspeth/engine/processor.py \
   src/elspeth/engine/orchestrator/aggregation.py \
   tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py \
   tests/integration/pipeline \
   tests/e2e/recovery/test_barrier_process_death_matrix.py \
+  tests/testcontainer/core/test_barrier_recovery_postgres.py \
+  docs/architecture/state_engine/architecture.md \
   docs/architecture/state_engine/assessments
 git commit -m "test(state-engine): complete durable barrier recovery"
 ```
 
 **Definition of Done:**
 
-- [ ] TS-07 and TS-15–18 pass for every applicable barrier family.
+- [ ] TS-15–18 pass for every applicable barrier family; Task 5's TS-07 BLOCKED-entry evidence is integrated without duplicate ownership.
 - [ ] AUX-03–05 and PB-04/05/10 pass across restart seams.
 - [ ] Row union loss, timeout, late arrival, and recovery cases are explicit.
-- [ ] No group releases twice and no committed continuation is lost.
+- [ ] PostgreSQL 16 and each SQLite deployment profile are separately attributable to the boundary actually exercised.
+- [ ] No group releases twice, no committed continuation is lost, and committed aggregation work is never replayed to reconstruct one.
 
 ---
 
