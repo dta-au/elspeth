@@ -1,4 +1,11 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, render, renderHook } from "@testing-library/react";
+import {
+  createElement,
+  startTransition,
+  Suspense,
+  useLayoutEffect,
+  useState,
+} from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -16,6 +23,7 @@ import type {
   ArtifactTab,
   StoredWorkspaceLayoutV1,
 } from "./workspaceTypes";
+import type { WorkspacePaneState } from "./useWorkspacePaneState";
 
 const VALID_LAYOUT: StoredWorkspaceLayoutV1 = {
   version: 1,
@@ -174,6 +182,16 @@ describe("workspace pane state", () => {
       expect(clampAuthoringWidth(300, bounds)).toBe(360);
       expect(clampAuthoringWidth(420, bounds)).toBe(420);
       expect(clampAuthoringWidth(620, bounds)).toBe(460);
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["positive infinity", Number.POSITIVE_INFINITY],
+      ["negative infinity", Number.NEGATIVE_INFINITY],
+      ["a negative width", -1],
+      ["zero", 0],
+    ])("treats %s workspace width as unmeasured", (_label, width) => {
+      expect(paneBoundsForWidth(width)).toEqual(paneBoundsForWidth(0));
     });
   });
 
@@ -362,6 +380,236 @@ describe("workspace pane state", () => {
       expect(result.current.activeArtifactTab).toBe("graph");
       expect(result.current.activeInspectorTab).toBeNull();
       expect(result.current.inspectorOpen).toBe(false);
+    });
+
+    it("exposes normalized ephemeral state to layout-effect consumers on the first transition commit", () => {
+      interface Observation {
+        sessionId: string;
+        activeArtifactTab: ArtifactTab;
+        activeInspectorTab: WorkspacePaneState["activeInspectorTab"];
+      }
+
+      interface ObserverProps {
+        paneState: WorkspacePaneState;
+        sessionId: string;
+        observations: Observation[];
+      }
+
+      function LayoutEffectObserver({
+        paneState,
+        sessionId,
+        observations,
+      }: ObserverProps) {
+        useLayoutEffect(() => {
+          committedController = paneState;
+          observations.push({
+            sessionId,
+            activeArtifactTab: paneState.activeArtifactTab,
+            activeInspectorTab: paneState.activeInspectorTab,
+          });
+        }, [
+          observations,
+          paneState,
+          paneState.activeArtifactTab,
+          paneState.activeInspectorTab,
+          sessionId,
+        ]);
+        return null;
+      }
+
+      interface HarnessProps {
+        sessionId: string;
+        availableArtifactTabs: readonly ArtifactTab[];
+        observations: Observation[];
+      }
+
+      function ConsumerHarness({
+        sessionId,
+        availableArtifactTabs,
+        observations,
+      }: HarnessProps) {
+        const paneState = useWorkspacePaneState({
+          workspaceWidth: 1536,
+          sessionId,
+          availableArtifactTabs,
+        });
+        return createElement(LayoutEffectObserver, {
+          paneState,
+          sessionId,
+          observations,
+        });
+      }
+
+      let committedController: WorkspacePaneState | null = null;
+      const observations: Observation[] = [];
+      const allTabs: readonly ArtifactTab[] = [
+        "graph",
+        "spec",
+        "yaml",
+        "run",
+      ];
+      const { rerender } = render(
+        createElement(ConsumerHarness, {
+          sessionId: "s1",
+          availableArtifactTabs: allTabs,
+          observations,
+        }),
+      );
+
+      act(() => {
+        if (committedController === null) throw new Error("controller not committed");
+        committedController.selectArtifactTab("run");
+        committedController.openInspector("audit");
+      });
+      observations.length = 0;
+
+      rerender(
+        createElement(ConsumerHarness, {
+          sessionId: "s2",
+          availableArtifactTabs: allTabs,
+          observations,
+        }),
+      );
+
+      expect(observations[0]).toEqual({
+        sessionId: "s2",
+        activeArtifactTab: "graph",
+        activeInspectorTab: null,
+      });
+
+      act(() => {
+        if (committedController === null) throw new Error("controller not committed");
+        committedController.selectArtifactTab("yaml");
+      });
+      observations.length = 0;
+
+      rerender(
+        createElement(ConsumerHarness, {
+          sessionId: "s2",
+          availableArtifactTabs: ["graph", "run"],
+          observations,
+        }),
+      );
+
+      expect(observations[0]).toEqual({
+        sessionId: "s2",
+        activeArtifactTab: "graph",
+        activeInspectorTab: null,
+      });
+    });
+
+    it("does not leak interrupted render values into committed callbacks", () => {
+      const neverResolves = new Promise<never>(() => undefined);
+      let committedController: WorkspacePaneState | null = null;
+      let beginSuspendedTransition: (() => void) | null = null;
+      let suspendedRenderObserved = false;
+
+      function ConcurrentProbe() {
+        const [workspaceWidth, setWorkspaceWidth] = useState(1536);
+        const paneState = useWorkspacePaneState({
+          workspaceWidth,
+          sessionId: "s1",
+        });
+        useLayoutEffect(() => {
+          committedController = paneState;
+          beginSuspendedTransition = () => {
+            startTransition(() => setWorkspaceWidth(1100));
+          };
+        }, [paneState]);
+
+        if (workspaceWidth === 1100) {
+          suspendedRenderObserved = true;
+          throw neverResolves;
+        }
+        return null;
+      }
+
+      render(
+        createElement(
+          Suspense,
+          { fallback: null },
+          createElement(ConcurrentProbe),
+        ),
+      );
+
+      act(() => {
+        if (beginSuspendedTransition === null) {
+          throw new Error("transition trigger not committed");
+        }
+        beginSuspendedTransition();
+      });
+      expect(suspendedRenderObserved).toBe(true);
+
+      act(() => {
+        if (committedController === null) throw new Error("controller not committed");
+        committedController.commitResize(620);
+      });
+
+      expect(storedLayout()?.preferredAuthoringWidth).toBe(620);
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["positive infinity", Number.POSITIVE_INFINITY],
+      ["negative infinity", Number.NEGATIVE_INFINITY],
+      ["a negative width", -1],
+      ["zero", 0],
+    ])("ignores transient and committed resize values that are %s", (_label, width) => {
+      localStorage.setItem(
+        WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify(VALID_LAYOUT),
+      );
+      const { result } = renderHook(() =>
+        useWorkspacePaneState({ workspaceWidth: 1536, sessionId: "s1" }),
+      );
+
+      act(() => result.current.resizeTransient(500));
+      act(() => {
+        result.current.resizeTransient(width);
+        result.current.commitResize(width);
+      });
+
+      expect(result.current.preferredAuthoringWidth).toBe(620);
+      expect(result.current.effectiveAuthoringWidth).toBe(500);
+      expect(storedLayout()).toEqual(VALID_LAYOUT);
+    });
+
+    it.each([
+      ["NaN", Number.NaN],
+      ["positive infinity", Number.POSITIVE_INFINITY],
+      ["negative infinity", Number.NEGATIVE_INFINITY],
+      ["a negative width", -1],
+      ["zero", 0],
+    ])("does not clamp or persist preference for an unmeasured %s observer width", (
+      _label,
+      width,
+    ) => {
+      localStorage.setItem(
+        WORKSPACE_LAYOUT_STORAGE_KEY,
+        JSON.stringify(VALID_LAYOUT),
+      );
+      const { result } = renderHook(() =>
+        useWorkspacePaneState({ workspaceWidth: width, sessionId: "s1" }),
+      );
+
+      expect(result.current.paneBounds).toEqual(paneBoundsForWidth(0));
+      expect(result.current.preferredAuthoringWidth).toBe(620);
+      expect(result.current.effectiveAuthoringWidth).toBe(620);
+      expect(storedLayout()).toEqual(VALID_LAYOUT);
+    });
+
+    it("enforces Graph availability at the hook boundary", () => {
+      const { result } = renderHook(() =>
+        useWorkspacePaneState({
+          workspaceWidth: 1536,
+          sessionId: "s1",
+          availableArtifactTabs: ["run"],
+        }),
+      );
+
+      expect(result.current.availableArtifactTabs).toEqual(["graph", "run"]);
+      act(() => result.current.selectArtifactTab("yaml"));
+      expect(result.current.activeArtifactTab).toBe("graph");
     });
 
     it("treats an initial zero width as unmeasured", () => {

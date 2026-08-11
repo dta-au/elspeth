@@ -2,6 +2,8 @@ export const ARTIFACT_TABS = ["graph", "spec", "yaml", "run"] as const;
 
 export type ArtifactTab = (typeof ARTIFACT_TABS)[number];
 
+export type AvailableArtifactTabs = readonly ["graph", ...ArtifactTab[]];
+
 export type InspectorTab = "validation" | "audit" | "history";
 
 export interface PaneBounds {

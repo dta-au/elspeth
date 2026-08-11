@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 
 import {
   ARTIFACT_TABS,
   type ArtifactTab,
+  type AvailableArtifactTabs,
   type InspectorTab,
   type PaneBounds,
   type StoredWorkspaceLayoutV1,
@@ -32,7 +33,7 @@ export interface WorkspacePaneState {
   preferredAuthoringWidth: number;
   effectiveAuthoringWidth: number;
   authoringCollapsed: boolean;
-  availableArtifactTabs: readonly ArtifactTab[];
+  availableArtifactTabs: AvailableArtifactTabs;
   activeArtifactTab: ArtifactTab;
   activeInspectorTab: InspectorTab | null;
   inspectorOpen: boolean;
@@ -50,18 +51,60 @@ interface InitialWorkspaceLayout {
   authoringCollapsed: boolean;
 }
 
+interface EphemeralPaneState {
+  sessionId: string | null;
+  activeArtifactTab: ArtifactTab;
+  activeInspectorTab: InspectorTab | null;
+}
+
+interface CommittedPaneValues {
+  paneBounds: PaneBounds;
+  workspaceMeasured: boolean;
+  preferredAuthoringWidth: number;
+  authoringCollapsed: boolean;
+  availableArtifactTabs: AvailableArtifactTabs;
+  sessionId: string | null;
+}
+
+function isMeasuredWidth(width: number): boolean {
+  return Number.isFinite(width) && width > 0;
+}
+
+function artifactTabsWithGraph(
+  availableArtifactTabs: readonly ArtifactTab[],
+): AvailableArtifactTabs {
+  if (availableArtifactTabs[0] === "graph") {
+    return availableArtifactTabs as AvailableArtifactTabs;
+  }
+  return [
+    "graph",
+    ...availableArtifactTabs.filter((tab) => tab !== "graph"),
+  ];
+}
+
+function defaultEphemeralPaneState(
+  sessionId: string | null,
+): EphemeralPaneState {
+  return {
+    sessionId,
+    activeArtifactTab: "graph",
+    activeInspectorTab: null,
+  };
+}
+
 export function paneBoundsForWidth(workspaceWidth: number): PaneBounds {
+  const measuredWidth = isMeasuredWidth(workspaceWidth) ? workspaceWidth : 0;
   const max = Math.max(
     AUTHORING_MIN,
-    Math.min(AUTHORING_MAX, workspaceWidth - ARTIFACT_MIN),
+    Math.min(AUTHORING_MAX, measuredWidth - ARTIFACT_MIN),
   );
   return {
     min: AUTHORING_MIN,
     max,
     defaultWidth:
-      workspaceWidth < STANDARD_DESKTOP_MIN ? AUTHORING_MIN : 420,
+      measuredWidth < STANDARD_DESKTOP_MIN ? AUTHORING_MIN : 420,
     resizable:
-      workspaceWidth >= AUTHORING_MIN + ARTIFACT_MIN && max > AUTHORING_MIN,
+      measuredWidth >= AUTHORING_MIN + ARTIFACT_MIN && max > AUTHORING_MIN,
   };
 }
 
@@ -74,7 +117,7 @@ export function clampAuthoringWidth(
 
 export function nearestAvailableArtifactTab(
   requested: ArtifactTab,
-  available: readonly ArtifactTab[],
+  available: AvailableArtifactTabs,
 ): ArtifactTab {
   return available.includes(requested) ? requested : "graph";
 }
@@ -141,7 +184,7 @@ function initialWorkspaceLayout(workspaceWidth: number): InitialWorkspaceLayout 
   }
 
   const defaultSourceWidth =
-    workspaceWidth > 0
+    isMeasuredWidth(workspaceWidth)
       ? workspaceWidth
       : typeof window === "undefined"
         ? STANDARD_DESKTOP_MIN
@@ -159,6 +202,10 @@ export function useWorkspacePaneState({
   sessionId,
   availableArtifactTabs = ARTIFACT_TABS,
 }: UseWorkspacePaneStateOptions): WorkspacePaneState {
+  const normalizedAvailableArtifactTabs = artifactTabsWithGraph(
+    availableArtifactTabs,
+  );
+  const workspaceMeasured = isMeasuredWidth(workspaceWidth);
   const [initialLayout] = useState(() => initialWorkspaceLayout(workspaceWidth));
   const [preferredAuthoringWidth, setPreferredAuthoringWidth] = useState(
     initialLayout.preferredAuthoringWidth,
@@ -169,28 +216,35 @@ export function useWorkspacePaneState({
   const [authoringCollapsed, setAuthoringCollapsedState] = useState(
     initialLayout.authoringCollapsed,
   );
-  const [activeArtifactTab, setActiveArtifactTab] =
-    useState<ArtifactTab>("graph");
-  const [activeInspectorTab, setActiveInspectorTab] =
-    useState<InspectorTab | null>(null);
+  const [ephemeralPaneState, setEphemeralPaneState] =
+    useState<EphemeralPaneState>(() => defaultEphemeralPaneState(sessionId));
 
   const paneBounds = paneBoundsForWidth(workspaceWidth);
   const effectiveCandidate =
     transientAuthoringWidth ?? preferredAuthoringWidth;
   const effectiveAuthoringWidth =
-    workspaceWidth > 0
+    workspaceMeasured
       ? clampAuthoringWidth(effectiveCandidate, paneBounds)
       : effectiveCandidate;
+  const ephemeralStateForSession =
+    ephemeralPaneState.sessionId === sessionId
+      ? ephemeralPaneState
+      : defaultEphemeralPaneState(sessionId);
+  const activeArtifactTab = nearestAvailableArtifactTab(
+    ephemeralStateForSession.activeArtifactTab,
+    normalizedAvailableArtifactTabs,
+  );
+  const activeInspectorTab = ephemeralStateForSession.activeInspectorTab;
 
   const storageRef = useRef(initialLayout.storage);
-  const boundsRef = useRef(paneBounds);
-  const preferredWidthRef = useRef(preferredAuthoringWidth);
-  const collapsedRef = useRef(authoringCollapsed);
-  const availableTabsRef = useRef(availableArtifactTabs);
-  boundsRef.current = paneBounds;
-  preferredWidthRef.current = preferredAuthoringWidth;
-  collapsedRef.current = authoringCollapsed;
-  availableTabsRef.current = availableArtifactTabs;
+  const committedValuesRef = useRef<CommittedPaneValues>({
+    paneBounds,
+    workspaceMeasured,
+    preferredAuthoringWidth,
+    authoringCollapsed,
+    availableArtifactTabs: normalizedAvailableArtifactTabs,
+    sessionId,
+  });
 
   const persist = useCallback(
     (preferredWidth: number, collapsed: boolean): void => {
@@ -211,63 +265,129 @@ export function useWorkspacePaneState({
   );
 
   const resizeTransient = useCallback((width: number): void => {
-    setTransientAuthoringWidth(clampAuthoringWidth(width, boundsRef.current));
+    const committed = committedValuesRef.current;
+    if (!committed.workspaceMeasured || !isMeasuredWidth(width)) return;
+    setTransientAuthoringWidth(
+      clampAuthoringWidth(width, committed.paneBounds),
+    );
   }, []);
 
   const commitResize = useCallback(
     (finalWidth: number): void => {
+      const committed = committedValuesRef.current;
+      if (!committed.workspaceMeasured || !isMeasuredWidth(finalWidth)) return;
       const committedWidth = clampAuthoringWidth(
         finalWidth,
-        boundsRef.current,
+        committed.paneBounds,
       );
-      preferredWidthRef.current = committedWidth;
+      committedValuesRef.current = {
+        ...committed,
+        preferredAuthoringWidth: committedWidth,
+      };
       setPreferredAuthoringWidth(committedWidth);
       setTransientAuthoringWidth(null);
-      persist(committedWidth, collapsedRef.current);
+      persist(committedWidth, committed.authoringCollapsed);
     },
     [persist],
   );
 
   const setAuthoringCollapsed = useCallback(
     (collapsed: boolean): void => {
-      collapsedRef.current = collapsed;
+      const committed = committedValuesRef.current;
+      committedValuesRef.current = {
+        ...committed,
+        authoringCollapsed: collapsed,
+      };
       setAuthoringCollapsedState(collapsed);
-      persist(preferredWidthRef.current, collapsed);
+      persist(committed.preferredAuthoringWidth, collapsed);
     },
     [persist],
   );
 
   const selectArtifactTab = useCallback((tab: ArtifactTab): void => {
-    setActiveArtifactTab(
-      nearestAvailableArtifactTab(tab, availableTabsRef.current),
-    );
+    const committed = committedValuesRef.current;
+    setEphemeralPaneState((current) => {
+      const sessionState =
+        current.sessionId === committed.sessionId
+          ? current
+          : defaultEphemeralPaneState(committed.sessionId);
+      return {
+        ...sessionState,
+        activeArtifactTab: nearestAvailableArtifactTab(
+          tab,
+          committed.availableArtifactTabs,
+        ),
+      };
+    });
   }, []);
 
   const openInspector = useCallback((tab: InspectorTab): void => {
-    setActiveInspectorTab(tab);
+    const committed = committedValuesRef.current;
+    setEphemeralPaneState((current) => {
+      const sessionState =
+        current.sessionId === committed.sessionId
+          ? current
+          : defaultEphemeralPaneState(committed.sessionId);
+      return {
+        ...sessionState,
+        activeInspectorTab: tab,
+      };
+    });
   }, []);
 
   const closeInspector = useCallback((): void => {
-    setActiveInspectorTab(null);
+    const committed = committedValuesRef.current;
+    setEphemeralPaneState((current) => {
+      const sessionState =
+        current.sessionId === committed.sessionId
+          ? current
+          : defaultEphemeralPaneState(committed.sessionId);
+      if (sessionState.activeInspectorTab === null) return sessionState;
+      return {
+        ...sessionState,
+        activeInspectorTab: null,
+      };
+    });
   }, []);
 
-  useEffect(() => {
-    setActiveArtifactTab((current) =>
-      nearestAvailableArtifactTab(current, availableArtifactTabs),
-    );
-  }, [availableArtifactTabs]);
-
-  useEffect(() => {
-    setActiveArtifactTab("graph");
-    setActiveInspectorTab(null);
-  }, [sessionId]);
+  useLayoutEffect(() => {
+    committedValuesRef.current = {
+      paneBounds,
+      workspaceMeasured,
+      preferredAuthoringWidth,
+      authoringCollapsed,
+      availableArtifactTabs: normalizedAvailableArtifactTabs,
+      sessionId,
+    };
+    setEphemeralPaneState((current) => {
+      if (current.sessionId !== sessionId) {
+        return defaultEphemeralPaneState(sessionId);
+      }
+      const normalizedTab = nearestAvailableArtifactTab(
+        current.activeArtifactTab,
+        normalizedAvailableArtifactTabs,
+      );
+      if (normalizedTab === current.activeArtifactTab) return current;
+      return {
+        ...current,
+        activeArtifactTab: normalizedTab,
+      };
+    });
+  }, [
+    authoringCollapsed,
+    normalizedAvailableArtifactTabs,
+    paneBounds,
+    preferredAuthoringWidth,
+    sessionId,
+    workspaceMeasured,
+  ]);
 
   return {
     paneBounds,
     preferredAuthoringWidth,
     effectiveAuthoringWidth,
     authoringCollapsed,
-    availableArtifactTabs,
+    availableArtifactTabs: normalizedAvailableArtifactTabs,
     activeArtifactTab,
     activeInspectorTab,
     inspectorOpen: activeInspectorTab !== null,
