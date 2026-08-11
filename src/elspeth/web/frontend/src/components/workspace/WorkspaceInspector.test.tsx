@@ -68,13 +68,19 @@ vi.mock("@/components/audit/AuditReadinessPanel", async (importOriginal) => {
   };
 });
 
-vi.mock("@/components/chat/guided/GuidedHistory", () => ({
-  GuidedHistory: () => (
-    <div>
-      History panel <button type="button">History detail action</button>
-    </div>
-  ),
-}));
+vi.mock("@/components/chat/guided/GuidedHistory", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("@/components/chat/guided/GuidedHistory")
+  >();
+  return {
+    ...actual,
+    GuidedHistory: () => (
+      <div>
+        History panel <button type="button">History detail action</button>
+      </div>
+    ),
+  };
+});
 
 vi.mock("@/components/sidebar/SideRailValidationBanner", () => ({
   SideRailValidationBanner: ({
@@ -295,6 +301,53 @@ describe("WorkspaceInspector", () => {
     expect(validation).toHaveFocus();
   });
 
+  it("does not expose History for current-step-only records", async () => {
+    const currentStep = activeGuidedSession().step;
+    useSessionStore.setState({
+      guidedSession: {
+        ...activeGuidedSession(),
+        history: [
+          {
+            ...activeGuidedSession().history[0],
+            step: currentStep,
+            summary: "Current transform choice",
+          },
+        ],
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.queryByRole("tab", { name: "History" })).toBeNull();
+  });
+
+  it("does not expose History for summary-null prior-step records", async () => {
+    useSessionStore.setState({
+      guidedSession: {
+        ...activeGuidedSession(),
+        history: [{ ...activeGuidedSession().history[0], summary: null }],
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.queryByRole("tab", { name: "History" })).toBeNull();
+  });
+
+  it("exposes History for a summarised prior completed step", async () => {
+    useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
+  });
+
   it.each([
     ["History tab", "tab"],
     ["History panel descendant", "panel"],
@@ -312,7 +365,16 @@ describe("WorkspaceInspector", () => {
 
       act(() => {
         useSessionStore.setState({
-          guidedSession: { ...activeGuidedSession(), history: [] },
+          guidedSession: {
+            ...activeGuidedSession(),
+            history: [
+              {
+                ...activeGuidedSession().history[0],
+                step: activeGuidedSession().step,
+                summary: "Current transform choice",
+              },
+            ],
+          },
         } as never);
       });
 

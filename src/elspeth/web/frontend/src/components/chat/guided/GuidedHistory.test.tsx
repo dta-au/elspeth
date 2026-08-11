@@ -2,7 +2,10 @@
 
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { GuidedHistory } from "./GuidedHistory";
+import {
+  GuidedHistory,
+  projectCompletedGuidedHistory,
+} from "./GuidedHistory";
 import type { TurnRecord } from "@/types/guided";
 
 const TURN_1: TurnRecord = {
@@ -22,6 +25,38 @@ const TURN_2: TurnRecord = {
   emitter: "llm",
   summary: "Sink configured: jsonl",
 };
+
+describe("projectCompletedGuidedHistory", () => {
+  it("returns no rows when history contains only current-step records", () => {
+    expect(
+      projectCompletedGuidedHistory([TURN_1], "step_1_source"),
+    ).toEqual([]);
+  });
+
+  it("returns no rows when prior-step records have no summary", () => {
+    expect(
+      projectCompletedGuidedHistory(
+        [{ ...TURN_1, summary: null }],
+        "step_2_sink",
+      ),
+    ).toEqual([]);
+  });
+
+  it("projects the latest summarised record for each completed step", () => {
+    const latestSource = {
+      ...TURN_1,
+      turn_type: "schema_form" as const,
+      summary: "Source configured: csv",
+    };
+
+    expect(
+      projectCompletedGuidedHistory(
+        [TURN_1, latestSource, TURN_2],
+        "step_3_transforms",
+      ),
+    ).toEqual([latestSource, TURN_2]);
+  });
+});
 
 describe("GuidedHistory", () => {
   it("renders an always-visible decision summary heading", () => {
@@ -68,6 +103,27 @@ describe("GuidedHistory", () => {
       />,
     );
     expect(container.firstChild).toBeNull();
+  });
+
+  it("renders only the completed rows selected by the shared projection", () => {
+    render(
+      <GuidedHistory
+        history={[
+          TURN_1,
+          { ...TURN_2, summary: null },
+          {
+            ...TURN_2,
+            step: "step_3_transforms",
+            summary: "Current transform choice",
+          },
+        ]}
+        currentStep="step_3_transforms"
+      />,
+    );
+
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("Source selected: csv")).toBeInTheDocument();
+    expect(screen.queryByText("Current transform choice")).toBeNull();
   });
 
   it("collapses multiple turns of the same step to one row (most-recent summary wins)", () => {

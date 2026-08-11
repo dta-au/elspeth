@@ -21,30 +21,34 @@ interface Props {
 }
 
 /**
- * Read-only plain-language list of completed guided-mode decisions.
+ * Select the visible decision recap rows from guided protocol history.
  *
- * Returns null when history is empty — the parent should not render this
- * widget unless there are completed steps to show.
+ * This projection is the single availability rule for both the History tab
+ * and the rendered history card: only summarised records outside the current
+ * in-progress step are eligible, with the latest summary winning for each
+ * completed step.
  */
-export function GuidedHistory({ history, currentStep }: Props): React.ReactElement | null {
-  // Empty history: nothing to show.
-  if (history.length === 0) {
-    return null;
-  }
-
-  // One row per COMPLETED step — a step the learner has moved PAST. The current
-  // step is in progress (its answered single_select may already carry a summary
-  // while a schema_form sub-turn is still pending), so it is never "decided" yet
-  // and is excluded outright. Among past steps, keep the most-recent summarised
-  // turn (Map.set on the chronological history wins last); a step that produced
-  // no summary at all contributes nothing. The Map preserves first-seen order.
+export function projectCompletedGuidedHistory(
+  history: readonly TurnRecord[],
+  currentStep: GuidedStep,
+): TurnRecord[] {
   const latestByStep = new Map<GuidedStep, TurnRecord>();
   for (const turn of history) {
     if (turn.step === currentStep) continue;
     if (turn.summary === null) continue;
     latestByStep.set(turn.step, turn);
   }
-  const rows = [...latestByStep.values()];
+  return [...latestByStep.values()];
+}
+
+/**
+ * Read-only plain-language list of completed guided-mode decisions.
+ *
+ * Returns null when history is empty — the parent should not render this
+ * widget unless there are completed steps to show.
+ */
+export function GuidedHistory({ history, currentStep }: Props): React.ReactElement | null {
+  const rows = projectCompletedGuidedHistory(history, currentStep);
 
   // No completed decisions yet (e.g. still on the first step before any Send):
   // render nothing rather than an empty "Decisions so far" card.

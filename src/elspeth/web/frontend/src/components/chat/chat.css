@@ -928,9 +928,9 @@
      which left a ~1100px dead gulf down the middle and forced the eye to jump
      left↔right to follow the thread. 56rem keeps a comfortable reading measure
      while giving consecutive bubbles a generous horizontal overlap.
-     Applies to freeform AND guided/tutorial — both emit .message-row. The
-     guided workspace widgets (.guided-workspace-*) and full-width run-result
-     panels (.inline-run-results) are NOT .message-row, so they keep full width. */
+     Applies to freeform AND guided/tutorial — both emit .message-row. Guided
+     authoring cards and common-workspace artifact panels are NOT .message-row,
+     so they keep their containing pane's width. */
   max-width: min(100%, 56rem);
   margin-inline: auto;
   width: 100%;

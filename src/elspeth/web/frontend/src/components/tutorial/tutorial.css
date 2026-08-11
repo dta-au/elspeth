@@ -73,12 +73,14 @@
   width: 100%;
 }
 
-/* ── Guided step: height-bounded WORKSPACE frame (the column scrolls) ──────────
+/* ── Guided step: height-bounded authoring frame (the column scrolls) ─────────
    The bookend turns (welcome/run/audit/graduation) are short centred cards on
    the base `.tutorial-shell` document scroll. The guided step instead becomes a
-   FIXED FRAME: the shell stops scrolling and the conversation column inside the
-   workspace (guided.css `.guided-workspace-scroll`) owns the scroll, freeform-
-   style, with the composer docked beneath it and the artifact rail flush right.
+   FIXED FRAME: the shell stops scrolling and ChatPanel's
+   `.guided-authoring-scroll` owns the conversation scroll, with the composer
+   docked beneath it. In the app, ComposerWorkspace provides the surrounding
+   authoring/artifact split; this tutorial bridge joins the same chain at the
+   ChatPanel boundary.
 
    (History: the guided step once borrowed the freeform chat model — a flex:1
    inner scroll that FILLS the viewport + a flex-shrink:0 bottom dock — which
@@ -89,9 +91,9 @@
    can outgrow the viewport.)
 
    The height chain below is all-or-nothing: shell → guided-shell → chat-panel →
-   workspace → stream → scroll wrapper each need flex:1/min-height:0 (or
-   flex-shrink:0 for fixed bands). Miss ONE min-height:0 and the chain silently
-   reverts to content-height growth — the internal scroll never engages.
+   authoring scroll each need flex:1/min-height:0 (or flex-shrink:0 for fixed
+   bands). Miss ONE min-height:0 and the chain silently reverts to content-height
+   growth — the internal scroll never engages.
 
    Scoped under `.tutorial-shell--guided` (live-guided + freeform never render
    under `.tutorial-shell`). tutorial.css imports BEFORE chat.css/guided.css, so

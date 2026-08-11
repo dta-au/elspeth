@@ -8,7 +8,10 @@ import {
 } from "react";
 
 import { AuditReadinessPanel } from "@/components/audit/AuditReadinessPanel";
-import { GuidedHistory } from "@/components/chat/guided/GuidedHistory";
+import {
+  GuidedHistory,
+  projectCompletedGuidedHistory,
+} from "@/components/chat/guided/GuidedHistory";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { SideRailValidationBanner } from "@/components/sidebar/SideRailValidationBanner";
 import {
@@ -46,7 +49,12 @@ export function WorkspaceInspector(): JSX.Element {
   const historyPanelRef = useRef<HTMLDivElement>(null);
   const historyOwnedFocusRef = useRef(false);
   const inspectorWasOpenRef = useRef(false);
-  const hasHistory = (guidedSession?.history.length ?? 0) > 0;
+  const hasHistory =
+    guidedSession !== null &&
+    projectCompletedGuidedHistory(
+      guidedSession.history,
+      guidedSession.step,
+    ).length > 0;
   const availableTabs: readonly InspectorTab[] = hasHistory
     ? ["validation", "audit", "history"]
     : ["validation", "audit"];

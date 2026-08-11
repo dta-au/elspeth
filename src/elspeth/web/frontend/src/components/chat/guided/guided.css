@@ -586,32 +586,9 @@
   right: var(--space-2xs);
 }
 
-/* ── Guided verification panel (Slice C) ──────────────────────────────────────
-   The canonical "what I built" surface above the current decision: gloss +
-   validation status (+ a graph thumbnail in the tutorial). A direct child of
-   .guided-scroll, so the sheet cap (64rem, centred) is inherited from the
-   `.guided-scroll > *` rule above. Mirrors the .guided-current-decision card. */
-.guided-graph-panel {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-  /* `auto` inline margins restore the centred 64rem sheet this panel inherits
-     from `.guided-scroll > *` (line ~115). A bare `margin: var(--space-md)`
-     shorthand here is same-specificity-but-later than that rule, so it silently
-     overrode `margin-inline:auto` and pinned the panel hard left — contradicting
-     the "centred sheet cap" the comment above promised. Keep the vertical rhythm
-     (top/bottom var(--space-md)); centre horizontally. */
-  margin: var(--space-md) auto;
-  padding: var(--space-md);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background-color: var(--color-surface);
-}
-
-/* ── Guided verification panel pieces (Slice C) ───────────────────────────────
-   The plain-language gloss + the in-column validation status. The gloss is the
-   canonical "what I built" line; the status is the novice-register verification
-   signal (the column thumbnail has no per-node markers — those are on expand).
+/* ── Pipeline explanation and validation pieces ──────────────────────────────
+   The plain-language gloss is used by the common Spec artifact; the validation
+   summary remains available to the completion surface.
    Status body text stays --color-text-secondary (AA on the panel surface,
    gated in colorContrast.test.ts); only the aria-hidden, redundant glyph is
    tinted by tone, so colour is never the sole signal. */
@@ -1838,10 +1815,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
-  /* `auto` inline margins centre this in the 64rem sheet inherited from
-     `.guided-scroll > *`. A bare `margin` shorthand (same-specificity-but-later)
-     clobbers `margin-inline:auto` and pins it hard left — the same trap fixed on
-     .guided-graph-panel; only visible once prior-step history exists. */
+  /* Preserve the recap's vertical rhythm while centring it in its containing
+     inspector or legacy guided sheet. */
   margin: var(--space-md) auto;
   padding: var(--space-md);
   border: 1px solid var(--color-border);
