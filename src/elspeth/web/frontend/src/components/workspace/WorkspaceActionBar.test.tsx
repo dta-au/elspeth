@@ -64,7 +64,21 @@ function freshAuditSnapshot(): AuditReadinessSnapshot {
     session_id: "session-1",
     composition_version: 4,
     checked_at: "2026-08-11T00:00:00Z",
-    rows: [],
+    rows: [
+      "validation",
+      "plugin_trust",
+      "provenance",
+      "retention",
+      "llm_interpretations",
+      "secrets",
+    ].map((id) => ({
+      id,
+      label: id,
+      status: "ok",
+      summary: "Ready",
+      detail: null,
+      component_ids: [],
+    })) as AuditReadinessSnapshot["rows"],
     validation_result: makeValidationResult(),
   };
 }
@@ -109,7 +123,7 @@ describe("WorkspaceActionBar", () => {
     expect(openInspector).toHaveBeenLastCalledWith("audit");
   });
 
-  it("shows audit as Checking when the current readiness request has failed identity validation", () => {
+  it("shows audit as Error when the current readiness request has failed identity validation", () => {
     useAuditReadinessStore.setState({
       snapshotsBySession: { "session-1": freshAuditSnapshot() },
       errorBySession: {
@@ -121,8 +135,8 @@ describe("WorkspaceActionBar", () => {
     renderActionBar({ completion: false, importYaml: false, catalog: false });
 
     expect(
-      screen.getByRole("button", { name: "Audit: Checking" }),
-    ).toHaveTextContent("AuditChecking");
+      screen.getByRole("button", { name: "Audit: Error" }),
+    ).toHaveTextContent("AuditError");
     expect(
       screen.queryByRole("button", { name: "Audit: Ready" }),
     ).not.toBeInTheDocument();

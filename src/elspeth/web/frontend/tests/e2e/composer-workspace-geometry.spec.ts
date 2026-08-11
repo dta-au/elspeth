@@ -406,4 +406,101 @@ test.describe("Composer deterministic workspace geometry", () => {
       await deleteWorkspaceScenario(page, sessionId);
     }
   });
+
+  test("long Run content keeps the artifact panel as the only scroll owner", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "active-completed-run");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await composer.artifactTab("Run").click();
+      await expect(composer.artifactTab("Run")).toHaveAttribute("aria-selected", "true");
+      const results = page.getByRole("region", { name: "Pipeline run results" });
+      await expect(results).toBeVisible();
+      await results.evaluate((element) => {
+        const tall = document.createElement("div");
+        tall.style.height = "1600px";
+        tall.dataset.testid = "long-run-probe";
+        element.append(tall);
+      });
+      const styles = await results.evaluate((element) => {
+        const computed = getComputedStyle(element);
+        return {
+          maxHeight: computed.maxHeight,
+          overflowY: computed.overflowY,
+          marginTop: computed.marginTop,
+          marginRight: computed.marginRight,
+          marginBottom: computed.marginBottom,
+          marginLeft: computed.marginLeft,
+        };
+      });
+      expect(styles).toEqual({
+        maxHeight: "none",
+        overflowY: "visible",
+        marginTop: "0px",
+        marginRight: "0px",
+        marginBottom: "0px",
+        marginLeft: "0px",
+      });
+      await expect.poll(() => composer.activeArtifactPanel().evaluate(
+        (element) => element.scrollHeight > element.clientHeight,
+      )).toBe(true);
+      await expect(composer.artifactTab("Run")).toHaveAttribute("aria-selected", "true");
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  test("collapsed restore status reserves space above the artifact toolbar", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "pending-acknowledgement");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await composer.collapseAuthoring().click();
+      const restore = composer.restoreAuthoring();
+      const toolbar = page.locator(".artifact-workspace-toolbar");
+      await expect(restore).toBeVisible();
+      await expect(restore).toBeFocused();
+      const [restoreBox, toolbarBox] = await Promise.all([
+        restore.boundingBox(),
+        toolbar.boundingBox(),
+      ]);
+      expect(restoreBox).not.toBeNull();
+      expect(toolbarBox).not.toBeNull();
+      expect(restoreBox!.y + restoreBox!.height).toBeLessThanOrEqual(toolbarBox!.y);
+      const hit = await page.evaluate(({ x, y }) => {
+        const element = document.elementFromPoint(x, y);
+        return element?.getAttribute("aria-label") ?? element?.textContent ?? null;
+      }, {
+        x: restoreBox!.x + restoreBox!.width / 2,
+        y: restoreBox!.y + restoreBox!.height / 2,
+      });
+      expect(hit).toContain("Restore authoring pane");
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  test("Ctrl+/ reveals Compose before focusing the chat input", async ({ page }) => {
+    await page.setViewportSize({ width: 720, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await composer.pipelineViewTab().click();
+      await page.keyboard.press("Control+/");
+      await expect(composer.composeViewTab()).toHaveAttribute("aria-selected", "true");
+      await expect(composer.chatInput()).toBeFocused();
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
 });

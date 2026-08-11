@@ -1,7 +1,6 @@
 import { useId } from "react";
 import {
-  REQUEST_ARTIFACT_VIEW_EVENT,
-  type RequestArtifactViewDetail,
+  dispatchArtifactViewIntent,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
@@ -43,20 +42,11 @@ export function ExportYamlButton(): JSX.Element | null {
       <button
         type="button"
         className="btn side-rail-export-yaml-btn"
-        onClick={() =>
-          window.dispatchEvent(
-            new CustomEvent<RequestArtifactViewDetail>(
-              REQUEST_ARTIFACT_VIEW_EVENT,
-              {
-                detail: {
-                  tab: "yaml",
-                  focusMode: false,
-                  sessionId: activeSessionId,
-                },
-              },
-            ),
-          )
-        }
+        onClick={() => dispatchArtifactViewIntent({
+          tab: "yaml",
+          focusMode: false,
+          sessionId: activeSessionId,
+        })}
         disabled={!hasContent}
         aria-disabled={!hasContent ? true : undefined}
         aria-label="Export YAML"

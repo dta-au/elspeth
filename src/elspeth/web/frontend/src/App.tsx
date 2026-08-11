@@ -32,9 +32,9 @@ import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
 import { HelloWorldTutorial } from "./components/tutorial";
 import {
-  REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
-  type RequestArtifactViewDetail,
+  FOCUS_AUTHORING_EVENT,
+  dispatchArtifactViewIntent,
 } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
@@ -386,18 +386,11 @@ function App() {
         (e.ctrlKey || e.metaKey)
       ) {
         e.preventDefault();
-        window.dispatchEvent(
-          new CustomEvent<RequestArtifactViewDetail>(
-            REQUEST_ARTIFACT_VIEW_EVENT,
-            {
-              detail: {
-                tab: "graph",
-                focusMode: false,
-                sessionId: activeSessionId,
-              },
-            },
-          ),
-        );
+        dispatchArtifactViewIntent({
+          tab: "graph",
+          focusMode: false,
+          sessionId: activeSessionId,
+        });
         return;
       }
 
@@ -413,18 +406,11 @@ function App() {
       ) {
         e.preventDefault();
         if (activeSessionId && hasCompositionContent(compositionState)) {
-          window.dispatchEvent(
-            new CustomEvent<RequestArtifactViewDetail>(
-              REQUEST_ARTIFACT_VIEW_EVENT,
-              {
-                detail: {
-                  tab: "yaml",
-                  focusMode: false,
-                  sessionId: activeSessionId,
-                },
-              },
-            ),
-          );
+          dispatchArtifactViewIntent({
+            tab: "yaml",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
         }
         return;
       }
@@ -439,10 +425,7 @@ function App() {
       // Ctrl+/ / Cmd+/: Focus chat input
       if (e.key === "/" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "[data-chat-input]",
-        );
-        input?.focus();
+        window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
         return;
       }
 

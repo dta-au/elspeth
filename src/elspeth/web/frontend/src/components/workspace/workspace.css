@@ -88,6 +88,12 @@
   display: none;
 }
 
+.artifact-workspace-panel .inline-run-results {
+  max-height: none;
+  overflow: visible;
+  margin: 0;
+}
+
 .workspace-action-bar {
   position: sticky;
   z-index: 3;
@@ -181,6 +187,27 @@
 
 .composer-workspace[data-authoring-collapsed="true"] {
   grid-template-columns: 0 minmax(0, 1fr);
+}
+
+.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) {
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
+  .workspace-authoring-slot {
+  grid-row: 1;
+  grid-column: 2;
+}
+
+.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
+  .workspace-collapsed-affordance {
+  position: static;
+  max-width: 100%;
+}
+
+.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
+  .workspace-artifact-slot {
+  grid-row: 2;
 }
 
 .workspace-separator-slot {

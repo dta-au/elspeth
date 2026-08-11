@@ -2,6 +2,7 @@ import {
   type CSSProperties,
   type KeyboardEvent,
   type ReactNode,
+  useCallback,
   useLayoutEffect,
   useRef,
   useState,
@@ -10,6 +11,7 @@ import {
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
+import { FOCUS_AUTHORING_EVENT } from "@/lib/composer-events";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
 import { WorkspaceSeparator } from "./WorkspaceSeparator";
 import { useWorkspacePaneState } from "./useWorkspacePaneState";
@@ -76,6 +78,7 @@ export function ComposerWorkspace({
     : EMPTY_ARTIFACT_TABS;
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [narrowView, setNarrowView] = useState<NarrowView>("compose");
+  const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
@@ -97,6 +100,8 @@ export function ComposerWorkspace({
   const authoringViewHidden = narrow && narrowView === "pipeline";
   const artifactViewHidden = narrow && narrowView === "compose";
   const authoringHidden = paneState.authoringCollapsed || authoringViewHidden;
+  const showPipeline = useCallback(() => setNarrowView("pipeline"), []);
+  const showCompose = useCallback(() => setNarrowView("compose"), []);
   const previousNarrowRef = useRef(narrow);
   const projectedCollapsedStatus = isCollapsedStatusProjection(collapsedStatus)
     ? collapsedStatus
@@ -166,6 +171,22 @@ export function ComposerWorkspace({
     target.current?.focus({ preventScroll: true });
   }, [narrow, narrowView, paneState.authoringCollapsed]);
 
+  useLayoutEffect(() => {
+    if (authoringFocusRequest === 0 || authoringHidden) return;
+    authoringSlotRef.current
+      ?.querySelector<HTMLElement>("[data-chat-input]")
+      ?.focus({ preventScroll: true });
+  }, [authoringFocusRequest, authoringHidden]);
+
+  useLayoutEffect(() => {
+    const focusAuthoring = (): void => {
+      setNarrowView("compose");
+      setAuthoringFocusRequest((current) => current + 1);
+    };
+    window.addEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
+    return () => window.removeEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
+  }, []);
+
   const collapseAuthoring = (): void => {
     focusIntentRef.current = "restore";
     paneState.setAuthoringCollapsed(true);
@@ -211,7 +232,13 @@ export function ComposerWorkspace({
   } as CSSProperties;
 
   return (
-    <WorkspacePaneProvider paneState={paneState}>
+    <WorkspacePaneProvider
+      paneState={paneState}
+      artifactVisible={!artifactViewHidden}
+      authoringVisible={!authoringHidden}
+      showPipeline={showPipeline}
+      showCompose={showCompose}
+    >
       <div
         ref={rootRef}
         className="composer-workspace"

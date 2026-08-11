@@ -32,8 +32,9 @@ export function projectValidationWorkspaceStatus(
   }
   const errorCount = validationResult.errors.length;
   if (errorCount > 0) {
-    return validationStatus(`${errorCount} errors`, "error");
+    return validationStatus(`${errorCount} ${errorCount === 1 ? "error" : "errors"}`, "error");
   }
+  if (!validationResult.is_valid) return validationStatus("Failed", "error");
   const warningCount = validationResult.warnings?.length ?? 0;
   if (warningCount > 0) {
     return validationStatus(`${warningCount} warnings`, "warning");
@@ -65,7 +66,7 @@ export function projectAuditWorkspaceStatus({
     activeSessionId === null
       ? null
       : errorBySession[activeSessionId] ?? null;
-  if (error !== null) return auditStatus("Checking", "busy");
+  if (error !== null) return auditStatus("Error", "error");
 
   const cached =
     activeSessionId === null
@@ -77,6 +78,23 @@ export function projectAuditWorkspaceStatus({
     compositionVersion,
   );
   if (snapshot === undefined) return auditStatus("Checking", "busy");
+
+  const expectedIds = new Set([
+    "validation", "plugin_trust", "provenance", "retention",
+    "llm_interpretations", "secrets",
+  ]);
+  const rowIds = snapshot.rows.map((row) => row.id);
+  const validationRow = snapshot.rows.find((row) => row.id === "validation");
+  if (
+    rowIds.length !== expectedIds.size ||
+    new Set(rowIds).size !== expectedIds.size ||
+    rowIds.some((id) => !expectedIds.has(id)) ||
+    validationRow === undefined ||
+    (!snapshot.validation_result.is_valid && validationRow.status !== "error") ||
+    (snapshot.validation_result.is_valid && validationRow.status === "error")
+  ) {
+    return auditStatus("Error", "error");
+  }
 
   const issueRows = snapshot.rows.filter(
     (row) => row.status === "warning" || row.status === "error",

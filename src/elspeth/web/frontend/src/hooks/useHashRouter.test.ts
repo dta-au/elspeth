@@ -703,7 +703,7 @@ describe("useHashRouter — Batch 2 fixes", () => {
 
   // ── Two rapid hashchanges ────────────────────────────────────────────────
 
-  it("two rapid hashchanges request both persistent artifacts", async () => {
+  it("a newer loaded YAML hash globally supersedes a queued Graph hash", async () => {
     window.history.replaceState(null, "", "#/sess-1");
     // The yaml verb is content-gated: give the active session a KNOWN,
     // non-empty composition so its dispatch fires (elspeth-bff8043d33).
@@ -731,13 +731,9 @@ describe("useHashRouter — Batch 2 fixes", () => {
       await Promise.resolve();
     });
 
-    expect(requests).toEqual(
-      expect.arrayContaining([
-        { tab: "graph", focusMode: false, sessionId: "sess-1" },
-        { tab: "yaml", focusMode: false, sessionId: "sess-1" },
-      ]),
-    );
-    expect(requests).toHaveLength(2);
+    expect(requests).toEqual([
+      { tab: "yaml", focusMode: false, sessionId: "sess-1" },
+    ]);
 
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });

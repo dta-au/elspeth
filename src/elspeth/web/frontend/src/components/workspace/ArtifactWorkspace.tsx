@@ -15,6 +15,7 @@ import { YamlView } from "@/components/inspector/YamlView";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
+  claimArtifactViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -138,6 +139,7 @@ export function ArtifactWorkspaceSurface({
   });
   const previousActiveTabRef = useRef(activeArtifactTab);
   const activePanelOwnedFocusRef = useRef(false);
+  const pendingTabFocusRef = useRef<ArtifactTab | null>(null);
   const mountedRef = useRef(false);
   const committedControllerRef = useRef<CommittedArtifactController>({
     sessionId: activeSessionId,
@@ -177,12 +179,17 @@ export function ArtifactWorkspaceSurface({
       const selected = committed.availableTabs.includes(requested)
         ? requested
         : "graph";
+      actions.showPipeline();
       committed.selectArtifactTab(requested);
-      tabRefs.current[selected]?.focus({ preventScroll: true });
+      if (state.artifactVisible) {
+        tabRefs.current[selected]?.focus({ preventScroll: true });
+      } else {
+        pendingTabFocusRef.current = selected;
+      }
       if (selected !== requested) announceFallback(requested);
       return selected;
     },
-    [announceFallback],
+    [actions, announceFallback, state.artifactVisible],
   );
 
   const queueGraphModal = useCallback((sessionId: string | null): void => {
@@ -212,6 +219,7 @@ export function ArtifactWorkspaceSurface({
       ) {
         return;
       }
+      claimArtifactViewIntent();
       selectAndFocus(request.tab);
       if (request.tab === "graph" && request.focusMode) {
         queueGraphModal(request.sessionId);
@@ -222,6 +230,19 @@ export function ArtifactWorkspaceSurface({
       window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handleRequest);
     };
   }, [queueGraphModal, selectAndFocus]);
+
+  useLayoutEffect(() => {
+    const pending = pendingTabFocusRef.current;
+    if (
+      pending === null ||
+      !state.artifactVisible ||
+      pending !== activeArtifactTab
+    ) {
+      return;
+    }
+    tabRefs.current[pending]?.focus({ preventScroll: true });
+    pendingTabFocusRef.current = null;
+  }, [activeArtifactTab, state.artifactVisible]);
 
   useLayoutEffect(() => {
     const previousActiveTab = previousActiveTabRef.current;
@@ -244,6 +265,8 @@ export function ArtifactWorkspaceSurface({
 
   const selectTab = (tab: ArtifactTab): void => {
     if (!availableArtifactTabs.includes(tab)) return;
+    claimArtifactViewIntent();
+    actions.showPipeline();
     actions.selectArtifactTab(tab);
     tabRefs.current[tab]?.focus({ preventScroll: true });
   };

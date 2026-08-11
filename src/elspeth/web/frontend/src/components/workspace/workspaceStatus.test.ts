@@ -16,7 +16,21 @@ function auditSnapshot(
     session_id: SESSION_ID,
     composition_version: 4,
     checked_at: "2026-08-11T00:00:00Z",
-    rows: [],
+    rows: [
+      "validation",
+      "plugin_trust",
+      "provenance",
+      "retention",
+      "llm_interpretations",
+      "secrets",
+    ].map((id) => ({
+      id,
+      label: id,
+      status: "ok",
+      summary: "Ready",
+      detail: null,
+      component_ids: [],
+    })) as AuditReadinessSnapshot["rows"],
     validation_result: makeValidationResult(),
     ...overrides,
   };
@@ -83,9 +97,21 @@ describe("workspace status projections", () => {
         }),
       ),
     ).toEqual({
-      text: "1 errors",
+      text: "1 error",
       tone: "error",
-      accessibleLabel: "Validation: 1 errors",
+      accessibleLabel: "Validation: 1 error",
+    });
+  });
+
+  it("fails closed when validation is invalid without structured errors", () => {
+    expect(
+      projectValidationWorkspaceStatus(
+        makeValidationResult({ is_valid: false, errors: [] }),
+      ),
+    ).toEqual({
+      text: "Failed",
+      tone: "error",
+      accessibleLabel: "Validation: Failed",
     });
   });
 
@@ -125,7 +151,7 @@ describe("workspace status projections", () => {
     ).toMatchObject({ text: "Checking", tone: "busy" });
   });
 
-  it("projects an audit identity error as Checking even while a matching cache exists", () => {
+  it("projects an audit identity error as Error without exposing raw detail", () => {
     expect(
       projectAuditWorkspaceStatus({
         activeSessionId: SESSION_ID,
@@ -137,40 +163,55 @@ describe("workspace status projections", () => {
         },
       }),
     ).toEqual({
-      text: "Checking",
-      tone: "busy",
-      accessibleLabel: "Audit: Checking",
+      text: "Error",
+      tone: "error",
+      accessibleLabel: "Audit: Error",
     });
+  });
+
+  it.each([
+    ["incomplete", ["validation"]],
+    ["duplicate", ["validation", "validation", "plugin_trust", "provenance", "retention", "llm_interpretations", "secrets"]],
+  ])("fails closed for a %s readiness-row matrix", (_label, ids) => {
+    const rows = ids.map((id) => ({
+      id,
+      label: id,
+      status: "ok",
+      summary: "Ready",
+      detail: null,
+      component_ids: [],
+    })) as AuditReadinessSnapshot["rows"];
+    expect(projectAuditWorkspaceStatus({
+      activeSessionId: SESSION_ID,
+      compositionVersion: 4,
+      snapshotsBySession: { [SESSION_ID]: auditSnapshot({ rows }) },
+      errorBySession: {},
+    })).toMatchObject({ text: "Error", tone: "error" });
+  });
+
+  it("fails closed when validation semantics contradict an all-green row matrix", () => {
+    expect(projectAuditWorkspaceStatus({
+      activeSessionId: SESSION_ID,
+      compositionVersion: 4,
+      snapshotsBySession: {
+        [SESSION_ID]: auditSnapshot({
+          validation_result: makeValidationResult({ is_valid: false, errors: [] }),
+        }),
+      },
+      errorBySession: {},
+    })).toMatchObject({ text: "Error", tone: "error" });
   });
 
   it("counts warning and error audit rows as issues only on a fresh snapshot", () => {
     const withIssues = auditSnapshot({
-      rows: [
-        {
-          id: "validation",
-          label: "Validation",
-          status: "error",
-          summary: "Blocked",
-          detail: null,
-          component_ids: [],
-        },
-        {
-          id: "provenance",
-          label: "Provenance",
-          status: "warning",
-          summary: "Review",
-          detail: null,
-          component_ids: [],
-        },
-        {
-          id: "retention",
-          label: "Retention",
-          status: "ok",
-          summary: "Ready",
-          detail: null,
-          component_ids: [],
-        },
-      ],
+      rows: auditSnapshot().rows.map((row) =>
+        row.id === "validation"
+          ? { ...row, status: "error" as const, summary: "Blocked" }
+          : row.id === "provenance"
+            ? { ...row, status: "warning" as const, summary: "Review" }
+            : row,
+      ),
+      validation_result: makeValidationResult({ is_valid: false, errors: [] }),
     });
 
     expect(

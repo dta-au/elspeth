@@ -17,6 +17,7 @@ import { useAuthStore } from "./stores/authStore";
 import { usePreferencesStore } from "./stores/preferencesStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
+  FOCUS_AUTHORING_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
   type RequestArtifactViewDetail,
@@ -721,6 +722,18 @@ describe("App banner roles", () => {
     expect(onOpenGraph).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+  });
+
+  it("routes Ctrl+/ through the shared authoring focus intent", async () => {
+    const onFocusAuthoring = vi.fn();
+    window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    fireEvent.keyDown(document, { key: "/", ctrlKey: true });
+
+    expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
   });
 
   it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {

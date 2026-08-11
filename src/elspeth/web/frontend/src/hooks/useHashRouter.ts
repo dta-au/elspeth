@@ -20,8 +20,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  REQUEST_ARTIFACT_VIEW_EVENT,
-  type RequestArtifactViewDetail,
+  claimArtifactViewIntent,
+  dispatchClaimedArtifactViewIntent,
+  isCurrentArtifactViewIntent,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
@@ -92,6 +93,7 @@ export function useHashRouter(
   const pendingArtifactIntent = useRef<{
     sessionId: string;
     tab: "spec" | "yaml";
+    sequence: number;
   } | null>(null);
   const pendingIntentUnsubscribe = useRef<(() => void) | null>(null);
 
@@ -102,20 +104,21 @@ export function useHashRouter(
   }, []);
 
   const dispatchArtifactIntent = useCallback((
+    sequence: number,
     sessionId: string,
     tab: ArtifactTab,
   ): void => {
-    window.dispatchEvent(
-      new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
-        detail: { tab, focusMode: false, sessionId },
-      }),
+    dispatchClaimedArtifactViewIntent(
+      sequence,
+      { tab, focusMode: false, sessionId },
     );
   }, []);
 
   const requestArtifact = useCallback((sessionId: string, tab: ArtifactTab): void => {
     cancelPendingArtifactIntent();
+    const sequence = claimArtifactViewIntent();
     if (tab !== "spec" && tab !== "yaml") {
-      queueMicrotask(() => dispatchArtifactIntent(sessionId, tab));
+      queueMicrotask(() => dispatchArtifactIntent(sequence, sessionId, tab));
       return;
     }
 
@@ -128,13 +131,13 @@ export function useHashRouter(
         return false;
       }
       if (hasCompositionContent(state.compositionState)) {
-        dispatchArtifactIntent(sessionId, tab);
+        dispatchArtifactIntent(sequence, sessionId, tab);
       }
       return true;
     };
     if (dispatchIfAvailable()) return;
 
-    const intent = { sessionId, tab };
+    const intent = { sessionId, tab, sequence };
     pendingArtifactIntent.current = intent;
     pendingIntentUnsubscribe.current = useSessionStore.subscribe((state) => {
       if (pendingArtifactIntent.current !== intent) return;
@@ -146,7 +149,10 @@ export function useHashRouter(
       pendingIntentUnsubscribe.current?.();
       pendingIntentUnsubscribe.current = null;
       queueMicrotask(() => {
-        if (pendingArtifactIntent.current !== intent) return;
+        if (
+          pendingArtifactIntent.current !== intent ||
+          !isCurrentArtifactViewIntent(intent.sequence)
+        ) return;
         const committedState = useSessionStore.getState();
         cancelPendingArtifactIntent();
         if (
@@ -154,7 +160,7 @@ export function useHashRouter(
           committedState.compositionStateLoaded &&
           hasCompositionContent(committedState.compositionState)
         ) {
-          dispatchArtifactIntent(sessionId, tab);
+          dispatchArtifactIntent(intent.sequence, sessionId, tab);
         }
       });
     });

@@ -631,6 +631,15 @@ describe("ComposerWorkspace", () => {
     ).not.toBe(0);
   });
 
+  it("reserves a desktop row for collapsed restore status instead of overlaying artifacts", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\)/s);
+    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*position:\s*static/s);
+  });
+
   it("publishes the authoritative session reset through one workspace controller", () => {
     const observations: string[] = [];
     function ContextProbe() {
@@ -655,5 +664,26 @@ describe("ComposerWorkspace", () => {
 
     act(() => useSessionStore.setState({ activeSessionId: "next-session" }));
     expect(observations[observations.length - 1]).toBe("graph");
+  });
+
+  it("lets an artifact intent reveal the narrow Pipeline view", () => {
+    function ArtifactIntent() {
+      const controller = useWorkspacePaneController();
+      return <button type="button" onClick={() => controller.actions.showPipeline()}>Open artifact</button>;
+    }
+    renderWorkspace({ authoring: <ArtifactIntent /> });
+    emitWidth(720);
+    fireEvent.click(screen.getByRole("button", { name: "Open artifact" }));
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("region", { name: "Pipeline artifact" })).toBeVisible();
+  });
+
+  it("reveals Compose before focusing the chat input from the shared authoring intent", () => {
+    renderWorkspace({ authoring: <textarea data-chat-input aria-label="Chat input" /> });
+    emitWidth(720);
+    fireEvent.click(screen.getByRole("tab", { name: "Pipeline" }));
+    act(() => window.dispatchEvent(new Event("elspeth:focus-authoring")));
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("textbox", { name: "Chat input" })).toHaveFocus();
   });
 });

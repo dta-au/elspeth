@@ -19,9 +19,10 @@ import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { fuzzyMatch } from "@/utils/fuzzyScore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
-  REQUEST_ARTIFACT_VIEW_EVENT,
+  FOCUS_AUTHORING_EVENT,
   REQUEST_RUN_EVENT,
-  type RequestArtifactViewDetail,
+  claimArtifactViewIntent,
+  dispatchClaimedArtifactViewIntent,
 } from "@/lib/composer-events";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -124,11 +125,10 @@ export function CommandPalette({
       category: "action",
       shortcut: "Ctrl+/",
       action: () => {
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "[data-chat-input]",
-        );
-        input?.focus();
         onClose();
+        queueMicrotask(() => {
+          window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
+        });
       },
     });
 
@@ -154,20 +154,14 @@ export function CommandPalette({
       category: "navigation",
       shortcut: "Ctrl+Shift+G",
       action: () => {
+        const intent = claimArtifactViewIntent();
         onClose();
         queueMicrotask(() => {
-          window.dispatchEvent(
-            new CustomEvent<RequestArtifactViewDetail>(
-              REQUEST_ARTIFACT_VIEW_EVENT,
-              {
-                detail: {
-                  tab: "graph",
-                  focusMode: false,
-                  sessionId: activeSessionId,
-                },
-              },
-            ),
-          );
+          dispatchClaimedArtifactViewIntent(intent, {
+            tab: "graph",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
         });
       },
     });
@@ -182,20 +176,14 @@ export function CommandPalette({
       // path into the near-empty modal (elspeth-bff8043d33 residual).
       enabled: hasCompositionContent(compositionState),
       action: () => {
+        const intent = claimArtifactViewIntent();
         onClose();
         queueMicrotask(() => {
-          window.dispatchEvent(
-            new CustomEvent<RequestArtifactViewDetail>(
-              REQUEST_ARTIFACT_VIEW_EVENT,
-              {
-                detail: {
-                  tab: "yaml",
-                  focusMode: false,
-                  sessionId: activeSessionId,
-                },
-              },
-            ),
-          );
+          dispatchClaimedArtifactViewIntent(intent, {
+            tab: "yaml",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
         });
       },
     });

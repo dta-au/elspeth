@@ -24,6 +24,7 @@ import * as api from "@/api/client";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition } from "@/test/composerFixtures";
+import { useHashRouter } from "@/hooks/useHashRouter";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
@@ -116,6 +117,11 @@ function LayoutCleanupRequestProbe({
   return null;
 }
 
+function HashRouterProbe(): null {
+  useHashRouter();
+  return null;
+}
+
 function requestArtifact(detail: RequestArtifactViewDetail): void {
   window.dispatchEvent(
     new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
@@ -152,6 +158,7 @@ describe("ArtifactWorkspace", () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     vi.useRealTimers();
+    window.history.replaceState(null, "", window.location.pathname);
   });
 
   it("fills the artifact body with one active-panel scroll owner", () => {
@@ -172,6 +179,11 @@ describe("ArtifactWorkspace", () => {
     expect(css).toMatch(
       /\.artifact-workspace-panel\[hidden\]\s*\{[^}]*display:\s*none;/s,
     );
+  });
+
+  it("lets the Run artifact panel own long-output scrolling", () => {
+    const workspaceCss = readFileSync(join(process.cwd(), "src/components/workspace/workspace.css"), "utf8");
+    expect(workspaceCss).toMatch(/\.artifact-workspace-panel\s+\.inline-run-results\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;[^}]*margin:\s*0;/s);
   });
 
   it("starts on Graph with one complete named tab relationship and the real empty state", () => {
@@ -251,6 +263,32 @@ describe("ArtifactWorkspace", () => {
     expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
     await user.keyboard("{Home}");
     expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+  });
+
+  it("keeps a newer direct Run selection after an older deferred Spec hash loads", async () => {
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: null,
+      sessions: [{ id: "session-1", title: "Session 1" }],
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+    const user = userEvent.setup();
+    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+
+    await user.click(screen.getByRole("tab", { name: "Run" }));
+    act(() => {
+      useSessionStore.setState({
+        compositionStateLoaded: true,
+        compositionState: makeComposition(1),
+      });
+    });
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByRole("tab", { name: "Run" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
   });
 
   it("skips disabled tabs while roving in an empty composition", async () => {

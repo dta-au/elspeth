@@ -16,8 +16,7 @@ import {
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { SideRailValidationBanner } from "@/components/sidebar/SideRailValidationBanner";
 import {
-  REQUEST_ARTIFACT_VIEW_EVENT,
-  type RequestArtifactViewDetail,
+  dispatchArtifactViewIntent,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
@@ -178,21 +177,13 @@ export function WorkspaceInspector({
   const selectComponent = useCallback(
     (componentId: string): void => {
       useSessionStore.getState().selectNode(componentId);
-      actions.selectArtifactTab("graph");
-      window.dispatchEvent(
-        new CustomEvent<RequestArtifactViewDetail>(
-          REQUEST_ARTIFACT_VIEW_EVENT,
-          {
-            detail: {
-              tab: "graph",
-              focusMode: false,
-              sessionId: activeSessionId,
-            },
-          },
-        ),
-      );
+      dispatchArtifactViewIntent({
+        tab: "graph",
+        focusMode: false,
+        sessionId: activeSessionId,
+      });
     },
-    [actions, activeSessionId],
+    [activeSessionId],
   );
 
   return (

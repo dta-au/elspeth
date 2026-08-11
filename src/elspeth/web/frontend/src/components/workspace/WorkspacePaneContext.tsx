@@ -21,6 +21,8 @@ export interface WorkspaceControllerState {
   activeArtifactTab: ArtifactTab;
   activeInspectorTab: InspectorTab | null;
   inspectorOpen: boolean;
+  artifactVisible: boolean;
+  authoringVisible: boolean;
 }
 
 export interface WorkspaceControllerActions {
@@ -28,6 +30,8 @@ export interface WorkspaceControllerActions {
   commitResize: WorkspacePaneState["commitResize"];
   setAuthoringCollapsed: WorkspacePaneState["setAuthoringCollapsed"];
   selectArtifactTab: WorkspacePaneState["selectArtifactTab"];
+  showPipeline: () => void;
+  showCompose: () => void;
   openInspector: (tab: InspectorTab, invoker: HTMLElement) => void;
   closeInspector: WorkspacePaneState["closeInspector"];
 }
@@ -52,13 +56,24 @@ const WorkspacePaneContext = createContext<WorkspacePaneController | null>(
   null,
 );
 
+const NOOP_SHOW_PIPELINE = (): void => undefined;
+const NOOP_SHOW_COMPOSE = (): void => undefined;
+
 interface WorkspacePaneProviderProps {
   paneState: WorkspacePaneState;
+  artifactVisible?: boolean;
+  authoringVisible?: boolean;
+  showPipeline?: () => void;
+  showCompose?: () => void;
   children: ReactNode;
 }
 
 export function WorkspacePaneProvider({
   paneState,
+  artifactVisible = true,
+  authoringVisible = true,
+  showPipeline = NOOP_SHOW_PIPELINE,
+  showCompose = NOOP_SHOW_COMPOSE,
   children,
 }: WorkspacePaneProviderProps) {
   const {
@@ -90,6 +105,8 @@ export function WorkspacePaneProvider({
       activeArtifactTab,
       activeInspectorTab,
       inspectorOpen,
+      artifactVisible,
+      authoringVisible,
     }),
     [
       activeArtifactTab,
@@ -97,6 +114,8 @@ export function WorkspacePaneProvider({
       authoringCollapsed,
       availableArtifactTabs,
       inspectorOpen,
+      artifactVisible,
+      authoringVisible,
     ],
   );
   const actions = useMemo<WorkspaceControllerActions>(
@@ -105,6 +124,8 @@ export function WorkspacePaneProvider({
       commitResize,
       setAuthoringCollapsed,
       selectArtifactTab,
+      showPipeline,
+      showCompose,
       openInspector,
       closeInspector,
     }),
@@ -115,6 +136,8 @@ export function WorkspacePaneProvider({
       resizeTransient,
       selectArtifactTab,
       setAuthoringCollapsed,
+      showCompose,
+      showPipeline,
     ],
   );
   const controller = useMemo<WorkspacePaneController>(

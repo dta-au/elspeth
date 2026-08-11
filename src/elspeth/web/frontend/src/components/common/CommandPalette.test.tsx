@@ -4,8 +4,11 @@ import { type ReactNode, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import {
+  FOCUS_AUTHORING_EVENT,
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
+  claimArtifactViewIntent,
+  isCurrentArtifactViewIntent,
   REQUEST_RUN_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
@@ -235,7 +238,9 @@ describe("CommandPalette guided-mode commands", () => {
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
+    const priorIntent = claimArtifactViewIntent();
     fireEvent.click(screen.getByText(/show graph/i));
+    expect(isCurrentArtifactViewIntent(priorIntent)).toBe(false);
     await waitFor(() => {
       expect(artifactRequests).toEqual([
         { tab: "graph", focusMode: false, sessionId: "session-1" },
@@ -245,6 +250,21 @@ describe("CommandPalette guided-mode commands", () => {
     expect(onLegacyModal).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onLegacyModal);
+  });
+
+  it("routes Focus Chat through the shared authoring-view intent", async () => {
+    const onFocusAuthoring = vi.fn();
+    window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
+
+    fireEvent.click(screen.getByText("Focus Chat Input"));
+
+    await waitFor(() => {
+      expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    });
+    window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
   });
 
   it("requests the YAML artifact when the pipeline has content", async () => {
