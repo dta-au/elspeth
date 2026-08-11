@@ -1539,6 +1539,17 @@ untrusted producers, lane drift, stale SHAs, and any digest mismatch. Test the
 operation with a synthetic digest-bound artifact envelope and mutations;
 credentials and provider values never enter the repository or assessment.
 
+The downloaded artifact cannot authenticate its own provenance. The ingest
+operation must independently query GitHub's Actions API for the official
+run/job/artifact record (or verify an equivalent GitHub artifact attestation)
+and bind that trusted response to the envelope, workflow digest, run attempt,
+job, artifact identity/digest, protected ref, and frozen SHA. A self-declared
+manifest with internally consistent hashes is insufficient. Tests mock the
+read-only provenance client and must prove that a fabricated, transplanted, or
+re-run envelope is rejected. Use deterministic per-lane publication filenames
+so schema-3 `publication_paths` can be frozen before dispatch; do not derive
+repository paths from an untrusted run ID.
+
 **Step 6: Fix defects and commit the implementation baseline**
 
 Review `git diff --name-only` against the Task 11 file inventory, including
