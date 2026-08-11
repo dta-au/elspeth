@@ -494,6 +494,10 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         landscape_url = settings.get_landscape_url()
     session_service = app.state.session_service
     cancelled_runs: list[RunRecord] = []
+    # Inline custody stages are part of the blob integrity protocol, not
+    # best-effort orphan bookkeeping. Do not serve until every stage has a
+    # row-authoritative outcome.
+    await app.state.blob_service.reconcile_inline_custody_publications()
     try:
         cancelled_runs = await session_service.cancel_all_orphaned_run_records(
             reason=f"Orphaned by server restart — no active process {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",

@@ -37,10 +37,15 @@ from elspeth.web.blobs.service import (
     inline_custody_blob_id,
     inline_custody_storage_path,
     persist_inline_custody_blob_on_connection,
+    publish_inline_custody_publication,
     sanitize_filename,
+)
+from elspeth.web.blobs.service import (
+    InlineCustodyPublication as InlineCustodyPublication,
 )
 from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.tools._common import PendingCustodyBlobView
+from elspeth.web.sessions.locking import _run_lock_cleanup
 
 if TYPE_CHECKING:
     from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
@@ -269,7 +274,7 @@ def finalize_pipeline_custody_on_connection(
     data_dir: str | Path,
     max_storage_per_session: int,
     write_fence: BlobGuidedOperationWriteFence | None,
-) -> None:
+) -> InlineCustodyPublication:
     """Materialize a prepared inline source inside a caller-owned transaction.
 
     The guided-full staging settlement calls this AFTER inserting the
@@ -287,7 +292,7 @@ def finalize_pipeline_custody_on_connection(
         raise TypeError("pipeline custody write_fence must be an exact BlobGuidedOperationWriteFence")
     if write_fence is not None and write_fence.session_id != preparation.request.session_id:
         raise AuditIntegrityError("Pipeline custody write fence targets a different session")
-    row = persist_inline_custody_blob_on_connection(
+    row, publication = persist_inline_custody_blob_on_connection(
         conn,
         data_dir=Path(data_dir),
         max_storage_per_session=max_storage_per_session,
@@ -296,6 +301,26 @@ def finalize_pipeline_custody_on_connection(
     )
     if str(row.id) != str(preparation.blob_id):
         raise AuditIntegrityError("Inline custody settled a blob id different from the prepared proposal")
+    return publication
+
+
+def publish_pipeline_custody(engine: Engine, publication: InlineCustodyPublication) -> None:
+    """Publish staged inline bytes after the owning transaction commits."""
+    publish_inline_custody_publication(engine, publication)
+
+
+def reconcile_pipeline_custody_after_transaction_failure(
+    engine: Engine,
+    publication: InlineCustodyPublication,
+    *,
+    primary_exc: BaseException,
+) -> None:
+    """Resolve a failed transaction without guessing its commit outcome."""
+    _run_lock_cleanup(
+        lambda: publish_inline_custody_publication(engine, publication),
+        label="Inline custody transaction-outcome reconciliation",
+        primary_exc=primary_exc,
+    )
 
 
 def pending_custody_blob_view(

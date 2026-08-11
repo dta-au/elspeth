@@ -36,6 +36,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.blobs import service as blob_service_module
 from elspeth.web.blobs.protocol import (
     BlobActiveRunError,
+    BlobContentMissingError,
     BlobForkCleanupError,
     BlobForkCleanupResult,
     BlobForkFenceLostError,
@@ -1699,6 +1700,351 @@ def _custody_process(
         engine.dispose()
 
 
+class TestInlineCustodyStartupReconciliation:
+    def test_startup_rejects_symbolic_link_custody_root(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        outside_root = tmp_path / "outside-blobs"
+        outside_session = outside_root / str(session_id)
+        outside_session.mkdir(parents=True)
+        storage = outside_session / f"{uuid4()}_rolled-back.csv"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.write_bytes(b"external-inline-content\n")
+        (tmp_path / "blobs").symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert staging.read_bytes() == b"external-inline-content\n"
+
+    def test_startup_rejects_session_directory_swapped_to_symlink_after_listing(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        custody_root = tmp_path.resolve() / "blobs"
+        session_dir = custody_root / str(session_id)
+        session_dir.mkdir(parents=True)
+        parked_session = custody_root / f"{session_id}.parked"
+        outside_session = tmp_path / "outside-session"
+        outside_session.mkdir()
+        outside_storage = outside_session / f"{uuid4()}_rolled-back.csv"
+        outside_staging = blob_service_module.inline_custody_staging_path(outside_storage)
+        outside_temp = outside_staging.with_name(f".{outside_staging.name}.custody.tmp")
+        outside_temp.write_bytes(b"external-inline-content\n")
+        original_lock = blob_service_module._blob_custody_session_lock
+        swapped = False
+
+        @contextlib.contextmanager
+        def _swap_before_lock(engine, locked_session_id: str):
+            nonlocal swapped
+            if not swapped and locked_session_id == str(session_id):
+                swapped = True
+                session_dir.rename(parked_session)
+                session_dir.symlink_to(outside_session, target_is_directory=True)
+            with original_lock(engine, locked_session_id) as connection:
+                yield connection
+
+        monkeypatch.setattr(blob_service_module, "_blob_custody_session_lock", _swap_before_lock)
+
+        with pytest.raises(AuditIntegrityError, match="session directory is not stable"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert outside_temp.read_bytes() == b"external-inline-content\n"
+
+    @pytest.mark.asyncio
+    async def test_startup_promotes_committed_stage_and_removes_rowless_stage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-before-inline-publication\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+
+        orphan_storage = storage.parent / f"{uuid4()}_rolled-back.csv"
+        orphan_staging = blob_service_module.inline_custody_staging_path(orphan_storage)
+        orphan_staging.write_bytes(b"rolled-back-inline-content\n")
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert storage.read_bytes() == content
+        assert not staging.exists()
+        assert not orphan_storage.exists()
+        assert not orphan_staging.exists()
+
+    @pytest.mark.asyncio
+    async def test_live_publication_rejects_symbolic_link_stage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        storage.unlink()
+        outside = tmp_path / "outside-inline-content.csv"
+        outside.write_bytes(content)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.symlink_to(outside)
+        publication = blob_service_module.InlineCustodyPublication(
+            session_id=str(session_id),
+            blob_id=str(record.id),
+            storage=storage,
+            staging=staging,
+            expected_hash=record.content_hash,
+            cleanup_after_rollback=False,
+        )
+
+        with pytest.raises(AuditIntegrityError, match="regular file"):
+            blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert outside.read_bytes() == content
+        assert staging.is_symlink()
+        assert not storage.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_symbolic_link_canonical_storage(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        storage.unlink()
+        outside = tmp_path / "outside-canonical-content.csv"
+        outside.write_bytes(content)
+        storage.symlink_to(outside)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        staging.write_bytes(content)
+
+        with pytest.raises(AuditIntegrityError, match="regular file"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert outside.read_bytes() == content
+        assert storage.is_symlink()
+        assert staging.exists()
+
+    def test_startup_removes_rowless_atomic_stage_temp(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        session_dir = tmp_path.resolve() / "blobs" / str(session_id)
+        session_dir.mkdir(parents=True)
+        storage = session_dir / f"{uuid4()}_rolled-back.csv"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        atomic_temp = staging.with_name(f".{staging.name}.custody.tmp")
+        atomic_temp.write_bytes(b"partial-inline-content\n")
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not atomic_temp.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_never_promotes_atomic_temp_for_ready_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        atomic_temp = staging.with_name(f".{staging.name}.custody.tmp")
+        storage.rename(atomic_temp)
+
+        with pytest.raises(BlobContentMissingError):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not storage.exists()
+        assert not atomic_temp.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_rejects_row_storage_path_with_different_filename(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        tampered_storage = storage.with_name(f"{record.id}_different.csv")
+        with db_engine.begin() as conn:
+            conn.execute(blobs_table.update().where(blobs_table.c.id == str(record.id)).values(storage_path=str(tampered_storage)))
+
+        with pytest.raises(AuditIntegrityError, match="does not match its committed row"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert staging.read_bytes() == content
+        assert not storage.exists()
+        assert not tampered_storage.exists()
+
+    @pytest.mark.asyncio
+    async def test_startup_inspects_stage_only_while_holding_session_custody_lock(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path)
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=b"committed-inline-content\n",
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        original_lock = blob_service_module._blob_custody_session_lock
+        held_by_thread: set[int] = set()
+
+        @contextlib.contextmanager
+        def _tracked_lock(engine, locked_session_id: str):
+            with original_lock(engine, locked_session_id) as connection:
+                thread_id = threading.get_ident()
+                held_by_thread.add(thread_id)
+                try:
+                    yield connection
+                finally:
+                    held_by_thread.remove(thread_id)
+
+        original_file_check = blob_service_module._regular_custody_file_exists
+
+        def _assert_locked_before_stage_inspection(path: Path, *, directory_fd: int | None = None) -> bool:
+            if path == staging and threading.get_ident() not in held_by_thread:
+                raise AssertionError("inline stage inspected outside the session custody lock")
+            return original_file_check(path, directory_fd=directory_fd)
+
+        monkeypatch.setattr(blob_service_module, "_blob_custody_session_lock", _tracked_lock)
+        monkeypatch.setattr(blob_service_module, "_regular_custody_file_exists", _assert_locked_before_stage_inspection)
+
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert storage.read_bytes() == b"committed-inline-content\n"
+        assert not staging.exists()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_startup_reconcilers_share_one_stage_outcome(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        service = BlobServiceImpl(db_engine, tmp_path)
+        content = b"committed-inline-content\n"
+        record = await service.create_blob(
+            session_id=session_id,
+            filename="committed.csv",
+            content=content,
+            mime_type="text/csv",
+        )
+        storage = Path(record.storage_path)
+        staging = blob_service_module.inline_custody_staging_path(storage)
+        storage.rename(staging)
+        start = threading.Barrier(2)
+
+        def _reconcile() -> None:
+            start.wait(timeout=5)
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(_reconcile) for _ in range(2)]
+            for future in futures:
+                future.result(timeout=10)
+
+        assert storage.read_bytes() == content
+        assert not staging.exists()
+
+    @pytest.mark.parametrize("raw_filename", ["a" * 200, "é" * 100])
+    def test_inline_stage_name_fits_for_maximum_valid_filename(self, tmp_path: Path, raw_filename: str) -> None:
+        filename = sanitize_filename(raw_filename)
+        storage = tmp_path / f"{uuid4()}_{filename}"
+        staging = blob_service_module.inline_custody_staging_path(storage)
+
+        blob_service_module._atomic_write_blob(staging, b"bounded-stage-name\n")
+
+        assert staging.read_bytes() == b"bounded-stage-name\n"
+        assert len(os.fsencode(staging.name)) <= os.pathconf(staging.parent, "PC_NAME_MAX")
+
+    def test_startup_rejects_malformed_inline_stage_identity(self, db_engine, session_id: UUID, tmp_path: Path) -> None:
+        session_dir = tmp_path.resolve() / "blobs" / str(session_id)
+        session_dir.mkdir(parents=True)
+        malformed = session_dir / ".not-a-uuid.inline-custody-staged"
+        malformed.write_bytes(b"unbound-inline-content\n")
+
+        with pytest.raises(AuditIntegrityError, match="invalid blob identity"):
+            blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert malformed.exists()
+
+    def test_candidate_replacement_during_hashing_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        candidate = tmp_path / "candidate"
+        candidate.write_bytes(b"a" * 8192)
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(b"b" * 8192)
+        monkeypatch.setattr(blob_service_module, "_STREAM_CHUNK_BYTES", 4096)
+        real_read = blob_service_module.os.read
+        replaced = False
+
+        def _replace_after_first_read(descriptor: int, size: int) -> bytes:
+            nonlocal replaced
+            chunk = real_read(descriptor, size)
+            if not replaced:
+                replaced = True
+                os.replace(replacement, candidate)
+            return chunk
+
+        monkeypatch.setattr(blob_service_module.os, "read", _replace_after_first_read)
+
+        with pytest.raises(AuditIntegrityError, match="changed while hashing"):
+            blob_service_module._content_hash_from_file(candidate)
+
+
 class TestInlineCustody:
     @staticmethod
     def _guided_operation_write_fence(
@@ -2202,6 +2548,236 @@ class TestInlineCustody:
                 select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0)).where(blobs_table.c.session_id == str(session_id))
             ).scalar_one()
         assert charged == len(request.content)
+
+    @pytest.mark.asyncio
+    async def test_caller_transaction_rollback_removes_stage_created_for_existing_pending_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
+        request = _custody_request(db_engine, session_id)
+        original_write = blob_service_module._atomic_write_blob
+
+        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+            raise RuntimeError("simulated interruption before file write")
+
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
+        with pytest.raises(RuntimeError, match="before file write"):
+            await service.reserve_inline_custody(request)
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
+
+        publication = None
+        with pytest.raises(RuntimeError, match="rollback caller-owned transaction"), db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+            raise RuntimeError("rollback caller-owned transaction")
+
+        assert publication is not None
+        assert publication.staging.exists()
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert not publication.staging.exists()
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table)).one()
+        assert row.status == "pending"
+
+    @pytest.mark.asyncio
+    async def test_startup_discards_stage_left_by_rollback_to_existing_pending_row(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        service = BlobServiceImpl(db_engine, tmp_path, max_storage_per_session=100)
+        request = _custody_request(db_engine, session_id)
+        original_write = blob_service_module._atomic_write_blob
+
+        def _interrupt_before_write(_path: Path, _content: bytes) -> None:
+            raise RuntimeError("simulated interruption before file write")
+
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", _interrupt_before_write)
+        with pytest.raises(RuntimeError, match="before file write"):
+            await service.reserve_inline_custody(request)
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", original_write)
+
+        publication = None
+        with pytest.raises(RuntimeError, match="simulate process death"), db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+            raise RuntimeError("simulate process death")
+
+        assert publication is not None
+        assert publication.staging.exists()
+        blob_service_module.reconcile_inline_custody_publications(db_engine, tmp_path)
+
+        assert not publication.staging.exists()
+        with db_engine.connect() as conn:
+            row = conn.execute(select(blobs_table)).one()
+        assert row.status == "pending"
+
+    def test_live_staging_rejects_symbolic_link_custody_root(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        outside_root = tmp_path / "outside-blobs"
+        outside_root.mkdir()
+        (tmp_path / "blobs").symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"), db_engine.begin() as conn:
+            blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert tuple(outside_root.rglob("*")) == ()
+
+    def test_live_publication_rejects_swapped_symbolic_link_custody_root(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+        custody_root = tmp_path / "blobs"
+        parked_root = tmp_path / "parked-blobs"
+        custody_root.rename(parked_root)
+        outside_root = tmp_path / "outside-blobs"
+        outside_session = outside_root / str(session_id)
+        outside_session.mkdir(parents=True)
+        outside_staging = outside_session / publication.staging.name
+        outside_staging.write_bytes(request.content)
+        custody_root.symlink_to(outside_root, target_is_directory=True)
+
+        with pytest.raises(AuditIntegrityError, match="custody root is not a stable directory"):
+            blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+        assert outside_staging.read_bytes() == request.content
+        assert not (outside_session / publication.storage.name).exists()
+        assert (parked_root / str(session_id) / publication.staging.name).read_bytes() == request.content
+
+    def test_first_live_stage_durably_links_new_custody_directories_before_file(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        original_mkdir = blob_service_module.os.mkdir
+        original_fsync = blob_service_module.os.fsync
+        events: list[str] = []
+
+        def _tracked_mkdir(path, mode=0o777, *, dir_fd=None):
+            result = original_mkdir(path, mode=mode, dir_fd=dir_fd)
+            if Path(path).name == "blobs":
+                events.append("mkdir-root")
+            elif path == str(session_id):
+                events.append("mkdir-session")
+            return result
+
+        def _tracked_fsync(descriptor: int) -> None:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if opened_path == tmp_path.resolve():
+                events.append("fsync-data-dir")
+            elif opened_path == tmp_path.resolve() / "blobs":
+                events.append("fsync-custody-root")
+            elif opened_path.name.endswith(".custody.tmp"):
+                events.append("fsync-stage-file")
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(blob_service_module.os, "mkdir", _tracked_mkdir)
+        monkeypatch.setattr(blob_service_module.os, "fsync", _tracked_fsync)
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert events.index("mkdir-root") < events.index("fsync-data-dir")
+        assert events.index("fsync-data-dir") < events.index("mkdir-session")
+        assert events.index("mkdir-session") < events.index("fsync-custody-root")
+        assert events.index("fsync-custody-root") < events.index("fsync-stage-file")
+
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
+
+    @pytest.mark.parametrize("failure_target", ["data-dir", "custody-root"])
+    def test_live_stage_retries_unproven_parent_directory_fsync(
+        self,
+        db_engine,
+        session_id: UUID,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        failure_target: str,
+    ) -> None:
+        request = _custody_request(db_engine, session_id)
+        original_fsync = blob_service_module.os.fsync
+        target_path = tmp_path.resolve() if failure_target == "data-dir" else tmp_path.resolve() / "blobs"
+        failed_once = False
+        target_events: list[str] = []
+
+        def _fail_target_once(descriptor: int) -> None:
+            nonlocal failed_once
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if opened_path == target_path:
+                if not failed_once:
+                    failed_once = True
+                    target_events.append("failed")
+                    raise OSError(f"simulated {failure_target} fsync failure")
+                target_events.append("succeeded")
+            original_fsync(descriptor)
+
+        monkeypatch.setattr(blob_service_module.os, "fsync", _fail_target_once)
+        with pytest.raises(OSError, match=f"simulated {failure_target} fsync failure"), db_engine.begin() as conn:
+            blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        with db_engine.begin() as conn:
+            _, publication = blob_service_module.persist_inline_custody_blob_on_connection(
+                conn,
+                data_dir=tmp_path,
+                max_storage_per_session=100,
+                request=request,
+                write_fence=None,
+            )
+
+        assert target_events[:2] == ["failed", "succeeded"]
+        blob_service_module.publish_inline_custody_publication(db_engine, publication)
 
     @pytest.mark.asyncio
     async def test_failed_ready_transition_leaves_pending_row_and_file_for_retry(

@@ -1371,6 +1371,45 @@ def test_guided_full_inline_custody_fault_rolls_back_blob_and_cohort_together(co
     assert operation["originating_message_id"] is None
 
 
+def test_guided_full_late_fault_removes_inline_custody_artifacts_after_rollback(composer_test_client) -> None:
+    """A later cohort failure must not leave rowless custody bytes behind."""
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full late custody fault"}).json()
+    engine = composer_test_client.app.state.session_engine
+    armed = True
+
+    def inject_fault(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal armed
+        if not armed:
+            return
+        normalized = " ".join(statement.lower().split())
+        if "insert into proposal_events" in normalized:
+            armed = False
+            raise RuntimeError("injected post-custody proposal-event fault")
+
+    event.listen(engine, "before_cursor_execute", inject_fault)
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000032",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", inject_fault)
+
+    assert response.status_code == 500, response.text
+    assert not armed, "late fault point was not reached"
+    with engine.connect() as conn:
+        assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_states_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+    session_blob_dir = Path(composer_test_client.app.state.settings.data_dir) / "blobs" / session["id"]
+    assert tuple(path for path in session_blob_dir.rglob("*") if path.is_file()) == ()
+
+
 @pytest.mark.parametrize(
     "fault_point",
     ("checkpoint", "origin", "proposal_event", "proposal", "operation_complete"),

@@ -153,6 +153,34 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-11 — caller-owned DB transactions cannot publish inline-custody files directly**:
+  the guided-full settlement must insert the originating message and blob row
+  in one transaction to satisfy the composite lineage FK, but a DB rollback
+  cannot roll back a canonical filesystem rename. Stage those bytes at the
+  bounded `.{blob_id}.inline-custody-staged` sibling, return the publication
+  to the transaction owner, and arbitrate the outcome from the committed row
+  under the same-session custody lock. A transaction error has an ambiguous
+  commit outcome: re-query and publish when the row won; remove the stage when
+  no row exists, or when this attempt created it and rollback restored an exact
+  pre-existing `pending` row. Startup likewise discards a stage beside an exact
+  `pending` row because inline settlement commits only `ready`; retaining that
+  non-authoritative stage makes the supported pending retry state unbootable.
+  The writer's `..{blob_id}.inline-custody-staged.custody.tmp`
+  is always disposable, never row authority: startup enumerates it and the
+  durable stage only after taking the session lock, then deletes temps and
+  reconciles stages. Reject symlink/non-regular candidates and validate a
+  row's exact canonical storage path before moving anything. Nofollow-open and
+  retain both the `blobs/` root and session directory descriptors across live
+  staging/publication/cleanup and the whole startup pass: checking only
+  session/final components still lets a `blobs -> outside` ancestor escape
+  custody. On first use, fsync the resolved data directory after linking
+  `blobs/`, then fsync `blobs/` after linking the session directory; fsyncing
+  only the stage file and session directory does not make those new ancestor
+  entries crash-durable. Reconciliation hashes every candidate incrementally with
+  `_STREAM_CHUNK_BYTES` through a no-follow descriptor; `Path.read_bytes()`
+  under the custody lock recreates the several-large-blobs worker-memory
+  failure this protocol is meant to prevent.
+
 - **2026-08-10 — a `DateTime(timezone=True)` column does NOT round-trip aware on
   SQLite**: the blobs write stamps `datetime.now(UTC)`, the column declares
   `timezone=True`, and `BlobRecord.created_at` still comes back with

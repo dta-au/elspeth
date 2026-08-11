@@ -47,7 +47,12 @@ from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer.authority_hashing import composer_authority_hash, project_composer_authority_payload
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
-from elspeth.web.composer.pipeline_custody import finalize_pipeline_custody_on_connection
+from elspeth.web.composer.pipeline_custody import (
+    InlineCustodyPublication,
+    finalize_pipeline_custody_on_connection,
+    publish_pipeline_custody,
+    reconcile_pipeline_custody_after_transaction_failure,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -10531,7 +10536,26 @@ class SessionServiceImpl:
         now = self._now()
 
         def _sync() -> GuidedFullPipelineProposalStageSettlement:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            publication: InlineCustodyPublication | None = None
+
+            @contextlib.contextmanager
+            def _reconcile_publication_on_error() -> Iterator[None]:
+                try:
+                    yield
+                except BaseException as primary_exc:
+                    if publication is not None:
+                        reconcile_pipeline_custody_after_transaction_failure(
+                            self._engine,
+                            publication,
+                            primary_exc=primary_exc,
+                        )
+                    raise
+
+            with (
+                _reconcile_publication_on_error(),
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+            ):
                 operation_row, _database_now = self.require_guided_operation_fence_on_connection(conn, command.fence)
                 if operation_row["kind"] != "guided_plan":
                     raise AuditIntegrityError("guided-full stage requires a guided_plan operation")
@@ -10609,7 +10633,7 @@ class SessionServiceImpl:
                     # single atomic cohort (elspeth-1e3ad83d89).
                     assert command.custody_max_storage_per_session is not None  # command __post_init__ contract
                     assert custody_data_dir is not None  # validated with the preparation above
-                    finalize_pipeline_custody_on_connection(
+                    publication = finalize_pipeline_custody_on_connection(
                         custody_preparation,
                         conn=conn,
                         data_dir=custody_data_dir,
@@ -10701,7 +10725,7 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                     actor=command.actor,
                 )
-                return GuidedFullPipelineProposalStageSettlement(
+                settlement = GuidedFullPipelineProposalStageSettlement(
                     checkpoint_state=checkpoint,
                     proposal=proposal_record,
                     originating_message=originating_message,
@@ -10709,6 +10733,9 @@ class SessionServiceImpl:
                     response_json=projected_json,
                     response_hash=response_hash,
                 )
+            if publication is not None:
+                publish_pipeline_custody(self._engine, publication)
+            return settlement
 
         settlement = cast(
             "GuidedFullPipelineProposalStageSettlement",

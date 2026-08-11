@@ -17593,6 +17593,70 @@ class TestBlobCrashStateReconciliation:
         assert self.storage_path.read_bytes() == self.old_content
         assert not tombstone.exists(), "delete tombstone must be consumed by reconciliation"
 
+    @pytest.mark.parametrize("artifact_kind", ["inline_stage", "sidecar", "tombstone"])
+    def test_crash_reconciliation_hashes_every_candidate_in_bounded_chunks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        artifact_kind: str,
+    ) -> None:
+        """Crash recovery must not materialize any candidate file in memory."""
+        import hashlib
+        import os
+
+        from elspeth.web.blobs import service as blob_service_module
+
+        monkeypatch.setattr(blob_service_module, "_STREAM_CHUNK_BYTES", 4096)
+        authoritative = bytes(range(256)) * 80
+        expected_hash = hashlib.sha256(authoritative).hexdigest()
+        with self.engine.begin() as conn:
+            from elspeth.web.sessions.models import blobs_table
+
+            conn.execute(
+                blobs_table.update()
+                .where(blobs_table.c.id == self.blob_id)
+                .values(content_hash=expected_hash, size_bytes=len(authoritative))
+            )
+
+        candidates: tuple[Path, ...]
+        if artifact_kind == "inline_stage":
+            self.storage_path.unlink()
+            inline_stage = blob_service_module.inline_custody_staging_path(self.storage_path)
+            inline_stage.write_bytes(authoritative)
+            candidates = (inline_stage,)
+        elif artifact_kind == "sidecar":
+            self.storage_path.write_bytes(b"x" * len(authoritative))
+            self.sidecar_path.write_bytes(authoritative)
+            candidates = (self.storage_path, self.sidecar_path)
+        else:
+            self.storage_path.unlink()
+            tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'0' * 32}")
+            tombstone.write_bytes(authoritative)
+            candidates = (tombstone,)
+
+        requested_sizes: dict[Path, list[int]] = {}
+        real_read = blob_service_module.os.read
+
+        def spy_read(descriptor: int, size: int) -> bytes:
+            opened_path = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if opened_path in candidates:
+                if opened_path not in requested_sizes:
+                    requested_sizes[opened_path] = []
+                requested_sizes[opened_path].append(size)
+            return real_read(descriptor, size)
+
+        monkeypatch.setattr(blob_service_module.os, "read", spy_read)
+
+        blob_service_module.reconcile_blob_storage_versions(
+            self.storage_path,
+            expected_hash=expected_hash,
+        )
+
+        assert set(requested_sizes) == set(candidates)
+        for sizes in requested_sizes.values():
+            assert len(sizes) > 1
+            assert all(0 < size <= 4096 for size in sizes)
+        assert self.storage_path.read_bytes() == authoritative
+
     def test_genuine_corruption_still_escalates(self) -> None:
         """No recoverable version matching the committed hash → escalate."""
         from elspeth.web.blobs.protocol import BlobIntegrityError

@@ -1320,6 +1320,22 @@ class TestLifespanShutdown:
     """Shutdown must await the execution-service drain path."""
 
     @pytest.mark.asyncio
+    async def test_lifespan_aborts_when_inline_custody_reconciliation_fails(self, monkeypatch, tmp_path) -> None:
+        """The server must not serve while a custody journal is unresolved."""
+        app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
+
+        async def _fail_reconciliation() -> None:
+            raise OSError("inline custody journal unavailable")
+
+        monkeypatch.setattr(app.state.blob_service, "reconcile_inline_custody_publications", _fail_reconciliation)
+        with (
+            patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])),
+            pytest.raises(OSError, match="inline custody journal unavailable"),
+        ):
+            async with lifespan(app):
+                pass
+
+    @pytest.mark.asyncio
     async def test_lifespan_aborts_on_composer_config_rejection(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         app.state._session_engine_finalizer()

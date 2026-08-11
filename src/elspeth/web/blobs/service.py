@@ -8,6 +8,7 @@ import hmac
 import json
 import os
 import re
+import stat
 import threading
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -63,6 +64,7 @@ from elspeth.web.blobs.protocol import (
 )
 from elspeth.web.sessions.converters import pipeline_dict_from_record
 from elspeth.web.sessions.locking import (
+    _run_lock_cleanup,
     acquire_session_advisory_xact_lock,
     locked_session_transaction,
     postgres_session_advisory_lock,
@@ -94,6 +96,8 @@ _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
 _LOWERCASE_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _GUIDED_INLINE_CUSTODY_OPERATION_KINDS = ("guided_plan", "guided_respond")
 _LOWERCASE_UUID_HEX = re.compile(r"[0-9a-f]{32}\Z")
+_INLINE_CUSTODY_STAGE_SUFFIX = ".inline-custody-staged"
+_INLINE_CUSTODY_STAGE_TEMP_SUFFIX = f"{_INLINE_CUSTODY_STAGE_SUFFIX}.custody.tmp"
 
 
 class _NormalizedInlineCustodyFields(TypedDict):
@@ -135,6 +139,18 @@ class _StagedBlobDeletion:
 
     storage: Path
     tombstone: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class InlineCustodyPublication:
+    """Tracked filesystem stage awaiting its enclosing transaction outcome."""
+
+    session_id: str
+    blob_id: str
+    storage: Path
+    staging: Path
+    expected_hash: str
+    cleanup_after_rollback: bool
 
 
 _ACTIVE_RUN_COMPOSITION_COLUMNS = (
@@ -475,13 +491,25 @@ def _atomic_write_blob(
     content: bytes,
     *,
     write_guard: Callable[[], None] | None = None,
+    directory_fd: int | None = None,
 ) -> None:
     if write_guard is not None:
         write_guard()
-    storage.parent.mkdir(parents=True, exist_ok=True)
-    _remove_blob_temp_artifacts(storage)
+    if directory_fd is None:
+        storage.parent.mkdir(parents=True, exist_ok=True)
+        _remove_blob_temp_artifacts(storage)
     temp_path = storage.with_name(f".{storage.name}.custody.tmp")
-    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    if directory_fd is not None and temp_path.name in os.listdir(directory_fd):
+        observed_temp = os.stat(temp_path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(observed_temp.st_mode):
+            raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {temp_path}")
+        os.unlink(temp_path.name, dir_fd=directory_fd)
+    fd = os.open(
+        temp_path if directory_fd is None else temp_path.name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
     try:
         with os.fdopen(fd, "wb") as handle:
             if write_guard is None:
@@ -499,15 +527,28 @@ def _atomic_write_blob(
             os.fsync(handle.fileno())
         if write_guard is not None:
             write_guard()
-        os.replace(temp_path, storage)
-        _fsync_parent_directory(storage.parent)
+        if directory_fd is None:
+            os.replace(temp_path, storage)
+            _fsync_parent_directory(storage.parent)
+        else:
+            os.replace(
+                temp_path.name,
+                storage.name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            os.fsync(directory_fd)
         if write_guard is not None:
             try:
                 write_guard()
             except BaseException as guard_exc:
                 try:
-                    storage.unlink(missing_ok=True)
-                    _fsync_parent_directory(storage.parent)
+                    if directory_fd is None:
+                        storage.unlink(missing_ok=True)
+                        _fsync_parent_directory(storage.parent)
+                    elif storage.name in os.listdir(directory_fd):
+                        os.unlink(storage.name, dir_fd=directory_fd)
+                        os.fsync(directory_fd)
                 except OSError as rollback_exc:
                     guard_exc.add_note(
                         f"Rollback failed: could not remove fork blob published after lease loss "
@@ -515,7 +556,10 @@ def _atomic_write_blob(
                     )
                 raise
     finally:
-        temp_path.unlink(missing_ok=True)
+        if directory_fd is None:
+            temp_path.unlink(missing_ok=True)
+        elif temp_path.name in os.listdir(directory_fd):
+            os.unlink(temp_path.name, dir_fd=directory_fd)
 
 
 def _fsync_parent_directory(directory: Path) -> None:
@@ -630,12 +674,276 @@ def blob_pre_update_sidecar(storage: Path) -> Path:
     return storage.with_name(f".{storage.name}.pre-update")
 
 
-def reconcile_blob_storage_versions(storage: Path, *, expected_hash: str | None) -> None:
+def inline_custody_staging_path(storage: Path) -> Path:
+    """Return the bounded deterministic stage for pre-commit inline custody."""
+    blob_id, separator, filename = storage.name.partition("_")
+    try:
+        parsed_blob_id = UUID(blob_id)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Inline custody storage has an invalid blob identity: {storage}") from exc
+    if separator != "_" or not filename or str(parsed_blob_id) != blob_id:
+        raise AuditIntegrityError(f"Inline custody storage has an invalid name: {storage}")
+    return storage.with_name(f".{blob_id}{_INLINE_CUSTODY_STAGE_SUFFIX}")
+
+
+def _inline_custody_staging_temp_path(staging: Path) -> Path:
+    return staging.with_name(f".{staging.name}.custody.tmp")
+
+
+def _inline_custody_artifact_blob_id(artifact: Path) -> str:
+    name = artifact.name
+    if name.startswith("..") and name.endswith(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX):
+        blob_id = name[2 : -len(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX)]
+    elif name.startswith(".") and name.endswith(_INLINE_CUSTODY_STAGE_SUFFIX):
+        blob_id = name[1 : -len(_INLINE_CUSTODY_STAGE_SUFFIX)]
+    else:
+        raise AuditIntegrityError(f"Inline custody artifact has an invalid name: {artifact}")
+    try:
+        parsed_blob_id = UUID(blob_id)
+    except ValueError as exc:
+        raise AuditIntegrityError(f"Inline custody artifact has an invalid blob identity: {artifact}") from exc
+    if str(parsed_blob_id) != blob_id:
+        raise AuditIntegrityError(f"Inline custody artifact has a non-canonical blob identity: {artifact}")
+    return blob_id
+
+
+def _regular_custody_file_exists(path: Path, *, directory_fd: int | None = None) -> bool:
+    """Check one custody entry without following its final symlink."""
+    if directory_fd is None:
+        if not os.path.lexists(path):
+            return False
+        observed = os.stat(path, follow_symlinks=False)
+    else:
+        if path.name not in os.listdir(directory_fd):
+            return False
+        observed = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+    if not stat.S_ISREG(observed.st_mode):
+        raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {path}")
+    return True
+
+
+def _open_stable_custody_root(custody_root: Path) -> int | None:
+    """Pin the blob root without following a repository-controlled symlink."""
+    if not os.path.lexists(custody_root):
+        return None
+    try:
+        descriptor = os.open(
+            custody_root,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise AuditIntegrityError(f"Blob custody root is not a stable directory: {custody_root}") from exc
+    observed = os.stat(custody_root, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        os.close(descriptor)
+        raise AuditIntegrityError(f"Blob custody root is not a stable directory: {custody_root}")
+    return descriptor
+
+
+def _require_stable_custody_root(custody_root: Path, descriptor: int) -> None:
+    observed = os.stat(custody_root, follow_symlinks=False)
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        raise AuditIntegrityError(f"Blob custody root changed during reconciliation: {custody_root}")
+
+
+def _open_stable_custody_session(
+    custody_root_fd: int,
+    *,
+    session_name: str,
+    expected_identity: os.stat_result,
+    session_dir: Path,
+) -> int:
+    try:
+        descriptor = os.open(
+            session_name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=custody_root_fd,
+        )
+    except OSError as exc:
+        raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or expected_identity.st_dev != opened.st_dev or expected_identity.st_ino != opened.st_ino:
+        os.close(descriptor)
+        raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}")
+    return descriptor
+
+
+def _require_stable_custody_session(
+    custody_root_fd: int,
+    *,
+    session_name: str,
+    descriptor: int,
+    session_dir: Path,
+) -> None:
+    try:
+        observed = os.stat(session_name, dir_fd=custody_root_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise AuditIntegrityError(f"Inline custody session directory changed during reconciliation: {session_dir}") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(observed.st_mode) or observed.st_dev != opened.st_dev or observed.st_ino != opened.st_ino:
+        raise AuditIntegrityError(f"Inline custody session directory changed during reconciliation: {session_dir}")
+
+
+@contextmanager
+def _inline_custody_directory_fds(
+    storage: Path,
+    *,
+    session_id: str,
+    create: bool,
+) -> Iterator[tuple[int, int] | None]:
+    """Pin the exact root/session directories used by one live publication."""
+    session_dir = storage.parent
+    custody_root = session_dir.parent
+    if session_dir.name != session_id or custody_root.name != "blobs":
+        raise AuditIntegrityError(f"Inline custody storage escapes its session directory: {storage}")
+    if create:
+        data_dir = custody_root.parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+        custody_root.mkdir(mode=0o700, exist_ok=True)
+        try:
+            data_dir_fd = os.open(
+                data_dir,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+        except OSError as exc:
+            raise AuditIntegrityError(f"Inline custody data directory is not stable: {data_dir}") from exc
+        try:
+            data_dir_observed = os.stat(data_dir, follow_symlinks=False)
+            data_dir_opened = os.fstat(data_dir_fd)
+            if (
+                not stat.S_ISDIR(data_dir_observed.st_mode)
+                or data_dir_observed.st_dev != data_dir_opened.st_dev
+                or data_dir_observed.st_ino != data_dir_opened.st_ino
+            ):
+                raise AuditIntegrityError(f"Inline custody data directory is not stable: {data_dir}")
+            os.fsync(data_dir_fd)
+        finally:
+            os.close(data_dir_fd)
+    custody_root_fd = _open_stable_custody_root(custody_root)
+    if custody_root_fd is None:
+        yield None
+        return
+    try:
+        session_exists = session_id in os.listdir(custody_root_fd)
+        if not session_exists:
+            if not create:
+                yield None
+                return
+            os.mkdir(session_id, mode=0o700, dir_fd=custody_root_fd)
+        if create:
+            os.fsync(custody_root_fd)
+        try:
+            session_observed = os.stat(session_id, dir_fd=custody_root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}") from exc
+        if not stat.S_ISDIR(session_observed.st_mode):
+            raise AuditIntegrityError(f"Inline custody session directory is not stable: {session_dir}")
+        session_fd = _open_stable_custody_session(
+            custody_root_fd,
+            session_name=session_id,
+            expected_identity=session_observed,
+            session_dir=session_dir,
+        )
+        try:
+            yield custody_root_fd, session_fd
+        finally:
+            os.close(session_fd)
+    finally:
+        os.close(custody_root_fd)
+
+
+def _content_hash_from_file(path: Path, *, directory_fd: int | None = None) -> str:
+    """Hash one stable regular file through a no-follow directory anchor."""
+    opened_directory_fd: int | None = None
+    descriptor: int | None = None
+    try:
+        if directory_fd is None:
+            opened_directory_fd = os.open(
+                path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            directory_fd = opened_directory_fd
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise AuditIntegrityError(f"Blob custody candidate is not a regular file: {path}")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, _STREAM_CHUNK_BYTES):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        observed = os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or observed.st_dev != after.st_dev
+            or observed.st_ino != after.st_ino
+            or observed.st_size != after.st_size
+            or observed.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise AuditIntegrityError(f"Blob custody candidate changed while hashing: {path}")
+        return digest.hexdigest()
+    except AuditIntegrityError:
+        raise
+    except OSError as exc:
+        raise AuditIntegrityError(f"Blob custody candidate is not a stable regular file: {path}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if opened_directory_fd is not None:
+            os.close(opened_directory_fd)
+
+
+def _unlink_custody_file(path: Path, *, directory_fd: int | None = None, missing_ok: bool = False) -> None:
+    if directory_fd is None:
+        path.unlink(missing_ok=missing_ok)
+    elif not missing_ok or path.name in os.listdir(directory_fd):
+        os.unlink(path.name, dir_fd=directory_fd)
+
+
+def _replace_custody_file(source: Path, destination: Path, *, directory_fd: int | None = None) -> None:
+    if directory_fd is None:
+        os.replace(source, destination)
+    else:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+
+
+def _fsync_custody_directory(directory: Path, *, directory_fd: int | None = None) -> None:
+    if directory_fd is None:
+        _fsync_parent_directory(directory)
+    else:
+        os.fsync(directory_fd)
+
+
+def reconcile_blob_storage_versions(
+    storage: Path,
+    *,
+    expected_hash: str | None,
+    directory_fd: int | None = None,
+) -> None:
     """Restore ONE authoritative blob version from crash leftovers.
 
-    The committed row's ``content_hash`` is the arbiter.  Two journal
+    The committed row's ``content_hash`` is the arbiter.  Three journal
     shapes can survive a crash:
 
+    * ``.{blob_id}.inline-custody-staged`` — bytes staged before their
+      caller-owned database transaction commits. A live ready row promotes
+      them; an already-published canonical file makes the stage stale. Its
+      deterministic ``.custody.tmp`` write artifact is always disposable:
+      it can survive before its bytes were fsynced and never arbitrates row
+      authority.
     * ``.{name}.pre-update`` — update's pre-swap bytes.  If the storage
       file already matches the committed hash the update committed and the
       sidecar is stale (purge it); if the sidecar matches, the update never
@@ -652,20 +960,49 @@ def reconcile_blob_storage_versions(storage: Path, *, expected_hash: str | None)
     """
     if expected_hash is None:
         return
-    sidecar = blob_pre_update_sidecar(storage)
-    if sidecar.exists():
-        if storage.exists() and content_hash(storage.read_bytes()) == expected_hash:
-            sidecar.unlink(missing_ok=True)
-            _fsync_parent_directory(storage.parent)
-        elif content_hash(sidecar.read_bytes()) == expected_hash:
-            os.replace(sidecar, storage)
-            _fsync_parent_directory(storage.parent)
+    inline_staging = inline_custody_staging_path(storage)
+    inline_temp = _inline_custody_staging_temp_path(inline_staging)
+    if _regular_custody_file_exists(inline_temp, directory_fd=directory_fd):
+        _unlink_custody_file(inline_temp, directory_fd=directory_fd)
+        _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+    if _regular_custody_file_exists(inline_staging, directory_fd=directory_fd):
+        if (
+            _regular_custody_file_exists(storage, directory_fd=directory_fd)
+            and _content_hash_from_file(storage, directory_fd=directory_fd) == expected_hash
+        ):
+            _unlink_custody_file(inline_staging, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        elif _content_hash_from_file(inline_staging, directory_fd=directory_fd) == expected_hash:
+            _replace_custody_file(inline_staging, storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
         return
-    if not storage.exists() and storage.parent.exists():
-        tombstones = sorted(storage.parent.glob(f".{storage.name}.delete-*"))
-        if len(tombstones) == 1 and content_hash(tombstones[0].read_bytes()) == expected_hash:
-            os.replace(tombstones[0], storage)
-            _fsync_parent_directory(storage.parent)
+    sidecar = blob_pre_update_sidecar(storage)
+    if _regular_custody_file_exists(sidecar, directory_fd=directory_fd):
+        if (
+            _regular_custody_file_exists(storage, directory_fd=directory_fd)
+            and _content_hash_from_file(storage, directory_fd=directory_fd) == expected_hash
+        ):
+            _unlink_custody_file(sidecar, directory_fd=directory_fd, missing_ok=True)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        elif _content_hash_from_file(sidecar, directory_fd=directory_fd) == expected_hash:
+            _replace_custody_file(sidecar, storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
+        return
+    if not _regular_custody_file_exists(storage, directory_fd=directory_fd):
+        if directory_fd is None:
+            if not storage.parent.exists():
+                return
+            tombstones = sorted(storage.parent.glob(f".{storage.name}.delete-*"))
+        else:
+            tombstone_prefix = f".{storage.name}.delete-"
+            tombstones = [storage.parent / name for name in sorted(os.listdir(directory_fd)) if name.startswith(tombstone_prefix)]
+        if (
+            len(tombstones) == 1
+            and _regular_custody_file_exists(tombstones[0], directory_fd=directory_fd)
+            and _content_hash_from_file(tombstones[0], directory_fd=directory_fd) == expected_hash
+        ):
+            _replace_custody_file(tombstones[0], storage, directory_fd=directory_fd)
+            _fsync_custody_directory(storage.parent, directory_fd=directory_fd)
 
 
 def _validate_reusable_blob_row(
@@ -1061,6 +1398,290 @@ def _persist_blob_content(
             raise
 
 
+def _stage_inline_custody_blob(
+    *,
+    storage: Path,
+    content: bytes,
+    expected_hash: str,
+    blob_id: str,
+    session_id: str,
+) -> InlineCustodyPublication:
+    staging = inline_custody_staging_path(storage)
+    staging_temp = _inline_custody_staging_temp_path(staging)
+    with _inline_custody_directory_fds(storage, session_id=session_id, create=True) as directory_fds:
+        if directory_fds is None:
+            raise AuditIntegrityError(f"Inline custody directory disappeared before staging: {storage.parent}")
+        custody_root_fd, session_fd = directory_fds
+        storage_exists = _regular_custody_file_exists(storage, directory_fd=session_fd)
+        staging_exists = _regular_custody_file_exists(staging, directory_fd=session_fd)
+        _regular_custody_file_exists(staging_temp, directory_fd=session_fd)
+        candidate = storage if storage_exists else staging if staging_exists else None
+        created_stage = False
+        if candidate is not None:
+            actual_hash = _content_hash_from_file(candidate, directory_fd=session_fd)
+            if not hmac.compare_digest(actual_hash, expected_hash):
+                raise BlobIntegrityError(blob_id, expected=expected_hash, actual=actual_hash)
+        else:
+            publication = InlineCustodyPublication(
+                session_id=session_id,
+                blob_id=blob_id,
+                storage=storage,
+                staging=staging,
+                expected_hash=expected_hash,
+                cleanup_after_rollback=True,
+            )
+            try:
+                _atomic_write_blob(staging, content, directory_fd=session_fd)
+                created_stage = True
+                _require_stable_custody_session(
+                    custody_root_fd,
+                    session_name=session_id,
+                    descriptor=session_fd,
+                    session_dir=storage.parent,
+                )
+                _require_stable_custody_root(storage.parent.parent, custody_root_fd)
+            except BaseException as primary_exc:
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                    primary_exc=primary_exc,
+                )
+                raise
+        return InlineCustodyPublication(
+            session_id=session_id,
+            blob_id=blob_id,
+            storage=storage,
+            staging=staging,
+            expected_hash=expected_hash,
+            cleanup_after_rollback=created_stage,
+        )
+
+
+def _discard_inline_custody_publication_at(
+    publication: InlineCustodyPublication,
+    *,
+    directory_fd: int,
+    primary_exc: BaseException | None = None,
+) -> None:
+    def _remove_stage() -> None:
+        artifacts = (
+            publication.staging,
+            _inline_custody_staging_temp_path(publication.staging),
+        )
+        removed = False
+        for artifact in artifacts:
+            if _regular_custody_file_exists(artifact, directory_fd=directory_fd):
+                _unlink_custody_file(artifact, directory_fd=directory_fd)
+                removed = True
+        if not removed:
+            return
+        _fsync_custody_directory(publication.staging.parent, directory_fd=directory_fd)
+
+    _run_lock_cleanup(
+        _remove_stage,
+        label="Inline custody rollback cleanup",
+        primary_exc=primary_exc,
+    )
+
+
+def discard_inline_custody_publication(
+    publication: InlineCustodyPublication,
+    *,
+    primary_exc: BaseException | None = None,
+    regardless_of_origin: bool = False,
+) -> None:
+    """Remove a rowless stage after rollback without masking its cause."""
+    if not regardless_of_origin and not publication.cleanup_after_rollback:
+        return
+
+    def _discard_anchored_stage() -> None:
+        with _inline_custody_directory_fds(
+            publication.storage,
+            session_id=publication.session_id,
+            create=False,
+        ) as directory_fds:
+            if directory_fds is None:
+                return
+            custody_root_fd, session_fd = directory_fds
+            _discard_inline_custody_publication_at(
+                publication,
+                directory_fd=session_fd,
+            )
+            _require_stable_custody_session(
+                custody_root_fd,
+                session_name=publication.session_id,
+                descriptor=session_fd,
+                session_dir=publication.storage.parent,
+            )
+            _require_stable_custody_root(publication.storage.parent.parent, custody_root_fd)
+
+    _run_lock_cleanup(
+        _discard_anchored_stage,
+        label="Inline custody rollback cleanup",
+        primary_exc=primary_exc,
+    )
+
+
+def publish_inline_custody_publication(engine: Engine, publication: InlineCustodyPublication) -> None:
+    """Promote a committed inline-custody stage under its custody lock."""
+    with (
+        _blob_custody_session_lock(engine, publication.session_id) as held_connection,
+        _inline_custody_directory_fds(
+            publication.storage,
+            session_id=publication.session_id,
+            create=False,
+        ) as directory_fds,
+        _blob_phase_transaction(engine, held_connection) as conn,
+    ):
+        _acquire_blob_phase_lock(conn, publication.session_id)
+        row = conn.execute(select(blobs_table).where(blobs_table.c.id == publication.blob_id)).one_or_none()
+        if row is None:
+            if directory_fds is not None:
+                _, session_fd = directory_fds
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                )
+            return
+        _guard_blob_row_literals(row)
+        if row.session_id != publication.session_id or row.storage_path != str(publication.storage):
+            raise AuditIntegrityError(f"Inline custody publication {publication.blob_id} does not match its committed row")
+        if row.status == "pending" and row.content_hash == publication.expected_hash and publication.cleanup_after_rollback:
+            if directory_fds is not None:
+                _, session_fd = directory_fds
+                _discard_inline_custody_publication_at(
+                    publication,
+                    directory_fd=session_fd,
+                )
+            return
+        if row.status != "ready" or row.content_hash != publication.expected_hash:
+            raise AuditIntegrityError(f"Inline custody publication {publication.blob_id} has non-authoritative committed state")
+        if directory_fds is None:
+            raise BlobContentMissingError(publication.blob_id, storage_path=str(publication.storage))
+        custody_root_fd, session_fd = directory_fds
+        reconcile_blob_storage_versions(
+            publication.storage,
+            expected_hash=publication.expected_hash,
+            directory_fd=session_fd,
+        )
+        if not _regular_custody_file_exists(publication.storage, directory_fd=session_fd):
+            raise BlobContentMissingError(publication.blob_id, storage_path=str(publication.storage))
+        actual_hash = _content_hash_from_file(publication.storage, directory_fd=session_fd)
+        if not hmac.compare_digest(actual_hash, publication.expected_hash):
+            raise BlobIntegrityError(publication.blob_id, expected=publication.expected_hash, actual=actual_hash)
+        _require_stable_custody_session(
+            custody_root_fd,
+            session_name=publication.session_id,
+            descriptor=session_fd,
+            session_dir=publication.storage.parent,
+        )
+        _require_stable_custody_root(publication.storage.parent.parent, custody_root_fd)
+
+
+def reconcile_inline_custody_publications(engine: Engine, data_dir: Path) -> None:
+    """Complete committed inline stages and purge stages whose rows rolled back."""
+    custody_root = data_dir.expanduser().resolve() / "blobs"
+    custody_root_fd = _open_stable_custody_root(custody_root)
+    if custody_root_fd is None:
+        return
+    try:
+        for session_name in sorted(os.listdir(custody_root_fd)):
+            session_observed = os.stat(session_name, dir_fd=custody_root_fd, follow_symlinks=False)
+            session_dir = custody_root / session_name
+            if stat.S_ISLNK(session_observed.st_mode):
+                raise AuditIntegrityError(f"Inline custody session directory is a symbolic link: {session_dir}")
+            if not stat.S_ISDIR(session_observed.st_mode):
+                continue
+            session_id = session_name
+            with _blob_custody_session_lock(engine, session_id) as held_connection:
+                _require_stable_custody_root(custody_root, custody_root_fd)
+                session_fd = _open_stable_custody_session(
+                    custody_root_fd,
+                    session_name=session_name,
+                    expected_identity=session_observed,
+                    session_dir=session_dir,
+                )
+                try:
+                    with _blob_phase_transaction(engine, held_connection) as conn:
+                        _acquire_blob_phase_lock(conn, session_id)
+                        artifact_names = sorted(
+                            name
+                            for name in os.listdir(session_fd)
+                            if (name.startswith(".") and name.endswith(_INLINE_CUSTODY_STAGE_SUFFIX))
+                            or (name.startswith("..") and name.endswith(_INLINE_CUSTODY_STAGE_TEMP_SUFFIX))
+                        )
+                        artifacts_by_blob: dict[str, list[Path]] = {}
+                        for artifact_name in artifact_names:
+                            artifact = session_dir / artifact_name
+                            if not _regular_custody_file_exists(artifact, directory_fd=session_fd):
+                                continue
+                            blob_id = _inline_custody_artifact_blob_id(artifact)
+                            if blob_id not in artifacts_by_blob:
+                                artifacts_by_blob[blob_id] = []
+                            artifacts_by_blob[blob_id].append(artifact)
+
+                        for blob_id, blob_artifacts in artifacts_by_blob.items():
+                            removed_temp = False
+                            durable_stages: list[Path] = []
+                            for artifact in blob_artifacts:
+                                if artifact.name.startswith(".."):
+                                    _unlink_custody_file(artifact, directory_fd=session_fd)
+                                    removed_temp = True
+                                else:
+                                    durable_stages.append(artifact)
+                            if removed_temp:
+                                _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                            row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one_or_none()
+                            if row is None:
+                                for staging in durable_stages:
+                                    _unlink_custody_file(staging, directory_fd=session_fd)
+                                if durable_stages:
+                                    _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                                continue
+                            _guard_blob_row_literals(row)
+                            if type(row.storage_path) is not str or type(row.filename) is not str:
+                                raise AuditIntegrityError(f"Inline custody artifact for {blob_id} has a non-string storage path")
+                            storage = Path(row.storage_path)
+                            sanitized_filename = sanitize_filename(row.filename)
+                            expected_storage = inline_custody_storage_path(
+                                data_dir,
+                                session_id=session_id,
+                                blob_id=blob_id,
+                                filename=sanitized_filename,
+                            )
+                            if row.session_id != session_id or sanitized_filename != row.filename or storage != expected_storage:
+                                raise AuditIntegrityError(f"Inline custody artifact for {blob_id} does not match its committed row")
+                            if row.status == "pending":
+                                for staging in durable_stages:
+                                    _unlink_custody_file(staging, directory_fd=session_fd)
+                                if durable_stages:
+                                    _fsync_custody_directory(session_dir, directory_fd=session_fd)
+                                continue
+                            if row.status != "ready" or row.content_hash is None:
+                                raise AuditIntegrityError(f"Inline custody artifact for {blob_id} has non-authoritative committed state")
+                            reconcile_blob_storage_versions(
+                                storage,
+                                expected_hash=row.content_hash,
+                                directory_fd=session_fd,
+                            )
+                            if not _regular_custody_file_exists(storage, directory_fd=session_fd):
+                                raise BlobContentMissingError(blob_id, storage_path=str(storage))
+                            actual_hash = _content_hash_from_file(storage, directory_fd=session_fd)
+                            if not hmac.compare_digest(actual_hash, row.content_hash):
+                                raise BlobIntegrityError(blob_id, expected=row.content_hash, actual=actual_hash)
+                        _require_stable_custody_session(
+                            custody_root_fd,
+                            session_name=session_name,
+                            descriptor=session_fd,
+                            session_dir=session_dir,
+                        )
+                        _require_stable_custody_root(custody_root, custody_root_fd)
+                finally:
+                    os.close(session_fd)
+    finally:
+        os.close(custody_root_fd)
+
+
 def persist_inline_custody_blob_on_connection(
     conn: Connection,
     *,
@@ -1068,7 +1689,7 @@ def persist_inline_custody_blob_on_connection(
     max_storage_per_session: int,
     request: InlineCustodyRequest,
     write_fence: BlobGuidedOperationWriteFence | None,
-) -> Row[Any]:
+) -> tuple[Row[Any], InlineCustodyPublication]:
     """Settle one inline-custody blob inside an enclosing atomic transaction.
 
     The three-phase committed protocol (:func:`_persist_blob_content`) keeps
@@ -1078,10 +1699,10 @@ def persist_inline_custody_blob_on_connection(
     caller-owned transaction, which is the only ordering under which the
     composite lineage FK (created_from_message_id, session_id) is satisfiable
     at insert time (elspeth-1e3ad83d89). No transaction is opened or committed
-    here. The single external effect is the content file write — validated by
-    hash and idempotent under the deterministic blob id — whose
-    orphan-file-on-rollback residue matches the committed protocol's own crash
-    residue.
+    here. Content is written to a deterministic same-directory stage, never
+    the canonical path: the caller publishes it only after commit, reconciles
+    the row outcome after rollback/commit ambiguity, and startup completes or
+    removes any stage left by process failure.
     """
     if type(max_storage_per_session) is not int or max_storage_per_session <= 0:
         raise ValueError("max_storage_per_session must be a positive exact integer")
@@ -1126,18 +1747,22 @@ def persist_inline_custody_blob_on_connection(
         _insert_pending_blob_row(conn, blob_id=blob_id, storage=storage, expected=expected)
         row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
     _validate_reusable_blob_row(row, expected=expected, blob_id=blob_id, storage_path=storage)
-    _write_or_validate_reserved_blob(
-        row=row,
+    publication = _stage_inline_custody_blob(
         storage=storage,
         content=request.content,
         expected_hash=expected["content_hash"],
         blob_id=blob_id,
+        session_id=session_id,
     )
-    if row.status == "pending":
-        conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id).values(status="ready"))
-    final_row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
-    _guard_blob_row_literals(final_row)
-    return final_row
+    try:
+        if row.status == "pending":
+            conn.execute(blobs_table.update().where(blobs_table.c.id == blob_id).values(status="ready"))
+        final_row = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+        _guard_blob_row_literals(final_row)
+        return final_row, publication
+    except BaseException as primary_exc:
+        discard_inline_custody_publication(publication, primary_exc=primary_exc)
+        raise
 
 
 def _option_value_references_blob(value: Any, blob_id: str, storage_path: str) -> bool:
@@ -1449,6 +2074,10 @@ class BlobServiceImpl:
 
     async def _run_sync(self, func: Callable[[], _T]) -> _T:
         return await run_sync_in_worker(func)
+
+    async def reconcile_inline_custody_publications(self) -> None:
+        """Reconcile tracked pre-commit inline stages before serving traffic."""
+        await self._run_sync(lambda: reconcile_inline_custody_publications(self._engine, self._data_dir))
 
     def _now(self) -> datetime:
         return datetime.now(UTC)

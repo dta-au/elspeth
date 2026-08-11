@@ -9,6 +9,8 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+import structlog
+from sqlalchemy import delete
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
@@ -23,10 +25,21 @@ from elspeth.web.composer.pipeline_custody import (
     verify_finalized_pipeline_custody,
 )
 from elspeth.web.composer.tools.blobs import _PreparedBlobCreate
+from elspeth.web.sessions.engine import create_session_engine
+from elspeth.web.sessions.models import blobs_table
+from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
+from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 
-def _prepared(tmp_path: Path, *, content: bytes = b"private-inline-value\n42\n") -> _PreparedBlobCreate:
-    session_id = str(uuid4())
+def _prepared(
+    tmp_path: Path,
+    *,
+    content: bytes = b"private-inline-value\n42\n",
+    session_id: str | None = None,
+    created_from_message_id: str | None = None,
+) -> _PreparedBlobCreate:
+    session_id = session_id or str(uuid4())
     blob_id = str(uuid4())
     return _PreparedBlobCreate(
         blob_id=blob_id,
@@ -37,7 +50,7 @@ def _prepared(tmp_path: Path, *, content: bytes = b"private-inline-value\n42\n")
         storage_path=tmp_path / "blobs" / session_id / f"{blob_id}_candidate.csv",
         description="reviewed candidate",
         creation_modality=CreationModality.LLM_GENERATED,
-        created_from_message_id=str(uuid4()),
+        created_from_message_id=created_from_message_id or str(uuid4()),
         creating_model_identifier="composer-model",
         creating_model_version="composer-version",
         creating_provider="provider",
@@ -134,6 +147,98 @@ def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> No
             max_storage_per_session=1024,
             write_fence=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(tmp_path: Path) -> None:
+    """A commit error is ambiguous: a durable row must win over cleanup."""
+    from elspeth.web.composer import pipeline_custody as pipeline_custody_module
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("test-user", "Ambiguous inline commit", "local")
+    message = await sessions.add_message(
+        session.id,
+        "user",
+        "Create the inline source.",
+        writer_principal="route_user_message",
+    )
+    session_id = str(session.id)
+    prepared = _prepared(tmp_path, session_id=session_id, created_from_message_id=str(message.id))
+    custody = prepare_pipeline_custody(
+        _arguments(),
+        prepared,
+        session_id=session_id,
+        max_storage_per_session=500 * 1024 * 1024,
+    )
+    with engine.begin() as conn:
+        publication = finalize_pipeline_custody_on_connection(
+            custody,
+            conn=conn,
+            data_dir=tmp_path,
+            max_storage_per_session=500 * 1024 * 1024,
+            write_fence=None,
+        )
+
+    assert not publication.storage.exists()
+    assert publication.staging.exists()
+    primary = RuntimeError("commit outcome unknown")
+    pipeline_custody_module.reconcile_pipeline_custody_after_transaction_failure(
+        engine,
+        publication,
+        primary_exc=primary,
+    )
+
+    assert publication.storage.read_bytes() == custody.request.content
+    assert not publication.staging.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_commit_reconciliation_removes_stage_when_committed_row_was_deleted(tmp_path: Path) -> None:
+    """A concurrent committed delete leaves no authority for staged bytes."""
+    from elspeth.web.composer import pipeline_custody as pipeline_custody_module
+
+    engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
+    initialize_session_schema(engine)
+    sessions = SessionServiceImpl(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test"))
+    session = await sessions.create_session("test-user", "Deleted inline commit", "local")
+    message = await sessions.add_message(
+        session.id,
+        "user",
+        "Create the inline source.",
+        writer_principal="route_user_message",
+    )
+    session_id = str(session.id)
+    prepared = _prepared(tmp_path, session_id=session_id, created_from_message_id=str(message.id))
+    custody = prepare_pipeline_custody(
+        _arguments(),
+        prepared,
+        session_id=session_id,
+        max_storage_per_session=500 * 1024 * 1024,
+    )
+    with engine.begin() as conn:
+        publication = finalize_pipeline_custody_on_connection(
+            custody,
+            conn=conn,
+            data_dir=tmp_path,
+            max_storage_per_session=500 * 1024 * 1024,
+            write_fence=None,
+        )
+    publication = replace(publication, cleanup_after_rollback=False)
+    with engine.begin() as conn:
+        conn.execute(delete(blobs_table).where(blobs_table.c.id == str(custody.blob_id)))
+
+    assert publication.staging.exists()
+    primary = RuntimeError("commit outcome unknown")
+    pipeline_custody_module.reconcile_pipeline_custody_after_transaction_failure(
+        engine,
+        publication,
+        primary_exc=primary,
+    )
+
+    assert not publication.storage.exists()
+    assert not publication.staging.exists()
 
 
 def test_preparation_rejects_non_positive_or_inexact_ceiling(tmp_path: Path) -> None:
