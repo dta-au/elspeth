@@ -306,7 +306,11 @@
 .composer-workspace[data-layout-mode="narrow"] {
   grid-template-rows: auto minmax(0, 1fr);
   grid-template-columns: minmax(0, 1fr);
-  min-height: 0;
+  /* Keep the shared workspace's usable-canvas floor at reflow widths. On a
+     very short viewport the App-owned .app-main becomes the outer vertical
+     scroller; cancelling the floor here instead compressed the conversation
+     log below a readable height and stranded the docked composer controls. */
+  min-height: 420px;
 }
 
 .composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs {

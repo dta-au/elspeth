@@ -142,6 +142,20 @@ describe("ComposerWorkspace", () => {
     ).not.toBe(0);
   });
 
+  it("retains the workspace height floor in narrow mode for short-viewport scrolling", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+    const narrowRule = css.match(
+      /\.composer-workspace\[data-layout-mode="narrow"\]\s*\{([^}]*)\}/s,
+    )?.[1];
+
+    expect(narrowRule).toBeDefined();
+    expect(narrowRule).toMatch(/min-height:\s*420px;/);
+    expect(narrowRule).not.toMatch(/min-height:\s*0;/);
+  });
+
   it("isolates an authoring render failure without swallowing sibling surfaces", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const preventExpectedWindowError = (event: ErrorEvent) => {
