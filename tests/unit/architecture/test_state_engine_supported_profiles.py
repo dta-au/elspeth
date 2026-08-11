@@ -31,18 +31,30 @@ def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() ->
     assert all(profile["required"] is True for profile in state_store_profiles)
     state_stores = {profile["id"]: profile for profile in state_store_profiles}
 
+    assert state_stores["sqlite-wal"]["contract_ref"] == ("docs/architecture/adr/030-multi-worker-deployment-shape.md")
+    assert state_stores["postgresql-16"]["contract_ref"] == ("docs/architecture/adr/041-state-engine-supported-profiles.md")
+
     sqlite_deployments = state_stores["sqlite-wal"]["deployments"]
     postgresql_deployments = state_stores["postgresql-16"]["deployments"]
-    assert sqlite_deployments == [
+    expected_sqlite_deployments = {
         "single-process-leader",
         "same-host-leader-plus-claim-only-followers",
         "web-hosted-leader-plus-same-host-cli-followers",
-    ]
-    assert postgresql_deployments == ["aws-single-leader-landscape"]
+    }
+    expected_postgresql_deployments = {"aws-single-leader-landscape"}
+    assert len(sqlite_deployments) == 3
+    assert len(sqlite_deployments) == len(set(sqlite_deployments))
+    assert set(sqlite_deployments) == expected_sqlite_deployments
+    assert len(postgresql_deployments) == 1
+    assert len(postgresql_deployments) == len(set(postgresql_deployments))
+    assert set(postgresql_deployments) == expected_postgresql_deployments
     assert set(sqlite_deployments).isdisjoint(postgresql_deployments)
 
     deployments = execution_profiles["deployments"]
-    assert deployments == [*sqlite_deployments, *postgresql_deployments]
+    expected_deployments = expected_sqlite_deployments | expected_postgresql_deployments
+    assert len(deployments) == 4
+    assert len(deployments) == len(set(deployments))
+    assert set(deployments) == expected_deployments
     assert all("multi-host" not in deployment for deployment in deployments)
 
     adr_041 = _normalized_text(ADR_041_PATH)

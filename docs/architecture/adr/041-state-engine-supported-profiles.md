@@ -39,9 +39,10 @@ backend for that deployment, not an optional, provisional, or future port. The
 AWS application topology still has exactly one Landscape scheduler leader.
 
 PostgreSQL multi-replica scheduling remains unsupported and is separately
-owned by the multi-replica integration program (`elspeth-4d6c0dd0f5`). This
-ADR neither enables nor supplies evidence for multiple scheduler leaders,
-multi-host follower scheduling, or multiple web replicas sharing run custody.
+owned by the multi-replica-safe web runtime program (`elspeth-b5d7aa5655`).
+Its current remediation prerequisite is `elspeth-4d6c0dd0f5`. This ADR neither
+enables nor supplies evidence for multiple scheduler leaders, multi-host
+follower scheduling, or multiple web replicas sharing run custody.
 
 The PostgreSQL state-engine contract includes DB-server time, row locking,
 isolation, schema migration, and connection-loss behavior. The proof catalog
