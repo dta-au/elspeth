@@ -18,7 +18,7 @@ import pytest
 
 from elspeth.contracts import TransformProtocol
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine.dag_navigator import DAGNavigator
 from elspeth.engine.processor import DAGTraversalContext
@@ -54,6 +54,7 @@ def _make_nav(
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
     sink_names: frozenset[str] | None = None,
     branch_first_node: dict[str, NodeID] | None = None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
 ) -> DAGNavigator:
     """Create a DAGNavigator with sensible defaults."""
     _node_to_plugin = node_to_plugin or {}
@@ -73,6 +74,7 @@ def _make_nav(
         coalesce_on_success_map=coalesce_on_success_map or {},
         sink_names=sink_names or frozenset(),
         branch_first_node=branch_first_node or {},
+        row_union_node_ids=row_union_node_ids or {},
     )
 
 
@@ -210,6 +212,57 @@ class TestResolveCoalesceSink:
             nav.resolve_coalesce_sink(CoalesceName("unknown"), context="test")
 
 
+class TestResolveBarrierIdentity:
+    """Barrier lookup maps fail closed in both directions."""
+
+    def test_resolves_coalesce_node(self) -> None:
+        node_id = NodeID("coalesce::merge")
+        nav = _make_nav(coalesce_node_ids={CoalesceName("merge"): node_id})
+
+        assert nav.resolve_coalesce_node(CoalesceName("merge")) == node_id
+
+    def test_unknown_coalesce_name_raises(self) -> None:
+        nav = _make_nav(coalesce_node_ids={CoalesceName("merge"): NodeID("coalesce::merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown coalesce name 'missing'"):
+            nav.resolve_coalesce_node(CoalesceName("missing"))
+
+    def test_resolves_row_union_node(self) -> None:
+        node_id = NodeID("row_union::merge")
+        nav = _make_nav(row_union_node_ids={RowUnionName("merge"): node_id})
+
+        assert nav.resolve_row_union_node(RowUnionName("merge")) == node_id
+
+    def test_unknown_row_union_name_raises(self) -> None:
+        nav = _make_nav(row_union_node_ids={RowUnionName("merge"): NodeID("row_union::merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown row_union name 'missing'"):
+            nav.resolve_row_union_node(RowUnionName("missing"))
+
+    def test_resolves_coalesce_name(self) -> None:
+        node_id = NodeID("coalesce::merge")
+        nav = _make_nav(coalesce_name_by_node_id={node_id: CoalesceName("merge")})
+
+        assert nav.resolve_coalesce_name(node_id) == CoalesceName("merge")
+
+    def test_unknown_coalesce_node_id_raises(self) -> None:
+        nav = _make_nav(coalesce_name_by_node_id={NodeID("coalesce::merge"): CoalesceName("merge")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown coalesce node id 'coalesce::missing'"):
+            nav.resolve_coalesce_name(NodeID("coalesce::missing"))
+
+    def test_resolves_branch_first_node(self) -> None:
+        nav = _make_nav(branch_first_node={"left": NodeID("transform-left")})
+
+        assert nav.resolve_branch_first_node("left") == NodeID("transform-left")
+
+    def test_unknown_branch_name_raises(self) -> None:
+        nav = _make_nav(branch_first_node={"left": NodeID("transform-left")})
+
+        with pytest.raises(OrchestrationInvariantError, match="Unknown branch name 'right'"):
+            nav.resolve_branch_first_node("right")
+
+
 # =============================================================================
 # resolve_jump_target_sink
 # =============================================================================
@@ -244,6 +297,21 @@ class TestResolveJumpTargetSink:
                 NodeID("gate-1"): None,
             },
         )
+        assert nav.resolve_jump_target_sink(NodeID("gate-1")) is None
+
+    def test_gate_path_does_not_pre_resolve_its_transform_destination_sink(self) -> None:
+        """A gate owns routing even when its selected transform is sink-bound."""
+        transform = _make_mock_transform(node_id="branch-t1", on_success="branch_sink")
+        gate = GateSettings(name="gate1", input="in_conn", condition="True", routes={"true": "out", "false": "err"})
+        nav = _make_nav(
+            node_to_plugin={NodeID("branch-t1"): transform, NodeID("gate-1"): gate},
+            node_to_next={
+                NodeID("gate-1"): NodeID("branch-t1"),
+                NodeID("branch-t1"): None,
+            },
+            sink_names=frozenset({"branch_sink"}),
+        )
+
         assert nav.resolve_jump_target_sink(NodeID("gate-1")) is None
 
     def test_raises_when_no_sink_and_no_gate(self) -> None:

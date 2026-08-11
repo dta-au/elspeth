@@ -530,6 +530,11 @@ evidence:
     locator: row-union-interleave:two-variant-ab
     claim: The canonical two-variant A/B case proves semantic production runtime behavior for a deterministic fork, declared-order row_union release, end-of-source long-format experiment comparison, and one complete terminal publication.
     stages: [config, build, runtime]
+  - id: harness-row-union-interleave-two-variant-ab-reopen-resume
+    kind: harness
+    locator: row-union-interleave:two-variant-ab-reopen-resume
+    claim: A fresh-object public resume after complete declared-order row_union release, end-of-source aggregation, source exhaustion, and an honest pre-publication sink-effect fault matches an uninterrupted control in every semantic field except the required pending-sink reclaim transition; it does not replay the source or duplicate or partially release a group, publishes once, removes the checkpoint, and preserves durable/export parity.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-retry-quarantine-discard-routed-errors-retry-then-success
     kind: harness
     locator: retry-quarantine-discard-routed-errors:retry-then-success
@@ -550,6 +555,11 @@ evidence:
     locator: retry-quarantine-discard-routed-errors:transform-error-route
     claim: Transform error routing records the exact MOVE and DIVERT routes, error artifact, routed failure plus control disposition, and matching durable and portable audit projections.
     stages: [config, build, runtime, audit]
+  - id: harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume
+    kind: harness
+    locator: retry-quarantine-discard-routed-errors:retry-success-reopen-resume
+    claim: A fresh-object public resume after one retryable transform failure, one successful retry, source exhaustion, and an honest pre-publication sink-effect fault reuses the original token and completed retry history, does not replay the source or duplicate work, publishes exactly once, removes the checkpoint, and preserves durable/export parity.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-sink-write-pending-redrive-write-once
     kind: harness
     locator: sink-write-pending-redrive:write-once
@@ -4079,6 +4089,38 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected: {"audit_record_counts":[{"count":1,"record_type":"artifact"},{"count":1,"record_type":"batch"},{"count":8,"record_type":"batch_member"},{"count":3,"record_type":"call"},{"count":7,"record_type":"edge"},{"count":1,"record_type":"manifest"},{"count":7,"record_type":"node"},{"count":26,"record_type":"node_state"},{"count":2,"record_type":"operation"},{"count":8,"record_type":"routing_event"},{"count":4,"record_type":"row"},{"count":1,"record_type":"run"},{"count":78,"record_type":"scheduler_event"},{"count":1,"record_type":"sink_effect"},{"count":3,"record_type":"sink_effect_attempt"},{"count":1,"record_type":"sink_effect_member"},{"count":1,"record_type":"sink_effect_stream"},{"count":13,"record_type":"token"},{"count":21,"record_type":"token_outcome"},{"count":9,"record_type":"token_parent"}],"kind":"semantic_runtime","projection_counts":{"batch_members":8,"batches":1,"intermediate_outcomes":8,"node_states":26,"parent_links":9,"routes":8,"rows":4,"scheduler_work":21,"terminal_dispositions":13,"tokens":13},"projection_sha256":"89d17c13b2ab7c433ffe5d2a32edc66939798beeea096a4a5a8b1b3202ea0061","rows_failed":0,"rows_processed":4,"rows_succeeded":1,"sink_outputs":[{"rows":["{\"baseline_count\":4,\"baseline_mean\":25,\"baseline_missing_count\":0,\"baseline_non_finite_count\":0,\"baseline_stdev\":12.909944487358056,\"baseline_total_count\":4,\"baseline_variant\":\"control\",\"batch_size\":8,\"confidence_95_high\":35.308258738155935,\"confidence_95_low\":-10.308258738155935,\"mean_delta\":12.5,\"relative_lift\":0.5,\"score_field\":\"score\",\"standard_error\":11.636866703140784,\"variant\":\"treatment\",\"variant_count\":4,\"variant_field\":\"prompt_variant\",\"variant_mean\":37.5,\"variant_missing_count\":0,\"variant_non_finite_count\":0,\"variant_stdev\":19.364916731037084,\"variant_total_count\":4,\"z_score\":1.0741723110591492}"],"sink_name":"output"}],"source_operation_count":1,"status":"completed"}
+      - id: two-variant-ab-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: row-union-interleave/two-variant-ab.yaml
+        input_fixtures:
+          primary: row-union-interleave/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 1
+          required_audit_record_types:
+            - artifact
+            - batch
+            - batch_member
+            - node_state
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
+            - token_parent
     dimensions:
       config:
         status: pass
@@ -4099,10 +4141,8 @@ scenarios:
         owner_issue: elspeth-a5b86149d4
         exit_gate: A repeated row-union corpus run pins canonical raw audit identity or an explicit accepted identity boundary, and the corpus gate passes.
       recovery:
-        status: unknown
-        reason: No registered row-union corpus recovery case exists.
-        owner_issue: elspeth-a5b86149d4
-        exit_gate: The row-union corpus case passes database-reopen and public-resume assertions without duplicate or partial group release.
+        status: pass
+        evidence: [harness-row-union-interleave-two-variant-ab-reopen-resume]
       concurrency:
         status: unknown
         reason: No complete row-union contention and fencing case exists.
@@ -4161,6 +4201,34 @@ scenarios:
         output_artifacts:
           error_output: errors.jsonl
         expected: {"audit_record_counts":[{"count":1,"record_type":"artifact"},{"count":3,"record_type":"call"},{"count":5,"record_type":"edge"},{"count":1,"record_type":"manifest"},{"count":4,"record_type":"node"},{"count":6,"record_type":"node_state"},{"count":2,"record_type":"operation"},{"count":2,"record_type":"routing_event"},{"count":2,"record_type":"row"},{"count":1,"record_type":"run"},{"count":7,"record_type":"scheduler_event"},{"count":1,"record_type":"sink_effect"},{"count":3,"record_type":"sink_effect_attempt"},{"count":1,"record_type":"sink_effect_member"},{"count":1,"record_type":"sink_effect_stream"},{"count":2,"record_type":"token"},{"count":2,"record_type":"token_outcome"},{"count":1,"record_type":"transform_error"}],"expected_error":null,"kind":"exact","projection":{"audit_records":[{"key":"artifact|sink:error_output@468d2923fe79|primary|0|file","material":"{\"artifact_type\":\"file\",\"content_hash\":\"15283e82066ae9202eb33fb674b48268117efebf84be8957a13cdf26640f2d1d\",\"idempotency_witness\":\"sink:error_output@468d2923fe79|primary|0\",\"path_or_uri\":\"$CORPUS_RUNTIME_PATH\",\"producer_kind\":\"sink_effect\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"size_bytes\":23}","record_type":"artifact","references":["sink:error_output@468d2923fe79","sink:error_output@468d2923fe79|primary|0"]},{"key":"call|sink:error_output@468d2923fe79|sink_write|0|0","material":"{\"call_index\":0,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}","record_type":"call","references":["sink:error_output@468d2923fe79|sink_write|0"]},{"key":"call|sink:error_output@468d2923fe79|sink_write|0|1","material":"{\"call_index\":1,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}","record_type":"call","references":["sink:error_output@468d2923fe79|sink_write|0"]},{"key":"call|sink:error_output@468d2923fe79|sink_write|0|2","material":"{\"call_index\":2,\"call_type\":\"filesystem\",\"error_json\":null,\"request_hash\":\"$SINK_EFFECT_REQUEST\",\"request_ref\":null,\"resolved_prompt_template_hash\":null,\"response_hash\":\"$SINK_EFFECT_RESPONSE\",\"response_ref\":null,\"status\":\"success\"}","record_type":"call","references":["sink:error_output@468d2923fe79|sink_write|0"]},{"key":"edge|gate:select_error@1f59be983ded|continue|move|transform:routed_error@e7eff0f8b3dc","material":"{\"default_mode\":\"move\",\"label\":\"continue\"}","record_type":"edge","references":["gate:select_error@1f59be983ded","transform:routed_error@e7eff0f8b3dc"]},{"key":"edge|gate:select_error@1f59be983ded|true|move|transform:routed_error@e7eff0f8b3dc","material":"{\"default_mode\":\"move\",\"label\":\"true\"}","record_type":"edge","references":["gate:select_error@1f59be983ded","transform:routed_error@e7eff0f8b3dc"]},{"key":"edge|source:primary@5a21cc0bf019|continue|move|gate:select_error@1f59be983ded","material":"{\"default_mode\":\"move\",\"label\":\"continue\"}","record_type":"edge","references":["gate:select_error@1f59be983ded","source:primary@5a21cc0bf019"]},{"key":"edge|transform:routed_error@e7eff0f8b3dc|__error_routed_error__|divert|sink:error_output@468d2923fe79","material":"{\"default_mode\":\"divert\",\"label\":\"__error_routed_error__\"}","record_type":"edge","references":["sink:error_output@468d2923fe79","transform:routed_error@e7eff0f8b3dc"]},{"key":"edge|transform:routed_error@e7eff0f8b3dc|on_success|move|sink:error_output@468d2923fe79","material":"{\"default_mode\":\"move\",\"label\":\"on_success\"}","record_type":"edge","references":["sink:error_output@468d2923fe79","transform:routed_error@e7eff0f8b3dc"]},{"key":"manifest|manifest","material":"{\"chunk_count\":1,\"derivation_version\":\"audit-export-derivation-v1\",\"export_format\":\"json\",\"hash_algorithm\":\"sha256\",\"record_chain_algorithm\":\"sha256_concat_record_sha256_v1\",\"record_count\":44,\"schema\":\"elspeth.audit-export-manifest.v2\",\"signature_algorithm\":\"unsigned\",\"signature_key_id\":\"UNSIGNED\",\"source_status\":\"completed_with_failures\"}","record_type":"manifest","references":["run|run"]},{"key":"node|gate:select_error@1f59be983ded","material":"{\"config\":{\"condition\":\"row['id'] == 1\",\"routes\":{\"false\":\"discard\",\"true\":\"error_in\"}},\"determinism\":\"deterministic\",\"node_type\":\"gate\",\"plugin_name\":\"config_gate:select_error\",\"plugin_version\":\"engine:0.7.2\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}","record_type":"node","references":[]},{"key":"node|sink:error_output@468d2923fe79","material":"{\"config\":{\"format\":\"jsonl\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"io_write\",\"node_type\":\"sink\",\"plugin_name\":\"json\",\"plugin_version\":\"1.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:67611d440f35c4ab\"}","record_type":"node","references":[]},{"key":"node|source:primary@5a21cc0bf019","material":"{\"config\":{\"on_validation_failure\":\"discard\",\"path\":\"$CORPUS_RUNTIME_PATH\",\"schema\":{\"fields\":[\"id: int\",\"value: int\"],\"mode\":\"fixed\"},\"source_name\":\"primary\"},\"determinism\":\"io_read\",\"node_type\":\"source\",\"plugin_name\":\"csv\",\"plugin_version\":\"1.0.0\",\"schema_fields\":[{\"name\":\"id\",\"nullable\":false,\"required\":true,\"type\":\"int\"},{\"name\":\"value\",\"nullable\":false,\"required\":true,\"type\":\"int\"}],\"schema_hash\":null,\"schema_mode\":\"fixed\",\"sequence_in_pipeline\":null,\"source_file_hash\":\"sha256:2b4b87f0eaca5602\"}","record_type":"node","references":[]},{"key":"node|transform:routed_error@e7eff0f8b3dc","material":"{\"config\":{\"schema\":{\"mode\":\"observed\"}},\"determinism\":\"deterministic\",\"node_type\":\"transform\",\"plugin_name\":\"dag_corpus_always_error\",\"plugin_version\":\"0.0.0\",\"schema_fields\":null,\"schema_hash\":null,\"schema_mode\":\"observed\",\"sequence_in_pipeline\":null,\"source_file_hash\":null}","record_type":"node","references":[]},{"key":"operation|sink:error_output@468d2923fe79|sink_write|0","material":"{\"error_message\":null,\"input_data_hash\":null,\"input_data_ref\":null,\"operation_type\":\"sink_write\",\"output_data_hash\":\"$SINK_EFFECT_RESULT\",\"output_data_ref\":null,\"status\":\"completed\"}","record_type":"operation","references":["sink:error_output@468d2923fe79","sink:error_output@468d2923fe79|primary|0"]},{"key":"operation|source:primary@5a21cc0bf019|source_load|0","material":"{\"error_message\":null,\"input_data_hash\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"input_data_ref\":\"0e37f99723e7da93940b4a3a377db5f9c31e30b922d8da8c4c3152d7fb5dc49c\",\"operation_type\":\"source_load\",\"output_data_hash\":null,\"output_data_ref\":null,\"status\":\"completed\"}","record_type":"operation","references":["source:primary@5a21cc0bf019"]},{"key":"run|run","material":"{\"canonical_version\":\"sha256-rfc8785-v1\",\"reproducibility_grade\":\"replay_reproducible\",\"semantic_settings_sha256\":\"506e816227329802aec3d3c65ae8993a1d9f17523c02121ced3bd76d16b4c025\",\"status\":\"completed_with_failures\"}","record_type":"run","references":[]},{"key":"sink_effect_attempt|sink:error_output@468d2923fe79|primary|0|0","material":"{\"action\":\"inspect\",\"attempt_index\":0,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:error_output@468d2923fe79|sink_write|0|0\",\"generation\":1,\"member_ordinal\":null,\"request_witness\":\"sink:error_output@468d2923fe79|sink_write|0|0\",\"state\":\"returned\"}","record_type":"sink_effect_attempt","references":["sink:error_output@468d2923fe79|primary|0","sink:error_output@468d2923fe79|sink_write|0|0"]},{"key":"sink_effect_attempt|sink:error_output@468d2923fe79|primary|0|1","material":"{\"action\":\"reconcile\",\"attempt_index\":1,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:error_output@468d2923fe79|sink_write|0|1\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:error_output@468d2923fe79|sink_write|0|1\",\"state\":\"returned\"}","record_type":"sink_effect_attempt","references":["sink:error_output@468d2923fe79|primary|0","sink:error_output@468d2923fe79|sink_write|0|1"]},{"key":"sink_effect_attempt|sink:error_output@468d2923fe79|primary|0|2","material":"{\"action\":\"commit\",\"attempt_index\":2,\"call_kind\":\"filesystem\",\"evidence_present\":true,\"evidence_witness\":\"sink:error_output@468d2923fe79|sink_write|0|2\",\"generation\":2,\"member_ordinal\":null,\"request_witness\":\"sink:error_output@468d2923fe79|sink_write|0|2\",\"state\":\"returned\"}","record_type":"sink_effect_attempt","references":["sink:error_output@468d2923fe79|primary|0","sink:error_output@468d2923fe79|sink_write|0|2"]},{"key":"sink_effect_member|sink:error_output@468d2923fe79|primary|0|0","material":"{\"descriptor_witness\":\"sink:error_output@468d2923fe79|primary|0\",\"evidence_present\":true,\"ingest_sequence\":0,\"lineage_hash\":\"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945\",\"member_effect_bound\":true,\"member_state\":\"finalized\",\"ordinal\":0,\"payload_hash\":\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\",\"prepared_disposition\":\"accepted\",\"reason_hash\":null,\"role\":\"primary\"}","record_type":"sink_effect_member","references":["primary:0","primary:0#0","sink:error_output@468d2923fe79","sink:error_output@468d2923fe79|primary|0"]},{"key":"sink_effect_stream|sink:error_output@468d2923fe79|primary","material":"{\"head_descriptor_witness\":\"sink:error_output@468d2923fe79|primary|0\",\"next_sequence\":1,\"requested_target\":\"$CORPUS_RUNTIME_PATH\",\"role\":\"primary\"}","record_type":"sink_effect_stream","references":["sink:error_output@468d2923fe79","sink:error_output@468d2923fe79|primary|0"]},{"key":"sink_effect|sink:error_output@468d2923fe79|primary|0","material":"{\"descriptor_mode\":\"precomputed\",\"descriptor_witness\":\"sink:error_output@468d2923fe79|primary|0|file\",\"generation\":2,\"group_payload_hash\":\"4fc38f93ea1e35a5df92369288cb1a75a8f56d6cc439f962675c8532e7eaac93\",\"input_kind\":\"pipeline_members\",\"inspection_mode\":\"inspected\",\"member_payload_hashes\":[\"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2\"],\"plan_present\":true,\"precondition_witness\":\"sink:error_output@468d2923fe79|primary\",\"protocol_version\":\"sink-effect-v1\",\"publication_evidence_kind\":\"returned\",\"publication_performed\":true,\"reconcile_kind\":null,\"role\":\"primary\",\"state\":\"finalized\",\"stream_sequence\":0}","record_type":"sink_effect","references":["sink:error_output@468d2923fe79","sink:error_output@468d2923fe79|primary","sink:error_output@468d2923fe79|primary|0|0","sink:error_output@468d2923fe79|primary|0|file"]}],"batches":[],"expansions":[],"intermediate_outcomes":[],"node_states":[{"attempt":0,"context_after":null,"error":null,"key":"primary:0#0|gate:select_error@1f59be983ded|1|0","node_key":"gate:select_error@1f59be983ded","status":"completed","step_index":1,"token_key":"primary:0#0"},{"attempt":0,"context_after":null,"error":null,"key":"primary:0#0|sink:error_output@468d2923fe79|3|0","node_key":"sink:error_output@468d2923fe79","status":"completed","step_index":3,"token_key":"primary:0#0"},{"attempt":0,"context_after":null,"error":null,"key":"primary:0#0|source:primary@5a21cc0bf019|0|0","node_key":"source:primary@5a21cc0bf019","status":"completed","step_index":0,"token_key":"primary:0#0"},{"attempt":0,"context_after":null,"error":"{\"error\":\"injected DAG corpus routed error\",\"reason\":\"invalid_input\"}","key":"primary:0#0|transform:routed_error@e7eff0f8b3dc|2|0","node_key":"transform:routed_error@e7eff0f8b3dc","status":"failed","step_index":2,"token_key":"primary:0#0"},{"attempt":0,"context_after":null,"error":null,"key":"primary:1#0|gate:select_error@1f59be983ded|1|0","node_key":"gate:select_error@1f59be983ded","status":"completed","step_index":1,"token_key":"primary:1#0"},{"attempt":0,"context_after":null,"error":null,"key":"primary:1#0|source:primary@5a21cc0bf019|0|0","node_key":"source:primary@5a21cc0bf019","status":"completed","step_index":0,"token_key":"primary:1#0"}],"routes":[{"from_node_key":"gate:select_error@1f59be983ded","key":"primary:0#0|gate:select_error@1f59be983ded|0|transform:routed_error@e7eff0f8b3dc","label":"true","mode":"move","ordinal":0,"to_node_key":"transform:routed_error@e7eff0f8b3dc","token_key":"primary:0#0"},{"from_node_key":"transform:routed_error@e7eff0f8b3dc","key":"primary:0#0|transform:routed_error@e7eff0f8b3dc|0|sink:error_output@468d2923fe79","label":"__error_routed_error__","mode":"divert","ordinal":0,"to_node_key":"sink:error_output@468d2923fe79","token_key":"primary:0#0"}],"rows":[{"ingest_sequence":0,"key":"primary:0","source_data_hash":"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2","source_name":"primary","source_row_index":0},{"ingest_sequence":1,"key":"primary:1","source_data_hash":"ffeb1fb12db8f2d5c55f05b744bde7f0e0858990ceb9202d9ec418045aa0fd8d","source_name":"primary","source_row_index":1}],"scheduler_work":[{"final_status":"terminal","key":"primary:0#0|gate:select_error@1f59be983ded|0","node_key":"gate:select_error@1f59be983ded","token_key":"primary:0#0","transitions":["enqueue:ready","claim_ready:leased","mark_pending_sink:pending_sink","mark_pending_sink_terminal:terminal"]},{"final_status":"terminal","key":"primary:1#0|gate:select_error@1f59be983ded|0","node_key":"gate:select_error@1f59be983ded","token_key":"primary:1#0","transitions":["enqueue:ready","claim_ready:leased","mark_terminal:terminal"]}],"terminal_dispositions":[{"error_hash":"a2f3ed6052168a71","key":"primary:0#0","outcome":"failure","path":"on_error_routed","sink_name":"error_output","token_key":"primary:0#0"},{"error_hash":null,"key":"primary:1#0","outcome":"success","path":"gate_discarded","sink_name":null,"token_key":"primary:1#0"}],"tokens":[{"branch_name":null,"key":"primary:0#0","parents":[],"row_key":"primary:0"},{"branch_name":null,"key":"primary:1#0","parents":[],"row_key":"primary:1"}],"transform_errors":[{"destination":"error_output","error_details":"{\"error\":\"injected DAG corpus routed error\",\"reason\":\"invalid_input\"}","key":"primary:0#0|transform:routed_error@e7eff0f8b3dc","row_data":null,"row_hash":"19b33c29a9a46e8935271aed5ccd77ab3b9d4be9ef78e2267548874cd61726b2","token_key":"primary:0#0","transform_node_key":"transform:routed_error@e7eff0f8b3dc"}],"validation_errors":[]},"rows_failed":1,"rows_processed":2,"rows_succeeded":1,"sink_outputs":[{"rows":["{\"id\":1,\"value\":10}"],"sink_name":"error_output"}],"source_operation_count":1,"status":"completed_with_failures"}
+      - id: retry-success-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: retry-quarantine-discard-routed-errors/retry-then-success.yaml
+        input_fixtures:
+          primary: retry-quarantine-discard-routed-errors/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 1
+          required_audit_record_types:
+            - artifact
+            - node_state
+            - operation
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
     dimensions:
       config: *config_pass
       build: *build_pass
@@ -4196,11 +4264,9 @@ scenarios:
         reason: Exact durable leader-path evidence passes, but authoritative scheduler disposition and follower drain audit proof remain open under elspeth-2e66723070 and elspeth-6f6bbbec00.
         owner_issue: elspeth-2e66723070
         exit_gate: Both authoritative scheduler-disposition and follower-drain issues integrate, then durable and portable exact corpus evidence passes unchanged.
-      recovery: &recovery_unknown
-        status: unknown
-        reason: No complete database-reopen recovery case exists for this scenario.
-        owner_issue: elspeth-ef29ef6ba4
-        exit_gate: The scenario corpus case passes database-reopen and public-resume assertions without duplicate work.
+      recovery:
+        status: pass
+        evidence: [harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume]
       concurrency: *concurrency_unknown
       freeform: *freeform_pass
       guided: *guided_fail

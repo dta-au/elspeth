@@ -16,9 +16,10 @@ from types import MappingProxyType
 
 import pytest
 
+from elspeth.contracts import RouteDestination
 from elspeth.contracts.enums import NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import BranchInfo, GraphValidationError
 
@@ -132,6 +133,22 @@ class TestSelectMergeCoalesceRaisesOnBrokenBranch:
 
 
 class TestExecutionGraphConstructionApi:
+    def test_add_node_wraps_invalid_raw_schema_as_graph_validation_error(self) -> None:
+        graph = ExecutionGraph()
+
+        with pytest.raises(GraphValidationError, match="Invalid schema config") as exc_info:
+            graph.add_node(
+                "source",
+                node_type=NodeType.SOURCE,
+                plugin_name="csv",
+                config={"schema": {"mode": "invalid"}},
+            )
+
+        assert exc_info.value.component_id == "source"
+        assert exc_info.value.component_type == "source"
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert "Invalid schema mode 'invalid'" in str(exc_info.value.__cause__)
+
     def test_set_node_output_schema_replaces_node_info_without_mutating_existing_instance(self) -> None:
         graph = ExecutionGraph()
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
@@ -205,3 +222,158 @@ class TestExecutionGraphConstructionApi:
         assert config["options"]["columns"] == ("name",)
         with pytest.raises(TypeError):
             config["new"] = "value"
+
+    def test_set_route_resolution_map_copies_caller_mapping(self) -> None:
+        graph = ExecutionGraph()
+        key = (NodeID("gate"), "drop")
+        route_map = {key: RouteDestination.discard()}
+
+        graph.set_route_resolution_map(route_map)
+        route_map.clear()
+
+        assert graph.get_route_resolution_map() == {key: RouteDestination.discard()}
+
+    def test_set_route_label_map_copies_caller_mapping(self) -> None:
+        graph = ExecutionGraph()
+        key = (NodeID("gate"), SinkName("output"))
+        route_map = {key: "selected"}
+
+        graph.set_route_label_map(route_map)
+        route_map.clear()
+
+        assert graph.get_route_label("gate", SinkName("output")) == "selected"
+
+
+class TestExecutionGraphTraversal:
+    def test_get_next_node_ignores_continue_copy_edge(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
+        graph.add_node("copy_target", node_type=NodeType.TRANSFORM, plugin_name="copy")
+        graph.add_edge("source", "copy_target", label="continue", mode=RoutingMode.COPY)
+
+        assert graph.get_next_node(NodeID("source")) is None
+
+    def test_get_next_node_treats_sink_as_terminal(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("transform", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_edge("transform", "sink", label="continue", mode=RoutingMode.MOVE)
+
+        assert graph.get_next_node(NodeID("transform")) is None
+
+    def test_get_next_node_rejects_multiple_continue_processing_edges(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="expression")
+        graph.add_node("left", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("right", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_edge("gate", "left", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("gate", "right", label="continue", mode=RoutingMode.MOVE)
+
+        with pytest.raises(GraphValidationError, match="multiple continue MOVE edges") as exc_info:
+            graph.get_next_node(NodeID("gate"))
+
+        assert exc_info.value.component_id == "gate"
+        assert exc_info.value.component_type == "gate"
+
+    def test_pipeline_node_sequence_is_empty_without_sources(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("transform", node_type=NodeType.TRANSFORM, plugin_name="map")
+
+        assert graph.get_pipeline_node_sequence() == []
+
+    def test_pipeline_node_sequence_checks_every_source(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("terminal_source", node_type=NodeType.SOURCE, plugin_name="csv")
+        graph.add_node("active_source", node_type=NodeType.SOURCE, plugin_name="csv")
+        graph.add_node("transform", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_edge("terminal_source", "sink", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("active_source", "transform", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("transform", "sink", label="continue", mode=RoutingMode.MOVE)
+
+        assert graph.get_pipeline_node_sequence() == [NodeID("transform")]
+
+    def test_pipeline_node_sequence_deduplicates_a_converged_node(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="expression")
+        graph.add_node("left", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("right", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("queue", node_type=NodeType.QUEUE, plugin_name="queue")
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_edge("source", "gate", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("gate", "left", label="left", mode=RoutingMode.MOVE)
+        graph.add_edge("gate", "right", label="right", mode=RoutingMode.MOVE)
+        graph.add_edge("left", "queue", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("right", "queue", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("queue", "sink", label="continue", mode=RoutingMode.MOVE)
+
+        sequence = graph.get_pipeline_node_sequence()
+
+        assert sequence.count(NodeID("queue")) == 1
+        assert set(sequence) == {
+            NodeID("gate"),
+            NodeID("left"),
+            NodeID("right"),
+            NodeID("queue"),
+        }
+
+    def test_pipeline_node_sequence_ignores_copy_targets(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="csv")
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="expression")
+        graph.add_node("copy_target", node_type=NodeType.COALESCE, plugin_name="coalesce")
+        graph.add_node("move_target", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_edge("source", "gate", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("gate", "copy_target", label="identity", mode=RoutingMode.COPY)
+        graph.add_edge("gate", "move_target", label="selected", mode=RoutingMode.MOVE)
+        graph.add_edge("copy_target", "sink", label="on_success", mode=RoutingMode.MOVE)
+        graph.add_edge("move_target", "sink", label="on_success", mode=RoutingMode.MOVE)
+
+        assert graph.get_pipeline_node_sequence() == [NodeID("gate"), NodeID("move_target")]
+
+    def test_row_union_branch_first_nodes_cover_identity_and_transform_arms(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork")
+        graph.add_node("transform", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("union", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        graph.add_edge("gate", "union", label="identity", mode=RoutingMode.COPY)
+        graph.add_edge("gate", "transform", label="changed", mode=RoutingMode.MOVE)
+        graph.add_edge("transform", "union", label="continue", mode=RoutingMode.MOVE)
+        graph.set_row_union_id_map({RowUnionName("merge"): NodeID("union")})
+        graph.set_branch_to_row_union_map(
+            {
+                BranchName("identity"): RowUnionName("merge"),
+                BranchName("changed"): RowUnionName("merge"),
+            }
+        )
+        graph.set_row_union_branch_gates(
+            {
+                BranchName("identity"): NodeID("gate"),
+                BranchName("changed"): NodeID("gate"),
+            }
+        )
+
+        assert graph.get_branch_first_nodes() == {
+            BranchName("identity"): NodeID("union"),
+            BranchName("changed"): NodeID("transform"),
+        }
+
+    def test_branch_and_terminal_sink_maps_filter_by_edge_contract(self) -> None:
+        graph = ExecutionGraph()
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork")
+        graph.add_node("transform", node_type=NodeType.TRANSFORM, plugin_name="map")
+        graph.add_node("branch_sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.add_node("terminal_sink", node_type=NodeType.SINK, plugin_name="json")
+        graph.set_sink_id_map(
+            {
+                SinkName("branch_output"): NodeID("branch_sink"),
+                SinkName("terminal_output"): NodeID("terminal_sink"),
+            }
+        )
+        graph.add_edge("gate", "branch_sink", label="selected", mode=RoutingMode.COPY)
+        graph.add_edge("transform", "terminal_sink", label="on_success", mode=RoutingMode.MOVE)
+
+        assert graph.get_branch_to_sink_map() == {BranchName("selected"): SinkName("branch_output")}
+        assert graph.get_terminal_sink_map() == {NodeID("transform"): SinkName("terminal_output")}

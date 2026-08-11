@@ -192,7 +192,7 @@ def build_execution_graph(
     """
     if not sources:
         raise GraphValidationError("ExecutionGraph requires at least one source")
-    if sinks is None:
+    if not sinks:
         raise GraphValidationError("ExecutionGraph requires at least one sink")
     if aggregations is None:
         aggregations = {}

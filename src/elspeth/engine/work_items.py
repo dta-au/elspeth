@@ -72,7 +72,12 @@ class WorkItemFactory:
         row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
     ) -> WorkItem:
-        """Create a WorkItem, resolving one missing coalesce half when possible."""
+        """Create a cursor with validated coalesce or resolved row-union metadata.
+
+        A single supplied coalesce identity is resolved in the other direction;
+        when both are supplied, they must describe the same barrier. Row-union
+        names are always resolved to their structural node ids.
+        """
         resolved_coalesce_node_id = coalesce_node_id
         resolved_coalesce_name = coalesce_name
 
@@ -80,6 +85,14 @@ class WorkItemFactory:
             resolved_coalesce_node_id = self.navigation.resolve_coalesce_node(resolved_coalesce_name)
         elif resolved_coalesce_node_id is not None and resolved_coalesce_name is None:
             resolved_coalesce_name = self.navigation.resolve_coalesce_name(resolved_coalesce_node_id)
+        elif resolved_coalesce_node_id is not None and resolved_coalesce_name is not None:
+            expected_node_id = self.navigation.resolve_coalesce_node(resolved_coalesce_name)
+            if resolved_coalesce_node_id != expected_node_id:
+                raise OrchestrationInvariantError(
+                    f"WorkItem coalesce metadata mismatch: coalesce_name={resolved_coalesce_name!r} "
+                    f"resolves to node_id={expected_node_id!r}, not supplied "
+                    f"coalesce_node_id={resolved_coalesce_node_id!r}"
+                )
 
         row_union_node_id = self.navigation.resolve_row_union_node(row_union_name) if row_union_name is not None else None
 
