@@ -128,7 +128,9 @@ leg/case/profile proof subject per node, match one catalog execution profile,
 and report a positive all-passing result with no skip, xfail, or xpass.
 The checked-in reporter obtains backend facts from the live connection at the
 trusted test boundary, binds the deployment assertion to the probe node, and
-emits exact JUnit/profile node identities. PostgreSQL evidence reports a
+emits exact JUnit/profile node identities, one machine outcome per collected
+node, and warning provenance. Manifest counts must equal those derived facts;
+XFAIL, XPASS, and generic skip remain separate. PostgreSQL evidence reports a
 server-queried semantic 16.x version; SQLite evidence reports a
 connection-queried semantic 3.x version.
 

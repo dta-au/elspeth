@@ -549,11 +549,11 @@ def _node_matches_selector(node_id: str, selector: str) -> bool:
     return node_id == selector or node_id.startswith(f"{selector}::") or node_id.startswith(f"{selector}[")
 
 
-def _junit_node_ids(junit_path: Path, evidence_id: str) -> tuple[list[str], dict[str, int]]:
+def _junit_node_ids(junit_path: Path, evidence_id: str) -> tuple[list[str], list[str]]:
     junit_root = ET.parse(junit_path).getroot()
     testcases = [element for element in junit_root.iter() if element.tag.rsplit("}", 1)[-1] == "testcase"]
     node_ids: list[str] = []
-    outcomes = {"failures": 0, "errors": 0, "skipped": 0}
+    outcomes: list[str] = []
     for testcase in testcases:
         properties = [element for element in testcase.iter() if element.tag.rsplit("}", 1)[-1] == "property"]
         identity = [element.attrib.get("value") for element in properties if element.attrib.get("name") == "elspeth_node_id"]
@@ -563,9 +563,9 @@ def _junit_node_ids(junit_path: Path, evidence_id: str) -> tuple[list[str], dict
         )
         node_ids.append(cast(str, identity[0]))
         child_tags = {child.tag.rsplit("}", 1)[-1] for child in testcase}
-        outcomes["failures"] += "failure" in child_tags
-        outcomes["errors"] += "error" in child_tags
-        outcomes["skipped"] += "skipped" in child_tags
+        result_tags = child_tags & {"failure", "error", "skipped"}
+        _require(len(result_tags) <= 1, f"pytest evidence {evidence_id} JUnit testcase has conflicting outcomes")
+        outcomes.append(next(iter(result_tags), "passed"))
     _require(bool(node_ids), f"pytest evidence {evidence_id} JUnit XML has no testcases")
     _unique(node_ids, f"pytest evidence {evidence_id} JUnit node identities")
     leaf_suites = [
@@ -580,8 +580,15 @@ def _junit_node_ids(junit_path: Path, evidence_id: str) -> tuple[list[str], dict
         }
     except ValueError:
         _fail(f"pytest evidence {evidence_id} JUnit aggregate counts must be integers")
+    outcome_counts = Counter(outcomes)
     _require(
-        aggregate == {"tests": len(testcases), **outcomes},
+        aggregate
+        == {
+            "tests": len(testcases),
+            "failures": outcome_counts["failure"],
+            "errors": outcome_counts["error"],
+            "skipped": outcome_counts["skipped"],
+        },
         f"pytest evidence {evidence_id} JUnit aggregate counts disagree with testcase evidence",
     )
     return node_ids, outcomes
@@ -592,7 +599,8 @@ def _validate_profile_report(
     evidence_id: str,
     profile_case_by_id: dict[str, dict[str, Any]],
     node_ids: list[str],
-) -> None:
+    junit_outcomes: list[str],
+) -> tuple[dict[str, Any], dict[str, int]]:
     profile = load_unique_json(profile_path)
     expected_fields = {
         "schema_version",
@@ -605,14 +613,16 @@ def _validate_profile_report(
         "deployment_probe",
         "probe_node_id",
         "node_ids",
+        "outcomes",
+        "warnings",
     }
     _require(set(profile) == expected_fields, f"evidence {evidence_id} profile report has unexpected fields")
     _require(
-        type(profile.get("schema_version")) is int and profile["schema_version"] == 1,
-        f"evidence {evidence_id} profile report schema_version must be integer 1",
+        type(profile.get("schema_version")) is int and profile["schema_version"] == 2,
+        f"evidence {evidence_id} profile report schema_version must be integer 2",
     )
     _require(
-        profile.get("producer") == "elspeth-state-engine-profile-reporter-v1",
+        profile.get("producer") == "elspeth-state-engine-profile-reporter-v2",
         f"evidence {evidence_id} profile report has an unknown producer",
     )
     profile_case_id = _string(profile.get("profile_case_id"), f"evidence {evidence_id} profile_case_id")
@@ -625,6 +635,63 @@ def _validate_profile_report(
     reported_nodes = _strings(profile.get("node_ids"), f"evidence {evidence_id} profile node_ids")
     _unique(reported_nodes, f"evidence {evidence_id} profile node_ids")
     _require(reported_nodes == node_ids, f"evidence {evidence_id} profile node identities do not match JUnit/index evidence")
+    raw_outcomes = _list(profile.get("outcomes"), f"evidence {evidence_id} profile outcomes")
+    _require(len(raw_outcomes) == len(node_ids), f"evidence {evidence_id} profile must report one outcome per node")
+    outcome_counts: Counter[str] = Counter()
+    junit_compatibility = {
+        "passed": {"passed"},
+        "failed": {"failure"},
+        "error": {"error"},
+        "skipped": {"skipped"},
+        "xfailed": {"skipped"},
+        "xpassed": {"passed", "failure"},
+    }
+    for index, (raw_outcome, node_id, junit_outcome) in enumerate(zip(raw_outcomes, node_ids, junit_outcomes, strict=True)):
+        outcome_record = _dict(raw_outcome, f"evidence {evidence_id} profile outcome {index}")
+        _require(
+            set(outcome_record) == {"node_id", "outcome"},
+            f"evidence {evidence_id} profile outcome has unexpected fields",
+        )
+        _require(
+            outcome_record.get("node_id") == node_id,
+            f"evidence {evidence_id} profile outcome node identities do not match JUnit/index evidence",
+        )
+        outcome = _string(outcome_record.get("outcome"), f"evidence {evidence_id} profile outcome")
+        _require(outcome in junit_compatibility, f"evidence {evidence_id} profile has an unknown pytest outcome")
+        _require(
+            junit_outcome in junit_compatibility[outcome],
+            f"evidence {evidence_id} profile outcome disagrees with JUnit testcase evidence",
+        )
+        outcome_counts[outcome] += 1
+    raw_warnings = _list(profile.get("warnings"), f"evidence {evidence_id} profile warnings")
+    for index, raw_warning in enumerate(raw_warnings):
+        warning = _dict(raw_warning, f"evidence {evidence_id} profile warning {index}")
+        _require(
+            set(warning) == {"node_id", "when", "category", "message", "filename", "line"},
+            f"evidence {evidence_id} profile warning has unexpected fields",
+        )
+        warning_node = warning.get("node_id")
+        _require(
+            warning_node is None or warning_node in node_ids,
+            f"evidence {evidence_id} profile warning names an unknown node",
+        )
+        _require(
+            warning.get("when") in {"config", "collect", "runtest"},
+            f"evidence {evidence_id} profile warning has an invalid phase",
+        )
+        for field in ("category", "filename"):
+            _require(
+                isinstance(warning.get(field), str) and bool(warning[field]),
+                f"evidence {evidence_id} profile warning {field} must be non-empty text",
+            )
+        _require(
+            isinstance(warning.get("message"), str),
+            f"evidence {evidence_id} profile warning message must be text",
+        )
+        _require(
+            type(warning.get("line")) is int and warning["line"] > 0,
+            f"evidence {evidence_id} profile warning line must be a positive integer",
+        )
     probe_node_id = _string(profile.get("probe_node_id"), f"evidence {evidence_id} profile probe_node_id")
     _require(probe_node_id in node_ids, f"evidence {evidence_id} profile probe node is not retained")
     deployment_probe = _dict(profile.get("deployment_probe"), f"evidence {evidence_id} deployment_probe")
@@ -652,6 +719,15 @@ def _validate_profile_report(
             re.fullmatch(r"3\.\d+(?:\.\d+)?", backend_version) is not None,
             f"evidence {evidence_id} SQLite backend version must be 3.x",
         )
+    return profile, {
+        "passed": outcome_counts["passed"],
+        "failed": outcome_counts["failed"],
+        "errors": outcome_counts["error"],
+        "skipped": outcome_counts["skipped"],
+        "xfailed": outcome_counts["xfailed"],
+        "xpassed": outcome_counts["xpassed"],
+        "warnings": len(raw_warnings),
+    }
 
 
 def _validate_evidence(
@@ -844,11 +920,21 @@ def _validate_evidence(
                     all(any(_node_matches_selector(node_id, selector) for selector in selectors) for node_id in junit_nodes),
                     f"pytest evidence {evidence_id} JUnit node identity is outside the recorded selectors",
                 )
-                _validate_profile_report(profile_path, evidence_id, profile_case_by_id, nodes)
-                junit_counts = {
-                    "tests": len(junit_nodes),
-                    **junit_outcomes,
-                }
+                profile, machine_counts = _validate_profile_report(
+                    profile_path,
+                    evidence_id,
+                    profile_case_by_id,
+                    nodes,
+                    junit_outcomes,
+                )
+                _require(
+                    machine_counts == counts,
+                    f"pytest evidence {evidence_id} machine-reported outcome counts do not match result_counts",
+                )
+                _require(
+                    {key[3] for key in coverage} <= {profile["profile_case_id"]},
+                    f"evidence {evidence_id} runtime profile does not match coverage",
+                )
             else:
                 names = [Path(str(_dict(item, "artifact").get("path"))).name for item in artifacts]
                 _require(
@@ -871,19 +957,16 @@ def _validate_evidence(
                 junit_counts = {
                     key: sum(int(suite.attrib.get(key, 0)) for suite in suites) for key in ("tests", "failures", "errors", "skipped")
                 }
-            expected_tests = sum(int(counts.get(key, 0)) for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
-            _require(junit_counts["tests"] == expected_tests == record["collected_nodes"], f"pytest result total mismatch: {evidence_id}")
-            _require(junit_counts["failures"] == counts.get("failed", 0), f"pytest failure count mismatch: {evidence_id}")
-            _require(junit_counts["errors"] == counts.get("errors", 0), f"pytest error count mismatch: {evidence_id}")
-            _require(
-                junit_counts["skipped"] == counts.get("skipped", 0) + counts.get("xfailed", 0),
-                f"pytest skipped count mismatch: {evidence_id}",
-            )
-            if v2:
-                profile = load_unique_json(artifacts_by_kind["profile_report"][1])
+                expected_tests = sum(int(counts.get(key, 0)) for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
                 _require(
-                    {key[3] for key in coverage} <= {profile["profile_case_id"]},
-                    f"evidence {evidence_id} runtime profile does not match coverage",
+                    junit_counts["tests"] == expected_tests == record["collected_nodes"],
+                    f"pytest result total mismatch: {evidence_id}",
+                )
+                _require(junit_counts["failures"] == counts.get("failed", 0), f"pytest failure count mismatch: {evidence_id}")
+                _require(junit_counts["errors"] == counts.get("errors", 0), f"pytest error count mismatch: {evidence_id}")
+                _require(
+                    junit_counts["skipped"] == counts.get("skipped", 0) + counts.get("xfailed", 0),
+                    f"pytest skipped count mismatch: {evidence_id}",
                 )
             if (
                 record["exit_code"] == 0

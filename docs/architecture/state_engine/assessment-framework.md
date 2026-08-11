@@ -50,7 +50,8 @@ Every execution record contains:
 - safe environment additions/removals and required resources;
 - start/end times, timeout, exit code, and duration;
 - one machine-produced runtime profile report with its state store, deployment,
-  semantic backend version, probe kind, and exact probe node;
+  semantic backend version, probe kind, exact probe node, one classified pytest
+  outcome per collected node, and warning provenance;
 - positive, unique collected node IDs and exact
   pass/fail/error/skip/xfail/xpass/warning counts;
 - stdout, stderr, JUnit, and retained artifact paths with SHA-256 when stored;
@@ -76,9 +77,12 @@ inputs.
 Only a successful `pytest` record with a positive pass count, no
 fail/error/skip/xfail/xpass result, matching JUnit testcase/aggregate totals,
 exact equality among JUnit properties, node index, and profile node IDs, and one
-proof subject per cited node can promote a behavioral cell. A node may cover
-several dimensions of that one leg/case/profile subject. Documentation records
-are support-only and cannot promote behavioral cells.
+proof subject per cited node can promote a behavioral cell. Manifest result
+counts are derived from the profile's machine outcomes and warnings; human
+stdout summaries are retained context, never count authority. XFAIL and XPASS
+remain distinct from generic skip and pass, and any XPASS blocks promotion. A
+node may cover several dimensions of that one leg/case/profile subject.
+Documentation records are support-only and cannot promote behavioral cells.
 
 ## Classification rules
 

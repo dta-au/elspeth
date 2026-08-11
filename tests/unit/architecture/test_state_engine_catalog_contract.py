@@ -399,6 +399,10 @@ def _replace_genuine_node_identity(repository: Path, record: dict[str, Any], nod
     profile["node_ids"] = [node_id]
     profile["probe_node_id"] = node_id
     profile["deployment_probe"]["node_id"] = node_id
+    profile["outcomes"][0]["node_id"] = node_id
+    for warning in profile["warnings"]:
+        if warning["node_id"] is not None:
+            warning["node_id"] = node_id
     _write_json(profile_path, profile)
     profile_record["sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
     node_record = record["collected_node_index"]
@@ -407,7 +411,13 @@ def _replace_genuine_node_identity(repository: Path, record: dict[str, Any], nod
     node_record["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
 
 
-def _profile_provenance(profile_case: str, nodes: list[str]) -> dict[str, Any]:
+def _profile_provenance(
+    profile_case: str,
+    nodes: list[str],
+    *,
+    outcomes: list[str] | None = None,
+    warnings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     if profile_case == "postgresql-16-aws-single-leader-landscape":
         state_store = "postgresql-16"
         deployment = "aws-single-leader-landscape"
@@ -428,8 +438,8 @@ def _profile_provenance(profile_case: str, nodes: list[str]) -> dict[str, Any]:
         }
     probe_node_id = nodes[0] if nodes else "tests/unit/test_state_engine_contract.py::missing_probe"
     return {
-        "schema_version": 1,
-        "producer": "elspeth-state-engine-profile-reporter-v1",
+        "schema_version": 2,
+        "producer": "elspeth-state-engine-profile-reporter-v2",
         "profile_case_id": profile_case,
         "state_store": state_store,
         "deployment": deployment,
@@ -438,6 +448,10 @@ def _profile_provenance(profile_case: str, nodes: list[str]) -> dict[str, Any]:
         "deployment_probe": {"kind": "trusted-test-runtime-assertion", "node_id": probe_node_id},
         "probe_node_id": probe_node_id,
         "node_ids": nodes,
+        "outcomes": [
+            {"node_id": node_id, "outcome": outcome} for node_id, outcome in zip(nodes, outcomes or ["passed"] * len(nodes), strict=True)
+        ],
+        "warnings": warnings or [],
     }
 
 
@@ -459,6 +473,25 @@ def _pytest_evidence(
         "xpassed": 0,
         "warnings": 0,
     }
+    outcome_values = [
+        *(["failed"] * result_counts["failed"]),
+        *(["error"] * result_counts["errors"]),
+        *(["skipped"] * result_counts["skipped"]),
+        *(["xfailed"] * result_counts["xfailed"]),
+        *(["xpassed"] * result_counts["xpassed"]),
+        *(["passed"] * result_counts["passed"]),
+    ]
+    warning_provenance = [
+        {
+            "node_id": nodes[index % len(nodes)] if nodes else None,
+            "when": "runtest",
+            "category": "builtins.UserWarning",
+            "message": f"synthetic warning {index + 1}",
+            "filename": "tests/unit/test_state_engine_contract.py",
+            "line": 1,
+        }
+        for index in range(result_counts["warnings"])
+    ]
     stem = f"docs/architecture/state_engine/assessments/minimal-assessment/evidence/{evidence_id.lower()}"
     junit_tests = sum(result_counts[key] for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
     testcase_fragments: list[str] = []
@@ -498,7 +531,20 @@ def _pytest_evidence(
         ),
         typed_artifact(stdout_relative, "pytest fixture output\n", "stdout"),
         typed_artifact(stderr_relative, "", "stderr"),
-        typed_artifact(profile_relative, json.dumps(_profile_provenance(profile_case, nodes), indent=2) + "\n", "profile_report"),
+        typed_artifact(
+            profile_relative,
+            json.dumps(
+                _profile_provenance(
+                    profile_case,
+                    nodes,
+                    outcomes=outcome_values,
+                    warnings=warning_provenance,
+                ),
+                indent=2,
+            )
+            + "\n",
+            "profile_report",
+        ),
     ]
     node_index_content = "".join(f"{node}\n" for node in nodes)
     node_index = typed_artifact(node_relative, node_index_content, "node_index")
@@ -830,8 +876,8 @@ def test_profile_reporter_emits_sqlite_runtime_observation_and_exact_junit_node(
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     node_id = "tests/test_runtime_profile.py::test_runtime_profile"
     assert profile == {
-        "schema_version": 1,
-        "producer": "elspeth-state-engine-profile-reporter-v1",
+        "schema_version": 2,
+        "producer": "elspeth-state-engine-profile-reporter-v2",
         "profile_case_id": "sqlite-wal-single-process-leader",
         "state_store": "sqlite-wal",
         "deployment": "single-process-leader",
@@ -847,10 +893,101 @@ def test_profile_reporter_emits_sqlite_runtime_observation_and_exact_junit_node(
         },
         "probe_node_id": node_id,
         "node_ids": [node_id],
+        "outcomes": [{"node_id": node_id, "outcome": "passed"}],
+        "warnings": [],
     }
     assert re.fullmatch(r"3\.\d+(?:\.\d+)?", profile["backend_version"])
     junit = junit_path.read_text(encoding="utf-8")
     assert f'name="elspeth_node_id" value="{node_id}"' in junit
+
+
+def test_profile_reporter_emits_exact_outcomes_and_warning_provenance(
+    tmp_path: Path,
+) -> None:
+    test_path = tmp_path / "tests/test_runtime_outcomes.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "import sqlite3\n"
+        "import warnings\n\n"
+        "import pytest\n\n"
+        "def test_pass_profile(state_engine_profile):\n"
+        "    connection = sqlite3.connect(':memory:')\n"
+        "    state_engine_profile.observe_sqlite(\n"
+        "        connection, deployment='single-process-leader'\n"
+        "    )\n\n"
+        "@pytest.mark.xfail(reason='expected failure')\n"
+        "def test_xfail():\n"
+        "    assert False\n\n"
+        "@pytest.mark.xfail(reason='unexpected pass')\n"
+        "def test_xpass():\n"
+        "    pass\n\n"
+        "@pytest.mark.skip(reason='expected skip')\n"
+        "def test_skip():\n"
+        "    pass\n\n"
+        "def test_fail():\n"
+        "    assert False\n\n"
+        "@pytest.fixture\n"
+        "def broken_fixture():\n"
+        "    raise RuntimeError('setup exploded')\n\n"
+        "def test_error(broken_fixture):\n"
+        "    pass\n\n"
+        "def test_warning():\n"
+        "    warnings.warn('profile warning', UserWarning)\n",
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "profile.json"
+    junit_path = tmp_path / "result.junit.xml"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(REPOSITORY_ROOT),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            PROFILE_REPORTER_PLUGIN,
+            f"--state-engine-profile-report={profile_path}",
+            f"--junitxml={junit_path}",
+            "tests/test_runtime_outcomes.py",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    prefix = "tests/test_runtime_outcomes.py::"
+    assert profile["outcomes"] == [
+        {"node_id": f"{prefix}test_pass_profile", "outcome": "passed"},
+        {"node_id": f"{prefix}test_xfail", "outcome": "xfailed"},
+        {"node_id": f"{prefix}test_xpass", "outcome": "xpassed"},
+        {"node_id": f"{prefix}test_skip", "outcome": "skipped"},
+        {"node_id": f"{prefix}test_fail", "outcome": "failed"},
+        {"node_id": f"{prefix}test_error", "outcome": "error"},
+        {"node_id": f"{prefix}test_warning", "outcome": "passed"},
+    ]
+    assert len(profile["warnings"]) == 1
+    warning = profile["warnings"][0]
+    assert warning == {
+        "node_id": f"{prefix}test_warning",
+        "when": "runtest",
+        "category": "builtins.UserWarning",
+        "message": "profile warning",
+        "filename": warning["filename"],
+        "line": warning["line"],
+    }
+    assert warning["filename"].endswith("tests/test_runtime_outcomes.py")
+    assert type(warning["line"]) is int and warning["line"] > 0
 
 
 def test_validate_catalog_cli_accepts_current_v2_catalog() -> None:
@@ -1089,6 +1226,104 @@ def test_validate_package_and_collect_evidence_accept_same_genuine_runtime_artif
     assert validation.returncode == 0, validation.stderr
     assert collection.returncode == 0, collection.stderr
     assert "1 pytest records" in collection.stdout
+
+
+def test_validate_package_ignores_relabelled_human_stdout_when_machine_outcomes_are_unchanged(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    record = assessment["evidence"][0]
+    stdout_record = _artifact_by_kind(record, "stdout")
+    stdout_path = repository / stdout_record["path"]
+    stdout_path.write_text("1 xpassed in 0.01s\n", encoding="utf-8")
+    stdout_record["sha256"] = hashlib.sha256(stdout_path.read_bytes()).hexdigest()
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 0, result.stderr
+    assert "complete" in result.stdout
+
+
+def test_both_validators_reject_complete_package_relabelled_as_xpass_in_machine_outcomes(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    record = assessment["evidence"][0]
+    stdout_record = _artifact_by_kind(record, "stdout")
+    stdout_path = repository / stdout_record["path"]
+    stdout_path.write_text("1 xpassed in 0.01s\n", encoding="utf-8")
+    stdout_record["sha256"] = hashlib.sha256(stdout_path.read_bytes()).hexdigest()
+    profile_record = _artifact_by_kind(record, "profile_report")
+    profile_path = repository / profile_record["path"]
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["outcomes"][0]["outcome"] = "xpassed"
+    _write_json(profile_path, profile)
+    profile_record["sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    _write_json(assessment_path, assessment)
+
+    for command in ("validate-package", "collect-evidence"):
+        result = _run_assessment_cli(command, str(assessment_path), cwd=repository)
+
+        assert result.returncode == 1
+        assert "machine-reported outcome counts do not match result_counts" in result.stderr
+
+
+@pytest.mark.parametrize("mismatch", ["xfailed", "warning"])
+def test_both_validators_reject_machine_outcome_or_warning_count_mismatch(
+    assessment_repository: tuple[Path, Path],
+    mismatch: str,
+) -> None:
+    repository, assessment_path = assessment_repository
+    node = "tests/unit/test_state_engine_contract.py::test_retained_outcome"
+    counts = {
+        "passed": int(mismatch == "warning"),
+        "failed": 0,
+        "errors": 0,
+        "skipped": int(mismatch == "xfailed"),
+        "xfailed": 0,
+        "xpassed": 0,
+        "warnings": 0,
+    }
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-OUTCOME-MISMATCH",
+        profile_case="sqlite-wal-single-process-leader",
+        coverage=[],
+        nodes=[node],
+        counts=counts,
+    )
+    profile_record = _artifact_by_kind(record, "profile_report")
+    profile_path = repository / profile_record["path"]
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    if mismatch == "xfailed":
+        profile["outcomes"][0]["outcome"] = "xfailed"
+    else:
+        profile["warnings"].append(
+            {
+                "node_id": node,
+                "when": "runtest",
+                "category": "builtins.UserWarning",
+                "message": "unreported warning",
+                "filename": "tests/unit/test_state_engine_contract.py",
+                "line": 1,
+            }
+        )
+    _write_json(profile_path, profile)
+    profile_record["sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    for command in ("validate-package", "collect-evidence"):
+        result = _run_assessment_cli(command, str(assessment_path), cwd=repository)
+
+        assert result.returncode == 1
+        assert "machine-reported outcome counts do not match result_counts" in result.stderr
 
 
 def test_validate_package_and_collect_evidence_share_command_and_environment_contract(

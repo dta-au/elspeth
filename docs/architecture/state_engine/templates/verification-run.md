@@ -19,6 +19,7 @@
 
 - Exit code and duration:
 - Passed / failed / errors / skipped / xfailed / xpassed / warnings:
+- Machine outcome and warning authority: retained profile report path and SHA-256
 - Exact collected test or harness selectors:
 - Retained stdout, stderr, JUnit, and artifact paths plus SHA-256:
 

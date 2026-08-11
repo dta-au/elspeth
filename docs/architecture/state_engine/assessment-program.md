@@ -168,9 +168,10 @@ deployment=...)` or `observe_postgresql(live_sqlalchemy_connection,
 deployment=...)` at the runtime boundary. The reporter derives the catalog
 profile identity, queries SQLite with `SELECT sqlite_version()` or PostgreSQL
 with `SHOW server_version`, adds the exact `elspeth_node_id` property to every
-JUnit testcase, and writes the retained profile report. Deployment remains an
-explicit trusted-test assertion bound to the probe node; it is not a manifest
-or free-form CLI label.
+JUnit testcase, classifies every collected node as pass, fail, error, skip,
+XFAIL, or XPASS, records warning provenance, and writes the retained profile
+report. Deployment remains an explicit trusted-test assertion bound to the
+probe node; it is not a manifest or free-form CLI label.
 
 Run the evidence once, then derive the retained node index from the
 machine-produced profile report:
@@ -278,10 +279,12 @@ evidence validation. It executes no recorded command and imports no project
 test module. It uses the same command/environment/artifact authority as
 `validate-package`: exact trusted reporter plugin and output paths, closed safe-
 environment names, existing current-checkout selectors, exact JUnit testcase
-node properties, exact node-index equality, runtime profile provenance, result
-counts, and artifact digests. This removes process-containment and stdout-
-parsing claims from the validator; executing evidence remains the explicit
-operator step in section 6.
+node properties, exact node-index equality, runtime profile provenance,
+machine-derived outcome/warning counts, and artifact digests. XFAIL is not
+collapsed into skip and XPASS is not collapsed into pass. Human stdout is not
+parsed for result counts. This removes process-containment and stdout-parsing
+claims from the validator; executing evidence remains the explicit operator
+step in section 6.
 `check-links` checks repository-relative Markdown links under the state-engine
 documentation and `docs/README.md`; absolute paths, repository escapes, and
 symlink inputs/escapes are invalid for inline links and reference definitions.

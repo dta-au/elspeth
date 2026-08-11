@@ -70,8 +70,10 @@ explicitly unknown through the default.
   visibly unowned.
 - `pytest` is the only behavioral promotion kind. It requires positive passing
   node counts, exact JUnit/count agreement, no failed/error/skipped/xfail/xpass
-  result, exact JUnit/index/profile node identity, and matching runtime-profile
-  provenance produced at the trusted test/database boundary.
+  result, exact JUnit/index/profile node identity, exact machine-derived
+  outcome and warning counts, and matching runtime-profile provenance produced
+  at the trusted test/database boundary. Human stdout summaries do not supply
+  counts; XFAIL and XPASS remain distinct from skip and pass.
 - `documentation` evidence may support a result but cannot independently
   produce behavioral `pass` or `partial`.
 - Evidence coverage names exact
