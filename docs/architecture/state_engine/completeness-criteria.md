@@ -4,7 +4,8 @@
 
 The durable state engine is **complete** only when every mandatory state,
 subtype, boundary, read decision, refusal, and recovery path has current,
-production-representative evidence for every applicable dimension in the v1
+production-representative evidence for every applicable dimension and
+state-store/deployment profile case in the v2
 proof catalog.
 
 Completeness is binary. A maturity score cannot override a failed or unknown
@@ -17,12 +18,17 @@ The claim includes:
 - durable token work from enqueue through terminal disposition;
 - transform and sink-redrive leasing, heartbeat, expiry, reclaim, and fencing;
 - aggregation and coalesce barrier adoption, completion, and continuation;
+- row-union release with all branches, branch loss before or after partial
+  arrival, timeout, late arrival, and restart on either side of release;
 - sink-effect reservation, preparation, lease, reconciliation, publication,
   finalization, and scheduler repair;
 - source, transform, gate, aggregation, coalesce, sink, follower, and lifecycle
   production boundaries;
 - scheduler events, coordination evidence, node states, token outcomes,
   branch-loss rows, effect attempts, and artifacts;
+- fenced failed/interrupted finalization in which every still-undecided row is
+  atomically recorded as `(NULL, ABANDONED)` and cannot re-enter processing,
+  resume derivation, or predicate accounting;
 - orchestration read models that decide drain, flush, resume, relinquishment,
   eviction, or completion;
 - the catalog's exact state-store, deployment, lifecycle, and first-party
@@ -78,6 +84,23 @@ Every catalog leg accounts for all ten dimensions:
 
 Applicability is catalog-owned. An assessor cannot mark a dimension N/A merely
 because it is inconvenient to execute.
+
+## Required execution-profile cases
+
+Every mandatory v2 cell is proved independently for these catalog-owned
+state-store/deployment pairs:
+
+1. `sqlite-wal-single-process-leader`;
+2. `sqlite-wal-same-host-leader-plus-claim-only-followers`;
+3. `sqlite-wal-web-hosted-leader-plus-same-host-cli-followers`;
+4. `postgresql-16-aws-single-leader-landscape`.
+
+This is an evidence cross-product, not an assertion that every lifecycle mode
+applies to every deployment. The catalog lists the modes supported by each
+profile case. In particular, follower lifecycle evidence applies only to the
+two SQLite follower profiles. The PostgreSQL 16 contract is the maintained AWS
+single-leader Landscape profile; it does not advertise PostgreSQL multi-leader,
+multi-replica, or multi-host scheduling.
 
 ## Evidence hierarchy
 
@@ -137,7 +160,7 @@ Overall verdicts:
 
 ## Production-supported claim
 
-`complete` proves the catalog contract at every versioned execution profile.
+`complete` proves all 72 legs at every versioned execution profile.
 `production-supported` additionally requires:
 
 - every state-store, deployment, lifecycle, and first-party plugin named in
