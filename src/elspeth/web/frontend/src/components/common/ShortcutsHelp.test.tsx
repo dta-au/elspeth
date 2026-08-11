@@ -1,4 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { useState } from "react";
+
+import { render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { ShortcutsHelp } from "./ShortcutsHelp";
@@ -15,6 +19,64 @@ import { ShortcutsHelp } from "./ShortcutsHelp";
 const GROUP_NAMES = ["Actions", "Navigation", "Reference", "Editing"] as const;
 
 describe("ShortcutsHelp — four-group structure", () => {
+  it("uses a unique labelled title and a bounded header/body/footer structure", () => {
+    render(
+      <>
+        <ShortcutsHelp onClose={vi.fn()} />
+        <ShortcutsHelp onClose={vi.fn()} />
+      </>,
+    );
+
+    const dialogs = screen.getAllByRole("dialog", {
+      name: "Keyboard Shortcuts",
+    });
+    expect(dialogs).toHaveLength(2);
+    const titleIds = dialogs.map((dialog) =>
+      dialog.getAttribute("aria-labelledby"),
+    );
+    expect(new Set(titleIds).size).toBe(2);
+    for (const [index, dialog] of dialogs.entries()) {
+      expect(dialog).not.toHaveAttribute("aria-label");
+      expect(within(dialog).getByRole("heading", { level: 2 })).toHaveAttribute(
+        "id",
+        titleIds[index],
+      );
+      expect(dialog.querySelectorAll(":scope > .confirm-dialog-header"))
+        .toHaveLength(1);
+      expect(dialog.querySelectorAll(":scope > .confirm-dialog-body"))
+        .toHaveLength(1);
+      expect(dialog.querySelectorAll(":scope > .confirm-dialog-actions"))
+        .toHaveLength(1);
+    }
+
+    const css = readFileSync("src/styles/shared.css", "utf8");
+    expect(css).toMatch(
+      /\.confirm-dialog-body\s*\{[^}]*overflow-y:\s*auto;/s,
+    );
+  });
+
+  it("restores focus to the exact invoker after Close unmounts the dialog", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>
+            Open shortcuts
+          </button>
+          {open ? <ShortcutsHelp onClose={() => setOpen(false)} /> : null}
+        </>
+      );
+    }
+
+    render(<Harness />);
+    const invoker = screen.getByRole("button", { name: "Open shortcuts" });
+    await user.click(invoker);
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(invoker).toHaveFocus();
+  });
+
   it("renders an Actions group", () => {
     render(<ShortcutsHelp onClose={vi.fn()} />);
     expect(

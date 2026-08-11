@@ -129,6 +129,47 @@ test.describe("Composer workspace integration geometry", () => {
             document.documentElement.clientWidth,
         );
         expect(overflow).toBeLessThanOrEqual(0);
+
+        if (viewport.width === 1280 && viewport.height === 720) {
+          const invoker = page.getByRole("button", {
+            name: `Session switcher: workspace ${viewport.width}x${viewport.height}`,
+          });
+          await invoker.focus();
+          await page.evaluate(() => {
+            document.dispatchEvent(
+              new KeyboardEvent("keydown", {
+                key: "?",
+                shiftKey: true,
+                bubbles: true,
+              }),
+            );
+          });
+          const shortcuts = page.getByRole("dialog", {
+            name: "Keyboard Shortcuts",
+          });
+          await expect(shortcuts).toBeVisible();
+          await expect(
+            shortcuts.getByRole("heading", { name: "Keyboard Shortcuts" }),
+          ).toBeVisible();
+          const close = shortcuts.getByRole("button", { name: "Close" });
+          await expect(close).toBeVisible();
+          const body = shortcuts.locator(":scope > .confirm-dialog-body");
+          const scrollGeometry = await body.evaluate((element) => ({
+            overflowY: window.getComputedStyle(element).overflowY,
+            clientHeight: element.clientHeight,
+            scrollHeight: element.scrollHeight,
+          }));
+          expect(scrollGeometry.overflowY).toBe("auto");
+          expect(scrollGeometry.scrollHeight).toBeGreaterThan(
+            scrollGeometry.clientHeight,
+          );
+          const editing = shortcuts.getByRole("region", { name: "Editing" });
+          await editing.scrollIntoViewIfNeeded();
+          await expect(editing).toBeVisible();
+          await close.click();
+          await expect(shortcuts).toBeHidden();
+          await expect(invoker).toBeFocused();
+        }
       } finally {
         if (sessionId !== undefined) await deleteSession(ctx, sessionId);
         await ctx.dispose();
@@ -183,6 +224,49 @@ test.describe("Composer workspace integration geometry", () => {
       await expect(more).toBeVisible();
       const workspaceBefore = await box(workspace);
 
+      const header = page.getByRole("banner");
+      const main = page.locator("#composer-main");
+      const version = page.getByRole("button", {
+        name: /Composition history \(currently v\d+\)/,
+      });
+      const primaryBounds = await primary.boundingBox();
+      const headerBounds = await header.boundingBox();
+      const mainBounds = await main.boundingBox();
+      const versionBounds = await version.boundingBox();
+      expect(primaryBounds).not.toBeNull();
+      expect(headerBounds).not.toBeNull();
+      expect(mainBounds).not.toBeNull();
+      expect(versionBounds).not.toBeNull();
+      expect(headerBounds!.y).toBeGreaterThanOrEqual(
+        primaryBounds!.y + primaryBounds!.height,
+      );
+      expect(mainBounds!.y).toBeGreaterThanOrEqual(
+        headerBounds!.y + headerBounds!.height,
+      );
+      const headerControls = [
+        page.getByRole("button", { name: /Session switcher:/ }),
+        version,
+        page.getByRole("button", { name: "account menu" }),
+      ];
+      for (const control of headerControls) {
+        const bounds = await control.boundingBox();
+        expect(bounds).not.toBeNull();
+        expect(bounds!.height).toBeGreaterThanOrEqual(36);
+        expect(bounds!.y).toBeGreaterThanOrEqual(headerBounds!.y);
+        expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(
+          headerBounds!.y + headerBounds!.height,
+        );
+      }
+      const versionHitTarget = await version.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const hit = document.elementFromPoint(
+          bounds.left + bounds.width / 2,
+          bounds.top + bounds.height / 2,
+        );
+        return hit === element || (hit !== null && element.contains(hit));
+      });
+      expect(versionHitTarget).toBe(true);
+
       await more.click();
       const popover = page.getByRole("region", { name: "All notices" });
       await expect(popover).toBeVisible();
@@ -215,6 +299,66 @@ test.describe("Composer workspace integration geometry", () => {
 
       const workspaceAfter = await box(workspace);
       expect(Math.abs(workspaceAfter.height - workspaceBefore.height)).toBeLessThanOrEqual(1);
+    } finally {
+      if (sessionId !== undefined) await deleteSession(ctx, sessionId);
+      await ctx.dispose();
+    }
+  });
+
+  test("a resolving notice action focuses the surviving primary notice", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    let backendRecovered = false;
+    await page.route("**/api/system/status", async (route) => {
+      if (!backendRecovered) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "Temporarily unavailable" }),
+        });
+        return;
+      }
+      await route.fulfill({
+        json: {
+          composer_available: true,
+          composer_model: "deterministic-e2e",
+          composer_provider: "playwright-route",
+          composer_reason: null,
+          composer_missing_keys: [],
+          composer_timeout_seconds: 180,
+        },
+      });
+    });
+    await page.route("**/api/composer-preferences", async (route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ detail: "Preferences remain unavailable" }),
+      });
+    });
+
+    const token = tokenFromStorageState(await page.context().storageState());
+    const ctx = await authedContext(token);
+    let sessionId: string | undefined;
+    try {
+      const session = await createSession(ctx, "workspace notice focus");
+      sessionId = session.id;
+      await seedPopulatedComposition(ctx, sessionId);
+      await page.goto(`/#/${sessionId}`);
+
+      const more = page.getByRole("button", { name: "1 more notice" });
+      await expect(more).toBeVisible();
+      await more.click();
+      const popover = page.getByRole("region", { name: "All notices" });
+      backendRecovered = true;
+      await popover.getByRole("button", { name: "Retry connection" }).click();
+
+      const primary = page.getByTestId("app-notice-primary");
+      await expect(primary).toContainText("Preferences:");
+      await expect(more).toHaveCount(0);
+      await expect(popover).toHaveCount(0);
+      await expect(primary).toBeFocused();
     } finally {
       if (sessionId !== undefined) await deleteSession(ctx, sessionId);
       await ctx.dispose();

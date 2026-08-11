@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useId, useRef } from "react";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
 interface ShortcutsHelpProps {
@@ -80,6 +80,7 @@ function ShortcutList({ items }: { items: ShortcutEntry[] }) {
 
 export function ShortcutsHelp({ onClose }: ShortcutsHelpProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = `${useId()}-shortcuts-title`;
   useFocusTrap(dialogRef);
 
   return (
@@ -93,7 +94,7 @@ export function ShortcutsHelp({ onClose }: ShortcutsHelpProps) {
         ref={dialogRef}
         role="dialog"
         aria-modal="true"
-        aria-label="Keyboard shortcuts"
+        aria-labelledby={titleId}
         className="confirm-dialog"
         onKeyDown={(e) => {
           if (e.key === "Escape") {
@@ -102,22 +103,32 @@ export function ShortcutsHelp({ onClose }: ShortcutsHelpProps) {
           }
         }}
       >
-        <h2 className="confirm-dialog-title">Keyboard Shortcuts</h2>
-        {GROUPS.map((group) => (
-          <section
-            key={group.name}
-            aria-label={group.name}
-            className="shortcuts-group"
+        <header className="confirm-dialog-header">
+          <h2 id={titleId} className="confirm-dialog-title">
+            Keyboard Shortcuts
+          </h2>
+        </header>
+        <div className="confirm-dialog-body">
+          {GROUPS.map((group) => (
+            <section
+              key={group.name}
+              aria-label={group.name}
+              className="shortcuts-group"
+            >
+              <h3 className="shortcuts-subheading">{group.name}</h3>
+              <ShortcutList items={group.items} />
+            </section>
+          ))}
+        </div>
+        <footer className="confirm-dialog-actions">
+          <button
+            type="button"
+            onClick={onClose}
+            className="btn confirm-dialog-btn"
           >
-            <h3 className="shortcuts-subheading">{group.name}</h3>
-            <ShortcutList items={group.items} />
-          </section>
-        ))}
-        <div className="confirm-dialog-actions">
-          <button onClick={onClose} className="btn confirm-dialog-btn">
             Close
           </button>
-        </div>
+        </footer>
       </div>
     </>
   );

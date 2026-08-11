@@ -162,8 +162,17 @@
 
 @media (min-width: 961px) and (max-height: 800px) {
   .app-header {
-    height: calc(var(--size-header-height) - var(--space-sm));
+    /* The row includes its 1px bottom border; reserve a full 36px content
+       box so compact controls never straddle adjacent application regions. */
+    height: calc(var(--size-control-compact) + 1px);
     padding-inline: var(--space-sm);
+  }
+
+  .header-session-switcher-trigger,
+  .header-version-selector .version-selector-trigger,
+  .user-menu-trigger {
+    height: var(--size-control-compact);
+    min-height: var(--size-control-compact);
   }
 }
 

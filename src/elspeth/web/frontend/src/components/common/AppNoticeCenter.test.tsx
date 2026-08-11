@@ -1,4 +1,12 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { useState } from "react";
+
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
@@ -122,6 +130,83 @@ describe("AppNoticeCenter", () => {
     await user.click(screen.getByRole("button", { name: "Outside" }));
     expect(screen.queryByRole("region", { name: "All notices" })).toBeNull();
     expect(invoker).toHaveFocus();
+  });
+
+  it("restores focus after commit to the primary notice when More unmounts", async () => {
+    const user = userEvent.setup();
+    const primaryNotice = notice(
+      "backend-unavailable",
+      "alert",
+      "Backend",
+    );
+    const { rerender } = render(
+      <AppNoticeCenter
+        notices={[
+          primaryNotice,
+          notice("preferences", "alert", "Preferences"),
+        ]}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "1 more notice" }));
+    rerender(<AppNoticeCenter notices={[primaryNotice]} />);
+
+    const primary = screen.getByTestId("app-notice-primary");
+    await waitFor(() => expect(primary).toHaveFocus());
+    expect(screen.queryByRole("region", { name: "All notices" })).toBeNull();
+  });
+
+  it("uses the primary notice then Composer main as stable action focus fallbacks", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const [notices, setNotices] = useState<AppNotice[]>([
+        notice(
+          "backend-unavailable",
+          "alert",
+          "Backend",
+          <button type="button" onClick={() => setNotices([])}>
+            Clear all notices
+          </button>,
+        ),
+        notice(
+          "preferences",
+          "alert",
+          "Preferences",
+          <button
+            type="button"
+            onClick={() =>
+              setNotices((current) =>
+                current.filter((item) => item.kind !== "preferences"),
+              )
+            }
+          >
+            Dismiss preferences
+          </button>,
+        ),
+      ]);
+      return (
+        <>
+          <main id="composer-main" tabIndex={-1}>
+            Composer main
+          </main>
+          <AppNoticeCenter notices={notices} />
+        </>
+      );
+    }
+
+    render(<Harness />);
+    await user.click(screen.getByRole("button", { name: "1 more notice" }));
+    await user.click(
+      screen.getByRole("button", { name: "Dismiss preferences" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("app-notice-primary")).toHaveFocus(),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Clear all notices" }));
+    await waitFor(() =>
+      expect(document.getElementById("composer-main")).toHaveFocus(),
+    );
   });
 
   it("renders no banner row when there are no active notices", () => {

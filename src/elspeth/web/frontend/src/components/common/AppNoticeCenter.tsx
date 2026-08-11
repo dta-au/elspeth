@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -44,7 +45,10 @@ export function AppNoticeCenter({
 }): JSX.Element | null {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
+  const primaryRef = useRef<HTMLDivElement>(null);
   const invokerRef = useRef<HTMLButtonElement>(null);
+  const logicalInvokerRef = useRef<HTMLButtonElement | null>(null);
+  const pendingFocusRef = useRef<HTMLElement | null | undefined>(undefined);
   const popoverId = `${useId()}-app-notices`;
   const orderedNotices = useMemo(
     () =>
@@ -63,12 +67,47 @@ export function AppNoticeCenter({
     ({ notice }) => notice.role === "alert",
   ).length;
 
-  const close = useCallback((restoreFocus: boolean) => {
-    setOpen(false);
-    if (restoreFocus) {
-      invokerRef.current?.focus({ preventScroll: true });
+  const close = useCallback(
+    (
+      restoreFocus: boolean,
+      preferredFocus: HTMLElement | null = invokerRef.current,
+    ) => {
+      if (restoreFocus) pendingFocusRef.current = preferredFocus;
+      setOpen(false);
+    },
+    [],
+  );
+
+  useLayoutEffect(() => {
+    const primaryFallback = primaryRef.current;
+    const mainFallback = document.getElementById("composer-main");
+    const preferred = pendingFocusRef.current;
+    let target: HTMLElement | null = null;
+    if (preferred !== undefined) {
+      pendingFocusRef.current = undefined;
+      target =
+        preferred?.isConnected === true
+          ? preferred
+          : primaryFallback?.isConnected === true
+            ? primaryFallback
+            : mainFallback;
+    } else if (
+      logicalInvokerRef.current !== null &&
+      !logicalInvokerRef.current.isConnected &&
+      (document.activeElement === document.body ||
+        document.activeElement === document.documentElement)
+    ) {
+      logicalInvokerRef.current = null;
+      target =
+        primaryFallback?.isConnected === true ? primaryFallback : mainFallback;
     }
-  }, []);
+    if (target instanceof HTMLElement && target.isConnected) {
+      target.focus({ preventScroll: true });
+      if (target === invokerRef.current) {
+        logicalInvokerRef.current = invokerRef.current;
+      }
+    }
+  });
 
   useEffect(() => {
     if (!open) return undefined;
@@ -112,13 +151,29 @@ export function AppNoticeCenter({
   return (
     <div ref={rootRef} className="app-notice-center">
       <div
+        ref={primaryRef}
         role={primary.role}
+        tabIndex={-1}
         className={`${bannerClassName(primary.tone)} app-notice-primary`}
         data-testid="app-notice-primary"
       >
         <span className="app-notice-primary-message">{primary.content}</span>
         <span className="app-notice-primary-actions">
-          {primary.action}
+          {primary.action === undefined ? null : (
+            <span
+              className="app-notice-primary-action"
+              onClick={() =>
+                close(
+                  true,
+                  document.activeElement instanceof HTMLElement
+                    ? document.activeElement
+                    : null,
+                )
+              }
+            >
+              {primary.action}
+            </span>
+          )}
           {additional.length > 0 ? (
             <button
               ref={invokerRef}
@@ -126,6 +181,9 @@ export function AppNoticeCenter({
               className="alert-banner-action app-notice-more"
               aria-expanded={open}
               aria-controls={popoverId}
+              onFocus={() => {
+                logicalInvokerRef.current = invokerRef.current;
+              }}
               onClick={() => (open ? close(true) : setOpen(true))}
             >
               {additionalLabel}
