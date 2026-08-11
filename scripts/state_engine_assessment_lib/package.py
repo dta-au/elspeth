@@ -63,7 +63,7 @@ V2_ASSESSMENT_TOP_LEVEL_KEYS = {
 ASSESSMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 EVIDENCE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 PYTEST_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
-PYTEST_SAFE_ENVIRONMENT = {"PYTHONHASHSEED", "TZ", "LANG", "LC_ALL"}
+PYTEST_SAFE_ENVIRONMENT = {"PYTHONHASHSEED", "PYTHONPATH", "TZ", "LANG", "LC_ALL"}
 PYTEST_FLAGS = {
     "-q",
     "--quiet",
@@ -547,6 +547,11 @@ def _validate_pytest_command(
     for name, value in safe_environment.items():
         _require(name in PYTEST_SAFE_ENVIRONMENT, f"evidence {evidence_id} safe_environment name is not permitted: {name}")
         _require(value is None or isinstance(value, str), f"evidence {evidence_id} safe_environment value must be text or null")
+        if name == "PYTHONPATH":
+            _require(
+                value == str(root / "src"),
+                f"evidence {evidence_id} PYTHONPATH must name the assessed checkout src directory",
+            )
     return selectors
 
 

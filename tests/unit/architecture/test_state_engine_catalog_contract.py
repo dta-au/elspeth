@@ -1690,6 +1690,11 @@ def test_validate_package_and_collect_evidence_share_command_and_environment_con
             lambda item: item.update({"safe_environment": {"AWS_SECRET_ACCESS_KEY": "not-a-real-secret"}}),
             "safe_environment name is not permitted",
         ),
+        (
+            "foreign-pythonpath",
+            lambda item: item.update({"safe_environment": {"PYTHONPATH": "/tmp/foreign/src"}}),
+            "PYTHONPATH must name the assessed checkout src directory",
+        ),
     ]
     for _case, mutation, expected_error in cases:
         assessment = json.loads(json.dumps(base))
@@ -1704,6 +1709,27 @@ def test_validate_package_and_collect_evidence_share_command_and_environment_con
         assert validation.returncode == collection.returncode == 1
         assert expected_error in validation.stderr
         assert expected_error in collection.stderr
+
+
+def test_validate_package_and_collect_evidence_accept_exact_checkout_pythonpath(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    record = _genuine_sqlite_evidence(repository)
+    record["safe_environment"] = {
+        "PYTHONHASHSEED": "0",
+        "PYTHONPATH": str(repository / "src"),
+    }
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    validation = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+    collection = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+    assert validation.returncode == collection.returncode == 0
 
 
 def test_validate_package_rejects_junit_node_identity_outside_recorded_selectors(
