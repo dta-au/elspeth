@@ -111,6 +111,7 @@ describe("ComposerWorkspace", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
 
@@ -199,12 +200,20 @@ describe("ComposerWorkspace", () => {
       expect(root).toHaveAttribute("data-layout-mode", mode);
       expect(separator).toHaveAttribute("tabindex", separatorTabIndex);
       expect(root).toHaveStyle({ "--authoring-pane-width": "360px" });
-      const viewTabs = root.querySelector('[role="tablist"]');
+      const viewTabs = root.querySelector(".workspace-view-tabs");
       expect(viewTabs).not.toBeNull();
       if (mode === "narrow") {
+        expect(viewTabs).toHaveAttribute("role", "tablist");
         expect(viewTabs).not.toHaveAttribute("hidden");
+        expect(screen.getAllByRole("tab")).toHaveLength(2);
+        expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(2);
       } else {
+        expect(viewTabs).not.toHaveAttribute("role");
         expect(viewTabs).toHaveAttribute("hidden");
+        expect(screen.queryByRole("tab", { hidden: true })).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole("tabpanel", { hidden: true }),
+        ).not.toBeInTheDocument();
       }
     },
   );
@@ -227,6 +236,10 @@ describe("ComposerWorkspace", () => {
     expect(pipeline).toHaveAttribute("tabindex", "-1");
     expect(compose).toHaveAttribute("aria-controls", "workspace-authoring-panel");
     expect(pipeline).toHaveAttribute("aria-controls", "workspace-artifact-panel");
+    const panels = screen.getAllByRole("tabpanel", { hidden: true });
+    expect(panels).toHaveLength(2);
+    expect(panels[0]).toHaveAttribute("aria-labelledby", compose.id);
+    expect(panels[1]).toHaveAttribute("aria-labelledby", pipeline.id);
     expect(authoringRegion).not.toHaveAttribute("inert");
     expect(artifactRegion).toHaveAttribute("inert");
     expect(artifactRegion).toHaveAttribute("aria-hidden", "true");
@@ -288,6 +301,7 @@ describe("ComposerWorkspace", () => {
     });
     emitWidth(1280);
     const draft = screen.getByRole("button", { name: "Live draft" });
+    const authoringLiveStatus = screen.getByRole("status");
     await user.click(
       screen.getByRole("button", { name: "Collapse authoring pane" }),
     );
@@ -303,9 +317,8 @@ describe("ComposerWorkspace", () => {
     expect(
       screen.queryByRole("button", { name: "Live draft" }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("status", { name: "Authoring ready" }),
-    ).not.toBeInTheDocument();
+    expect(authoringLiveStatus).toBeInTheDocument();
+    expect(authoringLiveStatus.closest("[hidden]")).not.toBeNull();
     expect(
       screen.getByRole("separator", {
         name: "Resize authoring pane",
@@ -319,6 +332,8 @@ describe("ComposerWorkspace", () => {
     ).toMatchObject({ authoringCollapsed: true });
 
     const projection = screen.getByRole("status");
+    expect(projection).not.toBe(authoringLiveStatus);
+    expect(screen.getAllByRole("status")).toEqual([projection]);
     expect(projection).toHaveTextContent("2 unread acknowledgements");
     const restore = screen.getByRole("button", {
       name: "Restore authoring pane",
@@ -399,6 +414,77 @@ describe("ComposerWorkspace", () => {
     emitWidth(1280);
 
     expect(mounts).toEqual({ authoring: 1, artifact: 1, inspector: 1 });
+  });
+
+  it.each([
+    [1200, 959, "narrow"],
+    [320, 1000, "desktop"],
+  ] as const)(
+    "uses observed workspace width at a %ipx viewport for %ipx content",
+    (viewportWidth, workspaceWidth, expectedMode) => {
+      vi.spyOn(window, "innerWidth", "get").mockReturnValue(viewportWidth);
+      renderWorkspace();
+
+      const root = emitWidth(workspaceWidth);
+
+      expect(root).toHaveAttribute("data-layout-mode", expectedMode);
+      if (expectedMode === "narrow") {
+        expect(screen.getByRole("tablist", { name: "Workspace view" })).toBeVisible();
+        expect(screen.getAllByRole("tab")).toHaveLength(2);
+        expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(2);
+      } else {
+        expect(screen.queryByRole("tab", { hidden: true })).not.toBeInTheDocument();
+        expect(
+          screen.queryByRole("tabpanel", { hidden: true }),
+        ).not.toBeInTheDocument();
+        expect(
+          screen.getByRole("region", { name: "Authoring pane" }),
+        ).toBeVisible();
+        expect(
+          screen.getByRole("region", { name: "Pipeline artifact" }),
+        ).toBeVisible();
+      }
+    },
+  );
+
+  it("moves focus from a disappearing narrow tab to its desktop region", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+    emitWidth(959);
+    await user.click(screen.getByRole("tab", { name: "Pipeline" }));
+
+    emitWidth(1000);
+
+    expect(screen.queryByRole("tab", { hidden: true })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("region", { name: "Pipeline artifact" }),
+    ).toHaveFocus();
+  });
+
+  it("keeps the narrow collapsed affordance inside the content slot after the tablist", async () => {
+    const user = userEvent.setup();
+    renderWorkspace({
+      collapsedStatus: { text: "Authoring paused", tone: "busy" },
+    });
+    const root = emitWidth(320);
+    await user.click(
+      screen.getByRole("button", { name: "Collapse authoring pane" }),
+    );
+
+    const tablist = screen.getByRole("tablist", { name: "Workspace view" });
+    const restore = screen.getByRole("button", {
+      name: "Restore authoring pane",
+    });
+    const authoringSlot = root.querySelector(
+      '[data-workspace-part="authoring"]',
+    );
+    expect(authoringSlot).not.toBeNull();
+    expect(authoringSlot).toContainElement(restore);
+    expect(tablist).not.toContainElement(restore);
+    expect(
+      tablist.compareDocumentPosition(authoringSlot as Node) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
   });
 
   it("publishes the authoritative session reset through one workspace controller", () => {

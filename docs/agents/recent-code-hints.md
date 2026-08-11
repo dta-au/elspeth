@@ -151,6 +151,14 @@ new TRANSFORM the full list (all hit while landing
 Sources have the same shape (see 0ec120e2d for the blob_rows list: source
 count/names, registry, catalog, golden, contracts whitelist).
 
+### 7. CSS barrel structural gates (2026-08-11)
+
+Every custom property referenced with `var()` must also be defined in a
+stylesheet; an inline React style does not satisfy the whole-tree token gate.
+Do not add a standalone `@media (forced-colors: active)` block before the
+canonical final block in `styles/themes.css`: the whole-barrel contrast gate
+treats the first block as canonical and will inspect only that partial corpus.
+
 ## Recent conventions (prune when archived)
 
 - **2026-08-10 — a `DateTime(timezone=True)` column does NOT round-trip aware on

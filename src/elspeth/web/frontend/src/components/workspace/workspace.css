@@ -1,4 +1,6 @@
 .composer-workspace {
+  --authoring-pane-width: 360px;
+
   position: relative;
   display: grid;
   grid-template-rows: minmax(420px, 1fr);
@@ -6,7 +8,7 @@
   width: 100%;
   height: 100%;
   min-width: 0;
-  min-height: 0;
+  min-height: 420px;
   overflow: hidden;
 }
 
@@ -147,8 +149,45 @@
   pointer-events: auto;
 }
 
+.composer-workspace[data-layout-mode="narrow"] {
+  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+}
+
+.composer-workspace[data-layout-mode="narrow"] .workspace-view-tabs {
+  display: flex;
+  grid-row: 1;
+  grid-column: 1;
+  gap: 0.25rem;
+}
+
+.composer-workspace[data-layout-mode="narrow"]
+  .workspace-view-tabs
+  > [role="tab"] {
+  min-width: var(--size-control);
+  min-height: var(--size-control);
+}
+
+.composer-workspace[data-layout-mode="narrow"] .workspace-authoring-slot,
+.composer-workspace[data-layout-mode="narrow"] .workspace-artifact-slot {
+  grid-row: 2;
+  grid-column: 1;
+}
+
+.composer-workspace[data-layout-mode="narrow"] .workspace-separator-slot {
+  display: none;
+}
+
+.composer-workspace[data-layout-mode="narrow"]
+  .workspace-collapsed-affordance {
+  position: static;
+  max-width: 100%;
+  margin: 0.5rem;
+}
+
 /* Component display rules outrank the user-agent [hidden] rule. Keep this
-   scoped override after every base display declaration so collapsed/inactive
+   scoped override after every display declaration so collapsed/inactive
    workspace surfaces retain their React state without participating in layout. */
 .composer-workspace .workspace-view-tabs[hidden],
 .composer-workspace .workspace-authoring-slot[hidden],
@@ -159,53 +198,9 @@
   display: none;
 }
 
-@media (width < 960px) {
-  .composer-workspace,
-  .composer-workspace[data-authoring-collapsed="true"] {
-    grid-template-rows: auto minmax(0, 1fr);
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .workspace-view-tabs {
-    display: flex;
-    grid-row: 1;
-    grid-column: 1;
-    gap: 0.25rem;
-  }
-
-  .workspace-view-tabs > [role="tab"] {
-    min-width: var(--size-control);
-    min-height: var(--size-control);
-  }
-
-  .workspace-authoring-slot,
-  .workspace-artifact-slot {
-    grid-row: 2;
-    grid-column: 1;
-  }
-
-  .workspace-separator-slot {
-    display: none;
-  }
-}
-
 @media (prefers-reduced-motion: reduce) {
   .composer-workspace,
   .workspace-collapsed-affordance {
     scroll-behavior: auto;
-  }
-}
-
-@media (forced-colors: active) {
-  .workspace-separator::before {
-    background: CanvasText;
-  }
-
-  .workspace-separator:focus-visible {
-    outline-color: Highlight;
-  }
-
-  .workspace-collapsed-affordance {
-    border-color: CanvasText;
   }
 }

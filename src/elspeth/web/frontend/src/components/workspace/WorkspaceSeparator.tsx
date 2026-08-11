@@ -1,6 +1,7 @@
 import {
   type KeyboardEvent,
   type PointerEvent,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -77,13 +78,61 @@ export function WorkspaceSeparator({
     currentWidthRef.current = clamp(value, min, max);
   }, [disabled, max, min, value]);
 
-  useEffect(
-    () => () => {
+  const settlePointerResize = useCallback(
+    (pointerId: number, releaseTarget: HTMLDivElement | null): void => {
+      const resize = pointerResizeRef.current;
+      if (resize === null || resize.pointerId !== pointerId) return;
+
+      const contract = contractRef.current;
+      const finalWidth = clamp(
+        resize.queuedWidth ?? resize.latestWidth,
+        contract.min,
+        contract.max,
+      );
       if (animationFrameRef.current !== null) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
       }
+      currentWidthRef.current = finalWidth;
+      pointerResizeRef.current = null;
+
+      if (releaseTarget !== null) {
+        let captured = false;
+        try {
+          captured = releaseTarget.hasPointerCapture(pointerId);
+        } catch {
+          // Capture may already have been released by the browser.
+        }
+        if (captured) {
+          try {
+            releaseTarget.releasePointerCapture(pointerId);
+          } catch {
+            // A racing lostpointercapture event owns the release now.
+          }
+        }
+      }
+
+      if (resize.publishedWidth !== finalWidth) {
+        contract.onResize(finalWidth);
+      }
+      contract.onResizeEnd(finalWidth);
     },
     [],
+  );
+
+  useEffect(
+    () => () => {
+      const resize = pointerResizeRef.current;
+      if (resize !== null) {
+        // Lifecycle choice: an unmounted separator settles its last valid
+        // width exactly once; no detached pointer session or RAF survives.
+        settlePointerResize(resize.pointerId, null);
+      } else if (animationFrameRef.current !== null) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+    },
+    [settlePointerResize],
   );
 
   const publishKeyboardWidth = (nextWidth: number): void => {
@@ -148,9 +197,15 @@ export function WorkspaceSeparator({
   };
 
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>): void => {
-    if (disabled) return;
+    if (
+      disabled ||
+      event.button !== 0 ||
+      !event.isPrimary ||
+      pointerResizeRef.current !== null
+    ) {
+      return;
+    }
     event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
     const startWidth = clamp(currentWidthRef.current, min, max);
     pointerResizeRef.current = {
       pointerId: event.pointerId,
@@ -160,6 +215,11 @@ export function WorkspaceSeparator({
       publishedWidth: startWidth,
       queuedWidth: null,
     };
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // The drag remains valid while events continue to target the separator.
+    }
   };
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>): void => {
@@ -181,32 +241,13 @@ export function WorkspaceSeparator({
   const finishPointerResize = (
     event: PointerEvent<HTMLDivElement>,
   ): void => {
-    const resize = pointerResizeRef.current;
-    if (resize === null || resize.pointerId !== event.pointerId) {
-      return;
-    }
+    settlePointerResize(event.pointerId, event.currentTarget);
+  };
 
-    const contract = contractRef.current;
-    const finalWidth = clamp(
-      resize.queuedWidth ?? resize.latestWidth,
-      contract.min,
-      contract.max,
-    );
-    resize.latestWidth = finalWidth;
-    resize.queuedWidth = null;
-    if (animationFrameRef.current !== null) {
-      cancelAnimationFrame(animationFrameRef.current);
-      animationFrameRef.current = null;
-    }
-    currentWidthRef.current = finalWidth;
-    pointerResizeRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-    if (resize.publishedWidth !== finalWidth) {
-      contract.onResize(finalWidth);
-    }
-    contract.onResizeEnd(finalWidth);
+  const handleLostPointerCapture = (
+    event: PointerEvent<HTMLDivElement>,
+  ): void => {
+    settlePointerResize(event.pointerId, null);
   };
 
   return (
@@ -225,6 +266,7 @@ export function WorkspaceSeparator({
       onPointerMove={handlePointerMove}
       onPointerUp={finishPointerResize}
       onPointerCancel={finishPointerResize}
+      onLostPointerCapture={handleLostPointerCapture}
     />
   );
 }

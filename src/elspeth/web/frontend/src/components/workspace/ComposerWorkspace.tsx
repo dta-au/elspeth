@@ -65,6 +65,8 @@ export function ComposerWorkspace({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
+  const authoringPaneRef = useRef<HTMLElement | null>(null);
+  const artifactPaneRef = useRef<HTMLElement | null>(null);
   const paneState = useWorkspacePaneState({
     workspaceWidth,
     sessionId: activeSessionId,
@@ -88,6 +90,22 @@ export function ComposerWorkspace({
     observer.observe(root);
     return () => observer.disconnect();
   }, []);
+
+  useLayoutEffect(() => {
+    if (narrow) return;
+    const activeElement = document.activeElement;
+    if (
+      activeElement !== composeTabRef.current &&
+      activeElement !== pipelineTabRef.current
+    ) {
+      return;
+    }
+    const target =
+      narrowView === "compose" && !paneState.authoringCollapsed
+        ? authoringPaneRef
+        : artifactPaneRef;
+    target.current?.focus({ preventScroll: true });
+  }, [narrow, narrowView, paneState.authoringCollapsed]);
 
   const selectNarrowView = (view: NarrowView, moveFocus: boolean): void => {
     setNarrowView(view);
@@ -136,18 +154,18 @@ export function ComposerWorkspace({
         <div
           className="workspace-view-tabs"
           data-workspace-part="view-tabs"
-          role="tablist"
-          aria-label="Workspace view"
+          role={narrow ? "tablist" : undefined}
+          aria-label={narrow ? "Workspace view" : undefined}
           hidden={!narrow}
         >
           <button
             ref={composeTabRef}
             type="button"
-            role="tab"
-            id="workspace-compose-tab"
-            aria-controls="workspace-authoring-panel"
-            aria-selected={narrowView === "compose"}
-            tabIndex={narrowView === "compose" ? 0 : -1}
+            role={narrow ? "tab" : undefined}
+            id={narrow ? "workspace-compose-tab" : undefined}
+            aria-controls={narrow ? "workspace-authoring-panel" : undefined}
+            aria-selected={narrow ? narrowView === "compose" : undefined}
+            tabIndex={narrow && narrowView === "compose" ? 0 : -1}
             onClick={() => selectNarrowView("compose", true)}
             onKeyDown={handleViewTabKeyDown}
           >
@@ -156,11 +174,11 @@ export function ComposerWorkspace({
           <button
             ref={pipelineTabRef}
             type="button"
-            role="tab"
-            id="workspace-pipeline-tab"
-            aria-controls="workspace-artifact-panel"
-            aria-selected={narrowView === "pipeline"}
-            tabIndex={narrowView === "pipeline" ? 0 : -1}
+            role={narrow ? "tab" : undefined}
+            id={narrow ? "workspace-pipeline-tab" : undefined}
+            aria-controls={narrow ? "workspace-artifact-panel" : undefined}
+            aria-selected={narrow ? narrowView === "pipeline" : undefined}
+            tabIndex={narrow && narrowView === "pipeline" ? 0 : -1}
             onClick={() => selectNarrowView("pipeline", true)}
             onKeyDown={handleViewTabKeyDown}
           >
@@ -174,18 +192,20 @@ export function ComposerWorkspace({
           hidden={authoringViewHidden}
         >
           <section
+            ref={authoringPaneRef}
             className="workspace-authoring-pane"
             role="region"
             aria-label="Authoring pane"
             aria-hidden={authoringHidden || undefined}
             {...(authoringHidden ? { inert: "" } : {})}
             hidden={authoringHidden}
+            tabIndex={-1}
           >
             <div
-              id="workspace-authoring-panel"
+              id={narrow ? "workspace-authoring-panel" : undefined}
               className="workspace-authoring-body"
-              role="tabpanel"
-              aria-labelledby="workspace-compose-tab"
+              role={narrow ? "tabpanel" : undefined}
+              aria-labelledby={narrow ? "workspace-compose-tab" : undefined}
             >
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
@@ -244,18 +264,20 @@ export function ComposerWorkspace({
           hidden={artifactViewHidden}
         >
           <section
+            ref={artifactPaneRef}
             className="workspace-artifact-pane"
             role="region"
             aria-label="Pipeline artifact"
             aria-hidden={artifactViewHidden || undefined}
             {...(artifactViewHidden ? { inert: "" } : {})}
             hidden={artifactViewHidden}
+            tabIndex={-1}
           >
             <div
-              id="workspace-artifact-panel"
+              id={narrow ? "workspace-artifact-panel" : undefined}
               className="workspace-artifact-body"
-              role="tabpanel"
-              aria-labelledby="workspace-pipeline-tab"
+              role={narrow ? "tabpanel" : undefined}
+              aria-labelledby={narrow ? "workspace-pipeline-tab" : undefined}
             >
               {artifact}
             </div>
