@@ -121,7 +121,7 @@ class BlobRowsSource(BaseSource):
     name = "blob_rows"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:99a725d9950619d0"
+    source_file_hash: str | None = "sha256:083891225d454848"
     config_model = BlobRowsSourceConfig
     # DESIGN DEVIATION (recorded for adjudication): the approved design lists
     # ``creates_tokens = True``, but that attribute exists only on the
@@ -200,6 +200,7 @@ class BlobRowsSource(BaseSource):
         self._payload_store: PayloadStore | None = None
 
     def on_start(self, ctx: LifecycleContext) -> None:
+        super().on_start(ctx)
         self._payload_store = ctx.payload_store
 
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
