@@ -80,6 +80,25 @@ assessment that names its parent, changed cells, changed gates, and freshly
 executed evidence. Task 12 creates a new full assessment at the frozen final
 commit; it never edits the Task 3 package or any intermediate delta.
 
+### Retained pytest evidence rule
+
+The file-level and `-k` commands in task RED/GREEN steps are development
+selectors, not promotable evidence records. Before promoting a cell, replace
+them with an explicit, reviewed list of full pytest node IDs containing `::`
+and execute exactly those nodes. Each profile-bound pytest process must retain:
+
+- the exact node list (`.nodes`) and exact argv/environment recorded in the manifest;
+- one JUnit XML written with `--junitxml`;
+- one runtime profile report written by `scripts.state_engine_profile_reporter`;
+- captured stdout and stderr with secrets and connection URLs excluded;
+- one genuinely exercised profile only, observed through `observe_sqlite` or
+  `observe_postgresql` on the live connection used by the test.
+
+The JUnit, profile report, and node list must contain the same exact node IDs.
+Skipped, deselected, uncollected, xfailed, xpassed, warning-bearing, or
+profile-mismatched runs are retained as non-pass evidence. Run both
+`validate-package` and `collect-evidence` before any delta is published.
+
 ---
 
 ### Task 1: Reconcile and pin supported state-engine profiles
@@ -948,25 +967,36 @@ git commit -m "test(state-engine): complete durable barrier recovery"
 - Modify: `tests/integration/pipeline/test_sink_effect_recovery.py`
 - Modify: `tests/integration/pipeline/test_sink_effect_lease_wait_recovery.py`
 - Modify: `tests/integration/pipeline/test_builtin_sink_effect_recovery.py`
+- Modify: `tests/integration/pipeline/test_audit_export_effect_recovery.py`
+- Create: `tests/integration/pipeline/test_sink_effect_recovery_aws_live.py`
+- Modify: `tests/unit/core/landscape/test_scheduler_events.py`
+- Modify: `tests/unit/plugins/sinks/test_json_sink.py`
+- Modify: `tests/e2e/recovery/test_suspended_winner_fences.py`
 - Modify: `tests/testcontainer/core/test_sink_effect_lock_order_postgres.py`
 - Create: `tests/e2e/recovery/test_sink_effect_process_death_matrix.py`
 - Modify as defects require: `src/elspeth/core/landscape/execution/sink_effect_reservation.py`
 - Modify as defects require: `src/elspeth/core/landscape/execution/sink_effect_lifecycle.py`
 - Modify as defects require: `src/elspeth/core/landscape/execution/sink_effect_finalization.py`
 - Modify as defects require: `src/elspeth/engine/executors/sink_effects.py`
+- Modify as defects require: `src/elspeth/plugins/sinks/aws_s3_sink.py`
+- Modify as defects require: `src/elspeth/plugins/sinks/json_sink.py`
+- Modify as contract changes require: `docs/architecture/state_engine/architecture.md`
 
 **Step 1: Materialize every PB-06 and PB-07 case**
 
-Use the named cases already present in v1, plus backend/profile cases introduced in v2. No broad “sink recovery passed” selector may stand in for omitted cases.
+Use the named cases already present in v1, plus backend/profile cases introduced in v2. Include `reserve-audit-export-snapshot`, the TS-11–14/F-08 scheduler-event arms, and both sink-specific stale-winner fences. No broad “sink recovery passed” selector may stand in for omitted cases.
 
 **Step 2: Add abrupt-process seams**
 
-Kill and resume before/after reservation, preparation claim, inspection, plan CAS, publication, response, finalization, and scheduler callback. Assert one effect ID, generation discipline, one external publication, exact attempt evidence, one artifact, terminal outcomes, and TS-14 repair without republishing.
+Kill and resume before/after reservation, preparation claim, inspection, plan CAS, publication, response, finalization, and scheduler callback. Assert one effect ID, generation discipline, one effective external publication, exact attempt evidence, one artifact, terminal outcomes, and TS-14 repair without republishing.
+
+Capture both the complete Landscape image and the external target image at every seam. A deterministic effect ID identifies one logical effect; it does not by itself prove one physical provider request. Prove one effective target state/version/ledger winner with the adapter's conditional-write or reconciliation contract, while accounting for failed or response-lost attempts. When the target cannot establish the exact result, the correct verdict is `UNKNOWN` and publication remains blocked.
 
 **Step 3: Exercise both stores**
 
 - SQLite: production pipeline with local deterministic sinks and OS-process death.
-- PostgreSQL 16: lock order, concurrent reservation/finalization/takeover, returned-result finalization, and ADR-038 token/outcome races.
+- Local PostgreSQL 16 testcontainer: lock order, concurrent reservation/finalization/takeover, returned-result finalization, and ADR-038 token/outcome races. This proves backend transaction semantics, not the AWS deployment boundary by itself.
+- Maintained AWS profile: an AWS-backed production sink-effect coordinator matrix against a real PostgreSQL 16 Landscape connection and a real supported external sink (initially conditional S3), under the single-leader topology. Execute every applicable PB-06 named case and PB-07 process-loss seam, plus their TS-11–14/F-08 scheduler outcomes. Missing credentials or an unavailable environment leaves the profile cells `unknown`; it is never relabelled from the local testcontainer run.
 
 **Step 4: Run RED**
 
@@ -975,14 +1005,43 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/integration/pipeline/test_sink_effect_recovery.py \
   tests/integration/pipeline/test_sink_effect_lease_wait_recovery.py \
   tests/integration/pipeline/test_builtin_sink_effect_recovery.py \
+  tests/integration/pipeline/test_audit_export_effect_recovery.py \
   tests/e2e/recovery/test_sink_effect_process_death_matrix.py
 PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
   tests/testcontainer/core/test_sink_effect_lock_order_postgres.py
 ```
 
+After those cohorts stabilize, discover three genuinely distinct SQLite deployment selections and the live AWS PostgreSQL/S3 coordinator matrix in separate pytest processes. Materialize each selection as exact node IDs and capture it under the retained pytest evidence rule above; the file/`-k` commands below are selection sketches only. The live AWS tests must be marked `live_aws`, must call `observe_postgresql` on the real Landscape connection, and must fail the evidence gate when skipped or uncollected:
+
+```bash
+for deployment in \
+  single_process_leader \
+  same_host_leader_plus_claim_only_followers \
+  web_hosted_leader_plus_same_host_cli_followers
+do
+  PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
+    -p scripts.state_engine_profile_reporter \
+    --state-engine-profile-report="<assessment>/evidence/task9-${deployment}.profile.json" \
+    tests/e2e/recovery/test_sink_effect_process_death_matrix.py \
+    -k "$deployment"
+done
+
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
+  -m "integration and live_aws" \
+  -p scripts.state_engine_profile_reporter \
+  --state-engine-profile-report=<assessment>/evidence/task9-aws-postgresql.profile.json \
+  tests/integration/pipeline/test_sink_effect_recovery_aws_live.py
+```
+
 **Step 5: Fix defects at the effect boundary**
 
 Preserve the closed reconciliation vocabulary. `UNKNOWN` must stop publication; `APPLIED_WITH_EXACT_DESCRIPTOR` must finalize without another commit; `NOT_APPLIED` may commit once. Every takeover/finalization write remains generation fenced.
+
+Resolve Task 9's half of `elspeth-800d00c03e` without inventing an unfenced operation lease: for an effect-linked operation, `open` means the logical operation is unfinished and may be actively executing or interrupted; the associated sink effect's lease and generation are the only current-custody authority. Recovery reuses the same open operation/effect and records interruption/resumption in effect attempts and generations. Atomic effect finalization writes `completed`. Do not repurpose the existing completion-shaped `pending` operation status or reopen terminal rows. Add RED cases for abrupt death with an open operation, generation-fenced recovery to completion, and absence of any second operation/effect. Document why this operation lifecycle is distinct from ADR-019's retained token-outcome axes.
+
+Task 10 owns the other half: only fenced non-resumable run finalization may move an existing effect-linked operation from `open` to `failed`, atomically with the run stamp and ABANDONED outcomes; resume is prohibited afterward. Ordinary pre-reservation sink, source, and runtime operation failures keep their existing writers. Keep the Task 9 owner open until that Task 10 evidence is linked rather than duplicating run-finalization ownership here.
+
+Resolve `elspeth-e08643b495` by validating JSON encoding before accepting the member and diverting unrepresentable rows with the same attributed category as sibling file sinks. Refresh `JSONSink.source_file_hash` mechanically **after** formatting, using `scripts/cicd/plugin_hash.py`, and run the exact plugin-hash/family gate. Do not close Task 9 while either demonstrated lifecycle defect remains unresolved.
 
 **Step 6: Run GREEN and commit**
 
@@ -991,9 +1050,17 @@ git add src/elspeth/core/landscape/execution/sink_effect_reservation.py \
   src/elspeth/core/landscape/execution/sink_effect_lifecycle.py \
   src/elspeth/core/landscape/execution/sink_effect_finalization.py \
   src/elspeth/engine/executors/sink_effects.py \
+  src/elspeth/plugins/sinks/aws_s3_sink.py \
+  src/elspeth/plugins/sinks/json_sink.py \
+  docs/architecture/state_engine/architecture.md \
   tests/integration/pipeline/test_sink_effect_recovery.py \
   tests/integration/pipeline/test_sink_effect_lease_wait_recovery.py \
   tests/integration/pipeline/test_builtin_sink_effect_recovery.py \
+  tests/integration/pipeline/test_audit_export_effect_recovery.py \
+  tests/integration/pipeline/test_sink_effect_recovery_aws_live.py \
+  tests/unit/core/landscape/test_scheduler_events.py \
+  tests/unit/plugins/sinks/test_json_sink.py \
+  tests/e2e/recovery/test_suspended_winner_fences.py \
   tests/e2e/recovery/test_sink_effect_process_death_matrix.py \
   tests/testcontainer/core/test_sink_effect_lock_order_postgres.py \
   docs/architecture/state_engine/assessments
@@ -1002,9 +1069,12 @@ git commit -m "test(state-engine): complete sink-effect recovery proofs"
 
 **Definition of Done:**
 
-- [ ] Every PB-06/PB-07 named case is resolved for applicable stores.
-- [ ] External visibility never exceeds one effective publication.
+- [ ] TS-11–14, PB-06/PB-07, and F-08 named cases are resolved for every required profile.
+- [ ] External visibility never exceeds one effective target state/version/ledger winner; request-attempt counts are reported separately.
 - [ ] Finalization and scheduler callback loss converge without republishing.
+- [ ] Recoverable interruption keeps the same unfinished effect-linked `open` operation/effect and custody comes only from the effect lease/generation.
+- [ ] Task 10's fenced non-resumable finalization evidence is linked before the Task 9 owner closes.
+- [ ] Local PostgreSQL 16 semantics and the live AWS PostgreSQL/S3 production boundary are separately attributable.
 - [ ] Legacy `write`/`flush` remains unreachable as a production publication path.
 
 ---
@@ -1035,6 +1105,8 @@ Prove:
 - concurrent decided-outcome versus abandonment is serialized on PostgreSQL;
 - decided-plus-abandoned images fail closed in accounting and resume;
 - ABANDONED never reaches processing counters.
+- fenced non-resumable finalization atomically moves every existing effect-linked `open` operation to `failed` with the run stamp and ABANDONED outcomes, while resumable runs leave those operations open and terminal effect operations remain unchanged;
+- resume refuses the non-resumable failed-operation image and no path reopens a terminal operation.
 
 **Step 2: Exercise real follower traversal**
 
@@ -1078,6 +1150,7 @@ git commit -m "test(state-engine): complete lifecycle and abandonment proofs"
 
 - [ ] TS-19, RM-14, F-14, PB-08, and lifecycle parts of PB-09 pass.
 - [ ] PostgreSQL outcome/abandonment locking has executable race evidence.
+- [ ] Effect-linked operation failure is atomic with fenced non-resumable finalization; resumable interruption remains open for the same effect.
 - [ ] Follower proof crosses production assembly and plugin traversal.
 - [ ] Every lifecycle mode terminates with an honest durable image.
 
