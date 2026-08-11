@@ -218,7 +218,9 @@ export function WorkspaceSeparator({
     try {
       event.currentTarget.setPointerCapture(event.pointerId);
     } catch {
-      // The drag remains valid while events continue to target the separator.
+      // Without capture, a pointer leaving this element has no guaranteed
+      // terminal event. Abort now so the failed attempt cannot wedge resizing.
+      pointerResizeRef.current = null;
     }
   };
 

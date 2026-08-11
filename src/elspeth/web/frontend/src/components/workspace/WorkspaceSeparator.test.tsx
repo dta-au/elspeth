@@ -574,9 +574,7 @@ describe("WorkspaceSeparator", () => {
   it("settles a drag when pointer-capture APIs throw", () => {
     installRafHarness();
     const { separator, onResize, onResizeEnd } = renderSeparator();
-    separator.setPointerCapture = vi.fn(() => {
-      throw new DOMException("capture unavailable", "InvalidStateError");
-    });
+    separator.setPointerCapture = vi.fn();
     separator.hasPointerCapture = vi.fn(() => {
       throw new DOMException("capture unavailable", "InvalidStateError");
     });
@@ -598,6 +596,45 @@ describe("WorkspaceSeparator", () => {
     expect(onResize).toHaveBeenCalledExactlyOnceWith(460);
     expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(460);
     expect(separator.releasePointerCapture).not.toHaveBeenCalled();
+  });
+
+  it("aborts a failed capture so a later pointer can resize normally", () => {
+    const raf = installRafHarness();
+    const { separator, onResize, onResizeEnd } = renderSeparator();
+    let captureFails = true;
+    const setPointerCapture = vi.fn(() => {
+      if (captureFails) {
+        throw new DOMException("capture unavailable", "InvalidStateError");
+      }
+    });
+    separator.setPointerCapture = setPointerCapture;
+    separator.hasPointerCapture = vi.fn(() => true);
+    separator.releasePointerCapture = vi.fn();
+
+    fireEvent.pointerDown(separator, {
+      pointerId: 20,
+      clientX: 100,
+      button: 0,
+      isPrimary: true,
+    });
+    expect(raf.queuedCount()).toBe(0);
+    expect(onResize).not.toHaveBeenCalled();
+    expect(onResizeEnd).not.toHaveBeenCalled();
+
+    captureFails = false;
+    fireEvent.pointerDown(separator, {
+      pointerId: 25,
+      clientX: 100,
+      button: 0,
+      isPrimary: true,
+    });
+    fireEvent.pointerMove(separator, { pointerId: 25, clientX: 140 });
+    fireEvent.pointerUp(separator, { pointerId: 25, clientX: 140 });
+
+    expect(setPointerCapture.mock.calls).toEqual([[20], [25]]);
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(460);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(460);
+    expect(raf.queuedCount()).toBe(0);
   });
 
   it("settles a drag when releasing pointer capture throws", () => {

@@ -18,6 +18,7 @@ import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 const EMPTY_ARTIFACT_TABS: readonly ArtifactTab[] = ["graph", "run"];
 
 type NarrowView = "compose" | "pipeline";
+type FocusIntent = "collapse" | "restore" | null;
 
 export interface ComposerWorkspaceProps {
   authoring: ReactNode;
@@ -65,8 +66,14 @@ export function ComposerWorkspace({
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
+  const authoringSlotRef = useRef<HTMLDivElement | null>(null);
+  const separatorSlotRef = useRef<HTMLDivElement | null>(null);
+  const artifactSlotRef = useRef<HTMLDivElement | null>(null);
   const authoringPaneRef = useRef<HTMLElement | null>(null);
   const artifactPaneRef = useRef<HTMLElement | null>(null);
+  const collapseControlRef = useRef<HTMLButtonElement | null>(null);
+  const restoreControlRef = useRef<HTMLButtonElement | null>(null);
+  const focusIntentRef = useRef<FocusIntent>(null);
   const paneState = useWorkspacePaneState({
     workspaceWidth,
     sessionId: activeSessionId,
@@ -77,6 +84,7 @@ export function ComposerWorkspace({
   const authoringViewHidden = narrow && narrowView === "pipeline";
   const artifactViewHidden = narrow && narrowView === "compose";
   const authoringHidden = paneState.authoringCollapsed || authoringViewHidden;
+  const previousNarrowRef = useRef(narrow);
 
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -92,8 +100,40 @@ export function ComposerWorkspace({
   }, []);
 
   useLayoutEffect(() => {
-    if (narrow) return;
+    const focusIntent = focusIntentRef.current;
+    const intentTarget =
+      focusIntent === "restore"
+        ? restoreControlRef.current
+        : focusIntent === "collapse"
+          ? collapseControlRef.current
+          : null;
+    if (intentTarget !== null) {
+      intentTarget.focus({ preventScroll: true });
+      focusIntentRef.current = null;
+    }
+
+    const wasNarrow = previousNarrowRef.current;
+    previousNarrowRef.current = narrow;
+    if (wasNarrow === narrow) return;
+
     const activeElement = document.activeElement;
+    if (narrow) {
+      const hiddenSlot =
+        narrowView === "compose"
+          ? artifactSlotRef.current
+          : authoringSlotRef.current;
+      if (
+        !hiddenSlot?.contains(activeElement) &&
+        !separatorSlotRef.current?.contains(activeElement)
+      ) {
+        return;
+      }
+      const target =
+        narrowView === "compose" ? composeTabRef : pipelineTabRef;
+      target.current?.focus({ preventScroll: true });
+      return;
+    }
+
     if (
       activeElement !== composeTabRef.current &&
       activeElement !== pipelineTabRef.current
@@ -106,6 +146,16 @@ export function ComposerWorkspace({
         : artifactPaneRef;
     target.current?.focus({ preventScroll: true });
   }, [narrow, narrowView, paneState.authoringCollapsed]);
+
+  const collapseAuthoring = (): void => {
+    focusIntentRef.current = "restore";
+    paneState.setAuthoringCollapsed(true);
+  };
+
+  const restoreAuthoring = (): void => {
+    focusIntentRef.current = "collapse";
+    paneState.setAuthoringCollapsed(false);
+  };
 
   const selectNarrowView = (view: NarrowView, moveFocus: boolean): void => {
     setNarrowView(view);
@@ -187,6 +237,7 @@ export function ComposerWorkspace({
         </div>
 
         <div
+          ref={authoringSlotRef}
           className="workspace-authoring-slot"
           data-workspace-part="authoring"
           hidden={authoringViewHidden}
@@ -211,10 +262,11 @@ export function ComposerWorkspace({
             </div>
             <div className="workspace-authoring-status">{authoringStatus}</div>
             <button
+              ref={collapseControlRef}
               type="button"
               className="workspace-collapse-control"
               aria-label="Collapse authoring pane"
-              onClick={() => paneState.setAuthoringCollapsed(true)}
+              onClick={collapseAuthoring}
             >
               Collapse authoring pane
             </button>
@@ -228,10 +280,11 @@ export function ComposerWorkspace({
                 {collapsedStatus.text}
               </div>
               <button
+                ref={restoreControlRef}
                 type="button"
                 aria-label="Restore authoring pane"
                 aria-describedby="workspace-collapsed-status"
-                onClick={() => paneState.setAuthoringCollapsed(false)}
+                onClick={restoreAuthoring}
               >
                 Restore authoring pane
               </button>
@@ -240,6 +293,7 @@ export function ComposerWorkspace({
         </div>
 
         <div
+          ref={separatorSlotRef}
           className="workspace-separator-slot"
           data-workspace-part="separator"
           hidden={narrow || paneState.authoringCollapsed}
@@ -259,6 +313,7 @@ export function ComposerWorkspace({
         </div>
 
         <div
+          ref={artifactSlotRef}
           className="workspace-artifact-slot"
           data-workspace-part="artifact"
           hidden={artifactViewHidden}

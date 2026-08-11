@@ -339,8 +339,15 @@ describe("ComposerWorkspace", () => {
       name: "Restore authoring pane",
     });
     expect(restore).toHaveAccessibleDescription("2 unread acknowledgements");
+    expect(restore).toHaveFocus();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
 
     await user.click(restore);
+    const collapse = screen.getByRole("button", {
+      name: "Collapse authoring pane",
+    });
+    expect(collapse).toHaveFocus();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
     expect(
       screen.getByRole("region", { name: "Authoring pane" }),
     ).not.toHaveAttribute("inert");
@@ -459,6 +466,73 @@ describe("ComposerWorkspace", () => {
     expect(
       screen.getByRole("region", { name: "Pipeline artifact" }),
     ).toHaveFocus();
+  });
+
+  it("moves focus from desktop content that becomes hidden to the selected narrow tab", () => {
+    renderWorkspace();
+    emitWidth(1280);
+    const artifactControl = screen.getByRole("button", {
+      name: "Artifact control",
+    });
+    artifactControl.focus();
+    expect(artifactControl).toHaveFocus();
+
+    emitWidth(959);
+
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveFocus();
+    expect(artifactControl.closest("[hidden], [inert]")).not.toBeNull();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
+  });
+
+  it("repairs desktop authoring focus when Pipeline remains the selected narrow view", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+    emitWidth(959);
+    await user.click(screen.getByRole("tab", { name: "Pipeline" }));
+    emitWidth(1280);
+    const authorControl = screen.getByRole("button", { name: "Author control" });
+    authorControl.focus();
+
+    emitWidth(959);
+
+    expect(screen.getByRole("tab", { name: "Pipeline" })).toHaveFocus();
+    expect(authorControl.closest("[hidden], [inert]")).not.toBeNull();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
+  });
+
+  it("moves focus from the disappearing desktop separator to the selected narrow tab", () => {
+    renderWorkspace();
+    emitWidth(1280);
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    separator.focus();
+    expect(separator).toHaveFocus();
+
+    emitWidth(959);
+
+    expect(screen.getByRole("tab", { name: "Compose" })).toHaveFocus();
+    expect(separator.closest("[hidden]")).not.toBeNull();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
+  });
+
+  it("keeps a visible Restore target focused when collapsed Compose enters narrow mode", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+    emitWidth(1280);
+    await user.click(
+      screen.getByRole("button", { name: "Collapse authoring pane" }),
+    );
+    const restore = screen.getByRole("button", {
+      name: "Restore authoring pane",
+    });
+    restore.focus();
+
+    emitWidth(959);
+
+    expect(screen.getByRole("tab", { name: "Compose" })).toBeVisible();
+    expect(restore).toHaveFocus();
+    expect(document.activeElement?.closest("[hidden], [inert]")).toBeNull();
   });
 
   it("keeps the narrow collapsed affordance inside the content slot after the tablist", async () => {
