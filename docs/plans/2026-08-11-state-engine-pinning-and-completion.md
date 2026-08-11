@@ -823,14 +823,18 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/unit/core/landscape/test_state_engine_forbidden_paths.py
 ```
 
-Run PostgreSQL 16 separately with a live reporter probe:
+Run PostgreSQL 16 separately as reporter-free backend-support qualification:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
-  -p scripts.state_engine_profile_reporter \
-  --state-engine-profile-report=<assessment>/evidence/task7-postgresql.profile.json \
   tests/testcontainer/core/test_state_engine_read_model_truth_tables_postgres.py
 ```
+
+`observe_postgresql` denotes the actual maintained AWS composition, so a local
+testcontainer must not call it or emit an AWS profile report. Retain this result
+as backend-support evidence only. The AWS PostgreSQL 16 read-model cells remain
+`unknown` until the real protected AWS lane exercises the production
+composition.
 
 Repository-only selectors and mocked consumer decisions remain separately attributable; neither is evidence of their production composition by itself. Likewise, one generic SQLite repository run must not be relabelled as all three SQLite deployment profiles.
 
@@ -917,14 +921,18 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/e2e/recovery/test_barrier_process_death_matrix.py
 ```
 
-Run PostgreSQL 16 separately with a live profile reporter; these assertions cover the AWS single-leader backend semantics and do not claim multi-replica scheduling:
+Run PostgreSQL 16 separately as reporter-free backend-support qualification;
+these assertions cover local PostgreSQL transaction semantics only and do not
+claim the AWS deployment composition or multi-replica scheduling:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
-  -p scripts.state_engine_profile_reporter \
-  --state-engine-profile-report=<assessment>/evidence/task8-postgresql.profile.json \
   tests/testcontainer/core/test_barrier_recovery_postgres.py
 ```
+
+Do not call `observe_postgresql` for this local testcontainer run. The AWS
+PostgreSQL 16 barrier cells remain `unknown` until the protected live lane
+executes the real maintained AWS composition.
 
 Define one genuinely exercised process-matrix selector for each SQLite deployment profile and retain them in separate reporter sessions:
 
