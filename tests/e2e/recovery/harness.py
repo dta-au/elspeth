@@ -10,9 +10,8 @@ changes in the move; ``test_concurrent_resume.py`` imports everything back.
 Construction note (kept honest, same technique as
 test_eof_resume_proof.py): the crashed-mid-claim state cannot be reached
 by a graceful shutdown — the engine always finishes the in-flight row before
-honoring the shutdown event — and a real SIGKILL is not deterministic inside
-a unit process. So each test first runs the REAL pipeline (real Orchestrator,
-real checkpoint writer, real scheduler journal) to an interrupted-but-
+honoring the shutdown event. So each test first runs the REAL pipeline (real
+Orchestrator, real checkpoint writer, real scheduler journal) to an interrupted-but-
 checkpointed state, then crafts the kill instant through the production
 Tier-1 writers themselves: ``RecorderFactory.data_flow.create_row`` /
 ``create_token`` for the row the dead worker was carrying, and
@@ -24,15 +23,14 @@ and ``runs.status=FAILED``). The resume side is then driven exclusively
 through the public production path with an injected deterministic MockClock
 (no sleeps, no monkeypatching of code under test).
 
-The HARNESS, by necessity, enters resume through today's checkpoint-layer
-surface: ``RecoveryManager.get_resume_point`` and the Orchestrator's
+The deterministic repository fixtures enter resume through today's
+checkpoint-layer surface: ``RecoveryManager.get_resume_point`` and the Orchestrator's
 ``checkpoint_manager``/``checkpoint_config`` kwargs. That dependency is
-confined to exactly three seams — :func:`_run_to_interrupted_checkpoint`
-(run setup), :class:`_CrashedRun` (``resume_orchestrator``), and
-:func:`_recovery_manager` / :func:`_resume_point` (resume entry, shared by
-every test). When the checkpoint constructors/signatures change or
-disappear, the edits land in those seams only; the assertions in the test
-files survive unchanged.
+confined to the construction/entry seams: :func:`_run_to_interrupted_checkpoint`,
+:class:`_CrashedRun` (``resume_orchestrator``), :func:`_recovery_manager` /
+:func:`_resume_point`, and :func:`_resume` (the fresh-database public-resume
+path). When the checkpoint constructors/signatures change or disappear, the
+edits land in those seams only; the assertions in the test files survive.
 
 EPOCH-21 SEAT ASSUMPTION (slice 2, ADR-030 — pinned here per the test
 campaign spec): ``begin_run`` now mints the ``run_coordination`` leader seat
@@ -47,12 +45,22 @@ assumption is safe in both worlds.
 
 from __future__ import annotations
 
+import inspect
+import multiprocessing
+import os
+import signal
 import threading
-from collections.abc import Iterator
+import traceback
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
+from multiprocessing.connection import Connection
+from multiprocessing.connection import wait as wait_for_connection
+from multiprocessing.process import BaseProcess
 from pathlib import Path
-from typing import Any, ClassVar
+from types import FunctionType
+from typing import Any, ClassVar, NewType, Self
 
 import pytest
 from sqlalchemy import func, insert, select, update
@@ -102,6 +110,247 @@ _T0 = 1_750_000_000.0
 _DEFAULT_LEASE_SECONDS = 300
 
 _SOURCE_ROWS = [{"id": i, "value": i * 10} for i in range(3)]
+
+_PROCESS_CLEANUP_JOIN_SECONDS = 2.0
+_PROCESS_SEAM_MAX_BLOCK_SECONDS = 120.0
+
+ProcessSeam = NewType("ProcessSeam", str)
+
+
+@dataclass(frozen=True)
+class ProcessSeamReady:
+    """Child-owned database connection has reached the named crash seam."""
+
+    pid: int
+    seam: str
+    database_dialect: str
+
+
+@dataclass(frozen=True)
+class ProcessSeamFailure:
+    """Bounded child failure reported before readiness."""
+
+    exception_type: str
+    message: str
+    traceback_text: str
+
+
+@dataclass(frozen=True)
+class ProcessExitStatus:
+    """Observed terminal status for a spawned state-engine child."""
+
+    exitcode: int
+    was_killed: bool
+
+
+def _database_process_target(
+    database_url: str,
+    seam: ProcessSeam,
+    action: Callable[..., None],
+    action_args: tuple[object, ...],
+    ready_writer: Connection,
+    release_reader: Connection,
+) -> None:
+    """Spawn target: open a fresh DB, cross one action, then block at a seam."""
+    database: LandscapeDB | None = None
+    try:
+        database = LandscapeDB.from_url(database_url, create_tables=False)
+        action(database, *action_args)
+        ready_writer.send(
+            ProcessSeamReady(
+                pid=os.getpid(),
+                seam=str(seam),
+                database_dialect=database.engine.dialect.name,
+            )
+        )
+        if not release_reader.poll(_PROCESS_SEAM_MAX_BLOCK_SECONDS):
+            raise TimeoutError(f"child remained blocked at process seam {seam!s} beyond its harness bound")
+        release_reader.recv_bytes()
+    except BaseException as exc:
+        with suppress(BrokenPipeError, EOFError, OSError):
+            ready_writer.send(
+                ProcessSeamFailure(
+                    exception_type=type(exc).__name__,
+                    message=str(exc),
+                    traceback_text=traceback.format_exc(),
+                )
+            )
+        raise
+    finally:
+        if database is not None:
+            database.close()
+        ready_writer.close()
+        release_reader.close()
+
+
+class SpawnedProcessAtSeam:
+    """Bounded readiness, SIGKILL, exit, and cleanup oracle for one child."""
+
+    def __init__(
+        self,
+        *,
+        process: BaseProcess,
+        ready_reader: Connection,
+        release_writer: Connection,
+        seam: ProcessSeam,
+    ) -> None:
+        self._process = process
+        self._ready_reader = ready_reader
+        self._release_writer = release_writer
+        self._seam = seam
+        self._ready: ProcessSeamReady | None = None
+        self._closed = False
+
+    @property
+    def pid(self) -> int:
+        pid = self._process.pid
+        if pid is None:
+            raise RuntimeError("state-engine child has not started")
+        return pid
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def is_alive(self) -> bool:
+        return False if self._closed else self._process.is_alive()
+
+    def wait_until_ready(self, *, timeout: float) -> ProcessSeamReady:
+        """Wait for the exact named seam or fail on timeout/early child exit."""
+        if timeout <= 0:
+            raise ValueError("readiness timeout must be positive")
+        if self._ready is not None:
+            return self._ready
+
+        available = wait_for_connection([self._ready_reader, self._process.sentinel], timeout=timeout)
+        if self._ready_reader in available:
+            try:
+                message = self._ready_reader.recv()
+            except EOFError as exc:
+                self.close()
+                raise AssertionError(f"child exited before reaching process seam {self._seam!s}") from exc
+            if isinstance(message, ProcessSeamFailure):
+                self.close()
+                raise AssertionError(
+                    f"child failed before process seam {self._seam!s}: "
+                    f"{message.exception_type}: {message.message}\n{message.traceback_text}"
+                )
+            if not isinstance(message, ProcessSeamReady):
+                self.close()
+                raise AssertionError(f"child sent invalid readiness message at process seam {self._seam!s}")
+            if message.seam != self._seam:
+                self.close()
+                raise AssertionError(f"child reached process seam {message.seam!r}, expected {str(self._seam)!r}")
+            self._ready = message
+            return message
+
+        if self._process.sentinel in available:
+            self._process.join(timeout=0)
+            exitcode = self._process.exitcode
+            self.close()
+            raise AssertionError(f"child exited with code {exitcode} before reaching process seam {self._seam!s}")
+
+        self.close()
+        raise AssertionError(f"child did not reach process seam {self._seam!s} within {timeout:.3f}s")
+
+    def kill(self) -> None:
+        """Abruptly terminate the child (SIGKILL on POSIX)."""
+        if self._closed:
+            raise RuntimeError("state-engine child handle is closed")
+        if self._process.is_alive():
+            self._process.kill()
+
+    def wait_for_exit(self, *, timeout: float) -> ProcessExitStatus:
+        """Observe a bounded child exit and classify a Process.kill outcome."""
+        if timeout <= 0:
+            raise ValueError("exit timeout must be positive")
+        self._process.join(timeout=timeout)
+        if self._process.is_alive():
+            self.close()
+            raise AssertionError(f"child did not exit from process seam {self._seam!s} within {timeout:.3f}s")
+        exitcode = self._process.exitcode
+        if exitcode is None:
+            raise AssertionError("child exit code remained unavailable after bounded join")
+        was_killed = exitcode == -signal.SIGKILL if os.name == "posix" else exitcode != 0
+        return ProcessExitStatus(exitcode=exitcode, was_killed=was_killed)
+
+    def close(self) -> None:
+        """Release or force-stop the child through a strictly bounded ladder."""
+        if self._closed:
+            return
+        if self._process.is_alive():
+            with suppress(BrokenPipeError, EOFError, OSError):
+                self._release_writer.send_bytes(b"release")
+        self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
+        if self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
+        if self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
+        if self._process.is_alive():
+            raise AssertionError(f"could not clean up child at process seam {self._seam!s}")
+        self._ready_reader.close()
+        self._release_writer.close()
+        self._process.close()
+        self._closed = True
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
+        self.close()
+
+
+def spawn_database_process_at_seam(
+    *,
+    database_url: str,
+    seam: str,
+    action: Callable[..., None],
+    action_args: tuple[object, ...] = (),
+) -> SpawnedProcessAtSeam:
+    """Spawn a child with its own connection and pause after a named action.
+
+    ``action`` must be a module-level function so the spawn start method can
+    import it in a fresh interpreter.  No live engine, connection, factory, or
+    plugin object crosses the process boundary.
+    """
+    if not seam.strip():
+        raise ValueError("process seam name must not be empty")
+    if not isinstance(action, FunctionType) or inspect.iscoroutinefunction(action) or "<locals>" in action.__qualname__:
+        raise TypeError("process seam action must be a synchronous module-level picklable callable")
+
+    context = multiprocessing.get_context("spawn")
+    ready_reader, ready_writer = context.Pipe(duplex=False)
+    release_reader, release_writer = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_database_process_target,
+        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader),
+        name=f"state-engine:{seam}",
+    )
+    try:
+        process.start()
+    except BaseException:
+        ready_reader.close()
+        ready_writer.close()
+        release_reader.close()
+        release_writer.close()
+        process.close()
+        raise
+    ready_writer.close()
+    release_reader.close()
+    return SpawnedProcessAtSeam(
+        process=process,
+        ready_reader=ready_reader,
+        release_writer=release_writer,
+        seam=ProcessSeam(seam),
+    )
 
 
 class _CrashRowSchema(PluginSchema):
@@ -413,12 +662,25 @@ def _craft_crashed_lease(
 
 
 def _resume(crashed: _CrashedRun) -> tuple[Any, CollectSink, _InterruptibleSource]:
-    """Drive the PUBLIC resume path with fresh plugins (new-process reality)."""
-    resume_point = _resume_point(crashed)
-    assert resume_point is not None
-    config, graph, sink, source = _build_pipeline(_SOURCE_ROWS)
-    result = crashed.resume_orchestrator().resume(resume_point, config, graph, payload_store=crashed.payload_store)
-    return result, sink, source
+    """Drive public resume with a fresh DB handle and production objects."""
+    fresh_db = LandscapeDB.from_url(crashed.db.connection_string, create_tables=False)
+    fresh_payload_store = FilesystemPayloadStore(crashed.payload_store.base_path)
+    fresh_checkpoint_manager = CheckpointManager(fresh_db)
+    try:
+        recovery_manager = RecoveryManager(fresh_db, fresh_checkpoint_manager)
+        config, graph, sink, source = _build_pipeline(_SOURCE_ROWS)
+        resume_point = recovery_manager.get_resume_point(crashed.run_id, graph)
+        assert resume_point is not None
+        orchestrator = Orchestrator(
+            fresh_db,
+            checkpoint_manager=fresh_checkpoint_manager,
+            checkpoint_config=crashed.checkpoint_config,
+            clock=crashed.clock,
+        )
+        result = orchestrator.resume(resume_point, config, graph, payload_store=fresh_payload_store)
+        return result, sink, source
+    finally:
+        fresh_db.close()
 
 
 # ---------------------------------------------------------------------------
