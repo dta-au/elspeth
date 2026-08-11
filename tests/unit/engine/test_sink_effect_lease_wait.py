@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import update
 
+from elspeth.contracts.audit import SinkEffect
 from elspeth.contracts.errors import GracefulShutdownError
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
@@ -20,6 +21,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
     SinkEffectState,
 )
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectLifecycle
 from elspeth.core.landscape.schema import sink_effects_table
@@ -29,10 +31,11 @@ from elspeth.engine.executors.sink_effects import (
     SinkEffectExecutionSeam,
     SinkEffectInjectedFault,
     SinkEffectLeaseHeld,
+    SinkEffectPredecessorPending,
 )
 from tests.fixtures.sink_effects import DuplicateObservableSink, DuplicateObservableTarget
-from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members
-from tests.unit.engine.test_sink_effect_executor import _execution_request
+from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
+from tests.unit.engine.test_sink_effect_executor import _CumulativeObservableSink, _CumulativeTarget, _execution_request
 
 
 class _AdvanceSleep:
@@ -171,6 +174,340 @@ def test_waiter_reuses_peer_finalized_effect_without_publishing_again(
         assert result.effect.effect_id == peer.effect.effect_id  # type: ignore[attr-defined]
         assert result.artifact.artifact_id == peer.artifact.artifact_id  # type: ignore[attr-defined]
         assert target.publication_count == 1
+    finally:
+        db.close()
+
+
+def test_successor_waits_for_peer_to_finalize_predecessor_then_advances_stream_once() -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 2)
+    predecessor_request = _execution_request(run_id, sink_id, members[:1])
+    successor_request = _execution_request(run_id, sink_id, members[1:])
+    target = _CumulativeTarget()
+    sink = _CumulativeObservableSink(target)
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+
+    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
+    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    assert predecessor is not None
+    assert successor is not None
+    assert successor.predecessor_effect_id == predecessor.effect_id
+
+    peer_results: list[SinkEffectFinalizationResult] = []
+
+    def finalize_predecessor_from_peer() -> None:
+        if peer_results:
+            return
+        peer_results.append(
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="predecessor-peer",
+                clock=clock,
+            ).execute(predecessor_request, sink)
+        )
+
+    sleep = _AdvanceSleep(clock, after_sleep=finalize_predecessor_from_peer)
+    try:
+        with pytest.raises(SinkEffectPredecessorPending, match="waiting for predecessor"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="immediate-successor",
+                clock=clock,
+            ).execute(successor_request, sink)
+        assert target.published_rows == []
+
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id="successor-waiter",
+            lease_ttl=timedelta(seconds=2),
+            clock=clock,
+            sleep=sleep,
+            poll_interval=0.5,
+        ).execute_with_lease_wait(successor_request, sink)
+
+        assert len(peer_results) == 1
+        assert result.effect.effect_id == successor.effect_id
+        assert sleep.calls == [0.5]
+        assert all(seconds > 0.0 for seconds in sleep.calls)
+        assert sum(sleep.calls) <= 2.5
+        assert sink.commit_calls == 2
+        assert target.published_rows == [
+            [{"ordinal": 0}],
+            [{"ordinal": 0}, {"ordinal": 1}],
+        ]
+        effects = factory.execution.sink_effects.get_effects_for_run(run_id)
+        assert [(effect.stream_sequence, effect.state, effect.publication_performed) for effect in effects] == [
+            (0, SinkEffectState.FINALIZED, True),
+            (1, SinkEffectState.FINALIZED, True),
+        ]
+        artifacts = factory.execution.get_artifacts(run_id)
+        assert len(artifacts) == 2
+        assert {artifact.sink_effect_id for artifact in artifacts} == {predecessor.effect_id, successor.effect_id}
+    finally:
+        db.close()
+
+
+def test_predecessor_then_foreign_lease_share_one_fixed_wait_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    lease_ttl = timedelta(seconds=2)
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 2)
+    predecessor_request = _execution_request(run_id, sink_id, members[:1])
+    successor_request = _execution_request(run_id, sink_id, members[1:])
+    target = _CumulativeTarget()
+    sink = _CumulativeObservableSink(target)
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+    monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
+
+    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
+    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    assert predecessor is not None
+    assert successor is not None
+
+    peer_result: list[SinkEffectFinalizationResult] = []
+    successor_claim: list[SinkEffectLease] = []
+
+    def keep_successor_contended() -> None:
+        if not peer_result:
+            peer_result.append(
+                SinkEffectCoordinator(
+                    factory=factory,
+                    worker_id="predecessor-peer",
+                    lease_ttl=lease_ttl,
+                    clock=clock,
+                ).execute(predecessor_request, sink)
+            )
+            successor_claim.append(
+                factory.execution.sink_effects.claim_preparation(
+                    successor.effect_id,
+                    owner="successor-holder",
+                    ttl=lease_ttl,
+                )
+            )
+            return
+        claim = successor_claim[0]
+        factory.execution.sink_effects.heartbeat_lease(
+            successor.effect_id,
+            owner=claim.owner,
+            generation=claim.generation,
+            ttl=lease_ttl,
+        )
+
+    sleep = _AdvanceSleep(clock, after_sleep=keep_successor_contended)
+    try:
+        with pytest.raises(SinkEffectLeaseHeld, match="preparation"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="successor-waiter",
+                lease_ttl=lease_ttl,
+                clock=clock,
+                sleep=sleep,
+                poll_interval=0.5,
+            ).execute_with_lease_wait(successor_request, sink)
+
+        assert len(peer_result) == 1
+        assert sleep.calls == [0.5] * 5
+        assert sum(sleep.calls) == lease_ttl.total_seconds() + 0.5
+        assert target.published_rows == [[{"ordinal": 0}]]
+        current = factory.execution.sink_effects.get_effect(successor.effect_id)
+        assert current is not None
+        assert current.lease_owner == "successor-holder"
+        assert current.state is SinkEffectState.RESERVED
+    finally:
+        db.close()
+
+
+def test_shutdown_interrupts_predecessor_wait_before_peer_finalization() -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 2)
+    successor_request = _execution_request(run_id, sink_id, members[1:])
+    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
+    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    assert predecessor is not None
+    assert successor is not None
+    target = _CumulativeTarget()
+    shutdown = threading.Event()
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+    sleep = _AdvanceSleep(clock, after_sleep=shutdown.set)
+    try:
+        with pytest.raises(GracefulShutdownError):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="successor-waiter",
+                clock=clock,
+                sleep=sleep,
+                poll_interval=0.5,
+                shutdown_event=shutdown,
+                make_shutdown_error=_shutdown_error,
+            ).execute_with_lease_wait(successor_request, _CumulativeObservableSink(target))
+
+        assert sleep.calls == [0.5]
+        assert target.published_rows == []
+        current_predecessor = factory.execution.sink_effects.get_effect(predecessor.effect_id)
+        current_successor = factory.execution.sink_effects.get_effect(successor.effect_id)
+        assert current_predecessor is not None
+        assert current_successor is not None
+        assert current_predecessor.state is SinkEffectState.RESERVED
+        assert current_successor.state is SinkEffectState.RESERVED
+    finally:
+        db.close()
+
+
+def test_coordination_latch_interrupts_predecessor_wait_before_peer_finalization() -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 2)
+    successor_request = _execution_request(run_id, sink_id, members[1:])
+    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
+    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    assert predecessor is not None
+    assert successor is not None
+    target = _CumulativeTarget()
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+    sleep = _AdvanceSleep(clock)
+    latch_calls = 0
+
+    class _Deposed(RuntimeError):
+        pass
+
+    def latch() -> None:
+        nonlocal latch_calls
+        latch_calls += 1
+        if latch_calls == 2:
+            raise _Deposed("worker epoch was deposed")
+
+    try:
+        with pytest.raises(_Deposed, match="deposed"):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="successor-waiter",
+                clock=clock,
+                sleep=sleep,
+                poll_interval=0.5,
+                check_coordination_latch=latch,
+            ).execute_with_lease_wait(successor_request, _CumulativeObservableSink(target))
+
+        assert latch_calls == 2
+        assert sleep.calls == [0.5]
+        assert target.published_rows == []
+        current_predecessor = factory.execution.sink_effects.get_effect(predecessor.effect_id)
+        current_successor = factory.execution.sink_effects.get_effect(successor.effect_id)
+        assert current_predecessor is not None
+        assert current_successor is not None
+        assert current_predecessor.state is SinkEffectState.RESERVED
+        assert current_successor.state is SinkEffectState.RESERVED
+    finally:
+        db.close()
+
+
+def test_successor_wait_traverses_multi_hop_predecessor_chain() -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 3)
+    requests = tuple(_execution_request(run_id, sink_id, members[index : index + 1]) for index in range(3))
+    effects = tuple(
+        factory.execution.sink_effects.reserve(
+            _pipeline_request(run_id, sink_id, members[index : index + 1], replacing_target=True)
+        ).new_effect
+        for index in range(3)
+    )
+    assert all(effect is not None for effect in effects)
+    first, second, third = effects
+    assert first is not None
+    assert second is not None
+    assert third is not None
+    assert second.predecessor_effect_id == first.effect_id
+    assert third.predecessor_effect_id == second.effect_id
+    target = _CumulativeTarget()
+    sink = _CumulativeObservableSink(target)
+    clock = MockClock(start=datetime.now(UTC).timestamp())
+    finalized_predecessors: list[SinkEffectFinalizationResult] = []
+
+    def finalize_next_predecessor() -> None:
+        index = len(finalized_predecessors)
+        if index >= 2:
+            raise AssertionError("successor wait polled after both predecessors finalized")
+        finalized_predecessors.append(
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id=f"predecessor-peer-{index}",
+                clock=clock,
+            ).execute(requests[index], sink)
+        )
+
+    sleep = _AdvanceSleep(clock, after_sleep=finalize_next_predecessor)
+    try:
+        result = SinkEffectCoordinator(
+            factory=factory,
+            worker_id="successor-waiter",
+            clock=clock,
+            sleep=sleep,
+            poll_interval=0.5,
+        ).execute_with_lease_wait(requests[2], sink)
+
+        assert result.effect.effect_id == third.effect_id
+        assert sleep.calls == [0.5, 0.5]
+        assert sink.commit_calls == 3
+        assert target.published_rows == [
+            [{"ordinal": 0}],
+            [{"ordinal": 0}, {"ordinal": 1}],
+            [{"ordinal": 0}, {"ordinal": 1}, {"ordinal": 2}],
+        ]
+    finally:
+        db.close()
+
+
+def test_predecessor_disappearing_during_wait_fails_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.fixtures.landscape import make_factory, make_landscape_db
+
+    db = make_landscape_db()
+    factory = make_factory(db)
+    run_id, sink_id, members = _pipeline_members(factory, 2)
+    successor_request = _execution_request(run_id, sink_id, members[1:])
+    predecessor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[:1], replacing_target=True)).new_effect
+    successor = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members[1:], replacing_target=True)).new_effect
+    assert predecessor is not None
+    assert successor is not None
+
+    def refuse_sleep(_seconds: float) -> None:
+        raise AssertionError("missing predecessor must not be polled")
+
+    coordinator = SinkEffectCoordinator(
+        factory=factory,
+        worker_id="successor-waiter",
+        sleep=refuse_sleep,
+    )
+    original_get_effect = coordinator._effects.get_effect
+    predecessor_reads = 0
+
+    def disappear_after_initial_read(effect_id: str) -> SinkEffect | None:
+        nonlocal predecessor_reads
+        if effect_id == predecessor.effect_id:
+            predecessor_reads += 1
+            if predecessor_reads > 1:
+                return None
+        return original_get_effect(effect_id)
+
+    monkeypatch.setattr(coordinator._effects, "get_effect", disappear_after_initial_read)
+    try:
+        with pytest.raises(LandscapeRecordError, match="predecessor disappeared"):
+            coordinator.execute_with_lease_wait(successor_request, _CumulativeObservableSink(_CumulativeTarget()))
     finally:
         db.close()
 

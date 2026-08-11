@@ -71,7 +71,7 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A response-lost publication resumes once after its live lease expires."""
+    """A same-process injected response loss resumes once after DB reopen."""
     database_path = tmp_path / "audit.db"
     payload_path = tmp_path / "payloads"
     output = tmp_path / "output.jsonl"
@@ -138,9 +138,15 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
             )
         factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(payload_path))
         (effect_before,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        (operation_before,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run(run_id) if operation.sink_effect_id is not None
+        )
         assert effect_before.state is SinkEffectState.IN_FLIGHT
         assert effect_before.lease_expires_at is not None
         assert effect_before.lease_expires_at.replace(tzinfo=UTC) > clock.now_utc()
+        assert operation_before.sink_effect_id == effect_before.effect_id
+        assert operation_before.status == "open"
+        assert operation_before.completed_at is None
         assert scheduler_before == ("pending_sink",)
         assert checkpoint_manager.get_latest_checkpoint(run_id) is not None
         assert [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()] == [{"id": 1, "value": "once"}]
@@ -171,9 +177,17 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
         assert result.status is RunStatus.COMPLETED
         factory = RecorderFactory(reopened, payload_store=FilesystemPayloadStore(payload_path))
         (effect_after,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        (operation_after,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run(run_id) if operation.sink_effect_id is not None
+        )
         assert effect_after.state is SinkEffectState.FINALIZED
         assert effect_after.effect_id == effect_before.effect_id
         assert effect_after.artifact_id == effect_before.artifact_id
+        assert effect_after.generation > effect_before.generation
+        assert operation_after.operation_id == operation_before.operation_id
+        assert operation_after.sink_effect_id == effect_after.effect_id
+        assert operation_after.status == "completed"
+        assert operation_after.completed_at is not None
         (artifact,) = factory.execution.get_artifacts(run_id)
         assert artifact.artifact_id == effect_before.artifact_id
         assert artifact.sink_effect_id == effect_before.effect_id

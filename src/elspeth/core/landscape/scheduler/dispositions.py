@@ -409,6 +409,11 @@ class SchedulerDispositionRepository:
         work item while avoiding one transaction and one indexed SELECT per token
         after large sink writes.
 
+        Every requested token must resolve to exactly one complete durable sink
+        bundle with the expected owner before the first mutation. Completeness
+        is repeated in each update CAS so a concurrently malformed member aborts
+        and rolls back the whole batch rather than returning a partial count.
+
         ``expected_lease_owner`` is REQUIRED and the owner CAS is STRICT
         (ADR-030 §C.4 row 7; see :meth:`mark_pending_sink_terminal` for the
         attributed-park co-change): a row whose owner does not match —
@@ -439,6 +444,7 @@ class SchedulerDispositionRepository:
             token_work_items_table.c.status.in_((TokenWorkStatus.PENDING_SINK.value, TokenWorkStatus.LEASED.value)),
             token_work_items_table.c.pending_sink_name.is_not(None),
         ]
+        complete_bundle = pending_sink_bundle_clause()
         with fenced_leader_transaction(
             self._engine,
             token=coordination_token,
@@ -448,7 +454,7 @@ class SchedulerDispositionRepository:
         ) as conn:
             rows = (
                 conn.execute(
-                    select(token_work_items_table)
+                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
                     .where(and_(*predicates))
                     .order_by(
                         token_work_items_table.c.ingest_sequence,
@@ -477,7 +483,13 @@ class SchedulerDispositionRepository:
                         f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} found "
                         f"{len(matching_rows)} matching rows; expected exactly one."
                     )
-                row_lease_owner = matching_rows[0]["lease_owner"]
+                matching_row = matching_rows[0]
+                if not matching_row["_pending_sink_bundle_complete"]:
+                    raise AuditIntegrityError(
+                        f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} "
+                        "refused a member without a complete durable sink bundle; refusing partial terminalization."
+                    )
+                row_lease_owner = matching_row["lease_owner"]
                 if row_lease_owner != expected_lease_owner:
                     raise AuditIntegrityError(
                         f"Scheduler pending-sink batch terminalization for run_id={run_id!r} token_id={token_id!r} found "
@@ -495,6 +507,7 @@ class SchedulerDispositionRepository:
                     .where(token_work_items_table.c.status == row["status"])
                     .where(token_work_items_table.c.pending_sink_name.is_not(None))
                     .where(token_work_items_table.c.lease_owner == expected_lease_owner)
+                    .where(complete_bundle)
                     .values(
                         status=TokenWorkStatus.TERMINAL.value,
                         row_payload_json=scrubbed_row_payload_json(row["token_id"]),
@@ -523,10 +536,11 @@ class SchedulerDispositionRepository:
                         caller_owner=expected_lease_owner,
                     )
                     terminalized += 1
-                elif result.rowcount not in (0, None):
+                else:
                     raise AuditIntegrityError(
                         f"Scheduler pending-sink batch terminalization affected {result.rowcount} rows for "
-                        f"run_id={run_id!r} token_id={row['token_id']!r} work_item_id={row['work_item_id']!r}; expected 0 or 1."
+                        f"run_id={run_id!r} token_id={row['token_id']!r} work_item_id={row['work_item_id']!r}; expected exactly 1 "
+                        "complete owner-matched member. Refusing partial terminalization."
                     )
         return terminalized
 

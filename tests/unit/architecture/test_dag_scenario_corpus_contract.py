@@ -525,7 +525,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8ab
 # Rotated again for elspeth-3875f3b381: one summary row-union recovery
 # declaration reuses the pinned two-variant fixture; all 48 prior declarations
 # are unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "34924d819a4670e534e3a82c1678f5f9fa9dd241d7e47f1579865ad235a6a504"
+EXPECTED_CASE_REGISTRY_SHA256 = "6bf7fea9bea268ce3017f277e7450ca40e3e99320d14aa07c1ad9da71b1bee81"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

@@ -308,6 +308,112 @@ def _execution_request(run_id: str, sink_id: str, members: tuple[object, ...]) -
     )
 
 
+def _coordinator_durable_image(
+    factory: RecorderFactory,
+    run_id: str,
+) -> tuple[
+    tuple[tuple[str, int, str | None, bool, bool], ...],
+    tuple[tuple[str, str, int], ...],
+    tuple[int, ...],
+    tuple[tuple[str, bool], ...],
+]:
+    effects = factory.execution.sink_effects.get_effects_for_run(run_id)
+    return (
+        tuple(
+            (
+                effect.state.value,
+                effect.generation,
+                effect.lease_owner,
+                effect.plan_hash is not None,
+                effect.inspection_attempt_id is not None,
+            )
+            for effect in effects
+        ),
+        tuple(
+            (attempt.action.value, attempt.state.value, attempt.generation)
+            for attempt in factory.execution.sink_effects.get_attempts_for_run(run_id)
+        ),
+        tuple(len(factory.execution.sink_effects.get_members(effect.effect_id)) for effect in effects),
+        tuple((operation.status, operation.sink_effect_id is not None) for operation in factory.execution.get_operations_for_run(run_id)),
+    )
+
+
+@pytest.mark.parametrize(
+    ("seam_value", "expected_image"),
+    [
+        ("before_reservation", ((), (), (), ())),
+        (
+            "after_reservation",
+            ((("reserved", 0, None, False, False),), (), (1,), (("open", True),)),
+        ),
+        (
+            "after_preparation_claim",
+            ((("reserved", 1, "worker-a", False, False),), (), (1,), (("open", True),)),
+        ),
+        (
+            "after_inspection",
+            (
+                (("reserved", 1, "worker-a", False, False),),
+                (("inspect", "returned", 1),),
+                (1,),
+                (("open", True),),
+            ),
+        ),
+        (
+            "after_plan_cas",
+            (
+                (("prepared", 1, None, True, True),),
+                (("inspect", "returned", 1),),
+                (1,),
+                (("open", True),),
+            ),
+        ),
+    ],
+)
+def test_committed_coordinator_seam_has_exact_durable_image_and_retry_converges(
+    seam_value: str,
+    expected_image: tuple[
+        tuple[tuple[str, int, str | None, bool, bool], ...],
+        tuple[tuple[str, str, int], ...],
+        tuple[int, ...],
+        tuple[tuple[str, bool], ...],
+    ],
+) -> None:
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        request = _execution_request(run_id, sink_id, members)
+        target = _CumulativeTarget()
+        sink = _CumulativeObservableSink(target)
+        seam = SinkEffectExecutionSeam(seam_value)
+        observed_images: list[object] = []
+
+        def stop_at_committed_boundary(observed: SinkEffectExecutionSeam) -> None:
+            if observed is seam:
+                observed_images.append(_coordinator_durable_image(factory, run_id))
+                raise SinkEffectInjectedFault(seam)
+
+        with pytest.raises(SinkEffectInjectedFault):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="worker-a",
+                fault_hook=stop_at_committed_boundary,
+            ).execute(request, sink)
+
+        assert observed_images == [expected_image]
+        assert _coordinator_durable_image(make_factory(db), run_id) == expected_image
+
+        recovered_factory = make_factory(db)
+        recovered = SinkEffectCoordinator(factory=recovered_factory, worker_id="worker-a").execute(request, sink)
+
+        assert recovered.effect.state.value == "finalized"
+        assert target.published_rows == [[{"ordinal": 0}]]
+        assert [operation.status for operation in recovered_factory.execution.get_operations_for_run(run_id)] == ["completed"]
+    finally:
+        db.close()
+
+
 def test_sink_effect_capabilities_cannot_be_forged_by_attributes() -> None:
     class _CapabilityPretender(_CumulativeObservableSink):
         supports_member_effects = True
@@ -383,28 +489,268 @@ def test_sink_effect_capabilities_require_nominal_opt_in() -> None:
         db.close()
 
 
-def _production_calls(path: str, method: str) -> list[int]:
-    source_path = _ROOT / path
+_SINK_PROTOCOL_ANNOTATIONS = frozenset({"SinkEffectProtocol", "SinkProtocol"})
+
+
+def _is_sink_protocol_annotation(annotation: ast.expr | None) -> bool:
+    if annotation is None:
+        return False
+    for node in ast.walk(annotation):
+        if isinstance(node, ast.Name) and node.id in _SINK_PROTOCOL_ANNOTATIONS:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in _SINK_PROTOCOL_ANNOTATIONS:
+            return True
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and any(name in node.value for name in _SINK_PROTOCOL_ANNOTATIONS)
+        ):
+            return True
+    return False
+
+
+def _cast_sink_protocol(call: ast.Call) -> bool:
+    if not isinstance(call.func, ast.Name) or call.func.id != "cast" or not call.args:
+        return False
+    return _is_sink_protocol_annotation(call.args[0])
+
+
+def _annotation_type_name(annotation: ast.expr | None) -> str | None:
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Attribute):
+        return annotation.attr
+    if isinstance(annotation, ast.Constant) and isinstance(annotation.value, str):
+        return annotation.value.rsplit(".", maxsplit=1)[-1]
+    return None
+
+
+class _ScopeSinkBindings(ast.NodeVisitor):
+    """Collect sink-protocol bindings without descending into nested scopes."""
+
+    def __init__(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+        self.local_names = {argument.arg for argument in arguments}
+        self.names = {argument.arg for argument in arguments if _is_sink_protocol_annotation(argument.annotation)}
+        self.object_types = {
+            argument.arg: type_name for argument in arguments if (type_name := _annotation_type_name(argument.annotation)) is not None
+        }
+        for variadic in (node.args.vararg, node.args.kwarg):
+            if variadic is not None:
+                self.local_names.add(variadic.arg)
+                if _is_sink_protocol_annotation(variadic.annotation):
+                    self.names.add(variadic.arg)
+        self._aliases: list[tuple[str, str]] = []
+        for statement in node.body:
+            self.visit(statement)
+        while True:
+            discovered = {target for target, source in self._aliases if source in self.names}
+            if discovered <= self.names:
+                break
+            self.names.update(discovered)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        del node
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        del node
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        del node
+
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Store):
+            self.local_names.add(node.id)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if isinstance(node.target, ast.Name) and _is_sink_protocol_annotation(node.annotation):
+            self.names.add(node.target.id)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        targets = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        if isinstance(node.value, ast.Name):
+            self._aliases.extend((target, node.value.id) for target in targets)
+        elif isinstance(node.value, ast.Call) and _cast_sink_protocol(node.value):
+            self.names.update(targets)
+        self.generic_visit(node)
+
+
+def _is_bound_sink_receiver(
+    receiver: ast.expr,
+    *,
+    sink_bindings: frozenset[str],
+    object_types: dict[str, str],
+    class_sink_attributes: dict[str, frozenset[str]],
+) -> bool:
+    if isinstance(receiver, ast.Name):
+        return receiver.id in sink_bindings
+    if isinstance(receiver, ast.Attribute) and isinstance(receiver.value, ast.Name):
+        receiver_type = object_types.get(receiver.value.id)
+        return receiver_type is not None and receiver.attr in class_sink_attributes.get(receiver_type, ())
+    return isinstance(receiver, ast.Call) and _cast_sink_protocol(receiver)
+
+
+def _is_precise_non_sink_write(
+    call: ast.Call,
+    *,
+    os_module_names: frozenset[str],
+    local_names: frozenset[str],
+) -> bool:
+    """Exclude module APIs whose two-argument shape cannot dispatch a sink."""
+    return (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and call.func.value.id in os_module_names
+        and call.func.value.id not in local_names
+    )
+
+
+class _LegacySinkPublicationVisitor(ast.NodeVisitor):
+    def __init__(
+        self,
+        *,
+        os_module_names: frozenset[str],
+        class_sink_attributes: dict[str, frozenset[str]],
+    ) -> None:
+        self.violations: list[tuple[int, int, str]] = []
+        self._sink_binding_scopes: list[frozenset[str]] = [frozenset()]
+        self._local_name_scopes: list[frozenset[str]] = [frozenset()]
+        self._object_type_scopes: list[dict[str, str]] = [{}]
+        self._os_module_names = os_module_names
+        self._class_sink_attributes = class_sink_attributes
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        bindings = _ScopeSinkBindings(node)
+        self._sink_binding_scopes.append(frozenset(bindings.names))
+        self._local_name_scopes.append(frozenset(bindings.local_names))
+        self._object_type_scopes.append(bindings.object_types)
+        for statement in node.body:
+            self.visit(statement)
+        self._object_type_scopes.pop()
+        self._local_name_scopes.pop()
+        self._sink_binding_scopes.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function(node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {"flush", "write"}:
+            bound_sink = _is_bound_sink_receiver(
+                node.func.value,
+                sink_bindings=self._sink_binding_scopes[-1],
+                object_types=self._object_type_scopes[-1],
+                class_sink_attributes=self._class_sink_attributes,
+            )
+            # SinkProtocol.write has exactly the rows/context argument pair. Treat
+            # that call shape as publication regardless of receiver spelling or
+            # expression shape; only exact module functions that cannot dispatch
+            # a sink are excluded. A typed sink receiver is also forbidden even
+            # if a caller spells the arguments incorrectly or calls flush alone.
+            legacy_write_shape = (
+                node.func.attr == "write"
+                and len(node.args) + len(node.keywords) == 2
+                and not _is_precise_non_sink_write(
+                    node,
+                    os_module_names=self._os_module_names,
+                    local_names=self._local_name_scopes[-1],
+                )
+            )
+            if bound_sink or legacy_write_shape:
+                self.violations.append((node.lineno, node.col_offset, node.func.attr))
+        self.generic_visit(node)
+
+
+def _legacy_sink_publication_calls(source_path: Path) -> list[tuple[int, int, str]]:
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    return [
-        node.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == method
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id in {"sink", "failsink"}
+    os_module_names = frozenset(
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.Import)
+        for alias in statement.names
+        if alias.name == "os"
+    )
+    class_sink_attributes = {
+        statement.name: frozenset(
+            member.target.id
+            for member in statement.body
+            if isinstance(member, ast.AnnAssign) and isinstance(member.target, ast.Name) and _is_sink_protocol_annotation(member.annotation)
+        )
+        for statement in tree.body
+        if isinstance(statement, ast.ClassDef)
+    }
+    visitor = _LegacySinkPublicationVisitor(
+        os_module_names=os_module_names,
+        class_sink_attributes=class_sink_attributes,
+    )
+    visitor.visit(tree)
+    return visitor.violations
+
+
+def test_legacy_publication_guard_detects_renamed_sink_receiver(
+    tmp_path: Path,
+) -> None:
+    source_path = tmp_path / "src/elspeth/engine/new_publication_path.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        """from elspeth.contracts import SinkProtocol
+
+def publish(destination: SinkProtocol, rows: list[dict[str, object]], context: object) -> None:
+    destination.write(rows, context)
+    destination.flush()
+
+def publish_through_attribute(runtime: object, rows: list[dict[str, object]], context: object) -> None:
+    runtime.destination.write(rows=rows, ctx=context)
+
+def shadow_module_name(os: object, rows: list[dict[str, object]], context: object) -> None:
+    os.write(rows, context)
+
+class Runtime:
+    destination: SinkProtocol
+
+def flush_through_attribute(runtime: Runtime) -> None:
+    runtime.destination.flush()
+""",
+        encoding="utf-8",
+    )
+
+    assert _legacy_sink_publication_calls(source_path) == [
+        (4, 4, "write"),
+        (5, 4, "flush"),
+        (8, 4, "write"),
+        (11, 4, "write"),
+        (17, 4, "flush"),
     ]
 
 
-def test_pipeline_executor_has_no_legacy_write_or_flush_publication_boundary() -> None:
-    assert _production_calls("src/elspeth/engine/executors/sink.py", "write") == []
-    assert _production_calls("src/elspeth/engine/executors/sink.py", "flush") == []
+def test_legacy_publication_guard_excludes_unrelated_write_and_flush_apis(tmp_path: Path) -> None:
+    source_path = tmp_path / "src/elspeth/core/unrelated_io.py"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_text(
+        """import os
+
+def persist(stream: object, descriptor: int, payload: bytes) -> None:
+    stream.write(payload)
+    stream.flush()
+    os.write(descriptor, payload)
+""",
+        encoding="utf-8",
+    )
+
+    assert _legacy_sink_publication_calls(source_path) == []
 
 
-def test_audit_export_has_no_legacy_write_or_flush_publication_boundary() -> None:
-    assert _production_calls("src/elspeth/engine/orchestrator/export.py", "write") == []
-    assert _production_calls("src/elspeth/engine/orchestrator/export.py", "flush") == []
+def test_production_tree_has_no_legacy_write_or_flush_publication_boundary() -> None:
+    violations = {
+        str(source_path.relative_to(_ROOT)): calls
+        for source_path in sorted((_ROOT / "src/elspeth").rglob("*.py"))
+        if (calls := _legacy_sink_publication_calls(source_path))
+    }
+
+    assert violations == {}
 
 
 def test_result_derived_reconciliation_finalizes_exact_marker_partition() -> None:

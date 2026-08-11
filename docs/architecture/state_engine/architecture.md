@@ -228,6 +228,16 @@ The durable model includes:
 - effect attempts and external-call intent/result;
 - artifact and token-outcome finalization in one Landscape transaction.
 
+Reservation also creates exactly one deterministic `sink_write` operation
+linked to the effect. While that effect is unfinished, `status = open` means
+unfinished and resumable; it is not failure evidence. The effect's current
+lease owner and generation are the sole publication-custody authority, so a
+recovering worker reuses the same effect and operation after a fenced takeover.
+Atomic effect finalization completes that operation. Task 10 owns the distinct
+fenced transition from a non-resumable open operation to `failed`, together
+with the corresponding prohibition on resume; recoverable effect handling must
+not perform that terminal transition.
+
 `RESERVED` has two durable subtypes. An unclaimed reservation has no active
 preparation owner. A preparation-claimed reservation persists owner,
 generation, heartbeat, and expiry while target inspection and adapter

@@ -66,8 +66,13 @@ logger = logging.getLogger(__name__)
 
 
 class SinkEffectExecutionSeam(StrEnum):
-    """Deterministic crash seams around the externally observable commit."""
+    """Deterministic crash seams at durable coordinator boundaries."""
 
+    BEFORE_RESERVATION = "before_reservation"
+    AFTER_RESERVATION = "after_reservation"
+    AFTER_PREPARATION_CLAIM = "after_preparation_claim"
+    AFTER_INSPECTION = "after_inspection"
+    AFTER_PLAN_CAS = "after_plan_cas"
     BEFORE_EFFECT = "before_effect"
     AFTER_EFFECT_BEFORE_RETURN = "after_effect_before_return"
     AFTER_RETURN_BEFORE_FINALIZE = "after_return_before_finalize"
@@ -290,7 +295,7 @@ class SinkEffectCoordinator:
         request: SinkEffectExecutionRequest,
         sink: _SinkEffectAdapter,
     ) -> SinkEffectFinalizationResult:
-        """Execute once, preserving immediate ``SinkEffectLeaseHeld`` refusal."""
+        """Execute once, preserving immediate lease and predecessor refusals."""
         return self._execute(request, sink, wait_for_lease=False)
 
     def execute_with_lease_wait(
@@ -298,7 +303,7 @@ class SinkEffectCoordinator:
         request: SinkEffectExecutionRequest,
         sink: _SinkEffectAdapter,
     ) -> SinkEffectFinalizationResult:
-        """Execute with one fixed, TTL-derived budget for foreign live leases."""
+        """Execute with one fixed TTL-derived budget shared by predecessor and live-lease waits."""
         return self._execute(request, sink, wait_for_lease=True)
 
     def _execute(
@@ -312,7 +317,9 @@ class SinkEffectCoordinator:
             raise TypeError("request must be exact SinkEffectExecutionRequest")
 
         self._persist_pipeline_member_payloads(request.effect_input)
+        self._fault(SinkEffectExecutionSeam.BEFORE_RESERVATION)
         reservation = self._effects.reserve(request.reservation)
+        self._fault(SinkEffectExecutionSeam.AFTER_RESERVATION)
         effect_ids = (*reservation.finalized_effect_ids, *reservation.open_effect_ids)
         if reservation.new_effect is not None:
             effect_ids = (*effect_ids, reservation.new_effect.effect_id)
@@ -335,8 +342,8 @@ class SinkEffectCoordinator:
                 if refreshed.state is SinkEffectState.FINALIZED:
                     results.append(self._load_finalized(refreshed.effect_id))
                     break
-                partition_request = self._request_for_effect(refreshed, request)
                 try:
+                    partition_request = self._request_for_effect(refreshed, request)
                     results.append(self._execute_effect(refreshed, partition_request, sink))
                 except SinkEffectLeaseHeld as exc:
                     if not wait_for_lease:
@@ -347,8 +354,65 @@ class SinkEffectCoordinator:
                         original_error=exc,
                     )
                     continue
+                except SinkEffectPredecessorPending as exc:
+                    if not wait_for_lease:
+                        raise
+                    wait_deadline = self._wait_until_predecessor_finalized(
+                        effect_id=refreshed.effect_id,
+                        deadline=wait_deadline,
+                        original_error=exc,
+                    )
+                    continue
                 break
         return results[-1]
+
+    def _wait_until_predecessor_finalized(
+        self,
+        *,
+        effect_id: str,
+        deadline: float | None,
+        original_error: SinkEffectPredecessorPending,
+    ) -> float | None:
+        """Poll the predecessor chain within the same fixed TTL-derived budget."""
+        while True:
+            self._check_wait_interruptions()
+            effect = self._require_effect(effect_id)
+            predecessor_id = effect.predecessor_effect_id
+            seen = {effect.effect_id}
+            pending = False
+            while predecessor_id is not None:
+                if predecessor_id in seen or len(seen) > 256:
+                    raise LandscapeRecordError("sink effect predecessor chain is cyclic or exceeds 256 effects")
+                seen.add(predecessor_id)
+                predecessor = self._effects.get_effect(predecessor_id)
+                if predecessor is None:
+                    raise LandscapeRecordError("sink effect predecessor disappeared")
+                if predecessor.state is not SinkEffectState.FINALIZED:
+                    pending = True
+                    break
+                predecessor_id = predecessor.predecessor_effect_id
+            if not pending:
+                return deadline
+
+            monotonic_now = self._clock.monotonic()
+            if deadline is None:
+                deadline = monotonic_now + self._lease_ttl.total_seconds() + self._poll_interval
+            if monotonic_now >= deadline:
+                logger.warning(
+                    "Bounded sink-effect predecessor wait exhausted for effect %s (lease_ttl_seconds=%.3f, poll_interval_seconds=%.3f)",
+                    effect.effect_id,
+                    self._lease_ttl.total_seconds(),
+                    self._poll_interval,
+                )
+                raise original_error
+
+            sleep_seconds = min(self._poll_interval, deadline - monotonic_now)
+            if sleep_seconds <= 0.0:  # pragma: no cover - guarded by deadline check
+                raise LandscapeRecordError("sink-effect predecessor wait produced a non-positive poll interval")
+            if self._shutdown_event is not None and self._sleep is time.sleep:
+                self._shutdown_event.wait(timeout=sleep_seconds)
+            else:
+                self._sleep(sleep_seconds)
 
     def _wait_until_effect_actionable(
         self,
@@ -1007,6 +1071,7 @@ class SinkEffectCoordinator:
             if self._held_lease_remaining_seconds(current) is not None:
                 raise SinkEffectLeaseHeld(f"sink effect {effect.effect_id} preparation advanced concurrently under another worker") from exc
             raise
+        self._fault(SinkEffectExecutionSeam.AFTER_PREPARATION_CLAIM)
         effect = self._require_effect(effect.effect_id)
         if effect.state is not SinkEffectState.RESERVED:  # pragma: no cover - claim holds the effect reserved
             return self._load_plan(effect)
@@ -1062,6 +1127,7 @@ class SinkEffectCoordinator:
                         latency_ms=(time.monotonic() - started) * 1_000,
                     )
                 )
+            self._fault(SinkEffectExecutionSeam.AFTER_INSPECTION)
             heartbeat.refresh_and_check()
             prepare_request = SinkEffectPrepareRequest(
                 effect_id=effect.effect_id,
@@ -1074,6 +1140,7 @@ class SinkEffectCoordinator:
             heartbeat.stop()
         heartbeat.refresh_and_check()
         self._effects.complete_plan(effect.effect_id, plan, claim=claim)
+        self._fault(SinkEffectExecutionSeam.AFTER_PLAN_CAS)
         return plan
 
     @staticmethod

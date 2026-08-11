@@ -167,7 +167,7 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:67611d440f35c4ab"
+    source_file_hash: str | None = "sha256:d256471d62211308"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
@@ -470,6 +470,15 @@ class JSONSink(BaseSink):
                 current_member = current_by_effect_id.get(snapshot_member.member_effect_id)
                 try:
                     serialized = json.dumps(output, indent=self._indent if self._format == "json" else None, allow_nan=False)
+                    serialized.encode(self._encoding)
+                except UnicodeEncodeError as exc:
+                    reason = f"JSON encoding ({self._encoding}) failed: {exc}"
+                    if current_member is None:
+                        raise ValueError(f"Predecessor JSON snapshot is incompatible: {reason}") from exc
+                    self._divert_row(original, row_index=current_member.ordinal, reason=reason)
+                    diverted.append(current_member.ordinal)
+                    diversion_attribution.append(build_diversion_attribution(ordinal=current_member.ordinal, reason=reason))
+                    continue
                 except (ValueError, TypeError) as exc:
                     reason = f"JSON serialization failed: {exc}"
                     if current_member is None:
@@ -480,7 +489,6 @@ class JSONSink(BaseSink):
                     continue
                 if current_member is not None:
                     accepted.append(current_member.ordinal)
-                serialized.encode(self._encoding)
                 yield snapshot_member.ordinal, serialized
 
         def jsonl_chunks() -> Iterator[bytes]:
