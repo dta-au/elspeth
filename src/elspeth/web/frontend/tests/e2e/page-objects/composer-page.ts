@@ -45,4 +45,72 @@ export class ComposerPage {
   executeButton(): Locator {
     return this.page.getByRole("button", { name: /Execute pipeline/i });
   }
+
+  workspace(): Locator {
+    return this.page.getByTestId("composer-workspace");
+  }
+
+  authoringPane(): Locator {
+    return this.page.getByRole("region", { name: "Authoring pane" });
+  }
+
+  separator(): Locator {
+    return this.page.getByRole("separator", { name: "Resize authoring pane" });
+  }
+
+  artifactRegion(): Locator {
+    return this.page.getByRole("region", { name: "Pipeline artifact" });
+  }
+
+  artifactTab(name: "Graph" | "Spec" | "YAML" | "Run"): Locator {
+    return this.page.getByRole("tab", { name, exact: true });
+  }
+
+  activeArtifactPanel(): Locator {
+    return this.page.locator('.artifact-workspace-panel:not([hidden])');
+  }
+
+  inspector(): Locator {
+    return this.page.getByRole("complementary", { name: "Inspector" });
+  }
+
+  inspectorBody(): Locator {
+    return this.page.locator(".workspace-inspector-body");
+  }
+
+  actionBar(): Locator {
+    return this.page.getByRole("group", { name: "Workspace actions" });
+  }
+
+  collapseAuthoring(): Locator {
+    return this.page.getByRole("button", { name: "Collapse authoring pane" });
+  }
+
+  restoreAuthoring(): Locator {
+    return this.page.getByRole("button", { name: "Restore authoring pane" });
+  }
+
+  composeViewTab(): Locator {
+    return this.page.getByRole("tab", { name: "Compose", exact: true });
+  }
+
+  pipelineViewTab(): Locator {
+    return this.page.getByRole("tab", { name: "Pipeline", exact: true });
+  }
+
+  validationStatus(): Locator {
+    return this.page.getByRole("button", { name: /^Validation: / });
+  }
+
+  auditStatus(): Locator {
+    return this.page.getByRole("button", { name: /^Audit: / });
+  }
+
+  moreActions(): Locator {
+    return this.page.getByRole("button", { name: "More actions" });
+  }
+
+  runPipeline(): Locator {
+    return this.page.getByRole("button", { name: "Run pipeline" });
+  }
 }
