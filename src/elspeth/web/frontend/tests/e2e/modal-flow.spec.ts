@@ -1,8 +1,9 @@
-// Modal flow spec — Graph modal, YAML modal, Catalog modal.
+// Composer navigation and modal flow spec — persistent Graph/YAML artifacts,
+// explicit Graph focus mode, and Catalog drawer.
 //
-// Covers the riskiest modal surface: modal open/close via three entry
-// points (SideRail click, Escape key, keyboard shortcut) plus hash-routed
-// deep links for graph and yaml.
+// Graph/YAML shortcuts and deep links select the persistent workspace tabs.
+// The Graph modal remains available only through the explicit Focus Graph
+// action; Catalog remains a modal drawer.
 //
 // Existing modal-adjacent stubs (yaml-export-roundtrip.spec.ts,
 // topology.spec.ts) are both tracked test.skip (elspeth-7cf763da7c) — they
@@ -89,7 +90,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
   // ── Graph modal ──────────────────────────────────────────────────────────
 
   test.describe("Graph modal", () => {
-    test("Ctrl+Shift+G keyboard shortcut opens the Graph modal; Escape closes it", async ({
+    test("explicit Focus Graph action opens the Graph modal; Escape closes it", async ({
       page,
     }) => {
       const storageState = await page.context().storageState();
@@ -103,16 +104,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        // The GraphMiniView renders "No pipeline yet" when there is no
-        // composition state. Click it expecting the OPEN_GRAPH_MODAL_EVENT
-        // dispatch. The aria-label on GraphMiniView's empty-state div is not
-        // a button so the modal won't open from the empty state — use the
-        // keyboard shortcut path instead, which is always available.
-        // (See GraphMiniView.tsx: the button is only rendered when state exists.)
-        //
-        // Use Ctrl+Shift+G as the trigger: it is always wired regardless of
-        // composition state (App.tsx:154-163).
-        await page.keyboard.press("Control+Shift+G");
+        await page.getByRole("button", { name: "Focus Graph" }).click();
 
         const dialog = page.getByRole("dialog", { name: /pipeline graph/i });
         await expect(dialog).toBeVisible();
@@ -127,9 +119,10 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
       }
     });
 
-    test("deep link /#/{id}/graph opens the Graph modal and rewrites hash to canonical", async ({
+    test("deep link /#/{id}/graph selects Graph and rewrites hash to canonical", async ({
       page,
     }) => {
+      await page.setViewportSize({ width: 720, height: 720 });
       const storageState = await page.context().storageState();
       const token = tokenFromStorageState(storageState);
       const ctx = await authedContext(token);
@@ -138,13 +131,16 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         const session = await createSession(ctx, "pw-3b-graph-deeplink");
         sessionId = session.id;
 
-        // Navigate directly to the verb URL. useHashRouter dispatches
-        // OPEN_GRAPH_MODAL_EVENT via queueMicrotask and then rewrites the hash.
         await page.goto(`/#/${sessionId}/graph`);
-        await new ComposerPage(page).waitForChatReady();
+        await page.getByTestId("composer-workspace").waitFor();
 
-        const dialog = page.getByRole("dialog", { name: /pipeline graph/i });
-        await expect(dialog).toBeVisible();
+        const graphTab = page.getByRole("tab", { name: "Graph" });
+        await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+        await expect(graphTab).toHaveAttribute("aria-selected", "true");
+        await expect(graphTab).toBeFocused();
+        await expect(
+          page.getByRole("dialog", { name: /pipeline graph/i }),
+        ).toHaveCount(0);
 
         // Hash must be rewritten to canonical (verb fragment stripped).
         await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
@@ -156,9 +152,10 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
       }
     });
 
-    test("Ctrl+Shift+G keyboard shortcut opens the Graph modal", async ({
+    test("Ctrl+Shift+G keyboard shortcut selects the Graph artifact", async ({
       page,
     }) => {
+      await page.setViewportSize({ width: 720, height: 720 });
       const storageState = await page.context().storageState();
       const token = tokenFromStorageState(storageState);
       const ctx = await authedContext(token);
@@ -170,11 +167,23 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
+        await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
+        await page.getByRole("tab", { name: "Run" }).click();
+        await expect(page.getByRole("tab", { name: "Run" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+        await page.getByRole("tab", { name: "Compose", exact: true }).click();
+
         await page.keyboard.press("Control+Shift+G");
 
+        const graphTab = page.getByRole("tab", { name: "Graph" });
+        await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+        await expect(graphTab).toHaveAttribute("aria-selected", "true");
+        await expect(graphTab).toBeFocused();
         await expect(
           page.getByRole("dialog", { name: /pipeline graph/i }),
-        ).toBeVisible();
+        ).toHaveCount(0);
       } finally {
         if (sessionId !== undefined) {
           await deleteSession(ctx, sessionId);
@@ -184,12 +193,13 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
     });
   });
 
-  // ── YAML modal ───────────────────────────────────────────────────────────
+  // ── YAML artifact ────────────────────────────────────────────────────────
 
-  test.describe("YAML modal", () => {
-    test("SideRail Export YAML button opens the YAML modal; Escape closes it", async ({
+  test.describe("YAML artifact", () => {
+    test("Export YAML command selects and focuses the persistent YAML artifact", async ({
       page,
     }) => {
+      await page.setViewportSize({ width: 720, height: 720 });
       const storageState = await page.context().storageState();
       const token = tokenFromStorageState(storageState);
       const ctx = await authedContext(token);
@@ -202,21 +212,26 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        // ExportYamlButton is content-gated. Seed an exportable state above so
-        // this test covers the open/close path instead of the empty-pipeline
-        // disabled affordance.
+        // Export YAML is content-gated. Seed an exportable state above so the
+        // command is available before exercising its narrow-view transition.
+        await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
         const exportYamlBtn = page.getByRole("button", {
           name: /export yaml/i,
         });
         await expect(exportYamlBtn).toBeVisible();
         await expect(exportYamlBtn).toBeEnabled();
-        await exportYamlBtn.click();
+        await page.getByRole("tab", { name: "Compose", exact: true }).click();
+        await page.keyboard.press("Control+k");
+        await page.getByRole("option", { name: "Export YAML" }).click();
 
-        const dialog = page.getByRole("dialog", { name: /export yaml/i });
-        await expect(dialog).toBeVisible();
-
-        await page.keyboard.press("Escape");
-        await expect(dialog).not.toBeVisible();
+        const yamlTab = page.getByRole("tab", { name: "YAML" });
+        await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toBeFocused();
+        await expect(page.getByRole("tabpanel", { name: "YAML" })).toBeVisible();
+        await expect(
+          page.getByRole("dialog", { name: /export yaml/i }),
+        ).toHaveCount(0);
       } finally {
         if (sessionId !== undefined) {
           await deleteSession(ctx, sessionId);
@@ -225,9 +240,10 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
       }
     });
 
-    test("deep link /#/{id}/yaml opens the YAML modal and rewrites hash to canonical", async ({
+    test("deep link /#/{id}/yaml selects YAML and rewrites hash to canonical", async ({
       page,
     }) => {
+      await page.setViewportSize({ width: 720, height: 720 });
       const storageState = await page.context().storageState();
       const token = tokenFromStorageState(storageState);
       const ctx = await authedContext(token);
@@ -238,10 +254,15 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await seedExportableCompositionState(ctx, sessionId);
 
         await page.goto(`/#/${sessionId}/yaml`);
-        await new ComposerPage(page).waitForChatReady();
+        await page.getByTestId("composer-workspace").waitFor();
 
-        const dialog = page.getByRole("dialog", { name: /export yaml/i });
-        await expect(dialog).toBeVisible();
+        const yamlTab = page.getByRole("tab", { name: "YAML" });
+        await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toBeFocused();
+        await expect(
+          page.getByRole("dialog", { name: /export yaml/i }),
+        ).toHaveCount(0);
 
         await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
       } finally {
@@ -252,9 +273,10 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
       }
     });
 
-    test("Ctrl+Shift+Y keyboard shortcut opens the YAML modal", async ({
+    test("Ctrl+Shift+Y keyboard shortcut selects the YAML artifact", async ({
       page,
     }) => {
+      await page.setViewportSize({ width: 720, height: 720 });
       const storageState = await page.context().storageState();
       const token = tokenFromStorageState(storageState);
       const ctx = await authedContext(token);
@@ -269,12 +291,18 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
 
         // State hydration is asynchronous. The shortcut uses the same
         // composition-content gate as this button, so wait for that gate.
+        await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
         await expect(page.getByRole("button", { name: /export yaml/i })).toBeEnabled();
+        await page.getByRole("tab", { name: "Compose", exact: true }).click();
         await page.keyboard.press("Control+Shift+Y");
 
+        const yamlTab = page.getByRole("tab", { name: "YAML" });
+        await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toHaveAttribute("aria-selected", "true");
+        await expect(yamlTab).toBeFocused();
         await expect(
           page.getByRole("dialog", { name: /export yaml/i }),
-        ).toBeVisible();
+        ).toHaveCount(0);
       } finally {
         if (sessionId !== undefined) {
           await deleteSession(ctx, sessionId);
@@ -284,10 +312,39 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
     });
   });
 
+  test.describe("narrow persistent artifact deep links", () => {
+    for (const [verb, tab] of [["spec", "Spec"], ["runs", "Run"]] as const) {
+      test(`/${verb} reveals Pipeline and focuses ${tab}`, async ({ page }) => {
+        await page.setViewportSize({ width: 720, height: 720 });
+        const storageState = await page.context().storageState();
+        const token = tokenFromStorageState(storageState);
+        const ctx = await authedContext(token);
+        let sessionId: string | undefined;
+        try {
+          const session = await createSession(ctx, `pw-3b-${verb}-deeplink`);
+          sessionId = session.id;
+          if (verb === "spec") await seedExportableCompositionState(ctx, sessionId);
+
+          await page.goto(`/#/${sessionId}/${verb}`);
+          await page.getByTestId("composer-workspace").waitFor();
+
+          await expect(page.getByRole("tab", { name: "Pipeline", exact: true })).toHaveAttribute("aria-selected", "true");
+          const artifactTab = page.getByRole("tab", { name: tab, exact: true });
+          await expect(artifactTab).toHaveAttribute("aria-selected", "true");
+          await expect(artifactTab).toBeFocused();
+          await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
+        } finally {
+          if (sessionId !== undefined) await deleteSession(ctx, sessionId);
+          await ctx.dispose();
+        }
+      });
+    }
+  });
+
   // ── Catalog modal ─────────────────────────────────────────────────────────
   // CatalogDrawer renders as a drawer (role="dialog" with name "Plugin Catalog")
   // opened by the OPEN_CATALOG_EVENT. No hash-routed deep link exists for
-  // catalog (useHashRouter.ts ACTION_VERBS only contains "graph" and "yaml").
+  // catalog (useHashRouter owns only persistent artifact verbs).
   // Deep-link assertion is skipped per the task brief.
 
   test.describe("Catalog modal", () => {
@@ -305,6 +362,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
+        await page.getByRole("button", { name: "More actions" }).click();
         const catalogBtn = page.getByRole("button", {
           name: /catalog \(reference\)/i,
         });

@@ -129,6 +129,7 @@ test.describe("empty run discard visibility", () => {
         const composer = new ComposerPage(page);
         await composer.goto(session.id);
         await composer.waitForChatReady();
+        await composer.artifactTab("Run").click();
 
         const warning = page.getByRole("alert").filter({
           hasText: /2 rows discarded at source validation/i,

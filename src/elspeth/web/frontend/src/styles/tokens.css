@@ -177,8 +177,8 @@
   /* ── Sizing ──────────────────────────────────────────────────────────────── */
   --inspector-default-width: 320px;
   --inspector-min-width:     240px;
-  /* Composer shell right rail. Consumed by .app-layout's grid template in
-     shared.css (previously a hardcoded inline style in Layout.tsx). */
+  /* Guided authoring's embedded artifact rail. The common desktop workspace
+     owns its width independently through --authoring-pane-width. */
   --siderail-width:          320px;
 
   /* ── Typography — Inter for body, system fallback ────────────────────────── */

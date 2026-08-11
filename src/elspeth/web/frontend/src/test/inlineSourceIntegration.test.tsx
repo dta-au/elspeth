@@ -36,8 +36,7 @@
 // provenance today. Re-enable when Task 7 wires the row.
 // ============================================================================
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "../App";
@@ -65,6 +64,13 @@ const READY_READINESS = {
   blockers: [],
 };
 
+class PassiveResizeObserver implements ResizeObserver {
+  constructor(_callback: ResizeObserverCallback) {}
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
+
 // ── Sub-component stubs ──────────────────────────────────────────────────────
 // We render <App /> end-to-end (so ChatPanel's projection effect, store
 // wiring, and useComposer hook all participate), but stub the heavy
@@ -75,22 +81,8 @@ vi.mock("../components/common/AppHeader", () => ({
   AppHeader: () => <div data-testid="app-header-stub" />,
 }));
 
-// SideRail itself is stubbed (we don't render the catalog/execute/graph
-// affordances for this test), but the audit-readiness slot is forwarded
-// so the real AuditReadinessPanel mounts and assertion (g) can reach
-// the inline-source provenance row.
-vi.mock("../components/sidebar/SideRail", () => ({
-  SideRail: ({ auditReadinessSlot }: { auditReadinessSlot?: ReactNode }) => (
-    <div data-testid="side-rail-stub">{auditReadinessSlot}</div>
-  ),
-}));
-
 vi.mock("../components/sidebar/GraphModal", () => ({
   GraphModal: () => null,
-}));
-
-vi.mock("../components/sidebar/ExportYamlModal", () => ({
-  ExportYamlModal: () => null,
 }));
 
 vi.mock("../components/catalog/CatalogDrawer", () => ({
@@ -345,6 +337,7 @@ function makeSendMessageResponse(): MessageWithStateResponse {
 
 describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widget", () => {
   beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
     vi.clearAllMocks();
     // jsdom does not implement Element.prototype.scrollIntoView, but
     // ChatPanel calls it on every render via its auto-scroll effect.
@@ -425,6 +418,10 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
     ]);
     vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
     vi.spyOn(api, "listBlobs").mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("verbatim path — user types a URL, set_pipeline returns inline_blob, widget renders WITHOUT Edit button", async () => {

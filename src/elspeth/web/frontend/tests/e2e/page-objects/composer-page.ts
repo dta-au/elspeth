@@ -32,10 +32,9 @@ export class ComposerPage {
   }
 
   chatInput(): Locator {
-    // ChatInput renders a textarea inside an aria-labelled region. Use the
-    // textbox role with the existing label "Message" (or fall back to any
-    // single textarea inside the chat panel).
-    return this.page.getByRole("textbox").filter({ hasText: "" }).first();
+    return this.page
+      .getByLabel("Chat panel")
+      .locator("textarea.chat-input-textarea");
   }
 
   validateButton(): Locator {
@@ -44,5 +43,89 @@ export class ComposerPage {
 
   executeButton(): Locator {
     return this.page.getByRole("button", { name: /Execute pipeline/i });
+  }
+
+  workspace(): Locator {
+    return this.page.getByTestId("composer-workspace");
+  }
+
+  authoringPane(): Locator {
+    return this.page.getByRole("region", { name: "Authoring pane" });
+  }
+
+  separator(): Locator {
+    return this.page.getByRole("separator", { name: "Resize authoring pane" });
+  }
+
+  artifactRegion(): Locator {
+    return this.page.getByRole("region", { name: "Pipeline artifact" });
+  }
+
+  artifactTab(name: "Graph" | "Spec" | "YAML" | "Run"): Locator {
+    return this.page.getByRole("tab", { name, exact: true });
+  }
+
+  activeArtifactPanel(): Locator {
+    return this.page.locator('.artifact-workspace-panel:not([hidden])');
+  }
+
+  inspector(): Locator {
+    return this.page.getByRole("complementary", { name: "Inspector" });
+  }
+
+  inspectorBody(): Locator {
+    return this.page.locator(".workspace-inspector-body");
+  }
+
+  inspectorTab(name: "Validation" | "Audit"): Locator {
+    return this.inspector().getByRole("tab", { name, exact: true });
+  }
+
+  closeInspector(): Locator {
+    return this.inspector().getByRole("button", { name: "Close inspector" });
+  }
+
+  actionBar(): Locator {
+    return this.page.getByRole("group", { name: "Workspace actions" });
+  }
+
+  collapseAuthoring(): Locator {
+    return this.page.getByRole("button", { name: "Collapse authoring pane" });
+  }
+
+  restoreAuthoring(): Locator {
+    return this.page.getByRole("button", { name: "Restore authoring pane" });
+  }
+
+  composeViewTab(): Locator {
+    return this.page.getByRole("tab", { name: "Compose", exact: true });
+  }
+
+  pipelineViewTab(): Locator {
+    return this.page.getByRole("tab", { name: "Pipeline", exact: true });
+  }
+
+  validationStatus(): Locator {
+    return this.page.getByRole("button", { name: /^Validation: / });
+  }
+
+  auditStatus(): Locator {
+    return this.page.getByRole("button", { name: /^Audit: / });
+  }
+
+  moreActions(): Locator {
+    return this.page.getByRole("button", { name: "More actions" });
+  }
+
+  runPipeline(): Locator {
+    return this.page.getByRole("button", { name: "Run pipeline" });
+  }
+
+  saveForReview(): Locator {
+    return this.page.getByRole("button", { name: "Save for review" });
+  }
+
+  exportYaml(): Locator {
+    return this.page.getByRole("button", { name: "Export YAML" });
   }
 }

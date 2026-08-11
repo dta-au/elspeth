@@ -1,4 +1,11 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useMemo,
+  useRef,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import "./styles/index.css";
 import * as api from "./api/client";
 import {
@@ -8,25 +15,27 @@ import {
 } from "./utils/deployBeacon";
 import { AuthGuard } from "./components/common/AuthGuard";
 import { AppHeader } from "./components/common/AppHeader";
-import { Layout } from "./components/common/Layout";
-import { SideRail } from "./components/sidebar/SideRail";
-import { GraphMiniView } from "./components/sidebar/GraphMiniView";
 import { GraphModal } from "./components/sidebar/GraphModal";
-import { ExportYamlModal } from "./components/sidebar/ExportYamlModal";
 import { ImportYamlModalHost } from "./components/sidebar/ImportYamlModal";
-import { CatalogButton } from "./components/sidebar/CatalogButton";
 import { CommandPalette } from "./components/common/CommandPalette";
 import { ConfirmDialog } from "./components/common/ConfirmDialog";
+import {
+  AppNoticeCenter,
+  type AppNotice,
+} from "./components/common/AppNoticeCenter";
 import { ShortcutsHelp } from "./components/common/ShortcutsHelp";
+import { DefaultModeChangedBanner } from "./components/common/DefaultModeChangedBanner";
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
-import { AuditReadinessPanel } from "./components/audit/AuditReadinessPanel";
 import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
 import { HelloWorldTutorial } from "./components/tutorial";
-import { SideRailValidationBanner } from "./components/sidebar/SideRailValidationBanner";
-import { REQUEST_RUN_EVENT } from "./lib/composer-events";
+import {
+  REQUEST_RUN_EVENT,
+  dispatchAuthoringFocusIntent,
+  dispatchArtifactViewIntent,
+} from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
 import { useSessionStore } from "./stores/sessionStore";
@@ -46,12 +55,15 @@ import {
 } from "./hooks/useDocumentTitle";
 import { hasCompositionContent } from "./utils/compositionState";
 import { SharedInspectView } from "./components/shared/SharedInspectView";
-import { CompletionBar } from "./components/composer/CompletionBar";
 import { SaveForReviewDialog } from "./components/composer/SaveForReviewDialog";
+import { ComposerWorkspace } from "./components/workspace/ComposerWorkspace";
+import { ArtifactWorkspace } from "./components/workspace/ArtifactWorkspace";
+import { WorkspaceInspector } from "./components/workspace/WorkspaceInspector";
+import { WorkspaceActionBar } from "./components/workspace/WorkspaceActionBar";
+import { useWorkspacePaneController } from "./components/workspace/WorkspacePaneContext";
+import { useCollapsedAuthoringStatus } from "./components/workspace/useCollapsedAuthoringStatus";
 import { useSessionLifecycle } from "./hooks/useSession";
 import {
-  OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
   OPEN_CATALOG_EVENT,
 } from "./lib/composer-events";
 import type { SystemStatus } from "./types/index";
@@ -68,9 +80,23 @@ initStoreSubscriptions();
  * Top-level application component.
  *
  * Single composition root: AuthGuard gates the entire app behind authentication,
- * then AppHeader and Layout render the composer shell with ChatPanel and
- * SideRail. No router in v1 -- the entire application is a single page.
+ * then AppHeader and ComposerWorkspace render the authoring and artifact
+ * surfaces. No router in v1 -- the entire application is a single page.
  */
+function CollapsedAuthoringStatus(): JSX.Element {
+  const activeSessionId = useSessionStore((state) => state.activeSessionId);
+  const { state } = useWorkspacePaneController();
+  const status = useCollapsedAuthoringStatus({
+    activeSessionId,
+    authoringCollapsed: state.authoringCollapsed,
+  });
+  return (
+    <span className="workspace-collapsed-status" data-tone={status.tone}>
+      {status.text}
+    </span>
+  );
+}
+
 function App() {
   const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
   // Deploy-cache coherence beacon: this tab's own bundle identity (null in
@@ -189,15 +215,29 @@ function App() {
     !showTutorial &&
     !showEmptyLanding &&
     !guidedBuildActive;
+  const catalogAvailable = !guidedBuildActive;
+  const workspaceActionCapabilities = useMemo(
+    () => ({
+      completion: runAdmissionAvailable,
+      importYaml: !guidedBuildActive,
+      catalog: catalogAvailable,
+    }),
+    [catalogAvailable, guidedBuildActive, runAdmissionAvailable],
+  );
 
   useEffect(() => {
+    if (!catalogAvailable) {
+      setCatalogOpen(false);
+      return;
+    }
+
     function handleOpenCatalog() {
       setCatalogOpen(true);
     }
 
     window.addEventListener(OPEN_CATALOG_EVENT, handleOpenCatalog);
     return () => window.removeEventListener(OPEN_CATALOG_EVENT, handleOpenCatalog);
-  }, []);
+  }, [catalogAvailable]);
 
   // Phase 1B + I5: load account-level composer preferences once authenticated.
   // bootstrapPrefs() is contracted to NEVER reject — it catches failures
@@ -214,6 +254,13 @@ function App() {
   const openSecrets = useCallback(() => setShowSecrets(true), []);
   const closeSecrets = useCallback(() => setShowSecrets(false), []);
   const closePalette = useCallback(() => setShowPalette(false), []);
+  const focusMainContent = useCallback(
+    (event: ReactMouseEvent<HTMLAnchorElement>) => {
+      event.preventDefault();
+      document.getElementById("composer-main")?.focus({ preventScroll: true });
+    },
+    [],
+  );
   const confirmFanoutExecution = useCallback(async () => {
     await useExecutionStore.getState().confirmFanoutExecution();
   }, []);
@@ -326,22 +373,28 @@ function App() {
         (e.ctrlKey || e.metaKey)
       ) {
         e.preventDefault();
-        window.dispatchEvent(new CustomEvent(OPEN_CATALOG_EVENT));
+        if (catalogAvailable) {
+          window.dispatchEvent(new CustomEvent(OPEN_CATALOG_EVENT));
+        }
         return;
       }
 
-      // Ctrl+Shift+G / Cmd+Shift+G: Open graph modal
+      // Ctrl+Shift+G / Cmd+Shift+G: Select the persistent Graph artifact.
       if (
         e.key.toLowerCase() === "g" &&
         e.shiftKey &&
         (e.ctrlKey || e.metaKey)
       ) {
         e.preventDefault();
-        window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
+        dispatchArtifactViewIntent({
+          tab: "graph",
+          focusMode: false,
+          sessionId: activeSessionId,
+        });
         return;
       }
 
-      // Ctrl+Shift+Y / Cmd+Shift+Y: Open YAML export modal.
+      // Ctrl+Shift+Y / Cmd+Shift+Y: Select the persistent YAML artifact.
       // Gated on composition content — the same hasCompositionContent
       // predicate ExportYamlButton uses — so the shortcut can't open the
       // near-empty modal on a pipeline with nothing to export
@@ -352,8 +405,12 @@ function App() {
         (e.ctrlKey || e.metaKey)
       ) {
         e.preventDefault();
-        if (hasCompositionContent(compositionState)) {
-          window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
+        if (activeSessionId && hasCompositionContent(compositionState)) {
+          dispatchArtifactViewIntent({
+            tab: "yaml",
+            focusMode: false,
+            sessionId: activeSessionId,
+          });
         }
         return;
       }
@@ -368,10 +425,7 @@ function App() {
       // Ctrl+/ / Cmd+/: Focus chat input
       if (e.key === "/" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        const input = document.querySelector<HTMLTextAreaElement>(
-          "[data-chat-input]",
-        );
-        input?.focus();
+        dispatchAuthoringFocusIntent();
         return;
       }
 
@@ -416,7 +470,13 @@ function App() {
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [createSession, activeSessionId, compositionState, runAdmissionAvailable]);
+  }, [
+    activeSessionId,
+    catalogAvailable,
+    compositionState,
+    createSession,
+    runAdmissionAvailable,
+  ]);
 
   // Initial health check and periodic polling
   useEffect(() => {
@@ -447,6 +507,122 @@ function App() {
     wasAuthenticatedRef.current = isAuthenticated;
   }, [isAuthenticated, checkHealth]);
 
+  const appNotices = useMemo<AppNotice[]>(() => {
+    const notices: AppNotice[] = [];
+    if (backendAvailable === false) {
+      notices.push({
+        kind: "backend-unavailable",
+        role: "alert",
+        content: (
+          <>
+            <strong>Backend unavailable</strong> — Cannot connect to the
+            ELSPETH server. Check that the backend is running.
+            {lastHealthCheckAt !== null ? (
+              <> Last attempt: {lastHealthCheckAt}.</>
+            ) : null}
+          </>
+        ),
+        action: (
+          <button
+            type="button"
+            onClick={checkHealth}
+            disabled={healthChecking}
+            aria-busy={healthChecking}
+            aria-label="Retry connection"
+            title="Retry connection"
+            className="alert-banner-action"
+          >
+            {healthChecking ? "Checking…" : "Retry"}
+          </button>
+        ),
+      });
+    }
+    if (preferencesWriteError !== null) {
+      notices.push({
+        kind: "preferences",
+        role: "alert",
+        content: (
+          <>
+            <strong>Preferences:</strong> {preferencesWriteError}
+          </>
+        ),
+      });
+    }
+    if (redirectToast !== null) {
+      notices.push({
+        kind: "redirect",
+        role: "alert",
+        tone: "info",
+        content: redirectToast.message,
+        action: (
+          <button
+            type="button"
+            className="alert-banner-action"
+            onClick={redirectToast.dismiss}
+            aria-label="Dismiss"
+          >
+            Dismiss
+          </button>
+        ),
+      });
+    }
+    if (staleBuildDetected) {
+      notices.push({
+        kind: "stale-build",
+        role: "status",
+        content: "A new version of ELSPETH is available — refresh to load it.",
+        action: (
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="alert-banner-action"
+          >
+            Refresh
+          </button>
+        ),
+      });
+    }
+    if (
+      backendAvailable &&
+      systemStatus !== null &&
+      !systemStatus.composer_available
+    ) {
+      notices.push({
+        kind: "composer-unavailable",
+        role: "status",
+        content: (
+          <>
+            Service unavailable:{" "}
+            {systemStatus.composer_reason ??
+              "The composer cannot reach a usable LLM right now."}
+          </>
+        ),
+        action: (
+          <button
+            type="button"
+            onClick={openSecrets}
+            aria-label="Open secrets settings"
+            title="Configure API keys"
+            className="alert-banner-action"
+          >
+            ⚙ API Keys
+          </button>
+        ),
+      });
+    }
+    return notices;
+  }, [
+    backendAvailable,
+    checkHealth,
+    healthChecking,
+    lastHealthCheckAt,
+    openSecrets,
+    preferencesWriteError,
+    redirectToast,
+    staleBuildDetected,
+    systemStatus,
+  ]);
+
   // Phase 6B Task 8 short-circuit: if the URL hash is `#/shared/{token}`,
   // render the read-only inspect view inside AuthGuard. The token is a
   // CAPABILITY, not an authenticator — the recipient must still be logged
@@ -465,124 +641,37 @@ function App() {
   return (
     <AuthGuard>
       <div className="app-root">
-        <a href="#chat-main" className="skip-to-content">
+        <a
+          href="#composer-main"
+          className="skip-to-content"
+          onClick={focusMainContent}
+        >
           Skip to main content
         </a>
         <h1 className="sr-only">ELSPETH Pipeline Composer</h1>
 
-        {/* Redirect toast: shown once when a stale hash fragment (e.g. #/id/runs
-            or #/id/spec) is detected. Dismissed by clicking the button; dismissal
-            is persisted in localStorage so the toast never reappears.
-            Uses role=alert so assistive technology announces it immediately. */}
-        {redirectToast && (
-          <div role="alert" className="alert-banner alert-banner--info">
-            <span>{redirectToast.message}</span>
-            <button
-              type="button"
-              className="alert-banner-action"
-              onClick={redirectToast.dismiss}
-              aria-label="Dismiss"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {/* Backend unavailable banner.
-            role=alert (assertive) because backend-down is a hard outage that
-            blocks every feature in the app; the composer-unavailable banner
-            below is role=status (polite) because it's a soft degradation. */}
-        {backendAvailable === false && (
-          <div role="alert" className="alert-banner">
-            <span>
-              <strong>Backend unavailable</strong> — Cannot connect to the
-              ELSPETH server. Check that the backend is running.
-              {lastHealthCheckAt !== null && (
-                <> Last attempt: {lastHealthCheckAt}.</>
-              )}
-            </span>
-            <button
-              onClick={checkHealth}
-              disabled={healthChecking}
-              aria-busy={healthChecking}
-              aria-label="Retry connection"
-              title="Retry connection"
-              className="alert-banner-action"
-            >
-              {healthChecking ? "Checking…" : "Retry"}
-            </button>
-          </div>
-        )}
-
-        {/* I5: preferences-bootstrap failure banner. The store's bootstrap()
-            is contracted to set writeError on failure (no fabricated defaults);
-            without this always-mounted surface, the writeError would be set
-            but invisible — the other components that read writeError mount
-            conditionally (DefaultModeChangedBanner only on mode-change flows,
-            ComposerPreferencesPanel only when settings is open, and
-            ComposerPreferencesForm explicitly returns null when defaultMode
-            is null, which is exactly the bootstrap-failure shape). Moving the
-            silent failure one layer up would defeat the purpose of I5.
-            Mounting here, alongside the backend-unavailable and
-            composer-unavailable banners, is the standard "always-on chrome"
-            surface for non-blocking failure signals. */}
-        {preferencesWriteError !== null && (
-          <div role="alert" className="alert-banner">
-            <span>
-              <strong>Preferences:</strong> {preferencesWriteError}
-            </span>
-          </div>
-        )}
-
-        {/* Deploy beacon: this tab is running a previous bundle (stale
-            hashed assets may 404 and new features are absent). Non-blocking,
-            persistent once latched; refresh is the only clear. */}
-        {staleBuildDetected && (
-          <div role="status" className="alert-banner">
-            <span>
-              A new version of ELSPETH is available — refresh to load it.
-            </span>
-            <button
-              onClick={() => window.location.reload()}
-              className="alert-banner-action"
-            >
-              Refresh
-            </button>
-          </div>
-        )}
-
-        {/* Composer unavailable banner (backend is up but LLM not configured) */}
-        {backendAvailable && systemStatus && !systemStatus.composer_available && (
-          <div role="status" className="alert-banner">
-            <span>
-              Service unavailable:{" "}
-              {systemStatus.composer_reason ??
-                "The composer cannot reach a usable LLM right now."}
-            </span>
-            <button
-              onClick={openSecrets}
-              aria-label="Open secrets settings"
-              title="Configure API keys"
-              className="alert-banner-action"
-            >
-              ⚙ API Keys
-            </button>
-          </div>
-        )}
+        <AppNoticeCenter notices={appNotices} />
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
         />
         {showTutorial ? (
-          <HelloWorldTutorial
-            key={tutorialResetEpoch}
-            composerAvailable={systemStatus?.composer_available ?? false}
-            composerUnavailableReason={systemStatus?.composer_reason ?? null}
-            tutorialReady={systemStatus?.tutorial_ready ?? false}
-            tutorialUnavailableReason={systemStatus?.tutorial_reason ?? null}
-          />
+          <div id="composer-main" className="app-main" tabIndex={-1}>
+            <HelloWorldTutorial
+              key={tutorialResetEpoch}
+              composerAvailable={systemStatus?.composer_available ?? false}
+              composerUnavailableReason={systemStatus?.composer_reason ?? null}
+              tutorialReady={systemStatus?.tutorial_ready ?? false}
+              tutorialUnavailableReason={systemStatus?.tutorial_reason ?? null}
+            />
+          </div>
         ) : showEmptyLanding ? (
-          <div className="app-main" role="main">
+          <div
+            id="composer-main"
+            className="app-main"
+            role="main"
+            tabIndex={-1}
+          >
             <section
               className="empty-landing"
               aria-labelledby="empty-landing-title"
@@ -611,36 +700,22 @@ function App() {
             </section>
           </div>
         ) : (
-          <div className="app-main" role="main">
-            <Layout
-              chat={
-                <ChatPanel onOpenSecrets={openSecrets} />
-              }
-              siderail={
-                // While a guided build is on screen the workspace inside
-                // ChatPanel carries its own pipeline rail — suppress the
-                // freeform SideRail or two rails render side by side. It
-                // returns the moment the session leaves the build (completed
-                // terminal, exit to freeform): Run / Save-for-review /
-                // Copy-YAML live in CompletionBar, so the completed surface
-                // must have it back. isGuidedBuildActive is the SAME
-                // predicate ChatPanel's workspace branch renders under.
-                runAdmissionAvailable ? (
-                  <SideRail
-                    auditReadinessSlot={<AuditReadinessPanel />}
-                    validationBannerSlot={<SideRailValidationBanner />}
-                    graphMiniSlot={<GraphMiniView />}
-                    catalogSlot={<CatalogButton />}
-                    // Phase 6B Task 9 / Task 10: the three-button CompletionBar
-                    // is the single mount surface for Save-for-review, Run,
-                    // and Copy-YAML. The standalone ExportYamlButton +
-                    // ExecuteButton primitives that previously occupied
-                    // dedicated slots are now rendered INSIDE CompletionBar;
-                    // Phase 5b interpretation-gating and YAML modal dispatch
-                    // are preserved untouched.
-                    completionBarSlot={<CompletionBar />}
-                  />
-                ) : null
+          <div
+            id="composer-main"
+            className="app-main"
+            role="main"
+            tabIndex={-1}
+          >
+            <ComposerWorkspace
+              authoring={<ChatPanel onOpenSecrets={openSecrets} />}
+              authoringStatus={<DefaultModeChangedBanner />}
+              collapsedStatus={<CollapsedAuthoringStatus />}
+              artifact={<ArtifactWorkspace />}
+              inspector={<WorkspaceInspector />}
+              actionBar={
+                <WorkspaceActionBar
+                  capabilities={workspaceActionCapabilities}
+                />
               }
             />
           </div>
@@ -648,7 +723,6 @@ function App() {
 
         {showSecrets && <SecretsPanel onClose={closeSecrets} />}
         <GraphModal />
-        <ExportYamlModal />
         <ImportYamlModalHost />
         {/* Phase 6B Task 4: mount the SaveForReviewDialog at app-root level so
          *  CompletionBar's Save-for-review verb can open it regardless of

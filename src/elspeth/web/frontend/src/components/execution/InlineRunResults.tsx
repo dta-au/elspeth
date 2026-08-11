@@ -1,12 +1,15 @@
 // ============================================================================
 // InlineRunResults
 //
-// Mounts in the chat column and renders the active or most-recent run's
-// progress and outputs. Historical access lives in RunsHistoryDrawer.
+// Mounts in the persistent Run artifact and renders the active or most-recent
+// run's progress and outputs. Historical access lives in RunsHistoryDrawer.
 // ============================================================================
 
 import { useEffect, useState } from "react";
-import { useExecutionStore } from "@/stores/executionStore";
+import {
+  type RunHistoryLoadOutcome,
+  useExecutionStore,
+} from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { ProgressView } from "@/components/execution/ProgressView";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
@@ -214,7 +217,18 @@ function DiscardSummaryWarning({ run }: { run: Run | null }): JSX.Element | null
   );
 }
 
-export function InlineRunResults(): JSX.Element | null {
+export interface InlineRunResultsProps {
+  showEmptyState?: boolean;
+}
+
+interface InitialRunLoadState {
+  sessionId: string | null;
+  status: Exclude<RunHistoryLoadOutcome, "stale"> | "loading";
+}
+
+export function InlineRunResults({
+  showEmptyState = false,
+}: InlineRunResultsProps = {}): JSX.Element | null {
   const activeRunId = useExecutionStore((s) => s.activeRunId);
   const progress = useExecutionStore((s) => s.progress);
   const runs = useExecutionStore((s) => s.runs);
@@ -222,11 +236,35 @@ export function InlineRunResults(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const [showHistory, setShowHistory] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [historyRetrySequence, setHistoryRetrySequence] = useState(0);
+  const [initialRunLoad, setInitialRunLoad] = useState<InitialRunLoadState>(
+    () => ({
+      sessionId: activeSessionId,
+      status: activeSessionId === null ? "loaded" : "loading",
+    }),
+  );
 
   useEffect(() => {
-    if (!activeSessionId) return;
-    void loadRuns(activeSessionId);
-  }, [activeSessionId, loadRuns]);
+    if (!activeSessionId) {
+      setInitialRunLoad({ sessionId: null, status: "loaded" });
+      return;
+    }
+    const sessionId = activeSessionId;
+    let cancelled = false;
+    setInitialRunLoad({ sessionId, status: "loading" });
+    const settle = (outcome: RunHistoryLoadOutcome): void => {
+      if (cancelled || outcome === "stale") return;
+      setInitialRunLoad((current) =>
+        current.sessionId === sessionId
+          ? { sessionId, status: outcome }
+          : current,
+      );
+    };
+    void loadRuns(sessionId).then(settle, () => settle("unavailable"));
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSessionId, historyRetrySequence, loadRuns]);
 
   const visibleRuns = activeSessionId
     ? runs.filter((run) => !run.session_id || run.session_id === activeSessionId)
@@ -249,11 +287,11 @@ export function InlineRunResults(): JSX.Element | null {
   const mostRecentRun = !activeRunId ? (visibleRuns[0] ?? null) : null;
   const displayRun = activeRun ?? mostRecentRun;
   // Drawer contents: all terminal runs, including the one already displayed,
-  // PLUS any live (pending/running) run this tab is NOT attached to. An
-  // attached live run already exposes Cancel through ProgressView; an
-  // unattached one (reload where rehydration raced, run started from
-  // another tab) must reach the drawer so its REST-backed Cancel is the
-  // guaranteed fallback (elspeth-90db33baac).
+  // PLUS any live (pending/running) run this browser tab is NOT attached to.
+  // An attached live run already exposes Cancel through ProgressView in the
+  // persistent Run artifact; an unattached one (reload where rehydration
+  // raced, run started from another browser tab) must reach history so its
+  // REST-backed Cancel is the guaranteed fallback (elspeth-90db33baac).
   const drawerRuns = visibleRuns.filter((run) => {
     if (isTerminalRunStatus(run.status)) {
       return true;
@@ -277,9 +315,39 @@ export function InlineRunResults(): JSX.Element | null {
     progressBelongsToActiveRun ? progress : null,
     displayRun,
   );
+  const currentSessionHistoryStatus =
+    activeSessionId === null
+      ? "loaded"
+      : initialRunLoad.sessionId === activeSessionId
+        ? initialRunLoad.status
+        : "loading";
 
   if (!showProgress && !outputRunId && !hasDrawerRuns) {
-    return null;
+    if (showEmptyState && currentSessionHistoryStatus === "loading") {
+      return (
+        <p className="artifact-empty" role="status" aria-live="polite">
+          Loading runs…
+        </p>
+      );
+    }
+    if (showEmptyState && currentSessionHistoryStatus === "unavailable") {
+      return (
+        <div className="artifact-empty">
+          <p role="status" aria-live="polite">
+            Run history unavailable.
+          </p>
+          <button
+            type="button"
+            onClick={() => setHistoryRetrySequence((current) => current + 1)}
+          >
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return showEmptyState ? (
+      <p className="artifact-empty">No runs yet.</p>
+    ) : null;
   }
 
   return (

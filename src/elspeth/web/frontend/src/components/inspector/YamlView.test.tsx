@@ -226,6 +226,48 @@ describe("YamlView", () => {
     });
   });
 
+  it("explains the deployment-owned scope above every exported YAML", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml).mockResolvedValue({
+      yaml: "source:\n  plugin: text\n",
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(),
+    });
+
+    render(<YamlView />);
+
+    const note = await screen.findByTestId("yaml-export-scope-note");
+    expect(note).toHaveTextContent(
+      "This is the pipeline definition only. Deployment-owned configuration — including the landscape audit destination — is supplied by the environment at run time and is never written here.",
+    );
+    const display = screen.getByRole("button", {
+      name: "Copy YAML to clipboard",
+    });
+    expect(
+      note.compareDocumentPosition(display) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).not.toBe(0);
+  });
+
+  it("adds the blob-binding note only for the active session's exported binding", async () => {
+    const { fetchYaml } = await import("@/api/client");
+    vi.mocked(fetchYaml).mockResolvedValue({
+      yaml: "source:\n  plugin: text\n",
+      source_blob_ids: { source: "22222222-2222-2222-2222-222222222222" },
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(),
+    });
+
+    render(<YamlView />);
+
+    expect(await screen.findByTestId("yaml-export-blob-note")).toHaveTextContent(
+      "Source data is session-bound: this pipeline reads an uploaded file held in this session, so the path is not in the YAML. To run it elsewhere, bind an uploaded file on import.",
+    );
+  });
+
   it("renders pending YAML change summary when proposals affect yaml", async () => {
     const { fetchYaml } = await import("@/api/client");
     vi.mocked(fetchYaml).mockResolvedValue({

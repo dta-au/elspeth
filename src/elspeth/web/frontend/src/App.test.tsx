@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import * as api from "./api/client";
@@ -7,10 +14,13 @@ import { resetStore } from "@/test/store-helpers";
 import { useSessionStore } from "./stores/sessionStore";
 import { useExecutionStore } from "./stores/executionStore";
 import { useAuthStore } from "./stores/authStore";
+import { usePreferencesStore } from "./stores/preferencesStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  FOCUS_AUTHORING_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
 } from "./lib/composer-events";
 import type {
   ChatMessage,
@@ -33,25 +43,83 @@ import {
 } from "@/test/composerFixtures";
 
 // ── Sub-component stubs ──────────────────────────────────────────────────────
-// App renders many heavy children (Layout, ChatPanel, …).
+// App renders many heavy children (ComposerWorkspace, ChatPanel, …).
 // Stub them out so the test focuses solely on App's own banner DOM.
 
 const tutorialMountSpy = vi.hoisted(() => vi.fn());
 const tutorialPropsSpy = vi.hoisted(() => vi.fn());
+const workspaceMountSpy = vi.hoisted(() => vi.fn());
+const workspaceCapabilitiesSpy = vi.hoisted(() => vi.fn());
 
-vi.mock("./components/common/Layout", () => ({
-  Layout: ({
-    chat,
-    siderail,
-  }: {
-    chat: React.ReactNode;
-    siderail: React.ReactNode;
-  }) => (
-    <div data-testid="layout-stub">
-      {chat}
-      {siderail}
+vi.mock("./components/workspace/ComposerWorkspace", () => ({
+  ComposerWorkspace: (props: {
+    authoring: React.ReactNode;
+    authoringStatus?: React.ReactNode;
+    artifact: React.ReactNode;
+    inspector: React.ReactNode;
+    actionBar: React.ReactNode;
+    collapsedStatus?: React.ReactNode | { text: string; tone: string };
+  }) => {
+    workspaceMountSpy(props);
+    return (
+      <div data-testid="composer-workspace-stub">
+        {props.authoring}
+        {props.authoringStatus}
+        {props.artifact}
+        {props.inspector}
+        {props.actionBar}
+        <output data-testid="collapsed-authoring-status">
+          {typeof props.collapsedStatus === "object" &&
+          props.collapsedStatus !== null &&
+          "text" in props.collapsedStatus
+            ? props.collapsedStatus.text
+            : props.collapsedStatus}
+        </output>
+      </div>
+    );
+  },
+}));
+
+vi.mock("./components/workspace/WorkspacePaneContext", () => ({
+  useWorkspacePaneController: () => ({
+    state: { authoringCollapsed: false },
+  }),
+}));
+
+vi.mock("./components/workspace/ArtifactWorkspace", () => ({
+  ArtifactWorkspace: () => <div data-testid="artifact-workspace-stub" />,
+}));
+
+vi.mock("./components/workspace/WorkspaceInspector", () => ({
+  WorkspaceInspector: () => (
+    <div data-testid="workspace-inspector-stub">
+      <div data-testid="audit-readiness-stub" />
+      <div data-testid="side-rail-validation-banner-stub" />
     </div>
   ),
+}));
+
+vi.mock("./components/workspace/WorkspaceActionBar", () => ({
+  WorkspaceActionBar: ({
+    capabilities,
+  }: {
+    capabilities: {
+      completion: boolean;
+      importYaml: boolean;
+      catalog: boolean;
+    };
+  }) => {
+    workspaceCapabilitiesSpy(capabilities);
+    return (
+      <div data-testid="workspace-action-bar-stub">
+        <button type="button">Validation Not checked</button>
+        <button type="button">Audit Checking</button>
+        {capabilities.completion ? <div data-testid="completion-bar" /> : null}
+        {capabilities.importYaml ? <button type="button">Import YAML</button> : null}
+        {capabilities.catalog ? <button type="button">Catalog (reference)</button> : null}
+      </div>
+    );
+  },
 }));
 
 vi.mock("./components/chat/ChatPanel", () => ({
@@ -169,9 +237,7 @@ vi.mock("./api/client", () => ({
   sendMessage: vi.fn(),
   recompose: vi.fn(),
   fetchMessages: vi.fn(),
-  // YamlView (inside ExportYamlModal) fetches the rendered YAML when the
-  // modal opens — reachable now that the Ctrl+Shift+Y test seeds a
-  // non-empty composition.
+  // YamlView fetches the rendered YAML when its persistent artifact tab opens.
   fetchYaml: vi.fn().mockResolvedValue({ yaml: "sources: {}" }),
   // refreshAll fans out to refreshInterpretationEventsForSession on session
   // select, so this is called incidentally during App render. Without the mock
@@ -215,6 +281,7 @@ describe("App banner roles", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(useSessionStore);
+    resetStore(usePreferencesStore);
     useExecutionStore.getState().reset();
     // Seed authStore as authenticated. useSessionLifecycle now reads
     // useAuthStore(selectIsAuthenticated) directly and skips loadSessions
@@ -246,6 +313,8 @@ describe("App banner roles", () => {
     vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
     vi.spyOn(api, "fetchRuns").mockResolvedValue([]);
     tutorialMountSpy.mockClear();
+    workspaceMountSpy.mockClear();
+    workspaceCapabilitiesSpy.mockClear();
   });
 
   it("uses role=alert for the backend-unavailable banner (hard outage)", async () => {
@@ -287,6 +356,33 @@ describe("App banner roles", () => {
     expect(root!.getAttribute("role")).toBe("status");
   });
 
+  it("consolidates simultaneous notices into one priority-ordered banner row", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    usePreferencesStore.setState({
+      loaded: true,
+      writeError: "Preferences could not be loaded.",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    const primary = await screen.findByTestId("app-notice-primary");
+    expect(within(primary).getByText(/Backend unavailable/i)).toBeVisible();
+    expect(screen.getAllByTestId("app-notice-primary")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "1 more notice" })).toBeVisible();
+    expect(screen.queryByText("Preferences could not be loaded.")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "1 more notice" }));
+    const popover = screen.getByRole("region", { name: "All notices" });
+    expect(within(popover).getByText("Preferences could not be loaded.")).toBeVisible();
+    expect(within(primary).getByRole("button", { name: "Retry connection" }))
+      .toBeVisible();
+    errorSpy.mockRestore();
+  });
+
   it("silently canonicalizes stale Runs hashes", async () => {
     useSessionStore.setState({ activeSessionId: "session-1" });
     window.history.replaceState(null, "", "#/session-1/runs");
@@ -318,7 +414,7 @@ describe("App banner roles", () => {
     expect(screen.queryByLabelText(/sessions sidebar/i)).not.toBeInTheDocument();
   });
 
-  it("mounts audit readiness and validation through side rail slots", async () => {
+  it("mounts one common workspace with authoring, artifact, inspector, and actions", async () => {
     // An active session keeps the composer shell mounted — with no sessions
     // at all App now renders the empty landing instead (elspeth-e69642fede).
     useSessionStore.setState({ activeSessionId: "session-1" });
@@ -331,10 +427,59 @@ describe("App banner roles", () => {
     expect(
       screen.getByTestId("side-rail-validation-banner-stub"),
     ).toBeInTheDocument();
-    expect(screen.queryByTestId("inspector-panel-stub")).toBeNull();
+    expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("artifact-workspace-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("workspace-action-bar-stub")).toBeInTheDocument();
+    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
+    expect(workspaceMountSpy).toHaveBeenCalled();
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: true,
+      importYaml: true,
+      catalog: true,
+    });
   });
 
-  it("suppresses the SideRail while a guided build is active — the workspace rail inside ChatPanel replaces it", async () => {
+  it("moves skip-link focus to the stable main workspace without changing session routing", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(<App />);
+    await waitFor(() => expect(window.location.hash).toBe("#/session-1"));
+
+    const main = screen.getByRole("main");
+    expect(main).toHaveAttribute("id", "composer-main");
+    expect(main).toHaveAttribute("tabindex", "-1");
+
+    const skipLink = screen.getByRole("link", { name: "Skip to main content" });
+    expect(skipLink).toHaveAttribute("href", "#composer-main");
+    await user.click(skipLink);
+
+    expect(main).toHaveFocus();
+    expect(window.location.hash).toBe("#/session-1");
+    expect(useSessionStore.getState().activeSessionId).toBe("session-1");
+  });
+
+  it.each([
+    ["busy", { guidedChatPending: true, error: null }],
+    ["error", { guidedChatPending: false, error: "authoring failed" }],
+  ] as const)(
+    "renders the real App-owned collapsed status projection with %s tone",
+    async (tone, state) => {
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        ...state,
+      });
+      render(<App />);
+      await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+      const projection = within(
+        screen.getByTestId("collapsed-authoring-status"),
+      ).getByText(tone === "busy" ? "Authoring in progress" : /Authoring error:/);
+      expect(projection).toHaveAttribute("data-tone", tone);
+      expect(projection).toHaveClass("workspace-collapsed-status");
+    },
+  );
+
+  it("keeps the common workspace during active guided work but exposes status controls only", async () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
       // Non-terminal guided session at step_3 with no server turn — the
@@ -356,14 +501,23 @@ describe("App banner roles", () => {
     await waitFor(() => {
       expect(api.fetchSystemStatus).toHaveBeenCalled();
     });
-    // The composer shell is still mounted...
+    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
     expect(screen.getByTestId("chat-panel-stub")).toBeInTheDocument();
-    // ...but App passed siderail={null}: no rail slots render.
-    expect(screen.queryByTestId("audit-readiness-stub")).toBeNull();
-    expect(screen.queryByTestId("side-rail-validation-banner-stub")).toBeNull();
+    expect(screen.getByRole("button", { name: /validation/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /audit/i })).toBeInTheDocument();
+    expect(screen.queryByTestId("completion-bar")).toBeNull();
+    expect(screen.queryByRole("button", { name: /import yaml/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /catalog/i })).toBeNull();
+    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
+    expect(workspaceMountSpy).toHaveBeenCalled();
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: false,
+      importYaml: false,
+      catalog: false,
+    });
   });
 
-  it("restores the SideRail when the guided session reaches a terminal (Run/Export live in the rail post-completion)", async () => {
+  it("keeps the same common workspace and restores actions after guided completion", async () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
       guidedSession: {
@@ -389,6 +543,15 @@ describe("App banner roles", () => {
     expect(
       screen.getByTestId("side-rail-validation-banner-stub"),
     ).toBeInTheDocument();
+    expect(screen.getByTestId("composer-workspace-stub")).toBeInTheDocument();
+    expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
+    expect(screen.getAllByTestId("composer-workspace-stub")).toHaveLength(1);
+    expect(workspaceMountSpy).toHaveBeenCalled();
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: true,
+      importYaml: true,
+      catalog: true,
+    });
   });
 
   it("loads sessions on startup after SessionSidebar removal", async () => {
@@ -445,11 +608,85 @@ describe("App banner roles", () => {
     window.removeEventListener("open-catalog", onOpenCatalog);
   });
 
-  it("dispatches graph and YAML modal events on Ctrl+Shift shortcuts", async () => {
+  it("blocks ambient and shortcut catalog requests during active guided work", async () => {
+    const onOpenCatalog = vi.fn();
+    window.addEventListener("open-catalog", onOpenCatalog);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      guidedSession: {
+        step: "step_3_transforms",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      } as unknown as import("./types/guided").GuidedSession,
+      guidedNextTurn: null,
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
+    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+
+    fireEvent.keyDown(document, {
+      key: "P",
+      code: "KeyP",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+    window.removeEventListener("open-catalog", onOpenCatalog);
+  });
+
+  it("closes the Catalog drawer when active guided work revokes the capability", async () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
+    expect(
+      screen.getByRole("dialog", { name: "Plugin Catalog" }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({
+        guidedSession: {
+          step: "step_3_transforms",
+          history: [],
+          terminal: null,
+          chat_history: [],
+          chat_turn_seq: 0,
+          profile: null,
+        } as unknown as import("./types/guided").GuidedSession,
+        guidedNextTurn: null,
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Plugin Catalog" }),
+      ).toBeNull(),
+    );
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: false,
+      importYaml: false,
+      catalog: false,
+    });
+  });
+
+  it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
     const onOpenGraph = vi.fn();
-    const onOpenYaml = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
     // Ctrl+Shift+Y is content-gated (elspeth-bff8043d33 residual): seed a
     // non-empty composition so the YAML dispatch fires.
     useSessionStore.setState({
@@ -478,10 +715,45 @@ describe("App banner roles", () => {
       shiftKey: true,
     });
 
-    expect(onOpenGraph).toHaveBeenCalledTimes(1);
-    expect(onOpenYaml).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([
+      { tab: "graph", focusMode: false, sessionId: "session-1" },
+      { tab: "yaml", focusMode: false, sessionId: "session-1" },
+    ]);
+    expect(onOpenGraph).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
+  });
+
+  it("lets Ctrl+/ supersede a real deferred Spec hash through the shared workspace clock", async () => {
+    const onFocusAuthoring = vi.fn();
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [{ id: "session-1", title: "Session 1" } as never],
+      compositionStateLoaded: false,
+      compositionState: makeState(1),
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    fireEvent.keyDown(document, { key: "/", ctrlKey: true });
+    act(() => {
+      useSessionStore.setState({ compositionStateLoaded: true });
+    });
+    await act(async () => Promise.resolve());
+
+    expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });
 
   it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {
@@ -966,9 +1238,9 @@ describe("App composer recovery panel", () => {
     render(<App />);
     await userEvent.click(screen.getByRole("button", { name: "Send compose" }));
 
-    expect(
-      await screen.findByText(/couldn't complete the composition/),
-    ).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /couldn't complete the composition/,
+    );
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -1089,7 +1361,7 @@ describe("App preferences bootstrap (Phase 1B)", () => {
     render(<App />);
 
     expect(screen.getByTestId("tutorial-stub")).toBeInTheDocument();
-    expect(screen.queryByTestId("layout-stub")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("composer-workspace-stub")).not.toBeInTheDocument();
   });
 
   it("keeps tutorial readiness fail-closed while system status is still loading", async () => {
@@ -1223,7 +1495,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
     // NOT rendered under a shared route. If a refactor drops the
     // short-circuit in App.tsx, this assertion fails and the regression
     // is caught.
-    expect(screen.queryByTestId("layout-stub")).toBeNull();
+    expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
     // The chat panel is part of Layout; pin its absence too, because the
     // layout-stub testid is one indirection away from the actual chrome.
     expect(screen.queryByTestId("chat-panel-stub")).toBeNull();
@@ -1240,7 +1512,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
 
     render(<App />);
 
-    expect(await screen.findByTestId("layout-stub")).toBeInTheDocument();
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("shared-inspect-loading")).toBeNull();
   });
 });
@@ -1286,7 +1558,7 @@ describe("App empty landing and auto-resume", () => {
       screen.getByRole("button", { name: /browse the catalog/i }),
     ).toBeInTheDocument();
     // The composer shell is replaced, not layered under.
-    expect(screen.queryByTestId("layout-stub")).toBeNull();
+    expect(screen.queryByTestId("composer-workspace-stub")).toBeNull();
   });
 
   it("auto-resumes the most recently active session for a returning user", async () => {
@@ -1311,13 +1583,13 @@ describe("App empty landing and auto-resume", () => {
       expect(useSessionStore.getState().activeSessionId).toBe("newest");
     });
     // With a session active, the composer shell renders — not the landing.
-    expect(await screen.findByTestId("layout-stub")).toBeInTheDocument();
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
     expect(screen.queryByText(/no sessions yet/i)).toBeNull();
   });
 
-  it("does not open the YAML modal on Ctrl+Shift+Y when the pipeline is empty", async () => {
-    const onOpenYaml = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
+  it("does not request the YAML artifact on Ctrl+Shift+Y when the pipeline is empty", async () => {
+    const onArtifactRequest = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     vi.spyOn(api, "fetchSessions").mockResolvedValue([]);
     useSessionStore.setState({
       activeSessionId: "session-1",
@@ -1336,7 +1608,7 @@ describe("App empty landing and auto-resume", () => {
       shiftKey: true,
     });
 
-    expect(onOpenYaml).not.toHaveBeenCalled();
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
+    expect(onArtifactRequest).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });
 });

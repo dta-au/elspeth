@@ -1,6 +1,7 @@
 # ELSPETH User Manual
 
-This manual covers day-to-day usage of the ELSPETH CLI for running auditable pipelines.
+This manual covers day-to-day use of the ELSPETH CLI and Web Composer for
+building and running auditable pipelines.
 
 ## Table of Contents
 
@@ -14,7 +15,7 @@ This manual covers day-to-day usage of the ELSPETH CLI for running auditable pip
 8. [Resuming Failed Runs](#resuming-failed-runs)
 9. [Health Checks](#health-checks)
 10. [Examples](#examples-walkthrough)
-11. [Web Composer: Guided Mode](#web-composer-guided-mode)
+11. [Web Composer workspace and guided mode](#web-composer-guided-mode)
 
 ---
 
@@ -532,6 +533,53 @@ elspeth web
 ```
 
 Then open the URL printed on the console (typically <http://localhost:8765>).
+
+### Using the desktop workspace
+
+On desktop, the Composer keeps authoring and the current pipeline together in
+one workspace. The authoring pane contains freeform chat or the current guided
+step. The pipeline workspace stays beside it so you can inspect the artifact
+without leaving the conversation.
+
+- Drag the divider to resize the authoring pane. You can also focus the divider
+  and use Left/Right Arrow, Shift+Left/Right Arrow for larger steps, or Home/End
+  for its minimum or maximum width.
+- Select **Collapse authoring pane** when you want more room for the pipeline.
+  **Restore authoring pane** reopens it; the collapsed control continues to
+  report busy, error, or unread authoring status.
+- Use **Graph**, **Spec**, **YAML**, and **Run** to switch the persistent
+  pipeline view. Graph shows the pipeline structure; Spec and YAML become
+  available once the pipeline has content. Spec summarizes its components and
+  configuration, YAML provides the current export controls, and Run shows
+  current or recent execution results.
+- Select the **Validation** or **Audit** status in the workspace action bar to
+  open the Inspector. Guided sessions also show a **History** tab when completed
+  decisions are available. Close the Inspector to return focus to the status
+  control that opened it.
+- Use **Focus Graph** for an optional full-screen graph. The persistent Graph
+  tab remains the normal working view.
+
+The workspace action bar keeps state-dependent actions such as **Save for
+review**, **Run pipeline**, and **Export YAML** reachable without scrolling the
+conversation. Lower-frequency actions appear under **More actions** when they
+are available.
+
+When the workspace is too narrow for both main panes, use the **Compose** and
+**Pipeline** switcher to choose which pane is visible. Pane resizing is disabled
+in this narrow layout.
+
+Two global shortcuts select and focus persistent artifact tabs:
+
+| Shortcut | Result |
+| --- | --- |
+| `Ctrl/Cmd+Shift+G` | Select Graph. |
+| `Ctrl/Cmd+Shift+Y` | Select YAML when the pipeline has content. |
+
+These shortcuts select the workspace tab; they do not open Focus Graph. Press
+`?` outside a text field to see the complete keyboard-shortcut reference.
+
+The saved pane width and collapsed state are local interface preferences. They
+do not change the pipeline, session, validation, audit, or execution semantics.
 
 When you create a new session, the composer starts in **Guided Mode** unless
 your Composer preference says otherwise. Guided mode is LLM-primary: each stage

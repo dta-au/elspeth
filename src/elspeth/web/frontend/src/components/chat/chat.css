@@ -203,20 +203,6 @@
   overflow: auto;
 }
 
-/* The completed surface is a vertical evidence stack: the completion
-   summary first,
-   then its run evidence. Keep the two cards visually adjacent while allowing
-   expanded results to consume the rest of the panel instead of leaving an
-   unstructured void below. The :not() preserves the collapse affordance's
-   content-height contract. */
-.chat-panel--completed > .inline-run-results:not(.inline-run-results--collapsed) {
-  flex: 1 1 auto;
-  min-height: 6rem;
-  max-height: none;
-  margin-top: var(--space-xs);
-  margin-bottom: 0;
-}
-
 .inline-run-results--collapsed {
   max-height: none;
   overflow: visible;
@@ -473,6 +459,8 @@
 
 .chat-input-textarea {
   flex: 1;
+  max-height: min(28dvh, 240px);
+  overflow-y: auto;
   resize: vertical;
   padding: var(--space-sm) var(--space-md);
   border: 1px solid var(--color-border-strong);
@@ -482,6 +470,13 @@
   line-height: 1.4;
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
+}
+
+@media (min-width: 761px) and (max-height: 800px) {
+  .chat-panel-header,
+  .chat-input {
+    padding-block: var(--space-xs);
+  }
 }
 
 .chat-input-icon-btn {
@@ -928,9 +923,9 @@
      which left a ~1100px dead gulf down the middle and forced the eye to jump
      left↔right to follow the thread. 56rem keeps a comfortable reading measure
      while giving consecutive bubbles a generous horizontal overlap.
-     Applies to freeform AND guided/tutorial — both emit .message-row. The
-     guided workspace widgets (.guided-workspace-*) and full-width run-result
-     panels (.inline-run-results) are NOT .message-row, so they keep full width. */
+     Applies to freeform AND guided/tutorial — both emit .message-row. Guided
+     authoring cards and common-workspace artifact panels are NOT .message-row,
+     so they keep their containing pane's width. */
   max-width: min(100%, 56rem);
   margin-inline: auto;
   width: 100%;

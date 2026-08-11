@@ -193,6 +193,18 @@ export function validateAuditReadinessSnapshot(
       throw unexpectedShape(status);
     }
   }
+  const rowIds = body.rows.map((row) => row.id);
+  const validationRow = body.rows.find((row) => row.id === "validation");
+  if (
+    rowIds.length !== READINESS_ROW_IDS.size ||
+    new Set(rowIds).size !== READINESS_ROW_IDS.size ||
+    rowIds.some((id) => !READINESS_ROW_IDS.has(id)) ||
+    validationRow === undefined ||
+    (!body.validation_result.is_valid && validationRow.status !== "error") ||
+    (body.validation_result.is_valid && validationRow.status === "error")
+  ) {
+    throw unexpectedShape(status);
+  }
   return {
     session_id: body.session_id,
     composition_version: body.composition_version,

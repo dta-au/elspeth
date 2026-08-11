@@ -277,7 +277,7 @@ The payload store has reaped the blob. Ask the sender to re-mint.
 The user-facing entry points landed by Phase 6B:
 
 * **Completion bar** — `components/composer/CompletionBar.tsx`. Mounted
-  in the side rail's `completionBarSlot`. Three co-equal verbs: Save
+  in the pipeline artifact action bar. Three co-equal verbs: Save
   for review, Run pipeline, Export YAML. The Save-for-review button is
   client-side-disabled when the composition's validation is invalid or
   has not run; the backend would also 409 on submission, but the

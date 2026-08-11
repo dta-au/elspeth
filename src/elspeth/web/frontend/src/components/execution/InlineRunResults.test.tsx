@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { InlineRunResults } from "./InlineRunResults";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -21,6 +21,18 @@ vi.mock("@/components/inspector/RunOutputsPanel", () => ({
 vi.mock("@/components/composer/NarrativeResults", () => ({
   NarrativeResults: () => <div data-testid="narrative-results-stub" />,
 }));
+
+const productionLoadRuns = useExecutionStore.getState().loadRuns;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
 
 describe("InlineRunResults", () => {
   beforeEach(() => {
@@ -73,6 +85,7 @@ describe("InlineRunResults", () => {
       isExecuting: false,
       wsDisconnected: false,
       error: null,
+      loadRuns: productionLoadRuns,
     } as never);
     useSessionStore.setState({
       activeSessionId: "sess-1",
@@ -81,8 +94,164 @@ describe("InlineRunResults", () => {
 
   it("renders nothing when there are no runs", () => {
     const { container } = render(<InlineRunResults />);
-    expect(container.querySelector("[data-testid='progress-view-stub']")).toBeNull();
-    expect(container.querySelector("[data-testid='run-outputs-stub']")).toBeNull();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders the artifact empty state only when explicitly requested", () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    render(<InlineRunResults showEmptyState />);
+
+    return waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+    });
+  });
+
+  it("shows neutral loading until the current session's empty history settles", async () => {
+    const history = deferred<"loaded">();
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockReturnValue(history.promise),
+    } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toHaveClass("artifact-empty");
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve("loaded");
+      await history.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+  });
+
+  it("renders loaded history without flashing the empty state", async () => {
+    const history = deferred<void>();
+    const loadRuns = vi.fn(async () => {
+      await history.promise;
+      useExecutionStore.setState({
+        runs: [
+          { id: "run-loaded", session_id: "sess-1", status: "completed" },
+        ],
+      } as never);
+      return "loaded" as const;
+    });
+    useExecutionStore.setState({ loadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve();
+      await history.promise;
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("run-outputs-stub")).toHaveAttribute(
+        "data-run-id",
+        "run-loaded",
+      );
+    });
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+  });
+
+  it("shows unavailable with Retry when the initial history request fails", async () => {
+    vi.spyOn(apiClient, "fetchRuns").mockRejectedValue(new Error("offline"));
+    useExecutionStore.setState({ loadRuns: productionLoadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("Run history unavailable.")).toBeInTheDocument();
+    });
+    expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+  });
+
+  it("retries an unavailable history request through loading to empty", async () => {
+    const retry = deferred<"loaded">();
+    const loadRuns = vi
+      .fn()
+      .mockResolvedValueOnce("unavailable")
+      .mockReturnValueOnce(retry.promise);
+    useExecutionStore.setState({ loadRuns } as never);
+    const user = userEvent.setup();
+    render(<InlineRunResults showEmptyState />);
+    expect(
+      await screen.findByText("Run history unavailable."),
+    ).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Retry" }));
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      retry.resolve("loaded");
+      await retry.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toBeInTheDocument();
+  });
+
+  it("does not let a stale session load mark the new session as settled", async () => {
+    const first = deferred<"stale">();
+    const second = deferred<"loaded">();
+    const loadRuns = vi.fn((sessionId: string) =>
+      sessionId === "sess-1" ? first.promise : second.promise,
+    );
+    useExecutionStore.setState({ loadRuns } as never);
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-2" } as never);
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    await act(async () => {
+      first.resolve("stale");
+      await first.promise;
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      second.resolve("loaded");
+      await second.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toBeInTheDocument();
+  });
+
+  it("continues to render cached runs when a refresh is unavailable", async () => {
+    useExecutionStore.setState({
+      runs: [
+        { id: "run-cached", session_id: "sess-1", status: "completed" },
+      ],
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+
+    render(<InlineRunResults showEmptyState />);
+
+    expect(screen.getByTestId("run-outputs-stub")).toHaveAttribute(
+      "data-run-id",
+      "run-cached",
+    );
+    await waitFor(() => {
+      expect(screen.queryByText("Loading runs…")).not.toBeInTheDocument();
+    });
+    expect(
+      screen.queryByText("Run history unavailable."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the default embedded mode empty when history is unavailable", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+    const { container } = render(<InlineRunResults />);
+
+    await waitFor(() => {
+      expect(useExecutionStore.getState().loadRuns).toHaveBeenCalled();
+    });
+    expect(container).toBeEmptyDOMElement();
   });
 
   it("renders ProgressView for an active running run", () => {
@@ -518,7 +687,7 @@ describe("InlineRunResults", () => {
   });
 
   it("loads the active session's runs when mounted", async () => {
-    const loadRuns = vi.fn().mockResolvedValue(undefined);
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
     useExecutionStore.setState({ loadRuns } as never);
 
     render(<InlineRunResults />);
@@ -526,6 +695,28 @@ describe("InlineRunResults", () => {
     await waitFor(() => {
       expect(loadRuns).toHaveBeenCalledWith("sess-1");
     });
+  });
+
+  it("stops polling run history when its owner unmounts", async () => {
+    vi.useFakeTimers();
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
+    useExecutionStore.setState({
+      loadRuns,
+      runs: [
+        { id: "run-live", session_id: "sess-1", status: "running" } as never,
+      ],
+    } as never);
+    const view = render(<InlineRunResults />);
+
+    await act(async () => Promise.resolve());
+    expect(loadRuns).toHaveBeenCalledTimes(1);
+    act(() => vi.advanceTimersByTime(3000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+    act(() => vi.advanceTimersByTime(6000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 
   // ==========================================================================

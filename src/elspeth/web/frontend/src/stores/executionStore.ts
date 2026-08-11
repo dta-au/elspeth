@@ -40,6 +40,8 @@ const MAX_RECENT_ERRORS = 50;
 const STALE_FANOUT_READINESS_ERROR =
   "This pipeline is no longer ready to run. Validate it again before executing.";
 
+export type RunHistoryLoadOutcome = "loaded" | "stale" | "unavailable";
+
 interface ExecutionState {
   runs: Run[];
   activeRunId: string | null;
@@ -54,6 +56,7 @@ interface ExecutionState {
   pendingFanoutGuard: ExecutionFanoutGuard | null;
   pendingFanoutSessionId: string | null;
   isValidating: boolean;
+  validationError: string | null;
   isExecuting: boolean;
   wsDisconnected: boolean;
   error: string | null;
@@ -74,7 +77,7 @@ interface ExecutionState {
   acknowledgeRunDisclosure: (sessionId: string) => void;
   clearRunDisclosureAcks: () => void;
   cancel: (runId: string) => Promise<void>;
-  loadRuns: (sessionId: string) => Promise<void>;
+  loadRuns: (sessionId: string) => Promise<RunHistoryLoadOutcome>;
   rehydrateActiveRun: (sessionId: string) => Promise<void>;
   loadRunDiagnostics: (runId: string) => Promise<void>;
   evaluateRunDiagnostics: (runId: string) => Promise<void>;
@@ -335,6 +338,7 @@ const initialExecutionState = {
   pendingFanoutGuard: null as ExecutionFanoutGuard | null,
   pendingFanoutSessionId: null as string | null,
   isValidating: false,
+  validationError: null as string | null,
   isExecuting: false,
   wsDisconnected: false,
   error: null as string | null,
@@ -349,7 +353,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     const compositionState = useSessionStore.getState().compositionState;
     const expectedVersion = options.expectedVersion ?? compositionState?.version ?? null;
     const stateId = compositionState?.id;
-    set({ isValidating: true, validationResult: null, error: null });
+    set({
+      isValidating: true,
+      validationResult: null,
+      validationError: null,
+      error: null,
+    });
     try {
       const result =
         stateId === undefined
@@ -360,7 +369,11 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
         set({ isValidating: false });
         return false;
       }
-      set({ validationResult: result, isValidating: false });
+      set({
+        validationResult: result,
+        isValidating: false,
+        validationError: null,
+      });
       return true;
     } catch (err) {
       if (requestSeq !== validationRequestSeq) return false;
@@ -375,6 +388,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
           : apiErr.detail ?? "Validation failed. Please try again.";
       set({
         isValidating: false,
+        validationError: message,
         error: message,
       });
       // false = caller must not record this version as validated.
@@ -383,7 +397,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   setValidationResult(result: ValidationResult | null) {
-    set({ validationResult: result });
+    set({ validationResult: result, validationError: null });
   },
 
   async execute(sessionId: string, fanoutAck?: ExecutionFanoutAck) {
@@ -632,10 +646,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   async loadRuns(sessionId: string) {
     try {
       const runs = await api.fetchRuns(sessionId);
-      if (!shouldApplyRunListResult(sessionId)) return;
+      if (!shouldApplyRunListResult(sessionId)) return "stale";
       set({ runs });
+      return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
+      return "unavailable";
     }
   },
 
@@ -773,7 +789,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   },
 
   clearValidation() {
-    set({ validationResult: null });
+    set({ validationResult: null, validationError: null });
   },
 
   reset() {

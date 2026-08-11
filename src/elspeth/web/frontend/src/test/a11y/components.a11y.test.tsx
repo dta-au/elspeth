@@ -42,9 +42,7 @@ const AUDITED_COMPONENTS = [
   "AppHeader",
   "HeaderSessionSwitcher",
   "HeaderVersionSelector",
-  "SideRail",
   "GraphMiniView",
-  "ExportYamlModal",
   "InlineSourceCreatedTurn",
   "InlineSourceDisambiguationTurn",
   "InlineSourceFallbackPrompt",
@@ -69,6 +67,7 @@ const AUDITED_COMPONENTS = [
   "ChatInput",
   "CommandPalette",
   "ConfirmDialog",
+  "WorkspaceSeparator",
   "GraphModal",
   "GraphView",
   "HelloWorldTutorial",
@@ -103,7 +102,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ConfirmDialog",
   "DefaultModeChangedBanner",
   "ExplainDialog",
-  "ExportYamlModal",
   "FilterChipStrip",
   "GraphMiniView",
   "GraphModal",
@@ -125,7 +123,6 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "RecoveryPanel",
   "RunsHistoryDrawer",
   "SchemaFormTurn",
-  "SideRail",
   "ShortcutsHelp",
   "FreeformIntroduction",
   "TutorialGuidedShell",
@@ -134,6 +131,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "TutorialTurn5AuditStory",
   "TutorialTurn7Graduation",
   "UserMenu",
+  "WorkspaceSeparator",
   "WireStageTurn",
 ];
 
@@ -274,10 +272,7 @@ import { ExplainDialog } from "@/components/audit/ExplainDialog";
 import { AppHeader } from "@/components/common/AppHeader";
 import { HeaderSessionSwitcher } from "@/components/sessions/HeaderSessionSwitcher";
 import { HeaderVersionSelector } from "@/components/header/HeaderVersionSelector";
-import { SideRail } from "@/components/sidebar/SideRail";
 import { GraphMiniView } from "@/components/sidebar/GraphMiniView";
-import { ExportYamlModal } from "@/components/sidebar/ExportYamlModal";
-import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { InlineSourceCreatedTurn } from "@/components/chat/InlineSourceCreatedTurn";
 import { InlineSourceDisambiguationTurn } from "@/components/chat/InlineSourceDisambiguationTurn";
 import { InlineSourceFallbackPrompt } from "@/components/chat/InlineSourceFallbackPrompt";
@@ -299,6 +294,7 @@ import { ChatPanel } from "@/components/chat/ChatPanel";
 import { LoginPage } from "@/components/auth/LoginPage";
 import { CommandPalette } from "@/components/common/CommandPalette";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { WorkspaceSeparator } from "@/components/workspace/WorkspaceSeparator";
 import { ProgressView } from "@/components/execution/ProgressView";
 import { RunsHistoryDrawer } from "@/components/execution/RunsHistoryDrawer";
 import { GraphView } from "@/components/inspector/GraphView";
@@ -685,21 +681,6 @@ describe("HeaderVersionSelector", () => {
   });
 });
 
-describe("SideRail", () => {
-  it("has no axe violations", async () => {
-    const { container } = render(
-      <SideRail
-        auditReadinessSlot={<div>readiness</div>}
-        validationBannerSlot={<div>banner</div>}
-        graphMiniSlot={<div>mini</div>}
-        catalogSlot={<div>catalog</div>}
-        completionBarSlot={<div>completion</div>}
-      />,
-    );
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
 describe("GraphMiniView", () => {
   it("has no axe violations", async () => {
     const { container } = render(<GraphMiniView />);
@@ -711,16 +692,6 @@ describe("GraphMiniView", () => {
     expect(
       screen.getByRole("button", { name: /pipeline graph/i }),
     ).toBeInTheDocument();
-    expect(await axe(container)).toHaveNoViolations();
-  });
-});
-
-describe("ExportYamlModal", () => {
-  it("has no axe violations", async () => {
-    const { container, rerender } = render(<ExportYamlModal />);
-    // Modal only renders when the open event fires.
-    window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
-    rerender(<ExportYamlModal />);
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1170,6 +1141,14 @@ describe("TutorialGuidedShell", () => {
     vi.mocked(apiClient.startGuidedSession).mockReturnValue(
       new Promise<never>(() => {}),
     );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
+    );
     const { container } = render(
       <TutorialGuidedShell
         sessionId="00000000-0000-4000-8000-000000000999"
@@ -1292,15 +1271,18 @@ describe("ChatPanelTutorialWorkspace", () => {
       />,
     );
 
-    // Guard against a vacuous pass: the named scroll group, the artifact
-    // rail, both role=log regions (transcript + wizard step), the rail's
-    // decision history, and the Sent composer state must all be mounted.
+    // Guard against a vacuous pass: the named authoring scroll group, both
+    // role=log regions (transcript + wizard step), and the Sent composer state
+    // must all be mounted. Artifact and history content belongs to the common
+    // workspace/Inspector, not this authoring component.
     screen.getByRole("group", { name: "Conversation" });
-    screen.getByRole("complementary", { name: "Pipeline summary" });
     screen.getByRole("log", { name: "Step chat history" });
     screen.getByRole("log", { name: "Guided wizard step" });
-    screen.getByRole("heading", { name: /decisions so far/i });
     screen.getByText(/your request is in the transcript above/i);
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
+    expect(screen.queryByRole("heading", { name: /decisions so far/i })).toBeNull();
 
     expect(await axe(container)).toHaveNoViolations();
   });
@@ -1339,7 +1321,7 @@ describe("ChatPanelTutorialWorkspace", () => {
     // no longer swapped out from under the typing area).
     const strip = container.querySelector(".guided-pending-strip");
     expect(strip).not.toBeNull();
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
     expect(scroll!.contains(strip)).toBe(true);
     screen.getByRole("button", { name: "Stop composing" });
@@ -1556,6 +1538,22 @@ describe("ConfirmDialog", () => {
   });
 });
 
+describe("WorkspaceSeparator", () => {
+  it("has no axe violations while keyboard resizing is available", async () => {
+    const { container } = render(
+      <WorkspaceSeparator
+        value={448}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={() => {}}
+        onResizeEnd={() => {}}
+      />,
+    );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
 describe("CommandPalette", () => {
   it("has no axe violations when open", async () => {
     // jsdom does not implement Element.prototype.scrollIntoView (the
@@ -1655,9 +1653,8 @@ describe("GraphModal", () => {
       compositionProposals: [],
     } as never);
     const { container } = render(<GraphModal />);
-    // Modal only renders once the open event fires (the ExportYamlModal
-    // idiom above, with the dispatch act()-wrapped so the listener's
-    // setState commits before the assertion).
+    // The dispatch is act()-wrapped so the listener's setState commits before
+    // the assertion.
     act(() => {
       window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
     });

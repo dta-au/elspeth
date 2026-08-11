@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { axe, toHaveNoViolations } from "jest-axe";
@@ -59,6 +61,16 @@ describe("SaveForReviewDialog", () => {
     const dialog = screen.getByRole("dialog", { name: "Share for review" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(dialog).toHaveAttribute("aria-labelledby", "save-for-review-dialog-title");
+  });
+
+  it("uses the dynamic viewport when bounding its scroll owner", () => {
+    const css = readFileSync("src/components/composer/composer.css", "utf8");
+    expect(css).toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100dvh - 32px\);[^}]*overflow:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /\.save-for-review-dialog\s*\{[^}]*max-height:\s*calc\(100vh - 32px\);/s,
+    );
   });
 
   // M09 (WCAG 4.1.2): the dialog used to *announce* aria-modal="true" while

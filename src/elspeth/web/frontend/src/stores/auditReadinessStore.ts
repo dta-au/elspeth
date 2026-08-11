@@ -17,6 +17,7 @@ import {
   fetchAuditReadiness,
   fetchAuditReadinessExplain,
 } from "../api/auditReadiness";
+import { matchingAuditReadinessSnapshot } from "../lib/auditReadinessFreshness";
 import type {
   AuditReadinessSnapshot,
   AuditReadinessExplain,
@@ -86,7 +87,14 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
     options: LoadSnapshotOptions = { force: false },
   ) {
     const cached = get().snapshotsBySession[sessionId];
-    if (!options.force && cached && cached.composition_version === compositionVersion) {
+    if (
+      !options.force &&
+      matchingAuditReadinessSnapshot(
+        cached,
+        sessionId,
+        compositionVersion,
+      ) !== undefined
+    ) {
       return;
     }
 
@@ -102,9 +110,54 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const snapshot = await fetchAuditReadiness(sessionId, controller.signal);
+      if (
+        matchingAuditReadinessSnapshot(
+          snapshot,
+          sessionId,
+          compositionVersion,
+        ) === undefined
+      ) {
+        set((state) => {
+          if (state.abortControllers[sessionId] !== controller) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
+          const current = state.snapshotsBySession[sessionId];
+          let snapshotsBySession = state.snapshotsBySession;
+          if (
+            current === cached &&
+            matchingAuditReadinessSnapshot(
+              current,
+              sessionId,
+              compositionVersion,
+            ) !== undefined
+          ) {
+            const { [sessionId]: _quarantined, ...restSnapshots } =
+              state.snapshotsBySession;
+            snapshotsBySession = restSnapshots;
+          }
+          return {
+            snapshotsBySession,
+            abortControllers: restCtrl,
+            isLoadingBySession: {
+              ...state.isLoadingBySession,
+              [sessionId]: false,
+            },
+            errorBySession: {
+              ...state.errorBySession,
+              [sessionId]:
+                "Audit readiness response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       // Monotonic write guard: discard the response if a newer version has
       // already been stored while this fetch was in flight.
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const current = state.snapshotsBySession[sessionId];
         if (current && current.composition_version > snapshot.composition_version) {
           // Stale response arrived after a newer one was already cached —
@@ -152,6 +205,9 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
         return {
           abortControllers: restCtrl,
@@ -185,7 +241,39 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const explain = await fetchAuditReadinessExplain(sessionId, explainController.signal);
+      if (
+        explain.session_id !== sessionId ||
+        explain.composition_version !== compositionVersion
+      ) {
+        set((state) => {
+          if (
+            state.explainAbortControllers[sessionId] !== explainController
+          ) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } =
+            state.explainAbortControllers;
+          return {
+            explainAbortControllers: restCtrl,
+            isLoadingExplainBySession: {
+              ...state.isLoadingExplainBySession,
+              [sessionId]: false,
+            },
+            explainErrorBySession: {
+              ...state.explainErrorBySession,
+              [sessionId]:
+                "Audit explain response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainsBySession: {
@@ -222,6 +310,11 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainAbortControllers: restCtrl,

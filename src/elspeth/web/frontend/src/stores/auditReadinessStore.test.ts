@@ -6,6 +6,7 @@ import type { AuditReadinessSnapshot, AuditReadinessExplain } from "../types/api
 vi.mock("../api/auditReadiness");
 
 const SESSION_ID = "00000000-0000-0000-0000-000000000001";
+const OTHER_SESSION_ID = "00000000-0000-0000-0000-000000000002";
 const READY_READINESS = {
   authoring_valid: true,
   execution_ready: true,
@@ -37,6 +38,24 @@ function snapshot(version: number): AuditReadinessSnapshot {
   };
 }
 
+function explain(version: number, narrative = `version ${version}`): AuditReadinessExplain {
+  return {
+    session_id: SESSION_ID,
+    composition_version: version,
+    narrative,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("useAuditReadinessStore", () => {
   beforeEach(() => {
     useAuditReadinessStore.setState(getInitialState());
@@ -63,6 +82,50 @@ describe("useAuditReadinessStore", () => {
     expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
   });
 
+  it("refetches and recovers when a same-version cache entry belongs to another session", async () => {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        [SESSION_ID]: {
+          ...snapshot(2),
+          session_id: OTHER_SESSION_ID,
+        },
+      },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(2));
+
+    await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 2);
+
+    expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(1);
+    expect(
+      useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID]
+        ?.session_id,
+    ).toBe(SESSION_ID);
+    expect(useAuditReadinessStore.getState().errorBySession[SESSION_ID]).toBeNull();
+  });
+
+  it.each([
+    ["session", { session_id: OTHER_SESSION_ID }],
+    ["composition version", { composition_version: 3 }],
+  ] as const)(
+    "rejects a fetched snapshot with mismatched %s and exposes a settled retryable error",
+    async (_identity, mismatch) => {
+      vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce({
+        ...snapshot(2),
+        ...mismatch,
+      });
+
+      await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 2);
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingBySession[SESSION_ID]).toBe(false);
+      expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBe(
+        "Audit readiness response did not match the requested composition.",
+      );
+    },
+  );
+
   it("loadSnapshot force option bypasses a matching-version cached snapshot", async () => {
     vi.mocked(api.fetchAuditReadiness)
       .mockResolvedValueOnce(snapshot(2))
@@ -72,6 +135,65 @@ describe("useAuditReadinessStore", () => {
     await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 2, { force: true });
 
     expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(2);
+  });
+
+  it("quarantines a matching cache after a forced refresh identity failure and recovers on retry", async () => {
+    const cached = snapshot(4);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: cached },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce({
+      ...snapshot(4),
+      session_id: OTHER_SESSION_ID,
+    });
+
+    await useAuditReadinessStore
+      .getState()
+      .loadSnapshot(SESSION_ID, 4, { force: true });
+
+    let state = useAuditReadinessStore.getState();
+    expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+    expect(state.isLoadingBySession[SESSION_ID]).toBe(false);
+    expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+    expect(state.errorBySession[SESSION_ID]).toBe(
+      "Audit readiness response did not match the requested composition.",
+    );
+
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(4));
+    await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 4, {
+      force: true,
+    });
+
+    state = useAuditReadinessStore.getState();
+    expect(state.snapshotsBySession[SESSION_ID]).toEqual(snapshot(4));
+    expect(state.errorBySession[SESSION_ID]).toBeNull();
+  });
+
+  it("preserves a replacement cache when an older forced refresh fails identity validation", async () => {
+    const cached = snapshot(4);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: cached },
+    });
+    let resolve!: (value: AuditReadinessSnapshot) => void;
+    vi.mocked(api.fetchAuditReadiness).mockReturnValueOnce(
+      new Promise<AuditReadinessSnapshot>((done) => {
+        resolve = done;
+      }),
+    );
+
+    const refresh = useAuditReadinessStore
+      .getState()
+      .loadSnapshot(SESSION_ID, 4, { force: true });
+    const replacement = snapshot(5);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: replacement },
+    });
+    resolve({ ...snapshot(4), session_id: OTHER_SESSION_ID });
+    await refresh;
+
+    expect(
+      useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID],
+    ).toBe(replacement);
   });
 
   it("loadSnapshot refetches when the version advances", async () => {
@@ -132,6 +254,32 @@ describe("useAuditReadinessStore", () => {
       useAuditReadinessStore.getState().explainsBySession[SESSION_ID]?.narrative,
     ).toBe("v2 text");
   });
+
+  it.each([
+    ["session", { session_id: OTHER_SESSION_ID }],
+    ["composition version", { composition_version: 3 }],
+  ] as const)(
+    "rejects a current-controller explain with mismatched %s identity",
+    async (_identity, mismatch) => {
+      vi.mocked(api.fetchAuditReadinessExplain).mockResolvedValueOnce({
+        ...explain(2, "foreign narrative"),
+        ...mismatch,
+      });
+
+      await useAuditReadinessStore.getState().loadExplain(SESSION_ID, 2);
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(false);
+      expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBe(
+        "Audit explain response did not match the requested composition.",
+      );
+      expect(JSON.stringify(state.explainsBySession)).not.toContain(
+        "foreign narrative",
+      );
+    },
+  );
 
   it("clearSession removes both snapshot and explain", async () => {
     vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(1));
@@ -219,6 +367,121 @@ describe("useAuditReadinessStore", () => {
     expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
     expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(false);
   });
+
+  it.each(["success", "error"] as const)(
+    "a superseded snapshot %s cannot publish, clear loading, or remove the newer controller",
+    async (outcome) => {
+      const first = deferred<AuditReadinessSnapshot>();
+      const second = deferred<AuditReadinessSnapshot>();
+      vi.mocked(api.fetchAuditReadiness)
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+
+      const firstLoad = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 1);
+      const secondLoad = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 2);
+      const newerController =
+        useAuditReadinessStore.getState().abortControllers[SESSION_ID];
+
+      if (outcome === "success") first.resolve(snapshot(1));
+      else first.reject({ status: 500, detail: "stale snapshot failure" });
+      await firstLoad;
+
+      let state = useAuditReadinessStore.getState();
+      expect(state.abortControllers[SESSION_ID]).toBe(newerController);
+      expect(state.isLoadingBySession[SESSION_ID]).toBe(true);
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBeNull();
+
+      const secondSnapshot = snapshot(2);
+      second.resolve(secondSnapshot);
+      await secondLoad;
+      state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toEqual(secondSnapshot);
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "a snapshot %s settling after clearSession cannot resurrect session state",
+    async (outcome) => {
+      const request = deferred<AuditReadinessSnapshot>();
+      vi.mocked(api.fetchAuditReadiness).mockReturnValueOnce(request.promise);
+      const load = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 1);
+
+      useAuditReadinessStore.getState().clearSession(SESSION_ID);
+      if (outcome === "success") request.resolve(snapshot(1));
+      else request.reject({ status: 500, detail: "late snapshot failure" });
+      await load;
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingBySession[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBeUndefined();
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "a superseded explain %s cannot publish, clear loading, or remove the newer controller",
+    async (outcome) => {
+      const first = deferred<AuditReadinessExplain>();
+      const second = deferred<AuditReadinessExplain>();
+      vi.mocked(api.fetchAuditReadinessExplain)
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+
+      const firstLoad = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 1);
+      const secondLoad = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 2);
+      const newerController =
+        useAuditReadinessStore.getState().explainAbortControllers[SESSION_ID];
+
+      if (outcome === "success") first.resolve(explain(1));
+      else first.reject({ status: 500, detail: "stale explain failure" });
+      await firstLoad;
+
+      let state = useAuditReadinessStore.getState();
+      expect(state.explainAbortControllers[SESSION_ID]).toBe(newerController);
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(true);
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBeNull();
+
+      second.resolve(explain(2));
+      await secondLoad;
+      state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toEqual(explain(2));
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "an explain %s settling after clearSession cannot resurrect session state",
+    async (outcome) => {
+      const request = deferred<AuditReadinessExplain>();
+      vi.mocked(api.fetchAuditReadinessExplain).mockReturnValueOnce(request.promise);
+      const load = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 1);
+
+      useAuditReadinessStore.getState().clearSession(SESSION_ID);
+      if (outcome === "success") request.resolve(explain(1));
+      else request.reject({ status: 500, detail: "late explain failure" });
+      await load;
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBeUndefined();
+    },
+  );
 
   // --- Monotonic write-guard contract ---
   // This test exercises the version monotonicity guard (loadSnapshot discards

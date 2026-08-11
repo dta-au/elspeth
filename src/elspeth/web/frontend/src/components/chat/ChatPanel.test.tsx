@@ -1,7 +1,14 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatPanel,
@@ -20,7 +27,6 @@ import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useExecutionStore } from "@/stores/executionStore";
-import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { resetStore } from "@/test/store-helpers";
 import { useComposer } from "@/hooks/useComposer";
 import { makeComposition } from "@/test/composerFixtures";
@@ -46,6 +52,15 @@ import type { InterpretationEvent } from "@/types/interpretation";
 
 vi.mock("@/hooks/useComposer", () => ({
   useComposer: vi.fn(),
+}));
+
+const inlineRunResultsMountSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("@/components/execution/InlineRunResults", () => ({
+  InlineRunResults: () => {
+    inlineRunResultsMountSpy();
+    return <div data-testid="inline-run-results" />;
+  },
 }));
 
 // Spy-style mock of the blob-fetch surface so the inline-source-projection
@@ -268,10 +283,6 @@ vi.mock("@/components/blobs/BlobManager", () => ({
   BlobManager: () => <div data-testid="blob-manager" />,
 }));
 
-vi.mock("@/components/execution/InlineRunResults", () => ({
-  InlineRunResults: () => <div data-testid="inline-run-results" />,
-}));
-
 describe("ChatPanel", () => {
   beforeEach(() => {
     vi.resetAllMocks();
@@ -285,6 +296,28 @@ describe("ChatPanel", () => {
       compositionState: null,
       error: null,
     });
+  });
+
+  it("observes the InlineRunResults sentinel when the retired owner is imported", async () => {
+    const { InlineRunResults } = await import(
+      "@/components/execution/InlineRunResults"
+    );
+    render(<InlineRunResults />);
+
+    expect(inlineRunResultsMountSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+  });
+
+  it("does not mount run results in the freeform authoring pane", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      messages: [],
+    });
+
+    render(<ChatPanel />);
+
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("passes backend composer progress to the composing indicator", () => {
@@ -1775,7 +1808,8 @@ describe("ChatPanel mode discriminator", () => {
     // "docks ... BELOW the decision" test above. This test asserts presence
     // only; per-step placeholder + onSend wiring are exercised below.
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
-    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("shows the composer model chip in the GUIDED chat header too (elspeth-e9f7678de8)", async () => {
@@ -1962,13 +1996,10 @@ describe("ChatPanel mode discriminator", () => {
     ).toBeInTheDocument();
   });
 
-  // ── Slice C: the guided verification panel ────────────────────────────────
+  // ── Common workspace ownership ───────────────────────────────────────────
   //
-  // The panel (gloss + plain validation summary) leads the guided column for
-  // BOTH surfaces; the graph THUMBNAIL is tutorial-only (live-guided already
-  // renders GraphMiniView in the SideRail, so the column would otherwise
-  // duplicate it). No second GraphModal is mounted here — both surfaces expand
-  // into the App-root GraphModal.
+  // Active guided ChatPanel owns authoring only. Graph, spec, validation, and
+  // history project through the surrounding common workspace and Inspector.
   function sourceLlmCsvComposition() {
     return makeComposition(1, {
       sources: { source: { plugin: "text", options: {} } },
@@ -1987,7 +2018,7 @@ describe("ChatPanel mode discriminator", () => {
     });
   }
 
-  it("mounts the guided verification panel (gloss + validation + graph thumbnail) in the workspace rail for live guided", () => {
+  it("leaves live guided graph, spec, and validation evidence to the common workspace", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2000,33 +2031,22 @@ describe("ChatPanel mode discriminator", () => {
 
     const { container } = render(<ChatPanel />);
 
-    // The verification panel anchors the artifact rail.
-    const rail = container.querySelector("aside.guided-workspace-rail");
-    expect(rail).not.toBeNull();
-    const panel = screen.getByRole("region", { name: "Pipeline so far" });
-    expect(rail!.contains(panel)).toBe(true);
-    // Gloss renders a plain-language sentence from the composition.
-    expect(screen.getByTestId("pipeline-gloss")).toHaveTextContent(
-      /this pipeline will read your data, rate each row, and write a csv\./i,
-    );
-    // Validation summary root is always present (neutral here — no result yet).
+    expect(screen.queryByRole("region", { name: "Pipeline so far" })).toBeNull();
+    expect(screen.queryByTestId("pipeline-gloss")).toBeNull();
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
     expect(
-      screen.getByTestId("pipeline-validation-summary"),
-    ).toBeInTheDocument();
-    // The graph thumbnail rides in the rail for EVERY guided session — the
-    // App suppresses the freeform SideRail (its old home) while the guided
-    // workspace is on screen.
-    expect(
-      screen.getByRole("button", {
+      screen.queryByRole("button", {
         name: "Pipeline graph (click to expand)",
       }),
-    ).toBeInTheDocument();
-    // No second GraphModal is mounted in the panel (App-root one serves all).
+    ).toBeNull();
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
     expect(screen.queryByTestId("graph-modal-backdrop")).toBeNull();
     expect(container.querySelector(".graph-modal")).toBeNull();
   });
 
-  it("renders the graph thumbnail in the tutorial rail (which has no SideRail)", () => {
+  it("does not duplicate artifact surfaces inside active tutorial authoring", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2037,32 +2057,24 @@ describe("ChatPanel mode discriminator", () => {
       compositionStateLoaded: true,
     });
 
-    const { container } = render(
+    render(
       <ChatPanel
         isTutorial
         lockedChatPrompt={{ step_1_source: "create the source" }}
       />,
     );
 
-    // Panel + gloss + summary present in the tutorial too — anchored in the
-    // artifact rail (the workspace's right column), not the conversation.
-    const rail = container.querySelector("aside.guided-workspace-rail");
-    expect(rail).not.toBeNull();
-    const panel = screen.getByRole("region", { name: "Pipeline so far" });
-    expect(rail!.contains(panel)).toBe(true);
-    expect(screen.getByTestId("pipeline-gloss")).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Pipeline so far" })).toBeNull();
+    expect(screen.queryByTestId("pipeline-gloss")).toBeNull();
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
     expect(
-      screen.getByTestId("pipeline-validation-summary"),
-    ).toBeInTheDocument();
-    // The tutorial gets the rail thumbnail (populated → the expand button).
-    expect(
-      screen.getByRole("button", {
+      screen.queryByRole("button", {
         name: "Pipeline graph (click to expand)",
       }),
-    ).toBeInTheDocument();
+    ).toBeNull();
   });
 
-  it("retains the per-step rationale prose below the verification panel (demoted, not deleted)", () => {
+  it("retains the per-step rationale prose in the common authoring scroller", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2089,8 +2101,6 @@ describe("ChatPanel mode discriminator", () => {
 
     const { container } = render(<ChatPanel />);
 
-    // The rationale prose is RETAINED as the decision heading, inside the
-    // conversation column's scroll region (the action zone)...
     const rationale = screen.getByRole("heading", {
       level: 2,
       name: /source created as a 3-row csv/i,
@@ -2098,18 +2108,13 @@ describe("ChatPanel mode discriminator", () => {
     expect(rationale).toBeInTheDocument();
     expect(
       container
-        .querySelector(".guided-workspace-scroll")!
+        .querySelector(".guided-authoring-scroll")!
         .contains(rationale),
     ).toBe(true);
-    // ...while the verification panel (the canonical "what I built") holds
-    // its own ambient surface in the artifact rail.
-    const panel = screen.getByRole("region", { name: "Pipeline so far" });
-    expect(
-      container.querySelector("aside.guided-workspace-rail")!.contains(panel),
-    ).toBe(true);
+    expect(screen.queryByRole("region", { name: "Pipeline so far" })).toBeNull();
   });
 
-  // Shared validation-readiness stub (PipelineValidationSummary ignores it).
+  // Shared validation-readiness fixture.
   const READINESS = {
     authoring_valid: true,
     execution_ready: true,
@@ -2117,7 +2122,7 @@ describe("ChatPanel mode discriminator", () => {
     blockers: [],
   };
 
-  it("D1: renders the guided verification panel from the store only — no source-DATA fetch", () => {
+  it("D1: flattening guided authoring performs no source-DATA fetch", () => {
     // Scope the spies to SOURCE-DATA endpoints (blob content / upload). The
     // mode-agnostic auto-validate fires api.validatePipeline, which is
     // metadata-only and D1-safe — it is intentionally NOT spied (a blanket
@@ -2146,29 +2151,12 @@ describe("ChatPanel mode discriminator", () => {
       },
     } as never);
 
-    const { container } = render(
+    render(
       <ChatPanel
         isTutorial
         lockedChatPrompt={{ step_1_source: "create the source" }}
       />,
     );
-
-    // The panel is built purely from compositionState + validationResult,
-    // and lives in the artifact rail.
-    expect(
-      container.querySelector(
-        'aside.guided-workspace-rail [data-testid="pipeline-gloss"]',
-      ),
-    ).not.toBeNull();
-    expect(screen.getByTestId("pipeline-gloss")).toBeInTheDocument();
-    expect(
-      screen.getByTestId("pipeline-validation-summary"),
-    ).toHaveTextContent(/looks good/i);
-    expect(
-      screen.getByRole("button", {
-        name: "Pipeline graph (click to expand)",
-      }),
-    ).toBeInTheDocument();
 
     // Zero source-DATA reads — D1 (consumable source, zero rows).
     expect(uploadSpy).not.toHaveBeenCalled();
@@ -2178,7 +2166,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(apiClient.getBlobMetadata).not.toHaveBeenCalled();
   });
 
-  it("tutorial parity: the in-column validation summary reflects validationResult, and the thumbnail expands the App-root modal", () => {
+  it("active tutorial validation remains available to common surfaces without an in-authoring duplicate", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2208,38 +2196,16 @@ describe("ChatPanel mode discriminator", () => {
       },
     } as never);
 
-    const { container } = render(
+    render(
       <ChatPanel
         isTutorial
         lockedChatPrompt={{ step_1_source: "create the source" }}
       />,
     );
 
-    // (a) the summary reflects validationResult, with the PLAIN node name
-    // mapped from the finding's component_id (not the raw id) — rendered in
-    // the artifact rail.
-    const summary = screen.getByTestId("pipeline-validation-summary");
-    expect(
-      container
-        .querySelector("aside.guided-workspace-rail")
-        ?.contains(summary),
-    ).toBe(true);
-    expect(summary).toHaveTextContent(/rate each row/);
-    expect(summary).toHaveTextContent(/review the prompt wording/i);
-
-    // (b) clicking the thumbnail dispatches OPEN_GRAPH_MODAL_EVENT, caught by
-    // the App-root GraphModal — no second modal is mounted in the column. The
-    // per-node MARKER assertion targets the modal GraphView (GraphView.test.tsx
-    // marker coverage), NOT GraphMiniView (which has no markers).
-    const openSpy = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, openSpy);
-    fireEvent.click(
-      screen.getByRole("button", {
-        name: "Pipeline graph (click to expand)",
-      }),
-    );
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, openSpy);
-    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(useExecutionStore.getState().validationResult?.warnings).toHaveLength(1);
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
+    expect(screen.queryByTestId("pipeline-gloss")).toBeNull();
   });
 
   it("scrolls the guided log into view when the active step advances", () => {
@@ -2601,7 +2567,7 @@ describe("ChatPanel mode discriminator", () => {
     };
   }
 
-  it("tutorial guided: workspace — transcript, acks, decision and composer share the conversation column in order; the rail holds no decision", () => {
+  it("guided workspace uses one authoring scroller in transcript, acknowledgements, decision, pending, composer order without a nested rail", () => {
     useInterpretationEventsStore.setState({
       pendingBySession: { "session-guided": { "card-workspace-1": pendingAckCard() } },
     });
@@ -2625,55 +2591,57 @@ describe("ChatPanel mode discriminator", () => {
         ],
       },
       guidedNextTurn: singleSelectTurn(),
+      guidedChatPending: true,
     });
 
-    const { container } = render(
-      <ChatPanel
-        isTutorial
-        lockedChatPrompt={{ step_1_source: "create the source" }}
-      />,
-    );
+    const { container } = render(<ChatPanel />);
 
-    // The workspace: conversation column (stream) + artifact rail.
-    const stream = container.querySelector(".guided-workspace-stream");
-    const rail = container.querySelector("aside.guided-workspace-rail");
-    expect(stream).not.toBeNull();
-    expect(rail).not.toBeNull();
-    // The rail is ambient pipeline state — labelled for what it now holds
-    // ("Pipeline summary", distinct from the inner "Pipeline so far" section),
-    // with NO decision card in it.
-    expect(rail!.getAttribute("aria-label")).toBe("Pipeline summary");
-    expect(rail!.querySelector(".guided-current-decision")).toBeNull();
-    expect(rail!.querySelector(".guided-step-chat")).toBeNull();
+    const authoringPane = screen.getByRole("region", {
+      name: "Guided composer",
+    });
+    expect(
+      within(authoringPane).getByRole("log", { name: "Step chat history" }),
+    ).toBeVisible();
+    expect(
+      within(authoringPane).getByRole("log", { name: "Guided wizard step" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
+    expect(container.querySelector(".guided-workspace")).toBeNull();
 
-    // The decision lives INSIDE the conversation column's internal scroll
-    // region, and the composer docks after it in the stream.
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    // One named scroller owns the active guided authoring body. The live
+    // acknowledgement count stays mounted before it, while the composer stays
+    // docked after it and therefore never becomes scroll content.
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
-    expect(scroll!.querySelector(".guided-current-decision")).not.toBeNull();
-    const composer = stream!.querySelector(".guided-step-chat");
+    expect(scroll).toHaveAttribute("role", "group");
+    expect(scroll).toHaveAttribute("aria-label", "Conversation");
+    expect(scroll).toHaveAttribute("tabindex", "0");
+    const announcer = authoringPane.querySelector(
+      '[role="status"].visually-hidden',
+    );
+    expect(announcer).not.toBeNull();
+    expect(scroll!.contains(announcer)).toBe(false);
+
+    const composer = authoringPane.querySelector(".guided-step-chat");
     expect(composer).not.toBeNull();
     expect(scroll!.contains(composer)).toBe(false);
 
-    // DOM-order chain inside the column: transcript → AcknowledgementStack →
-    // decision → composer (DOCUMENT_POSITION_FOLLOWING = the argument follows
-    // the receiver).
-    const transcript = stream!.querySelector(".guided-chat-bubbles");
-    const acks = stream!.querySelector('[data-testid="acknowledgement-stack"]');
-    const decision = stream!.querySelector(".guided-current-decision");
+    const transcript = scroll!.querySelector(".guided-chat-bubbles");
+    const acks = scroll!.querySelector('[data-testid="acknowledgement-stack"]');
+    const decision = scroll!.querySelector(".guided-current-decision");
+    const pending = scroll!.querySelector(".guided-pending-strip");
     expect(transcript).not.toBeNull();
     expect(acks).not.toBeNull();
     expect(decision).not.toBeNull();
+    expect(pending).not.toBeNull();
     const follows = (earlier: Element, later: Element) =>
       earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING;
     expect(follows(transcript!, acks!)).toBeTruthy();
     expect(follows(acks!, decision!)).toBeTruthy();
-    expect(follows(decision!, composer!)).toBeTruthy();
-
-    // Tutorial suppresses the exit affordance, so there is no header/exit.
-    expect(
-      screen.queryByRole("button", { name: "Exit to freeform" }),
-    ).toBeNull();
+    expect(follows(decision!, pending!)).toBeTruthy();
+    expect(follows(pending!, composer!)).toBeTruthy();
   });
 
   it("tutorial: the conversation column is a named, keyboard-focusable scroll region (not a live region)", () => {
@@ -2693,7 +2661,7 @@ describe("ChatPanel mode discriminator", () => {
     );
 
     const scroll = container.querySelector<HTMLElement>(
-      ".guided-workspace-scroll",
+      ".guided-authoring-scroll",
     );
     expect(scroll).not.toBeNull();
     // role="group" is required for the accessible name to be exposed
@@ -2708,7 +2676,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(scroll!.getAttribute("role")).not.toBe("log");
   });
 
-  it("tutorial: the artifact rail is a keyboard-scrollable tab stop", () => {
+  it("tutorial: does not mount a nested artifact rail", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2724,13 +2692,10 @@ describe("ChatPanel mode discriminator", () => {
       />,
     );
 
-    // The rail scrolls (overflow-y:auto; the ≤900px strip caps at 30vh while
-    // hiding its only focusable furniture) — without a tab stop its overflow
-    // is keyboard-unreachable (WCAG 2.1.1). The complementary role already
-    // carries the accessible name.
-    const rail = container.querySelector("aside.guided-workspace-rail");
-    expect(rail).not.toBeNull();
-    expect(rail!.getAttribute("tabindex")).toBe("0");
+    expect(container.querySelector("aside.guided-workspace-rail")).toBeNull();
+    expect(
+      screen.queryByRole("complementary", { name: "Pipeline summary" }),
+    ).toBeNull();
   });
 
   it("presents the respond-rejection alert by scrolling it into view when it lands", () => {
@@ -2795,7 +2760,7 @@ describe("ChatPanel mode discriminator", () => {
     // — between the reply and the composer, never docked with the composer
     // (a tall schema/wire widget in a fixed dock crushes the transcript).
     expect(
-      container.querySelector(".guided-workspace-scroll .guided-current-decision"),
+      container.querySelector(".guided-authoring-scroll .guided-current-decision"),
     ).not.toBeNull();
     // .guided-scroll is the LIVE guided arrangement — the tutorial never
     // renders it (the old assertion here passed vacuously against it).
@@ -2816,7 +2781,7 @@ describe("ChatPanel mode discriminator", () => {
     ).not.toBeNull();
   });
 
-  it("tutorial rail: pipeline summary + decisions so far, and nothing actionable (no decision/submit/composer affordances)", () => {
+  it("keeps guided history in session state without duplicating it in tutorial authoring", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2824,8 +2789,8 @@ describe("ChatPanel mode discriminator", () => {
       guidedSession: {
         ...activeGuidedSession(),
         step: "step_2_sink",
-        // A PAST summarised step so GuidedHistory ("Decisions so far") renders
-        // — it returns null until a step the learner moved past has a summary.
+        // A past summarised step remains available to the common Inspector's
+        // History tab even though ChatPanel no longer mounts GuidedHistory.
         history: [
           {
             step: "step_1_source",
@@ -2849,34 +2814,9 @@ describe("ChatPanel mode discriminator", () => {
       />,
     );
 
-    const rail = container.querySelector("aside.guided-workspace-rail");
-    expect(rail).not.toBeNull();
-    // Summary card: gloss + validation + graph thumbnail, inside the rail.
-    expect(rail!.querySelector('[data-testid="pipeline-gloss"]')).not.toBeNull();
-    expect(
-      rail!.querySelector('[data-testid="pipeline-validation-summary"]'),
-    ).not.toBeNull();
-    const expandButton = screen.getByRole("button", {
-      name: "Pipeline graph (click to expand)",
-    });
-    expect(rail!.contains(expandButton)).toBe(true);
-    // "Decisions so far" folded into the rail (single mount — it left the
-    // conversation column).
-    const decisionsHeading = screen.getByRole("heading", {
-      name: "Decisions so far",
-    });
-    expect(rail!.contains(decisionsHeading)).toBe(true);
-    expect(screen.getAllByRole("heading", { name: "Decisions so far" })).toHaveLength(1);
-
-    // Nothing actionable: no composer, no decision widget, no submit controls.
-    // (GraphMiniView's expand button above is the accepted exception — it
-    // matches live's SideRail; "actionable" = decision/submit/composer
-    // affordances.)
-    expect(rail!.querySelector('[data-testid="chat-input"]')).toBeNull();
-    expect(rail!.querySelector("fieldset")).toBeNull();
-    expect(rail!.querySelector("textarea")).toBeNull();
-    expect(rail!.querySelector(".guided-current-decision")).toBeNull();
-    expect(rail!.querySelector(".guided-step-chat")).toBeNull();
+    expect(useSessionStore.getState().guidedSession?.history).toHaveLength(1);
+    expect(screen.queryByRole("heading", { name: "Decisions so far" })).toBeNull();
+    expect(container.querySelector("aside.guided-workspace-rail")).toBeNull();
   });
 
   it("tutorial: bare composer — locked read-only prompt in the named region, no visible card heading", () => {
@@ -2923,18 +2863,15 @@ describe("ChatPanel mode discriminator", () => {
 
     const { container } = render(<ChatPanel />);
 
-    // The workspace is THE guided layout (promoted from the tutorial,
-    // operator directive 2026-07-03) — the old .guided-scroll flat
-    // arrangement is gone for good.
-    expect(container.querySelector(".guided-workspace")).not.toBeNull();
+    // The common ComposerWorkspace owns the outer layout; ChatPanel supplies
+    // only its authoring contents.
+    expect(container.querySelector(".guided-workspace")).toBeNull();
     expect(container.querySelector(".guided-scroll")).toBeNull();
     // Decision = the action zone at the end of the conversation column.
     expect(
-      container.querySelector(".guided-workspace-scroll .guided-current-decision"),
+      container.querySelector(".guided-authoring-scroll .guided-current-decision"),
     ).not.toBeNull();
-    // Artifact rail present (the App suppresses the freeform SideRail while
-    // this surface renders — the rail here replaces it).
-    expect(container.querySelector("aside.guided-workspace-rail")).not.toBeNull();
+    expect(container.querySelector("aside.guided-workspace-rail")).toBeNull();
     // Bare docked composer: no card heading in ANY mode...
     expect(container.querySelector(".guided-step-chat-heading")).toBeNull();
     // ...but live input stays EDITABLE — the tutorial's locked prompt is the
@@ -2951,7 +2888,7 @@ describe("ChatPanel mode discriminator", () => {
     ).toBeInTheDocument();
   });
 
-  it("tutorial: the workflow stepper renders above the workspace", () => {
+  it("tutorial: the workflow stepper renders above the authoring scroller", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -2968,10 +2905,10 @@ describe("ChatPanel mode discriminator", () => {
     );
 
     const stepper = screen.getByRole("list", { name: /guided workflow/i });
-    const workspace = container.querySelector(".guided-workspace");
-    expect(workspace).not.toBeNull();
+    const scroller = container.querySelector(".guided-authoring-scroll");
+    expect(scroller).not.toBeNull();
     expect(
-      stepper.compareDocumentPosition(workspace!) &
+      stepper.compareDocumentPosition(scroller!) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
   });
@@ -3028,10 +2965,10 @@ describe("ChatPanel mode discriminator", () => {
     // its 0→1 announce contract (content mutation inside a pre-existing node)
     // survives the relayout, and there must be exactly one.
     const announcers = container.querySelectorAll(
-      '.guided-workspace-stream [role="status"].visually-hidden',
+      '#chat-main > [role="status"].visually-hidden',
     );
     expect(announcers).toHaveLength(1);
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
     expect(scroll!.contains(announcers[0])).toBe(false);
   });
@@ -3067,7 +3004,7 @@ describe("ChatPanel mode discriminator", () => {
     );
 
     const scroll = container.querySelector<HTMLElement>(
-      ".guided-workspace-scroll",
+      ".guided-authoring-scroll",
     );
     expect(scroll).not.toBeNull();
     // Stub the scroll geometry (jsdom has no layout): content overflows the
@@ -3148,7 +3085,7 @@ describe("ChatPanel mode discriminator", () => {
     );
 
     const scroll = container.querySelector<HTMLElement>(
-      ".guided-workspace-scroll",
+      ".guided-authoring-scroll",
     );
     expect(scroll).not.toBeNull();
     let scrollTop = 100; // 1000 - 100 - 400 = 500px from the bottom (> 40px).
@@ -3216,7 +3153,7 @@ describe("ChatPanel mode discriminator", () => {
     );
 
     const scroll = container.querySelector<HTMLElement>(
-      ".guided-workspace-scroll",
+      ".guided-authoring-scroll",
     );
     expect(scroll).not.toBeNull();
     let scrollHeight = 1000;
@@ -3278,14 +3215,15 @@ describe("ChatPanel mode discriminator", () => {
     // frame would strand the completion content off-screen.
     const chatMain = container.querySelector("#chat-main");
     expect(chatMain?.classList.contains("chat-panel--completed")).toBe(true);
-    // Stepper (all steps done → "Ready") + the completion summary render.
+    // Stepper (all steps done → "Ready") + the completion outcome render.
     expect(
       screen.getByRole("list", { name: /guided workflow/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Export YAML" }),
+      screen.getByRole("heading", { name: "Pipeline updated" }),
     ).toBeInTheDocument();
-    expect(screen.getByTestId("pipeline-validation-summary")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Export YAML" })).toBeNull();
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
     // Tutorial completion suppresses the freeform handoff (concern B).
     expect(
       screen.queryByRole("button", { name: "Open freeform editor" }),
@@ -3355,7 +3293,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(current).toHaveTextContent("Ready");
   });
 
-  it("workspace CSS: internal scroll region focus ring is inset, and the 900px collapse bounds the stream row with the rail strip first", () => {
+  it("guided authoring CSS keeps one bounded scroller, an inset focus ring, and compact short-height progress", () => {
     // jsdom runs with css:false — media queries and computed styles are
     // invisible, so the responsive contract is pinned as CSS text (same idiom
     // as the stepper-grid test above).
@@ -3367,15 +3305,16 @@ describe("ChatPanel mode discriminator", () => {
     // workspace frame clips overflow, so the default +2px offset ring would
     // be invisible on all four sides.
     expect(css).toMatch(
-      /\.guided-workspace-scroll:focus-visible\s*\{[^}]*outline-offset: -2px/,
+      /\.guided-authoring-scroll:focus-visible\s*\{[^}]*outline-offset: -2px/,
     );
-    // ≤900px: single column; the rail collapses to a strip ABOVE the
-    // conversation (order:-1) and the stream row stays bounded
-    // (minmax(0, 1fr)) so the internal scroll still engages.
-    const media900 = css.match(/@media \(max-width: 900px\)[\s\S]*?\n\}/);
-    expect(media900).not.toBeNull();
-    expect(media900![0]).toContain("grid-template-rows: auto minmax(0, 1fr);");
-    expect(media900![0]).toContain("order: -1;");
+    expect(css).toMatch(
+      /\.guided-authoring-scroll\s*\{[^}]*min-height: 0;[^}]*overflow-y: auto/,
+    );
+    expect(css).not.toContain(".guided-workspace-rail");
+    expect(css).not.toContain(".guided-workspace {");
+    const shortHeight = css.match(/@media \(max-height: 760px\)[\s\S]*?\n\}/);
+    expect(shortHeight).not.toBeNull();
+    expect(shortHeight![0]).toContain("padding-top: 2px;");
   });
 
   it("delegates guided ChatInput sends to the retry-safe store action", async () => {
@@ -4055,7 +3994,7 @@ assistant_message_kind: "synthetic_failure",
 
     const strip = container.querySelector(".guided-pending-strip");
     expect(strip).not.toBeNull();
-    const scroll = container.querySelector(".guided-workspace-scroll");
+    const scroll = container.querySelector(".guided-authoring-scroll");
     expect(scroll).not.toBeNull();
     expect(scroll!.contains(strip)).toBe(true);
     const composer = screen.getByRole("region", {
@@ -4527,16 +4466,17 @@ assistant_message_kind: "synthetic_failure",
 
     const { container } = render(<ChatPanel />);
 
-    // CompletionSummary renders task-oriented terminal actions.
+    // CompletionSummary keeps only the async mode transition. Artifacts,
+    // validation, and run history stay owned by the common workspace.
     expect(
       screen.getByRole("button", { name: "Open freeform editor" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Export YAML" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Export YAML" }),
+    ).toBeNull();
     expect(
-      screen.getByRole("button", { name: "Validate pipeline" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Validate pipeline" }),
+    ).toBeNull();
 
     // Container carries the per-branch CSS hook AND preserves the skip-link anchor.
     const chatMain = container.querySelector("#chat-main");
@@ -4545,7 +4485,8 @@ assistant_message_kind: "synthetic_failure",
 
     // Freeform surface suppressed.
     expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
-    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+    expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("renders pending interpretation Accept cards on the completed surface", () => {
@@ -4612,7 +4553,7 @@ assistant_message_kind: "synthetic_failure",
     expect(screen.getByTestId("acknowledgement-card")).toBeInTheDocument();
   });
 
-  it("tutorial completed: renders validation feedback on the reset tutorial shell", () => {
+  it("tutorial completed: leaves validation to the common inspector", () => {
     const terminal: TerminalState = {
       kind: "completed",
       reason: null,
@@ -4646,12 +4587,8 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel isTutorial />);
 
-    expect(screen.getByTestId("pipeline-validation-summary")).toBeInTheDocument();
-    // Multiple role="status" elements exist on the completed surface (the
-    // validation summary plus the always-mounted acknowledgement live
-    // region) — assert the validation one specifically.
-    const statuses = screen.getAllByRole("status");
-    expect(statuses.some((el) => /looks good/i.test(el.textContent ?? ""))).toBe(true);
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
+    expect(screen.queryByText(/looks good/i)).toBeNull();
   });
 
   it("does not render ExitToFreeformButton on the completed surface (regression pin for elspeth-obs-0a1002de6d)", () => {

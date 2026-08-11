@@ -1,11 +1,16 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { type ReactNode, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import {
+  FOCUS_AUTHORING_EVENT,
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
   REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -16,6 +21,32 @@ import {
 import { resetStore } from "@/test/store-helpers";
 import type { GuidedSession } from "@/types/guided";
 import type { ValidationResult } from "@/types/index";
+import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
+import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
+import { useHashRouter } from "@/hooks/useHashRouter";
+
+vi.mock("@xyflow/react", () => ({
+  MarkerType: { ArrowClosed: "arrowclosed" },
+  Position: { Top: "top", Bottom: "bottom" },
+  ReactFlowProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+  ReactFlow: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  BaseEdge: () => null,
+  Handle: () => null,
+  Background: () => null,
+  Controls: () => null,
+  MiniMap: () => null,
+}));
+vi.mock("@xyflow/react/dist/style.css", () => ({}));
+vi.mock("@/components/inspector/YamlView", () => ({
+  YamlView: () => <div>YAML artifact</div>,
+}));
+
+class PassiveResizeObserver implements ResizeObserver {
+  constructor(_callback: ResizeObserverCallback) {}
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
 
 vi.mock("@/api/client", () => ({
   fetchSessions: vi.fn(),
@@ -33,6 +64,7 @@ vi.mock("@/api/client", () => ({
   respondGuided: vi.fn(),
   reenterGuided: vi.fn(),
   chatGuided: vi.fn(),
+  fetchYaml: vi.fn().mockResolvedValue({ yaml: "sources: {}" }),
 }));
 
 const executionStoreState = vi.hoisted(() => ({
@@ -68,6 +100,64 @@ describe("CommandPalette guided-mode commands", () => {
     executionStoreState.progress = null;
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
+    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
+  });
+
+  it("closes before YAML supersedes a deferred Spec hash so final focus lands on YAML", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [{ id: "session-1", title: "Session 1" }],
+      compositionStateLoaded: false,
+      compositionState: {
+        id: "state-1",
+        version: 1,
+        sources: { source: { plugin: "csv", options: {} } },
+        nodes: [],
+        edges: [],
+        outputs: [],
+        metadata: { name: null, description: null },
+      },
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+
+    function Harness() {
+      useHashRouter();
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>
+            Open palette
+          </button>
+          <ComposerWorkspace
+            authoring={<div>Authoring</div>}
+            artifact={<ArtifactWorkspace />}
+            inspector={<div>Inspector</div>}
+            actionBar={<div>Actions</div>}
+          />
+          <CommandPalette
+            isOpen={open}
+            onClose={() => setOpen(false)}
+            runAdmissionAvailable
+          />
+        </>
+      );
+    }
+
+    render(<Harness />);
+    await user.click(screen.getByRole("button", { name: "Open palette" }));
+    await user.click(screen.getByRole("option", { name: /export yaml/i }));
+    act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+    await act(async () => Promise.resolve());
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
+      expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
+    });
+    expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 
   it("offers Re-enter guided mode for a user-exited guided session", async () => {
@@ -140,23 +230,60 @@ describe("CommandPalette guided-mode commands", () => {
     ).toBeNull();
   });
 
-  it("opens the graph modal via the command 'Open graph view'", () => {
-    const handler = vi.fn();
-    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+  it("requests the Graph artifact without opening the legacy modal", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    const onLegacyModal = vi.fn();
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onLegacyModal);
+    useSessionStore.setState({ activeSessionId: "session-1" });
 
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
-    fireEvent.click(screen.getByText(/open graph view/i));
+    const priorIntent = claimWorkspaceViewIntent();
+    fireEvent.click(screen.getByText(/show graph/i));
+    expect(isCurrentWorkspaceViewIntent(priorIntent)).toBe(false);
+    await waitFor(() => {
+      expect(artifactRequests).toEqual([
+        { tab: "graph", focusMode: false, sessionId: "session-1" },
+      ]);
+    });
 
-    expect(handler).toHaveBeenCalled();
-    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
+    expect(onLegacyModal).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onLegacyModal);
   });
 
-  it("opens the yaml export modal via the command 'Export YAML' when the pipeline has content", () => {
-    const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
+  it("routes Focus Chat through the shared authoring-view intent", async () => {
+    const onFocusAuthoring = vi.fn();
+    window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
+
+    fireEvent.click(screen.getByText("Focus Chat Input"));
+
+    await waitFor(() => {
+      expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    });
+    window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+  });
+
+  it("requests the YAML artifact when the pipeline has content", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     useSessionStore.setState({
+      activeSessionId: "session-1",
       compositionState: {
         id: "state-1",
         version: 1,
@@ -172,9 +299,13 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
     fireEvent.click(screen.getByText(/export yaml/i));
+    await waitFor(() => {
+      expect(artifactRequests).toEqual([
+        { tab: "yaml", focusMode: false, sessionId: "session-1" },
+      ]);
+    });
 
-    expect(handler).toHaveBeenCalled();
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });
 
   // elspeth-bff8043d33 residual: the palette command was a leftover path
@@ -189,16 +320,16 @@ describe("CommandPalette guided-mode commands", () => {
     expect(screen.queryByText(/export yaml/i)).toBeNull();
   });
 
-  it("does not offer the old Graph or YAML tab commands", () => {
+  it("offers persistent Graph navigation and withholds YAML without content", () => {
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
     expect(
-      screen.queryByRole("option", { name: /Switch to Graph Tab/i }),
-    ).toBeNull();
+      screen.getByRole("option", { name: /show graph/i }),
+    ).toBeInTheDocument();
     expect(
-      screen.queryByRole("option", { name: /Switch to YAML Tab/i }),
+      screen.queryByRole("option", { name: /export yaml/i }),
     ).toBeNull();
   });
 

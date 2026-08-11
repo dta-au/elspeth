@@ -590,7 +590,7 @@ function ImportYamlSourceBindings({
  * Import-YAML modal: paste or load-from-file, confirm when replacing a
  * non-trivial pipeline, submit, and render the outcome. Mounted only while
  * open (by ImportYamlModalHost), so `useFocusTrap`'s `active` is always true:
- * mount IS open, matching ExportYamlModal's focus/Escape/backdrop idiom.
+ * mount IS open, matching the application's focus/Escape/backdrop idiom.
  */
 export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);

@@ -167,6 +167,9 @@ describe("executionStore.validate", () => {
     expect(state.validationResult).toBeNull();
     expect(state.isValidating).toBe(false);
     expect(state.error).toContain("internal error");
+    expect(state.validationError).toBe(
+      "Validation encountered an internal error. Please try again.",
+    );
     // Catch path must return false so the caller does not cache this version.
     expect(result).toBe(false);
   });
@@ -893,6 +896,17 @@ describe("executionStore.loadRuns", () => {
     useSessionStore.setState({ activeSessionId: "session-1" } as never);
   });
 
+  it("returns loaded after applying the current session's run list", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const currentRuns = [makeRun({ id: "run-current" })];
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue(currentRuns);
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("loaded");
+    expect(useExecutionStore.getState().runs).toEqual(currentRuns);
+  });
+
   it("drops a run-list response that resolves after the active session changes", async () => {
     const { fetchRuns } = await import("@/api/client");
     const pendingRuns = deferred<Run[]>();
@@ -911,9 +925,24 @@ describe("executionStore.loadRuns", () => {
         session_id: "session-1",
       }),
     ]);
-    await loadPromise;
+    const outcome = await loadPromise;
 
+    expect(outcome).toBe("stale");
     expect(useExecutionStore.getState().runs).toEqual([currentRun]);
+  });
+
+  it("returns unavailable without discarding cached runs when fetching fails", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const cachedRun = makeRun({ id: "run-cached" });
+    useExecutionStore.setState({ runs: [cachedRun] });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new Error("network down"),
+    );
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("unavailable");
+    expect(useExecutionStore.getState().runs).toEqual([cachedRun]);
   });
 });
 

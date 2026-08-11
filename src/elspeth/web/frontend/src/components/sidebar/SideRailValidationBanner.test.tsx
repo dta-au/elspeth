@@ -128,6 +128,49 @@ describe("SideRailValidationBanner", () => {
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
   });
 
+  it("uses workspace component navigation without selecting or opening the legacy modal", async () => {
+    const user = userEvent.setup();
+    const selectNode = vi.fn();
+    const onSelectComponent = vi.fn();
+    const onOpenGraph = vi.fn();
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+    useSessionStore.setState({
+      compositionState: makeComposition(1),
+      selectNode,
+    } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        summary: "Validation failed",
+        checks: [],
+        errors: [
+          {
+            component_id: "select_columns",
+            component_type: "transform",
+            message: "Bad transform",
+            suggestion: null,
+          },
+        ],
+        warnings: [],
+        readiness: BLOCKED_READINESS,
+      },
+    });
+
+    render(
+      <SideRailValidationBanner onSelectComponent={onSelectComponent} />,
+    );
+    await user.click(
+      screen.getByRole("button", { name: /transform:select_columns/ }),
+    );
+
+    expect(onSelectComponent).toHaveBeenCalledExactlyOnceWith(
+      "select_columns",
+    );
+    expect(selectNode).not.toHaveBeenCalled();
+    expect(onOpenGraph).not.toHaveBeenCalled();
+    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+  });
+
   it("selects source validation entries and opens the graph modal", async () => {
     const user = userEvent.setup();
     const selectNode = vi.fn();

@@ -58,6 +58,14 @@ export function YamlView() {
   const setExportedYamlBlobBinding = useSessionStore(
     (s) => s.setExportedYamlBlobBinding,
   );
+  const storedBlobBinding = useSessionStore(
+    (s) => s.exportedYamlBlobBinding,
+  );
+  const blobBinding =
+    storedBlobBinding !== null &&
+    storedBlobBinding.sessionId === activeSessionId
+      ? storedBlobBinding
+      : null;
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
   const proposalActionPendingIds = useSessionStore(
     (s) => s.proposalActionPendingIds,
@@ -242,6 +250,21 @@ export function YamlView() {
   return (
     <div className="yaml-view">
       {pendingYamlProposalPanel}
+      <div className="yaml-modal-note" data-testid="yaml-export-scope-note">
+        This is the pipeline definition only. Deployment-owned configuration —
+        including the <code>landscape</code> audit destination — is supplied by
+        the environment at run time and is never written here.
+      </div>
+      {blobBinding !== null && (
+        <div
+          className="yaml-modal-note yaml-modal-note--warn"
+          data-testid="yaml-export-blob-note"
+        >
+          Source data is session-bound: this pipeline reads an uploaded file
+          held in this session, so the path is not in the YAML. To run it
+          elsewhere, bind an uploaded file on import.
+        </div>
+      )}
       <YamlDisplay
         yaml={yaml}
         filename={`pipeline-v${compositionState?.version ?? 1}.yaml`}

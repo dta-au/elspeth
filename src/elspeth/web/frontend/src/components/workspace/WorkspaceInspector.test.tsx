@@ -1,0 +1,632 @@
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { type ReactNode, useEffect, useState } from "react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import {
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
+import { makeComposition } from "@/test/composerFixtures";
+import { resetStore } from "@/test/store-helpers";
+import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { useExecutionStore } from "@/stores/executionStore";
+import { useInlineSourceStore } from "@/stores/inlineSourceStore";
+import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import { useSessionStore } from "@/stores/sessionStore";
+import { useHashRouter } from "@/hooks/useHashRouter";
+import type { AuditReadinessSnapshot } from "@/types/api";
+import {
+  useWorkspacePaneController,
+  WorkspacePaneProvider,
+} from "./WorkspacePaneContext";
+import { WorkspaceInspector } from "./WorkspaceInspector";
+import type { WorkspacePaneState } from "./useWorkspacePaneState";
+import type { InspectorTab } from "./workspaceTypes";
+
+const panelState = vi.hoisted(() => ({
+  auditThrows: false,
+  auditMounts: 0,
+  auditUnmounts: 0,
+  validationMounts: 0,
+  validationUnmounts: 0,
+  useRealAudit: false,
+}));
+
+function HashRouterProbe(): null {
+  useHashRouter();
+  return null;
+}
+
+vi.mock("@/components/audit/AuditReadinessPanel", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("@/components/audit/AuditReadinessPanel")
+  >();
+  return {
+    AuditReadinessPanel: (props: {
+      onSelectComponent?: (componentId: string) => void;
+    }) => {
+      useEffect(() => {
+        if (panelState.useRealAudit) return;
+        panelState.auditMounts += 1;
+        return () => {
+          panelState.auditUnmounts += 1;
+        };
+      }, []);
+      if (panelState.useRealAudit) {
+        const ActualAuditReadinessPanel = actual.AuditReadinessPanel;
+        return <ActualAuditReadinessPanel {...props} />;
+      }
+      const { onSelectComponent } = props;
+      if (panelState.auditThrows) throw new Error("audit exploded");
+      return (
+        <div>
+          Audit panel
+          <button
+            type="button"
+            onClick={() => onSelectComponent?.("select_columns")}
+          >
+            Audit component
+          </button>
+        </div>
+      );
+    },
+  };
+});
+
+vi.mock("@/components/chat/guided/GuidedHistory", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("@/components/chat/guided/GuidedHistory")
+  >();
+  return {
+    ...actual,
+    GuidedHistory: () => (
+      <div>
+        History panel <button type="button">History detail action</button>
+      </div>
+    ),
+  };
+});
+
+vi.mock("@/components/sidebar/SideRailValidationBanner", () => ({
+  SideRailValidationBanner: ({
+    onSelectComponent,
+  }: {
+    onSelectComponent?: (componentId: string) => void;
+  }) => {
+    useEffect(() => {
+      panelState.validationMounts += 1;
+      return () => {
+        panelState.validationUnmounts += 1;
+      };
+    }, []);
+    return (
+      <div>
+        Validation panel
+        <button
+          type="button"
+          onClick={() => onSelectComponent?.("select_columns")}
+        >
+          Validation component
+        </button>
+      </div>
+    );
+  },
+}));
+
+interface HarnessProps {
+  initialTab?: InspectorTab | null;
+  removeInvokerOnOpen?: boolean;
+  validationContent?: ReactNode;
+}
+
+function InspectorHarness({
+  initialTab = null,
+  removeInvokerOnOpen = false,
+  validationContent,
+}: HarnessProps): JSX.Element {
+  const [activeTab, setActiveTab] = useState<InspectorTab | null>(initialTab);
+  const [showInvoker, setShowInvoker] = useState(true);
+  const paneState: WorkspacePaneState = {
+    paneBounds: { min: 360, max: 640, defaultWidth: 420, resizable: true },
+    preferredAuthoringWidth: 420,
+    effectiveAuthoringWidth: 420,
+    authoringCollapsed: false,
+    availableArtifactTabs: ["graph", "spec", "yaml", "run"],
+    activeArtifactTab: "graph",
+    activeInspectorTab: activeTab,
+    inspectorOpen: activeTab !== null,
+    resizeTransient: vi.fn(),
+    commitResize: vi.fn(),
+    setAuthoringCollapsed: vi.fn(),
+    selectArtifactTab: vi.fn(),
+    openInspector: (tab) => {
+      setActiveTab(tab);
+      if (removeInvokerOnOpen) setShowInvoker(false);
+    },
+    closeInspector: () => setActiveTab(null),
+  };
+
+  return (
+    <WorkspacePaneProvider paneState={paneState}>
+      <div
+        id="workspace-status-controls"
+        data-workspace-status-controls="true"
+        role="group"
+        aria-label="Workspace status"
+        tabIndex={-1}
+      >
+        {showInvoker && (
+          <OpenInspectorButton tab="validation">
+            Open validation
+          </OpenInspectorButton>
+        )}
+        <OpenInspectorButton tab="audit">Open audit</OpenInspectorButton>
+      </div>
+      <WorkspaceInspector validationContent={validationContent} />
+    </WorkspacePaneProvider>
+  );
+}
+
+function OpenInspectorButton({
+  tab,
+  children,
+}: {
+  tab: InspectorTab;
+  children: string;
+}): JSX.Element {
+  const { actions } = useWorkspacePaneController();
+  return (
+    <button
+      type="button"
+      onClick={(event) => actions.openInspector(tab, event.currentTarget)}
+    >
+      {children}
+    </button>
+  );
+}
+
+function activeGuidedSession() {
+  return {
+    step: "step_3_transforms" as const,
+    history: [
+      {
+        step: "step_1_source" as const,
+        turn_type: "single_select" as const,
+        payload_hash: "payload",
+        response_hash: "response",
+        summary: "Use a CSV source",
+        emitter: "server" as const,
+      },
+    ],
+    terminal: null,
+    chat_history: [],
+    chat_turn_seq: 0,
+    profile: null,
+  };
+}
+
+function actionableAuditSnapshot(): AuditReadinessSnapshot {
+  return {
+    session_id: "session-1",
+    composition_version: 4,
+    checked_at: "2026-08-11T00:00:00Z",
+    rows: [
+      {
+        id: "provenance",
+        label: "Provenance",
+        status: "warning",
+        summary: "Review provenance",
+        detail: "Provenance detail",
+        component_ids: ["select_columns"],
+      },
+    ],
+    validation_result: {
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+      readiness: {
+        authoring_valid: true,
+        execution_ready: true,
+        completion_ready: true,
+        blockers: [],
+      },
+    },
+  };
+}
+
+describe("WorkspaceInspector", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeComposition(4),
+      selectNode: vi.fn(),
+    } as never);
+    Object.assign(panelState, {
+      auditThrows: false,
+      auditMounts: 0,
+      auditUnmounts: 0,
+      validationMounts: 0,
+      validationUnmounts: 0,
+      useRealAudit: false,
+    });
+    useAuditReadinessStore.getState().reset();
+    useExecutionStore.getState().reset();
+    resetStore(useInlineSourceStore);
+    resetStore(useInterpretationEventsStore);
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 1920,
+      writable: true,
+    });
+  });
+
+  it("stays mounted while hidden and preserves both persistent panel bodies", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<InspectorHarness />);
+    const aside = container.querySelector("aside");
+    expect(aside).not.toBeNull();
+    expect(aside).toHaveAttribute("hidden");
+    expect(panelState.validationMounts).toBe(1);
+    expect(panelState.auditMounts).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "Open audit" }));
+    expect(aside).not.toHaveAttribute("hidden");
+    await user.click(screen.getByRole("button", { name: "Close inspector" }));
+
+    expect(aside).toHaveAttribute("hidden");
+    expect(panelState.validationMounts).toBe(1);
+    expect(panelState.auditMounts).toBe(1);
+    expect(panelState.validationUnmounts).toBe(0);
+    expect(panelState.auditUnmounts).toBe(0);
+  });
+
+  it("uses injected tutorial validation content without mounting the default owner", async () => {
+    const user = userEvent.setup();
+    render(
+      <InspectorHarness
+        validationContent={
+          <div data-testid="tutorial-validation">Tutorial validation</div>
+        }
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+
+    expect(screen.getByTestId("tutorial-validation")).toBeInTheDocument();
+    expect(screen.queryByText("Validation panel")).toBeNull();
+    expect(panelState.validationMounts).toBe(0);
+  });
+
+  it("renders Validation, Audit, and conditional History as roving tabs", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({
+      guidedSession: activeGuidedSession(),
+    } as never);
+    render(<InspectorHarness />);
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+
+    const validation = screen.getByRole("tab", { name: "Validation" });
+    const audit = screen.getByRole("tab", { name: "Audit" });
+    const history = screen.getByRole("tab", { name: "History" });
+    expect(validation).toHaveAttribute("aria-selected", "true");
+    expect(validation).toHaveAttribute("tabindex", "0");
+    expect(audit).toHaveAttribute("tabindex", "-1");
+    expect(screen.getAllByRole("tabpanel", { hidden: true })).toHaveLength(3);
+
+    validation.focus();
+    await user.keyboard("{ArrowRight}");
+    expect(audit).toHaveFocus();
+    expect(audit).toHaveAttribute("aria-selected", "true");
+    await user.keyboard("{End}");
+    expect(history).toHaveFocus();
+    await user.keyboard("{Home}");
+    expect(validation).toHaveFocus();
+  });
+
+  it("does not expose History for current-step-only records", async () => {
+    const currentStep = activeGuidedSession().step;
+    useSessionStore.setState({
+      guidedSession: {
+        ...activeGuidedSession(),
+        history: [
+          {
+            ...activeGuidedSession().history[0],
+            step: currentStep,
+            summary: "Current transform choice",
+          },
+        ],
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.queryByRole("tab", { name: "History" })).toBeNull();
+  });
+
+  it("does not expose History for summary-null prior-step records", async () => {
+    useSessionStore.setState({
+      guidedSession: {
+        ...activeGuidedSession(),
+        history: [{ ...activeGuidedSession().history[0], summary: null }],
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.queryByRole("tab", { name: "History" })).toBeNull();
+  });
+
+  it("exposes History for a summarised prior completed step", async () => {
+    useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
+  });
+
+  it("exposes History for a terminal session whose only summary is the final step", async () => {
+    const guided = activeGuidedSession();
+    useSessionStore.setState({
+      guidedSession: {
+        ...guided,
+        history: [{
+          ...guided.history[0],
+          step: guided.step,
+          summary: "Connected transform to output",
+        }],
+        terminal: { kind: "completed", reason: null },
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["History tab", "tab"],
+    ["History panel descendant", "panel"],
+  ] as const)(
+    "moves focus to Validation when the active %s disappears",
+    async (_label, focusOwner) => {
+      const user = userEvent.setup();
+      useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+      render(<InspectorHarness />);
+      await user.click(screen.getByRole("button", { name: "Open validation" }));
+      await user.click(screen.getByRole("tab", { name: "History" }));
+      if (focusOwner === "panel") {
+        screen.getByRole("button", { name: "History detail action" }).focus();
+      }
+
+      act(() => {
+        useSessionStore.setState({
+          guidedSession: {
+            ...activeGuidedSession(),
+            history: [
+              {
+                ...activeGuidedSession().history[0],
+                step: activeGuidedSession().step,
+                summary: "Current transform choice",
+              },
+            ],
+          },
+        } as never);
+      });
+
+      await waitFor(() => {
+        expect(screen.getByRole("tab", { name: "Validation" })).toHaveFocus();
+      });
+      expect(
+        screen.queryByRole("tab", { name: "History" }),
+      ).not.toBeInTheDocument();
+    },
+  );
+
+  it("does not steal unrelated focus when active History disappears", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ guidedSession: activeGuidedSession() } as never);
+    render(<InspectorHarness />);
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+    await user.click(screen.getByRole("tab", { name: "History" }));
+    const unrelated = screen.getByRole("button", { name: "Open audit" });
+    unrelated.focus();
+
+    act(() => {
+      useSessionStore.setState({
+        guidedSession: { ...activeGuidedSession(), history: [] },
+      } as never);
+    });
+
+    expect(unrelated).toHaveFocus();
+    expect(
+      screen.getByRole("tab", { name: "Validation" }),
+    ).toHaveAttribute("aria-selected", "true");
+  });
+
+  it("restores focus to the exact invoker on Close and Escape", async () => {
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    const validationInvoker = screen.getByRole("button", {
+      name: "Open validation",
+    });
+    await user.click(validationInvoker);
+    await user.click(screen.getByRole("button", { name: "Close inspector" }));
+    expect(validationInvoker).toHaveFocus();
+
+    const auditInvoker = screen.getByRole("button", { name: "Open audit" });
+    await user.click(auditInvoker);
+    screen.getByRole("tab", { name: "Audit" }).focus();
+    await user.keyboard("{Escape}");
+    expect(auditInvoker).toHaveFocus();
+  });
+
+  it("focuses the status-control group when the exact invoker disconnects", async () => {
+    const user = userEvent.setup();
+    render(<InspectorHarness removeInvokerOnOpen />);
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+    expect(
+      screen.queryByRole("button", { name: "Open validation" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Close inspector" }));
+    expect(
+      screen.getByRole("group", { name: "Workspace status" }),
+    ).toHaveFocus();
+  });
+
+  it("applies the compact overlay class below 1536 without modal semantics", async () => {
+    Object.defineProperty(window, "innerWidth", { value: 1280, writable: true });
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open audit" }),
+    );
+
+    const inspector = screen.getByRole("complementary", { name: "Inspector" });
+    expect(inspector).toHaveClass("workspace-inspector--overlay");
+    expect(inspector).not.toHaveAttribute("aria-modal");
+  });
+
+  it("keeps tabs and Close operable when one inspector body throws", async () => {
+    panelState.auditThrows = true;
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    const preventExpectedWindowError = (event: ErrorEvent) => {
+      event.preventDefault();
+    };
+    window.addEventListener("error", preventExpectedWindowError);
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    await user.click(screen.getByRole("button", { name: "Open audit" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Audit inspector encountered an error",
+    );
+    expect(screen.getByRole("tab", { name: "Validation" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Close inspector" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "Close inspector" }));
+    expect(screen.getByRole("button", { name: "Open audit" })).toHaveFocus();
+    window.removeEventListener("error", preventExpectedWindowError);
+    consoleError.mockRestore();
+  });
+
+  it("lets component navigation supersede a deferred Spec hash with Graph", async () => {
+    const user = userEvent.setup();
+    const selectNode = vi.fn();
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const graphModal = vi.fn();
+    useSessionStore.setState({
+      selectNode,
+      sessions: [{ id: "session-1", title: "Session 1" }],
+      compositionStateLoaded: false,
+      compositionState: makeComposition(4),
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    window.addEventListener("elspeth-open-graph-modal", graphModal);
+    try {
+      render(
+        <>
+          <HashRouterProbe />
+          <InspectorHarness />
+        </>,
+      );
+      await user.click(screen.getByRole("button", { name: "Open validation" }));
+      await user.click(
+        screen.getByRole("button", { name: "Validation component" }),
+      );
+      act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+      await act(async () => Promise.resolve());
+
+      expect(selectNode).toHaveBeenCalledExactlyOnceWith("select_columns");
+      expect(artifactRequests).toEqual([
+        { tab: "graph", focusMode: false, sessionId: "session-1" },
+      ]);
+      expect(graphModal).not.toHaveBeenCalled();
+    } finally {
+      window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+      window.removeEventListener("elspeth-open-graph-modal", graphModal);
+    }
+  });
+
+  it("lets ReadinessRowDetail consume the first Escape before the inspector closes", async () => {
+    panelState.useRealAudit = true;
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { "session-1": actionableAuditSnapshot() },
+    });
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    const invoker = screen.getByRole("button", { name: "Open audit" });
+    await user.click(invoker);
+    await user.click(screen.getByRole("button", { name: /Provenance/ }));
+    expect(screen.getByRole("dialog", { name: "Provenance" })).toBeVisible();
+
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("dialog", { name: "Provenance" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Inspector" }),
+    ).toBeVisible();
+    expect(invoker).not.toHaveFocus();
+
+    screen.getByRole("tab", { name: "Audit" }).focus();
+    await user.keyboard("{Escape}");
+    expect(invoker).toHaveFocus();
+  });
+
+  it("lets ExplainDialog consume the first Escape and restore its own opener", async () => {
+    panelState.useRealAudit = true;
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { "session-1": actionableAuditSnapshot() },
+      explainsBySession: {
+        "session-1": {
+          session_id: "session-1",
+          composition_version: 4,
+          narrative: "Audit narrative",
+        },
+      },
+    });
+    const user = userEvent.setup();
+    render(<InspectorHarness />);
+    const invoker = screen.getByRole("button", { name: "Open audit" });
+    await user.click(invoker);
+    const explain = screen.getByRole("button", { name: /Explain/ });
+    await user.click(explain);
+    expect(
+      screen.getByRole("dialog", {
+        name: "What this pipeline will record",
+      }),
+    ).toBeVisible();
+
+    await user.keyboard("{Escape}");
+
+    expect(
+      screen.queryByRole("dialog", {
+        name: "What this pipeline will record",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("complementary", { name: "Inspector" }),
+    ).toBeVisible();
+    await waitFor(() => expect(explain).toHaveFocus());
+
+    await user.keyboard("{Escape}");
+    expect(invoker).toHaveFocus();
+  });
+});

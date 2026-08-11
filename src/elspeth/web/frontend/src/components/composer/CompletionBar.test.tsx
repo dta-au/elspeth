@@ -1,7 +1,12 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { type ReactNode } from "react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { CompletionBar } from "./CompletionBar";
-import { ExportYamlModal } from "@/components/sidebar/ExportYamlModal";
+import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
+import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -26,6 +31,26 @@ vi.mock("@/components/inspector/YamlView", () => ({
     </button>
   ),
 }));
+
+vi.mock("@xyflow/react", () => ({
+  MarkerType: { ArrowClosed: "arrowclosed" },
+  Position: { Top: "top", Bottom: "bottom" },
+  ReactFlowProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
+  ReactFlow: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  BaseEdge: () => null,
+  Handle: () => null,
+  Background: () => null,
+  Controls: () => null,
+  MiniMap: () => null,
+}));
+vi.mock("@xyflow/react/dist/style.css", () => ({}));
+
+class PassiveResizeObserver implements ResizeObserver {
+  constructor(_callback: ResizeObserverCallback) {}
+  observe(): void {}
+  unobserve(): void {}
+  disconnect(): void {}
+}
 
 function _validValidation(): ValidationResult {
   return makeValidationResult();
@@ -62,6 +87,7 @@ function _invalidValidation(): ValidationResult {
 
 describe("CompletionBar", () => {
   beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
@@ -74,6 +100,27 @@ describe("CompletionBar", () => {
     });
     useShareableReviewStore.getState().reset();
     resetStore(useInterpretationEventsStore);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("keeps the horizontal compact override scoped to the workspace action bar", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*flex-direction:\s*row;[^}]*flex-wrap:\s*wrap;[^}]*padding:\s*0;/s,
+    );
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*flex:\s*1 1 [^;]+;[^}]*width:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /(?:^|\n)\.completion-bar\s*\{[^}]*flex-direction:\s*row;/s,
+    );
   });
 
   it("renders nothing without an active session", () => {
@@ -302,11 +349,7 @@ describe("CompletionBar", () => {
     expect(executeSpy).toHaveBeenCalledWith("sess-RUN");
   });
 
-  // Plan 19b:232 — AC 7: Clicking Export-YAML opens the existing YamlView
-  // modal. ExportYamlButton dispatches a window CustomEvent
-  // (OPEN_YAML_MODAL_EVENT) that ExportYamlModal listens for; rendering both
-  // components together lets us assert the dialog becomes visible end-to-end.
-  it("clicking Export-YAML opens the ExportYamlModal dialog (plan 19b:232, AC 7)", async () => {
+  it("clicking Export-YAML selects and focuses the persistent YAML artifact", async () => {
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
@@ -319,21 +362,30 @@ describe("CompletionBar", () => {
     });
 
     render(
-      <>
-        <CompletionBar />
-        <ExportYamlModal />
-      </>,
+      <ComposerWorkspace
+        authoring={<div>Authoring</div>}
+        artifact={<ArtifactWorkspace />}
+        inspector={<div>Inspector</div>}
+        actionBar={<CompletionBar />}
+      />,
     );
 
-    // Dialog should not be mounted before the click.
-    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
 
     const exportContainer = screen.getByTestId("completion-bar-export-yaml");
     const exportButton = exportContainer.querySelector("button") as HTMLButtonElement;
     fireEvent.click(exportButton);
 
     await waitFor(() => {
-      expect(screen.getByRole("dialog", { name: /export yaml/i })).toBeInTheDocument();
+      expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
     });
+    expect(screen.queryByRole("dialog", { name: /export yaml/i })).toBeNull();
   });
 });

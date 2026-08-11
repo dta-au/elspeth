@@ -122,49 +122,10 @@
   padding-inline: var(--space-lg);
 }
 
-/* ── THE WORKSPACE (the one guided layout; grew up inside the tutorial) ───────
-   Freeform-congruent conversation column (internal scroll region over a docked
-   composer) on the LEFT; a SideRail-width artifact rail flush RIGHT. Rendered
-   inside a height-bounded frame — the app shell's .layout-chat → .chat-panel
-   chain, or tutorial.css `.tutorial-shell--guided` — so the COLUMN scrolls,
-   not the page. Grid mirrors the freeform `.app-layout` template (shared.css)
-   so the rail reads as the same chrome; while this layout is on screen the
-   App suppresses the freeform SideRail (Layout's null-siderail single-column
-   shell), so the two rails never render together. */
-.guided-workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) var(--siderail-width);
-  /* Bound the single row to the container so the column's internal scroll can
-     engage: an auto row sizes to CONTENT and silently defeats every
-     min-height:0 below it. Belt-and-braces with the items' min-height:0. */
-  grid-template-rows: minmax(0, 1fr);
-  /* No gap — the rail's border-left is the seam (SideRail idiom). */
-  gap: 0;
-  align-items: stretch;
-  width: 100%;
-  max-width: none;
-  margin-inline: 0;
-  padding-inline: 0;
-  /* The growing flex child of the height-bounded .chat-panel. */
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.guided-workspace-stream {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-md);
-  min-width: 0;
-  /* Grid items default min-height:auto — without this the column grows to
-     content height and the internal scroll never engages. */
-  min-height: 0;
-}
-
-/* The conversation column's internal scroll region (transcript → run results →
-   acknowledgements → current decision). Mirrors freeform's
-   .chat-panel-messages; the bubbles carry their own row gutters
-   (.message-row), so only a modest inline pad is needed. */
-.guided-workspace-scroll {
+/* Active guided mode supplies only the common workspace's authoring pane.
+   Transcript, acknowledgement cards, current decision, and pending reply
+   share one bounded scroller; the composer remains docked beneath it. */
+.guided-authoring-scroll {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
@@ -180,7 +141,7 @@
   flex-direction: column;
 }
 
-.guided-workspace-scroll > :first-child {
+.guided-authoring-scroll > :first-child {
   margin-top: auto;
 }
 
@@ -188,65 +149,20 @@
    app focus ring, drawn INSET because the workspace frame clips overflow —
    the default +2px offset ring would be invisible on all four sides (same
    failure chat.css already fixes for .chat-panel-messages). */
-.guided-workspace-scroll:focus-visible {
+.guided-authoring-scroll:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: -2px;
 }
 
-/* The rail scrolls too (overflow-y:auto both at desktop and as the ≤900px
-   strip) and is keyboard-focusable for the same WCAG 2.1.1 reason — at ≤900px
-   the strip hides its only focusable furniture (graph thumbnail), so without
-   a tab stop its overflow is keyboard-unreachable. Same inset-ring rationale
-   as the scroll region above. */
-.guided-workspace-rail:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: -2px;
-}
-
-/* The docked composer must keep its intrinsic height when the column is
-   squeezed — only the scroll region above it may shrink. */
-.guided-workspace-stream > .guided-step-chat {
+/* Only the authoring scroller may shrink in a short pane. */
+.chat-panel--guided > .guided-step-chat {
   flex-shrink: 0;
 }
 
-/* Artifact rail: ambient pipeline state (summary card + decisions so far).
-   SideRail chrome congruence (shared.css .layout-siderail idiom): border-left
-   seam, inspector surface, own scroll within the bounded row. */
-.guided-workspace-rail {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-md);
-  min-width: 0;
-  min-height: 0;
-  overflow-y: auto;
-  border-left: 1px solid var(--color-border);
-  background-color: var(--color-surface-inspector);
-  padding: var(--space-sm);
-}
-
-/* Each column owns its vertical rhythm via `gap`; reset the pieces' own block
-   margins (they centre in a 64rem sheet in the single-column layout) and let
-   them fill their column. Transcript rows live INSIDE .guided-workspace-scroll
-   — never as direct stream children — so `max-width:none` can not kill the
-   .bubble width caps. Specificity (0,2,0) is load-bearing: the rail cards'
-   own `margin: var(--space-md) auto` sheet-centring rules (.guided-graph-panel,
-   .guided-history) appear LATER in this file and would win a same-specificity
-   tie, leaving stray margins inside the rail. */
-.guided-workspace .guided-workspace-stream > *,
-.guided-workspace .guided-workspace-rail > * {
-  width: 100%;
-  max-width: none;
-  margin: 0;
-}
-
 /* Cards inside the scroll region align their left/right edges with the bubble
-   rows' content gutter (wrapper --space-md pad + .message-row --space-lg
-   padding); their base rules carry sheet-centring margins sized for the live
-   .guided-scroll column, which read as ragged edges here. InlineRunResults is
-   deliberately absent: it already carries margin-inline var(--space-lg) and a
-   ≤760px --space-sm tightening this (0,2,0) rule would clobber. */
-.guided-workspace-scroll > .ack-stack,
-.guided-workspace-scroll > .guided-current-decision {
+   rows' content gutter. */
+.guided-authoring-scroll > .ack-stack,
+.guided-authoring-scroll > .guided-current-decision {
   margin-inline: var(--space-lg);
 }
 
@@ -254,37 +170,34 @@
    centred measure as .message-row instead of stretching across the whole
    workspace column. The explicit narrow-width calculation preserves the
    ordinary chat gutters before the max-width cap engages. */
-.guided-workspace-scroll > .guided-current-decision {
+.guided-authoring-scroll > .guided-current-decision {
   width: calc(100% - var(--space-lg) - var(--space-lg));
   max-width: 56rem;
   margin-inline: auto;
 }
 
-/* Narrow screens: single column with the rail collapsed to a compact strip
-   ABOVE the conversation (order:-1 — the strip is ambient context the learner
-   should pass before the transcript). DOM order stays stream-first, so visual
-   order diverges from source/tab order here — a documented reading-order
-   divergence, matching the stacked .app-layout rail precedent. The bounded
-   second row (minmax(0,1fr)) keeps the internal scroll engaged. */
-@media (max-width: 900px) {
-  .guided-workspace {
-    grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr);
+/* The authoring pane can be 360px wide at a wide viewport, so compact the
+   five-step band without relying on a viewport-width media query. */
+.chat-panel--guided .guided-workflow-list {
+  gap: 2px;
+}
+
+.chat-panel--guided .guided-workflow-step {
+  padding: var(--space-xs);
+  font-size: var(--font-size-xs);
+}
+
+.chat-panel--guided .guided-workflow-index {
+  display: none;
+}
+
+@media (max-height: 760px) {
+  .chat-panel--guided > .guided-workflow {
+    padding-top: 2px;
   }
 
-  .guided-workspace-rail {
-    order: -1;
-    border-left: none;
-    border-bottom: 1px solid var(--color-border);
-    max-height: 30vh;
-    overflow-y: auto;
-  }
-
-  /* Compact strip keeps only the one-line gloss + validation signal; the
-     graph thumbnail and decision history are desktop-rail furniture. */
-  .guided-workspace-rail .graph-mini,
-  .guided-workspace-rail .guided-history {
-    display: none;
+  .chat-panel--guided .guided-workflow-step {
+    padding-block: 2px;
   }
 }
 
@@ -673,32 +586,9 @@
   right: var(--space-2xs);
 }
 
-/* ── Guided verification panel (Slice C) ──────────────────────────────────────
-   The canonical "what I built" surface above the current decision: gloss +
-   validation status (+ a graph thumbnail in the tutorial). A direct child of
-   .guided-scroll, so the sheet cap (64rem, centred) is inherited from the
-   `.guided-scroll > *` rule above. Mirrors the .guided-current-decision card. */
-.guided-graph-panel {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
-  /* `auto` inline margins restore the centred 64rem sheet this panel inherits
-     from `.guided-scroll > *` (line ~115). A bare `margin: var(--space-md)`
-     shorthand here is same-specificity-but-later than that rule, so it silently
-     overrode `margin-inline:auto` and pinned the panel hard left — contradicting
-     the "centred sheet cap" the comment above promised. Keep the vertical rhythm
-     (top/bottom var(--space-md)); centre horizontally. */
-  margin: var(--space-md) auto;
-  padding: var(--space-md);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background-color: var(--color-surface);
-}
-
-/* ── Guided verification panel pieces (Slice C) ───────────────────────────────
-   The plain-language gloss + the in-column validation status. The gloss is the
-   canonical "what I built" line; the status is the novice-register verification
-   signal (the column thumbnail has no per-node markers — those are on expand).
+/* ── Pipeline explanation and validation pieces ──────────────────────────────
+   The plain-language gloss is used by the common Spec artifact; the validation
+   summary remains available to the completion surface.
    Status body text stays --color-text-secondary (AA on the panel surface,
    gated in colorContrast.test.ts); only the aria-hidden, redundant glyph is
    tinted by tone, so colour is never the sole signal. */
@@ -838,7 +728,7 @@
 
 /* Chat-pending working strip (elspeth-6a9673ecd3; placement pass
    2026-07-23): pulse dots + adaptive headline + elapsed + Stop, riding IN
-   the conversation flow as the last child of .guided-workspace-scroll — the
+   the conversation flow as the last child of .guided-authoring-scroll — the
    provisional reply slot, matching the decision-submit indicator — instead
    of swapping over the composer's typing area. The docked-band chrome
    (border-top seam, input-strip min-height) died with the swap; margins
@@ -852,7 +742,7 @@
   padding: var(--space-xs) 0;
 }
 
-.guided-workspace-scroll > .guided-pending-strip {
+.guided-authoring-scroll > .guided-pending-strip {
   margin-inline: var(--space-lg);
 }
 
@@ -1900,35 +1790,24 @@
    GuidedHistory (Task 7.9)
    Classes prefixed guided-history-*.
 
-   Collapsible read-only list of completed wizard steps.  Rendered above the
-   active turn widget so the user can see what was decided in prior steps.
+   Always-visible read-only card within the Inspector History tab. The shared
+   completed-history projection controls whether the tab/card is available, so
+   a mounted card always contains at least one summarised prior-step decision.
 
    Visual design:
      - Muted appearance (secondary text colour) to avoid competing with the
-       active turn widget.
-     - Toggle button matches the ExitToFreeformButton secondary style
-       (transparent background, border, muted text) but is visually lighter.
-     - List items use small text with separator dots between step name,
-       turn type, and emitter.
-
-   Collapsible region contract (Task 7.5 I2):
-     The region is ALWAYS rendered (hidden attribute toggles, not conditional
-     mounting) so the toggle's aria-controls always resolves.  Native browser
-     `[hidden] { display: none; }` handles both visual and AT-tree hiding —
-     no additional CSS required for the hidden state.
-
-   Sized to WCAG 2.5.8 minimum target (min-height: 44px on toggle button).
-   Focus ring and hover match the guided-* family convention.
+       active Inspector surfaces.
+     - List items pair a compact step label with its plain-language summary.
+     - The card has no collapse control or independent focus target; the
+       surrounding Inspector tab owns disclosure and keyboard navigation.
    --------------------------------------------------------------------------- */
 
 .guided-history {
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
-  /* `auto` inline margins centre this in the 64rem sheet inherited from
-     `.guided-scroll > *`. A bare `margin` shorthand (same-specificity-but-later)
-     clobbers `margin-inline:auto` and pins it hard left — the same trap fixed on
-     .guided-graph-panel; only visible once prior-step history exists. */
+  /* Preserve the recap's vertical rhythm while centring it in its containing
+     inspector or legacy guided sheet. */
   margin: var(--space-md) auto;
   padding: var(--space-md);
   border: 1px solid var(--color-border);
@@ -1990,25 +1869,10 @@
    CompletionSummary (Task 7.10)
    Classes prefixed guided-completion-*.
 
-   Terminal widget rendered when the guided wizard reaches kind="completed"
-   and pipeline_yaml is non-null.  Displays the finalized pipeline YAML in a
-   syntax-highlighted block (prism-react-renderer, vsDark / vsLight) with
-   task-oriented actions:
-     "Open freeform editor" -- continue editing in the freeform composer.
-     "Export YAML"          -- open the YAML export dialog.
-     "Validate pipeline"    -- run validation for the active session.
-
-   Visual hierarchy:
-     heading     -- readiness-derived ("Pipeline updated" / "Review
-                    required" / "Pipeline ready"), h3, muted weight to avoid
-                    competing
-                    with surrounding chat layout.
-     yaml block  -- monospace pre inside a scrollable container with an
-                    inset surface to visually contain the code.
-     action row  -- primary freeform handoff plus YAML review and validation.
-
-   Reduced-motion: guided-completion-save-btn and guided-completion-edit-btn
-   both carry transitions; both are silenced in the @media block below.
+   Terminal widget rendered when the guided wizard reaches kind="completed".
+   The card keeps the readiness-derived heading and, outside the tutorial, the
+   state-machine transition into freeform. YAML, validation, and run history
+   are owned by the common workspace.
    --------------------------------------------------------------------------- */
 
 /* Outer wrapper */
@@ -2022,15 +1886,12 @@
   border-radius: var(--radius-lg);
 }
 
-/* On a completed wide/short workspace, Run Results must remain visible at the
-   bottom instead of being squeezed below the 400px YAML preview. Let this card
-   yield vertical space while preserving enough room for its heading, actions,
-   and a useful scrollable YAML viewport. */
+/* Preserve the established completion gutter without imposing a legacy YAML
+   preview height; acknowledgement cards and the stepper keep the remaining
+   authoring space. */
 .chat-panel--completed > .guided-completion {
-  min-height: 18rem;
   margin-top: var(--space-xs);
   margin-inline: var(--space-lg);
-  overflow: hidden;
 }
 
 /* Match chat.css's compact Run Results gutter at the same breakpoint. */
@@ -2044,55 +1905,12 @@
   }
 }
 
-.chat-panel--completed
-  > .guided-completion
-  .guided-completion-yaml-container {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
 /* Section heading -- readiness-derived completion label */
 .guided-completion-heading {
   margin: 0;
   font-size: var(--font-size-base);
   font-weight: 600;
   color: var(--color-success);
-}
-
-/* Scrollable YAML preview container */
-.guided-completion-yaml-container {
-  overflow: auto;
-  max-height: 400px;
-  background-color: var(--color-surface-elevated);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-}
-
-/* Keyboard-focusable scroll region (tabIndex=0 in CompletionSummary) — inset
-   ring so the container's own border/radius doesn't clip it. */
-.guided-completion-yaml-container:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: -2px;
-}
-
-/* <pre> block produced by prism-react-renderer.
-   Reset browser default pre margins; monospace font family to match YamlView. */
-.guided-completion-pre {
-  margin: 0;
-  padding: var(--space-md);
-  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas,
-    monospace;
-  font-size: var(--font-size-sm);
-  line-height: 1.5;
-  overflow-x: auto;
-  white-space: pre;
-}
-
-/* Action row: freeform handoff, YAML review, and validation */
-.guided-completion-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-sm);
 }
 
 /* Primary action: open the freeform editor */
@@ -2117,31 +1935,6 @@
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
-
-/* Secondary action: review generated YAML */
-.guided-completion-edit-btn {
-  padding: var(--space-sm) var(--space-lg);
-  background-color: transparent;
-  color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  font-size: var(--font-size-base);
-  font-family: inherit;
-  min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease, border-color 0.1s ease;
-}
-
-.guided-completion-edit-btn:hover {
-  background-color: var(--color-surface-elevated);
-  border-color: var(--color-accent);
-}
-
-.guided-completion-edit-btn:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
 
 /* The guided interpretation-review card styling was retired with the
    InterpretationReviewTurn widget; pending LLM decisions now render through the
@@ -2363,8 +2156,7 @@
   .wire-stage__correction-input,
   .guided-schema-advanced-toggle,
   .guided-schema-continue-btn,
-  .guided-completion-save-btn,
-  .guided-completion-edit-btn {
+  .guided-completion-save-btn {
     transition: none;
   }
 }

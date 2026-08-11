@@ -4,6 +4,8 @@
 
 import { request, type APIRequestContext } from "@playwright/test";
 
+import type { CompositionState } from "@/types";
+
 // Overridable by Playwright configs so the same specs can run against either
 // the local-spawned webServer or an already-deployed environment (e.g.
 // elspeth.foundryside.dev).
@@ -16,7 +18,14 @@ export interface SessionSummary {
   title: string;
 }
 
-export type CompositionStateSeed = Record<string, unknown>;
+export type CompositionStateSeed = Pick<
+  CompositionState,
+  "version" | "metadata" | "sources" | "nodes" | "edges" | "outputs"
+>;
+
+export interface SeedCompositionStateOptions {
+  timeout?: number;
+}
 
 export async function authedContext(token: string): Promise<APIRequestContext> {
   return request.newContext({
@@ -68,16 +77,18 @@ export async function seedCompositionState(
   ctx: APIRequestContext,
   sessionId: string,
   state: CompositionStateSeed,
-): Promise<Record<string, unknown>> {
+  options: SeedCompositionStateOptions = {},
+): Promise<CompositionState> {
   const resp = await ctx.post(`/api/sessions/${sessionId}/state/e2e-seed`, {
     data: { state },
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
   });
   if (!resp.ok()) {
     throw new Error(
       `POST /api/sessions/${sessionId}/state/e2e-seed failed (${resp.status()}): ${(await resp.text()).slice(0, 500)}`,
     );
   }
-  return (await resp.json()) as Record<string, unknown>;
+  return (await resp.json()) as CompositionState;
 }
 
 // Minimal blob metadata fields used by tests.  The backend returns more fields

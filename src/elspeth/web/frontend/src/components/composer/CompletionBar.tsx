@@ -7,7 +7,8 @@
  *                        signed share URL.
  *   * Run pipeline     → reuses the existing ExecuteButton primitive (which
  *                        carries the Phase 5b interpretation-gating logic).
- *   * Export YAML      → reuses the existing ExportYamlButton primitive.
+ *   * Export YAML      → selects the persistent YAML artifact through the
+ *                        existing ExportYamlButton primitive.
  *
  * Per plan 19b §"Scope boundaries": no primary emphasis — all three are
  * co-equal verbs. The "Save for review" button follows the backend-owned
