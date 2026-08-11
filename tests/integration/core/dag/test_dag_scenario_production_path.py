@@ -92,6 +92,7 @@ B3_RUNTIME_CASES = (
 B3_RECOVERY_CASES = (
     ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
     ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+    ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
     ("sink-write-pending-redrive", "pending-redrive-reopen"),
 )
 
@@ -2450,6 +2451,81 @@ def test_linear_sink_boundary_recovery_reopens_and_resumes_without_reminting(
     ]
 
 
+def test_retry_success_recovery_preserves_completed_attempt_history_without_duplicate_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case(
+        "retry-quarantine-discard-routed-errors",
+        "retry-success-reopen-resume",
+    )
+    monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
+    monkeypatch.setattr(Orchestrator, "resume", inspect.unwrap(Orchestrator.resume))
+    install_corpus_plugin_manager(monkeypatch)
+    interrupted_retry_states: list[tuple[tuple[int, str, str | None, str | None], ...]] = []
+
+    def verify_completed_retry_before_reopen(
+        context: corpus_harness.SinkBoundaryInterruptedContext,
+    ) -> None:
+        transform_ids = context.built.graph.get_transform_id_map()
+        assert tuple(transform_ids) == (0,)
+        retry_node_id = transform_ids[0]
+        with context.database.connection() as conn:
+            states = tuple(
+                (
+                    int(row["attempt"]),
+                    str(row["status"]),
+                    None if row["error_json"] is None else str(row["error_json"]),
+                    None if row["resume_checkpoint_id"] is None else str(row["resume_checkpoint_id"]),
+                )
+                for row in conn.execute(
+                    select(
+                        node_states_table.c.attempt,
+                        node_states_table.c.status,
+                        node_states_table.c.error_json,
+                        node_states_table.c.resume_checkpoint_id,
+                    )
+                    .where(
+                        node_states_table.c.run_id == context.run_id,
+                        node_states_table.c.node_id == retry_node_id,
+                    )
+                    .order_by(node_states_table.c.attempt)
+                ).mappings()
+            )
+        assert states == (
+            (0, "failed", '{"exception":"injected DAG corpus retryable failure","type":"ConnectionError"}', None),
+            (1, "completed", None, None),
+        )
+        interrupted_retry_states.append(states)
+
+    evidence = corpus_harness.run_sink_boundary_recovery_case(
+        scenario,
+        case,
+        tmp_path,
+        before_reopen_verifier=verify_completed_retry_before_reopen,
+    )
+
+    _assert_declared_recovery_evidence(scenario, case, evidence)
+    assert len(interrupted_retry_states) == 1
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    retry_states_after = tuple(
+        (state.attempt, state.status, state.error) for state in projection.node_states if state.node_key.startswith("transform:retry_once@")
+    )
+    assert retry_states_after == tuple(state[:3] for state in interrupted_retry_states[0])
+    assert evidence.runtime.sink_outputs == (SinkOutputProjection(sink_name="output", rows=('{"id":1,"value":10}',)),)
+    assert evidence.audit.source_operation_count == 1
+    proof = evidence.recovery.sink_boundary
+    assert proof is not None
+    assert proof.token_ids_before == proof.token_ids_after
+    assert len(proof.work_before) == len(proof.work_after) == 1
+    assert proof.work_before[0].status == "pending_sink"
+    assert proof.work_after[0].status == "terminal"
+    assert proof.effect_count_before == proof.effect_count_after == 1
+    assert proof.artifact_count_before == proof.publication_count_before == 0
+    assert proof.artifact_count_after == proof.publication_count_after == 1
+
+
 def test_recovery_durable_oracle_rejects_shared_serializer_record_family_omission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2495,6 +2571,11 @@ def test_b3_recovery_cases_are_registered_as_closed_recovery_workflows() -> None
             "row-expansion-parent-child-recovery",
             "resume-after-child-enqueue",
             "expansion_child_enqueue",
+        ),
+        (
+            "retry-quarantine-discard-routed-errors",
+            "retry-success-reopen-resume",
+            "sink_boundary",
         ),
         ("sink-write-pending-redrive", "pending-redrive-reopen", "pending_sink_redrive"),
     )
@@ -2574,6 +2655,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+        ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
         ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     )

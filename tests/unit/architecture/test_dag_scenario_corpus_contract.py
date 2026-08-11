@@ -256,7 +256,7 @@ EXPECTED_STATUS_MATRIX = {
         "partial",
         "partial",
         "partial",
-        "unknown",
+        "pass",
         "unknown",
         "pass",
         "fail",
@@ -438,7 +438,10 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb84c65a0b5100f4354830f9"
+# Rotated 2026-08-11 for elspeth-7e556decc9: one executable recovery evidence
+# reference was added for retry-success-reopen-resume; existing references are
+# unchanged and preserve their declaration order.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "748613cc309597fbef9331330bb8cd15a90f5c2db44ad7a1e5d2003462af6555"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -511,7 +514,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # expansions, sink_effects and every other record compared equal, so no audit
 # projection material moved. The declarations are build-time only and are read
 # by no runtime path, which is why nothing else could move.
-EXPECTED_CASE_REGISTRY_SHA256 = "031b13edb202e5a8c5341d57f99667c47e6eaac8a10c61200a37d7d303926923"
+# Rotated 2026-08-11 for elspeth-7e556decc9: one summary recovery declaration
+# reuses the pinned retry fixture and input bytes; all 47 prior case declarations
+# are unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "4e3df78ebdbdc2d310dec7a337424f63526a4e0ee4ea02f947e58fb9b001fd49"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -587,6 +593,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "retry-quarantine-discard-routed-errors:source-quarantine-routed": "286d04abef045d70a846b65bfc348792ff6242aff237451f30050565d8e5e639",
     "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
     "retry-quarantine-discard-routed-errors:transform-error-route": "d4321f033f305d215563d2bfb62cb190df8a3eff87e10d8ac9805e9e9b45ca71",
+    "retry-quarantine-discard-routed-errors:retry-success-reopen-resume": "add6f84b856bf06915c6275a005bfb4aef5ad50068f7c93038b6b7d99970ab90",
     "sink-write-pending-redrive:write-once": "e8344036a8baf85bba035264683e47f3502d17336db55bef5174c87d468577de",
     "sink-write-pending-redrive:pending-redrive-reopen": "e8344036a8baf85bba035264683e47f3502d17336db55bef5174c87d468577de",
     "checkpoint-deterministic-resume:reopen-resume": "ce62216ce20210600f1a9c20e362aaf299c7538e6c4d3bd0e97627563dc813e6",
@@ -717,6 +724,11 @@ EXPECTED_HARNESS_EVIDENCE = (
             ("config", "build", "runtime", "audit"),
         )
         for case_id in ("retry-then-success", "source-quarantine-routed", "transform-discard", "transform-error-route")
+    ),
+    (
+        "harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume",
+        "retry-quarantine-discard-routed-errors:retry-success-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     (
         "harness-sink-write-pending-redrive-write-once",
@@ -4972,6 +4984,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
         ("retry-quarantine-discard-routed-errors", "transform-error-route"),
+        ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
         ("sink-write-pending-redrive", "write-once"),
         ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
@@ -4988,11 +5001,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 110
+    assert len(manifest.evidence) == 111
     assert len(assessment_evidence) == 63
-    assert len(harness_evidence) == 47
-    assert len({reference.id for reference in manifest.evidence}) == 110
-    assert len({reference.locator for reference in manifest.evidence}) == 110
+    assert len(harness_evidence) == 48
+    assert len({reference.id for reference in manifest.evidence}) == 111
+    assert len({reference.locator for reference in manifest.evidence}) == 111
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -5030,6 +5043,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
         ("retry-quarantine-discard-routed-errors", "transform-error-route"),
+        ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
         ("sink-write-pending-redrive", "write-once"),
         ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
@@ -5143,6 +5157,9 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             )
             for case_id in ("retry-then-success", "source-quarantine-routed", "transform-discard", "transform-error-route")
         },
+        "harness-retry-quarantine-discard-routed-errors-retry-success-reopen-resume": (
+            ("retry-quarantine-discard-routed-errors", "recovery"),
+        ),
         "harness-sink-write-pending-redrive-write-once": (
             ("sink-write-pending-redrive", "runtime"),
             ("sink-write-pending-redrive", "audit"),
