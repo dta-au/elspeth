@@ -759,21 +759,26 @@ git commit -m "test(state-engine): prove process authority and lease recovery"
 - Create: `tests/unit/core/landscape/test_state_engine_read_model_truth_tables.py`
 - Create: `tests/integration/pipeline/test_state_engine_read_model_consumers.py`
 - Create: `tests/unit/core/landscape/test_state_engine_forbidden_paths.py`
+- Create: `tests/testcontainer/core/test_state_engine_read_model_truth_tables_postgres.py`
 - Modify as defects require: `src/elspeth/core/landscape/scheduler/restore_read_model.py`
 - Modify as defects require: `src/elspeth/core/landscape/run_status_projection.py`
 - Modify as defects require: `src/elspeth/core/landscape/run_coordination_repository.py`
+- Modify as defects require: `src/elspeth/core/checkpoint/recovery.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/resume.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/run_status.py`
+- Modify as defects require: `src/elspeth/web/execution/accounting.py`
 
 **Step 1: Express each RM leg as data**
 
-For RM-01 through RM-14, define a table of seeded rows, expected repository result, and expected production decision. Include positive and negative status/subtype arms, foreign run/owner, exact expiry equality, duplicates, ordering, malformed identities, and backend profile.
+For RM-01 through RM-14, define a table of seeded rows, expected repository result, and expected production decision. Include positive and negative status/subtype arms, foreign run/owner, exact expiry equality, duplicates, ordering, malformed identities, and backend profile. RM-14 must cover recovery worksets, terminal-status projection, and accounting census rather than treating `run_status.py` as the whole read model.
 
 Use direct function objects in parametrization; do not resolve functions by dynamic attribute name.
 
 **Step 2: Add forbidden-path cases**
 
-For F-01 through F-14, assert the exact exception/error category and complete before/after durable image. Reach every production surface that could attempt the path; where a path is deliberately absent, attach fresh Loomweave caller evidence and an executable architecture gate.
+Own F-04, F-06, F-07, F-10, and F-12 in this task, matching the pinned proof-matrix cohort. Assert the exact exception/error category and complete before/after durable image. Reach every production surface that could attempt the path; where a path is deliberately absent, attach fresh Loomweave caller evidence and an executable architecture gate.
+
+Integrate the retained evidence for the other forbidden legs from their assigned cohorts (Tasks 5, 8, 9, and 10/11); do not reassign, duplicate, or close those owners from Task 7. F-10 permits only its contracted best-effort `fence_refusal` event as an explicit image delta.
 
 **Step 3: Run RED**
 
@@ -783,6 +788,17 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/integration/pipeline/test_state_engine_read_model_consumers.py \
   tests/unit/core/landscape/test_state_engine_forbidden_paths.py
 ```
+
+Run PostgreSQL 16 separately with a live reporter probe:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
+  -p scripts.state_engine_profile_reporter \
+  --state-engine-profile-report=<assessment>/evidence/task7-postgresql.profile.json \
+  tests/testcontainer/core/test_state_engine_read_model_truth_tables_postgres.py
+```
+
+Repository-only selectors and mocked consumer decisions remain separately attributable; neither is evidence of their production composition by itself. Likewise, one generic SQLite repository run must not be relabelled as all three SQLite deployment profiles.
 
 **Step 4: Fix selectors at their owners**
 
@@ -794,10 +810,13 @@ Do not compensate for a faulty read model in an orchestration consumer. Repair t
 git add src/elspeth/core/landscape/scheduler/restore_read_model.py \
   src/elspeth/core/landscape/run_status_projection.py \
   src/elspeth/core/landscape/run_coordination_repository.py \
+  src/elspeth/core/checkpoint/recovery.py \
   src/elspeth/engine/orchestrator \
+  src/elspeth/web/execution/accounting.py \
   tests/unit/core/landscape/test_state_engine_read_model_truth_tables.py \
   tests/integration/pipeline/test_state_engine_read_model_consumers.py \
   tests/unit/core/landscape/test_state_engine_forbidden_paths.py \
+  tests/testcontainer/core/test_state_engine_read_model_truth_tables_postgres.py \
   docs/architecture/state_engine/assessments
 git commit -m "test(state-engine): close read-model and refusal matrices"
 ```
@@ -806,7 +825,9 @@ git commit -m "test(state-engine): close read-model and refusal matrices"
 
 - [ ] RM-01–14 truth tables cover every current state/subtype arm.
 - [ ] Each read model has a production consumer assertion.
-- [ ] F-01–14 refusal includes complete zero-mutation evidence.
+- [ ] F-04/06/07/10/12 refusal includes complete zero-mutation evidence, with only the contracted F-10 event delta.
+- [ ] Other F-leg evidence remains attached to its pinned cohort owner and is integrated without duplicate closure.
+- [ ] SQLite and PostgreSQL 16 evidence is separately attributable, and deployment-profile labels match exercised boundaries.
 - [ ] No unproved read-model arm controls drain, flush, resume, eviction, or completion.
 
 ---
