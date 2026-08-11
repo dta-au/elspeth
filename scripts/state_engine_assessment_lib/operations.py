@@ -42,7 +42,8 @@ def check_links(root: Path) -> int:
     docs_readme = root / "docs/README.md"
     if docs_readme.is_file():
         documents.append(docs_readme)
-    pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+    inline_pattern = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
+    reference_pattern = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(?:<([^>\n]+)>|(\S+))", re.MULTILINE)
     checked = 0
     missing: list[str] = []
     for document in documents:
@@ -51,7 +52,8 @@ def check_links(root: Path) -> int:
             f"documentation input cannot be a symlink: {document.relative_to(root)}",
         )
         text = document.read_text(encoding="utf-8")
-        for raw_target in pattern.findall(text):
+        reference_targets = [angle or bare for angle, bare in reference_pattern.findall(text)]
+        for raw_target in [*inline_pattern.findall(text), *reference_targets]:
             target = raw_target.split(maxsplit=1)[0].strip("<>")
             if not target or target.startswith(("http://", "https://", "mailto:", "#")):
                 continue

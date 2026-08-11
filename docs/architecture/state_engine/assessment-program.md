@@ -32,8 +32,11 @@ PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
 
 The initializer creates a fully materialized 73-leg v2 manifest plus readable
 README, evidence, and review templates. It refuses any pre-existing destination
-(including a symlink), stages the complete package in a sibling directory, and
-renames it into place only after every write succeeds.
+(including a symlink) and stages the files in a sibling directory. It then
+claims the destination with an atomic no-replace `mkdir`, moves the staged files
+into that reservation, and creates `.state-engine-assessment.ready` last. A
+visible directory without that exact completion marker is an incomplete
+reservation, not a valid package.
 
 Use `full` when the catalog, architecture, state vocabulary, transaction
 boundaries, support profiles, or global verdict may change. A delta is also a
@@ -50,6 +53,15 @@ parent. Undeclared changes fail. A delta cannot change catalogs or declare the
 global engine complete.
 
 ## 2. Capture Git identity
+
+New v2 assessments use an explicit baseline provenance mode. Use `current` for
+the Task 3 assessment and ordinary new assessments: repository root, origin,
+branch, commit, and tree must all match the validating checkout, and the
+non-document worktree must be clean. Use `historical` only for retained-object
+validation: it records only a full commit and its tree, both of which must
+resolve in the repository. Do not copy historical root, branch, or remote labels
+into that mode as though they were current facts. Environment and structural
+snapshots are recorded observations in either mode, not live identity claims.
 
 Prefer a clean dedicated worktree at the exact commit. Capture:
 
@@ -150,24 +162,34 @@ Run production-boundary evidence first, then direct repository detail. Use
 argument vectors in `assessment.json`; the Markdown command is a readable
 rendering, not the authority.
 
-For pytest evidence, emit a JUnit artifact and record exact node collection:
+For pytest evidence, load the checked-in profile reporter. The selected trusted
+test must call `state_engine_profile.observe_sqlite(live_connection,
+deployment=...)` or `observe_postgresql(live_sqlalchemy_connection,
+deployment=...)` at the runtime boundary. The reporter derives the catalog
+profile identity, queries SQLite with `SELECT sqlite_version()` or PostgreSQL
+with `SHOW server_version`, adds the exact `elspeth_node_id` property to every
+JUnit testcase, and writes the retained profile report. Deployment remains an
+explicit trusted-test assertion bound to the probe node; it is not a manifest
+or free-form CLI label.
+
+Run the evidence once, then derive the retained node index from the
+machine-produced profile report:
 
 ```bash
 STATE_EVIDENCE_ARTIFACTS="${STATE_ASSESSMENT_DIR}/artifacts"
 STATE_EVIDENCE_NODES="${STATE_ASSESSMENT_DIR}/nodes"
+STATE_PYTHON="$(.venv/bin/python -c 'import sys; print(sys.executable)')"
 mkdir -p "${STATE_EVIDENCE_ARTIFACTS}" "${STATE_EVIDENCE_NODES}"
-.venv/bin/python -m pytest --collect-only -q -n 0 \
-  tests/path/test_file.py::test_exact_node \
-  >"${STATE_EVIDENCE_ARTIFACTS}/EV-001.collect.stdout" \
-  2>"${STATE_EVIDENCE_ARTIFACTS}/EV-001.collect.stderr"
-awk 'index($0, "::") && $0 !~ /^ / {print}' \
-  "${STATE_EVIDENCE_ARTIFACTS}/EV-001.collect.stdout" \
-  >"${STATE_EVIDENCE_NODES}/EV-001.txt"
-.venv/bin/python -m pytest -q -n 0 \
+"${STATE_PYTHON}" -m pytest -q \
+  -p scripts.state_engine_profile_reporter \
+  --state-engine-profile-report="${STATE_EVIDENCE_ARTIFACTS}/EV-001.profile.json" \
   --junitxml="${STATE_EVIDENCE_ARTIFACTS}/EV-001.junit.xml" \
   tests/path/test_file.py::test_exact_node \
   >"${STATE_EVIDENCE_ARTIFACTS}/EV-001.stdout" \
   2>"${STATE_EVIDENCE_ARTIFACTS}/EV-001.stderr"
+jq -r '.node_ids[]' \
+  "${STATE_EVIDENCE_ARTIFACTS}/EV-001.profile.json" \
+  >"${STATE_EVIDENCE_NODES}/EV-001.txt"
 sha256sum \
   "${STATE_EVIDENCE_NODES}/EV-001.txt" \
   "${STATE_EVIDENCE_ARTIFACTS}"/EV-001.*
@@ -227,7 +249,7 @@ the package validator rejects a pending record.
 
 ## 10. Direct package validation
 
-Before updating the hub, run the package, evidence-collection, and link checks:
+Before updating the hub, run the package, retained-evidence, and link checks:
 
 ```bash
 STATE_ASSESSMENT_PATH="${STATE_ASSESSMENT_DIR}/assessment.json"
@@ -243,19 +265,26 @@ git diff --check
 `validate-package` rejects duplicate keys, namespace or profile drift, omitted
 legs, unsupported evidence promotion/N/A, dangling coverage, invalid gate
 mappings, dishonest derived verdicts/counts, altered artifacts or node indexes,
-and a human proof matrix that contradicts the manifest. It resolves the
-recorded baseline commit/tree and refuses any committed or uncommitted
-difference outside `docs/` before live plugin discovery.
+and a human proof matrix that contradicts the manifest. Its order is: validate
+catalog identity; validate the exact assessment schema and completion marker;
+validate catalog bindings, leg identity, and full/delta mode; validate baseline
+and environment; validate review and placeholders; validate retained evidence;
+derive changed tuples, gates, and proof cells; validate any delta parent; then
+recompute totals, verdict, and the human proof matrix. Current provenance also
+refuses any committed or uncommitted difference outside `docs/`.
 
-`collect-evidence` accepts only a literal `sys.executable -m pytest` command
-with allowlisted collection options and explicit `tests/` selectors. It strips
-JUnit output and `-n 0` arguments, clears ambient pytest options, disables
-third-party plugin autoload, applies only the closed safe-environment
-allowlist, enforces the positive timeout, and kills the collection process
-group on expiry. The exact resulting node list must equal the retained index.
+`collect-evidence` is intentionally a compatibility name for static retained-
+evidence validation. It executes no recorded command and imports no project
+test module. It uses the same command/environment/artifact authority as
+`validate-package`: exact trusted reporter plugin and output paths, closed safe-
+environment names, existing current-checkout selectors, exact JUnit testcase
+node properties, exact node-index equality, runtime profile provenance, result
+counts, and artifact digests. This removes process-containment and stdout-
+parsing claims from the validator; executing evidence remains the explicit
+operator step in section 6.
 `check-links` checks repository-relative Markdown links under the state-engine
 documentation and `docs/README.md`; absolute paths, repository escapes, and
-symlink inputs/escapes are invalid.
+symlink inputs/escapes are invalid for inline links and reference definitions.
 These are direct assessment operations, not unit tests for a document package.
 
 ## Historical rerun

@@ -1663,6 +1663,56 @@ def test_init_full_rejects_preexisting_destination(
     assert list(destination.iterdir()) == []
 
 
+def test_init_full_publishes_completion_marker_last(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    _repository, assessment_path = assessment_repository
+    marker = assessment_path.parent / ".state-engine-assessment.ready"
+
+    assert marker.read_text(encoding="utf-8") == "state-engine-assessment-package-v2\n"
+
+
+def test_validate_package_rejects_incomplete_reserved_package(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    marker = assessment_path.parent / ".state-engine-assessment.ready"
+    marker.unlink(missing_ok=True)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "completion marker" in result.stderr
+
+
+def test_init_full_does_not_replace_directory_created_after_advisory_check(
+    assessment_repository: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository, _assessment_path = assessment_repository
+    destination = repository / "docs/architecture/state_engine/assessments/concurrent-empty"
+    initialize_full = _assessment_namespace()["initialize_full"]
+    original_lstat = Path.lstat
+    destination_checks = 0
+
+    def create_destination_after_second_check(path: Path) -> os.stat_result:
+        nonlocal destination_checks
+        if path == destination:
+            destination_checks += 1
+            if destination_checks == 2:
+                os.mkdir(destination)
+                raise FileNotFoundError(destination)
+        return original_lstat(path)
+
+    monkeypatch.setattr(Path, "lstat", create_destination_after_second_check)
+
+    with pytest.raises(ValueError, match="destination already exists"):
+        initialize_full("concurrent-empty", destination)
+
+    assert destination.is_dir()
+    assert list(destination.iterdir()) == []
+
+
 def test_init_full_rejects_symlink_destination_without_touching_target(
     assessment_repository: tuple[Path, Path],
 ) -> None:
@@ -1714,6 +1764,19 @@ def test_check_links_rejects_absolute_local_target(
 
     assert result.returncode == 1
     assert "link target must be repository-relative" in result.stderr
+
+
+def test_check_links_rejects_missing_reference_definition_target(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    attack = repository / "docs/architecture/state_engine/reference-link.md"
+    attack.write_text("Use [the missing reference][missing].\n\n[missing]: absent.md\n", encoding="utf-8")
+
+    result = _run_assessment_cli("check-links", cwd=repository)
+
+    assert result.returncode == 1
+    assert "reference-link.md -> absent.md" in result.stderr
 
 
 def test_check_links_rejects_traversal_outside_repository(
@@ -1782,3 +1845,26 @@ def test_main_reports_unexpected_failures_without_traceback(
     assert captured.out == ""
     assert captured.err == "state-engine assessment: internal error (RuntimeError): injected internal failure\n"
     assert "Traceback" not in captured.err
+
+
+def test_assessment_wrapper_precedes_ambient_pythonpath_packages(tmp_path: Path) -> None:
+    fake_root = tmp_path / "ambient"
+    fake_package = fake_root / "scripts/state_engine_assessment_lib"
+    fake_package.mkdir(parents=True)
+    (fake_root / "scripts/__init__.py").write_text("", encoding="utf-8")
+    (fake_package / "__init__.py").write_text("", encoding="utf-8")
+    marker = tmp_path / "ambient-package-imported"
+    import_side_effect = f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
+    (fake_package / "common.py").write_text(
+        import_side_effect + "def load_unique_json(path):\n    return {}\n",
+        encoding="utf-8",
+    )
+    (fake_package / "operations.py").write_text(import_side_effect + "def main(argv=None):\n    return 0\n", encoding="utf-8")
+    (fake_package / "package.py").write_text(import_side_effect + "def initialize_full(*args):\n    return None\n", encoding="utf-8")
+    pythonpath = os.pathsep.join((str(fake_root), str(REPOSITORY_ROOT), str(REPOSITORY_ROOT / "src")))
+
+    result = _run_assessment_cli("--help", environment_overrides={"PYTHONPATH": pythonpath})
+
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout
+    assert not marker.exists()

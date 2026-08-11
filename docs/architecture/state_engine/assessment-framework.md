@@ -49,8 +49,8 @@ Every execution record contains:
 - repository-relative working directory;
 - safe environment additions/removals and required resources;
 - start/end times, timeout, exit code, and duration;
-- one catalog execution profile with its state store, deployment, and semantic
-  backend version;
+- one machine-produced runtime profile report with its state store, deployment,
+  semantic backend version, probe kind, and exact probe node;
 - positive, unique collected node IDs and exact
   pass/fail/error/skip/xfail/xpass/warning counts;
 - stdout, stderr, JUnit, and retained artifact paths with SHA-256 when stored;
@@ -63,16 +63,22 @@ Every execution record contains:
 Warnings, skips, xfails, missing credentials, and partial platform coverage are
 evidence facts. Do not omit them to make a run appear cleaner.
 
-Collection replays only the recorded trusted Python/pytest vector with explicit
-`tests/` selectors. Ambient pytest options and credential-bearing environment
-variables are not inherited; only the validator's closed safe-environment
-allowlist may be applied, under the record's positive timeout.
+The `collect-evidence` compatibility command statically revalidates retained
+artifacts; it never replays pytest or imports a recorded test module. It and
+`validate-package` share one exact command/environment schema. The recorded
+vector must load the trusted profile reporter, select explicit `tests/` nodes,
+and bind its JUnit and profile outputs to retained artifacts. The reporter gets
+backend facts from the live database connection at a trusted test boundary;
+deployment is a trusted test assertion bound to that probe node, not a manifest
+label. The closed safe-environment allowlist records only approved reproduction
+inputs.
 
 Only a successful `pytest` record with a positive pass count, no
-fail/error/skip/xfail/xpass result, matching collection/JUnit totals, and
-one proof subject per cited node can promote a behavioral cell. A node may
-cover several dimensions of that one leg/case/profile subject. Documentation
-records are support-only and cannot promote behavioral cells.
+fail/error/skip/xfail/xpass result, matching JUnit testcase/aggregate totals,
+exact equality among JUnit properties, node index, and profile node IDs, and one
+proof subject per cited node can promote a behavioral cell. A node may cover
+several dimensions of that one leg/case/profile subject. Documentation records
+are support-only and cannot promote behavioral cells.
 
 ## Classification rules
 

@@ -71,6 +71,8 @@ PYTEST_FLAGS = {
     "--strict-markers",
     "--disable-warnings",
 }
+COMPLETION_MARKER_NAME = ".state-engine-assessment.ready"
+COMPLETION_MARKER_CONTENT = b"state-engine-assessment-package-v2\n"
 
 
 def _initial_derived(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -162,21 +164,70 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
         "review.md": "# Assessment Review\n\nReview outcome: pending\n",
     }
     staged = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=parent))
+    reserved = False
+    parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         (staged / "assessment.json").write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         for name, content in templates.items():
             (staged / name).write_text(content, encoding="utf-8")
+        for staged_file in staged.iterdir():
+            with staged_file.open("rb") as handle:
+                os.fsync(handle.fileno())
+        staged_fd = os.open(staged, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(staged_fd)
+        finally:
+            os.close(staged_fd)
         try:
             destination.lstat()
         except FileNotFoundError:
             pass
         else:
             _fail(f"assessment destination already exists: {destination}")
-        os.rename(staged, destination)
+        try:
+            os.mkdir(destination, mode=0o700)
+        except FileExistsError:
+            _fail(f"assessment destination already exists: {destination}")
+        reserved = True
+        os.fsync(parent_fd)
+        destination_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            for staged_file in staged.iterdir():
+                os.rename(staged_file, destination / staged_file.name)
+            os.chmod(destination, 0o755)
+            os.fsync(destination_fd)
+            marker_fd = os.open(
+                COMPLETION_MARKER_NAME,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o644,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(marker_fd, COMPLETION_MARKER_CONTENT)
+                os.fsync(marker_fd)
+            finally:
+                os.close(marker_fd)
+            os.fsync(destination_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(destination_fd)
+    except Exception:
+        if reserved:
+            shutil.rmtree(destination)
+            os.fsync(parent_fd)
+        raise
     finally:
+        os.close(parent_fd)
         if staged.exists():
             shutil.rmtree(staged)
     return destination / "assessment.json"
+
+
+def _validate_completion_marker(assessment_path: Path) -> None:
+    marker = assessment_path.parent / COMPLETION_MARKER_NAME
+    _require(marker.is_file(), f"assessment package completion marker is missing: {marker}")
+    _require(not marker.is_symlink(), f"assessment package completion marker cannot be a symlink: {marker}")
+    _require(marker.read_bytes() == COMPLETION_MARKER_CONTENT, f"assessment package completion marker is invalid: {marker}")
 
 
 def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
@@ -856,6 +907,7 @@ def validate_evidence_artifacts(assessment_path: Path) -> int:
     validate_catalog(catalog, catalog_path)
     if catalog.get("catalog_id") == "elspeth-state-engine-v2":
         _validate_v2_assessment_schema(assessment)
+        _validate_completion_marker(assessment_path)
     else:
         _require(
             type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
@@ -1045,6 +1097,7 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     validate_catalog(catalog, catalog_path)
     if catalog.get("catalog_id") == "elspeth-state-engine-v2":
         _validate_v2_assessment_schema(assessment)
+        _validate_completion_marker(assessment_path)
     else:
         _require(
             type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,

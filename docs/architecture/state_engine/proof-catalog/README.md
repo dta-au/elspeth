@@ -70,7 +70,8 @@ explicitly unknown through the default.
   visibly unowned.
 - `pytest` is the only behavioral promotion kind. It requires positive passing
   node counts, exact JUnit/count agreement, no failed/error/skipped/xfail/xpass
-  result, and matching execution-profile provenance.
+  result, exact JUnit/index/profile node identity, and matching runtime-profile
+  provenance produced at the trusted test/database boundary.
 - `documentation` evidence may support a result but cannot independently
   produce behavioral `pass` or `partial`.
 - Evidence coverage names exact
@@ -83,9 +84,9 @@ explicitly unknown through the default.
 
 Follow [the assessment program](../assessment-program.md). The single
 `scripts/state_engine_assessment.py` entry point provides duplicate-key-safe
-JSON parsing, exact catalog/manifest checks, executable-node collection,
-relative-link checks, and review requirements. Validate the current contract
-with:
+JSON parsing, exact catalog/manifest checks, static retained-evidence
+validation, relative-link checks, and review requirements. Validate the current
+contract with:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \

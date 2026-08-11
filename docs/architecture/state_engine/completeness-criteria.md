@@ -126,8 +126,11 @@ promotion kind and `documentation` is support-only. A promoting pytest record
 must bind every coverage tuple to retained node IDs, use one
 leg/case/profile proof subject per node, match one catalog execution profile,
 and report a positive all-passing result with no skip, xfail, or xpass.
-PostgreSQL evidence reports a semantic 16.x backend version; SQLite evidence
-reports a semantic 3.x version.
+The checked-in reporter obtains backend facts from the live connection at the
+trusted test boundary, binds the deployment assertion to the probe node, and
+emits exact JUnit/profile node identities. PostgreSQL evidence reports a
+server-queried semantic 16.x version; SQLite evidence reports a
+connection-queried semantic 3.x version.
 
 Concurrency claims require independent connections and, where the contract is
 process-scoped, independent operating-system processes. In-process exception
