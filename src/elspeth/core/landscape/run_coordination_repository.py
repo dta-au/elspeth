@@ -1006,7 +1006,9 @@ class RunCoordinationRepository:
         liveness definition is consistent across the read (who to attempt to evict)
         and the write (the CAS guard inside evict_worker).
 
-        Returns a tuple of worker_ids (deterministic order by registered_at).
+        Returns a tuple of worker_ids in deterministic
+        ``(registered_at, worker_id)`` order; the identity tie-break prevents
+        database-dependent ordering when workers register simultaneously.
         The caller then calls ``evict_worker`` for each, which is idempotent
         (benign skip if the worker heartbeated or holds a live lease).
         """
@@ -1021,7 +1023,7 @@ class RunCoordinationRepository:
                     run_workers_table.c.worker_id != leader_worker_id,
                     run_workers_table.c.heartbeat_expires_at < grace_threshold,
                 )
-                .order_by(run_workers_table.c.registered_at)
+                .order_by(run_workers_table.c.registered_at, run_workers_table.c.worker_id)
             ).scalars()
         return tuple(rows)
 

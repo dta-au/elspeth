@@ -89,13 +89,13 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing
     assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
-    assert "SQLITE_SCHEMA_EPOCH=30" in sharing
+    assert "SQLITE_SCHEMA_EPOCH=31" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")
     assert "elspeth:ecs-0.7.2-closeout" in aws
     assert '"candidate_package_version": "0.7.2"' in aws
     assert '"previous_package_version": "0.7.1"' in aws
-    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": 30' in aws
+    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": 31' in aws
     assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
-    assert f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_30' in aws
-    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-30 Landscape code" in aws
+    assert f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_31' in aws
+    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-31 Landscape code" in aws

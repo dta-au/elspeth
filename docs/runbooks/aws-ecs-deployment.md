@@ -1510,9 +1510,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 47, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 47, "landscape_epoch": 31, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_47_landscape_epoch_29_to_30_blob_cleanup_guided_decline_and_row_union_barrier",
+    "structural_changes": "session_epoch_35_to_47_landscape_epoch_29_to_31_blob_cleanup_guided_decline_row_union_barrier_and_scheduler_status_closure",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
@@ -1538,12 +1538,12 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 45, Landscape epoch 30 and `run_web_plugin_policy` presence,
+session epoch 47, Landscape epoch 31 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
 any later deployment action. The 0.7.1 image understands session epoch 35,
-not epoch 45. Pre-1.0 candidates do not migrate predecessor schemas: the old
+not epoch 47. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
@@ -3187,7 +3187,7 @@ Retain only allowlisted checks, classes, counts, and hashes.
 ### 7. Prove rollback refusal without crossing the schema stop
 
 The current upgrade record proves the opposite of rollback authorization. Once
-the candidate has recreated Landscape at epoch 30, the 0.7.0 image must
+the candidate has recreated Landscape at epoch 31, the 0.7.0 image must
 never be deployed against that database. Scenario B therefore exercises a
 fail-closed rollback refusal and forward recovery: revalidate and persist the
 sanitized compatibility receipt, prove the candidate task remains the active
@@ -3209,7 +3209,7 @@ if test "$DEPLOYMENT_MODE" = upgrade; then
     .backward_compatible == false
     and .rollback_permitted == false
     and .schema_facts.previous.landscape_epoch == 23
-    and .schema_facts.candidate.landscape_epoch == 30
+    and .schema_facts.candidate.landscape_epoch == 31
   ' "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
   persist_sanitized_receipt "$ACTIVE_SCENARIO_ID" compatibility-record \
     "$COMPATIBILITY_RECORD_SHA256" "$ROLLBACK_REFUSAL_RECEIPT" >/dev/null
@@ -3227,7 +3227,7 @@ fi
 
 The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
 the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-47 session/epoch-30 Landscape code.
+drained and repair forward with epoch-47 session/epoch-31 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
 

@@ -18,7 +18,7 @@ REQUIRED_EFFECT_DOC_TERMS = {
     "UNKNOWN",
     "NO_INSPECTION_REQUIRED",
     "publication_performed",
-    "epoch 30",
+    "epoch 31",
 }
 
 

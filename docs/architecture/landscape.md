@@ -168,9 +168,10 @@ provenance. Epoch 29 adds run-scoped ancestry/error links, output-contract
 hashes, durable batch-expansion claims, and the transaction-owned sidecar
 journal outbox. Epoch 30 adds `token_work_items.row_union_name` so a recovered
 scheduler can attribute a blocked work item to its declared row_union barrier.
+Epoch 31 closes `token_work_items.status` over the public scheduler status enum.
 
 ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 30; startup and read-only inspection do not
+required and recreated at epoch 31; startup and read-only inspection do not
 transform a predecessor store in place.
 
 ### Multi-source ingestion (ADR-025)

@@ -15,7 +15,7 @@ def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Deliberate literal pin: an epoch bump must consciously update this test
     # (and the release docs the docs tests check), not slide through.
     assert SESSION_SCHEMA_EPOCH == 47
-    assert SQLITE_SCHEMA_EPOCH == 30
+    assert SQLITE_SCHEMA_EPOCH == 31
 
 
 def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:

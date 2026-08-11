@@ -844,9 +844,19 @@ class TokenSchedulerRepository:
         """Count how many of the given work item IDs are in FAILED status."""
         return self.reads.count_failed_in_set(run_id=run_id, work_item_ids=work_item_ids)
 
-    def has_peer_owned_work(self, *, run_id: str, caller_owner: str) -> bool:
+    def has_peer_owned_work(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+        work_item_ids: Sequence[str] | None = None,
+    ) -> bool:
         """Return True if any non-terminal row is owned by a DIFFERENT worker."""
-        return self.reads.has_peer_owned_work(run_id=run_id, caller_owner=caller_owner)
+        return self.reads.has_peer_owned_work(
+            run_id=run_id,
+            caller_owner=caller_owner,
+            work_item_ids=work_item_ids,
+        )
 
     def count_active_work(self, *, run_id: str) -> int:
         """Count non-terminal scheduler work for a run."""

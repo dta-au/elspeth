@@ -278,7 +278,10 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        recovered scheduler can reconcile fork-branch groups without in-memory
 #        state. This is a pre-1.0 delete-and-recreate boundary; a Landscape
 #        store written at epoch 29 lacks the column and is not migrated.
-SQLITE_SCHEMA_EPOCH = 30
+#   31 → token_work_items.status is mechanically closed over TokenWorkStatus.
+#        Removed states such as WAITING can no longer be reintroduced through
+#        direct SQL. This is a pre-1.0 delete-and-recreate boundary.
+SQLITE_SCHEMA_EPOCH = 31
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -702,6 +705,7 @@ token_work_items_table = Table(
         f"AND lease_owner IS NOT NULL AND length(lease_owner) > 0) OR status != {_sql_string_literal(TokenWorkStatus.LEASED.value)}",
         name="ck_token_work_items_lease_owner_required_when_leased",
     ),
+    CheckConstraint(_enum_in_check("status", TokenWorkStatus), name="ck_token_work_items_status"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),

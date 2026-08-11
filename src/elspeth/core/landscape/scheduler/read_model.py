@@ -134,12 +134,18 @@ class SchedulerReadModel:
                 total += int(result)
         return total
 
-    def has_peer_owned_work(self, *, run_id: str, caller_owner: str) -> bool:
+    def has_peer_owned_work(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+        work_item_ids: Sequence[str] | None = None,
+    ) -> bool:
         """Return True if any non-terminal row is owned by a DIFFERENT worker.
 
         ADR-030 M1 relinquish discriminator, arm (3): proves a PEER (some
         ``lease_owner`` other than ``caller_owner``) is/was carrying work on this
-        run. A row counts if it is LEASED or PENDING_SINK with a non-NULL
+        run. A row counts if it is LEASED or PENDING_SINK with a non-empty
         ``lease_owner`` that differs from ``caller_owner``. PENDING_SINK is
         included deliberately: ``mark_pending_sink`` KEEPS the claimant's
         ``lease_owner`` (unlike mark_terminal/mark_failed/mark_blocked, which NULL
@@ -149,18 +155,34 @@ class SchedulerReadModel:
         peer's leases lapse. An N=1 leader's own rows carry the leader's owner (and
         BLOCKED rows carry no owner), so this returns False for a solo leader,
         keeping its self-stranded continuations loud. Scoped to ``run_id`` like
-        every sibling verb.
+        every sibling verb. When ``work_item_ids`` is supplied, only those
+        exact continuations can establish peer authority; unrelated peer work
+        elsewhere in the run cannot authorize RM-05 relinquishment.
         """
+        if work_item_ids is not None and not work_item_ids:
+            return False
+        chunks: tuple[Sequence[str] | None, ...]
+        if work_item_ids is None:
+            chunks = (None,)
+        else:
+            ids = list(work_item_ids)
+            chunks = tuple(ids[start : start + 900] for start in range(0, len(ids), 900))
         with self._engine.connect() as conn:
-            found = conn.execute(
-                select(token_work_items_table.c.work_item_id)
-                .where(token_work_items_table.c.run_id == run_id)
-                .where(token_work_items_table.c.status.in_((TokenWorkStatus.LEASED.value, TokenWorkStatus.PENDING_SINK.value)))
-                .where(token_work_items_table.c.lease_owner.is_not(None))
-                .where(token_work_items_table.c.lease_owner != caller_owner)
-                .limit(1)
-            ).first()
-        return found is not None
+            for chunk in chunks:
+                query = (
+                    select(token_work_items_table.c.work_item_id)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status.in_((TokenWorkStatus.LEASED.value, TokenWorkStatus.PENDING_SINK.value)))
+                    .where(token_work_items_table.c.lease_owner.is_not(None))
+                    .where(token_work_items_table.c.lease_owner != "")
+                    .where(token_work_items_table.c.lease_owner != caller_owner)
+                    .limit(1)
+                )
+                if chunk is not None:
+                    query = query.where(token_work_items_table.c.work_item_id.in_(chunk))
+                if conn.execute(query).first() is not None:
+                    return True
+        return False
 
     def count_active_work(self, *, run_id: str) -> int:
         """Count non-terminal scheduler work for a run."""

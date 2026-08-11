@@ -1842,7 +1842,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 30
+### Landscape schema epoch 31
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce
@@ -1855,16 +1855,18 @@ expansion claims, and a transaction-owned sidecar-journal outbox. Each outbox
 batch records its
 canonical sidecar owner so another worker or path cannot publish or acknowledge
 it. Epoch 30 adds `token_work_items.row_union_name` so a recovered scheduler can
-attribute a blocked work item to its declared row_union barrier. See the
+attribute a blocked work item to its declared row_union barrier. Epoch 31
+closes `token_work_items.status` over the public scheduler status enum so a
+removed state such as `waiting` cannot be reintroduced through direct SQL. See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 
 ELSPETH is pre-1.0. It does not transform an older Landscape schema into epoch
-30, either automatically at startup or through an operator migration command.
+31, either automatically at startup or through an operator migration command.
 Stop and uninstall the old deployment, archive or export evidence when policy
 requires it, delete/recreate the Landscape database, then reinstall and
 initialize this ELSPETH version. PostgreSQL schema-owner and runtime/DML roles
 remain separate; recreation is an operator action. Code that understands only
-an older epoch must not be rolled back over an epoch-30 database.
+an older epoch must not be rolled back over an epoch-31 database.
 
 Data-preserving, version-to-version schema migrations become a first-class
 compatibility obligation at 1.0. They are intentionally not a pre-1.0 promise.

@@ -2,7 +2,7 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 47 and Landscape epoch 30)
+## Current Cutover: 0.7.2 blob cleanup, guided decline, and scheduler-state closure (session epoch 47 and Landscape epoch 31)
 
 0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 47. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
@@ -74,11 +74,13 @@ validation-error links, durable batch-expansion claims, and the
 transaction-owned sidecar-journal outbox. Epoch 30 adds
 `token_work_items.row_union_name` so a recovered scheduler can attribute a
 blocked work item to its declared row_union barrier.
+Epoch 31 constrains `token_work_items.status` to the six public scheduler
+states, preventing removed states such as `waiting` from being persisted.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor
-session epoch is a recreate boundary, including epoch 37. Landscape epoch 30
-is the current release boundary, so a Landscape database left at epoch 29 is
+session epoch is a recreate boundary, including epoch 37. Landscape epoch 31
+is the current release boundary, so a Landscape database left at epoch 30 is
 stale and must be recreated in the same service-stop window. Any stale PostgreSQL session shape is recreated by
 the schema owner; the runtime role remains DML-only.
 
@@ -96,7 +98,7 @@ and epochs; forward and backward compatibility decisions; and an explicit
 the freshly recreated current databases. Rollback across this boundary is
 unsupported: keep the service drained, repair the epoch-47 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-47/Landscape-epoch-30 record when binding candidate and rollback
+session-epoch-47/Landscape-epoch-31 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account

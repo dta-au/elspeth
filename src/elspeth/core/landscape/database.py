@@ -596,6 +596,7 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("run_attributions", "ck_run_attributions_auth_provider_type"),
     ("run_web_plugin_policy", "ck_run_web_plugin_policy_schema_version"),
     ("run_sources", "ck_run_sources_lifecycle_state"),
+    ("token_work_items", "ck_token_work_items_status"),
     ("token_work_items", "ck_token_work_items_lease_owner_required_when_leased"),
     ("scheduler_events", "ck_scheduler_events_event_type"),
     ("scheduler_events", "ck_scheduler_events_from_status"),
