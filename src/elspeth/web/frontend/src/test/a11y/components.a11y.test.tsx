@@ -67,6 +67,7 @@ const AUDITED_COMPONENTS = [
   "ChatInput",
   "CommandPalette",
   "ConfirmDialog",
+  "WorkspaceSeparator",
   "GraphModal",
   "GraphView",
   "HelloWorldTutorial",
@@ -130,6 +131,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "TutorialTurn5AuditStory",
   "TutorialTurn7Graduation",
   "UserMenu",
+  "WorkspaceSeparator",
   "WireStageTurn",
 ];
 
@@ -292,6 +294,7 @@ import { ChatPanel } from "@/components/chat/ChatPanel";
 import { LoginPage } from "@/components/auth/LoginPage";
 import { CommandPalette } from "@/components/common/CommandPalette";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { WorkspaceSeparator } from "@/components/workspace/WorkspaceSeparator";
 import { ProgressView } from "@/components/execution/ProgressView";
 import { RunsHistoryDrawer } from "@/components/execution/RunsHistoryDrawer";
 import { GraphView } from "@/components/inspector/GraphView";
@@ -1530,6 +1533,22 @@ describe("ConfirmDialog", () => {
       >
         <p>One output file will be removed.</p>
       </ConfirmDialog>,
+    );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("WorkspaceSeparator", () => {
+  it("has no axe violations while keyboard resizing is available", async () => {
+    const { container } = render(
+      <WorkspaceSeparator
+        value={448}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={() => {}}
+        onResizeEnd={() => {}}
+      />,
     );
     expect(await axe(container)).toHaveNoViolations();
   });

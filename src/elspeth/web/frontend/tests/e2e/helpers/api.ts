@@ -76,6 +76,10 @@ export async function seedCompositionState(
 ): Promise<CompositionState> {
   const resp = await ctx.post(`/api/sessions/${sessionId}/state/e2e-seed`, {
     data: { state },
+    // Tall workspace fixtures intentionally seed dozens of graph nodes. Give
+    // that setup request room to persist while keeping the suite's normal
+    // 10-second interaction timeout unchanged.
+    timeout: 30_000,
   });
   if (!resp.ok()) {
     throw new Error(

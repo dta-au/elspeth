@@ -4,7 +4,8 @@
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.workspace-e2e.tsbuildinfo"
   },
   "include": [
-    "tests/e2e/composer-workspace-geometry.spec.ts",
+    "tests/e2e/composer-workspace-*.spec.ts",
+    "tests/e2e/composer-workspace.visual.spec.ts",
     "tests/e2e/composer-reflow.spec.ts",
     "tests/e2e/helpers/api.ts",
     "tests/e2e/helpers/workspace-fixtures.ts",
