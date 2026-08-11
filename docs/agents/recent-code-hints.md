@@ -159,6 +159,14 @@ Do not add a standalone `@media (forced-colors: active)` block before the
 canonical final block in `styles/themes.css`: the whole-barrel contrast gate
 treats the first block as canonical and will inspect only that partial corpus.
 
+### 8. Playwright auth state is worktree-global (2026-08-12)
+
+Never run two Playwright commands concurrently in the same worktree. Global
+setup rewrites the shared `tests/e2e/.auth/user.json`; distinct backend and
+frontend ports do not isolate that file, so otherwise independent runs can
+corrupt each other's authenticated state. Run every Playwright suite
+sequentially per worktree.
+
 ## Recent conventions (prune when archived)
 
 - **2026-08-10 — a `DateTime(timezone=True)` column does NOT round-trip aware on
