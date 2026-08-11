@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -23,9 +24,14 @@ from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 V1_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v1/catalog.json"
 V2_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
+V3_CATALOG_DIRECTORY = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3"
+V3_CATALOG_PATH = V3_CATALOG_DIRECTORY / "catalog.json"
+V3_CATALOG_SCHEMA_PATH = V3_CATALOG_DIRECTORY / "catalog.schema.json"
+V3_ASSESSMENT_SCHEMA_PATH = V3_CATALOG_DIRECTORY / "assessment.schema.json"
 ASSESSMENT_SCRIPT_PATH = REPOSITORY_ROOT / "scripts/state_engine_assessment.py"
 PROFILE_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 V1_CATALOG_SHA256 = "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
+V2_CATALOG_SHA256 = "802734e04f4292cacac9fd5ffa32a3f6a7e3a1b5200c09a7595a158c6e1e2c6a"
 
 
 def _load_catalog(path: Path) -> dict[str, object]:
@@ -162,6 +168,91 @@ def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
     assert hashlib.sha256(V1_CATALOG_PATH.read_bytes()).hexdigest() == V1_CATALOG_SHA256
+
+
+def test_v2_catalog_remains_byte_identical_historical_evidence() -> None:
+    assert hashlib.sha256(V2_CATALOG_PATH.read_bytes()).hexdigest() == V2_CATALOG_SHA256
+
+
+def test_v3_catalog_and_normative_schemas_are_valid() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
+    catalog_schema = _load_catalog(V3_CATALOG_SCHEMA_PATH)
+    assessment_schema = _load_catalog(V3_ASSESSMENT_SCHEMA_PATH)
+
+    Draft202012Validator.check_schema(catalog_schema)
+    Draft202012Validator.check_schema(assessment_schema)
+    Draft202012Validator(catalog_schema).validate(catalog)
+    assert catalog["catalog_id"] == "elspeth-state-engine-v3"
+    assert catalog["schema_version"] == 2
+    assert "applicability_profiles" not in catalog
+
+
+def test_v3_catalog_cases_have_explicit_total_cell_applicability() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
+    profile_ids = [profile["id"] for profile in catalog["execution_profiles"]["profile_cases"]]
+    dimensions = catalog["dimensions"]
+
+    for leg in catalog["legs"]:
+        cases = leg["required_cases"]
+        assert cases
+        assert len({case["case_id"] for case in cases}) == len(cases)
+        for case in cases:
+            assert set(case) == {"case_id", "plugin_key", "variant_id", "cell_applicability"}
+            assert isinstance(case["variant_id"], str) and case["variant_id"]
+            assert list(case["cell_applicability"]) == profile_ids
+            for profile in case["cell_applicability"].values():
+                assert list(profile) == dimensions
+                for cell in profile.values():
+                    assert set(cell) == {"status", "reason"}
+                    if cell["status"] == "required":
+                        assert cell["reason"] is None
+                    else:
+                        assert cell["status"] == "not_applicable"
+                        assert isinstance(cell["reason"], str) and cell["reason"].strip()
+
+        if leg["id"] == "PB-09":
+            assert all(isinstance(case["plugin_key"], str) and case["plugin_key"] for case in cases)
+            pairs = [(case["plugin_key"], case["variant_id"]) for case in cases]
+            assert len(pairs) == len(set(pairs))
+        else:
+            assert all(case["plugin_key"] is None for case in cases)
+
+
+def test_v3_transition_is_lossless_outside_pb09() -> None:
+    v2 = _load_catalog(V2_CATALOG_PATH)
+    v3 = _load_catalog(V3_CATALOG_PATH)
+
+    for field in (
+        "criteria_ref",
+        "architecture_ref",
+        "dimensions",
+        "vocabularies",
+        "execution_profiles",
+        "family_dimension_acceptance",
+        "evidence_contract",
+        "hard_gates",
+        "required_leg_ids",
+    ):
+        assert v3[field] == v2[field]
+
+    v2_legs = {leg["id"]: leg for leg in v2["legs"]}
+    v3_legs = {leg["id"]: leg for leg in v3["legs"]}
+    assert list(v3_legs) == list(v2_legs)
+    for leg_id, v2_leg in v2_legs.items():
+        v3_leg = v3_legs[leg_id]
+        assert {key: v3_leg[key] for key in ("id", "family", "title", "contract")} == {
+            key: v2_leg[key] for key in ("id", "family", "title", "contract")
+        }
+        if leg_id == "PB-09":
+            continue
+        profile = v2["applicability_profiles"][v2_leg["applicability_profile"]]
+        expected_case_ids = v2_leg.get("required_cases", [profile["default_case_id"]])
+        assert [case["case_id"] for case in v3_leg["required_cases"]] == expected_case_ids
+        for case in v3_leg["required_cases"]:
+            for profile_case, profile_policy in profile["profile_case_applicability"].items():
+                for dimension in v2["dimensions"]:
+                    expected = "required" if profile_policy == profile[dimension] == "required" else "not_applicable"
+                    assert case["cell_applicability"][profile_case][dimension]["status"] == expected
 
 
 def _run_assessment_cli(
@@ -1020,6 +1111,8 @@ def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     assessment_directory = repository / "docs/architecture/state_engine/assessments/minimal-assessment"
     result = _run_assessment_cli(
         "init-full",
+        "--catalog",
+        "docs/architecture/state_engine/proof-catalog/v2/catalog.json",
         "minimal-assessment",
         str(assessment_directory),
         cwd=repository,
@@ -1260,6 +1353,102 @@ def test_validate_catalog_cli_accepts_current_v2_catalog() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "state-engine catalog: valid" in result.stdout
+
+
+def test_validate_catalog_cli_accepts_v3_candidate_catalog() -> None:
+    result = _run_assessment_cli("validate-catalog", str(V3_CATALOG_PATH))
+
+    assert result.returncode == 0, result.stderr
+    assert "state-engine catalog: valid" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("source", "catalog_id", "schema_version"),
+    [
+        pytest.param(V1_CATALOG_PATH, "elspeth-state-engine-v1", 2, id="v1-schema-2"),
+        pytest.param(V2_CATALOG_PATH, "elspeth-state-engine-v2", 2, id="v2-schema-2"),
+        pytest.param(V3_CATALOG_PATH, "elspeth-state-engine-v3", 1, id="v3-schema-1"),
+        pytest.param(V3_CATALOG_PATH, "elspeth-state-engine-v4", 2, id="unknown-catalog-id"),
+    ],
+)
+def test_validate_catalog_cli_rejects_unsupported_version_pairs(
+    tmp_path: Path,
+    source: Path,
+    catalog_id: str,
+    schema_version: int,
+) -> None:
+    catalog = json.loads(source.read_text(encoding="utf-8"))
+    catalog.update({"catalog_id": catalog_id, "schema_version": schema_version})
+    catalog_path = tmp_path / "catalog.json"
+    _write_json(catalog_path, catalog)
+
+    result = _run_assessment_cli("validate-catalog", str(catalog_path))
+
+    assert result.returncode == 1
+    assert "unsupported catalog version pair" in result.stderr
+
+
+def test_init_full_requires_explicit_catalog_option(tmp_path: Path) -> None:
+    result = _run_assessment_cli("init-full", "missing-catalog", str(tmp_path / "assessment"))
+
+    assert result.returncode == 2
+    assert "--catalog" in result.stderr
+
+
+def test_init_full_rejects_absolute_catalog_path(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    result = _run_assessment_cli(
+        "init-full",
+        "--catalog",
+        str(repository / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"),
+        "absolute-catalog",
+        "docs/architecture/state_engine/assessments/absolute-catalog",
+        cwd=repository,
+    )
+
+    assert result.returncode == 1
+    assert "--catalog must be repository-relative" in result.stderr
+
+
+def test_init_full_accepts_explicit_v3_catalog(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    candidate = repository / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
+    _write_json(candidate, _load_catalog(V3_CATALOG_PATH))
+
+    result = _run_assessment_cli(
+        "init-full",
+        "--catalog",
+        "docs/architecture/state_engine/proof-catalog/v3/catalog.json",
+        "v3-candidate",
+        "docs/architecture/state_engine/assessments/v3-candidate",
+        cwd=repository,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assessment_path = repository / "docs/architecture/state_engine/assessments/v3-candidate/assessment.json"
+    assessment = _load_catalog(assessment_path)
+    assert assessment["schema_version"] == 3
+    assert assessment["catalog"]["catalog_id"] == "elspeth-state-engine-v3"
+    marker = assessment_path.parent / ".state-engine-assessment.ready"
+    assert marker.read_bytes() == b"state-engine-assessment-package-v3\n"
+
+
+def test_validate_package_rejects_unsupported_assessment_version_pair(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = _load_catalog(assessment_path)
+    assessment["schema_version"] = 3
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "unsupported assessment version pair" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -2282,7 +2471,14 @@ def test_init_full_rejects_preexisting_destination(
     destination = repository / "docs/architecture/state_engine/assessments/preexisting"
     destination.mkdir()
 
-    result = _run_assessment_cli("init-full", "preexisting", str(destination), cwd=repository)
+    result = _run_assessment_cli(
+        "init-full",
+        "--catalog",
+        "docs/architecture/state_engine/proof-catalog/v2/catalog.json",
+        "preexisting",
+        str(destination),
+        cwd=repository,
+    )
 
     assert result.returncode == 1
     assert "destination already exists" in result.stderr
@@ -2333,7 +2529,11 @@ def test_init_full_does_not_replace_directory_created_after_advisory_check(
     monkeypatch.setattr(Path, "lstat", create_destination_after_second_check)
 
     with pytest.raises(ValueError, match="destination already exists"):
-        initialize_full("concurrent-empty", destination)
+        initialize_full(
+            "concurrent-empty",
+            destination,
+            Path("docs/architecture/state_engine/proof-catalog/v2/catalog.json"),
+        )
 
     assert destination.is_dir()
     assert list(destination.iterdir()) == []
@@ -2349,7 +2549,14 @@ def test_init_full_rejects_symlink_destination_without_touching_target(
     destination = assessments / "symlink-destination"
     destination.symlink_to(target, target_is_directory=True)
 
-    result = _run_assessment_cli("init-full", "symlink", str(destination), cwd=repository)
+    result = _run_assessment_cli(
+        "init-full",
+        "--catalog",
+        "docs/architecture/state_engine/proof-catalog/v2/catalog.json",
+        "symlink",
+        str(destination),
+        cwd=repository,
+    )
 
     assert result.returncode == 1
     assert "destination already exists" in result.stderr
@@ -2373,7 +2580,11 @@ def test_init_full_cleans_staged_directory_after_write_failure(
     monkeypatch.setattr(Path, "write_text", fail_evidence_write)
 
     with pytest.raises(OSError, match="injected template write failure"):
-        initialize_full("write-failure", destination)
+        initialize_full(
+            "write-failure",
+            destination,
+            Path("docs/architecture/state_engine/proof-catalog/v2/catalog.json"),
+        )
 
     assert not destination.exists()
     assert list(destination.parent.glob(".write-failure.tmp-*")) == []

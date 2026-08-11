@@ -24,6 +24,10 @@ A historical rerun reconstructs a named baseline and executes recorded command
 vectors in a fresh worktree. It writes a new rerun directory and divergence
 report; it never overwrites the original assessment.
 
+Catalog and assessment versions are exact pairs. Historical v1 uses assessment
+schema 1; frozen v2 uses schema 2; candidate v3 uses schema 3. A validator never
+guesses a schema from record shape or silently falls back to a current catalog.
+
 ## Assessment sequence
 
 1. Fix the code baseline and capture the complete worktree identity.

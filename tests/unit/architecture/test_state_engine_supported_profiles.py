@@ -4,7 +4,8 @@ import json
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
+CURRENT_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
+V3_CANDIDATE_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 ADR_041_PATH = REPOSITORY_ROOT / "docs/architecture/adr/041-state-engine-supported-profiles.md"
 ADR_030_PATH = REPOSITORY_ROOT / "docs/architecture/adr/030-multi-worker-deployment-shape.md"
 ADR_INDEX_PATH = REPOSITORY_ROOT / "docs/architecture/adr/README.md"
@@ -17,9 +18,9 @@ def _normalized_text(path: Path) -> str:
 
 def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() -> None:
     assert ADR_041_PATH.is_file(), "ADR-041 must define the supported state-engine profiles"
-    assert CATALOG_PATH.is_file(), "the v2 proof catalog must pin the supported profiles"
+    assert CURRENT_CATALOG_PATH.is_file(), "the maintained-current v2 proof catalog must pin the supported profiles"
 
-    catalog = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    catalog = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
     assert catalog["catalog_id"] == "elspeth-state-engine-v2"
 
     execution_profiles = catalog["execution_profiles"]
@@ -83,3 +84,17 @@ def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() ->
 
     adr_index = ADR_INDEX_PATH.read_text(encoding="utf-8")
     assert "[041](041-state-engine-supported-profiles.md)" in adr_index
+
+
+def test_v3_candidate_preserves_supported_profiles_for_task12_pointer_switch() -> None:
+    current = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
+    candidate = json.loads(V3_CANDIDATE_CATALOG_PATH.read_text(encoding="utf-8"))
+
+    assert current["catalog_id"] == "elspeth-state-engine-v2"
+    assert candidate["catalog_id"] == "elspeth-state-engine-v3"
+    assert candidate["schema_version"] == 2
+    assert candidate["execution_profiles"] == current["execution_profiles"]
+    assert {profile["id"] for profile in candidate["execution_profiles"]["state_store"]} == {
+        "sqlite-wal",
+        "postgresql-16",
+    }

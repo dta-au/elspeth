@@ -14,6 +14,12 @@ The [v1 catalog](v1/catalog.json) is immutable historical evidence. Its 68-leg
 identity and bytes remain available for strict reruns of v1 assessments; new
 assessments must use v2.
 
+The [v3 candidate](v3/README.md) defines catalog schema 2 and assessment
+schema 3 for the next full publication. It replaces shared applicability
+profiles with an explicit policy for every case/profile/dimension cell and
+adds PB-09 variant identities. It is validated now, but it is not the current
+pointer until Task 12 publishes the first full v3 assessment.
+
 ## Catalog rules
 
 - Leg IDs are literal and ordered; range expressions are explanatory only.
@@ -49,6 +55,9 @@ assessments must use v2.
 - `maintenance` is always required.
 - Every hard gate declares the dimensions from which its status, affected legs,
   and evidence support are mechanically derived.
+- Catalog/assessment versions are dispatched as exact pairs: v1/1 is
+  historical, v2 schema 1 uses assessment schema 2, and v3 schema 2 uses
+  assessment schema 3. Other combinations are invalid.
 
 ## Assessment overlay
 

@@ -27,6 +27,7 @@ from .common import (
     PLACEHOLDER_PATTERN,
     SHA256_PATTERN,
     VERDICTS,
+    _assessment_schema_version,
     _dict,
     _expected_leg_ids,
     _fail,
@@ -74,7 +75,6 @@ PYTEST_FLAGS = {
     "--disable-warnings",
 }
 COMPLETION_MARKER_NAME = ".state-engine-assessment.ready"
-COMPLETION_MARKER_CONTENT = b"state-engine-assessment-package-v2\n"
 
 
 def _initial_derived(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -91,8 +91,14 @@ def _initial_derived(catalog: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def initialize_full(assessment_id: str, output_directory: Path) -> Path:
+def initialize_full(assessment_id: str, output_directory: Path, catalog_argument: Path) -> Path:
     root = _git_root(output_directory)
+    _require(not catalog_argument.is_absolute(), "--catalog must be repository-relative")
+    catalog_path = _repository_path(root, catalog_argument.as_posix(), "--catalog")
+    _require(catalog_path.is_file(), f"catalog file does not exist: {catalog_path}")
+    catalog = load_unique_json(catalog_path)
+    validate_catalog(catalog, catalog_path)
+    assessment_schema_version = _assessment_schema_version(catalog["catalog_id"])
     requested_parent = Path(os.path.abspath(output_directory.parent))
     _require(requested_parent.is_relative_to(root), "assessment destination must be inside the repository")
     parent = root
@@ -112,12 +118,9 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
         pass
     else:
         _fail(f"assessment destination already exists: {destination}")
-    catalog_path = root / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
-    catalog = load_unique_json(catalog_path)
-    validate_catalog(catalog, catalog_path)
     relative_directory = destination.relative_to(root).as_posix()
     document = {
-        "schema_version": 2,
+        "schema_version": assessment_schema_version,
         "assessment_id": assessment_id,
         "mode": "full",
         "parent_assessment": None,
@@ -205,7 +208,7 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
                 dir_fd=destination_fd,
             )
             try:
-                os.write(marker_fd, COMPLETION_MARKER_CONTENT)
+                os.write(marker_fd, f"state-engine-assessment-package-v{assessment_schema_version}\n".encode())
                 os.fsync(marker_fd)
             finally:
                 os.close(marker_fd)
@@ -225,11 +228,12 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
     return destination / "assessment.json"
 
 
-def _validate_completion_marker(assessment_path: Path) -> None:
+def _validate_completion_marker(assessment_path: Path, assessment_schema_version: int) -> None:
     marker = assessment_path.parent / COMPLETION_MARKER_NAME
     _require(marker.is_file(), f"assessment package completion marker is missing: {marker}")
     _require(not marker.is_symlink(), f"assessment package completion marker cannot be a symlink: {marker}")
-    _require(marker.read_bytes() == COMPLETION_MARKER_CONTENT, f"assessment package completion marker is invalid: {marker}")
+    expected = f"state-engine-assessment-package-v{assessment_schema_version}\n".encode()
+    _require(marker.read_bytes() == expected, f"assessment package completion marker is invalid: {marker}")
 
 
 def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
@@ -1030,14 +1034,7 @@ def validate_evidence_artifacts(assessment_path: Path) -> int:
     catalog_path = _repository_path(root, catalog_record.get("path"), "catalog.path")
     catalog = load_unique_json(catalog_path)
     validate_catalog(catalog, catalog_path)
-    if catalog.get("catalog_id") == "elspeth-state-engine-v2":
-        _validate_v2_assessment_schema(assessment)
-        _validate_completion_marker(assessment_path)
-    else:
-        _require(
-            type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
-            "historical assessment schema_version must be integer 1",
-        )
+    _validate_assessment_schema(assessment, catalog, assessment_path)
     _validate_baseline(assessment, root)
     _validate_environment(assessment)
     evidence_by_id, _coverage, _promotable = _validate_evidence(assessment, catalog, root)
@@ -1076,10 +1073,14 @@ def _validate_placeholders(assessment_path: Path, root: Path) -> None:
     _require(not findings, "unresolved placeholder found:\n" + "\n".join(findings))
 
 
-def _validate_v2_assessment_schema(assessment: dict[str, Any]) -> None:
+def _validate_versioned_assessment_schema(
+    assessment: dict[str, Any],
+    catalog_id: str,
+    expected_schema_version: int,
+) -> None:
     _require(
-        type(assessment.get("schema_version")) is int and assessment["schema_version"] == 2,
-        "assessment schema_version must be integer 2",
+        type(assessment.get("schema_version")) is int and assessment["schema_version"] == expected_schema_version,
+        f"unsupported assessment version pair (schema_version): {catalog_id}/schema-{assessment.get('schema_version')}",
     )
     _require(set(assessment) == V2_ASSESSMENT_TOP_LEVEL_KEYS, "assessment top-level schema has unexpected fields")
     assessment_id = _string(assessment.get("assessment_id"), "assessment_id")
@@ -1103,6 +1104,23 @@ def _validate_v2_assessment_schema(assessment: dict[str, Any]) -> None:
             set(leg) == {"id", "derived_verdict", "default_status", "reason", "owner_issue", "exit_gate", "overrides"},
             f"assessment leg {index} has unexpected fields",
         )
+
+
+def _validate_assessment_schema(
+    assessment: dict[str, Any],
+    catalog: dict[str, Any],
+    assessment_path: Path,
+) -> None:
+    catalog_id = _string(catalog.get("catalog_id"), "catalog_id")
+    expected = _assessment_schema_version(catalog_id)
+    if expected == 1:
+        _require(
+            type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
+            f"unsupported assessment version pair (schema_version): {catalog_id}/schema-{assessment.get('schema_version')}",
+        )
+        return
+    _validate_versioned_assessment_schema(assessment, catalog_id, expected)
+    _validate_completion_marker(assessment_path, expected)
     derived = _dict(assessment.get("derived"), "derived")
     _require(
         set(derived) == {"family_counts", "total", "overall_verdict", "reason"},
@@ -1220,14 +1238,7 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     catalog_path = _repository_path(root, catalog_record.get("path"), "catalog.path")
     catalog = load_unique_json(catalog_path)
     validate_catalog(catalog, catalog_path)
-    if catalog.get("catalog_id") == "elspeth-state-engine-v2":
-        _validate_v2_assessment_schema(assessment)
-        _validate_completion_marker(assessment_path)
-    else:
-        _require(
-            type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
-            "historical assessment schema_version must be integer 1",
-        )
+    _validate_assessment_schema(assessment, catalog, assessment_path)
     expected_ids = _expected_leg_ids(catalog["catalog_id"])
     _require(catalog_record.get("catalog_id") == catalog["catalog_id"], "assessment catalog_id mismatch")
     _require(catalog_record.get("schema_version") == catalog["schema_version"], "assessment catalog schema mismatch")

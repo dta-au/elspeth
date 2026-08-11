@@ -27,8 +27,13 @@ Use local Canberra time in `YYYY-MM-DD-HHMM` form:
 STATE_ASSESSMENT_ID="$(TZ=Australia/Canberra date '+%Y-%m-%d-%H%M')"
 STATE_ASSESSMENT_DIR="docs/architecture/state_engine/assessments/${STATE_ASSESSMENT_ID}"
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
-  init-full "${STATE_ASSESSMENT_ID}" "${STATE_ASSESSMENT_DIR}"
+  init-full --catalog docs/architecture/state_engine/proof-catalog/v2/catalog.json \
+  "${STATE_ASSESSMENT_ID}" "${STATE_ASSESSMENT_DIR}"
 ```
+
+`--catalog` is mandatory and repository-relative. There is deliberately no
+implicit current-catalog fallback. Keep v2 in this command until the first
+full v3 publication switches the maintained pointers atomically.
 
 The initializer creates a fully materialized 73-leg v2 manifest plus readable
 README, evidence, and review templates. It refuses any pre-existing destination

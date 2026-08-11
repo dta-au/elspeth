@@ -103,6 +103,16 @@ APPLICABILITY_PROFILE_IDS = {
         "postgresql-aws-only-v2",
     },
 }
+CATALOG_SCHEMA_BY_ID = {
+    "elspeth-state-engine-v1": 1,
+    "elspeth-state-engine-v2": 1,
+    "elspeth-state-engine-v3": 2,
+}
+ASSESSMENT_SCHEMA_BY_CATALOG_ID = {
+    "elspeth-state-engine-v1": 1,
+    "elspeth-state-engine-v2": 2,
+    "elspeth-state-engine-v3": 3,
+}
 PLACEHOLDER_PATTERN = re.compile(r"TBD|TODO|FIXME|<timestamp>|<full SHA>")
 CANONICAL_V2_LEGS_SHA256 = "ab579d510d9ed1e0becec9b290de2d598725b25e41d43ac4fe0427be6bf8ff01"
 CANONICAL_V2_ACCEPTANCE_SHA256 = "f56bd4d8bb68b1bc4bc95f718a426bdc5e22d71d12198307337d41c905e29e93"
@@ -125,6 +135,7 @@ CANONICAL_V2_TOP_LEVEL_KEYS = {
     "required_leg_ids",
     "legs",
 }
+CANONICAL_V3_TOP_LEVEL_KEYS = CANONICAL_V2_TOP_LEVEL_KEYS - {"applicability_profiles"}
 
 
 class ContractError(ValueError):
@@ -215,15 +226,32 @@ def _repository_path(root: Path, value: Any, context: str) -> Path:
 
 def _expected_leg_ids(catalog_id: Any) -> list[str]:
     _require(
-        catalog_id in {"elspeth-state-engine-v1", "elspeth-state-engine-v2"},
+        catalog_id in CATALOG_SCHEMA_BY_ID,
         f"unsupported catalog_id: {catalog_id}",
     )
-    v2 = catalog_id == "elspeth-state-engine-v2"
+    expanded = catalog_id in {"elspeth-state-engine-v2", "elspeth-state-engine-v3"}
     return (
-        [f"TS-{number:02d}" for number in range(20 if v2 else 19)]
+        [f"TS-{number:02d}" for number in range(20 if expanded else 19)]
         + [f"AUX-{number:02d}" for number in range(1, 8)]
         + [f"RC-{number:02d}" for number in range(1, 8)]
-        + [f"PB-{number:02d}" for number in range(1, 12 if v2 else 10)]
-        + [f"RM-{number:02d}" for number in range(1, 15 if v2 else 14)]
-        + [f"F-{number:02d}" for number in range(1, 15 if v2 else 14)]
+        + [f"PB-{number:02d}" for number in range(1, 12 if expanded else 10)]
+        + [f"RM-{number:02d}" for number in range(1, 15 if expanded else 14)]
+        + [f"F-{number:02d}" for number in range(1, 15 if expanded else 14)]
     )
+
+
+def _catalog_version(catalog: dict[str, Any]) -> tuple[str, int]:
+    catalog_id = _string(catalog.get("catalog_id"), "catalog_id")
+    schema_version = catalog.get("schema_version")
+    expected = CATALOG_SCHEMA_BY_ID.get(catalog_id)
+    _require(
+        type(schema_version) is int and expected == schema_version,
+        f"unsupported catalog version pair: {catalog_id}/schema-{schema_version}",
+    )
+    return catalog_id, cast(int, schema_version)
+
+
+def _assessment_schema_version(catalog_id: str) -> int:
+    version = ASSESSMENT_SCHEMA_BY_CATALOG_ID.get(catalog_id)
+    _require(version is not None, f"unsupported catalog_id: {catalog_id}")
+    return cast(int, version)

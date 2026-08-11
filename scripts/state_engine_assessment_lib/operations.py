@@ -84,6 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     validate_catalog_parser = subparsers.add_parser("validate-catalog")
     validate_catalog_parser.add_argument("catalog", type=Path)
     init_parser = subparsers.add_parser("init-full")
+    init_parser.add_argument("--catalog", required=True, type=Path)
     init_parser.add_argument("assessment_id")
     init_parser.add_argument("output_directory", type=Path)
     validate_package_parser = subparsers.add_parser("validate-package")
@@ -102,7 +103,7 @@ def main(argv: list[str] | None = None) -> int:
             validate_catalog(load_unique_json(catalog_path), catalog_path)
             print(f"state-engine catalog: valid ({catalog_path})")
         elif arguments.command == "init-full":
-            output = initialize_full(arguments.assessment_id, arguments.output_directory)
+            output = initialize_full(arguments.assessment_id, arguments.output_directory, arguments.catalog)
             print(f"state-engine assessment initialized: {output}")
         elif arguments.command == "validate-package":
             leg_count, verdict = validate_package(arguments.assessment)
