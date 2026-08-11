@@ -141,6 +141,20 @@ describe("useHashRouter Phase 3B fragment migration", () => {
     expect(window.location.hash).toBe("#/sess-1");
   });
 
+  it("treats the Composer skip target as non-routing and preserves the active session", () => {
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+    } as never);
+    window.history.replaceState(null, "", "#/sess-1");
+    renderHook(() => useHashRouter());
+
+    window.history.replaceState(null, "", "#composer-main");
+    act(() => window.dispatchEvent(new HashChangeEvent("hashchange")));
+
+    expect(window.location.hash).toBe("#composer-main");
+    expect(useSessionStore.getState().activeSessionId).toBe("sess-1");
+  });
+
   it("defers cold-load graph actions until enabled", async () => {
     const handler = vi.fn();
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);

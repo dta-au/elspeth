@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
 import * as api from "./api/client";
@@ -405,6 +412,46 @@ describe("App banner roles", () => {
     });
   });
 
+  it("moves skip-link focus to the stable main workspace without changing session routing", async () => {
+    const user = userEvent.setup();
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(<App />);
+    await waitFor(() => expect(window.location.hash).toBe("#/session-1"));
+
+    const main = screen.getByRole("main");
+    expect(main).toHaveAttribute("id", "composer-main");
+    expect(main).toHaveAttribute("tabindex", "-1");
+
+    const skipLink = screen.getByRole("link", { name: "Skip to main content" });
+    expect(skipLink).toHaveAttribute("href", "#composer-main");
+    await user.click(skipLink);
+
+    expect(main).toHaveFocus();
+    expect(window.location.hash).toBe("#/session-1");
+    expect(useSessionStore.getState().activeSessionId).toBe("session-1");
+  });
+
+  it.each([
+    ["busy", { guidedChatPending: true, error: null }],
+    ["error", { guidedChatPending: false, error: "authoring failed" }],
+  ] as const)(
+    "renders the real App-owned collapsed status projection with %s tone",
+    async (tone, state) => {
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        ...state,
+      });
+      render(<App />);
+      await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+      const projection = within(
+        screen.getByTestId("collapsed-authoring-status"),
+      ).getByText(tone === "busy" ? "Authoring in progress" : /Authoring error:/);
+      expect(projection).toHaveAttribute("data-tone", tone);
+      expect(projection).toHaveClass("workspace-collapsed-status");
+    },
+  );
+
   it("keeps the common workspace during active guided work but exposes status controls only", async () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
@@ -532,6 +579,75 @@ describe("App banner roles", () => {
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("dialog", { name: "Plugin Catalog" })).toBeInTheDocument();
     window.removeEventListener("open-catalog", onOpenCatalog);
+  });
+
+  it("blocks ambient and shortcut catalog requests during active guided work", async () => {
+    const onOpenCatalog = vi.fn();
+    window.addEventListener("open-catalog", onOpenCatalog);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      guidedSession: {
+        step: "step_3_transforms",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      } as unknown as import("./types/guided").GuidedSession,
+      guidedNextTurn: null,
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
+    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+
+    fireEvent.keyDown(document, {
+      key: "P",
+      code: "KeyP",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    expect(onOpenCatalog).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+    window.removeEventListener("open-catalog", onOpenCatalog);
+  });
+
+  it("closes the Catalog drawer when active guided work revokes the capability", async () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+
+    act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
+    expect(
+      screen.getByRole("dialog", { name: "Plugin Catalog" }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({
+        guidedSession: {
+          step: "step_3_transforms",
+          history: [],
+          terminal: null,
+          chat_history: [],
+          chat_turn_seq: 0,
+          profile: null,
+        } as unknown as import("./types/guided").GuidedSession,
+        guidedNextTurn: null,
+      });
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Plugin Catalog" }),
+      ).toBeNull(),
+    );
+    expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
+      completion: false,
+      importYaml: false,
+      catalog: false,
+    });
   });
 
   it("routes Graph and YAML shortcuts to the active session's persistent artifact tabs", async () => {

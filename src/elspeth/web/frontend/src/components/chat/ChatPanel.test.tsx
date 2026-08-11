@@ -48,6 +48,15 @@ vi.mock("@/hooks/useComposer", () => ({
   useComposer: vi.fn(),
 }));
 
+const inlineRunResultsMountSpy = vi.hoisted(() => vi.fn());
+
+vi.mock("@/components/execution/InlineRunResults", () => ({
+  InlineRunResults: () => {
+    inlineRunResultsMountSpy();
+    return <div data-testid="inline-run-results" />;
+  },
+}));
+
 // Spy-style mock of the blob-fetch surface so the inline-source-projection
 // effect can be driven from the test. The actual module is preserved
 // (`...actual`) so we don't accidentally stub other exports the file uses.
@@ -283,6 +292,16 @@ describe("ChatPanel", () => {
     });
   });
 
+  it("observes the InlineRunResults sentinel when the retired owner is imported", async () => {
+    const { InlineRunResults } = await import(
+      "@/components/execution/InlineRunResults"
+    );
+    render(<InlineRunResults />);
+
+    expect(inlineRunResultsMountSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("inline-run-results")).toBeInTheDocument();
+  });
+
   it("does not mount run results in the freeform authoring pane", () => {
     useSessionStore.setState({
       activeSessionId: "session-1",
@@ -292,6 +311,7 @@ describe("ChatPanel", () => {
     render(<ChatPanel />);
 
     expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("passes backend composer progress to the composing indicator", () => {
@@ -1783,6 +1803,7 @@ describe("ChatPanel mode discriminator", () => {
     // only; per-step placeholder + onSend wiring are exercised below.
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
     expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("shows the composer model chip in the GUIDED chat header too (elspeth-e9f7678de8)", async () => {
@@ -4553,6 +4574,7 @@ assistant_message_kind: "synthetic_failure",
     // Freeform surface suppressed.
     expect(screen.queryByTestId("chat-input")).not.toBeInTheDocument();
     expect(screen.queryByTestId("inline-run-results")).toBeNull();
+    expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
   it("renders pending interpretation Accept cards on the completed surface", () => {

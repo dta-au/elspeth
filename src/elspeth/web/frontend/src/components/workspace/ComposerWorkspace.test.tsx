@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import {
   act,
   fireEvent,
@@ -394,6 +397,22 @@ describe("ComposerWorkspace", () => {
     );
     expect(screen.getByRole("status")).toHaveTextContent(
       "Authoring pane collapsed",
+    );
+  });
+
+  it("maps App-owned ReactNode tones onto the collapsed affordance border", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toContain(
+      '.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {\n' +
+        "  border-color: var(--color-warning, currentcolor);\n}",
+    );
+    expect(css).toContain(
+      '.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) {\n' +
+        "  border-color: var(--color-error, currentcolor);\n}",
     );
   });
 

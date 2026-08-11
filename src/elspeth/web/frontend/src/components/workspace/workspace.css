@@ -167,7 +167,15 @@
   border-color: var(--color-warning, currentcolor);
 }
 
+.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {
+  border-color: var(--color-warning, currentcolor);
+}
+
 .workspace-collapsed-affordance[data-tone="error"] {
+  border-color: var(--color-error, currentcolor);
+}
+
+.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) {
   border-color: var(--color-error, currentcolor);
 }
 

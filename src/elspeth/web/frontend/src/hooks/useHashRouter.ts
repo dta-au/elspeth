@@ -7,6 +7,7 @@
  *         #/{sessionId}/yaml            -> select YAML artifact, then rewrite
  *         #/{sessionId}/runs            -> select Run artifact, then rewrite
  *         #/{sessionId}/{anything-else} -> silently strip the verb
+ *         #composer-main                -> IGNORED — owned by App's skip link
  *         #/shared/{token}              -> IGNORED — owned by useSharedToken
  *                                          (Phase 6B Task 8); the hook below
  *                                          short-circuits without touching the
@@ -53,6 +54,7 @@ const RETIRED_VERBS: Record<string, string> = {};
 const TOAST_DISMISSED_KEY = "elspeth_redirect_toast_dismissed";
 
 const SHARED_HASH_PREFIX = "#/shared/";
+const COMPOSER_MAIN_HASH = "#composer-main";
 
 /** True when the current hash is a Phase 6B shared-inspect route. The
  *  session router short-circuits on this so SharedInspectView keeps
@@ -61,9 +63,13 @@ function _isSharedRoute(hash: string): boolean {
   return hash.startsWith(SHARED_HASH_PREFIX);
 }
 
+function _isNonRoutingHash(hash: string): boolean {
+  return hash === COMPOSER_MAIN_HASH || _isSharedRoute(hash);
+}
+
 function parseHash(): HashState {
   const hash = window.location.hash;
-  if (_isSharedRoute(hash)) return { sessionId: null, verb: null };
+  if (_isNonRoutingHash(hash)) return { sessionId: null, verb: null };
   const match = hash.match(/^#\/([^/]+?)(?:\/([a-z]+))?$/);
   if (!match) return { sessionId: null, verb: null };
   return { sessionId: match[1], verb: match[2] ?? null };
@@ -166,12 +172,10 @@ export function useHashRouter(
   );
 
   const applyHash = useCallback((state: HashState) => {
-    // Phase 6B Task 8: when the live hash is a shared-inspect route the
-    // session router is dormant — SharedInspectView owns the URL. Apply
-    // is a no-op in that mode so the hash is preserved verbatim and the
-    // active session is not mutated by the (deliberately empty) parsed
-    // state we'd otherwise act on.
-    if (_isSharedRoute(window.location.hash)) {
+    // Shared inspection and the App-owned skip target are non-routing hashes.
+    // Their owners keep control of navigation/focus, so applying either is a
+    // no-op and cannot unbind the active Composer session.
+    if (_isNonRoutingHash(window.location.hash)) {
       return;
     }
     applying.current = true;
@@ -229,6 +233,7 @@ export function useHashRouter(
 
   useEffect(() => {
     if (!enabled) return;
+    if (_isNonRoutingHash(window.location.hash)) return;
     const initial = parseHash();
     if (initial.sessionId) {
       lastWrittenHash.current = window.location.hash;
@@ -276,12 +281,11 @@ export function useHashRouter(
     const unsub = useSessionStore.subscribe((state, prevState) => {
       if (applying.current) return;
       if (state.activeSessionId === prevState.activeSessionId) return;
-      // Phase 6B Task 8: do not mutate the URL while a shared-inspect
-      // route is live — SharedInspectView owns the hash. The session
-      // store may legitimately change activeSessionId via background
-      // bootstrap while a reviewer is on the shared route; the change
-      // is irrelevant to the rendered view and must not strip the token.
-      if (_isSharedRoute(window.location.hash)) return;
+      // Non-routing hashes remain owned by their view/focus surface. The
+      // session store may legitimately change activeSessionId via background
+      // bootstrap while one is live; that must not strip the shared token or
+      // reinterpret the skip target as session navigation.
+      if (_isNonRoutingHash(window.location.hash)) return;
 
       const hash = buildCanonicalHash(state.activeSessionId);
       if (hash === lastWrittenHash.current) return;

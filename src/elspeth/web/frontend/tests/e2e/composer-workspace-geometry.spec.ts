@@ -135,4 +135,66 @@ test.describe("Composer workspace integration geometry", () => {
       }
     });
   }
+
+  test("skip link preserves a collapsed narrow Pipeline workspace and active session", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 900, height: 720 });
+    await page.addInitScript(() => {
+      window.localStorage.setItem(
+        "elspeth_composer_workspace_layout_v1",
+        JSON.stringify({
+          version: 1,
+          preferredAuthoringWidth: 420,
+          authoringCollapsed: true,
+        }),
+      );
+    });
+    const token = tokenFromStorageState(await page.context().storageState());
+    const ctx = await authedContext(token);
+    let sessionId: string | undefined;
+    try {
+      const session = await createSession(ctx, "workspace skip target");
+      sessionId = session.id;
+      await seedPopulatedComposition(ctx, sessionId);
+      await page.goto(`/#/${sessionId}`);
+
+      const workspace = page.getByTestId("composer-workspace");
+      await expect(workspace).toHaveAttribute("data-layout-mode", "narrow");
+      await expect(workspace).toHaveAttribute(
+        "data-authoring-collapsed",
+        "true",
+      );
+      const pipelineView = page.getByRole("tab", { name: "Pipeline" });
+      await pipelineView.click();
+      await expect(pipelineView).toHaveAttribute("aria-selected", "true");
+      await expect(
+        page.getByRole("region", { name: "Authoring pane" }),
+      ).toBeHidden();
+
+      const sessionSwitcher = page.getByRole("button", {
+        name: "Session switcher: workspace skip target",
+      });
+      await expect(sessionSwitcher).toBeVisible();
+      const skipLink = page.getByRole("link", { name: "Skip to main content" });
+      await skipLink.focus();
+      await skipLink.press("Enter");
+
+      const main = page.locator("#composer-main");
+      await expect(main).toBeVisible();
+      await expect(main).not.toHaveAttribute("hidden", "");
+      await expect(main).not.toHaveAttribute("inert", "");
+      await expect(main).toBeFocused();
+      await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
+      await expect(sessionSwitcher).toBeVisible();
+      await expect(pipelineView).toHaveAttribute("aria-selected", "true");
+      await expect(workspace).toHaveAttribute(
+        "data-authoring-collapsed",
+        "true",
+      );
+    } finally {
+      if (sessionId !== undefined) await deleteSession(ctx, sessionId);
+      await ctx.dispose();
+    }
+  });
 });

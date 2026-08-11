@@ -1,4 +1,11 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useMemo,
+  useRef,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
 import "./styles/index.css";
 import * as api from "./api/client";
 import {
@@ -204,23 +211,29 @@ function App() {
     !showTutorial &&
     !showEmptyLanding &&
     !guidedBuildActive;
+  const catalogAvailable = !guidedBuildActive;
   const workspaceActionCapabilities = useMemo(
     () => ({
       completion: runAdmissionAvailable,
       importYaml: !guidedBuildActive,
-      catalog: !guidedBuildActive,
+      catalog: catalogAvailable,
     }),
-    [guidedBuildActive, runAdmissionAvailable],
+    [catalogAvailable, guidedBuildActive, runAdmissionAvailable],
   );
 
   useEffect(() => {
+    if (!catalogAvailable) {
+      setCatalogOpen(false);
+      return;
+    }
+
     function handleOpenCatalog() {
       setCatalogOpen(true);
     }
 
     window.addEventListener(OPEN_CATALOG_EVENT, handleOpenCatalog);
     return () => window.removeEventListener(OPEN_CATALOG_EVENT, handleOpenCatalog);
-  }, []);
+  }, [catalogAvailable]);
 
   // Phase 1B + I5: load account-level composer preferences once authenticated.
   // bootstrapPrefs() is contracted to NEVER reject — it catches failures
@@ -237,6 +250,13 @@ function App() {
   const openSecrets = useCallback(() => setShowSecrets(true), []);
   const closeSecrets = useCallback(() => setShowSecrets(false), []);
   const closePalette = useCallback(() => setShowPalette(false), []);
+  const focusMainContent = useCallback(
+    (event: ReactMouseEvent<HTMLAnchorElement>) => {
+      event.preventDefault();
+      document.getElementById("composer-main")?.focus({ preventScroll: true });
+    },
+    [],
+  );
   const confirmFanoutExecution = useCallback(async () => {
     await useExecutionStore.getState().confirmFanoutExecution();
   }, []);
@@ -349,7 +369,9 @@ function App() {
         (e.ctrlKey || e.metaKey)
       ) {
         e.preventDefault();
-        window.dispatchEvent(new CustomEvent(OPEN_CATALOG_EVENT));
+        if (catalogAvailable) {
+          window.dispatchEvent(new CustomEvent(OPEN_CATALOG_EVENT));
+        }
         return;
       }
 
@@ -461,7 +483,13 @@ function App() {
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [createSession, activeSessionId, compositionState, runAdmissionAvailable]);
+  }, [
+    activeSessionId,
+    catalogAvailable,
+    compositionState,
+    createSession,
+    runAdmissionAvailable,
+  ]);
 
   // Initial health check and periodic polling
   useEffect(() => {
@@ -510,7 +538,11 @@ function App() {
   return (
     <AuthGuard>
       <div className="app-root">
-        <a href="#chat-main" className="skip-to-content">
+        <a
+          href="#composer-main"
+          className="skip-to-content"
+          onClick={focusMainContent}
+        >
           Skip to main content
         </a>
         <h1 className="sr-only">ELSPETH Pipeline Composer</h1>
@@ -619,15 +651,22 @@ function App() {
           onSignOut={logout}
         />
         {showTutorial ? (
-          <HelloWorldTutorial
-            key={tutorialResetEpoch}
-            composerAvailable={systemStatus?.composer_available ?? false}
-            composerUnavailableReason={systemStatus?.composer_reason ?? null}
-            tutorialReady={systemStatus?.tutorial_ready ?? false}
-            tutorialUnavailableReason={systemStatus?.tutorial_reason ?? null}
-          />
+          <div id="composer-main" className="app-main" tabIndex={-1}>
+            <HelloWorldTutorial
+              key={tutorialResetEpoch}
+              composerAvailable={systemStatus?.composer_available ?? false}
+              composerUnavailableReason={systemStatus?.composer_reason ?? null}
+              tutorialReady={systemStatus?.tutorial_ready ?? false}
+              tutorialUnavailableReason={systemStatus?.tutorial_reason ?? null}
+            />
+          </div>
         ) : showEmptyLanding ? (
-          <div className="app-main" role="main">
+          <div
+            id="composer-main"
+            className="app-main"
+            role="main"
+            tabIndex={-1}
+          >
             <section
               className="empty-landing"
               aria-labelledby="empty-landing-title"
@@ -656,7 +695,12 @@ function App() {
             </section>
           </div>
         ) : (
-          <div className="app-main" role="main">
+          <div
+            id="composer-main"
+            className="app-main"
+            role="main"
+            tabIndex={-1}
+          >
             <ComposerWorkspace
               authoring={<ChatPanel onOpenSecrets={openSecrets} />}
               authoringStatus={<DefaultModeChangedBanner />}
