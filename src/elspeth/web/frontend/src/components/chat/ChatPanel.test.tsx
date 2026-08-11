@@ -3215,14 +3215,15 @@ describe("ChatPanel mode discriminator", () => {
     // frame would strand the completion content off-screen.
     const chatMain = container.querySelector("#chat-main");
     expect(chatMain?.classList.contains("chat-panel--completed")).toBe(true);
-    // Stepper (all steps done → "Ready") + the completion summary render.
+    // Stepper (all steps done → "Ready") + the completion outcome render.
     expect(
       screen.getByRole("list", { name: /guided workflow/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Export YAML" }),
+      screen.getByRole("heading", { name: "Pipeline updated" }),
     ).toBeInTheDocument();
-    expect(screen.getByTestId("pipeline-validation-summary")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Export YAML" })).toBeNull();
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
     // Tutorial completion suppresses the freeform handoff (concern B).
     expect(
       screen.queryByRole("button", { name: "Open freeform editor" }),
@@ -4465,16 +4466,17 @@ assistant_message_kind: "synthetic_failure",
 
     const { container } = render(<ChatPanel />);
 
-    // CompletionSummary renders task-oriented terminal actions.
+    // CompletionSummary keeps only the async mode transition. Artifacts,
+    // validation, and run history stay owned by the common workspace.
     expect(
       screen.getByRole("button", { name: "Open freeform editor" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Export YAML" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Export YAML" }),
+    ).toBeNull();
     expect(
-      screen.getByRole("button", { name: "Validate pipeline" }),
-    ).toBeInTheDocument();
+      screen.queryByRole("button", { name: "Validate pipeline" }),
+    ).toBeNull();
 
     // Container carries the per-branch CSS hook AND preserves the skip-link anchor.
     const chatMain = container.querySelector("#chat-main");
@@ -4551,7 +4553,7 @@ assistant_message_kind: "synthetic_failure",
     expect(screen.getByTestId("acknowledgement-card")).toBeInTheDocument();
   });
 
-  it("tutorial completed: renders validation feedback on the reset tutorial shell", () => {
+  it("tutorial completed: leaves validation to the common inspector", () => {
     const terminal: TerminalState = {
       kind: "completed",
       reason: null,
@@ -4585,12 +4587,8 @@ assistant_message_kind: "synthetic_failure",
 
     render(<ChatPanel isTutorial />);
 
-    expect(screen.getByTestId("pipeline-validation-summary")).toBeInTheDocument();
-    // Multiple role="status" elements exist on the completed surface (the
-    // validation summary plus the always-mounted acknowledgement live
-    // region) — assert the validation one specifically.
-    const statuses = screen.getAllByRole("status");
-    expect(statuses.some((el) => /looks good/i.test(el.textContent ?? ""))).toBe(true);
+    expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
+    expect(screen.queryByText(/looks good/i)).toBeNull();
   });
 
   it("does not render ExitToFreeformButton on the completed surface (regression pin for elspeth-obs-0a1002de6d)", () => {

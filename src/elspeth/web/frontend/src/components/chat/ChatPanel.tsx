@@ -45,7 +45,6 @@ import { GuidedDecisionPendingIndicator } from "./guided/GuidedDecisionPendingIn
 import { GuidedTurn } from "./guided/GuidedTurn";
 import { isGuidedBuildActive } from "./guided/guidedBuildActive";
 import { latestAssistantRationale } from "./guided/guidedRationale";
-import { PipelineValidationSummary } from "./guided/PipelineValidationSummary";
 import { clientWireBlockerMessages, humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
 import {
   AcknowledgementLiveRegion,
@@ -2117,7 +2116,6 @@ export function ChatPanel({
             }
           }}
         />
-        {isTutorial && <PipelineValidationSummary isTutorial />}
         <CompletionSummary terminal={guidedSession.terminal} isTutorial={isTutorial} />
       </div>
     );

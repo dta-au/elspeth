@@ -16,7 +16,6 @@ import { useExecutionStore } from "./stores/executionStore";
 import { useAuthStore } from "./stores/authStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
   type RequestArtifactViewDetail,
@@ -236,9 +235,7 @@ vi.mock("./api/client", () => ({
   sendMessage: vi.fn(),
   recompose: vi.fn(),
   fetchMessages: vi.fn(),
-  // YamlView (inside ExportYamlModal) fetches the rendered YAML when the
-  // modal opens — reachable now that the Ctrl+Shift+Y test seeds a
-  // non-empty composition.
+  // YamlView fetches the rendered YAML when its persistent artifact tab opens.
   fetchYaml: vi.fn().mockResolvedValue({ yaml: "sources: {}" }),
   // refreshAll fans out to refreshInterpretationEventsForSession on session
   // select, so this is called incidentally during App render. Without the mock
@@ -658,10 +655,8 @@ describe("App banner roles", () => {
       );
     };
     const onOpenGraph = vi.fn();
-    const onOpenYaml = vi.fn();
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
     // Ctrl+Shift+Y is content-gated (elspeth-bff8043d33 residual): seed a
     // non-empty composition so the YAML dispatch fires.
     useSessionStore.setState({
@@ -695,10 +690,8 @@ describe("App banner roles", () => {
       { tab: "yaml", focusMode: false, sessionId: "session-1" },
     ]);
     expect(onOpenGraph).not.toHaveBeenCalled();
-    expect(onOpenYaml).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
   });
 
   it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {

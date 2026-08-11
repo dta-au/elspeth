@@ -5,23 +5,15 @@
 // Current guided completion projection.
 //
 //   - Props: { terminal: TerminalState } -- read-only consumer of the terminal.
-//   - Renders only when terminal.kind === "completed". The TerminalState
-//     discriminator guarantees completed terminals carry pipeline YAML.
-//   - Task-oriented actions expose the three next moves users expect after the
-//     wizard completes: open freeform editing, review generated YAML, or run
-//     validation.
-//   - useTheme() for Prism theme-awareness, matching YamlView.tsx:164.
+//   - Renders only when terminal.kind === "completed".
+//   - Keeps the readiness-derived outcome and the guided-to-freeform state
+//     transition. YAML, validation, and run history belong to the surrounding
+//     common workspace.
 //   - <button type="button"> (never <div onClick>).
-//   - CSS via components/chat/guided/guided.css guided-completion-* classes with design tokens.
+//   - CSS via components/chat/guided/guided.css guided-completion-* classes.
 //   - No auto-focus on mount.
 
-import { useId } from "react";
-import { Highlight, themes } from "prism-react-renderer";
 import { useSessionStore } from "@/stores/sessionStore";
-import { useExecutionStore } from "@/stores/executionStore";
-import { requestValidate } from "@/stores/subscriptions";
-import { useTheme } from "@/hooks/useTheme";
-import { OPEN_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import {
   COMPLETION_OUTCOME_LABELS,
   useCompletionOutcome,
@@ -44,7 +36,7 @@ export function CompletionSummary({ terminal, isTutorial }: CompletionSummaryPro
     return null;
   }
 
-  return <CompletionSummaryInner yaml={terminal.pipeline_yaml} isTutorial={isTutorial} />;
+  return <CompletionSummaryInner isTutorial={isTutorial} />;
 }
 
 // ── Inner component (separated so hooks run unconditionally) ──────────────────
@@ -54,19 +46,12 @@ export function CompletionSummary({ terminal, isTutorial }: CompletionSummaryPro
 // always-rendered branch; it can call hooks without violating the Rules of Hooks.
 
 interface CompletionSummaryInnerProps {
-  yaml: string;
   isTutorial?: boolean;
 }
 
-function CompletionSummaryInner({ yaml, isTutorial }: CompletionSummaryInnerProps) {
-  const reactId = useId();
-  const headingId = `${reactId}-heading`;
-  const preId = `${reactId}-pre`;
-
+function CompletionSummaryInner({ isTutorial }: CompletionSummaryInnerProps) {
   const exitToFreeform = useSessionStore((s) => s.exitToFreeform);
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
-  const compositionState = useSessionStore((s) => s.compositionState);
-  const isValidating = useExecutionStore((s) => s.isValidating);
   // Heading honesty (elspeth-bf9c296ee5): a guided completion always carries
   // a composed pipeline (pipelineMutated: true), so the heading ladders over
   // Review required / Pipeline ready / Pipeline updated from the same
@@ -74,88 +59,27 @@ function CompletionSummaryInner({ yaml, isTutorial }: CompletionSummaryInnerProp
   // acknowledgement stack above still blocks execution or before the backend
   // has admitted the pipeline.
   const completionOutcome = useCompletionOutcome(activeSessionId, true);
-  const { resolvedTheme } = useTheme();
-
-  // Match the theme-awareness pattern from YamlView.tsx:164.
-  const highlightTheme =
-    resolvedTheme === "dark" ? themes.vsDark : themes.vsLight;
 
   function handleExit(): void {
     void exitToFreeform();
   }
 
-  function handleReviewYaml(): void {
-    window.dispatchEvent(new CustomEvent(OPEN_YAML_MODAL_EVENT));
-  }
-
-  function handleValidate(): void {
-    if (activeSessionId === null || compositionState === null) return;
-    requestValidate(activeSessionId, compositionState.version);
-  }
-
   return (
     <div className="guided-completion">
       {/* Heading per Task 7.6 M3 convention for primary entity names */}
-      <h3 id={headingId} className="guided-completion-heading">
+      <h3 className="guided-completion-heading">
         {COMPLETION_OUTCOME_LABELS[completionOutcome]}
       </h3>
 
-      {/* YAML preview -- syntax-highlighted via prism-react-renderer.
-          Theme-aware: dark/light resolved via useTheme() to match YamlView.
-          The pre id is used for distinctness testing across instances.
-          role=region + tabIndex: the container scrolls (max-height 400px,
-          overflow:auto) and holds no focusable content, so without a tab stop
-          its overflow is keyboard-unreachable (WCAG 2.1.1; axe
-          scrollable-region-focusable, caught live — jsdom never lays out, so
-          the a11y suite cannot see scrollability). A role is required for the
-          accessible name to be exposed (elspeth-37293a3b7c). */}
-      <div
-        className="guided-completion-yaml-container"
-        role="region"
-        aria-label="Pipeline YAML"
-        tabIndex={0}
-      >
-        <Highlight theme={highlightTheme} code={yaml} language="yaml">
-          {({ tokens, getLineProps, getTokenProps }) => (
-            <pre id={preId} className="guided-completion-pre">
-              {tokens.map((line, i) => (
-                <div key={i} {...getLineProps({ line })}>
-                  {line.map((token, key) => (
-                    <span key={key} {...getTokenProps({ token })} />
-                  ))}
-                </div>
-              ))}
-            </pre>
-          )}
-        </Highlight>
-      </div>
-
-      <div className="guided-completion-actions">
-        {!isTutorial && (
-          <button
-            type="button"
-            className="guided-completion-save-btn"
-            onClick={handleExit}
-          >
-            Open freeform editor
-          </button>
-        )}
+      {!isTutorial && (
         <button
           type="button"
-          className="guided-completion-edit-btn"
-          onClick={handleReviewYaml}
+          className="guided-completion-save-btn"
+          onClick={handleExit}
         >
-          Export YAML
+          Open freeform editor
         </button>
-        <button
-          type="button"
-          className="guided-completion-edit-btn"
-          onClick={handleValidate}
-          disabled={activeSessionId === null || compositionState === null || isValidating}
-        >
-          {isValidating ? "Validating" : "Validate pipeline"}
-        </button>
-      </div>
+      )}
     </div>
   );
 }

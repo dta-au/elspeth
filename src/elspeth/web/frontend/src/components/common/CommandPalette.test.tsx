@@ -5,7 +5,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import {
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
   type RequestArtifactViewDetail,
@@ -248,16 +247,14 @@ describe("CommandPalette guided-mode commands", () => {
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onLegacyModal);
   });
 
-  it("requests the YAML artifact without opening the legacy modal when the pipeline has content", async () => {
+  it("requests the YAML artifact when the pipeline has content", async () => {
     const artifactRequests: RequestArtifactViewDetail[] = [];
     const onArtifactRequest = (event: Event) => {
       artifactRequests.push(
         (event as CustomEvent<RequestArtifactViewDetail>).detail,
       );
     };
-    const onLegacyModal = vi.fn();
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, onLegacyModal);
     useSessionStore.setState({
       activeSessionId: "session-1",
       compositionState: {
@@ -281,9 +278,7 @@ describe("CommandPalette guided-mode commands", () => {
       ]);
     });
 
-    expect(onLegacyModal).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, onLegacyModal);
   });
 
   // elspeth-bff8043d33 residual: the palette command was a leftover path

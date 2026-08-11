@@ -1138,6 +1138,14 @@ describe("TutorialGuidedShell", () => {
     vi.mocked(apiClient.startGuidedSession).mockReturnValue(
       new Promise<never>(() => {}),
     );
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe(): void {}
+        unobserve(): void {}
+        disconnect(): void {}
+      },
+    );
     const { container } = render(
       <TutorialGuidedShell
         sessionId="00000000-0000-4000-8000-000000000999"

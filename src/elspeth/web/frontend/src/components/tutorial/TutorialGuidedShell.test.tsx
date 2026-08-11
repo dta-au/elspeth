@@ -1,4 +1,4 @@
-import { StrictMode } from "react";
+import { StrictMode, type ReactNode } from "react";
 import { render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TutorialGuidedShell } from "./TutorialGuidedShell";
@@ -87,6 +87,55 @@ vi.mock("@/components/chat/ChatPanel", () => ({
       />
     );
   },
+}));
+
+vi.mock("@/components/workspace/ComposerWorkspace", () => ({
+  ComposerWorkspace: (props: {
+    authoring: ReactNode;
+    artifact: ReactNode;
+    inspector: ReactNode;
+    actionBar: ReactNode;
+  }) => (
+    <div data-testid="composer-workspace-stub">
+      <div data-testid="workspace-authoring">{props.authoring}</div>
+      <div data-testid="workspace-artifact">{props.artifact}</div>
+      <div data-testid="workspace-inspector">{props.inspector}</div>
+      <div data-testid="workspace-action-bar">{props.actionBar}</div>
+    </div>
+  ),
+}));
+
+vi.mock("@/components/workspace/ArtifactWorkspace", () => ({
+  ArtifactWorkspace: () => <div>Artifact workspace</div>,
+}));
+
+vi.mock("@/components/workspace/WorkspaceInspector", () => ({
+  WorkspaceInspector: ({ validationContent }: { validationContent?: ReactNode }) => (
+    <div>
+      Inspector workspace
+      {validationContent}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/workspace/WorkspaceActionBar", () => ({
+  WorkspaceActionBar: ({
+    capabilities,
+  }: {
+    capabilities: { completion: boolean; importYaml: boolean; catalog: boolean };
+  }) => (
+    <div data-testid="tutorial-workspace-capabilities">
+      {JSON.stringify(capabilities)}
+    </div>
+  ),
+}));
+
+vi.mock("@/components/chat/guided/PipelineValidationSummary", () => ({
+  PipelineValidationSummary: ({ isTutorial }: { isTutorial?: boolean }) => (
+    <div data-testid="tutorial-validation-summary">
+      {String(isTutorial)}
+    </div>
+  ),
 }));
 
 describe("TutorialGuidedShell", () => {
@@ -190,6 +239,21 @@ describe("TutorialGuidedShell", () => {
     const stub = await screen.findByTestId("chat-panel-stub");
     expect(stub).toBeInTheDocument();
     expect(stub.dataset.isTutorial).toBe("true");
+  });
+
+  it("uses the common workspace with tutorial-safe actions and inspector validation", async () => {
+    render(<TutorialGuidedShell sessionId="sess-1" onCompleted={vi.fn()} />);
+
+    expect(await screen.findByTestId("composer-workspace-stub")).toBeInTheDocument();
+    expect(screen.getByText("Artifact workspace")).toBeInTheDocument();
+    expect(screen.getByText("Inspector workspace")).toBeInTheDocument();
+    expect(screen.getByTestId("tutorial-validation-summary")).toHaveTextContent(
+      "true",
+    );
+    expect(screen.getByTestId("tutorial-workspace-capabilities")).toHaveTextContent(
+      '{"completion":false,"importYaml":false,"catalog":false}',
+    );
+    expect(screen.queryByText("Run pipeline")).toBeNull();
   });
 
   it("passes the same closed proposal and exact review binding to the passive tutorial surface", async () => {

@@ -66,9 +66,8 @@
   letter-spacing: 0.01em;
 }
 
-/* Guided-shell bridge wrapper (TutorialGuidedShell): the embedded ChatPanel
-   guided surface lives here. Full width within the centered .tutorial-shell
-   column; the kicker sits above it. */
+/* Guided-shell bridge wrapper (TutorialGuidedShell): the common Composer
+   workspace lives here and owns the authoring/artifact split. */
 .tutorial-guided-shell {
   width: 100%;
 }
@@ -76,8 +75,9 @@
 /* ── Guided step: height-bounded authoring frame (the column scrolls) ─────────
    The bookend turns (welcome/run/audit/graduation) are short centred cards on
    the base `.tutorial-shell` document scroll. The guided step instead becomes a
-   FIXED FRAME: the shell stops scrolling and ChatPanel's
-   `.guided-authoring-scroll` owns the conversation scroll, with the composer
+   FIXED FRAME: the shell stops scrolling, the common workspace's authoring
+   chain terminates in ChatPanel, and `.guided-authoring-scroll` owns the
+   conversation scroll, with the composer
    docked beneath it. In the app, ComposerWorkspace provides the surrounding
    authoring/artifact split; this tutorial bridge joins the same chain at the
    ChatPanel boundary.
@@ -90,10 +90,10 @@
    just leaves empty column space and overflow scrolls — nothing is docked that
    can outgrow the viewport.)
 
-   The height chain below is all-or-nothing: shell → guided-shell → chat-panel →
-   authoring scroll each need flex:1/min-height:0 (or flex-shrink:0 for fixed
-   bands). Miss ONE min-height:0 and the chain silently reverts to content-height
-   growth — the internal scroll never engages.
+   The height chain below is all-or-nothing: shell → guided-shell → common
+   workspace → authoring body → tutorial authoring → chat-panel → authoring
+   scroll each need flex:1/min-height:0. Miss ONE min-height:0 and the chain
+   silently reverts to content-height growth — the internal scroll never engages.
 
    Scoped under `.tutorial-shell--guided` (live-guided + freeform never render
    under `.tutorial-shell`). tutorial.css imports BEFORE chat.css/guided.css, so
@@ -138,11 +138,25 @@
   flex-direction: column;
 }
 
+.tutorial-shell--guided .tutorial-guided-shell > .composer-workspace {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.tutorial-shell--guided .tutorial-guided-authoring {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
 /* Re-bound the panel (chat.css's base .chat-panel is height:100% against a
    full-height parent; here the parent is a flex column, so height:auto +
    flex:1 is the correct fill). overflow:hidden clips to the frame — the
    conversation column inside owns the scroll. */
-.tutorial-shell--guided .chat-panel {
+.tutorial-shell--guided .tutorial-guided-authoring > .chat-panel {
   flex: 1 1 auto;
   min-height: 0;
   height: auto;
@@ -153,7 +167,7 @@
    state, TutorialGuidedShell sawActiveRef) but has NO internal scroll region —
    a plain overflow:hidden frame would strand its content off-screen. Let the
    completed panel scroll itself instead. */
-.tutorial-shell--guided .chat-panel--completed {
+.tutorial-shell--guided .tutorial-guided-authoring > .chat-panel--completed {
   overflow-y: auto;
 }
 

@@ -1,5 +1,6 @@
 import {
   type KeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -35,7 +36,11 @@ function viewportIsCompact(): boolean {
   );
 }
 
-export function WorkspaceInspector(): JSX.Element {
+export function WorkspaceInspector({
+  validationContent,
+}: {
+  validationContent?: ReactNode;
+} = {}): JSX.Element {
   const { state, actions, inspectorInvokerRef } =
     useWorkspacePaneController();
   const activeSessionId = useSessionStore((current) => current.activeSessionId);
@@ -250,7 +255,11 @@ export function WorkspaceInspector(): JSX.Element {
             key={`${activeSessionId ?? "no-session"}:validation`}
             label="Validation inspector"
           >
-            <SideRailValidationBanner onSelectComponent={selectComponent} />
+            {validationContent === undefined ? (
+              <SideRailValidationBanner onSelectComponent={selectComponent} />
+            ) : (
+              validationContent
+            )}
           </ErrorBoundary>
         </div>
         <div

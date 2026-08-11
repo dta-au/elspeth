@@ -14,7 +14,6 @@ import { GraphView } from "@/components/inspector/GraphView";
 import { YamlView } from "@/components/inspector/YamlView";
 import {
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
@@ -218,16 +217,9 @@ export function ArtifactWorkspaceSurface({
         queueGraphModal(request.sessionId);
       }
     };
-    const handleLegacyYamlRequest = (): void => {
-      if (!mountedRef.current) return;
-      selectAndFocus("yaml");
-    };
-
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handleRequest);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handleLegacyYamlRequest);
     return () => {
       window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handleRequest);
-      window.removeEventListener(OPEN_YAML_MODAL_EVENT, handleLegacyYamlRequest);
     };
   }, [queueGraphModal, selectAndFocus]);
 

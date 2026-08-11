@@ -5,7 +5,6 @@ import {
   EXPORT_YAML_EMPTY_PIPELINE_TITLE,
 } from "./ExportYamlButton";
 import {
-  OPEN_YAML_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
@@ -73,9 +72,7 @@ describe("ExportYamlButton", () => {
     const handler = (event: Event) => {
       requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
     };
-    const legacyHandler = vi.fn();
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, legacyHandler);
 
     render(<ExportYamlButton />);
     fireEvent.click(screen.getByRole("button", { name: /export yaml/i }));
@@ -83,9 +80,7 @@ describe("ExportYamlButton", () => {
     expect(requests).toEqual([
       { tab: "yaml", focusMode: false, sessionId: "sess-1" },
     ]);
-    expect(legacyHandler).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, legacyHandler);
   });
 
   // elspeth-bff8043d33: Export must be disabled — with a stated reason —
@@ -118,16 +113,16 @@ describe("ExportYamlButton", () => {
     expect(screen.getByRole("button", { name: /export yaml/i })).toBeDisabled();
   });
 
-  it("does not dispatch the open event while disabled", () => {
+  it("does not dispatch an artifact request while disabled", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" } as never);
     const handler = vi.fn();
-    window.addEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
 
     render(<ExportYamlButton />);
     fireEvent.click(screen.getByRole("button", { name: /export yaml/i }));
 
     expect(handler).not.toHaveBeenCalled();
-    window.removeEventListener(OPEN_YAML_MODAL_EVENT, handler);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handler);
   });
 
   it("enables export without a disabled reason once the pipeline has content", () => {

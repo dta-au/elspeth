@@ -1,6 +1,6 @@
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -111,11 +111,13 @@ vi.mock("@/components/sidebar/SideRailValidationBanner", () => ({
 interface HarnessProps {
   initialTab?: InspectorTab | null;
   removeInvokerOnOpen?: boolean;
+  validationContent?: ReactNode;
 }
 
 function InspectorHarness({
   initialTab = null,
   removeInvokerOnOpen = false,
+  validationContent,
 }: HarnessProps): JSX.Element {
   const [activeTab, setActiveTab] = useState<InspectorTab | null>(initialTab);
   const [showInvoker, setShowInvoker] = useState(true);
@@ -155,7 +157,7 @@ function InspectorHarness({
         )}
         <OpenInspectorButton tab="audit">Open audit</OpenInspectorButton>
       </div>
-      <WorkspaceInspector />
+      <WorkspaceInspector validationContent={validationContent} />
     </WorkspacePaneProvider>
   );
 }
@@ -273,6 +275,23 @@ describe("WorkspaceInspector", () => {
     expect(panelState.auditMounts).toBe(1);
     expect(panelState.validationUnmounts).toBe(0);
     expect(panelState.auditUnmounts).toBe(0);
+  });
+
+  it("uses injected tutorial validation content without mounting the default owner", async () => {
+    const user = userEvent.setup();
+    render(
+      <InspectorHarness
+        validationContent={
+          <div data-testid="tutorial-validation">Tutorial validation</div>
+        }
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Open validation" }));
+
+    expect(screen.getByTestId("tutorial-validation")).toBeInTheDocument();
+    expect(screen.queryByText("Validation panel")).toBeNull();
+    expect(panelState.validationMounts).toBe(0);
   });
 
   it("renders Validation, Audit, and conditional History as roving tabs", async () => {

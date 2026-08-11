@@ -26,7 +26,6 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition } from "@/test/composerFixtures";
 import {
   OPEN_GRAPH_MODAL_EVENT,
-  OPEN_YAML_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
@@ -110,7 +109,6 @@ function LayoutCleanupRequestProbe({
         focusMode: false,
         sessionId: "session-1",
       });
-      window.dispatchEvent(new Event(OPEN_YAML_MODAL_EVENT));
       onAfterDispatch();
     },
     [onAfterDispatch],
@@ -853,22 +851,6 @@ describe("ArtifactWorkspace", () => {
     expect(observations).toHaveLength(1);
     expect(observations[0]).toBe(screen.getByRole("tab", { name: "Graph" }));
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
-  });
-
-  it("keeps the legacy YAML event as a persistent-tab compatibility request", () => {
-    useSessionStore.setState({ compositionState: makeComposition(1) });
-    renderArtifactWorkspace();
-
-    act(() => {
-      window.dispatchEvent(new Event(OPEN_YAML_MODAL_EVENT));
-    });
-
-    expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
-    expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(screen.getByRole("tabpanel", { name: "YAML" })).toBeInTheDocument();
   });
 
   it("keeps outer controls usable and resets a failed body by tab and session", async () => {
