@@ -446,8 +446,9 @@ async def test_settlement_required_trust_mode_fails_closed_when_revoked(service:
     with pytest.raises(TrustModeAutoCommitRevokedError):
         await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
 
-    # The settlement transaction rolled back atomically: no published
-    # state, no terminal event, proposal still pending for review.
+    # The settlement transaction records the non-terminal revocation before
+    # surfacing the exception: no published state or terminal event, and the
+    # proposal remains pending for review.
     with service._engine.connect() as conn:
         assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
         assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
@@ -457,6 +458,13 @@ async def test_settlement_required_trust_mode_fails_closed_when_revoked(service:
             ).scalar_one()
             == 0
         )
+    events = await service.list_proposal_events(session_id)
+    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
+    assert events[-1].actor == "user:alice"
+    assert dict(events[-1].payload) == {
+        "required_trust_mode": "auto_commit",
+        "current_trust_mode": "explicit_approve",
+    }
 
     # Manual review approval (no trust requirement) of the same proposal
     # still succeeds — explicit approval is valid in either trust mode.
@@ -466,15 +474,13 @@ async def test_settlement_required_trust_mode_fails_closed_when_revoked(service:
 
 @pytest.mark.asyncio
 async def test_auto_commit_revocation_leaves_a_durable_proposal_event(service: SessionServiceImpl) -> None:
-    """The blocked auto-commit is itself audit-recorded, not silently rewritten.
+    """The blocked auto-commit is audit-recorded exactly once across retries.
 
     The dispatch tool row persists BEFORE the settlement transaction, so the
-    revocation rollback alone leaves a trail showing a successful
-    ``set_pipeline`` dispatch against a still-pending proposal with nothing
-    recording the block. ``record_auto_commit_revocation`` (called by
-    ``settle_auto_commit_intent`` on ``TrustModeAutoCommitRevokedError``)
-    writes the non-terminal ``auto_commit.revoked`` event carrying the trust
-    facts; the proposal stays pending and reviewable.
+    settlement transaction writes the non-terminal ``auto_commit.revoked``
+    event carrying the trust facts before surfacing
+    ``TrustModeAutoCommitRevokedError``. An exact retry reuses that event;
+    the proposal stays pending and reviewable.
     """
     session_id = uuid4()
     _insert_session(service, session_id)  # trust_mode="explicit_approve"
@@ -483,26 +489,19 @@ async def test_auto_commit_revocation_leaves_a_durable_proposal_event(service: S
     binding = await _persist_dispatch(service, session_id)
     kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
 
-    with pytest.raises(TrustModeAutoCommitRevokedError) as raised:
+    with pytest.raises(TrustModeAutoCommitRevokedError):
+        await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
+    with pytest.raises(TrustModeAutoCommitRevokedError):
         await service.settle_pipeline_composition_proposal(**kwargs, required_trust_mode="auto_commit")
 
-    event = await service.record_auto_commit_revocation(
-        session_id=session_id,
-        proposal_id=row.id,
-        required_trust_mode=raised.value.required,
-        current_trust_mode=raised.value.current,
-        actor="user:alice",
-    )
-
-    assert event.event_type == "auto_commit.revoked"
-    assert event.proposal_id == row.id
-    assert event.actor == "user:alice"
-    assert dict(event.payload) == {
+    events = await service.list_proposal_events(session_id)
+    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
+    assert events[-1].proposal_id == row.id
+    assert events[-1].actor == "user:alice"
+    assert dict(events[-1].payload) == {
         "required_trust_mode": "auto_commit",
         "current_trust_mode": "explicit_approve",
     }
-    events = await service.list_proposal_events(session_id)
-    assert [item.event_type for item in events] == ["proposal.created", "auto_commit.revoked"]
 
     # Non-terminal: the recorded block does not strand the proposal —
     # manual review approval of the same proposal still succeeds.

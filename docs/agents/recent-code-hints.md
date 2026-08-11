@@ -153,6 +153,17 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-11 — cancellation-safe settlement outcomes belong in the locked
+  transaction**: a deferred-cancellation wrapper drains its shielded database
+  worker, then deliberately re-raises `CancelledError`. Any audit write left
+  to an outer exception handler can therefore be skipped even though an
+  earlier dispatch committed successfully; process failure creates the same
+  gap. For commit-boundary trust revocation, insert or exactly reuse
+  `auto_commit.revoked` inside the session-locked settlement transaction,
+  return the revocation as an internal outcome so the context commits, and
+  raise `TrustModeAutoCommitRevokedError` only after `_run_sync` returns. The
+  route translates that error but never owns a second revocation write.
+
 - **2026-08-11 — caller-owned DB transactions cannot publish inline-custody files directly**:
   the guided-full settlement must insert the originating message and blob row
   in one transaction to satisfy the composite lineage FK, but a DB rollback

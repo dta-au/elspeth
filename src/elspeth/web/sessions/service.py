@@ -1709,6 +1709,54 @@ def _proposal_event_record_from_row(row: Any) -> ProposalEventRecord:
     )
 
 
+def _record_auto_commit_revocation_on_connection(
+    conn: Connection,
+    *,
+    session_id: str,
+    proposal_id: str,
+    required_trust_mode: str,
+    current_trust_mode: str,
+    actor: str,
+    created_at: datetime,
+) -> ProposalEventRecord:
+    """Insert or reuse the one exact non-terminal revocation outcome."""
+    for name, value in (("required_trust_mode", required_trust_mode), ("current_trust_mode", current_trust_mode)):
+        if value not in COMPOSER_TRUST_MODE_VALUES:
+            raise ValueError(f"{name} must be one of {sorted(COMPOSER_TRUST_MODE_VALUES)!r}; got {value!r}")
+    expected_payload = {
+        "required_trust_mode": required_trust_mode,
+        "current_trust_mode": current_trust_mode,
+    }
+    existing_rows = conn.execute(
+        select(proposal_events_table)
+        .where(proposal_events_table.c.session_id == session_id)
+        .where(proposal_events_table.c.proposal_id == proposal_id)
+        .where(proposal_events_table.c.event_type == "auto_commit.revoked")
+    ).fetchall()
+    if len(existing_rows) > 1:
+        raise AuditIntegrityError("pipeline proposal has duplicate auto-commit revocation events")
+    if existing_rows:
+        existing = _proposal_event_record_from_row(existing_rows[0])
+        if existing.actor != actor or deep_thaw(existing.payload) != expected_payload:
+            raise AuditIntegrityError("pipeline proposal auto-commit revocation binding is malformed")
+        return existing
+
+    event_id = str(uuid.uuid4())
+    conn.execute(
+        insert(proposal_events_table).values(
+            id=event_id,
+            session_id=session_id,
+            proposal_id=proposal_id,
+            event_type="auto_commit.revoked",
+            actor=actor,
+            payload=expected_payload,
+            created_at=created_at,
+        )
+    )
+    row = conn.execute(select(proposal_events_table).where(proposal_events_table.c.id == event_id)).one()
+    return _proposal_event_record_from_row(row)
+
+
 def _restore_authoritative_pipeline_proposal(
     *,
     conn: Connection,
@@ -6303,8 +6351,9 @@ class SessionServiceImpl:
         (elspeth-01d4c6e683): auto-commit callers pass ``"auto_commit"``
         and the session's trust mode is re-read inside this write
         transaction — under the same per-session write lock
-        ``update_composer_preferences`` serialises on — raising
-        ``TrustModeAutoCommitRevokedError`` on mismatch. Only the
+        ``update_composer_preferences`` serialises on — recording one exact
+        non-terminal revocation event on mismatch. The transaction commits
+        before ``TrustModeAutoCommitRevokedError`` is raised. Only the
         pending->committed transition is guarded; the committed-replay
         branch returns the already-durable result regardless, so exact
         retries are never stranded by a later downgrade. Manual review
@@ -6326,7 +6375,7 @@ class SessionServiceImpl:
         sid = str(session_id)
         pid = str(proposal_id)
 
-        def _sync() -> tuple[PipelineProposalSettlementResult, bool]:
+        def _sync() -> tuple[PipelineProposalSettlementResult | TrustModeAutoCommitRevokedError, bool]:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
                 # Stamped under the lock, not at request entry: a settlement
                 # that waited on the session lock would otherwise record an
@@ -6450,10 +6499,22 @@ class SessionServiceImpl:
                     # after this transaction commits.
                     current_trust_mode = conn.execute(select(sessions_table.c.trust_mode).where(sessions_table.c.id == sid)).scalar_one()
                     if current_trust_mode != required_trust_mode:
-                        raise TrustModeAutoCommitRevokedError(
-                            sid,
-                            required=required_trust_mode,
-                            current=current_trust_mode,
+                        _record_auto_commit_revocation_on_connection(
+                            conn,
+                            session_id=sid,
+                            proposal_id=pid,
+                            required_trust_mode=required_trust_mode,
+                            current_trust_mode=current_trust_mode,
+                            actor=actor,
+                            created_at=now,
+                        )
+                        return (
+                            TrustModeAutoCommitRevokedError(
+                                sid,
+                                required=required_trust_mode,
+                                current=current_trust_mode,
+                            ),
+                            False,
                         )
 
                 current_row = conn.execute(
@@ -6554,14 +6615,20 @@ class SessionServiceImpl:
                     True,
                 )
 
-        result, transitioned = cast(tuple[PipelineProposalSettlementResult, bool], await self._run_sync(_sync))
+        result, transitioned = cast(
+            tuple[PipelineProposalSettlementResult | TrustModeAutoCommitRevokedError, bool],
+            await self._run_sync(_sync),
+        )
+        if type(result) is TrustModeAutoCommitRevokedError:
+            raise result
+        settled_result = cast(PipelineProposalSettlementResult, result)
         if transitioned:
-            assert result.proposal.pipeline_metadata is not None
+            assert settled_result.proposal.pipeline_metadata is not None
             _PIPELINE_SETTLEMENT_COUNTER.add(
                 1,
-                {"surface": result.proposal.pipeline_metadata.surface, "result": "accepted"},
+                {"surface": settled_result.proposal.pipeline_metadata.surface, "result": "accepted"},
             )
-        return result
+        return settled_result
 
     async def record_auto_commit_revocation(
         self,
@@ -6572,43 +6639,27 @@ class SessionServiceImpl:
         current_trust_mode: str,
         actor: str,
     ) -> ProposalEventRecord:
-        """Durably record an auto-commit blocked at the settlement boundary.
+        """Idempotently record a non-terminal auto-commit revocation.
 
-        The dispatch tool row persists BEFORE the settlement transaction, so
-        when ``settle_pipeline_composition_proposal`` raises
-        ``TrustModeAutoCommitRevokedError`` and the turn falls back to the
-        review path, the trail otherwise shows a successful ``set_pipeline``
-        dispatch against a still-pending proposal with nothing recording the
-        block (elspeth-01d4c6e683). Written in its own transaction — the
-        settlement transaction that detected the mismatch already rolled
-        back, by design. Non-terminal: the proposal stays pending.
+        Settlement writes this event inside its own locked transaction. This
+        compatibility entry point uses the same exact-binding helper so an
+        external retry cannot create a second or conflicting audit outcome.
         """
-        for name, value in (("required_trust_mode", required_trust_mode), ("current_trust_mode", current_trust_mode)):
-            if value not in COMPOSER_TRUST_MODE_VALUES:
-                raise ValueError(f"{name} must be one of {sorted(COMPOSER_TRUST_MODE_VALUES)!r}; got {value!r}")
         now = self._now()
         sid = str(session_id)
         pid = str(proposal_id)
-        event_id = str(uuid.uuid4())
 
         def _sync() -> ProposalEventRecord:
             with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                conn.execute(
-                    insert(proposal_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        proposal_id=pid,
-                        event_type="auto_commit.revoked",
-                        actor=actor,
-                        payload={
-                            "required_trust_mode": required_trust_mode,
-                            "current_trust_mode": current_trust_mode,
-                        },
-                        created_at=now,
-                    )
+                return _record_auto_commit_revocation_on_connection(
+                    conn,
+                    session_id=sid,
+                    proposal_id=pid,
+                    required_trust_mode=required_trust_mode,
+                    current_trust_mode=current_trust_mode,
+                    actor=actor,
+                    created_at=now,
                 )
-                row = conn.execute(select(proposal_events_table).where(proposal_events_table.c.id == event_id)).one()
-                return _proposal_event_record_from_row(row)
 
         return cast(ProposalEventRecord, await self._run_sync(_sync))
 

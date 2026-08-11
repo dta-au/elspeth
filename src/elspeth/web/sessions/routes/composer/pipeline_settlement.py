@@ -385,8 +385,8 @@ class AutoCommitRevoked:
     route can act on the revocation as an explicit outcome: the proposal
     remains pending and the turn becomes an ordinary review-path response.
     By the time a caller holds this value the revocation is already durable:
-    ``settle_auto_commit_intent`` writes the ``auto_commit.revoked``
-    proposal event (and structured log) before returning it.
+    the locked settlement transaction writes the ``auto_commit.revoked``
+    proposal event before raising the outcome translated here.
     """
 
     required: str
@@ -429,20 +429,9 @@ async def settle_auto_commit_intent(
             required_trust_mode="auto_commit",
         )
     except TrustModeAutoCommitRevokedError as exc:
-        # The dispatch tool row already persisted before the settlement
-        # transaction that this revocation aborted, so without a durable
-        # record the trail shows a successful set_pipeline dispatch against
-        # a still-pending proposal with nothing explaining why no commit
-        # followed. Record the block before returning the review-path
-        # fallback; a failure to write this row fails the turn rather than
-        # reopening the silent gap.
-        await service.record_auto_commit_revocation(
-            session_id=session_id,
-            proposal_id=intent.proposal_id,
-            required_trust_mode=exc.required,
-            current_trust_mode=exc.current,
-            actor=f"user:{user.user_id}",
-        )
+        # The locked settlement transaction committed this revocation before
+        # raising, so cancellation or process failure cannot leave the
+        # successful dispatch unexplained while the proposal stays pending.
         slog.info(
             "composer.auto_commit.revoked",
             session_id=str(session_id),

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -1162,6 +1163,103 @@ def test_send_message_auto_commit_lands_on_review_when_trust_revoked_before_sett
     pending = asyncio.run(service.list_composition_proposals(session_id))
     assert len(pending) == 1
     assert pending[0].status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_auto_commit_persists_concurrent_trust_revocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot erase a revocation detected by settlement."""
+    app, service, _pipeline, session_id, row, _endpoint = await _create_canonical_pipeline_route_proposal(
+        tmp_path,
+        monkeypatch,
+        tool_call_id="send-auto-cancelled-revocation",
+    )
+    assert row.pipeline_metadata is not None
+    composer = SimpleNamespace()
+    composer.surface_pending_interpretation_reviews = AsyncMock(
+        spec=ComposerService.surface_pending_interpretation_reviews,
+        return_value=None,
+    )
+    composer.compose = AsyncMock(
+        spec=ComposerService.compose,
+        return_value=ComposerResult(
+            message="Pipeline prepared.",
+            state=_EMPTY_STATE,
+            repair_turns_used=0,
+            pipeline_commit_intent=PipelineCommitIntent(
+                proposal_id=row.id,
+                draft_hash=row.pipeline_metadata.draft_hash,
+            ),
+        ),
+    )
+    app.state.composer_service = composer
+
+    settlement_worker_started = threading.Event()
+    release_settlement_worker = threading.Event()
+    settlement_worker_finished = threading.Event()
+    original_run_sync = service._run_sync  # type: ignore[attr-defined]
+
+    async def pause_settlement_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
+        if "settle_pipeline_composition_proposal.<locals>._sync" not in func.__qualname__:
+            return await original_run_sync(func, *args, **kwargs)
+
+        def paused_settlement() -> Any:
+            settlement_worker_started.set()
+            if not release_settlement_worker.wait(timeout=5.0):
+                raise TimeoutError("test did not release settlement worker")
+            try:
+                return func(*args, **kwargs)
+            finally:
+                settlement_worker_finished.set()
+
+        return await original_run_sync(paused_settlement)
+
+    monkeypatch.setattr(service, "_run_sync", pause_settlement_worker)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request_task = asyncio.create_task(
+            client.post(
+                f"/api/sessions/{session_id}/messages",
+                json={"content": "Build the pipeline."},
+            )
+        )
+        assert await asyncio.to_thread(settlement_worker_started.wait, 5.0), "settlement worker did not start"
+        await service.update_composer_preferences(
+            session_id,
+            trust_mode="explicit_approve",
+            density_default="high",
+            actor="user:alice",
+        )
+        request_task.cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        cancellation_escaped_before_worker = request_task.done()
+        release_settlement_worker.set()
+        assert await asyncio.to_thread(settlement_worker_finished.wait, 5.0), "settlement worker did not finish"
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(request_task, timeout=5.0)
+
+    assert not cancellation_escaped_before_worker, "request cancellation escaped while settlement was still in flight"
+    assert await service.get_current_state(session_id) is None
+    proposals = await service.list_composition_proposals(session_id)
+    assert len(proposals) == 1
+    assert proposals[0].status == "pending"
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+    recovery = await service.get_pipeline_dispatch_recovery(authority=authority)
+    assert recovery is not None
+    assert recovery.binding.status is ComposerToolStatus.SUCCESS
+    events = [event for event in await service.list_proposal_events(session_id) if event.proposal_id == row.id]
+    assert [event.event_type for event in events] == ["proposal.created", "auto_commit.revoked"]
+    assert dict(events[-1].payload) == {
+        "required_trust_mode": "auto_commit",
+        "current_trust_mode": "explicit_approve",
+    }
 
 
 def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
