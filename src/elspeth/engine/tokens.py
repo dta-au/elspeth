@@ -12,7 +12,7 @@ import copy
 from collections.abc import Sequence
 from typing import Any
 
-from elspeth.contracts import CoalesceParentCompletion, SourceRow, TokenInfo
+from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, SourceRow, TokenInfo
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalPath
@@ -383,6 +383,7 @@ class TokenManager:
         run_id: str,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
     ) -> tuple[list[TokenInfo], str]:
         """Create child tokens for deaggregation (1 input -> N outputs).
 
@@ -436,6 +437,7 @@ class TokenManager:
             step_in_pipeline=step,
             parent_path=parent_path,
             parent_batch_id=parent_batch_id,
+            aggregation_parent_dispositions=aggregation_parent_dispositions,
         )
 
         # Use output_contract (post-transform schema) for all expanded children

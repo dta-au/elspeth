@@ -15,16 +15,25 @@ import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC
+from hashlib import sha256
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
-from elspeth.contracts import RouteDestination, RowResult, SourceRow, TokenInfo, TransformResult
+from elspeth.contracts import (
+    AggregationParentDisposition,
+    PayloadNotFoundError,
+    RouteDestination,
+    RowResult,
+    SourceRow,
+    TokenInfo,
+    TransformResult,
+)
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
 from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingScalars
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
-from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
@@ -76,6 +85,7 @@ from elspeth.engine.work_items import WorkItem, WorkItemFactory
 if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
 
+    from elspeth.contracts import CommittedAggregationResidual, CommittedCoalesceResidual
     from elspeth.contracts.audit import Row as AuditRow
     from elspeth.contracts.audit import Token as AuditToken
     from elspeth.contracts.coordination import CoordinationToken
@@ -129,7 +139,9 @@ from elspeth.contracts.scheduler import (
     TokenWorkStatus,
 )
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
+from elspeth.core.canonical import stable_hash
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
+from elspeth.core.checkpoint.serialization import checkpoint_loads
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.ids import generate_id
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
@@ -558,6 +570,7 @@ class RowProcessor:
         )
         self._telemetry_manager = telemetry_manager
         self._scheduler = scheduler
+        self._payload_store = payload_store
         # One codec for the WorkItem <-> durable scheduler payload mapping
         # (elspeth-6291c51766): ingest, enqueue, READY barrier emission, and
         # rehydrate must derive byte-identical field bundles (deterministic
@@ -752,6 +765,8 @@ class RowProcessor:
                 released_row_union_items=self.released_row_union_items,
                 complete_row_union_fire=self._complete_row_union_fire,
                 emit_token_completed=self._emit_token_completed,
+                complete_committed_aggregation_residual=self._complete_committed_aggregation_residual,
+                complete_committed_coalesce_residual=self._complete_committed_coalesce_residual,
             ).restore_from_journal(barrier_restore)
 
     @property
@@ -1587,50 +1602,42 @@ class RowProcessor:
                 else non_quarantined_tokens[0]
             )
             output_contract = output_rows[0].contract
-            expanded_tokens, _expand_group_id = self._token_manager.expand_token(
-                parent_token=expand_parent_token,
-                expanded_rows=[row.to_dict() for row in output_rows],
-                output_contract=output_contract,
-                node_id=fctx.node_id,
-                run_id=self._run_id,
-                parent_path=TerminalPath.BATCH_CONSUMED,
-                parent_batch_id=fctx.batch_id,
+            parent_dispositions = tuple(
+                AggregationParentDisposition(
+                    parent_ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
+                    outcome=TerminalOutcome.FAILURE if i in quarantined_index_set else TerminalOutcome.TRANSIENT,
+                    path=TerminalPath.QUARANTINED_AT_SOURCE if i in quarantined_index_set else TerminalPath.BATCH_CONSUMED,
+                    error_hash=(compute_error_hash(f"quarantined_in_batch:{fctx.batch_id}:{i}") if i in quarantined_index_set else None),
+                )
+                for i, token in enumerate(fctx.buffered_tokens)
             )
+            try:
+                expanded_tokens, _expand_group_id = self._token_manager.expand_token(
+                    parent_token=expand_parent_token,
+                    expanded_rows=[row.to_dict() for row in output_rows],
+                    output_contract=output_contract,
+                    node_id=fctx.node_id,
+                    run_id=self._run_id,
+                    parent_path=TerminalPath.BATCH_CONSUMED,
+                    parent_batch_id=fctx.batch_id,
+                    aggregation_parent_dispositions=parent_dispositions,
+                )
+            except LandscapeRecordError as record_failure:
+                raise AuditIntegrityError(
+                    f"Failed to atomically record aggregation expansion and parent terminal outcomes "
+                    f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}, batch_id={fctx.batch_id!r}): "
+                    f"{type(record_failure).__name__}: {record_failure}."
+                ) from record_failure
 
-            # Record terminal outcomes for ALL buffered tokens AFTER expand_token
-            # succeeds. Recording before validation/expansion would leave parent
-            # tokens in a terminal state (CONSUMED_IN_BATCH/QUARANTINED) with no
-            # child tokens if a later step fails — recovery would skip them.
+            # Expansion atomically recorded every parent's terminal disposition;
+            # emit the matching telemetry and construct the triggering RowResult.
             for i, token in enumerate(fctx.buffered_tokens):
                 if i in quarantined_index_set:
-                    error_hash = compute_error_hash(f"quarantined_in_batch:{fctx.batch_id}:{i}")
-                    batch_id = None
                     outcome = TerminalOutcome.FAILURE
                     path = TerminalPath.QUARANTINED_AT_SOURCE
                 else:
-                    error_hash = None
-                    batch_id = fctx.batch_id
                     outcome = TerminalOutcome.TRANSIENT
                     path = TerminalPath.BATCH_CONSUMED
-                parent_outcome_was_recorded_atomically = token.token_id == expand_parent_token.token_id and i not in quarantined_index_set
-                try:
-                    if not parent_outcome_was_recorded_atomically:
-                        self._data_flow.record_token_outcome(
-                            ref=TokenRef(token_id=token.token_id, run_id=self._run_id),
-                            outcome=outcome,
-                            path=path,
-                            error_hash=error_hash,
-                            batch_id=batch_id,
-                        )
-                except LandscapeRecordError as record_failure:
-                    raise AuditIntegrityError(
-                        f"Failed to record batch parent terminal outcome for token {token.token_id!r} "
-                        f"during transform-mode aggregation routing "
-                        f"(transform={fctx.transform.name!r}, node={fctx.node_id!r}, batch_id={fctx.batch_id!r}). "
-                        f"Audit trail is INCOMPLETE — expanded child tokens were already created and "
-                        f"some buffered parents may already be terminalized while others remain BUFFERED. "
-                        f"Recorder failure: {type(record_failure).__name__}: {record_failure}."
-                    ) from record_failure
                 self._emit_token_completed(
                     token,
                     outcome=outcome,
@@ -3392,6 +3399,176 @@ class RowProcessor:
             fork_group_id=token.fork_group_id,
             join_group_id=token.join_group_id,
             expand_group_id=token.expand_group_id,
+        )
+
+    def _complete_committed_aggregation_residual(
+        self,
+        residual: CommittedAggregationResidual,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> None:
+        """Publish a committed aggregation result without replaying its plugin.
+
+        Transform-mode aggregation commits its batch/node result and expanded
+        child payloads before the scheduler barrier completion.  A process
+        death in that narrow window leaves an exact durable result receipt but
+        no READY/PENDING_SINK continuation.  Reconstruct the continuation from
+        that receipt and consume the original BLOCKED snapshot atomically.
+        """
+        if self._payload_store is None:
+            raise OrchestrationInvariantError(f"Committed aggregation residual {residual.batch_id!r} requires a configured payload store")
+
+        blocked_by_token = {item.token_id: item for item in blocked_items}
+        if tuple(sorted(blocked_by_token)) != tuple(sorted(residual.member_token_ids)):
+            raise AuditIntegrityError(f"Committed aggregation residual {residual.batch_id!r} does not match its exact BLOCKED membership")
+
+        child_tokens: list[TokenInfo] = []
+        for child in residual.children:
+            parent_item = blocked_by_token[child.parent_token_id]
+            child_tokens.append(
+                TokenInfo(
+                    row_id=child.row_id,
+                    token_id=child.token_id,
+                    row_data=self._load_committed_barrier_payload(
+                        token_id=child.token_id,
+                        token_data_ref=child.token_data_ref,
+                        receipt_name=f"aggregation batch {residual.batch_id!r}",
+                    ),
+                    branch_name=parent_item.branch_name,
+                    expand_group_id=child.expand_group_id,
+                )
+            )
+
+        child_rows = [token.row_data.to_dict() for token in child_tokens]
+        candidate_hashes = [stable_hash(child_rows)]
+        if len(child_rows) == 1:
+            candidate_hashes.append(stable_hash(child_rows[0]))
+        if candidate_hashes.count(residual.output_hash) != 1:
+            raise AuditIntegrityError(
+                f"Committed aggregation residual {residual.batch_id!r} child payloads do not match "
+                f"the completed node output hash {residual.output_hash!r}"
+            )
+
+        node_id = NodeID(residual.aggregation_node_id)
+        parent_item = blocked_by_token[residual.children[0].parent_token_id]
+        coalesce_name = CoalesceName(parent_item.coalesce_name) if parent_item.coalesce_name is not None else None
+        row_union_name = RowUnionName(parent_item.row_union_name) if parent_item.row_union_name is not None else None
+        next_node = self._nav.resolve_next_node(node_id)
+        emitted_ready: list[BarrierEmission] = []
+        emitted_pending_sink: list[BarrierEmission] = []
+        for token in child_tokens:
+            if row_union_name is not None and next_node is None:
+                item = self._work_items.create(
+                    token=token,
+                    current_node_id=self._nav.resolve_row_union_node(row_union_name),
+                    row_union_name=row_union_name,
+                )
+                emitted_ready.append(self._work_codec.ready_emission(item))
+            elif next_node is not None or coalesce_name is not None or row_union_name is not None:
+                item = self._work_items.create_continuation(
+                    token=token,
+                    current_node_id=node_id,
+                    coalesce_name=coalesce_name,
+                    row_union_name=row_union_name,
+                )
+                emitted_ready.append(self._work_codec.ready_emission(item))
+            else:
+                result = RowResult(
+                    token=token,
+                    final_data=token.row_data,
+                    outcome=TerminalOutcome.SUCCESS,
+                    path=TerminalPath.DEFAULT_FLOW,
+                    sink_name=self._aggregation_settings[node_id].on_success,
+                )
+                emitted_pending_sink.append(self._sink_emission_from_result(result))
+
+        self._scheduler.complete_barrier(
+            run_id=self._run_id,
+            barrier_key=str(node_id),
+            consumed_token_ids=residual.member_token_ids,
+            emitted_pending_sink=tuple(emitted_pending_sink),
+            emitted_ready=tuple(emitted_ready),
+            now=self._clock.now_utc(),
+            intake_snapshot_token_ids=frozenset(residual.member_token_ids),
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            release_context={"reason": "committed_aggregation_residual_recovery", "batch_id": residual.batch_id},
+        )
+
+    def _load_committed_barrier_payload(
+        self,
+        *,
+        token_id: str,
+        token_data_ref: str,
+        receipt_name: str,
+    ) -> PipelineRow:
+        """Load and validate a self-contained barrier-result payload."""
+        if self._payload_store is None:
+            raise OrchestrationInvariantError(f"Committed {receipt_name} requires a configured payload store")
+        try:
+            payload_bytes = self._payload_store.retrieve(token_data_ref)
+        except PayloadNotFoundError as exc:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload {token_data_ref!r} is unavailable") from exc
+        if sha256(payload_bytes).hexdigest() != token_data_ref:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload does not match its content address")
+        envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        if type(envelope) is not dict or "data" not in envelope or "contract" not in envelope:
+            raise AuditIntegrityError(
+                f"Committed {receipt_name} token {token_id!r} does not have a valid {{data, contract}} payload envelope"
+            )
+        data = envelope["data"]
+        contract_data = envelope["contract"]
+        if type(data) is not dict or type(contract_data) is not dict:
+            raise AuditIntegrityError(f"Committed {receipt_name} token {token_id!r} payload envelope has invalid data or contract fields")
+        return PipelineRow(data, SchemaContract.from_checkpoint(contract_data))
+
+    def _complete_committed_coalesce_residual(
+        self,
+        residual: CommittedCoalesceResidual,
+        blocked_items: Sequence[TokenWorkItem],
+    ) -> None:
+        """Publish a completed coalesce effect without repeating the merge."""
+        if frozenset(item.token_id for item in blocked_items) != frozenset(residual.member_token_ids):
+            raise AuditIntegrityError(f"Committed coalesce residual {residual.effect_id!r} does not match its exact BLOCKED membership")
+        token = TokenInfo(
+            row_id=residual.row_id,
+            token_id=residual.result_token_id,
+            row_data=self._load_committed_barrier_payload(
+                token_id=residual.result_token_id,
+                token_data_ref=residual.token_data_ref,
+                receipt_name=f"coalesce effect {residual.effect_id!r}",
+            ),
+            join_group_id=residual.result_join_group_id,
+        )
+        node_id = NodeID(residual.coalesce_node_id)
+        coalesce_name = CoalesceName(residual.coalesce_name)
+        next_node = self._nav.resolve_next_node(node_id)
+        merged_item = None
+        merged_sink_result = None
+        if next_node is not None:
+            merged_item = self._work_items.create_continuation(token=token, current_node_id=node_id)
+        else:
+            merged_sink_result = RowResult(
+                token=token,
+                final_data=token.row_data,
+                outcome=TerminalOutcome.SUCCESS,
+                path=TerminalPath.COALESCED,
+                sink_name=self._nav.resolve_coalesce_sink(
+                    coalesce_name,
+                    context="committed coalesce residual recovery",
+                ),
+            )
+        self._scheduler.complete_barrier(
+            run_id=self._run_id,
+            barrier_key=str(coalesce_name),
+            consumed_token_ids=residual.member_token_ids,
+            emitted_pending_sink=(() if merged_sink_result is None else (self._sink_emission_from_result(merged_sink_result),)),
+            emitted_ready=(() if merged_item is None else (self._work_codec.ready_emission(merged_item),)),
+            now=self._clock.now_utc(),
+            intake_snapshot_token_ids=frozenset(residual.member_token_ids),
+            scope_row_id=residual.row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+            release_context={"reason": "committed_coalesce_residual_recovery", "effect_id": residual.effect_id},
         )
 
     def _complete_aggregation_flush(

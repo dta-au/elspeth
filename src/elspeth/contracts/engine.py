@@ -21,6 +21,55 @@ class CoalesceParentCompletion:
 
 
 @dataclass(frozen=True, slots=True)
+class AggregationParentDisposition:
+    """One batch member's terminal disposition committed with expansion."""
+
+    parent_ref: TokenRef
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationChild:
+    """One ordered child from a committed transform-mode aggregation receipt."""
+
+    token_id: str
+    row_id: str
+    expand_group_id: str
+    token_data_ref: str
+    step_in_pipeline: int
+    parent_token_id: str
+    ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationResidual:
+    """Durable aggregation result whose scheduler barrier has not completed."""
+
+    batch_id: str
+    aggregation_node_id: str
+    output_hash: str
+    member_token_ids: tuple[str, ...]
+    children: tuple[CommittedAggregationChild, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedCoalesceResidual:
+    """Durable coalesce merge whose scheduler barrier has not completed."""
+
+    effect_id: str
+    coalesce_node_id: str
+    coalesce_name: str
+    row_id: str
+    result_token_id: str
+    result_join_group_id: str
+    token_data_ref: str
+    step_in_pipeline: int
+    member_token_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class BufferEntry[T]:
     """Entry emitted from the reorder buffer with timing metadata.
 

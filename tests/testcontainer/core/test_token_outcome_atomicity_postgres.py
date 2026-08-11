@@ -186,7 +186,7 @@ def test_postgres_batch_expansion_claims_batch_once_under_contention(
                 parent_batch_id=batch.batch_id,
             )
         except AuditIntegrityError as exc:
-            assert "already claimed an expansion" in str(exc)
+            assert "divergent expansion replay" in str(exc)
             return "rejected"
         return "committed"
 
@@ -206,7 +206,10 @@ def test_postgres_batch_expansion_claims_batch_once_under_contention(
             )
         ).all()
     assert len(children) == 2
-    assert outcomes == [(TerminalPath.BATCH_CONSUMED.value, batch.batch_id)]
+    assert outcomes == [
+        (TerminalPath.BATCH_CONSUMED.value, batch.batch_id),
+        (TerminalPath.BATCH_CONSUMED.value, batch.batch_id),
+    ]
 
 
 def _lock_timeout_result(db: LandscapeDB, start: threading.Event, statement: Executable) -> str:

@@ -16,12 +16,12 @@ import json
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from hashlib import sha256
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import and_, select
 from sqlalchemy.engine import Connection, RowMapping
 
-from elspeth.contracts import CoalesceParentCompletion, Row, Token
+from elspeth.contracts import AggregationParentDisposition, CoalesceParentCompletion, Row, Token
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath
@@ -1122,6 +1122,7 @@ class RowTokenRepository:
         step_in_pipeline: int | None = None,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
     ) -> tuple[list[Token], str]:
         """Expand a token into multiple child tokens (deaggregation).
 
@@ -1181,6 +1182,50 @@ class RowTokenRepository:
         else:
             raise ValueError(f"expand_token parent_path must be EXPAND_PARENT or BATCH_CONSUMED, got {parent_path.value!r}")
 
+        dispositions = tuple(aggregation_parent_dispositions)
+        if parent_path == TerminalPath.EXPAND_PARENT and dispositions:
+            raise ValueError("expand_token EXPAND_PARENT forbids aggregation_parent_dispositions")
+        if parent_path == TerminalPath.BATCH_CONSUMED:
+            if not dispositions:
+                assert parent_batch_id is not None  # validated above
+                member_rows = self._ops.execute_fetchall(
+                    select(batch_members_table.c.token_id)
+                    .where(batch_members_table.c.batch_id == parent_batch_id)
+                    .where(batch_members_table.c.run_id == parent_ref.run_id)
+                    .order_by(batch_members_table.c.ordinal)
+                )
+                dispositions = tuple(
+                    AggregationParentDisposition(
+                        parent_ref=TokenRef(token_id=str(row.token_id), run_id=parent_ref.run_id),
+                        outcome=TerminalOutcome.TRANSIENT,
+                        path=TerminalPath.BATCH_CONSUMED,
+                    )
+                    for row in member_rows
+                )
+                if not dispositions:
+                    raise AuditIntegrityError(
+                        f"expand_token: parent token {parent_ref.token_id!r} is not a member of an existing non-empty batch"
+                    )
+            disposition_refs = tuple(item.parent_ref for item in dispositions)
+            if len({ref.token_id for ref in disposition_refs}) != len(disposition_refs):
+                raise AuditIntegrityError("batch expansion parent dispositions contain duplicate tokens")
+            if parent_ref.token_id not in {ref.token_id for ref in disposition_refs}:
+                raise AuditIntegrityError("batch expansion parent dispositions omit the expansion parent")
+            for item in dispositions:
+                if item.parent_ref.run_id != parent_ref.run_id:
+                    raise AuditIntegrityError("batch expansion parent dispositions cross run identity")
+                consumed = (
+                    item.outcome is TerminalOutcome.TRANSIENT and item.path is TerminalPath.BATCH_CONSUMED and item.error_hash is None
+                )
+                quarantined = (
+                    item.outcome is TerminalOutcome.FAILURE
+                    and item.path is TerminalPath.QUARANTINED_AT_SOURCE
+                    and type(item.error_hash) is str
+                    and bool(item.error_hash)
+                )
+                if not (consumed or quarantined):
+                    raise AuditIntegrityError("batch expansion parent disposition is not BATCH_CONSUMED or quarantined")
+
         if self._payload_store is None:
             raise AuditIntegrityError(
                 "expand_token requires a configured payload store — each expanded child's "
@@ -1219,7 +1264,8 @@ class RowTokenRepository:
             # SQLite's write_connection() already holds BEGIN IMMEDIATE.  The
             # completed-outcome check is the durable claim shared by normal and
             # batch expansion paths.
-            self._outcomes.lock_token_outcome_dependencies((parent_ref,), conn=conn)
+            locked_refs = tuple(item.parent_ref for item in dispositions) if dispositions else (parent_ref,)
+            self._outcomes.lock_token_outcome_dependencies(locked_refs, conn=conn)
             existing_terminal = (
                 conn.execute(
                     select(
@@ -1250,6 +1296,7 @@ class RowTokenRepository:
                         require_recorded_count=True,
                     )
                 if parent_path == TerminalPath.BATCH_CONSUMED and existing_terminal["path"] == TerminalPath.BATCH_CONSUMED.value:
+                    assert parent_batch_id is not None  # validated above
                     batch_claim = conn.execute(
                         select(batches_table.c.run_id, batches_table.c.expansion_group_id).where(
                             batches_table.c.batch_id == parent_batch_id
@@ -1260,6 +1307,11 @@ class RowTokenRepository:
                             f"expand_token: divergent expansion replay for parent token {parent_ref.token_id!r}; "
                             "the committed batch claim does not match the requested batch"
                         )
+                    self._verify_aggregation_parent_dispositions(
+                        conn,
+                        batch_id=parent_batch_id,
+                        dispositions=dispositions,
+                    )
                     return self._reconcile_expansion_replay(
                         conn,
                         parent_ref=parent_ref,
@@ -1284,15 +1336,16 @@ class RowTokenRepository:
             if parent_path == TerminalPath.BATCH_CONSUMED:
                 assert parent_batch_id is not None  # validated above
                 membership = conn.execute(
-                    select(batch_members_table.c.token_id)
+                    select(batch_members_table.c.token_id, batch_members_table.c.ordinal)
                     .where(batch_members_table.c.batch_id == parent_batch_id)
                     .where(batch_members_table.c.run_id == parent_ref.run_id)
-                    .where(batch_members_table.c.token_id == parent_ref.token_id)
-                ).one_or_none()
-                if membership is None:
+                    .order_by(batch_members_table.c.ordinal)
+                ).all()
+                member_ids = tuple(str(row.token_id) for row in membership)
+                if member_ids != tuple(item.parent_ref.token_id for item in dispositions):
                     raise AuditIntegrityError(
-                        f"expand_token: parent token {parent_ref.token_id!r} is not a member of batch {parent_batch_id!r} "
-                        f"in run {parent_ref.run_id!r}"
+                        f"expand_token: parent dispositions do not match the exact ordered membership of batch "
+                        f"{parent_batch_id!r} in run {parent_ref.run_id!r}"
                     )
 
                 claim = conn.execute(
@@ -1388,16 +1441,58 @@ class RowTokenRepository:
                         f"expand_token: EXPANDED outcome INSERT affected zero rows (parent={parent_ref.token_id}, outcome_id={outcome_id})"
                     )
             else:
-                self._outcomes.record_token_outcome(
-                    ref=parent_ref,
-                    outcome=TerminalOutcome.TRANSIENT,
-                    path=TerminalPath.BATCH_CONSUMED,
-                    batch_id=parent_batch_id,
-                    conn=conn,
-                    dependencies_prelocked=True,
-                )
+                for item in dispositions:
+                    self._outcomes.record_token_outcome(
+                        ref=item.parent_ref,
+                        outcome=item.outcome,
+                        path=item.path,
+                        batch_id=parent_batch_id if item.path is TerminalPath.BATCH_CONSUMED else None,
+                        error_hash=item.error_hash,
+                        conn=conn,
+                        dependencies_prelocked=True,
+                    )
 
         return children, expand_group_id
+
+    def _verify_aggregation_parent_dispositions(
+        self,
+        conn: Connection,
+        *,
+        batch_id: str,
+        dispositions: Sequence[AggregationParentDisposition],
+    ) -> None:
+        """Refuse a replay unless every batch parent terminal is exact."""
+        token_ids = tuple(item.parent_ref.token_id for item in dispositions)
+        rows: list[Any] = []
+        for i in range(0, len(token_ids), 500):
+            chunk = token_ids[i : i + 500]
+            rows.extend(
+                conn.execute(
+                    select(
+                        token_outcomes_table.c.token_id,
+                        token_outcomes_table.c.outcome,
+                        token_outcomes_table.c.path,
+                        token_outcomes_table.c.batch_id,
+                        token_outcomes_table.c.error_hash,
+                    )
+                    .where(token_outcomes_table.c.run_id == dispositions[0].parent_ref.run_id)
+                    .where(token_outcomes_table.c.token_id.in_(chunk))
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all()
+            )
+        observed = {str(row.token_id): row for row in rows}
+        if len(rows) != len(dispositions) or len(observed) != len(dispositions):
+            raise AuditIntegrityError("batch expansion replay lacks exact terminal parent dispositions")
+        for item in dispositions:
+            row = observed[item.parent_ref.token_id]
+            expected_batch_id = batch_id if item.path is TerminalPath.BATCH_CONSUMED else None
+            if (
+                row.outcome != item.outcome.value
+                or row.path != item.path.value
+                or row.batch_id != expected_batch_id
+                or row.error_hash != item.error_hash
+            ):
+                raise AuditIntegrityError("batch expansion replay has divergent terminal parent dispositions")
 
     def _reconcile_expansion_replay(
         self,

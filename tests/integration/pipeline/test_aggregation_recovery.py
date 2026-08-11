@@ -49,7 +49,14 @@ from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceS
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import batch_members_table, batches_table, sink_effects_table, token_work_items_table
+from elspeth.core.landscape.schema import (
+    batch_members_table,
+    batches_table,
+    sink_effects_table,
+    token_outcomes_table,
+    token_work_items_table,
+    tokens_table,
+)
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -494,6 +501,121 @@ class TestFlushOutputJournalDurability:
             )
         assert work_statuses
         assert set(work_statuses) <= {"terminal"}
+
+    def test_committed_transform_result_before_barrier_completion_resumes_without_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A committed aggregate child closes its stranded BLOCKED inputs on resume.
+
+        This is the residual crash image between transform-mode output routing
+        and ``complete_barrier``: the batch/node result, expanded child token,
+        and BATCH_CONSUMED input outcomes are durable, while every scheduler
+        input remains BLOCKED and no READY/PENDING_SINK continuation exists.
+        Resume must continue from the persisted child payload without invoking
+        the aggregation transform again.
+        """
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.processor import RowProcessor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _SumBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+
+        real_complete_aggregation_flush = RowProcessor._complete_aggregation_flush
+
+        def crash_before_barrier_completion(
+            self: RowProcessor,
+            node_id: NodeID,
+            results: tuple[Any, ...],
+            buffered_tokens: list[Any],
+            child_items: list[Any],
+        ) -> tuple[tuple[Any, ...], frozenset[str]]:
+            del self, node_id, results, buffered_tokens, child_items
+            raise RuntimeError("injected crash before aggregation barrier completion")
+
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", crash_before_barrier_completion)
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=checkpoint_config,
+        )
+
+        with pytest.raises(RuntimeError, match="injected crash before aggregation barrier completion"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", real_complete_aggregation_flush)
+
+        assert transform.batch_calls == 1
+        assert output_sink.results == []
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            batch = conn.execute(select(batches_table.c.batch_id, batches_table.c.status).where(batches_table.c.run_id == run_id)).one()
+            consumed_ids = set(
+                conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.path == "batch_consumed")
+                    .where(token_outcomes_table.c.completed == 1)
+                )
+                .scalars()
+                .all()
+            )
+            blocked_ids = set(
+                conn.execute(
+                    select(token_work_items_table.c.token_id)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status == "blocked")
+                )
+                .scalars()
+                .all()
+            )
+            expanded_children = conn.execute(
+                select(tokens_table.c.token_id, tokens_table.c.token_data_ref)
+                .where(tokens_table.c.run_id == run_id)
+                .where(tokens_table.c.expand_group_id.isnot(None))
+            ).all()
+            continuations = conn.execute(
+                select(token_work_items_table.c.token_id)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status.in_(("ready", "pending_sink")))
+            ).all()
+
+        assert batch.status == "completed"
+        assert len(consumed_ids) == 3
+        assert blocked_ids == consumed_ids
+        assert len(expanded_children) == 1
+        assert expanded_children[0].token_data_ref is not None
+        assert continuations == []
+
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        resume_point = recovery.get_resume_point(run_id, graph)
+        assert resume_point is not None
+
+        result = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert result.status == RunStatus.COMPLETED
+        assert output_sink.results == [{"value": 60, "count": 3}]
+        assert transform.batch_calls == 1, "resume must use the committed aggregate child, not replay the transform"
+        assert source.load_invocations == 1
+
+        with db.connection() as conn:
+            remaining_statuses = conn.execute(
+                select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)
+            ).scalars()
+        assert set(remaining_statuses) <= {"terminal"}
 
 
 class _FailBatchTransform(BaseTransform):

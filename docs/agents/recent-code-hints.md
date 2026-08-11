@@ -173,6 +173,15 @@ count/names, registry, catalog, golden, contracts whitelist).
   cannot prove this protocol because `FOR UPDATE` is inert there; retain the
   independent PostgreSQL race tests for both lock winners.
 
+- **2026-08-12 — completed barrier effects are continuations, not late
+  arrivals**: aggregation expansion receipts and completed coalesce-effect
+  receipts can exist while their exact input scheduler rows are still
+  `BLOCKED` (process death before `complete_barrier`). Restore must validate
+  the durable receipt and publish its READY/PENDING_SINK successor in the same
+  strict barrier completion that consumes those inputs. Never replay the
+  committed plugin/merge, and never let completed-key reconciliation discard
+  the persisted result as if every blocked parent were a late arrival.
+
 - **2026-08-12 — a long-running transform must re-prove scheduler ownership
   before terminal audit writes**: `TransformExecutor` calls the processor's
   rate-limited active-claim heartbeat immediately after plugin return or

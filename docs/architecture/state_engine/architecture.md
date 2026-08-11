@@ -187,12 +187,19 @@ and may atomically emit:
 
 Coalesce now materializes deterministic effect identity, parent membership,
 merged token identity, and terminal parent evidence before marking the effect
-complete. Repository atomicity is strong; the full production process-death
-restart discriminator remains mandatory evidence.
+complete. Restore recognizes a completed effect whose exact parents are still
+BLOCKED and publishes the persisted merged token through one strict
+`complete_barrier` call; it does not classify those parents as mere late
+arrivals or execute the merge again. Repository atomicity is strong; the full
+deployment-profile process-death matrix remains mandatory evidence.
 
-Aggregation transform-mode continuation differs: a successful barrier consume
-can commit before non-sink child scheduling. The TS-15-to-child-TS-00 seam
-therefore remains a live architecture/proof gap.
+Aggregation transform mode similarly binds a completed batch/node result to a
+claimed expansion group and self-contained ordered child payloads. If those
+terminal parents remain BLOCKED with no child continuation, restore verifies
+the completed output hash and publishes READY/PENDING_SINK children together
+with exact parent consumption. The transform is never replayed to reconstruct
+that committed result. Images before the expansion receipt exists remain
+non-reconstructable and fail closed.
 
 ## Sink-effect state machine
 
@@ -322,7 +329,7 @@ list; that catalog list remains the machine authority.
 | Pre-fix TS-02 row/token/initial-claim image without source state | Resume drain and plugin traversal | Closed compatibility seam: before plugin execution, `SourceCompletionReconciler` requires a root `LEASED` work item at attempt 1/step 1, exactly one matching current-work-item `ENQUEUE` and `CLAIM_READY`, matching row/token/ingest/payload hashes, and no conflicting source state. It inserts one exact source `COMPLETED` witness; repeat repair is idempotent and every ambiguity fails closed. Current TS-02 ingress no longer creates this image. |
 | TS-00 child enqueue | Parent disposition | P1 crash seam; `elspeth-7cdc4da434` |
 | Plugin call begins under scheduler lease | Next heartbeat/disposition | P1 long-call characterization; `elspeth-51a4b5c771` |
-| TS-15 aggregation consume | Non-sink child TS-00 scheduling | Durable continuation authority incomplete |
+| Completed aggregation/coalesce result receipt | TS-15 consume plus TS-17/TS-18 successor publication | Restore derives the exact child/merged token from the durable receipt and completes the barrier without plugin/merge replay; deployment-profile process proof remains required |
 | Plugin return or visible side effect | Terminal node-state audit | Ordinary transform process-death proof incomplete |
 | Before/after sink-effect reservation | Preparation claim and target inspection | Deterministic reservation and generation-fenced preparation ownership must be reusable after restart |
 | Preparation claim / target inspection | Immutable plan CAS | Death or takeover must not bind a plan from a stale preparation generation |

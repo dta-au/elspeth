@@ -443,6 +443,7 @@ def _make_processor(
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,
         barrier_restore_reads=factory.barrier_restore,
+        payload_store=factory.payload_store,
         telemetry_manager=telemetry_manager,
         sink_names=sink_names,
         scheduler=factory.scheduler if scheduler is _DEFAULT_SCHEDULER else scheduler,
@@ -2997,10 +2998,9 @@ class TestAggregationFailureMatrix:
             patch.object(processor._aggregation_executor, "accept_adopted_row", side_effect=accept_side_effect),
             patch.object(processor._aggregation_executor, "check_flush_status", return_value=(True, TriggerType.COUNT)),
             patch.object(processor._aggregation_executor, "execute_flush", side_effect=execute_flush_side_effect),
-            patch.object(factory.data_flow, "record_token_outcome") as record_outcome,
             patch.object(processor, "_emit_transform_completed"),
             patch.object(processor, "_emit_token_completed"),
-            patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")),
+            patch.object(processor._token_manager, "expand_token", return_value=([], "expand-group-1")) as expand_token,
         ):
             results = processor.process_row(
                 row_index=1,
@@ -3022,11 +3022,11 @@ class TestAggregationFailureMatrix:
         triggering_token_id = captured["token"].token_id
         recorded = [
             (
-                call.kwargs["ref"].token_id,
-                call.kwargs["outcome"],
-                call.kwargs["path"],
+                disposition.parent_ref.token_id,
+                disposition.outcome,
+                disposition.path,
             )
-            for call in record_outcome.call_args_list
+            for disposition in expand_token.call_args.kwargs["aggregation_parent_dispositions"]
         ]
         assert (triggering_token_id, TerminalOutcome.FAILURE, TerminalPath.QUARANTINED_AT_SOURCE) in recorded
         assert (triggering_token_id, TerminalOutcome.TRANSIENT, TerminalPath.BATCH_CONSUMED) not in recorded
@@ -3366,10 +3366,9 @@ class TestTransformModeOutcomeOrdering:
 
     def test_parent_terminal_outcome_recorder_failure_raises_audit_integrity_error(self) -> None:
         """Recorder failure after expansion must surface as audit corruption, not a raw DB error."""
-        _db, factory, processor, transform, agg_node = self._setup_batch_processor()
+        _db, _factory, processor, transform, agg_node = self._setup_batch_processor()
         first_token = make_token_info(row_id="row-a", token_id="token-a", data={"value": 10})
         second_token = make_token_info(row_id="row-b", token_id="token-b", data={"value": 20})
-        child_token = make_token_info(row_id="row-child", token_id="token-child", data={"value": 999})
         fctx = _FlushContext(
             node_id=agg_node,
             transform=transform,
@@ -3401,15 +3400,10 @@ class TestTransformModeOutcomeOrdering:
             patch.object(
                 processor._token_manager,
                 "expand_token",
-                return_value=([child_token], "expand-group-1"),
-            ),
-            patch.object(
-                factory.data_flow,
-                "record_token_outcome",
                 side_effect=LandscapeRecordError("audit DB down"),
             ),
             patch.object(processor, "_emit_token_completed"),
-            pytest.raises(AuditIntegrityError, match="Failed to record batch parent terminal outcome") as exc_info,
+            pytest.raises(AuditIntegrityError, match="Failed to atomically record aggregation expansion") as exc_info,
         ):
             processor._route_transform_results(fctx, flush_result)
 

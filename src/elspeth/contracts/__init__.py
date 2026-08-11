@@ -141,7 +141,16 @@ from elspeth.contracts.data import (
     validate_row,
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
-from elspeth.contracts.engine import BufferEntry, CoalesceParentCompletion, PendingOutcome, RetryPolicy
+from elspeth.contracts.engine import (
+    AggregationParentDisposition,
+    BufferEntry,
+    CoalesceParentCompletion,
+    CommittedAggregationChild,
+    CommittedAggregationResidual,
+    CommittedCoalesceResidual,
+    PendingOutcome,
+    RetryPolicy,
+)
 from elspeth.contracts.enums import (
     AuditCharacteristic,
     BackpressureMode,
@@ -546,8 +555,12 @@ __all__ = [  # Grouped by category for readability
     "check_compatibility",
     "validate_row",
     # engine
+    "AggregationParentDisposition",
     "BufferEntry",
     "CoalesceParentCompletion",
+    "CommittedAggregationChild",
+    "CommittedAggregationResidual",
+    "CommittedCoalesceResidual",
     "PendingOutcome",
     "RetryPolicy",
     # payload_store
