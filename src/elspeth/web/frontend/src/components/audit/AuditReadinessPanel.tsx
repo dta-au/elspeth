@@ -32,6 +32,7 @@ import { ReadinessRowDetail } from "./ReadinessRowDetail";
 import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
 import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
+import { matchingAuditReadinessSnapshot } from "./auditReadinessFreshness";
 
 /** Glyph + accessible label for each row status. */
 function statusGlyph(status: ReadinessStatus): { glyph: string; aria: string } {
@@ -254,22 +255,37 @@ function projectMatchingSnapshotToExecution(
   if (
     activeSessionId !== sessionId ||
     activeVersion !== compositionVersion ||
-    currentSnapshot?.composition_version !== compositionVersion
+    matchingAuditReadinessSnapshot(
+      currentSnapshot,
+      sessionId,
+      compositionVersion,
+    ) === undefined
   ) {
     return;
   }
   setValidationResult(validationResultFromSnapshot(currentSnapshot));
 }
 
-export function AuditReadinessPanel() {
+interface AuditReadinessPanelProps {
+  onSelectComponent?: (componentId: string) => void;
+}
+
+export function AuditReadinessPanel({
+  onSelectComponent,
+}: AuditReadinessPanelProps = {}) {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
 
   const currentCompositionVersion = compositionState?.version ?? null;
   const snapshot = useAuditReadinessStore((s) => {
-    if (!activeSessionId || currentCompositionVersion === null) return undefined;
-    const cached = s.snapshotsBySession[activeSessionId];
-    return cached?.composition_version === currentCompositionVersion ? cached : undefined;
+    const cached = activeSessionId
+      ? s.snapshotsBySession[activeSessionId]
+      : undefined;
+    return matchingAuditReadinessSnapshot(
+      cached,
+      activeSessionId,
+      currentCompositionVersion,
+    );
   });
   const isLoading = useAuditReadinessStore((s) =>
     activeSessionId ? !!s.isLoadingBySession[activeSessionId] : false,
@@ -656,6 +672,7 @@ export function AuditReadinessPanel() {
           validationErrors={
             selectedRowId === "validation" ? snapshot.validation_result.errors : undefined
           }
+          onSelectComponent={onSelectComponent}
           onClose={() => setSelectedRowId(null)}
         />
       )}

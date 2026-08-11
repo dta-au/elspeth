@@ -129,7 +129,13 @@ function buildValidationComponentNames(
   return componentNames;
 }
 
-export function SideRailValidationBanner(): JSX.Element | null {
+interface ComponentNavigationProps {
+  onSelectComponent?: (componentId: string) => void;
+}
+
+export function SideRailValidationBanner({
+  onSelectComponent,
+}: ComponentNavigationProps = {}): JSX.Element | null {
   const compositionState = useSessionStore((s) => s.compositionState);
   const validationResult = useExecutionStore((s) => s.validationResult);
   const error = useExecutionStore((s) => s.error);
@@ -148,6 +154,10 @@ export function SideRailValidationBanner(): JSX.Element | null {
         componentId,
       )
     ) {
+      if (onSelectComponent !== undefined) {
+        onSelectComponent(componentId);
+        return;
+      }
       useSessionStore.getState().selectNode(componentId);
       window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT));
     }

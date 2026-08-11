@@ -37,10 +37,16 @@ export interface ReadinessRowDetailProps {
    *  engine-grade dumps never render raw on this novice surface. Absent for
    *  every other row (which carry display-ready backend prose). */
   validationErrors?: readonly ValidationError[];
+  onSelectComponent?: (componentId: string) => void;
   onClose: () => void;
 }
 
-export function ReadinessRowDetail({ row, validationErrors, onClose }: ReadinessRowDetailProps) {
+export function ReadinessRowDetail({
+  row,
+  validationErrors,
+  onSelectComponent,
+  onClose,
+}: ReadinessRowDetailProps) {
   const compositionState = useSessionStore((s) => s.compositionState);
   const selectNode = useSessionStore((s) => s.selectNode);
   const labelId = useId();
@@ -77,6 +83,10 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
   }, []);
 
   function handleJump(componentId: string) {
+    if (onSelectComponent !== undefined) {
+      onSelectComponent(componentId);
+      return;
+    }
     selectNode(componentId);
     // P0.3: GraphModal is mounted unconditionally at App.tsx near the
     // app root, so this CustomEvent always reaches its listener — the

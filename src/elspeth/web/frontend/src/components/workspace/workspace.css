@@ -51,6 +51,61 @@
   flex: 0 0 auto;
 }
 
+.workspace-action-bar {
+  position: sticky;
+  z-index: 3;
+  bottom: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+  border-top: 1px solid var(--color-border, currentcolor);
+  background: var(--color-surface, Canvas);
+}
+
+.workspace-status-controls,
+.workspace-more-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.workspace-status-control {
+  display: inline-flex;
+  gap: 0.375rem;
+  align-items: center;
+}
+
+.workspace-status-control[data-tone="busy"],
+.workspace-status-control[data-tone="warning"] {
+  border-color: var(--color-warning, currentcolor);
+}
+
+.workspace-status-control[data-tone="error"] {
+  border-color: var(--color-error, currentcolor);
+}
+
+.workspace-more-actions {
+  position: relative;
+}
+
+.workspace-more-actions-menu {
+  position: absolute;
+  z-index: 5;
+  right: 0;
+  bottom: calc(100% + 0.25rem);
+  display: grid;
+  gap: 0.25rem;
+  min-width: 12rem;
+  padding: 0.5rem;
+  border: 1px solid var(--color-border, currentcolor);
+  border-radius: var(--radius-md, 0.375rem);
+  background: var(--color-surface, Canvas);
+  box-shadow: 0 0.25rem 1rem rgb(0 0 0 / 20%);
+}
+
 .workspace-collapse-control {
   align-self: flex-end;
   flex: 0 0 auto;
@@ -139,7 +194,7 @@
 .workspace-inspector-slot {
   position: absolute;
   z-index: 4;
-  inset: 0 0 0 auto;
+  inset: 0 0 0 var(--authoring-pane-width);
   min-width: 0;
   min-height: 0;
   pointer-events: none;
@@ -147,6 +202,60 @@
 
 .workspace-inspector-slot > * {
   pointer-events: auto;
+}
+
+.composer-workspace[data-authoring-collapsed="true"]
+  .workspace-inspector-slot,
+.composer-workspace[data-layout-mode="narrow"] .workspace-inspector-slot {
+  left: 0;
+}
+
+.workspace-inspector {
+  position: absolute;
+  inset: 0 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  width: min(32rem, 100%);
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--color-border, currentcolor);
+  background: var(--color-surface, Canvas);
+}
+
+.workspace-inspector--overlay {
+  box-shadow: -0.5rem 0 1.5rem rgb(0 0 0 / 24%);
+}
+
+.workspace-inspector-header,
+.workspace-inspector-tabs {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0.5rem;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.5rem;
+}
+
+.workspace-inspector-header {
+  border-bottom: 1px solid var(--color-border, currentcolor);
+}
+
+.workspace-inspector-tabs {
+  justify-content: flex-start;
+  border-bottom: 1px solid var(--color-border, currentcolor);
+}
+
+.workspace-inspector-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  padding: 0.5rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.workspace-inspector-body > [role="tabpanel"] {
+  min-width: 0;
 }
 
 .composer-workspace[data-layout-mode="narrow"] {
@@ -194,7 +303,9 @@
 .composer-workspace .workspace-artifact-slot[hidden],
 .composer-workspace .workspace-separator-slot[hidden],
 .composer-workspace .workspace-authoring-pane[hidden],
-.composer-workspace .workspace-artifact-pane[hidden] {
+.composer-workspace .workspace-artifact-pane[hidden],
+.composer-workspace .workspace-inspector[hidden],
+.composer-workspace .workspace-inspector-body > [role="tabpanel"][hidden] {
   display: none;
 }
 

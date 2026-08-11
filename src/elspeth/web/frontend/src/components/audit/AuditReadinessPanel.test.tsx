@@ -325,6 +325,22 @@ describe("AuditReadinessPanel", () => {
     expect(screen.queryByRole("button", { name: /Audit ready/i })).not.toBeInTheDocument();
   });
 
+  it("does not render a version-matching snapshot belonging to another session", () => {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: {
+        [SESSION_ID]: {
+          ...allGreenSnapshot(1),
+          session_id: OTHER_SESSION_ID,
+        },
+      },
+    });
+    render(<AuditReadinessPanel />);
+
+    expect(
+      screen.queryByRole("button", { name: /Audit ready/i }),
+    ).not.toBeInTheDocument();
+  });
+
   it("projects an OK validation row into the execution validation state", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
