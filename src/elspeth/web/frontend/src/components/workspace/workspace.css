@@ -147,6 +147,18 @@
   pointer-events: auto;
 }
 
+/* Component display rules outrank the user-agent [hidden] rule. Keep this
+   scoped override after every base display declaration so collapsed/inactive
+   workspace surfaces retain their React state without participating in layout. */
+.composer-workspace .workspace-view-tabs[hidden],
+.composer-workspace .workspace-authoring-slot[hidden],
+.composer-workspace .workspace-artifact-slot[hidden],
+.composer-workspace .workspace-separator-slot[hidden],
+.composer-workspace .workspace-authoring-pane[hidden],
+.composer-workspace .workspace-artifact-pane[hidden] {
+  display: none;
+}
+
 @media (width < 960px) {
   .composer-workspace,
   .composer-workspace[data-authoring-collapsed="true"] {

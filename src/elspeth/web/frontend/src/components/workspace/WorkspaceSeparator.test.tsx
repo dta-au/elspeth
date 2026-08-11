@@ -58,6 +58,21 @@ function renderSeparator(overrides: {
   };
 }
 
+function installPointerCapture(
+  separator: HTMLElement,
+  captured = true,
+): {
+  setPointerCapture: ReturnType<typeof vi.fn>;
+  releasePointerCapture: ReturnType<typeof vi.fn>;
+} {
+  const setPointerCapture = vi.fn();
+  const releasePointerCapture = vi.fn();
+  separator.setPointerCapture = setPointerCapture;
+  separator.hasPointerCapture = vi.fn(() => captured);
+  separator.releasePointerCapture = releasePointerCapture;
+  return { setPointerCapture, releasePointerCapture };
+}
+
 describe("WorkspaceSeparator", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -129,10 +144,8 @@ describe("WorkspaceSeparator", () => {
   it("captures the pointer and batches moves to the latest clamped width", () => {
     const raf = installRafHarness();
     const { separator, onResize, onResizeEnd } = renderSeparator();
-    const setPointerCapture = vi.fn();
-    const releasePointerCapture = vi.fn();
-    separator.setPointerCapture = setPointerCapture;
-    separator.releasePointerCapture = releasePointerCapture;
+    const { setPointerCapture, releasePointerCapture } =
+      installPointerCapture(separator);
 
     fireEvent.pointerDown(separator, { pointerId: 7, clientX: 100 });
     fireEvent.pointerMove(separator, { pointerId: 7, clientX: 120 });
@@ -154,8 +167,7 @@ describe("WorkspaceSeparator", () => {
   it("flushes a queued final move on pointer-up without reading stale React state", () => {
     const raf = installRafHarness();
     const { separator, onResize, onResizeEnd } = renderSeparator();
-    separator.setPointerCapture = vi.fn();
-    separator.releasePointerCapture = vi.fn();
+    installPointerCapture(separator);
 
     fireEvent.pointerDown(separator, { pointerId: 2, clientX: 100 });
     fireEvent.pointerMove(separator, { pointerId: 2, clientX: 164 });
@@ -171,8 +183,7 @@ describe("WorkspaceSeparator", () => {
   it("commits the latest explicit width on pointer-cancel", () => {
     installRafHarness();
     const { separator, onResize, onResizeEnd } = renderSeparator();
-    separator.setPointerCapture = vi.fn();
-    separator.releasePointerCapture = vi.fn();
+    installPointerCapture(separator);
 
     fireEvent.pointerDown(separator, { pointerId: 9, clientX: 300 });
     fireEvent.pointerMove(separator, { pointerId: 9, clientX: 260 });
@@ -180,5 +191,189 @@ describe("WorkspaceSeparator", () => {
 
     expect(onResize).toHaveBeenCalledExactlyOnceWith(380);
     expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(380);
+  });
+
+  it("reclamps a published drag when the maximum shrinks before pointer-up", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    separator.setPointerCapture = vi.fn();
+    separator.hasPointerCapture = vi.fn(() => true);
+    separator.releasePointerCapture = vi.fn();
+
+    fireEvent.pointerDown(separator, { pointerId: 10, clientX: 100 });
+    fireEvent.pointerMove(separator, { pointerId: 10, clientX: 400 });
+    act(() => raf.flush());
+    expect(onResize.mock.calls).toEqual([[640]]);
+
+    view.rerender(
+      <WorkspaceSeparator
+        value={640}
+        min={360}
+        max={460}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    fireEvent.pointerUp(separator, { pointerId: 10, clientX: 400 });
+
+    expect(onResize.mock.calls).toEqual([[640], [460]]);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(460);
+    expect(separator.releasePointerCapture).toHaveBeenCalledWith(10);
+  });
+
+  it("cancels a queued frame and reclamps its width when bounds change", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    separator.setPointerCapture = vi.fn();
+    separator.hasPointerCapture = vi.fn(() => true);
+    separator.releasePointerCapture = vi.fn();
+
+    fireEvent.pointerDown(separator, { pointerId: 11, clientX: 100 });
+    fireEvent.pointerMove(separator, { pointerId: 11, clientX: 20 });
+    expect(raf.queuedCount()).toBe(1);
+
+    view.rerender(
+      <WorkspaceSeparator
+        value={420}
+        min={500}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+
+    expect(raf.queuedCount()).toBe(0);
+    act(() => raf.flush());
+    expect(onResize).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(separator, { pointerId: 11, clientX: 20 });
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(500);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(500);
+  });
+
+  it("finalizes a queued drag after disable without a stale frame publication", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    separator.setPointerCapture = vi.fn();
+    separator.hasPointerCapture = vi.fn(() => true);
+    separator.releasePointerCapture = vi.fn();
+
+    fireEvent.pointerDown(separator, { pointerId: 12, clientX: 100 });
+    fireEvent.pointerMove(separator, { pointerId: 12, clientX: 180 });
+    expect(raf.queuedCount()).toBe(1);
+
+    view.rerender(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+
+    expect(raf.queuedCount()).toBe(0);
+    act(() => raf.flush());
+    expect(onResize).not.toHaveBeenCalled();
+
+    fireEvent.pointerUp(separator, { pointerId: 12, clientX: 180 });
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(500);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(500);
+    expect(separator.releasePointerCapture).toHaveBeenCalledWith(12);
+    act(() => raf.flush());
+    expect(onResize).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans up pointer-cancel after disable when capture was implicitly lost", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    separator.setPointerCapture = vi.fn();
+    separator.hasPointerCapture = vi.fn(() => false);
+    separator.releasePointerCapture = vi.fn(() => {
+      throw new DOMException("capture already released", "NotFoundError");
+    });
+
+    fireEvent.pointerDown(separator, { pointerId: 13, clientX: 300 });
+    fireEvent.pointerMove(separator, { pointerId: 13, clientX: 260 });
+    view.rerender(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+
+    expect(() => {
+      fireEvent.pointerCancel(separator, { pointerId: 13 });
+    }).not.toThrow();
+    expect(raf.queuedCount()).toBe(0);
+    expect(onResize).toHaveBeenCalledExactlyOnceWith(380);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(380);
+    expect(separator.releasePointerCapture).not.toHaveBeenCalled();
+
+    fireEvent.pointerCancel(separator, { pointerId: 13 });
+    expect(onResizeEnd).toHaveBeenCalledTimes(1);
   });
 });
