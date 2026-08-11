@@ -548,9 +548,10 @@ without leaving the conversation.
   **Restore authoring pane** reopens it; the collapsed control continues to
   report busy, error, or unread authoring status.
 - Use **Graph**, **Spec**, **YAML**, and **Run** to switch the persistent
-  pipeline view. Graph shows the pipeline structure, Spec summarizes its
-  components and configuration, YAML provides the current export controls, and
-  Run shows current or recent execution results.
+  pipeline view. Graph shows the pipeline structure; Spec and YAML become
+  available once the pipeline has content. Spec summarizes its components and
+  configuration, YAML provides the current export controls, and Run shows
+  current or recent execution results.
 - Select the **Validation** or **Audit** status in the workspace action bar to
   open the Inspector. Guided sessions also show a **History** tab when completed
   decisions are available. Close the Inspector to return focus to the status
