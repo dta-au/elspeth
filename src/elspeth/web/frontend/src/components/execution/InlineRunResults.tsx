@@ -218,6 +218,11 @@ export interface InlineRunResultsProps {
   showEmptyState?: boolean;
 }
 
+interface InitialRunLoadState {
+  sessionId: string | null;
+  settled: boolean;
+}
+
 export function InlineRunResults({
   showEmptyState = false,
 }: InlineRunResultsProps = {}): JSX.Element | null {
@@ -228,10 +233,33 @@ export function InlineRunResults({
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const [showHistory, setShowHistory] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [initialRunLoad, setInitialRunLoad] = useState<InitialRunLoadState>(
+    () => ({
+      sessionId: activeSessionId,
+      settled: activeSessionId === null,
+    }),
+  );
 
   useEffect(() => {
-    if (!activeSessionId) return;
-    void loadRuns(activeSessionId);
+    if (!activeSessionId) {
+      setInitialRunLoad({ sessionId: null, settled: true });
+      return;
+    }
+    const sessionId = activeSessionId;
+    let cancelled = false;
+    setInitialRunLoad({ sessionId, settled: false });
+    const settle = (): void => {
+      if (cancelled) return;
+      setInitialRunLoad((current) =>
+        current.sessionId === sessionId
+          ? { sessionId, settled: true }
+          : current,
+      );
+    };
+    void loadRuns(sessionId).then(settle, settle);
+    return () => {
+      cancelled = true;
+    };
   }, [activeSessionId, loadRuns]);
 
   const visibleRuns = activeSessionId
@@ -283,8 +311,18 @@ export function InlineRunResults({
     progressBelongsToActiveRun ? progress : null,
     displayRun,
   );
+  const currentSessionHistorySettled =
+    activeSessionId === null ||
+    (initialRunLoad.sessionId === activeSessionId && initialRunLoad.settled);
 
   if (!showProgress && !outputRunId && !hasDrawerRuns) {
+    if (showEmptyState && !currentSessionHistorySettled) {
+      return (
+        <p className="artifact-empty" role="status" aria-live="polite">
+          Loading runs…
+        </p>
+      );
+    }
     return showEmptyState ? (
       <p className="artifact-empty">No runs yet.</p>
     ) : null;

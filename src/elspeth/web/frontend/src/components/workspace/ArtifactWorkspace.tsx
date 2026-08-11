@@ -2,6 +2,7 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useInsertionEffect,
   useLayoutEffect,
   useRef,
   useState,
@@ -34,6 +35,77 @@ interface Announcement {
   message: string;
 }
 
+interface CommittedArtifactController {
+  sessionId: string | null;
+  availableTabs: readonly ArtifactTab[];
+  selectArtifactTab: (tab: ArtifactTab) => void;
+}
+
+const REQUEST_DETAIL_KEYS = new Set<PropertyKey>([
+  "tab",
+  "focusMode",
+  "sessionId",
+]);
+
+function isPlainRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function admitArtifactRequest(event: Event): RequestArtifactViewDetail | null {
+  try {
+    if (!(event instanceof CustomEvent)) return null;
+    const detail: unknown = event.detail;
+    if (!isPlainRecord(detail)) return null;
+    const keys = Reflect.ownKeys(detail);
+    if (
+      keys.length !== REQUEST_DETAIL_KEYS.size ||
+      !keys.every((key) => REQUEST_DETAIL_KEYS.has(key))
+    ) {
+      return null;
+    }
+
+    const descriptors = Object.getOwnPropertyDescriptors(detail);
+    const tabDescriptor = descriptors.tab;
+    const focusModeDescriptor = descriptors.focusMode;
+    const sessionIdDescriptor = descriptors.sessionId;
+    if (
+      tabDescriptor === undefined ||
+      !("value" in tabDescriptor) ||
+      focusModeDescriptor === undefined ||
+      !("value" in focusModeDescriptor) ||
+      sessionIdDescriptor === undefined ||
+      !("value" in sessionIdDescriptor)
+    ) {
+      return null;
+    }
+
+    const tab: unknown = tabDescriptor.value;
+    const focusMode: unknown = focusModeDescriptor.value;
+    const sessionId: unknown = sessionIdDescriptor.value;
+    if (
+      typeof tab !== "string" ||
+      !(ARTIFACT_TABS as readonly string[]).includes(tab) ||
+      typeof focusMode !== "boolean" ||
+      (typeof sessionId !== "string" && sessionId !== null)
+    ) {
+      return null;
+    }
+    return {
+      tab: tab as ArtifactTab,
+      focusMode,
+      sessionId,
+    };
+  } catch {
+    // Ambient event payloads may be adversarial proxies. Admission failure is
+    // inert; it must not escape through the window event listener.
+    return null;
+  }
+}
+
 function activeArtifact(tab: ArtifactTab): JSX.Element {
   switch (tab) {
     case "graph":
@@ -49,6 +121,14 @@ function activeArtifact(tab: ArtifactTab): JSX.Element {
 
 export function ArtifactWorkspace(): JSX.Element {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
+  return <ArtifactWorkspaceSurface activeSessionId={activeSessionId} />;
+}
+
+export function ArtifactWorkspaceSurface({
+  activeSessionId,
+}: {
+  activeSessionId: string | null;
+}): JSX.Element {
   const { state, actions } = useWorkspacePaneController();
   const { activeArtifactTab, availableArtifactTabs } = state;
   const tabRefs = useRef<Record<ArtifactTab, HTMLButtonElement | null>>({
@@ -61,15 +141,25 @@ export function ArtifactWorkspace(): JSX.Element {
   const previousActiveTabRef = useRef(activeArtifactTab);
   const priorActiveOwnedFocusRef = useRef(false);
   const mountedRef = useRef(false);
-  const activeSessionIdRef = useRef(activeSessionId);
+  const committedControllerRef = useRef<CommittedArtifactController>({
+    sessionId: activeSessionId,
+    availableTabs: availableArtifactTabs,
+    selectArtifactTab: actions.selectArtifactTab,
+  });
   const [announcement, setAnnouncement] = useState<Announcement>({
     id: 0,
     message: "",
   });
 
-  activeSessionIdRef.current = activeSessionId;
+  useInsertionEffect(() => {
+    committedControllerRef.current = {
+      sessionId: activeSessionId,
+      availableTabs: availableArtifactTabs,
+      selectArtifactTab: actions.selectArtifactTab,
+    };
+  }, [actions.selectArtifactTab, activeSessionId, availableArtifactTabs]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
@@ -85,22 +175,23 @@ export function ArtifactWorkspace(): JSX.Element {
 
   const selectAndFocus = useCallback(
     (requested: ArtifactTab): ArtifactTab => {
-      const selected = availableArtifactTabs.includes(requested)
+      const committed = committedControllerRef.current;
+      const selected = committed.availableTabs.includes(requested)
         ? requested
         : "graph";
-      actions.selectArtifactTab(requested);
+      committed.selectArtifactTab(requested);
       tabRefs.current[selected]?.focus({ preventScroll: true });
       if (selected !== requested) announceFallback(requested);
       return selected;
     },
-    [actions, announceFallback, availableArtifactTabs],
+    [announceFallback],
   );
 
   const queueGraphModal = useCallback((sessionId: string | null): void => {
     queueMicrotask(() => {
       if (
         mountedRef.current &&
-        activeSessionIdRef.current === sessionId
+        committedControllerRef.current.sessionId === sessionId
       ) {
         window.dispatchEvent(new Event(OPEN_GRAPH_MODAL_EVENT));
       }
@@ -108,17 +199,23 @@ export function ArtifactWorkspace(): JSX.Element {
   }, []);
 
   const focusGraph = useCallback((): void => {
+    const sessionId = committedControllerRef.current.sessionId;
     selectAndFocus("graph");
-    queueGraphModal(activeSessionId);
-  }, [activeSessionId, queueGraphModal, selectAndFocus]);
+    queueGraphModal(sessionId);
+  }, [queueGraphModal, selectAndFocus]);
 
   useEffect(() => {
     const handleRequest = (event: Event): void => {
-      const request = event as CustomEvent<RequestArtifactViewDetail>;
-      if (request.detail.sessionId !== activeSessionId) return;
-      selectAndFocus(request.detail.tab);
-      if (request.detail.tab === "graph" && request.detail.focusMode) {
-        queueGraphModal(activeSessionId);
+      const request = admitArtifactRequest(event);
+      if (
+        request === null ||
+        request.sessionId !== committedControllerRef.current.sessionId
+      ) {
+        return;
+      }
+      selectAndFocus(request.tab);
+      if (request.tab === "graph" && request.focusMode) {
+        queueGraphModal(request.sessionId);
       }
     };
     const handleLegacyYamlRequest = (): void => {
@@ -131,7 +228,7 @@ export function ArtifactWorkspace(): JSX.Element {
       window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handleRequest);
       window.removeEventListener(OPEN_YAML_MODAL_EVENT, handleLegacyYamlRequest);
     };
-  }, [activeSessionId, queueGraphModal, selectAndFocus]);
+  }, [queueGraphModal, selectAndFocus]);
 
   useLayoutEffect(() => {
     const previousActiveTab = previousActiveTabRef.current;
@@ -237,20 +334,31 @@ export function ArtifactWorkspace(): JSX.Element {
       >
         {announcement.message}
       </p>
-      <div
-        ref={panelRef}
-        className="artifact-workspace-panel"
-        role="tabpanel"
-        id={`artifact-panel-${activeArtifactTab}`}
-        aria-labelledby={`artifact-tab-${activeArtifactTab}`}
-      >
-        <ErrorBoundary
-          key={`${activeSessionId ?? "no-session"}:${activeArtifactTab}`}
-          label={`${activeLabel} artifact`}
-        >
-          {activeArtifact(activeArtifactTab)}
-        </ErrorBoundary>
-      </div>
+      {ARTIFACT_TABS.map((tab) => {
+        const active = tab === activeArtifactTab;
+        return (
+          <div
+            key={tab}
+            ref={active ? panelRef : undefined}
+            className="artifact-workspace-panel"
+            role="tabpanel"
+            id={`artifact-panel-${tab}`}
+            aria-labelledby={`artifact-tab-${tab}`}
+            aria-hidden={!active || undefined}
+            hidden={!active}
+            {...(!active ? { inert: "" } : {})}
+          >
+            {active && (
+              <ErrorBoundary
+                key={`${activeSessionId ?? "no-session"}:${tab}`}
+                label={`${activeLabel} artifact`}
+              >
+                {activeArtifact(tab)}
+              </ErrorBoundary>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

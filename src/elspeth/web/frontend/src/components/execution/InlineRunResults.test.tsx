@@ -22,6 +22,18 @@ vi.mock("@/components/composer/NarrativeResults", () => ({
   NarrativeResults: () => <div data-testid="narrative-results-stub" />,
 }));
 
+const productionLoadRuns = useExecutionStore.getState().loadRuns;
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("InlineRunResults", () => {
   beforeEach(() => {
     _resetNarrativeModeCacheForTesting();
@@ -73,6 +85,7 @@ describe("InlineRunResults", () => {
       isExecuting: false,
       wsDisconnected: false,
       error: null,
+      loadRuns: productionLoadRuns,
     } as never);
     useSessionStore.setState({
       activeSessionId: "sess-1",
@@ -85,9 +98,99 @@ describe("InlineRunResults", () => {
   });
 
   it("renders the artifact empty state only when explicitly requested", () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue(undefined),
+    } as never);
     render(<InlineRunResults showEmptyState />);
 
+    return waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+    });
+  });
+
+  it("shows neutral loading until the current session's empty history settles", async () => {
+    const history = deferred<void>();
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockReturnValue(history.promise),
+    } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toHaveClass("artifact-empty");
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve();
+      await history.promise;
+    });
     expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+  });
+
+  it("renders loaded history without flashing the empty state", async () => {
+    const history = deferred<void>();
+    const loadRuns = vi.fn(async () => {
+      await history.promise;
+      useExecutionStore.setState({
+        runs: [
+          { id: "run-loaded", session_id: "sess-1", status: "completed" },
+        ],
+      } as never);
+    });
+    useExecutionStore.setState({ loadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await act(async () => {
+      history.resolve();
+      await history.promise;
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("run-outputs-stub")).toHaveAttribute(
+        "data-run-id",
+        "run-loaded",
+      );
+    });
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+  });
+
+  it("settles to the honest empty state when the store absorbs a history rejection", async () => {
+    vi.spyOn(apiClient, "fetchRuns").mockRejectedValue(new Error("offline"));
+    useExecutionStore.setState({ loadRuns: productionLoadRuns } as never);
+
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    await waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toBeInTheDocument();
+    });
+  });
+
+  it("does not let a stale session load mark the new session as settled", async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const loadRuns = vi.fn((sessionId: string) =>
+      sessionId === "sess-1" ? first.promise : second.promise,
+    );
+    useExecutionStore.setState({ loadRuns } as never);
+    render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({ activeSessionId: "sess-2" } as never);
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    await act(async () => {
+      first.resolve();
+      await first.promise;
+    });
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      second.resolve();
+      await second.promise;
+    });
+    expect(screen.getByText("No runs yet.")).toBeInTheDocument();
   });
 
   it("renders ProgressView for an active running run", () => {
