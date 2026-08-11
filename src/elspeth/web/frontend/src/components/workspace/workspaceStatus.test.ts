@@ -98,6 +98,7 @@ describe("workspace status projections", () => {
         activeSessionId: SESSION_ID,
         compositionVersion: 4,
         snapshotsBySession: snapshots,
+        errorBySession: {},
       }),
     ).toEqual({
       text: "Ready",
@@ -109,6 +110,7 @@ describe("workspace status projections", () => {
         activeSessionId: SESSION_ID,
         compositionVersion: 5,
         snapshotsBySession: snapshots,
+        errorBySession: {},
       }),
     ).toMatchObject({ text: "Checking", tone: "busy" });
     expect(
@@ -118,8 +120,27 @@ describe("workspace status projections", () => {
         snapshotsBySession: {
           [SESSION_ID]: auditSnapshot({ session_id: "session-2" }),
         },
+        errorBySession: {},
       }),
     ).toMatchObject({ text: "Checking", tone: "busy" });
+  });
+
+  it("projects an audit identity error as Checking even while a matching cache exists", () => {
+    expect(
+      projectAuditWorkspaceStatus({
+        activeSessionId: SESSION_ID,
+        compositionVersion: 4,
+        snapshotsBySession: { [SESSION_ID]: auditSnapshot() },
+        errorBySession: {
+          [SESSION_ID]:
+            "Audit readiness response did not match the requested composition.",
+        },
+      }),
+    ).toEqual({
+      text: "Checking",
+      tone: "busy",
+      accessibleLabel: "Audit: Checking",
+    });
   });
 
   it("counts warning and error audit rows as issues only on a fresh snapshot", () => {
@@ -157,6 +178,7 @@ describe("workspace status projections", () => {
         activeSessionId: SESSION_ID,
         compositionVersion: 4,
         snapshotsBySession: { [SESSION_ID]: withIssues },
+        errorBySession: {},
       }),
     ).toEqual({
       text: "2 issues",

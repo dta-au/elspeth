@@ -1,4 +1,4 @@
-import { matchingAuditReadinessSnapshot } from "@/components/audit/auditReadinessFreshness";
+import { matchingAuditReadinessSnapshot } from "@/lib/auditReadinessFreshness";
 import type {
   AuditReadinessSnapshot,
   ValidationResult,
@@ -45,6 +45,7 @@ interface AuditWorkspaceStatusInputs {
   activeSessionId: string | null;
   compositionVersion: number | null;
   snapshotsBySession: Record<string, AuditReadinessSnapshot>;
+  errorBySession: Record<string, string | null>;
 }
 
 function auditStatus(
@@ -58,7 +59,14 @@ export function projectAuditWorkspaceStatus({
   activeSessionId,
   compositionVersion,
   snapshotsBySession,
+  errorBySession,
 }: AuditWorkspaceStatusInputs): WorkspaceStatus {
+  const error =
+    activeSessionId === null
+      ? null
+      : errorBySession[activeSessionId] ?? null;
+  if (error !== null) return auditStatus("Checking", "busy");
+
   const cached =
     activeSessionId === null
       ? undefined

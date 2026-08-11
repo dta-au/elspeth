@@ -17,7 +17,7 @@ import {
   fetchAuditReadiness,
   fetchAuditReadinessExplain,
 } from "../api/auditReadiness";
-import { matchingAuditReadinessSnapshot } from "../components/audit/auditReadinessFreshness";
+import { matchingAuditReadinessSnapshot } from "../lib/auditReadinessFreshness";
 import type {
   AuditReadinessSnapshot,
   AuditReadinessExplain,
@@ -122,7 +122,22 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
             return state;
           }
           const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
+          const current = state.snapshotsBySession[sessionId];
+          let snapshotsBySession = state.snapshotsBySession;
+          if (
+            current === cached &&
+            matchingAuditReadinessSnapshot(
+              current,
+              sessionId,
+              compositionVersion,
+            ) !== undefined
+          ) {
+            const { [sessionId]: _quarantined, ...restSnapshots } =
+              state.snapshotsBySession;
+            snapshotsBySession = restSnapshots;
+          }
           return {
+            snapshotsBySession,
             abortControllers: restCtrl,
             isLoadingBySession: {
               ...state.isLoadingBySession,

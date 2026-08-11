@@ -119,6 +119,65 @@ describe("useAuditReadinessStore", () => {
     expect(api.fetchAuditReadiness).toHaveBeenCalledTimes(2);
   });
 
+  it("quarantines a matching cache after a forced refresh identity failure and recovers on retry", async () => {
+    const cached = snapshot(4);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: cached },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce({
+      ...snapshot(4),
+      session_id: OTHER_SESSION_ID,
+    });
+
+    await useAuditReadinessStore
+      .getState()
+      .loadSnapshot(SESSION_ID, 4, { force: true });
+
+    let state = useAuditReadinessStore.getState();
+    expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+    expect(state.isLoadingBySession[SESSION_ID]).toBe(false);
+    expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+    expect(state.errorBySession[SESSION_ID]).toBe(
+      "Audit readiness response did not match the requested composition.",
+    );
+
+    vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(4));
+    await useAuditReadinessStore.getState().loadSnapshot(SESSION_ID, 4, {
+      force: true,
+    });
+
+    state = useAuditReadinessStore.getState();
+    expect(state.snapshotsBySession[SESSION_ID]).toEqual(snapshot(4));
+    expect(state.errorBySession[SESSION_ID]).toBeNull();
+  });
+
+  it("preserves a replacement cache when an older forced refresh fails identity validation", async () => {
+    const cached = snapshot(4);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: cached },
+    });
+    let resolve!: (value: AuditReadinessSnapshot) => void;
+    vi.mocked(api.fetchAuditReadiness).mockReturnValueOnce(
+      new Promise<AuditReadinessSnapshot>((done) => {
+        resolve = done;
+      }),
+    );
+
+    const refresh = useAuditReadinessStore
+      .getState()
+      .loadSnapshot(SESSION_ID, 4, { force: true });
+    const replacement = snapshot(5);
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { [SESSION_ID]: replacement },
+    });
+    resolve({ ...snapshot(4), session_id: OTHER_SESSION_ID });
+    await refresh;
+
+    expect(
+      useAuditReadinessStore.getState().snapshotsBySession[SESSION_ID],
+    ).toBe(replacement);
+  });
+
   it("loadSnapshot refetches when the version advances", async () => {
     vi.mocked(api.fetchAuditReadiness)
       .mockResolvedValueOnce(snapshot(1))

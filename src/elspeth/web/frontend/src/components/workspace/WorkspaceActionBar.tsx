@@ -69,6 +69,9 @@ export function WorkspaceActionBar({
   const snapshotsBySession = useAuditReadinessStore(
     (state) => state.snapshotsBySession,
   );
+  const auditErrorsBySession = useAuditReadinessStore(
+    (state) => state.errorBySession,
+  );
   const [menuOpen, setMenuOpen] = useState(false);
   const moreButtonRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -79,6 +82,7 @@ export function WorkspaceActionBar({
     activeSessionId,
     compositionVersion,
     snapshotsBySession,
+    errorBySession: auditErrorsBySession,
   });
   const hasSecondaryActions =
     capabilities.importYaml || capabilities.catalog;

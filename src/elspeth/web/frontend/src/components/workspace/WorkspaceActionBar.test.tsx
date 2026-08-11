@@ -109,6 +109,25 @@ describe("WorkspaceActionBar", () => {
     expect(openInspector).toHaveBeenLastCalledWith("audit");
   });
 
+  it("shows audit as Checking when the current readiness request has failed identity validation", () => {
+    useAuditReadinessStore.setState({
+      snapshotsBySession: { "session-1": freshAuditSnapshot() },
+      errorBySession: {
+        "session-1":
+          "Audit readiness response did not match the requested composition.",
+      },
+    });
+
+    renderActionBar({ completion: false, importYaml: false, catalog: false });
+
+    expect(
+      screen.getByRole("button", { name: "Audit: Checking" }),
+    ).toHaveTextContent("AuditChecking");
+    expect(
+      screen.queryByRole("button", { name: "Audit: Ready" }),
+    ).not.toBeInTheDocument();
+  });
+
   it.each([
     ["ordinary freeform", true, true, true],
     ["terminal guided", true, true, true],

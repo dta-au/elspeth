@@ -32,7 +32,7 @@ import { ReadinessRowDetail } from "./ReadinessRowDetail";
 import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
 import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
-import { matchingAuditReadinessSnapshot } from "./auditReadinessFreshness";
+import { matchingAuditReadinessSnapshot } from "@/lib/auditReadinessFreshness";
 
 /** Glyph + accessible label for each row status. */
 function statusGlyph(status: ReadinessStatus): { glyph: string; aria: string } {
@@ -409,7 +409,7 @@ export function AuditReadinessPanel({
     );
   }
 
-  if (error && !snapshot) {
+  if (error) {
     return (
       <section
         aria-label="Audit readiness"
