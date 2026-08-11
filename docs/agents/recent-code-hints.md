@@ -153,6 +153,25 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-12 — a long-running transform must re-prove scheduler ownership
+  before terminal audit writes**: `TransformExecutor` calls the processor's
+  rate-limited active-claim heartbeat immediately after plugin return or
+  exception and before node-state completion, transform-error/routing writes,
+  contract evolution, or result visibility. If recovery or eviction has moved
+  authority, `NodeStateGuard.abandon_open_state()` leaves that stale attempt
+  OPEN (the honest hard-kill image) and the ownership-loss exception must
+  propagate immediately; do not auto-fail, complete, or otherwise mutate the
+  stale attempt. The scheduler drain then clears any in-memory staged branch
+  losses and records only the canonical lease-loss evidence.
+- **2026-08-12 — sink-redrive recovery is admitted by the complete durable
+  bundle, not by `pending_sink_name` alone**: a `LEASED` row with any
+  sink-redrive field set is sink-shaped debt and must satisfy
+  `pending_sink_bundle_clause()` before it can return to `PENDING_SINK`.
+  Repeat the same subtype/bundle predicate inside the recovery CAS; the
+  diagnostic SELECT is not the safety boundary. A partial or concurrently
+  corrupted bundle fails closed and the whole recovery transaction rolls back
+  without rotating attempts, changing owners, or appending events.
+
 - **2026-08-11 — the AWS IAM policy templates and the deploy README's floor
   commit are both pinned; editing either without its sibling update is red**:
   `tests/unit/deployment/test_aws_iam_policy_oracles.py` now pins the exact set

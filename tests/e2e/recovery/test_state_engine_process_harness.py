@@ -50,6 +50,10 @@ def _fail_before_process_seam(_db: LandscapeDB) -> None:
     raise RuntimeError("deliberate child failure before readiness")
 
 
+def _reach_process_seam(_db: LandscapeDB) -> None:
+    """Module-level no-op proving a cooperative child can exit cleanly."""
+
+
 @pytest.mark.skipif(os.name != "posix", reason="SIGKILL exit-code oracle is POSIX-specific")
 def test_spawned_child_is_killed_at_named_seam_then_fresh_objects_resume(
     tmp_path: Path,
@@ -119,3 +123,21 @@ def test_readiness_failure_is_bounded_and_cleans_up_child(tmp_path: Path) -> Non
 
     assert child.closed is True
     assert child.is_alive is False
+
+
+def test_spawned_child_release_has_bounded_clean_exit(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'child-release.db'}"
+    db = LandscapeDB(database_url)
+    db.close()
+
+    with spawn_database_process_at_seam(
+        database_url=database_url,
+        seam="cooperative-release",
+        action=_reach_process_seam,
+    ) as child:
+        child.wait_until_ready(timeout=5.0)
+        child.release()
+        exit_status = child.wait_for_exit(timeout=5.0)
+
+    assert exit_status.exitcode == 0
+    assert exit_status.was_killed is False

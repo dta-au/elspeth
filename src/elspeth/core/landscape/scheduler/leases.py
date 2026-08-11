@@ -577,8 +577,8 @@ class SchedulerLeaseRepository:
         #
         # 1. PENDING_SINK ABA window. ``next_work_item_id`` for the
         #    PENDING_SINK-recovery branch is the row's existing
-        #    ``work_item_id`` (see below — ``pending_sink_name is not None``
-        #    keeps the work-item identity stable). Between this SELECT and
+        #    ``work_item_id`` (see below — a complete sink-redrive bundle keeps
+        #    the work-item identity stable). Between this SELECT and
         #    the per-row UPDATE, a peer reaper may have already returned the
         #    row to PENDING_SINK and a peer claimant may have leased it
         #    again with a fresh ``lease_expires_at``. Without the
@@ -605,12 +605,22 @@ class SchedulerLeaseRepository:
             token_work_items_table.c.lease_owner.is_(None),
             token_work_items_table.c.lease_owner != caller_owner,
         )
+        sink_redrive_shaped = or_(
+            token_work_items_table.c.pending_sink_name.is_not(None),
+            token_work_items_table.c.pending_outcome.is_not(None),
+            token_work_items_table.c.pending_path.is_not(None),
+            token_work_items_table.c.pending_error_hash.is_not(None),
+            token_work_items_table.c.pending_error_message.is_not(None),
+        )
+        complete_pending_sink_bundle = pending_sink_bundle_clause()
 
         with write_transaction as conn:
             expired_rows = conn.execute(
                 select(
                     token_work_items_table,
                     owner_registry_dead.label("owner_is_dead"),
+                    sink_redrive_shaped.label("_sink_redrive_shaped"),
+                    complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
                 )
                 .where(token_work_items_table.c.run_id == run_id)
                 .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
@@ -633,14 +643,14 @@ class SchedulerLeaseRepository:
 
             recovered = 0
             for row in expired:
-                pending_sink_name = row["pending_sink_name"]
-                next_attempt = row["attempt"] if pending_sink_name is not None else row["attempt"] + 1
+                is_sink_redrive = bool(row["_sink_redrive_shaped"])
+                if is_sink_redrive and not row["_pending_sink_bundle_complete"]:
+                    raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
+                next_attempt = row["attempt"] if is_sink_redrive else row["attempt"] + 1
                 next_work_item_id = (
-                    row["work_item_id"]
-                    if pending_sink_name is not None
-                    else work_item_id(run_id, row["token_id"], row["node_id"], next_attempt)
+                    row["work_item_id"] if is_sink_redrive else work_item_id(run_id, row["token_id"], row["node_id"], next_attempt)
                 )
-                recovered_status = TokenWorkStatus.PENDING_SINK.value if pending_sink_name is not None else TokenWorkStatus.READY.value
+                recovered_status = TokenWorkStatus.PENDING_SINK.value if is_sink_redrive else TokenWorkStatus.READY.value
                 result = conn.execute(
                     update(token_work_items_table)
                     .where(token_work_items_table.c.work_item_id == row["work_item_id"])
@@ -654,6 +664,11 @@ class SchedulerLeaseRepository:
                         )
                     )
                     .where(reap_eligible)
+                    # The diagnostic SELECT above is not the safety boundary.
+                    # Repeat the exact subtype admission inside the conditional
+                    # UPDATE so a same-transaction interleaving cannot turn a
+                    # transform into sink debt (or lease a malformed bundle).
+                    .where(complete_pending_sink_bundle if is_sink_redrive else ~sink_redrive_shaped)
                     .values(
                         work_item_id=next_work_item_id,
                         attempt=next_attempt,
@@ -663,6 +678,27 @@ class SchedulerLeaseRepository:
                         updated_at=now,
                     )
                 )
+                if result.rowcount == 0:
+                    current = (
+                        conn.execute(
+                            select(
+                                token_work_items_table.c.status,
+                                sink_redrive_shaped.label("_sink_redrive_shaped"),
+                                complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
+                            )
+                            .where(token_work_items_table.c.work_item_id == row["work_item_id"])
+                            .where(token_work_items_table.c.run_id == run_id)
+                        )
+                        .mappings()
+                        .one_or_none()
+                    )
+                    if current is not None and current["status"] == TokenWorkStatus.LEASED.value:
+                        current_sink_redrive = bool(current["_sink_redrive_shaped"])
+                        current_bundle_complete = bool(current["_pending_sink_bundle_complete"])
+                        if (is_sink_redrive and not current_bundle_complete) or (
+                            not is_sink_redrive and current_sink_redrive and not current_bundle_complete
+                        ):
+                            raise _incomplete_pending_sink_bundle_error(run_id=run_id, work_item_id=row["work_item_id"])
                 if result.rowcount == 1:
                     self._events.record(
                         conn,

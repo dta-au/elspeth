@@ -538,6 +538,7 @@ class RowProcessor:
             max_workers=max_workers,
             error_edge_ids=error_edge_ids,
             data_flow=data_flow,
+            before_terminal_audit=self._heartbeat_active_claim,
         )
         self._gate_executor = GateExecutor(
             execution,

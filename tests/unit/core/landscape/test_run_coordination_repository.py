@@ -24,6 +24,7 @@ injected fixed datetimes.
 
 from __future__ import annotations
 
+import json
 import os
 import socket
 from collections.abc import Iterator
@@ -145,6 +146,32 @@ def _events(engine: Tier1Engine, run_id: str = RUN_ID) -> list[dict[str, object]
             .all()
         )
     return [dict(r) for r in rows]
+
+
+def _coordination_image(engine: Tier1Engine, run_id: str = RUN_ID) -> dict[str, tuple[dict[str, object], ...]]:
+    with engine.connect() as conn:
+        run_rows = conn.execute(select(runs_table).where(runs_table.c.run_id == run_id)).mappings().all()
+        seat_rows = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).mappings().all()
+        worker_rows = (
+            conn.execute(select(run_workers_table).where(run_workers_table.c.run_id == run_id).order_by(run_workers_table.c.worker_id))
+            .mappings()
+            .all()
+        )
+        event_rows = (
+            conn.execute(
+                select(run_coordination_events_table)
+                .where(run_coordination_events_table.c.run_id == run_id)
+                .order_by(run_coordination_events_table.c.seq)
+            )
+            .mappings()
+            .all()
+        )
+    return {
+        "runs": tuple(dict(row) for row in run_rows),
+        "run_coordination": tuple(dict(row) for row in seat_rows),
+        "run_workers": tuple(dict(row) for row in worker_rows),
+        "run_coordination_events": tuple(dict(row) for row in event_rows),
+    }
 
 
 def _expire_seat(engine: Tier1Engine, *, run_id: str = RUN_ID) -> None:
@@ -765,6 +792,270 @@ class TestRegistryVerbs:
         stale_token = CoordinationToken(run_id=RUN_ID, worker_id=token.worker_id, leader_epoch=token.leader_epoch - 1)
         with pytest.raises(RunLeadershipLostError):
             repo.evict_worker(token=stale_token, target_worker_id=fresh, now=NOW, grace_seconds=10, window_seconds=WINDOW)
+
+
+class TestRunCoordinationTruthTables:
+    """Exact RC-01..07 durable images and equality/refusal boundaries."""
+
+    def test_rc01_registration_rolls_back_seat_membership_and_first_event_when_second_event_fails(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.core.landscape import run_coordination_repository as coordination_module
+
+        _seed_run(engine)
+        before = _coordination_image(engine)
+        real_record = coordination_module.record_coordination_event
+
+        def fail_leader_acquire(conn, *, event_type: str, **kwargs: object) -> None:
+            if event_type == "leader_acquire":
+                raise RuntimeError("forced leader-acquire event failure")
+            real_record(conn, event_type=event_type, **kwargs)
+
+        monkeypatch.setattr(coordination_module, "record_coordination_event", fail_leader_acquire)
+
+        with pytest.raises(RuntimeError, match="forced leader-acquire event failure"):
+            repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+
+        assert _coordination_image(engine) == before
+
+    def test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine, status="failed")
+        incumbent = repo.register_run_leader(run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
+        exact_expiry = NOW + timedelta(seconds=WINDOW)
+        before = _coordination_image(engine)
+
+        with pytest.raises(NonResumableRunError, match="run leadership is held by"):
+            repo.acquire_run_leadership(run_id=RUN_ID, worker_id="leader-b", now=exact_expiry, window_seconds=WINDOW)
+
+        assert incumbent.leader_epoch == 1
+        assert _coordination_image(engine) == before
+
+    def test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine, status="failed")
+        incumbent = repo.register_run_leader(run_id=RUN_ID, worker_id="leader-a", now=NOW, window_seconds=WINDOW)
+
+        winner = repo.acquire_run_leadership(
+            run_id=RUN_ID,
+            worker_id="leader-b",
+            now=AFTER_EXPIRY,
+            window_seconds=WINDOW,
+        )
+
+        assert winner == CoordinationToken(run_id=RUN_ID, worker_id="leader-b", leader_epoch=incumbent.leader_epoch + 1)
+        seat = _seat_row(engine)
+        assert seat["leader_worker_id"] == "leader-b"
+        assert seat["leader_epoch"] == 2
+        assert seat["leader_heartbeat_expires_at"] == (AFTER_EXPIRY + timedelta(seconds=WINDOW)).replace(tzinfo=None)
+        assert _worker_row(engine, "leader-a")["status"] == "evicted"
+        new_worker = _worker_row(engine, "leader-b")
+        assert (new_worker["run_id"], new_worker["role"], new_worker["status"], new_worker["entry_point"]) == (
+            RUN_ID,
+            "leader",
+            "active",
+            "resume",
+        )
+        tail = _events(engine)[-3:]
+        assert [row["event_type"] for row in tail] == ["worker_evict", "worker_register", "leader_acquire"]
+        assert [row["leader_epoch"] for row in tail] == [2, 2, 2]
+        assert json.loads(str(tail[0]["context_json"])) == {
+            "evicted_by_worker_id": "leader-b",
+            "reason": "deposed_leader_takeover",
+        }
+        assert json.loads(str(tail[2]["context_json"])) == {
+            "deposed_leader_worker_id": "leader-a",
+            "entry_point": "resume",
+        }
+
+    def test_rc03_follower_heartbeat_changes_only_its_membership_window(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine)
+        leader = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        repo.admit_follower(
+            run_id=RUN_ID,
+            worker_id="follower",
+            config_hash="config",
+            now=NOW,
+            window_seconds=WINDOW,
+        )
+        seat_before = _seat_row(engine)
+        events_before = _events(engine)
+        follower_before = _worker_row(engine, "follower")
+        later = NOW + timedelta(seconds=30)
+
+        snapshot = repo.worker_heartbeat(worker_id="follower", now=later, window_seconds=WINDOW)
+
+        follower_after = _worker_row(engine, "follower")
+        expected_follower = dict(follower_before)
+        expected_follower["heartbeat_expires_at"] = (later + timedelta(seconds=WINDOW)).replace(tzinfo=None)
+        assert follower_after == expected_follower
+        assert _seat_row(engine) == seat_before
+        assert _events(engine) == events_before
+        assert snapshot.worker_active is True
+        assert snapshot.worker_role == "follower"
+        assert snapshot.leader_worker_id == leader.worker_id
+        assert snapshot.leader_epoch == leader.leader_epoch
+
+    def test_rc03_and_rc06_departed_member_cannot_regain_authority_by_heartbeat(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine)
+        repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        repo.admit_follower(
+            run_id=RUN_ID,
+            worker_id="follower",
+            config_hash="config",
+            now=NOW,
+            window_seconds=WINDOW,
+        )
+        departed_at = NOW + timedelta(seconds=10)
+        repo.depart_worker(worker_id="follower", now=departed_at)
+        before = _coordination_image(engine)
+
+        snapshot = repo.worker_heartbeat(
+            worker_id="follower",
+            now=departed_at + timedelta(seconds=1),
+            window_seconds=WINDOW,
+        )
+
+        assert snapshot.worker_active is False
+        assert _coordination_image(engine) == before
+        departed = _worker_row(engine, "follower")
+        assert departed["status"] == "departed"
+        assert departed["departed_at"] == departed_at.replace(tzinfo=None)
+        depart_events = [row for row in _events(engine) if row["event_type"] == "worker_depart"]
+        assert len(depart_events) == 1
+        assert json.loads(str(depart_events[0]["context_json"])) == {}
+
+    def test_rc04_exact_release_changes_only_current_seat_member_and_one_event(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine)
+        token = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        release_at = NOW + timedelta(seconds=10)
+
+        repo.release_seat(token=token, now=release_at)
+
+        seat = _seat_row(engine)
+        assert seat["leader_worker_id"] is None
+        assert seat["leader_epoch"] == token.leader_epoch
+        assert seat["leader_heartbeat_expires_at"] is None
+        assert seat["updated_at"] == release_at.replace(tzinfo=None)
+        worker = _worker_row(engine, token.worker_id)
+        assert worker["status"] == "departed"
+        assert worker["departed_at"] == release_at.replace(tzinfo=None)
+        releases = [row for row in _events(engine) if row["event_type"] == "leader_release"]
+        assert len(releases) == 1
+        assert (releases[0]["worker_id"], releases[0]["leader_epoch"]) == (token.worker_id, token.leader_epoch)
+        assert json.loads(str(releases[0]["context_json"])) == {"worker_row_departed": True}
+
+    def test_rc05_follower_admission_is_exact_and_refusal_is_zero_mutation(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine)
+        leader = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+
+        repo.admit_follower(
+            run_id=RUN_ID,
+            worker_id="follower",
+            config_hash="config",
+            now=NOW,
+            window_seconds=WINDOW,
+        )
+
+        follower = _worker_row(engine, "follower")
+        assert (follower["run_id"], follower["role"], follower["status"], follower["entry_point"]) == (
+            RUN_ID,
+            "follower",
+            "active",
+            "join",
+        )
+        assert follower["heartbeat_expires_at"] == (NOW + timedelta(seconds=WINDOW)).replace(tzinfo=None)
+        follower_events = [row for row in _events(engine) if row["worker_id"] == "follower"]
+        assert len(follower_events) == 1
+        assert follower_events[0]["event_type"] == "worker_register"
+        assert follower_events[0]["leader_epoch"] is None
+        assert json.loads(str(follower_events[0]["context_json"])) == {"entry_point": "join", "role": "follower"}
+        assert _seat_row(engine)["leader_worker_id"] == leader.worker_id
+        before_refusal = _coordination_image(engine)
+
+        with pytest.raises(JoinRefusedError, match="does not match"):
+            repo.admit_follower(
+                run_id=RUN_ID,
+                worker_id="rejected",
+                config_hash="wrong",
+                now=NOW,
+                window_seconds=WINDOW,
+            )
+
+        assert _coordination_image(engine) == before_refusal
+
+    def test_rc07_evicts_only_strictly_expired_same_run_non_leader_and_records_exact_event(
+        self,
+        engine: Tier1Engine,
+        repo: RunCoordinationRepository,
+    ) -> None:
+        _seed_run(engine)
+        token = repo.register_run_leader(run_id=RUN_ID, worker_id="leader", now=NOW, window_seconds=WINDOW)
+        evict_at = NOW + timedelta(seconds=200)
+        grace = 10.0
+        with engine.begin() as conn:
+            for worker_id, heartbeat_expires_at in (
+                ("eligible", evict_at - timedelta(seconds=grace + 1)),
+                ("equal", evict_at - timedelta(seconds=grace)),
+                ("fresh", evict_at - timedelta(seconds=grace - 1)),
+            ):
+                conn.execute(
+                    insert(run_workers_table).values(
+                        worker_id=worker_id,
+                        run_id=RUN_ID,
+                        role="follower",
+                        status="active",
+                        registered_at=NOW,
+                        heartbeat_expires_at=heartbeat_expires_at,
+                    )
+                )
+
+        assert repo.evict_worker(token=token, target_worker_id="equal", now=evict_at, grace_seconds=grace, window_seconds=WINDOW) is False
+        assert repo.evict_worker(token=token, target_worker_id="fresh", now=evict_at, grace_seconds=grace, window_seconds=WINDOW) is False
+        assert (
+            repo.evict_worker(token=token, target_worker_id=token.worker_id, now=evict_at, grace_seconds=grace, window_seconds=WINDOW)
+            is False
+        )
+        assert repo.evict_worker(token=token, target_worker_id="eligible", now=evict_at, grace_seconds=grace, window_seconds=WINDOW) is True
+
+        assert _worker_row(engine, "equal")["status"] == "active"
+        assert _worker_row(engine, "fresh")["status"] == "active"
+        eligible = _worker_row(engine, "eligible")
+        assert eligible["status"] == "evicted"
+        assert eligible["evicted_at"] == evict_at.replace(tzinfo=None)
+        assert eligible["evicted_by_worker_id"] == token.worker_id
+        evictions = [row for row in _events(engine) if row["event_type"] == "worker_evict" and row["worker_id"] == "eligible"]
+        assert len(evictions) == 1
+        assert evictions[0]["leader_epoch"] == token.leader_epoch
+        assert json.loads(str(evictions[0]["context_json"])) == {
+            "evicted_by_worker_id": token.worker_id,
+            "reason": "liveness_expired",
+        }
 
 
 class TestPragmaProbe:

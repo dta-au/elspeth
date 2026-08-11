@@ -199,6 +199,7 @@ class SpawnedProcessAtSeam:
         self._release_writer = release_writer
         self._seam = seam
         self._ready: ProcessSeamReady | None = None
+        self._released = False
         self._closed = False
 
     @property
@@ -261,6 +262,17 @@ class SpawnedProcessAtSeam:
         if self._process.is_alive():
             self._process.kill()
 
+    def release(self) -> None:
+        """Cooperatively release a ready child from its named seam."""
+        if self._closed:
+            raise RuntimeError("state-engine child handle is closed")
+        if self._released:
+            return
+        if not self._process.is_alive():
+            raise RuntimeError("state-engine child exited before its process seam was released")
+        self._release_writer.send_bytes(b"release")
+        self._released = True
+
     def wait_for_exit(self, *, timeout: float) -> ProcessExitStatus:
         """Observe a bounded child exit and classify a Process.kill outcome."""
         if timeout <= 0:
@@ -279,9 +291,9 @@ class SpawnedProcessAtSeam:
         """Release or force-stop the child through a strictly bounded ladder."""
         if self._closed:
             return
-        if self._process.is_alive():
+        if self._process.is_alive() and not self._released:
             with suppress(BrokenPipeError, EOFError, OSError):
-                self._release_writer.send_bytes(b"release")
+                self.release()
         self._process.join(timeout=_PROCESS_CLEANUP_JOIN_SECONDS)
         if self._process.is_alive():
             self._process.terminate()
