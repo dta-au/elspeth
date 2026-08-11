@@ -1088,10 +1088,20 @@ git commit -m "test(state-engine): complete sink-effect recovery proofs"
 - Modify: `tests/e2e/recovery/test_follower_join_and_drain.py`
 - Modify: `tests/e2e/recovery/test_run_coordination_uniformity.py`
 - Create: `tests/e2e/recovery/test_run_lifecycle_process_matrix.py`
+- Create: `tests/e2e/recovery/test_run_lifecycle_aws_live.py`
+- Create: `tests/integration/cli/test_state_engine_lifecycle_profiles.py`
+- Modify: `tests/unit/web/execution/test_run_accounting_projection.py`
+- Modify: `tests/unit/engine/orchestrator/test_terminal_pair_counter_parity.py`
 - Modify as defects require: `src/elspeth/core/landscape/run_lifecycle_repository.py`
+- Modify as defects require: `src/elspeth/core/landscape/execution/operations.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/run_lifecycle.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/follower.py`
 - Modify as defects require: `src/elspeth/engine/orchestrator/resume.py`
+- Modify as defects require: `src/elspeth/engine/orchestrator/run_status.py`
+- Modify as defects require: `src/elspeth/web/execution/accounting.py`
+- Modify as defects require: `src/elspeth/cli.py`
+- Modify as contract changes require: `docs/architecture/adr/038-non-terminal-abandoned-path.md`
+- Modify as contract changes require: `docs/architecture/state_engine/architecture.md`
 
 **Step 1: Add the complete ADR-038 matrix**
 
@@ -1108,13 +1118,19 @@ Prove:
 - fenced non-resumable finalization atomically moves every existing effect-linked `open` operation to `failed` with the run stamp and ABANDONED outcomes, while resumable runs leave those operations open and terminal effect operations remain unchanged;
 - resume refuses the non-resumable failed-operation image and no path reopens a terminal operation.
 
+Compute the fenced non-resumability decision once, then run independent token and effect-operation sweeps inside the same terminal transaction. Do not place the operation sweep beneath `_abandon_undecided_tokens_in()`'s no-undecided-token early return. A failed effect-linked operation must receive `completed_at`, non-null `duration_ms`, and a bounded non-sensitive `error_message`; any sweep failure rolls back the run stamp, ABANDONED rows, and operation failures together.
+
+Implement one operation-transition primitive in `execution/operations.py` that accepts the caller-owned transaction and enforces the `open -> failed` invariants. `run_lifecycle_repository.py` composes that primitive inside its fenced terminal transaction; it must not duplicate the invariant with a raw `UPDATE`.
+
 **Step 2: Exercise real follower traversal**
 
-Build the follower through production assembly, run real transform and gate work, and assert terminal, blocked, lossy, sink-handoff, transform-failure, heartbeat-loss, and teardown behavior.
+Build the follower through the real CLI/production assembly (`_build_resume_graphs`, plugin context/start/cleanup, `build_follower_processor`, `FollowerProcessor`, and `RowProcessor` traversal), run real transform and gate work, and assert terminal, blocked, lossy, sink-handoff, transform-failure, heartbeat-loss, and teardown behavior. Repository dispositions or stubbed drain loops are supporting evidence only. Revalidate the incomplete follower `PluginContext` tracked by `elspeth-6b6a62af1f`; do not close PB-08 if a supported plugin cannot traverse the real context.
 
 **Step 3: Cover lifecycle modes**
 
 Run fresh, resume, follower, partial-start failure, normal teardown, exceptional teardown, and leader takeover with exact worker/seat/checkpoint/run/outcome images.
+
+Retain three separately observed SQLite deployment selections. The web-hosted profile must exercise the actual CLI-hosted composition, not relabel a generic follower. Run PostgreSQL transaction/race cases locally on PostgreSQL 16, but keep them separate from the live AWS single-leader lifecycle matrix against the real PostgreSQL 16 Landscape connection. Local testcontainers cannot promote the AWS boundary and none of these cases implies multi-replica support.
 
 **Step 4: Run RED**
 
@@ -1123,24 +1139,49 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/unit/core/landscape/test_run_finalization_abandonment.py \
   tests/e2e/recovery/test_follower_join_and_drain.py \
   tests/e2e/recovery/test_run_coordination_uniformity.py \
-  tests/e2e/recovery/test_run_lifecycle_process_matrix.py
+  tests/e2e/recovery/test_run_lifecycle_process_matrix.py \
+  tests/integration/cli/test_state_engine_lifecycle_profiles.py
 PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 -m testcontainer \
   tests/testcontainer/core/test_token_outcome_atomicity_postgres.py
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
+  -m "integration and live_aws" \
+  tests/e2e/recovery/test_run_lifecycle_aws_live.py
 ```
 
-**Step 5: Implement minimal fixes, rerun GREEN, and close PB-08 owner**
+After RED/GREEN stabilizes, materialize exact node lists under the retained pytest evidence rule for:
+
+- `single-process-leader` from the lifecycle process matrix;
+- `same-host-leader-plus-claim-only-followers` from real follower traversal;
+- `web-hosted-leader-plus-same-host-cli-followers` from the CLI lifecycle profile test;
+- `aws-single-leader-landscape` from the `live_aws` lifecycle matrix using the real PostgreSQL 16 Landscape connection.
+
+Retain a fifth, support-only PostgreSQL 16 testcontainer record for the exact transaction/lock/race nodes. Attribute it only to backend-semantic concurrency/atomicity support; it cannot replace the AWS deployment-boundary record.
+
+Each selection runs in its own reporter/JUnit process. The AWS matrix must prove the maintained AWS composition and safe deployment provenance, not merely a local pytest process pointed at a remote PostgreSQL URL. Skipped or unavailable live AWS evidence remains `unknown`.
+
+**Step 5: Implement minimal fixes, rerun GREEN, and close exact owners**
 
 Close `elspeth-6f6bbbec00` only after the real `FollowerProcessor` path is evidenced.
+Claim `elspeth-800d00c03e` as the narrow cross-cohort operation-finalization issue for this task. Make the Task 9 sink owner depend on that issue; do **not** make Task 10 or the lifecycle cohort depend on Task 9. Close `elspeth-800d00c03e` after the Task 10 atomic finalization evidence lands, then notify the Task 9 owner to re-evaluate its remaining exits. Keep `elspeth-67be892457` open while the Python 3.14 blocker, Task 11 plugin cases, or any required profile remains unresolved.
 
 **Step 6: Commit**
 
 ```bash
 git add src/elspeth/core/landscape/run_lifecycle_repository.py \
+  src/elspeth/core/landscape/execution/operations.py \
   src/elspeth/engine/orchestrator/run_lifecycle.py \
   src/elspeth/engine/orchestrator/follower.py \
   src/elspeth/engine/orchestrator/resume.py \
+  src/elspeth/engine/orchestrator/run_status.py \
+  src/elspeth/web/execution/accounting.py \
+  src/elspeth/cli.py \
+  docs/architecture/adr/038-non-terminal-abandoned-path.md \
+  docs/architecture/state_engine/architecture.md \
   tests/unit/core/landscape/test_run_finalization_abandonment.py \
+  tests/unit/web/execution/test_run_accounting_projection.py \
+  tests/unit/engine/orchestrator/test_terminal_pair_counter_parity.py \
   tests/testcontainer/core/test_token_outcome_atomicity_postgres.py \
+  tests/integration/cli/test_state_engine_lifecycle_profiles.py \
   tests/e2e/recovery \
   docs/architecture/state_engine/assessments
 git commit -m "test(state-engine): complete lifecycle and abandonment proofs"
@@ -1148,10 +1189,12 @@ git commit -m "test(state-engine): complete lifecycle and abandonment proofs"
 
 **Definition of Done:**
 
-- [ ] TS-19, RM-14, F-14, PB-08, and lifecycle parts of PB-09 pass.
+- [ ] TS-19, F-14, and PB-08 pass. Task 10 lifecycle evidence remains support-only until Task 11 attaches it to every plugin-specific PB-09 case.
+- [ ] Finalization-specific RM-14 evidence is linked to Task 7/`elspeth-eefd990b46` without reassigning or prematurely closing that leg.
 - [ ] PostgreSQL outcome/abandonment locking has executable race evidence.
 - [ ] Effect-linked operation failure is atomic with fenced non-resumable finalization; resumable interruption remains open for the same effect.
 - [ ] Follower proof crosses production assembly and plugin traversal.
+- [ ] Three SQLite deployment profiles and the live AWS PostgreSQL 16 single-leader profile are separately attributable; PB-08 is N/A outside its two catalog-owned follower profiles.
 - [ ] Every lifecycle mode terminates with an honest durable image.
 
 ---
