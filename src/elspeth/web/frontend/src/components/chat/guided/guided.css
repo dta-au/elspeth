@@ -1869,25 +1869,10 @@
    CompletionSummary (Task 7.10)
    Classes prefixed guided-completion-*.
 
-   Terminal widget rendered when the guided wizard reaches kind="completed"
-   and pipeline_yaml is non-null.  Displays the finalized pipeline YAML in a
-   syntax-highlighted block (prism-react-renderer, vsDark / vsLight) with
-   task-oriented actions:
-     "Open freeform editor" -- continue editing in the freeform composer.
-     "Export YAML"          -- open the YAML export dialog.
-     "Validate pipeline"    -- run validation for the active session.
-
-   Visual hierarchy:
-     heading     -- readiness-derived ("Pipeline updated" / "Review
-                    required" / "Pipeline ready"), h3, muted weight to avoid
-                    competing
-                    with surrounding chat layout.
-     yaml block  -- monospace pre inside a scrollable container with an
-                    inset surface to visually contain the code.
-     action row  -- primary freeform handoff plus YAML review and validation.
-
-   Reduced-motion: guided-completion-save-btn and guided-completion-edit-btn
-   both carry transitions; both are silenced in the @media block below.
+   Terminal widget rendered when the guided wizard reaches kind="completed".
+   The card keeps the readiness-derived heading and, outside the tutorial, the
+   state-machine transition into freeform. YAML, validation, and run history
+   are owned by the common workspace.
    --------------------------------------------------------------------------- */
 
 /* Outer wrapper */
@@ -1901,15 +1886,12 @@
   border-radius: var(--radius-lg);
 }
 
-/* On a completed wide/short workspace, Run Results must remain visible at the
-   bottom instead of being squeezed below the 400px YAML preview. Let this card
-   yield vertical space while preserving enough room for its heading, actions,
-   and a useful scrollable YAML viewport. */
+/* Preserve the established completion gutter without imposing a legacy YAML
+   preview height; acknowledgement cards and the stepper keep the remaining
+   authoring space. */
 .chat-panel--completed > .guided-completion {
-  min-height: 18rem;
   margin-top: var(--space-xs);
   margin-inline: var(--space-lg);
-  overflow: hidden;
 }
 
 /* Match chat.css's compact Run Results gutter at the same breakpoint. */
@@ -1923,55 +1905,12 @@
   }
 }
 
-.chat-panel--completed
-  > .guided-completion
-  .guided-completion-yaml-container {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
 /* Section heading -- readiness-derived completion label */
 .guided-completion-heading {
   margin: 0;
   font-size: var(--font-size-base);
   font-weight: 600;
   color: var(--color-success);
-}
-
-/* Scrollable YAML preview container */
-.guided-completion-yaml-container {
-  overflow: auto;
-  max-height: 400px;
-  background-color: var(--color-surface-elevated);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-}
-
-/* Keyboard-focusable scroll region (tabIndex=0 in CompletionSummary) — inset
-   ring so the container's own border/radius doesn't clip it. */
-.guided-completion-yaml-container:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: -2px;
-}
-
-/* <pre> block produced by prism-react-renderer.
-   Reset browser default pre margins; monospace font family to match YamlView. */
-.guided-completion-pre {
-  margin: 0;
-  padding: var(--space-md);
-  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas,
-    monospace;
-  font-size: var(--font-size-sm);
-  line-height: 1.5;
-  overflow-x: auto;
-  white-space: pre;
-}
-
-/* Action row: freeform handoff, YAML review, and validation */
-.guided-completion-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-sm);
 }
 
 /* Primary action: open the freeform editor */
@@ -1996,31 +1935,6 @@
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
-
-/* Secondary action: review generated YAML */
-.guided-completion-edit-btn {
-  padding: var(--space-sm) var(--space-lg);
-  background-color: transparent;
-  color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  cursor: pointer;
-  font-size: var(--font-size-base);
-  font-family: inherit;
-  min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease, border-color 0.1s ease;
-}
-
-.guided-completion-edit-btn:hover {
-  background-color: var(--color-surface-elevated);
-  border-color: var(--color-accent);
-}
-
-.guided-completion-edit-btn:focus-visible {
-  outline: 2px solid var(--color-focus-ring);
-  outline-offset: 2px;
-}
-
 
 /* The guided interpretation-review card styling was retired with the
    InterpretationReviewTurn widget; pending LLM decisions now render through the
@@ -2242,8 +2156,7 @@
   .wire-stage__correction-input,
   .guided-schema-advanced-toggle,
   .guided-schema-continue-btn,
-  .guided-completion-save-btn,
-  .guided-completion-edit-btn {
+  .guided-completion-save-btn {
     transition: none;
   }
 }

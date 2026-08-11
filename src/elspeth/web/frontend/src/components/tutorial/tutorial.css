@@ -104,8 +104,8 @@
   /* The fixed frame: no document scroll on the guided step. */
   overflow: hidden;
   flex: 1 1 auto;
-  min-height: 0;
-  height: auto;
+  height: 100%;
+  min-height: calc(420px + var(--size-control) + var(--space-xl));
   /* Full-bleed workspace: children span the frame; the bands that need an
      inset (progress row, kicker, stepper) re-add their own inline padding. */
   align-items: stretch;

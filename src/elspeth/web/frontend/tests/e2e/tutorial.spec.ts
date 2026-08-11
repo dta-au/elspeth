@@ -699,6 +699,67 @@ async function installTutorialRoutes(
 }
 
 test.describe("first-run tutorial (staged guided flow)", () => {
+  test("guided workspace fills compact desktop and grows through WQHD", async ({
+    page,
+  }) => {
+    const state: GuidedFixtureState = {
+      sessionPostCount: 0,
+      guidedRespondCount: 0,
+      requestLog: [],
+    };
+    await installTutorialRoutes(page, state);
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+    await page.getByRole("button", { name: "Let's go" }).click();
+    await expect(page.getByLabel(/guided composer/i)).toBeVisible();
+
+    const measure = async (): Promise<number> => {
+      const appMain = page.locator(".app-main");
+      const shell = page.locator(".tutorial-shell--guided");
+      const progress = page.locator(".tutorial-progress");
+      const workspace = page.getByTestId("composer-workspace");
+      const authoring = page.getByRole("region", { name: "Authoring pane" });
+      const artifact = page.getByRole("region", { name: "Pipeline artifact" });
+      await expect(workspace).toBeVisible();
+      await expect(authoring).toBeVisible();
+      await expect(artifact).toBeVisible();
+      const [appBox, shellBox, progressBox, workspaceBox, authoringBox, artifactBox] =
+        await Promise.all([
+          appMain.boundingBox(),
+          shell.boundingBox(),
+          progress.boundingBox(),
+          workspace.boundingBox(),
+          authoring.boundingBox(),
+          artifact.boundingBox(),
+        ]);
+      expect(appBox).not.toBeNull();
+      expect(shellBox).not.toBeNull();
+      expect(progressBox).not.toBeNull();
+      expect(workspaceBox).not.toBeNull();
+      expect(authoringBox).not.toBeNull();
+      expect(artifactBox).not.toBeNull();
+      expect(shellBox!.height).toBeGreaterThanOrEqual(appBox!.height - 1);
+      expect(workspaceBox!.height).toBeGreaterThanOrEqual(
+        appBox!.height - progressBox!.height - 40,
+      );
+      expect(authoringBox!.height).toBeGreaterThanOrEqual(420);
+      expect(artifactBox!.height).toBeGreaterThanOrEqual(420);
+      expect(
+        await page.evaluate(
+          () =>
+            document.documentElement.scrollWidth <=
+            document.documentElement.clientWidth,
+        ),
+      ).toBe(true);
+      return workspaceBox!.height;
+    };
+
+    const compactHeight = await measure();
+    await page.setViewportSize({ width: 2560, height: 1280 });
+    const wqhdHeight = await measure();
+    expect(wqhdHeight).toBeGreaterThan(compactHeight + 400);
+  });
+
   test("welcome → guided (source/sink/wire) → run → audit → graduation", async ({
     page,
   }) => {

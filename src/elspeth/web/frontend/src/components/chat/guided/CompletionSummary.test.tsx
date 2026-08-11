@@ -2,22 +2,16 @@
 // CompletionSummary -- regression coverage for the guided-mode terminal widget.
 //
 // Pinned contracts:
-//   1. YAML text is rendered in the highlighted block -- the pipeline_yaml
-//      string appears in the document when terminal.kind === "completed" and
-//      pipeline_yaml is non-null.  (Does NOT assert Prism token structure --
-//      that is Prism's contract, not ours.)
-//   2. Task-oriented terminal actions render as <button type="button">.
-//   3. The freeform click invokes useSessionStore.exitToFreeform once.
-//   5. terminal.kind !== "completed" handling -- the parent should not render
+//   1. The readiness-derived completion heading remains visible.
+//   2. Non-tutorial completion exposes one real button for the state-machine
+//      transition; YAML, validation, and runs belong to the common workspace.
+//   3. The click invokes useSessionStore.exitToFreeform exactly once.
+//   4. terminal.kind !== "completed" handling -- the parent should not render
 //      CompletionSummary in non-completed terminals.  The widget defensively
 //      returns null in that case as well.  Negative-space pin.
-//   7. Distinctness pin (Task 7.4 I4 inheritance): two simultaneous
-//      CompletionSummary instances have per-instance IDs that differ.
-//      Asserted via not.toBe() on elements carrying useId()-scoped IDs.
-//   8. Initial-render no-auto-focus -- neither button has focus on mount
-//      (matches convention from InspectAndConfirmTurn, Task 7.3).
-//   9. Reduced-motion classes -- verified by CSS (not directly testable in
-//      jsdom); this file notes the expectation for the reviewer.
+//   5. Initial render never moves focus.
+//   6. Completion retains content-height sizing; deleted YAML/action styles
+//      cannot silently restore the legacy 18rem floor.
 //
 // Source of truth:
 //   - types/guided.ts:54-58 (TerminalState wire shape)
@@ -25,6 +19,8 @@
 //   - docs/superpowers/plans/2026-05-11-composer-guided-mode.md:4445
 // ============================================================================
 
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -57,7 +53,7 @@ beforeEach(() => {
   resetStore(useInterpretationEventsStore);
 });
 
-// ── Contract 1: common workspace owns artifacts ─────────────────────────
+// ── Common workspace owns artifacts ────────────────────────────────────────
 
 describe("CompletionSummary -- workspace convergence", () => {
   it("does not duplicate YAML, validation, or run surfaces", () => {
@@ -78,7 +74,7 @@ describe("CompletionSummary -- workspace convergence", () => {
   });
 });
 
-// ── Contract 2: Single button renders with type="button" ─────────────────────
+// ── Single button renders with type="button" ───────────────────────────────
 
 describe("CompletionSummary -- button identity", () => {
   it("renders only the freeform transition with type='button'", () => {
@@ -89,8 +85,7 @@ describe("CompletionSummary -- button identity", () => {
   });
 });
 
-// ── Contract 3: Exit calls exitToFreeform ────────────────────────────────────
-
+// ── Exit calls exitToFreeform ───────────────────────────────────────────────
 describe("CompletionSummary -- exit action", () => {
   it("clicking 'Open freeform editor' calls exitToFreeform once", async () => {
     const user = userEvent.setup();
@@ -105,10 +100,9 @@ describe("CompletionSummary -- exit action", () => {
     expect(mockExit).toHaveBeenCalledTimes(1);
     expect(mockExit).toHaveBeenCalledWith();
   });
-
 });
 
-// ── Contract 5: non-completed terminal -> null ────────────────────────────────
+// ── Non-completed terminal -> null ─────────────────────────────────────────
 
 describe("CompletionSummary -- non-completed terminal guard (negative space)", () => {
   it("returns null when terminal.kind is 'exited_to_freeform'", () => {
@@ -119,26 +113,7 @@ describe("CompletionSummary -- non-completed terminal guard (negative space)", (
   });
 });
 
-// ── Contract 7: distinctness pin (two simultaneous instances) ─────────────────
-
-describe("CompletionSummary -- distinctness pin (Task 7.4 I4 inheritance)", () => {
-  it("two simultaneous CompletionSummary instances have distinct heading IDs", () => {
-    render(
-      <div>
-        <CompletionSummary terminal={COMPLETED_TERMINAL} />
-        <CompletionSummary terminal={COMPLETED_TERMINAL} />
-      </div>,
-    );
-    const headings = screen.getAllByRole("heading");
-    // Two instances => two headings
-    expect(headings).toHaveLength(2);
-    // Headings are distinct DOM nodes (not.toBe per Task 7.4 I4 convention)
-    expect(headings[0]).not.toBe(headings[1]);
-  });
-
-});
-
-// ── Contract 8: no auto-focus on mount ────────────────────────────────────────
+// ── No auto-focus on mount ───────────────────────────────────────────────────────
 
 describe("CompletionSummary -- no auto-focus on initial render", () => {
   it("the exit button does not have focus immediately after render", () => {
@@ -147,6 +122,24 @@ describe("CompletionSummary -- no auto-focus on initial render", () => {
       name: /open freeform editor/i,
     });
     expect(document.activeElement).not.toBe(saveBtn);
+  });
+});
+
+describe("CompletionSummary -- content-height CSS", () => {
+  it("does not retain deleted YAML/action selectors or a legacy minimum height", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/guided/guided.css"),
+      "utf8",
+    );
+    const completedRule = css.match(
+      /\.chat-panel--completed\s*>\s*\.guided-completion\s*\{([^}]*)\}/,
+    );
+
+    expect(completedRule).not.toBeNull();
+    expect(completedRule?.[1]).not.toMatch(/min-height|overflow/);
+    expect(css).not.toMatch(
+      /guided-completion-(?:yaml-container|pre|actions|edit-btn)/,
+    );
   });
 });
 

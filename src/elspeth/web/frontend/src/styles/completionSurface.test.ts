@@ -79,21 +79,6 @@ describe("guided completion surface", () => {
     expect(rule?.groups?.body).toContain("margin-bottom: 0");
   });
 
-  it("lets the YAML preview yield height on wide, short completed pages", () => {
-    const css = readFileSync("src/components/chat/guided/guided.css", "utf8");
-    const completionRule = css.match(
-      /\.chat-panel--completed\s*>\s*\.guided-completion\s*\{(?<body>[^}]*)\}/s,
-    );
-    const yamlRule = css.match(
-      /\.chat-panel--completed\s*>\s*\.guided-completion\s+\.guided-completion-yaml-container\s*\{(?<body>[^}]*)\}/s,
-    );
-
-    expect(completionRule?.groups?.body).toContain("min-height: 18rem");
-    expect(completionRule?.groups?.body).toContain("overflow: hidden");
-    expect(yamlRule?.groups?.body).toContain("flex: 1 1 auto");
-    expect(yamlRule?.groups?.body).toContain("min-height: 0");
-  });
-
   it("declares the ELSPETH SVG favicon as a same-origin public asset", () => {
     const indexHtml = readFileSync("index.html", "utf8");
     const faviconPath = "public/favicon.svg";
