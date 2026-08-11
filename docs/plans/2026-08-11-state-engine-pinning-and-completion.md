@@ -807,6 +807,12 @@ Use direct function objects in parametrization; do not resolve functions by dyna
 Own F-04, F-06, F-07, F-10, and F-12 in this task, matching the pinned proof-matrix cohort. Assert the exact exception/error category and complete before/after durable image. Reach every production surface that could attempt the path; where a path is deliberately absent, attach fresh Loomweave caller evidence and an executable architecture gate.
 
 Integrate the retained evidence for the other forbidden legs from their assigned cohorts (Tasks 5, 8, 9, and 10/11); do not reassign, duplicate, or close those owners from Task 7. F-10 permits only its contracted best-effort `fence_refusal` event as an explicit image delta.
+F-07's valid-leader zero-recovery arm is a fence-as-heartbeat operation under
+ADR-030, so it permits only the exact leader `heartbeat_at` and
+`heartbeat_expires_at` extension made by the fenced transaction; scheduler
+rows, attempts, leases, outcomes, and scheduler/audit events must remain
+byte-for-byte unchanged. Stale or foreign F-07 refusals remain fully
+zero-mutation.
 
 **Step 3: Run RED**
 
@@ -853,7 +859,9 @@ git commit -m "test(state-engine): close read-model and refusal matrices"
 
 - [ ] RM-01–14 truth tables cover every current state/subtype arm.
 - [ ] Each read model has a production consumer assertion.
-- [ ] F-04/06/07/10/12 refusal includes complete zero-mutation evidence, with only the contracted F-10 event delta.
+- [ ] F-04/06/07/10/12 refusal includes complete zero-mutation evidence, with
+  only the contracted F-10 event delta and F-07 valid-leader heartbeat delta
+  described above.
 - [ ] Other F-leg evidence remains attached to its pinned cohort owner and is integrated without duplicate closure.
 - [ ] SQLite and PostgreSQL 16 evidence is separately attributable, and deployment-profile labels match exercised boundaries.
 - [ ] No unproved read-model arm controls drain, flush, resume, eviction, or completion.
