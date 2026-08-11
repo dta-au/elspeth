@@ -139,7 +139,24 @@
         "title": {"type": "string", "minLength": 1, "pattern": "\\S"},
         "contract": {"type": "string", "minLength": 1, "pattern": "\\S"},
         "required_cases": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/case"}}
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["id"],
+            "properties": {"id": {"not": {"const": "PB-09"}}}
+          },
+          "then": {
+            "properties": {
+              "required_cases": {
+                "items": {
+                  "properties": {"variant_id": {"const": "default"}}
+                }
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

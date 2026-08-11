@@ -98,6 +98,7 @@ def initialize_full(assessment_id: str, output_directory: Path, catalog_argument
     _require(catalog_path.is_file(), f"catalog file does not exist: {catalog_path}")
     catalog = load_unique_json(catalog_path)
     validate_catalog(catalog, catalog_path)
+    _require(catalog["catalog_id"] != "elspeth-state-engine-v1", "catalog v1 is historical-only and cannot initialize assessments")
     assessment_schema_version = _assessment_schema_version(catalog["catalog_id"])
     requested_parent = Path(os.path.abspath(output_directory.parent))
     _require(requested_parent.is_relative_to(root), "assessment destination must be inside the repository")

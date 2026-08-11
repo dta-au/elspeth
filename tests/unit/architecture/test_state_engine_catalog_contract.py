@@ -16,6 +16,7 @@ from typing import Any, cast
 
 import pytest
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -1388,11 +1389,70 @@ def test_validate_catalog_cli_rejects_unsupported_version_pairs(
     assert "unsupported catalog version pair" in result.stderr
 
 
+def test_v3_schema_rejects_nondefault_variant_on_pb11() -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
+    schema = _load_catalog(V3_CATALOG_SCHEMA_PATH)
+    pb11 = _catalog_leg(catalog, "PB-11")
+    pb11["required_cases"][0]["variant_id"] = "postgres-specific"
+
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(catalog)
+
+
+def test_validate_catalog_cli_rejects_nondefault_variant_on_pb11(tmp_path: Path) -> None:
+    catalog = _load_catalog(V3_CATALOG_PATH)
+    pb11 = _catalog_leg(catalog, "PB-11")
+    pb11["required_cases"][0]["variant_id"] = "postgres-specific"
+    catalog_path = tmp_path / "catalog.json"
+    _write_json(catalog_path, catalog)
+
+    result = _run_assessment_cli("validate-catalog", str(catalog_path))
+
+    assert result.returncode == 1
+    assert "non-PB-09 variant_id must be default" in result.stderr
+
+
 def test_init_full_requires_explicit_catalog_option(tmp_path: Path) -> None:
     result = _run_assessment_cli("init-full", "missing-catalog", str(tmp_path / "assessment"))
 
     assert result.returncode == 2
     assert "--catalog" in result.stderr
+
+
+def test_init_full_rejects_historical_v1_catalog(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    historical = repository / "docs/architecture/state_engine/proof-catalog/v1/catalog.json"
+    _write_json(historical, _load_catalog(V1_CATALOG_PATH))
+
+    result = _run_assessment_cli(
+        "init-full",
+        "--catalog",
+        "docs/architecture/state_engine/proof-catalog/v1/catalog.json",
+        "historical-v1",
+        "docs/architecture/state_engine/assessments/historical-v1",
+        cwd=repository,
+    )
+
+    assert result.returncode == 1
+    assert "v1 is historical-only" in result.stderr
+
+
+def test_initialize_full_function_rejects_historical_v1_catalog(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, _assessment_path = assessment_repository
+    historical = repository / "docs/architecture/state_engine/proof-catalog/v1/catalog.json"
+    _write_json(historical, _load_catalog(V1_CATALOG_PATH))
+    initialize_full = _assessment_namespace()["initialize_full"]
+
+    with pytest.raises(ValueError, match="v1 is historical-only"):
+        initialize_full(
+            "historical-v1-function",
+            repository / "docs/architecture/state_engine/assessments/historical-v1-function",
+            Path("docs/architecture/state_engine/proof-catalog/v1/catalog.json"),
+        )
 
 
 def test_init_full_rejects_absolute_catalog_path(

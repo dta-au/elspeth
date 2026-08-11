@@ -96,6 +96,7 @@ def _validate_v3_cases(catalog: dict[str, Any], legs: list[dict[str, Any]], prof
                 pairs.append((plugin_key, variant_id))
             else:
                 _require(plugin_key is None, f"catalog leg {leg_id} case {index} plugin_key must be null")
+                _require(variant_id == "default", f"catalog leg {leg_id} non-PB-09 variant_id must be default")
             applicability = _dict(case.get("cell_applicability"), f"catalog leg {leg_id} case {index} applicability")
             _require(list(applicability) == profile_case_ids, f"catalog leg {leg_id} case {index} must cover every profile in order")
             for profile_case, raw_dimensions in applicability.items():
