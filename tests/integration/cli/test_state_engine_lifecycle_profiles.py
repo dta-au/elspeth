@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import select, update
 from typer.testing import CliRunner
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import FrameworkBugError, RunStatus
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.config import load_settings_from_yaml_string
@@ -20,6 +20,7 @@ from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     node_states_table,
+    run_attributions_table,
     run_workers_table,
     runs_table,
     scheduler_events_table,
@@ -42,7 +43,12 @@ def test_actual_cli_join_traverses_and_tears_down_with_full_runtime_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Typer join must host the real follower with leader-equivalent facilities."""
+    """Typer join hosts a web-attributed run with leader-equivalent facilities.
+
+    The run-attribution row is the production web-to-Landscape identity seam.
+    This test deliberately does not emit the web-hosted deployment profile:
+    the leader is assembled directly rather than launched by the web service.
+    """
     from elspeth.cli import app
 
     processing_yaml = """
@@ -64,7 +70,14 @@ transforms:
     _plugins, graph, config = _build_runtime_graph(settings)
     db = LandscapeDB.from_url(settings.landscape.url)
     payload_store = FilesystemPayloadStore(settings.payload_store.base_path)
-    result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        initiated_by_user_id="task10-web-user",
+        auth_provider_type="local",
+    )
     run_id = result.run_id
     factory = RecorderFactory(db, payload_store=payload_store)
     target_node_id = graph.get_next_node(graph.get_sources()[0])
@@ -180,6 +193,12 @@ transforms:
                     run_workers_table.c.role == "follower",
                 )
             ).all()
+            attribution = conn.execute(
+                select(
+                    run_attributions_table.c.initiated_by_user_id,
+                    run_attributions_table.c.auth_provider_type,
+                ).where(run_attributions_table.c.run_id == run_id)
+            ).one()
 
         assert "completed" in states
         assert [event.event_type for event in events] == [
@@ -192,6 +211,118 @@ transforms:
         follower_id = next(iter(follower_ids))
         assert followers[0].status == "departed"
         assert [event.caller_owner for event in events] == [None, follower_id, follower_id]
+        assert tuple(attribution) == ("task10-web-user", "local")
 
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_actual_cli_join_exceptional_traversal_departs_and_cleans_plugins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Tier-1 traversal failure still tears down lifecycle and membership."""
+    from elspeth.cli import app
+
+    processing_yaml = """
+transforms:
+  - name: process_row
+    plugin: passthrough
+    input: processing
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+"""
+    settings_text = _real_follower_settings_text(tmp_path, processing_yaml=processing_yaml)
+    settings_path = tmp_path / "settings.yaml"
+    settings_path.write_text(settings_text, encoding="utf-8")
+    settings = load_settings_from_yaml_string(settings_text)
+
+    _plugins, graph, config = _build_runtime_graph(settings)
+    db = LandscapeDB.from_url(settings.landscape.url)
+    payload_store = FilesystemPayloadStore(settings.payload_store.base_path)
+    result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
+    run_id = result.run_id
+    factory = RecorderFactory(db, payload_store=payload_store)
+    target_node_id = graph.get_next_node(graph.get_sources()[0])
+    assert target_node_id is not None
+    token_id = _seed_real_follower_ready_item(
+        db=db,
+        factory=factory,
+        run_id=run_id,
+        row_data={"id": 5, "value": 50},
+        target_node_id=str(target_node_id),
+        target_step_index=graph.get_node_step_map()[target_node_id],
+    )
+    with db.engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+    factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:exceptional-leader",
+        now=datetime.now(UTC),
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
+
+    lifecycle: list[str] = []
+    real_start = PassThrough.on_start
+    real_complete = PassThrough.on_complete
+    real_close = PassThrough.close
+
+    def observed_start(self: PassThrough, ctx: PluginContext) -> None:
+        lifecycle.append("start")
+        real_start(self, ctx)
+
+    def fail_process(self: PassThrough, row: Any, ctx: Any) -> Any:
+        del self, row, ctx
+        raise FrameworkBugError("injected follower traversal integrity failure")
+
+    def observed_complete(self: PassThrough, ctx: PluginContext) -> None:
+        lifecycle.append("complete")
+        real_complete(self, ctx)
+
+    def observed_close(self: PassThrough) -> None:
+        lifecycle.append("close")
+        real_close(self)
+
+    monkeypatch.setattr(PassThrough, "on_start", observed_start)
+    monkeypatch.setattr(PassThrough, "process", fail_process)
+    monkeypatch.setattr(PassThrough, "on_complete", observed_complete)
+    monkeypatch.setattr(PassThrough, "close", observed_close)
+
+    cli_result = CliRunner().invoke(
+        app,
+        [
+            "join",
+            run_id,
+            "--settings",
+            str(settings_path),
+            "--database",
+            str(tmp_path / "real-follower-audit.db"),
+            "--format",
+            "json",
+        ],
+    )
+
+    try:
+        assert cli_result.exit_code == 4, cli_result.output
+        assert "FrameworkBugError" in cli_result.output
+        assert lifecycle == ["start", "complete", "close"]
+        item = _work_item(db, token_id)
+        assert item["status"] == TokenWorkStatus.FAILED.value
+        with db.engine.connect() as conn:
+            followers = (
+                conn.execute(
+                    select(run_workers_table.c.status).where(
+                        run_workers_table.c.run_id == run_id,
+                        run_workers_table.c.role == "follower",
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert followers == ["departed"]
     finally:
         db.close()

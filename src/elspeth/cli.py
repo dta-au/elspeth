@@ -90,8 +90,10 @@ def _start_follower_plugin_lifecycle(
     configured_modes: Mapping[str, str],
     admission: object,
     ctx: PluginContext,
+    started_transforms: list[RowPlugin] | None = None,
+    started_sinks: dict[str, SinkProtocol] | None = None,
 ) -> None:
-    """Consume exact follower admission immediately before plugin startup."""
+    """Consume admission and optionally record successfully-started plugins."""
     from elspeth.contracts.sink_effects import SinkEffectInputKind
     from elspeth.engine.orchestrator.preflight import require_sink_effect_admission
 
@@ -103,8 +105,12 @@ def _start_follower_plugin_lifecycle(
     )
     for transform in transforms:
         transform.on_start(ctx)
-    for sink in sinks.values():
+        if started_transforms is not None:
+            started_transforms.append(transform)
+    for sink_name, sink in sinks.items():
         sink.on_start(ctx)
+        if started_sinks is not None:
+            started_sinks[sink_name] = sink
 
 
 def _instantiate_plugins_for_runtime_preflight(
@@ -3483,6 +3489,8 @@ def join(
         # PluginContractViolation("Transform 'X' was called before on_start()")
         # on the first process() call.
         follower_run_entered = False
+        started_follower_transforms: list[RowPlugin] = []
+        started_follower_sinks: dict[str, SinkProtocol] = {}
         try:
             _start_follower_plugin_lifecycle(
                 transforms=follower_transforms,
@@ -3490,6 +3498,8 @@ def join(
                 configured_modes=execution_sink_modes,
                 admission=sink_effect_admission,
                 ctx=ctx,
+                started_transforms=started_follower_transforms,
+                started_sinks=started_follower_sinks,
             )
 
             follower_run_entered = True
@@ -3575,7 +3585,13 @@ def join(
             # (mirrors the resume path's include_source=False).
             from elspeth.engine.orchestrator.cleanup import cleanup_plugins as _cleanup_plugins
 
-            _cleanup_plugins(pipeline_config, ctx, include_source=False)
+            _cleanup_plugins(
+                pipeline_config,
+                ctx,
+                include_source=False,
+                started_transforms=started_follower_transforms,
+                started_sinks=started_follower_sinks,
+            )
 
         # Clean departure (run reached terminal state).
         if output_format == "json":

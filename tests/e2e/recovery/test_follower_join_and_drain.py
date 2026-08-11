@@ -43,6 +43,7 @@ import json
 import os
 import sqlite3
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
@@ -53,12 +54,13 @@ from sqlalchemy import select, update
 from elspeth.contracts import RunStatus
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import FollowerSeatDeadError, JoinRefusedError, RunWorkerEvictedError
-from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape.schema import (
     coalesce_branch_losses_table,
     run_coordination_table,
     run_workers_table,
     runs_table,
+    scheduler_events_table,
     token_work_items_table,
 )
 from elspeth.engine.clock import MockClock
@@ -1132,6 +1134,10 @@ def _run_real_follower(
     *,
     processing_yaml: str,
     row_data: dict[str, int],
+    clock: MockClock | None = None,
+    scheduler_lease_seconds: int = 300,
+    scheduler_heartbeat_seconds: int = 60,
+    before_follower_run: Callable[[Any, str, Any], None] | None = None,
 ) -> tuple[Any, str, str, Any, Path]:
     """Run one real follower through CLI graph/lifecycle and FollowerProcessor."""
     from datetime import UTC, datetime
@@ -1216,6 +1222,9 @@ def _run_real_follower(
         graph=execution_graph,
         config=follower_config,
         payload_store=payload_store,
+        clock=clock,
+        scheduler_lease_seconds=scheduler_lease_seconds,
+        scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
     )
     ctx = PluginContext(
         run_id=run_id,
@@ -1229,6 +1238,8 @@ def _run_real_follower(
             conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.FAILED.value))
 
     follower._wait_fn = _stop_after_idle
+    if before_follower_run is not None:
+        before_follower_run(db, token_id, follower_plugins)
     try:
         _start_follower_plugin_lifecycle(
             transforms=follower_config.transforms,
@@ -1354,5 +1365,82 @@ transforms:
         assert "failed" in states
         assert len(errors) == 1
         assert not output_path.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_scheduler_heartbeat_loss_abandons_result_without_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-plugin lease loss must discard the real traversal result."""
+    from datetime import UTC, datetime
+
+    from elspeth.plugins.transforms.passthrough import PassThrough
+
+    clock = MockClock(start=datetime.now(UTC).timestamp() + 10)
+    peer_owner = "worker:task10:lease-winner"
+
+    def install_lease_loss(db: Any, token_id: str, follower_plugins: Any) -> None:
+        transform = follower_plugins.transforms[0].plugin
+        assert isinstance(transform, PassThrough)
+        real_process = transform.process
+
+        def process_then_lose_lease(row: Any, ctx: Any) -> Any:
+            result = real_process(row, ctx)
+            with db.engine.begin() as conn:
+                updated = conn.execute(
+                    update(token_work_items_table)
+                    .where(token_work_items_table.c.token_id == token_id)
+                    .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                    .values(lease_owner=peer_owner)
+                )
+            assert updated.rowcount == 1
+            clock.advance(2)
+            return result
+
+        monkeypatch.setattr(transform, "process", process_then_lose_lease)
+
+    db, run_id, token_id, _plugins, output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: process_row
+    plugin: passthrough
+    input: processing
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+""",
+        row_data={"id": 4, "value": 40},
+        clock=clock,
+        scheduler_lease_seconds=10,
+        scheduler_heartbeat_seconds=1,
+        before_follower_run=install_lease_loss,
+    )
+    try:
+        item = _work_item(db, token_id)
+        assert item["status"] == TokenWorkStatus.LEASED.value
+        assert item["lease_owner"] == peer_owner
+        with db.engine.connect() as conn:
+            events = (
+                conn.execute(
+                    select(scheduler_events_table.c.event_type)
+                    .where(scheduler_events_table.c.run_id == run_id)
+                    .where(scheduler_events_table.c.token_id == token_id)
+                    .order_by(scheduler_events_table.c.recorded_at, scheduler_events_table.c.event_id)
+                )
+                .scalars()
+                .all()
+            )
+        assert events == [
+            SchedulerEventType.ENQUEUE.value,
+            SchedulerEventType.CLAIM_READY.value,
+            SchedulerEventType.LEASE_LOST.value,
+        ]
+        assert len(output_path.read_text(encoding="utf-8").splitlines()) == 1
     finally:
         db.close()

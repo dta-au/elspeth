@@ -249,6 +249,9 @@ class FollowerProcessor:
         ``SIGINT``
             :exc:`KeyboardInterrupt`.  Depart, re-raise (or return if the
             caller catches it).
+
+        Any other exception stops the heartbeat, departs the worker, and
+        propagates unchanged through the common teardown seam.
         """
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
@@ -277,7 +280,6 @@ class FollowerProcessor:
                 return
             # True eviction: leader's housekeeping sweep evicted us while the
             # run is still RUNNING (design case b). Propagate (CLI exit 3).
-            self._best_effort_depart()
             raise
         except KeyboardInterrupt:
             logger.info(
@@ -285,14 +287,12 @@ class FollowerProcessor:
                 self._token.worker_id,
                 self._token.run_id,
             )
-            self._best_effort_depart()
             raise
         except _SeatDeadError:
             # The leader seat expired while we were draining. Depart cleanly,
             # then raise FollowerSeatDeadError so the CLI can surface the
             # "use elspeth resume" guidance and exit with a distinct code
             # (design §B.1 step 5).
-            self._best_effort_depart()
             raise FollowerSeatDeadError(
                 worker_id=self._token.worker_id,
                 run_id=self._token.run_id,
@@ -301,13 +301,17 @@ class FollowerProcessor:
             # Clean terminal exit.
             terminal_exit = True
         finally:
-            if terminal_exit:
-                try:
+            try:
+                if terminal_exit:
                     heartbeat.stop(final_beat=False)
-                finally:
-                    self._best_effort_depart()
-            else:
-                heartbeat.stop()
+                else:
+                    heartbeat.stop()
+            finally:
+                # Every exit abandons this single-use worker identity. The
+                # named exception arms above deliberately do not depart on
+                # their own: one teardown seam keeps expected and unexpected
+                # traversal failures from leaving an ACTIVE registry row.
+                self._best_effort_depart()
 
     # ------------------------------------------------------------------
     # Internal

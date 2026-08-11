@@ -874,7 +874,7 @@ class TestJoinCommand:
         assert run_id in combined
 
     def test_join_startup_failure_departs_admitted_worker_and_cleans_plugins(self, tmp_path: Path) -> None:
-        """A follower plugin on_start failure after admission must still depart and tear down."""
+        """Partial follower startup cleans only plugins whose on_start completed."""
         from types import SimpleNamespace
         from unittest.mock import patch
 
@@ -938,6 +938,13 @@ class TestJoinCommand:
             SinkEffectRuntimeBinding,
         )
         from elspeth.plugins.sinks.json_sink import JSONSink
+        from elspeth.plugins.transforms.passthrough import PassThrough
+
+        started_transform = PassThrough({"schema": {"mode": "observed"}})
+        started_transform.node_id = "transform-started"
+        started_transform.on_start = _CallRecorder()  # type: ignore[method-assign]
+        started_transform.on_complete = _CallRecorder()  # type: ignore[method-assign]
+        started_transform.close = _CallRecorder()  # type: ignore[method-assign]
 
         failing_sink = JSONSink(dict(settings_config.sinks["default"].options))
         failing_sink.node_id = "sink-failing"
@@ -952,7 +959,7 @@ class TestJoinCommand:
         plugins = SimpleNamespace(
             sources={"primary": object()},
             source_settings_map={"primary": object()},
-            transforms=[],
+            transforms=[SimpleNamespace(plugin=started_transform)],
             aggregations={},
             sinks={"default": failing_sink},
             sink_effect_bindings={
@@ -980,9 +987,12 @@ class TestJoinCommand:
 
         assert result.exit_code == 4, (result.output, result.exception)
         mock_build_follower.assert_called_once()
+        started_transform.on_start.assert_called_once()
+        started_transform.on_complete.assert_called_once()
+        started_transform.close.assert_called_once()
         failing_sink.on_start.assert_called_once()
-        failing_sink.on_complete.assert_called_once()
-        failing_sink.close.assert_called_once()
+        assert failing_sink.on_complete.calls == []
+        assert failing_sink.close.calls == []
 
         verify_db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
         try:

@@ -8,6 +8,16 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-12 — follower teardown has one exit seam and partial startup is
+  tracked explicitly**: `FollowerProcessor.run()` stops its heartbeat before
+  departing the single-use worker on every exit, including unexpected
+  traversal exceptions. Do not add a new exception arm that departs early or
+  bypasses the common `finally`; exact-once departure and stop-before-depart
+  ordering are pinned. CLI follower startup records a transform or sink only
+  after its `on_start()` returns. Pass those exact started subsets to
+  `cleanup_plugins`; never call `on_complete()` or `close()` on the plugin
+  whose startup raised, or on later plugins that were never started.
+
 ## Whole-tree gates: a green scoped run proves NOTHING
 
 These gates assert over the ENTIRE tree with exact expected sets. Your change
