@@ -32,7 +32,7 @@ from elspeth.plugins.aws_s3_common import build_s3_client
 from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from tests.fixtures.base_classes import inject_write_failure
 
-pytestmark = [pytest.mark.slow, pytest.mark.integration]
+pytestmark = [pytest.mark.slow, pytest.mark.integration, pytest.mark.live_aws, pytest.mark.live_provider]
 
 _CTX = RestrictedSinkEffectContext(
     run_id="live-run",
@@ -91,7 +91,7 @@ def test_real_s3_conditional_write_idempotent_reaffirm_and_stale_etag_non_clobbe
     authorizes a real conditional replace."""
     bucket = os.environ.get("ELSPETH_TEST_S3_BUCKET")
     if not bucket:
-        pytest.skip("ELSPETH_TEST_S3_BUCKET is required for the real AWS S3 acceptance")
+        pytest.fail("ELSPETH_TEST_S3_BUCKET is required for the real AWS S3 acceptance", pytrace=False)
     key = f"elspeth-plan07/{uuid.uuid4()}/output.{format}"
     config = {
         "bucket": bucket,

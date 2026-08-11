@@ -15,6 +15,8 @@ from elspeth.web.dependencies import create_catalog_service
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.slow,
+    pytest.mark.live_aws,
+    pytest.mark.live_provider,
     pytest.mark.asyncio,
     pytest.mark.timeout(60),
 ]
@@ -22,7 +24,7 @@ pytestmark = [
 
 async def test_bedrock_live_smoke_uses_real_composer_service_and_default_credential_chain(tmp_path: Path) -> None:
     if os.environ.get("ELSPETH_RUN_BEDROCK_LIVE") != "1":
-        pytest.skip("set ELSPETH_RUN_BEDROCK_LIVE=1 to select the live Bedrock smoke test")
+        pytest.fail("ELSPETH_RUN_BEDROCK_LIVE=1 is required for the live Bedrock smoke test", pytrace=False)
 
     model = os.environ.get("ELSPETH_BEDROCK_LIVE_TEST_MODEL")
     if model is None or not model.startswith("bedrock/"):

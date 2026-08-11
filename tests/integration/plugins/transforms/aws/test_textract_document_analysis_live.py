@@ -36,10 +36,11 @@ class _LiveLandscapeRecorder:
 
 
 @pytest.mark.live_aws
+@pytest.mark.live_provider
 def test_async_textract_document_analysis_live() -> None:
     gate = os.getenv(_RUN_GATE)
     if gate is None:
-        pytest.skip("live Amazon Textract proof is opt-in")
+        pytest.fail("live Amazon Textract proof gate is required", pytrace=False)
     if gate != "1":
         pytest.fail("live Amazon Textract proof gate is invalid", pytrace=False)
 

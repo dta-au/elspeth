@@ -1,0 +1,451 @@
+name: State engine live-provider acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live_aws:
+    name: live-aws / ${{ matrix.case_id }}
+    environment: state-engine-live-aws
+    strategy:
+      fail-fast: false
+      matrix:
+        case_id:
+          - sink:aws_s3@default
+          - source:aws_s3@default
+          - transform:aws_bedrock_content_safety@default
+          - transform:aws_bedrock_prompt_shield@default
+          - transform:aws_textract_document_analysis@default_chain
+          - transform:aws_textract_document_analysis@secret_refs
+          - transform:aws_textract_inline_analysis@default_chain
+          - transform:aws_textract_inline_analysis@secret_refs
+    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+    timeout-minutes: 90
+    env:
+      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
+      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
+      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
+      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
+      ELSPETH_TEST_S3_BUCKET: ${{ vars.ELSPETH_TEST_S3_BUCKET }}
+      ELSPETH_TEST_TEXTRACT_REGION: ${{ vars.ELSPETH_TEST_TEXTRACT_REGION }}
+      ELSPETH_TEST_TEXTRACT_BUCKET: ${{ vars.ELSPETH_TEST_TEXTRACT_BUCKET }}
+      ELSPETH_TEST_TEXTRACT_KEY: ${{ vars.ELSPETH_TEST_TEXTRACT_KEY }}
+      ELSPETH_TEST_TEXTRACT_EXPECTED_TEXT: ${{ vars.ELSPETH_TEST_TEXTRACT_EXPECTED_TEXT }}
+      ELSPETH_BEDROCK_LIVE_TEST_MODEL: ${{ vars.ELSPETH_BEDROCK_LIVE_TEST_MODEL }}
+      ELSPETH_BEDROCK_LIVE_ADVISOR_MODEL: ${{ vars.ELSPETH_BEDROCK_LIVE_ADVISOR_MODEL }}
+      ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS: ${{ vars.ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS }}
+      ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT: ${{ vars.ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT }}
+      ELSPETH_LIVE_BEDROCK_PROMPT_BLOCKED_TEXT: ${{ vars.ELSPETH_LIVE_BEDROCK_PROMPT_BLOCKED_TEXT }}
+      ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION: ${{ vars.ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION }}
+      ELSPETH_LIVE_BEDROCK_CONTENT_PROFILE_ALIAS: ${{ vars.ELSPETH_LIVE_BEDROCK_CONTENT_PROFILE_ALIAS }}
+      ELSPETH_LIVE_BEDROCK_CONTENT_SAFE_TEXT: ${{ vars.ELSPETH_LIVE_BEDROCK_CONTENT_SAFE_TEXT }}
+      ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT: ${{ vars.ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT }}
+      ELSPETH_LIVE_BEDROCK_CONTENT_EXPECTED_VERSION: ${{ vars.ELSPETH_LIVE_BEDROCK_CONTENT_EXPECTED_VERSION }}
+      ELSPETH_RUN_BEDROCK_LIVE: "1"
+      ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS: "1"
+      ELSPETH_RUN_LIVE_TEXTRACT: "1"
+    steps:
+      - name: Checkout frozen baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.5"
+          enable-cache: false
+      - name: Assert protected default-branch baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/${{ github.event.repository.default_branch }}"
+          test "$GITHUB_REF" = "$expected_ref"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Install frozen acceptance dependencies
+        run: uv sync --frozen --all-extras
+      - name: Create scrub canaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import secrets
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
+              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
+          PY
+      - name: Resolve exact selector lane
+        id: lane
+        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run and seal exact live-provider lane
+        shell: bash
+        run: |
+          set -uo pipefail
+          artifact_dir="$RUNNER_TEMP/state-engine-evidence"
+          stdout_path="$RUNNER_TEMP/pytest.stdout"
+          stderr_path="$RUNNER_TEMP/pytest.stderr"
+          argv_path="$RUNNER_TEMP/pytest.argv.json"
+          metadata_path="$RUNNER_TEMP/run-metadata.json"
+          lane_id="${{ steps.lane.outputs.lane_id }}"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest \
+            --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json \
+            --lane "$lane_id" --artifact-dir "$artifact_dir" \
+            --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" \
+            --run-metadata-output "$metadata_path" --timeout-seconds 4800 \
+            > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
+          pytest_status="$?"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal \
+            --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json \
+            --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json \
+            --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" \
+            --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" \
+            --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
+      - name: Upload closed evidence envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: state-engine-live-${{ steps.lane.outputs.lane_id }}
+          path: ${{ runner.temp }}/state-engine-evidence
+          if-no-files-found: error
+          retention-days: 7
+
+  live_azure:
+    name: live-azure / ${{ matrix.case_id }}
+    environment: state-engine-live-azure
+    strategy:
+      fail-fast: false
+      matrix:
+        case_id:
+          - sink:azure_blob@connection_string
+          - sink:azure_blob@managed_identity
+          - sink:azure_blob@sas_token
+          - sink:azure_blob@service_principal
+          - source:azure_blob@connection_string
+          - source:azure_blob@managed_identity
+          - source:azure_blob@sas_token
+          - source:azure_blob@service_principal
+          - transform:azure_content_safety@default
+          - transform:azure_document_intelligence@default
+          - transform:azure_prompt_shield@default
+    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+    timeout-minutes: 90
+    env:
+      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
+      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
+      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
+      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
+      ELSPETH_TEST_AZURE_STORAGE_ACCOUNT_URL: ${{ vars.ELSPETH_TEST_AZURE_STORAGE_ACCOUNT_URL }}
+      ELSPETH_TEST_AZURE_CONTAINER: ${{ vars.ELSPETH_TEST_AZURE_CONTAINER }}
+      ELSPETH_TEST_AZURE_BLOB_PREFIX: ${{ vars.ELSPETH_TEST_AZURE_BLOB_PREFIX }}
+      ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_CONTENT_SAFETY_ENDPOINT }}
+      ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT }}
+      ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL }}
+      ELSPETH_TEST_AZURE_DOCUMENT_URL: ${{ vars.ELSPETH_TEST_AZURE_DOCUMENT_URL }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout frozen baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.5"
+          enable-cache: false
+      - name: Assert protected default-branch baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="refs/heads/${{ github.event.repository.default_branch }}"
+          test "$GITHUB_REF" = "$expected_ref"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Install frozen acceptance dependencies
+        run: uv sync --frozen --all-extras
+      - name: Create scrub canaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import secrets
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
+              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
+          PY
+      - name: Resolve exact selector lane
+        id: lane
+        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run and seal exact live-provider lane
+        shell: bash
+        run: |
+          set -uo pipefail
+          artifact_dir="$RUNNER_TEMP/state-engine-evidence"
+          stdout_path="$RUNNER_TEMP/pytest.stdout"
+          stderr_path="$RUNNER_TEMP/pytest.stderr"
+          argv_path="$RUNNER_TEMP/pytest.argv.json"
+          metadata_path="$RUNNER_TEMP/run-metadata.json"
+          lane_id="${{ steps.lane.outputs.lane_id }}"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest \
+            --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json \
+            --lane "$lane_id" --artifact-dir "$artifact_dir" \
+            --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" \
+            --run-metadata-output "$metadata_path" --timeout-seconds 4800 \
+            > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
+          pytest_status="$?"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal \
+            --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json \
+            --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json \
+            --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" \
+            --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" \
+            --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
+      - name: Upload closed evidence envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: state-engine-live-${{ steps.lane.outputs.lane_id }}
+          path: ${{ runner.temp }}/state-engine-evidence
+          if-no-files-found: error
+          retention-days: 7
+
+  live_dataverse:
+    name: live-dataverse / ${{ matrix.case_id }}
+    environment: state-engine-live-dataverse
+    strategy:
+      fail-fast: false
+      matrix:
+        case_id:
+          - sink:dataverse@managed_identity
+          - sink:dataverse@service_principal
+          - source:dataverse@managed_identity
+          - source:dataverse@service_principal
+    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+    timeout-minutes: 90
+    env:
+      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
+      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
+      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
+      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
+      ELSPETH_TEST_DATAVERSE_URL: ${{ vars.ELSPETH_TEST_DATAVERSE_URL }}
+      ELSPETH_TEST_DATAVERSE_ENTITY: ${{ vars.ELSPETH_TEST_DATAVERSE_ENTITY }}
+      ELSPETH_TEST_DATAVERSE_ROW_PREFIX: ${{ vars.ELSPETH_TEST_DATAVERSE_ROW_PREFIX }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout frozen baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: "${{ github.sha }}", persist-credentials: false}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: "3.13"}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with: {version: "0.5", enable-cache: false}
+      - name: Assert protected default-branch baseline
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Install frozen acceptance dependencies
+        run: uv sync --frozen --all-extras
+      - name: Create scrub canaries
+        run: |
+          python - <<'PY'
+          import os, secrets
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
+              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
+          PY
+      - name: Resolve exact selector lane
+        id: lane
+        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run and seal exact live-provider lane
+        run: |
+          set -uo pipefail
+          artifact_dir="$RUNNER_TEMP/state-engine-evidence"; stdout_path="$RUNNER_TEMP/pytest.stdout"
+          stderr_path="$RUNNER_TEMP/pytest.stderr"; argv_path="$RUNNER_TEMP/pytest.argv.json"; metadata_path="$RUNNER_TEMP/run-metadata.json"
+          lane_id="${{ steps.lane.outputs.lane_id }}"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" --run-metadata-output "$metadata_path" --timeout-seconds 4800 > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
+          pytest_status="$?"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
+      - name: Upload closed evidence envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
+
+  live_chroma:
+    name: live-chroma / ${{ matrix.case_id }}
+    environment: state-engine-live-chroma
+    strategy:
+      fail-fast: false
+      matrix:
+        case_id:
+          - sink:chroma_sink@client
+          - sink:chroma_sink@persistent
+    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+    timeout-minutes: 90
+    env:
+      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
+      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
+      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
+      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
+      ELSPETH_TEST_CHROMA_HOST: ${{ vars.ELSPETH_TEST_CHROMA_HOST }}
+      ELSPETH_TEST_CHROMA_PORT: ${{ vars.ELSPETH_TEST_CHROMA_PORT }}
+      ELSPETH_TEST_CHROMA_SSL: ${{ vars.ELSPETH_TEST_CHROMA_SSL }}
+      ELSPETH_TEST_CHROMA_TENANT: ${{ vars.ELSPETH_TEST_CHROMA_TENANT }}
+      ELSPETH_TEST_CHROMA_DATABASE: ${{ vars.ELSPETH_TEST_CHROMA_DATABASE }}
+      ELSPETH_TEST_CHROMA_COLLECTION_PREFIX: ${{ vars.ELSPETH_TEST_CHROMA_COLLECTION_PREFIX }}
+    steps:
+      - name: Checkout frozen baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: "${{ github.sha }}", persist-credentials: false}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: "3.13"}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with: {version: "0.5", enable-cache: false}
+      - name: Assert protected default-branch baseline
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Install frozen acceptance dependencies
+        run: uv sync --frozen --all-extras
+      - name: Create scrub canaries
+        run: |
+          python - <<'PY'
+          import os, secrets
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
+              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
+          PY
+      - name: Resolve exact selector lane
+        id: lane
+        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run and seal exact live-provider lane
+        run: |
+          set -uo pipefail
+          artifact_dir="$RUNNER_TEMP/state-engine-evidence"; stdout_path="$RUNNER_TEMP/pytest.stdout"
+          stderr_path="$RUNNER_TEMP/pytest.stderr"; argv_path="$RUNNER_TEMP/pytest.argv.json"; metadata_path="$RUNNER_TEMP/run-metadata.json"
+          lane_id="${{ steps.lane.outputs.lane_id }}"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" --run-metadata-output "$metadata_path" --timeout-seconds 4800 > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
+          pytest_status="$?"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
+      - name: Upload closed evidence envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
+
+  live_provider:
+    name: live-provider / ${{ matrix.case_id }}
+    environment: state-engine-live-provider
+    strategy:
+      fail-fast: false
+      matrix:
+        case_id:
+          - source:llm@azure
+          - source:llm@bedrock
+          - source:llm@gateway
+          - source:llm@openrouter
+          - transform:llm@azure
+          - transform:llm@bedrock
+          - transform:llm@gateway
+          - transform:llm@openrouter
+          - transform:rag_retrieval@azure-search-api-key
+          - transform:rag_retrieval@azure-search-managed-identity
+          - transform:rag_retrieval@chroma-client
+          - transform:rag_retrieval@chroma-ephemeral
+          - transform:rag_retrieval@chroma-persistent
+    runs-on: [self-hosted, Linux, X64, ephemeral, aws-ecs, postgresql-16-rds, state-engine-live-provider]
+    timeout-minutes: 90
+    env:
+      STATE_ENGINE_CASE_ID: ${{ matrix.case_id }}
+      STATE_ENGINE_PROFILE_CASE: postgresql-16-aws-single-leader-landscape
+      STATE_ENGINE_RUNNER_IMAGE: aws-ecs-postgresql16
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL: ${{ secrets.ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL }}
+      ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE: ${{ vars.ELSPETH_STATE_ENGINE_AWS_DEPLOYMENT_PROVENANCE }}
+      ELSPETH_TEST_AZURE_LLM_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_LLM_ENDPOINT }}
+      ELSPETH_TEST_AZURE_LLM_MODEL: ${{ vars.ELSPETH_TEST_AZURE_LLM_MODEL }}
+      ELSPETH_TEST_OPENROUTER_MODEL: ${{ vars.ELSPETH_TEST_OPENROUTER_MODEL }}
+      ELSPETH_TEST_BEDROCK_MODEL: ${{ vars.ELSPETH_TEST_BEDROCK_MODEL }}
+      ELSPETH_TEST_LLM_GATEWAY_URL: ${{ vars.ELSPETH_TEST_LLM_GATEWAY_URL }}
+      ELSPETH_TEST_LLM_GATEWAY_MODEL: ${{ vars.ELSPETH_TEST_LLM_GATEWAY_MODEL }}
+      ELSPETH_TEST_AZURE_SEARCH_ENDPOINT: ${{ vars.ELSPETH_TEST_AZURE_SEARCH_ENDPOINT }}
+      ELSPETH_TEST_AZURE_SEARCH_INDEX: ${{ vars.ELSPETH_TEST_AZURE_SEARCH_INDEX }}
+      ELSPETH_TEST_CHROMA_HOST: ${{ vars.ELSPETH_TEST_CHROMA_HOST }}
+      ELSPETH_TEST_CHROMA_PORT: ${{ vars.ELSPETH_TEST_CHROMA_PORT }}
+      ELSPETH_TEST_CHROMA_SSL: ${{ vars.ELSPETH_TEST_CHROMA_SSL }}
+      ELSPETH_TEST_CHROMA_TENANT: ${{ vars.ELSPETH_TEST_CHROMA_TENANT }}
+      ELSPETH_TEST_CHROMA_DATABASE: ${{ vars.ELSPETH_TEST_CHROMA_DATABASE }}
+      ELSPETH_TEST_CHROMA_COLLECTION_PREFIX: ${{ vars.ELSPETH_TEST_CHROMA_COLLECTION_PREFIX }}
+      AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout frozen baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with: {ref: "${{ github.sha }}", persist-credentials: false}
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with: {python-version: "3.13"}
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with: {version: "0.5", enable-cache: false}
+      - name: Assert protected default-branch baseline
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = "refs/heads/${{ github.event.repository.default_branch }}"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+          echo "STATE_ENGINE_HEAD_SHA=$GITHUB_SHA" >> "$GITHUB_ENV"
+      - name: Install frozen acceptance dependencies
+        run: uv sync --frozen --all-extras
+      - name: Create scrub canaries
+        run: |
+          python - <<'PY'
+          import os, secrets
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as target:
+              target.write(f"ELSPETH_STATE_ENGINE_CREDENTIAL_CANARY=credential-{secrets.token_hex(32)}\n")
+              target.write(f"ELSPETH_STATE_ENGINE_PROVIDER_PAYLOAD_CANARY=provider-{secrets.token_hex(32)}\n")
+          PY
+      - name: Resolve exact selector lane
+        id: lane
+        run: python scripts/state_engine_live_provider_artifact.py lane-id --case-id "$STATE_ENGINE_CASE_ID" >> "$GITHUB_OUTPUT"
+      - name: Run and seal exact live-provider lane
+        run: |
+          set -uo pipefail
+          artifact_dir="$RUNNER_TEMP/state-engine-evidence"; stdout_path="$RUNNER_TEMP/pytest.stdout"
+          stderr_path="$RUNNER_TEMP/pytest.stderr"; argv_path="$RUNNER_TEMP/pytest.argv.json"; metadata_path="$RUNNER_TEMP/run-metadata.json"
+          lane_id="${{ steps.lane.outputs.lane_id }}"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py run-pytest --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv-output "$argv_path" --run-metadata-output "$metadata_path" --timeout-seconds 4800 > "$RUNNER_TEMP/pytest.stdout" 2> "$RUNNER_TEMP/pytest.stderr"
+          pytest_status="$?"
+          PYTHONPATH="$PWD/src:$PWD" uv run python scripts/state_engine_live_provider_artifact.py seal --selector-manifest docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json --lane "$lane_id" --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json --workflow .github/workflows/state-engine-live-provider.yml --artifact-dir "$artifact_dir" --stdout "$stdout_path" --stderr "$stderr_path" --argv "$argv_path" --run-metadata "$metadata_path" --pytest-exit-code "$pytest_status" --secret-env ELSPETH_STATE_ENGINE_AWS_POSTGRES_URL
+      - name: Upload closed evidence envelope
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with: {name: "state-engine-live-${{ steps.lane.outputs.lane_id }}", path: "${{ runner.temp }}/state-engine-evidence", if-no-files-found: error, retention-days: 7}
