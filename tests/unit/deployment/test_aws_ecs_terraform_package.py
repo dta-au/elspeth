@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import itertools
 import json
 import os
@@ -9,7 +10,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, get_args
+from typing import Any, NoReturn, get_args
 
 import pytest
 import yaml
@@ -138,6 +139,26 @@ def _source_files(root: Path = PACKAGE) -> list[Path]:
 
 def _text(relative: str) -> str:
     return (PACKAGE / relative).read_text(encoding="utf-8")
+
+
+WEB_SETTINGS_ENV_PREFIX = "ELSPETH_WEB__"
+_WEB_SETTINGS_ENV_NAME = re.compile(rf"\b({WEB_SETTINGS_ENV_PREFIX}[A-Z0-9_]+)")
+
+
+def _shipped_web_settings_environment() -> tuple[str, list[str]]:
+    """The module's live `.tf` text and the `ELSPETH_WEB__` names it ships.
+
+    One derivation, two consumers: the field-existence test below and the
+    minimum-image-revision floor test. Scanning twice invites the two to
+    drift apart and disagree about what the package actually ships. See
+    that first test's docstring for why the match is bare rather than
+    quoted, and why only whole-line comments are stripped.
+    """
+    tf_lines = itertools.chain.from_iterable(
+        path.read_text(encoding="utf-8").splitlines() for path in _source_files() if path.name.endswith(".tf")
+    )
+    tf_sources = "\n".join(line for line in tf_lines if not line.lstrip().startswith(("#", "//")))
+    return tf_sources, sorted(set(_WEB_SETTINGS_ENV_NAME.findall(tf_sources)))
 
 
 def _all_text() -> str:
@@ -3450,19 +3471,14 @@ def test_every_shipped_web_environment_name_is_a_real_websettings_field() -> Non
     (`iam_observability.tf` has a markdown heading, `storage_identity.tf` a
     URL), and no name is reached only through a trailing comment.
     """
-    prefix = "ELSPETH_WEB__"
-    name_pattern = rf"\b({prefix}[A-Z0-9_]+)"
-    tf_lines = itertools.chain.from_iterable(
-        path.read_text(encoding="utf-8").splitlines() for path in _source_files() if path.name.endswith(".tf")
-    )
-    tf_sources = "\n".join(line for line in tf_lines if not line.lstrip().startswith(("#", "//")))
-    shipped = sorted(set(re.findall(name_pattern, tf_sources)))
+    prefix = WEB_SETTINGS_ENV_PREFIX
+    tf_sources, shipped = _shipped_web_settings_environment()
     assert shipped, "no ELSPETH_WEB__ environment names found in the module; this test is no longer reading the shipped environment"
 
     # Pinned directly rather than through a representative name: every name
     # the entrypoint exports is also shipped as a quoted `runtime_environment`
     # entry, so their presence proves nothing about which shapes are read.
-    assert re.findall(name_pattern, 'export ELSPETH_WEB__PORT="$port"') == [f"{prefix}PORT"], (
+    assert _WEB_SETTINGS_ENV_NAME.findall('export ELSPETH_WEB__PORT="$port"') == [f"{prefix}PORT"], (
         "the scan no longer matches an unquoted name, so the `export ELSPETH_WEB__...` lines "
         "in the ecs.tf entrypoint and the bare plugin-policy map keys in locals.tf are "
         "invisible to it again (elspeth-52af290183 review, F2/N1)"
@@ -3483,6 +3499,164 @@ def test_every_shipped_web_environment_name_is_a_real_websettings_field() -> Non
     assert f"{prefix}DEPLOYMENT_AWS_REGION" not in shipped, (
         "the module sets the reserved ELSPETH_WEB__DEPLOYMENT_AWS_REGION; settings_from_env rejects it by name and the web task would fail to boot"
     )
+
+
+def _git_history_available() -> bool:
+    """Whether this checkout can read historical revisions at all.
+
+    Separates "no history here" — a source archive, or a shallow clone —
+    from "history works but this revision does not resolve", which is a
+    real defect in what the tree claims and must never be skipped.
+    """
+    if not (REPO_ROOT / ".git").exists():
+        return False
+    probe = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+def _require_git_history(reason: str) -> NoReturn:
+    """Skip locally without history; fail loudly in CI.
+
+    Same rule as `_require_terraform`, for the same reason
+    (elspeth-af1efcb8d8): the workflow checks out with `fetch-depth: 0`, so
+    missing history in CI is a broken gate, not an environment quirk.
+    Shallowing the checkout for speed would otherwise silently retire this
+    test rather than fail it.
+    """
+    if os.environ.get("GITHUB_ACTIONS"):
+        pytest.fail(f"git history is unavailable in CI: {reason}")
+    pytest.skip(reason)
+
+
+def _web_settings_fields_at(revision: str) -> frozenset[str] | None:
+    """`WebSettings` field names at a past revision, or None if unreadable.
+
+    Parsed with `ast`, never imported: an older `config.py` is written
+    against that revision's dependency set and need not import under the
+    current one, and importing an operator-named revision would execute
+    arbitrary historical code inside the test run.
+    """
+    read = subprocess.run(
+        ["git", "show", f"{revision}:src/elspeth/web/config.py"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if read.returncode != 0:
+        return None
+    for node in ast.parse(read.stdout).body:
+        if isinstance(node, ast.ClassDef) and node.name == "WebSettings":
+            return frozenset(
+                statement.target.id
+                for statement in node.body
+                if isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name)
+            )
+    return None
+
+
+def test_documented_minimum_image_revision_is_the_true_settings_floor() -> None:
+    """The README's minimum image revision must be computed, not asserted.
+
+    The package ships `ELSPETH_WEB__` names that `settings_from_env`
+    rejects outright when the image's `WebSettings` does not define them,
+    so the README's minimum revision is the operator's only defence
+    against pinning an image that cannot boot. Prose cannot hold that
+    line: the figure was `a04021af6` while the true floor had moved six
+    settings forward to `25f3440f5`, and an operator obeying it would
+    have cold-installed an image that fails every task at settings load.
+    Nothing referenced the old value, so nothing noticed for a week.
+
+    Two directions are needed, and neither alone is sufficient. Coverage
+    alone passes for any revision at or after the floor, so HEAD always
+    satisfies it and the number may drift arbitrarily late. Minimality
+    alone passes for any revision before it. Together they pin exactly
+    one commit.
+
+    Minimality is checked against *every* parent rather than `commit^`.
+    A merge whose first parent lacks a field its second parent added
+    would read as minimal on a first-parent-only check while an image
+    built from the second lineage boots fine — the floor would be later
+    than the truth, rejecting valid images. This commit is not currently
+    a merge; that is not a property to depend on.
+    """
+    documented = re.search(r"the\s+image\s+must\s+include\s+commit\s+`([0-9a-f]{9,40})`", _text("README.md"))
+    assert documented is not None, (
+        "the README no longer states a minimum image revision in the form this test reads "
+        "(the phrase 'the image must include commit `<sha>`', at least 9 hex characters). "
+        "That paragraph is the operator's only protection against pinning an unbootable image; "
+        "restore it rather than deleting this test."
+    )
+    revision = documented.group(1)
+
+    _, shipped = _shipped_web_settings_environment()
+    required = {name[len(WEB_SETTINGS_ENV_PREFIX) :].lower() for name in shipped}
+    assert required <= set(WebSettings.model_fields), (
+        "the shipped environment does not match WebSettings at HEAD; fix that first — "
+        "test_every_shipped_web_environment_name_is_a_real_websettings_field owns it"
+    )
+
+    if not _git_history_available():
+        _require_git_history("this checkout cannot read historical revisions, so the documented image floor is unverified")
+
+    ancestry = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", revision, "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ancestry.returncode == 0, (
+        f"README names {revision} as the minimum image revision, but it does not resolve as an ancestor "
+        f"of HEAD in this repository. A stale, typo'd, or squashed-away SHA gives an operator a floor "
+        f"they cannot check and this package cannot honour. Recompute it against current history."
+    )
+
+    floor = _web_settings_fields_at(revision)
+    assert floor is not None, (
+        f"the documented minimum revision {revision} resolves, but its src/elspeth/web/config.py could not "
+        f"be read or declares no WebSettings class. The floor cannot be verified; do not assume it holds."
+    )
+
+    absent = sorted(required - floor)
+    assert not absent, (
+        f"README names {revision} as the minimum image revision, but WebSettings there does not define "
+        f"{absent}, which this package ships as ELSPETH_WEB__ names. An image built at {revision} raises "
+        f"'Unknown ELSPETH_WEB__ setting' and fails every task at settings load. Recompute the floor: the "
+        f"earliest ancestor of HEAD whose WebSettings covers every shipped name."
+    )
+
+    parents = subprocess.run(
+        ["git", "rev-parse", f"{revision}^@"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert parents.returncode == 0, f"cannot resolve the parents of {revision}, so its minimality is unproven"
+    lineage = parents.stdout.split()
+    assert lineage, (
+        f"the documented minimum revision {revision} is a root commit, so the minimality half of this "
+        f"test ran against nothing. Confirm the SHA is the one intended."
+    )
+    for parent in lineage:
+        earlier = _web_settings_fields_at(parent)
+        assert earlier is not None, (
+            f"parent {parent[:9]} of the documented minimum revision could not be read, so minimality is "
+            f"unproven in the direction that fails open — a parent that already covers every shipped name "
+            f"means the documented floor is too late and valid images are being refused."
+        )
+        assert not required <= earlier, (
+            f"README names {revision} as the minimum image revision, but its parent {parent[:9]} already "
+            f"covers every shipped ELSPETH_WEB__ name. The documented floor is later than the truth, so "
+            f"images that would boot are being refused. Move it back to the earliest covering ancestor."
+        )
 
 
 def _quoted_plugin_ids(body: str) -> set[str]:

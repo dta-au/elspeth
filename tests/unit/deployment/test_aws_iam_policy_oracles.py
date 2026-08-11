@@ -41,6 +41,87 @@ _PROVIDER_ASSIGNMENT = re.compile(r"^\s*provider\s*=\s*(?P<provider>aws(?:\.[a-z
 _REQUEST_TAG = "aws:RequestTag/ACCEPTANCE_RUN_ID"
 _RESOURCE_TAG = "aws:ResourceTag/ACCEPTANCE_RUN_ID"
 
+# Actions the RCA established as dual-purpose: each authorizes both the
+# resource being created and a pre-existing run-tagged parent, so each needs
+# a second arm keyed on the resource tag. The value is the Sid of that arm.
+# Every entry is proved against the rendered policy by
+# test_every_adjudicated_dual_purpose_action_has_both_tag_arms, which reads the
+# whole map and not a filtered slice: recording an action here without adding
+# its arm must be red, because this map is also what the RequestTag surface
+# below is derived from, and an unproved entry would otherwise discharge both.
+_DUAL_PURPOSE_PARENT_ARMS = {
+    "ec2:CreateRouteTable": "CreateChildrenOfRunTaggedVpc",
+    "ec2:CreateSecurityGroup": "CreateChildrenOfRunTaggedVpc",
+    "ec2:CreateSubnet": "CreateChildrenOfRunTaggedVpc",
+    "acm:ImportCertificate": "MutateRunTaggedRegionalResources",
+    "cloudwatch:PutMetricAlarm": "MutateRunTaggedRegionalResources",
+    "events:PutRule": "MutateRunTaggedRegionalResources",
+}
+
+# The complete set of actions granted under an aws:RequestTag condition.
+# Pinned so a newly granted create cannot reach an operator un-adjudicated;
+# see test_every_request_tag_conditioned_action_is_adjudicated for what to do
+# when this assertion fires. Membership here is not a claim that an action is
+# single-purpose — only that its tag arms were looked at.
+_REQUEST_TAG_CONDITIONED_ACTIONS = frozenset(_DUAL_PURPOSE_PARENT_ARMS) | {
+    "bedrock:CreateGuardrail",
+    "cognito-idp:CreateUserPool",
+    "ec2:AuthorizeSecurityGroupEgress",
+    "ec2:AuthorizeSecurityGroupIngress",
+    "ec2:CreateInternetGateway",
+    "ec2:CreateTags",
+    "ec2:CreateVpc",
+    "ecr:CreateRepository",
+    "ecr:TagResource",
+    "ecs:CreateCluster",
+    "ecs:CreateService",
+    "ecs:RegisterTaskDefinition",
+    "elasticfilesystem:CreateAccessPoint",
+    "elasticfilesystem:CreateFileSystem",
+    "elasticloadbalancing:AddTags",
+    "elasticloadbalancing:CreateListener",
+    "elasticloadbalancing:CreateLoadBalancer",
+    "elasticloadbalancing:CreateRule",
+    "elasticloadbalancing:CreateTargetGroup",
+    "iam:CreatePolicy",
+    "iam:CreateRole",
+    "iam:TagPolicy",
+    "iam:TagRole",
+    "logs:CreateLogGroup",
+    "rds:CreateDBCluster",
+    "rds:CreateDBInstance",
+    "rds:CreateDBSubnetGroup",
+    "secretsmanager:CreateSecret",
+    "sns:CreateTopic",
+    "xray:CreateGroup",
+    "xray:CreateSamplingRule",
+}
+
+# Wildcard action patterns the policies grant. Pinned for the same reason as
+# the set above: a wildcard is the broadest grant in the file, and one added
+# quietly widens the installer principal without any single line looking new.
+_WILDCARD_ACTION_PATTERNS = frozenset(
+    {
+        "cognito-idp:Describe*",
+        "cognito-idp:List*",
+        "ec2:Describe*",
+        "ecr:Describe*",
+        "ecr:List*",
+        "ecs:Describe*",
+        "elasticfilesystem:Describe*",
+        "elasticloadbalancing:Describe*",
+        "events:List*",
+        "iam:Get*",
+        "iam:List*",
+        "logs:Describe*",
+        "logs:List*",
+        "rds:Describe*",
+        "s3:GetBucket*",
+        "secretsmanager:List*",
+        "sns:List*",
+    }
+)
+
 
 def _render_policy_documents() -> dict[str, dict[str, Any]]:
     documents: dict[str, dict[str, Any]] = {}
@@ -139,6 +220,27 @@ def _resource_provider_aliases(module: str) -> dict[tuple[str, str], str]:
     return aliases
 
 
+def _condition_tag_keys(statement: dict[str, Any]) -> set[str]:
+    """Condition keys a statement tests, across every condition operator.
+
+    Read structurally rather than by substring so that an ARN or a tag VALUE
+    containing the literal `aws:RequestTag/...` cannot be mistaken for the
+    statement testing that key. Callers own the two narrowings this does not
+    do: it reports keys for Deny statements as readily as Allow, and it does
+    not distinguish operator semantics, so a `ForAllValues:`-prefixed or
+    `Null` operator is reported like any other. The policies use only
+    StringEquals, ArnEquals and ArnLike today; filtering for shapes that do
+    not exist would be speculative.
+    """
+    condition = statement.get("Condition", {})
+    assert isinstance(condition, dict)
+    keys: set[str] = set()
+    for operands in cast(dict[str, Any], condition).values():
+        assert isinstance(operands, dict)
+        keys.update(cast(dict[str, Any], operands))
+    return keys
+
+
 def _statements_for_action(action: str) -> list[dict[str, Any]]:
     return [
         statement
@@ -231,6 +333,36 @@ def test_vendored_iam_action_vocabulary_covers_every_policy_service_and_action()
     assert not unknown_literals, f"unknown IAM action literals: {sorted(unknown_literals)}"
     assert len(escaped_actions) == len(escapes)
     assert escaped_actions == catalogue_misses
+
+
+def test_granted_wildcard_action_patterns_are_pinned() -> None:
+    """A new wildcard grant cannot arrive without review.
+
+    The vocabulary test above checks a wildcard matches SOMETHING real, which
+    is a far weaker claim than it looks and cannot stand in for coverage:
+    `s3:GetBucket*` — the original defect — matches GetBucketAcl and friends,
+    so it passes there while covering none of the seven de-prefixed S3 actions
+    the module needs, `s3:GetAccelerateConfiguration` among them. Only the
+    module coverage oracle catches that shape, and only for actions its
+    reviewed set already names. What this pin adds is narrower and worth
+    stating exactly: the breadth of the wildcard surface itself is fixed.
+    """
+    wildcards: set[str] = set()
+    for pattern in _all_action_patterns():
+        match = _ACTION_PATTERN.fullmatch(pattern)
+        assert match is not None, f"malformed IAM action pattern: {pattern}"
+        name = match.group("name")
+        if "*" in name or "?" in name:
+            wildcards.add(pattern)
+
+    assert wildcards == _WILDCARD_ACTION_PATTERNS, (
+        "the set of wildcard action patterns has changed.\n"
+        f"  newly granted: {sorted(wildcards - _WILDCARD_ACTION_PATTERNS)}\n"
+        f"  no longer granted: {sorted(_WILDCARD_ACTION_PATTERNS - wildcards)}\n"
+        "A wildcard grants every present and FUTURE action matching it, including actions AWS "
+        "has not shipped yet. Confirm the breadth is intended and that the specific actions the "
+        "module needs are named literally where they must be provable, then update the set."
+    )
 
 
 def test_rendered_policy_statement_sids_are_nonempty_and_globally_unique() -> None:
@@ -503,17 +635,79 @@ def test_pinned_provider_update_actions_have_reviewed_resource_and_condition_sco
     assert "Condition" not in discovery
 
 
-def test_known_parent_resource_create_actions_have_request_and_resource_tag_arms() -> None:
-    # These module-declared creates authorize both the new child and an existing
-    # tagged VPC. This is the exact D11 trap; it is not a general IAM solver.
-    actions = {
-        "ec2:CreateRouteTable",
-        "ec2:CreateSecurityGroup",
-        "ec2:CreateSubnet",
+def test_every_request_tag_conditioned_action_is_adjudicated() -> None:
+    """Every action granted under `aws:RequestTag` carries a recorded verdict.
+
+    A `aws:RequestTag` condition authorizes the resource being created. The
+    D11 trap is an action that ALSO authorizes against a pre-existing parent
+    carrying no request tag — `ec2:CreateSubnet` against its VPC — which
+    denies at apply under a RequestTag-only grant. The sibling tests below
+    pin the six such actions the RCA established, and could only ever pin
+    those six: a newly granted dual-purpose action was invisible to this
+    suite, which is the gap that let the original corpus ship.
+
+    This test closes that for the RequestTag surface by pinning it whole
+    instead of a chosen subset. It does not decide whether a given AWS API is
+    dual-purpose — that is a fact about AWS, not about this tree, and no
+    offline oracle can settle it. What it guarantees is that adding one to
+    this surface cannot be silent.
+
+    Two boundaries, so the green is not read as wider than it is. Create-
+    shaped actions granted OUTSIDE a RequestTag condition — in a
+    ResourceTag-only statement, or one with no `Condition` at all — are
+    adjudicated by nothing here; `s3:CreateBucket` and
+    `elasticfilesystem:CreateMountTarget` are in that position today. And
+    membership pins the action SET, not the condition SHAPE: only
+    `CreateRunTaggedRegionalResources` has its condition contents pinned,
+    through the arm assertions.
+    """
+    granted = {
+        action
+        for statement in _statements()
+        if statement["Effect"] == "Allow" and _REQUEST_TAG in _condition_tag_keys(statement)
+        for action in _statement_actions(statement)
     }
-    for action in actions:
+    assert granted == _REQUEST_TAG_CONDITIONED_ACTIONS, (
+        "the set of actions granted under an aws:RequestTag condition has changed.\n"
+        f"  newly granted: {sorted(granted - _REQUEST_TAG_CONDITIONED_ACTIONS)}\n"
+        f"  no longer granted: {sorted(_REQUEST_TAG_CONDITIONED_ACTIONS - granted)}\n"
+        "For each newly granted action, decide whether the API also authorizes against a "
+        "pre-existing resource that carries no request tag (a parent VPC, cluster, load "
+        "balancer, file system). If it does, add the aws:ResourceTag/ACCEPTANCE_RUN_ID arm to "
+        "the policy AND record it in _DUAL_PURPOSE_PARENT_ARMS — recording it without the arm "
+        "is red, because test_every_adjudicated_dual_purpose_action_has_both_tag_arms proves "
+        "every entry against the rendered policy. If it does not, add it to the literal set "
+        "below. Do not update either set to make the test pass without answering that "
+        "question: a wrong answer denies at apply, after terraform has already created "
+        "earlier resources."
+    )
+
+
+def test_every_adjudicated_dual_purpose_action_has_both_tag_arms() -> None:
+    """Every entry in the adjudication map is proved against the policy.
+
+    Iterates the whole map, never a filtered slice. Filtering by the two
+    currently-known resource-tag Sids left an escape hatch exactly where the
+    gate is most load-bearing: the adjudication failure message tells an
+    author to record a dual-purpose action here, and because
+    `_REQUEST_TAG_CONDITIONED_ACTIONS` is derived from this map, doing so
+    also satisfied the exact-set pin. An entry naming a Sid outside the
+    filtered pair was therefore asserted by nothing — following the
+    instruction produced a green suite with the arm absent from the policy
+    and a recorded claim that it had been reviewed.
+
+    The size pin is what stops the other direction: driving assertions from
+    data means an emptied or shrunken map otherwise passes by having nothing
+    left to check.
+    """
+    assert len(_DUAL_PURPOSE_PARENT_ARMS) == 6, (
+        "the adjudicated dual-purpose set changed size. Adding one is expected when a new "
+        "dual-purpose API is granted — update this count with it. Losing one means an action "
+        "that authorizes against a pre-existing parent is no longer proved to have both arms."
+    )
+    for action, resource_tag_sid in sorted(_DUAL_PURPOSE_PARENT_ARMS.items()):
         _assert_exact_tag_arm(action=action, sid="CreateRunTaggedRegionalResources", tag_key=_REQUEST_TAG, resource="*")
-        _assert_exact_tag_arm(action=action, sid="CreateChildrenOfRunTaggedVpc", tag_key=_RESOURCE_TAG, resource="*")
+        _assert_exact_tag_arm(action=action, sid=resource_tag_sid, tag_key=_RESOURCE_TAG, resource="*")
 
 
 def test_known_tagless_authorization_paths_have_an_arm_without_resource_tags() -> None:
@@ -563,14 +757,16 @@ def test_known_tagless_authorization_paths_have_an_arm_without_resource_tags() -
             )
 
 
-def test_known_create_and_update_apis_have_request_and_resource_tag_arms() -> None:
-    # Regression protection for the three dual-purpose APIs established by
-    # the RCA. It cannot discover a newly introduced dual-purpose API.
-    actions = {
-        "acm:ImportCertificate",
-        "cloudwatch:PutMetricAlarm",
-        "events:PutRule",
+def test_adjudicated_dual_purpose_actions_keep_their_established_arm_grouping() -> None:
+    # The RCA established two distinct shapes: creates whose parent is the
+    # run-tagged VPC, and create/update APIs that mutate an existing run-tagged
+    # regional resource. Arm proof belongs to the test above, which reads every
+    # entry; this pins only the grouping, so a silent reclassification between
+    # the two shapes is visible in review.
+    grouping: dict[str, list[str]] = {}
+    for action, resource_tag_sid in sorted(_DUAL_PURPOSE_PARENT_ARMS.items()):
+        grouping.setdefault(resource_tag_sid, []).append(action)
+    assert grouping == {
+        "CreateChildrenOfRunTaggedVpc": ["ec2:CreateRouteTable", "ec2:CreateSecurityGroup", "ec2:CreateSubnet"],
+        "MutateRunTaggedRegionalResources": ["acm:ImportCertificate", "cloudwatch:PutMetricAlarm", "events:PutRule"],
     }
-    for action in actions:
-        _assert_exact_tag_arm(action=action, sid="CreateRunTaggedRegionalResources", tag_key=_REQUEST_TAG, resource="*")
-        _assert_exact_tag_arm(action=action, sid="MutateRunTaggedRegionalResources", tag_key=_RESOURCE_TAG, resource="*")

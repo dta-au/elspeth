@@ -152,9 +152,24 @@ loader rejects unknown `ELSPETH_WEB__` keys, so an image older than the
 package's settings contract fails every task at settings load (observed as
 `{"check": "storage_settings", ...}` from `provision-storage` on a cold
 install). The supported pairing is a package and image cut from the same
-commit. Concretely for 0.7.2: the image must include commit `a04021af6`
-(`ELSPETH_WEB__DEFAULT_LLM_PROFILE`); every image published before
-`v0.7.2-RC-300726` predates it and cannot boot under this package.
+commit. Concretely for 0.7.2: the image must include commit `25f3440f5`
+(`ELSPETH_WEB__LOG_JSON`), the earliest revision whose `WebSettings` defines
+every name this package ships. Any image whose revision does not contain it
+fails to boot under this package — this is ancestry, not chronology, so an
+image built later on a branch without the commit fails the same way. Check a
+candidate against the revision label described below:
+
+```bash
+git merge-base --is-ancestor 25f3440f5 <image revision label>
+```
+
+Do not edit this number on its own. It is re-derived from the tree on every
+test run by `test_documented_minimum_image_revision_is_the_true_settings_floor`
+in `tests/unit/deployment/test_aws_ecs_terraform_package.py`, which reads the
+commit out of this paragraph, checks that revision's `WebSettings` covers every
+shipped name, and checks each of its parents does not. Ship a new
+`ELSPETH_WEB__` name and that test fails, naming the settings this revision is
+missing; recompute the floor and correct the paragraph together.
 
 Image admission at apply time proves the digest the operator named is what ECR
 serves, the image's self-declared revision label matches the supplied SHA, and

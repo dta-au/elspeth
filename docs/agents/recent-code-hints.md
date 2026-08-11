@@ -153,6 +153,36 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-11 — the AWS IAM policy templates and the deploy README's floor
+  commit are both pinned; editing either without its sibling update is red**:
+  `tests/unit/deployment/test_aws_iam_policy_oracles.py` now pins the exact set
+  of actions granted under an `aws:RequestTag/ACCEPTANCE_RUN_ID` condition and
+  the exact set of wildcard patterns, so any grant added to
+  `deploy/aws-ecs/terraform/iam/*.json.tftpl` fails until it is adjudicated.
+  The verdict a new create needs: does the API ALSO authorize against a
+  pre-existing untagged parent (the D11 trap — `ec2:CreateSubnet` also
+  authorizes against its VPC, which carries no request tag)? If yes, add the
+  `aws:ResourceTag` arm to the policy AND record it in
+  `_DUAL_PURPOSE_PARENT_ARMS`; recording it WITHOUT the arm is red, because
+  every entry is proved against the rendered policy — an earlier revision of
+  this gate let a novel Sid discharge the pin with no arm present, which was
+  worse than not gating at all, since the green then asserted a verdict had
+  been reviewed. Neither set decides whether an API is dual-purpose (a fact
+  about AWS, not about this tree); they only make the question unskippable.
+  Two boundaries worth knowing: create-shaped actions granted OUTSIDE a
+  RequestTag condition are adjudicated by nothing, and membership pins the
+  action SET, not the condition SHAPE.
+- **2026-08-11 — "Minimum image revision" in `deploy/aws-ecs/terraform/README.md`
+  is machine-checked, not prose**: ship a new `ELSPETH_WEB__` name and
+  `test_documented_minimum_image_revision_is_the_true_settings_floor` fails
+  until that paragraph names the earliest ancestor of HEAD whose `WebSettings`
+  defines every shipped name. Correct the paragraph, never the number alone.
+  It was last wrong by six settings — `settings_from_env` raises on an unknown
+  key and `WebSettings` is `extra="forbid"`, so an operator obeying it pins an
+  image that fails every task at settings load, after a successful apply. The
+  test skips only when the checkout has no git history at all, and fails
+  loudly under `GITHUB_ACTIONS` (same rule as `_require_terraform`,
+  elspeth-af1efcb8d8); an unresolvable or non-ancestor SHA is always red.
 - **2026-08-11 — cancellation-safe settlement outcomes belong in the locked
   transaction**: a deferred-cancellation wrapper drains its shielded database
   worker, then deliberately re-raises `CancelledError`. Any audit write left
