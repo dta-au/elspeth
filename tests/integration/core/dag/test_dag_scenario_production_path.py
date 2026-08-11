@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from elspeth.contracts import RunStatus
 from elspeth.core.checkpoint.recovery import NonResumableRunError
@@ -22,6 +22,8 @@ from elspeth.core.landscape.scheduler import barrier as scheduler_barrier
 from elspeth.core.landscape.scheduler import queue as scheduler_queue
 from elspeth.core.landscape.scheduler import work_items as scheduler_work_items
 from elspeth.core.landscape.schema import (
+    batch_members_table,
+    batches_table,
     node_states_table,
     routing_events_table,
     rows_table,
@@ -92,6 +94,7 @@ B3_RUNTIME_CASES = (
 B3_RECOVERY_CASES = (
     ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
     ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+    ("row-union-interleave", "two-variant-ab-reopen-resume"),
     ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
     ("sink-write-pending-redrive", "pending-redrive-reopen"),
 )
@@ -2526,6 +2529,121 @@ def test_retry_success_recovery_preserves_completed_attempt_history_without_dupl
     assert proof.artifact_count_after == proof.publication_count_after == 1
 
 
+def test_row_union_recovery_preserves_exact_complete_group_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, uninterrupted_case = _declared_case("row-union-interleave", "two-variant-ab")
+    _recovery_scenario, recovery_case = _declared_case(
+        "row-union-interleave",
+        "two-variant-ab-reopen-resume",
+    )
+    assert _recovery_scenario is scenario
+    assert isinstance(uninterrupted_case.expected, SemanticRunExpectation)
+    monkeypatch.setattr(Orchestrator, "run", inspect.unwrap(Orchestrator.run))
+    monkeypatch.setattr(Orchestrator, "resume", inspect.unwrap(Orchestrator.resume))
+    install_corpus_plugin_manager(monkeypatch)
+    uninterrupted_evidence = run_scenario_case(
+        scenario,
+        uninterrupted_case,
+        tmp_path / "uninterrupted",
+    )
+    _assert_declared_run_evidence(scenario, uninterrupted_case, uninterrupted_evidence)
+    uninterrupted_projection = uninterrupted_evidence.runtime.durable_projection
+    assert uninterrupted_projection is not None
+    uninterrupted_semantic_projection = semantic_runtime_projection(uninterrupted_projection)
+    interrupted_group_members: list[tuple[str, ...]] = []
+
+    def verify_complete_group_before_reopen(
+        context: corpus_harness.SinkBoundaryInterruptedContext,
+    ) -> None:
+        with context.database.connection() as conn:
+            batch = (
+                conn.execute(
+                    select(
+                        batches_table.c.batch_id,
+                        batches_table.c.status,
+                        batches_table.c.trigger_type,
+                    ).where(batches_table.c.run_id == context.run_id)
+                )
+                .mappings()
+                .one()
+            )
+            member_token_ids = tuple(
+                str(token_id)
+                for token_id in conn.execute(
+                    select(batch_members_table.c.token_id)
+                    .where(
+                        batch_members_table.c.run_id == context.run_id,
+                        batch_members_table.c.batch_id == batch["batch_id"],
+                    )
+                    .order_by(batch_members_table.c.ordinal)
+                ).scalars()
+            )
+            parent_link_count = conn.execute(
+                select(func.count()).select_from(token_parents_table).where(token_parents_table.c.run_id == context.run_id)
+            ).scalar_one()
+            route_count = conn.execute(
+                select(func.count()).select_from(routing_events_table).where(routing_events_table.c.run_id == context.run_id)
+            ).scalar_one()
+            outcome_count = conn.execute(
+                select(func.count()).select_from(token_outcomes_table).where(token_outcomes_table.c.run_id == context.run_id)
+            ).scalar_one()
+
+        assert (batch["status"], batch["trigger_type"]) == ("completed", "end_of_source")
+        assert len(member_token_ids) == 8
+        assert len(context.token_ids) == 13
+        assert set(member_token_ids) < set(context.token_ids)
+        assert (parent_link_count, route_count, outcome_count) == (9, 8, 20)
+        assert len(context.work) == 21
+        assert sum(item.status == "pending_sink" for item in context.work) == 1
+        assert sum(item.status == "terminal" for item in context.work) == 20
+        interrupted_group_members.append(member_token_ids)
+
+    evidence = corpus_harness.run_sink_boundary_recovery_case(
+        scenario,
+        recovery_case,
+        tmp_path / "recovery",
+        before_reopen_verifier=verify_complete_group_before_reopen,
+    )
+
+    _assert_declared_recovery_evidence(scenario, recovery_case, evidence)
+    assert len(interrupted_group_members) == 1
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    semantic_projection = semantic_runtime_projection(projection)
+    assert (
+        semantic_projection.model_copy(update={"scheduler_work": uninterrupted_semantic_projection.scheduler_work})
+        == uninterrupted_semantic_projection
+    )
+    uninterrupted_work = {work.key: work.transitions for work in uninterrupted_semantic_projection.scheduler_work}
+    recovered_work = {work.key: work.transitions for work in semantic_projection.scheduler_work}
+    assert tuple(key for key in recovered_work if recovered_work[key] != uninterrupted_work[key]) == ("primary:0#1|scheduler:unbound|0",)
+    assert uninterrupted_work["primary:0#1|scheduler:unbound|0"] == (
+        "mark_pending_sink:pending_sink",
+        "mark_pending_sink_terminal:terminal",
+    )
+    assert recovered_work["primary:0#1|scheduler:unbound|0"] == (
+        "mark_pending_sink:pending_sink",
+        "claim_pending_sink:leased",
+        "mark_pending_sink_terminal:terminal",
+    )
+    assert semantic_runtime_projection_sha256(semantic_projection) == "99d7effd0d9ec60aa1f7624311b598d0a45d9be6584ad06db471eb5887868fc5"
+    assert semantic_runtime_projection_counts(semantic_projection) == uninterrupted_case.expected.projection_counts
+    assert evidence.runtime.sink_outputs == uninterrupted_case.expected.sink_outputs
+    assert evidence.audit.source_operation_count == 1
+    [batch_after] = projection.batches
+    [uninterrupted_batch] = uninterrupted_semantic_projection.batches
+    assert batch_after.members == uninterrupted_batch.members
+    proof = evidence.recovery.sink_boundary
+    assert proof is not None
+    assert proof.token_ids_before == proof.token_ids_after
+    assert set(interrupted_group_members[0]) < set(proof.token_ids_after)
+    assert proof.effect_count_before == proof.effect_count_after == 1
+    assert proof.artifact_count_before == proof.publication_count_before == 0
+    assert proof.artifact_count_after == proof.publication_count_after == 1
+
+
 def test_recovery_durable_oracle_rejects_shared_serializer_record_family_omission(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2571,6 +2689,11 @@ def test_b3_recovery_cases_are_registered_as_closed_recovery_workflows() -> None
             "row-expansion-parent-child-recovery",
             "resume-after-child-enqueue",
             "expansion_child_enqueue",
+        ),
+        (
+            "row-union-interleave",
+            "two-variant-ab-reopen-resume",
+            "sink_boundary",
         ),
         (
             "retry-quarantine-discard-routed-errors",
@@ -2655,6 +2778,7 @@ def test_checkpoint_reopen_resume_has_exact_restart_evidence(
         ("parallel-coalesces", "resume-after-left-finalize"),
         ("aggregation-immutable-batch", "resume-after-eof-flush-fault"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
+        ("row-union-interleave", "two-variant-ab-reopen-resume"),
         ("retry-quarantine-discard-routed-errors", "retry-success-reopen-resume"),
         ("sink-write-pending-redrive", "pending-redrive-reopen"),
         ("checkpoint-deterministic-resume", "reopen-resume"),

@@ -243,7 +243,7 @@ EXPECTED_STATUS_MATRIX = {
         "pass",
         "pass",
         "partial",
-        "unknown",
+        "pass",
         "unknown",
         "pass",
         "pass",
@@ -317,7 +317,10 @@ def test_row_union_two_variant_ab_semantic_case_is_registered() -> None:
     manifest = load_manifest()
     scenario = next(scenario for scenario in manifest.scenarios if scenario.id == "row-union-interleave")
 
-    assert tuple(case.id for case in scenario.cases) == ("two-variant-ab",)
+    assert tuple(case.id for case in scenario.cases) == (
+        "two-variant-ab",
+        "two-variant-ab-reopen-resume",
+    )
     case = scenario.cases[0]
     assert case.workflow == "run"
     assert case.fixture == "row-union-interleave/two-variant-ab.yaml"
@@ -441,7 +444,9 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # Rotated 2026-08-11 for elspeth-7e556decc9: one executable recovery evidence
 # reference was added for retry-success-reopen-resume; existing references are
 # unchanged and preserve their declaration order.
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "748613cc309597fbef9331330bb8cd15a90f5c2db44ad7a1e5d2003462af6555"
+# Rotated again for elspeth-3875f3b381: one executable row-union recovery
+# reference was added; all 111 prior references are unchanged.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8abc072237ea65b940b4e31c"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
@@ -517,7 +522,10 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "748613cc309597fbef9331330bb8cd15a90f5c2db44
 # Rotated 2026-08-11 for elspeth-7e556decc9: one summary recovery declaration
 # reuses the pinned retry fixture and input bytes; all 47 prior case declarations
 # are unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "4e3df78ebdbdc2d310dec7a337424f63526a4e0ee4ea02f947e58fb9b001fd49"
+# Rotated again for elspeth-3875f3b381: one summary row-union recovery
+# declaration reuses the pinned two-variant fixture; all 48 prior declarations
+# are unchanged.
+EXPECTED_CASE_REGISTRY_SHA256 = "34924d819a4670e534e3a82c1678f5f9fa9dd241d7e47f1579865ad235a6a504"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -589,6 +597,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "row-expansion-parent-child-recovery:json-explode-parent-child": "bf40f9a9fd913518566c36bd27a0530d6edaed40dde67b69642eabacc48716ed",
     "row-expansion-parent-child-recovery:resume-after-child-enqueue": "ebd85363be5af5e19acaa2af087ef5dddc10693fe7ac0674ff960d2d4f94a8e6",
     "row-union-interleave:two-variant-ab": "8561ba5d8eca7a3003075d15b78fa5e8088f585fb43d8ffb47f8b4e402e7cef5",
+    "row-union-interleave:two-variant-ab-reopen-resume": "8561ba5d8eca7a3003075d15b78fa5e8088f585fb43d8ffb47f8b4e402e7cef5",
     "retry-quarantine-discard-routed-errors:retry-then-success": "add6f84b856bf06915c6275a005bfb4aef5ad50068f7c93038b6b7d99970ab90",
     "retry-quarantine-discard-routed-errors:source-quarantine-routed": "286d04abef045d70a846b65bfc348792ff6242aff237451f30050565d8e5e639",
     "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
@@ -716,6 +725,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-row-union-interleave-two-variant-ab",
         "row-union-interleave:two-variant-ab",
         ("config", "build", "runtime"),
+    ),
+    (
+        "harness-row-union-interleave-two-variant-ab-reopen-resume",
+        "row-union-interleave:two-variant-ab-reopen-resume",
+        ("config", "build", "runtime", "audit", "recovery"),
     ),
     *(
         (
@@ -4980,6 +4994,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
         ("row-union-interleave", "two-variant-ab"),
+        ("row-union-interleave", "two-variant-ab-reopen-resume"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
@@ -5001,11 +5016,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 111
+    assert len(manifest.evidence) == 112
     assert len(assessment_evidence) == 63
-    assert len(harness_evidence) == 48
-    assert len({reference.id for reference in manifest.evidence}) == 111
-    assert len({reference.locator for reference in manifest.evidence}) == 111
+    assert len(harness_evidence) == 49
+    assert len({reference.id for reference in manifest.evidence}) == 112
+    assert len({reference.locator for reference in manifest.evidence}) == 112
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -5039,6 +5054,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
         ("row-union-interleave", "two-variant-ab"),
+        ("row-union-interleave", "two-variant-ab-reopen-resume"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
@@ -5150,6 +5166,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("row-union-interleave", "build"),
             ("row-union-interleave", "runtime"),
         ),
+        "harness-row-union-interleave-two-variant-ab-reopen-resume": (("row-union-interleave", "recovery"),),
         **{
             f"harness-retry-quarantine-discard-routed-errors-{case_id}": (
                 ("retry-quarantine-discard-routed-errors", "runtime"),

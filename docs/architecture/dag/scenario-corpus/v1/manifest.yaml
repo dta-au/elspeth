@@ -530,6 +530,11 @@ evidence:
     locator: row-union-interleave:two-variant-ab
     claim: The canonical two-variant A/B case proves semantic production runtime behavior for a deterministic fork, declared-order row_union release, end-of-source long-format experiment comparison, and one complete terminal publication.
     stages: [config, build, runtime]
+  - id: harness-row-union-interleave-two-variant-ab-reopen-resume
+    kind: harness
+    locator: row-union-interleave:two-variant-ab-reopen-resume
+    claim: A fresh-object public resume after complete declared-order row_union release, end-of-source aggregation, source exhaustion, and an honest pre-publication sink-effect fault matches an uninterrupted control in every semantic field except the required pending-sink reclaim transition; it does not replay the source or duplicate or partially release a group, publishes once, removes the checkpoint, and preserves durable/export parity.
+    stages: [config, build, runtime, audit, recovery]
   - id: harness-retry-quarantine-discard-routed-errors-retry-then-success
     kind: harness
     locator: retry-quarantine-discard-routed-errors:retry-then-success
@@ -4084,6 +4089,38 @@ scenarios:
         output_artifacts:
           output: output.jsonl
         expected: {"audit_record_counts":[{"count":1,"record_type":"artifact"},{"count":1,"record_type":"batch"},{"count":8,"record_type":"batch_member"},{"count":3,"record_type":"call"},{"count":7,"record_type":"edge"},{"count":1,"record_type":"manifest"},{"count":7,"record_type":"node"},{"count":26,"record_type":"node_state"},{"count":2,"record_type":"operation"},{"count":8,"record_type":"routing_event"},{"count":4,"record_type":"row"},{"count":1,"record_type":"run"},{"count":78,"record_type":"scheduler_event"},{"count":1,"record_type":"sink_effect"},{"count":3,"record_type":"sink_effect_attempt"},{"count":1,"record_type":"sink_effect_member"},{"count":1,"record_type":"sink_effect_stream"},{"count":13,"record_type":"token"},{"count":21,"record_type":"token_outcome"},{"count":9,"record_type":"token_parent"}],"kind":"semantic_runtime","projection_counts":{"batch_members":8,"batches":1,"intermediate_outcomes":8,"node_states":26,"parent_links":9,"routes":8,"rows":4,"scheduler_work":21,"terminal_dispositions":13,"tokens":13},"projection_sha256":"89d17c13b2ab7c433ffe5d2a32edc66939798beeea096a4a5a8b1b3202ea0061","rows_failed":0,"rows_processed":4,"rows_succeeded":1,"sink_outputs":[{"rows":["{\"baseline_count\":4,\"baseline_mean\":25,\"baseline_missing_count\":0,\"baseline_non_finite_count\":0,\"baseline_stdev\":12.909944487358056,\"baseline_total_count\":4,\"baseline_variant\":\"control\",\"batch_size\":8,\"confidence_95_high\":35.308258738155935,\"confidence_95_low\":-10.308258738155935,\"mean_delta\":12.5,\"relative_lift\":0.5,\"score_field\":\"score\",\"standard_error\":11.636866703140784,\"variant\":\"treatment\",\"variant_count\":4,\"variant_field\":\"prompt_variant\",\"variant_mean\":37.5,\"variant_missing_count\":0,\"variant_non_finite_count\":0,\"variant_stdev\":19.364916731037084,\"variant_total_count\":4,\"z_score\":1.0741723110591492}"],"sink_name":"output"}],"source_operation_count":1,"status":"completed"}
+      - id: two-variant-ab-reopen-resume
+        workflow: recovery
+        recovery_kind: sink_boundary
+        recovery_fault:
+          kind: sink_effect
+          seam: before_effect
+          sink_name: output
+          occurrence: 1
+        fixture: row-union-interleave/two-variant-ab.yaml
+        input_fixtures:
+          primary: row-union-interleave/input.csv
+        output_artifacts:
+          output: output.jsonl
+        expected:
+          kind: summary
+          status: completed
+          output_rows: 1
+          required_audit_record_types:
+            - artifact
+            - batch
+            - batch_member
+            - node_state
+            - operation
+            - routing_event
+            - row
+            - run
+            - scheduler_event
+            - sink_effect
+            - sink_effect_member
+            - token
+            - token_outcome
+            - token_parent
     dimensions:
       config:
         status: pass
@@ -4104,10 +4141,8 @@ scenarios:
         owner_issue: elspeth-a5b86149d4
         exit_gate: A repeated row-union corpus run pins canonical raw audit identity or an explicit accepted identity boundary, and the corpus gate passes.
       recovery:
-        status: unknown
-        reason: No registered row-union corpus recovery case exists.
-        owner_issue: elspeth-a5b86149d4
-        exit_gate: The row-union corpus case passes database-reopen and public-resume assertions without duplicate or partial group release.
+        status: pass
+        evidence: [harness-row-union-interleave-two-variant-ab-reopen-resume]
       concurrency:
         status: unknown
         reason: No complete row-union contention and fencing case exists.
