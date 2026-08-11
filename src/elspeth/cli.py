@@ -44,9 +44,11 @@ if TYPE_CHECKING:
     from elspeth.contracts.run_result import RunResult
     from elspeth.core.config import SecretsConfig
     from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.rate_limit import RateLimitRegistry
     from elspeth.engine import Orchestrator, PipelineConfig
     from elspeth.engine.orchestrator import RowPlugin
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+    from elspeth.telemetry import TelemetryManager
     from elspeth.web.auth.local import LocalAuthProvider
 __all__ = [
     "app",
@@ -3295,7 +3297,28 @@ def join(
         raise typer.Exit(1) from None
 
     follower_db: LandscapeDB | None = None
+    follower_rate_limit_registry: RateLimitRegistry | None = None
+    follower_telemetry_manager: TelemetryManager | None = None
     try:
+        import threading
+
+        from elspeth.contracts.config.runtime import (
+            RuntimeConcurrencyConfig,
+            RuntimeRateLimitConfig,
+            RuntimeTelemetryConfig,
+        )
+        from elspeth.core.rate_limit import RateLimitRegistry
+        from elspeth.telemetry import create_telemetry_manager
+
+        follower_concurrency_config = RuntimeConcurrencyConfig.from_settings(settings_config.concurrency)
+        follower_rate_limit_registry = RateLimitRegistry(RuntimeRateLimitConfig.from_settings(settings_config.rate_limit))
+        follower_telemetry_manager = create_telemetry_manager(RuntimeTelemetryConfig.from_settings(settings_config.telemetry))
+        follower_shutdown_event = threading.Event()
+
+        def emit_follower_telemetry(event: Any) -> None:
+            if follower_telemetry_manager is not None:
+                follower_telemetry_manager.handle_event(event)
+
         # Admission: Orchestrator.join_run does the filesystem preflight and the
         # atomic BEGIN IMMEDIATE admission transaction (§B.1 steps 0-2).
         from elspeth.engine import Orchestrator
@@ -3440,6 +3463,8 @@ def join(
             graph=execution_graph,
             config=pipeline_config,
             payload_store=payload_store,
+            concurrency_config=follower_concurrency_config,
+            telemetry=follower_telemetry_manager,
         )
 
         ctx = PluginContext(
@@ -3447,6 +3472,10 @@ def join(
             config=resolve_config(settings_config),
             landscape=factory.plugin_audit_writer(),
             payload_store=payload_store,
+            rate_limit_registry=follower_rate_limit_registry,
+            concurrency_config=follower_concurrency_config,
+            shutdown_event=follower_shutdown_event,
+            telemetry_emit=emit_follower_telemetry,
         )
 
         # Call on_start for all transforms and sinks — mirrors the leader's
@@ -3608,9 +3637,18 @@ def join(
             typer.echo(traceback.format_exc(), err=True)
         raise typer.Exit(4) from e  # Exit 4: unknown errors are likely framework bugs
     finally:
-        if follower_db is not None:
-            follower_db.close()
-        db.close()
+        import sys
+
+        try:
+            _close_orchestrator_resources(
+                follower_rate_limit_registry,
+                follower_telemetry_manager,
+                pending_exc=sys.exc_info()[1],
+            )
+        finally:
+            if follower_db is not None:
+                follower_db.close()
+            db.close()
 
 
 @app.command()

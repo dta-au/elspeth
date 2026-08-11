@@ -108,11 +108,13 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from elspeth.contracts import RowResult
+    from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.dag import ExecutionGraph
     from elspeth.core.landscape.factory import RecorderFactory
     from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
     from elspeth.engine.clock import Clock
+    from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.orchestrator.types import PipelineConfig
 
 __all__ = ["FollowerProcessor", "FollowerWorkSource", "build_follower_processor"]
@@ -450,6 +452,8 @@ def build_follower_processor(
     config: PipelineConfig,
     payload_store: PayloadStore,
     clock: Clock | None = None,
+    concurrency_config: RuntimeConcurrencyConfig | None = None,
+    telemetry: TelemetryManagerProtocol | None = None,
     scheduler_lease_seconds: int = 300,
     scheduler_heartbeat_seconds: int = 60,
 ) -> FollowerProcessor:
@@ -490,6 +494,8 @@ def build_follower_processor(
         config: The run's :class:`PipelineConfig`.
         payload_store: PayloadStore for row payload persistence.
         clock: Optional clock injection for tests.
+        concurrency_config: Runtime worker bounds shared with leader/resume.
+        telemetry: Runtime telemetry manager shared with executor traversal.
         scheduler_lease_seconds: Item lease TTL (default 300 s).
         scheduler_heartbeat_seconds: Item heartbeat cadence (default 60 s).
 
@@ -563,8 +569,8 @@ def build_follower_processor(
         payload_store=payload_store,
         span_factory=SpanFactory(),
         clock=clock,
-        max_workers=None,
-        telemetry=None,
+        max_workers=concurrency_config.max_workers if concurrency_config is not None else None,
+        telemetry=telemetry,
         mode=ProcessorMode.FOLLOWER,
         scheduler_lease_owner=worker_id,  # §A.1: registered identity = lease owner
         scheduler_lease_seconds=scheduler_lease_seconds,

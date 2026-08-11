@@ -41,9 +41,10 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import types
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +78,9 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
+
+if TYPE_CHECKING:
+    from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 
 # Window large enough that the seat reads live under both MockClock and wall clock.
 _GUARD_LIVE_SEAT_WINDOW_SECONDS = 10**9
@@ -993,3 +997,362 @@ class TestFollowerEnqueueFence:
             rows = conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == child_token.token_id)).fetchall()
         assert rows == [], "no READY row must be inserted when the fence fires"
         crashed.db.close()
+
+
+# ---------------------------------------------------------------------------
+# 2E  Real production follower assembly and plugin traversal
+# ---------------------------------------------------------------------------
+
+
+def _real_follower_settings_text(tmp_path: Path, *, processing_yaml: str) -> str:
+    """Render one production-discoverable source -> processing -> sink graph."""
+    input_path = tmp_path / "real-follower-input.jsonl"
+    input_path.write_text(json.dumps({"id": 1, "value": 10}) + "\n", encoding="utf-8")
+    output_path = tmp_path / "real-follower-output.jsonl"
+    return f"""
+sources:
+  rows:
+    plugin: json
+    on_success: processing
+    options:
+      path: {json.dumps(str(input_path))}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+{processing_yaml}
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {json.dumps(str(output_path))}
+      format: jsonl
+      schema:
+        mode: observed
+landscape:
+  url: sqlite:///{tmp_path / "real-follower-audit.db"}
+payload_store:
+  backend: filesystem
+  base_path: {tmp_path / "real-follower-payloads"}
+"""
+
+
+def _real_follower_settings(tmp_path: Path, *, processing_yaml: str) -> Any:
+    """Load the real-follower settings through the production YAML parser."""
+    from elspeth.core.config import load_settings_from_yaml_string
+
+    return load_settings_from_yaml_string(_real_follower_settings_text(tmp_path, processing_yaml=processing_yaml))
+
+
+def _build_runtime_graph(settings: Any) -> tuple[Any, Any, Any]:
+    """Use the runtime factory and production graph builder for a fresh run."""
+    from elspeth.core.dag import ExecutionGraph
+    from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
+    from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
+
+    plugins = instantiate_plugins_from_config(settings)
+    graph = ExecutionGraph.from_plugin_instances(
+        sources=plugins.sources,
+        source_settings_map=plugins.source_settings_map,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        gates=list(settings.gates),
+        coalesce_settings=(list(settings.coalesce) if settings.coalesce else None),
+        queues=settings.queues,
+        row_union_settings=(list(settings.row_unions) if settings.row_unions else None),
+    )
+    graph.validate()
+    config = assemble_and_validate_pipeline_config(
+        sources=plugins.sources,
+        transforms=plugins.transforms,
+        sinks=plugins.sinks,
+        aggregations=plugins.aggregations,
+        settings=settings,
+        graph=graph,
+    )
+    return plugins, graph, config
+
+
+def _seed_real_follower_ready_item(
+    *,
+    db: Any,
+    factory: Any,
+    run_id: str,
+    row_data: dict[str, int],
+    target_node_id: str,
+    target_step_index: int,
+) -> str:
+    """Seed one source-complete READY item at the run's real processing node."""
+    from datetime import UTC, datetime
+
+    from elspeth.contracts import PipelineRow
+    from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+    from elspeth.core.landscape.schema import rows_table
+    from tests.e2e.recovery.harness import _observed_contract
+
+    with db.engine.connect() as conn:
+        source_node_id = str(conn.execute(select(rows_table.c.source_node_id).where(rows_table.c.run_id == run_id).limit(1)).scalar_one())
+
+    ingest_sequence = 10_000 + abs(row_data["id"])
+    row = factory.data_flow.create_row(
+        run_id=run_id,
+        source_node_id=source_node_id,
+        row_index=ingest_sequence,
+        data=row_data,
+        source_row_index=ingest_sequence,
+        ingest_sequence=ingest_sequence,
+    )
+    token = factory.data_flow.create_token(row_id=row.row_id)
+    factory.execution.record_completed_node_state(
+        token_id=token.token_id,
+        node_id=source_node_id,
+        run_id=run_id,
+        step_index=0,
+        input_data=row_data,
+        output_data=row_data,
+        duration_ms=0,
+    )
+    factory.scheduler.enqueue_ready(
+        run_id=run_id,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=target_node_id,
+        step_index=target_step_index,
+        ingest_sequence=ingest_sequence,
+        row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(row_data, _observed_contract(row_data))),
+        available_at=datetime.now(UTC),
+    )
+    return token.token_id
+
+
+def _run_real_follower(
+    tmp_path: Path,
+    *,
+    processing_yaml: str,
+    row_data: dict[str, int],
+) -> tuple[Any, str, str, Any, Path]:
+    """Run one real follower through CLI graph/lifecycle and FollowerProcessor."""
+    from datetime import UTC, datetime
+
+    from elspeth.cli import (
+        _build_resume_graphs,
+        _instantiate_plugins_for_runtime_preflight,
+        _preflight_execution_sinks,
+        _start_follower_plugin_lifecycle,
+    )
+    from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.core.config import resolve_config
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.core.landscape.factory import RecorderFactory
+    from elspeth.core.payload_store import FilesystemPayloadStore
+    from elspeth.engine.orchestrator.cleanup import cleanup_plugins
+    from elspeth.engine.orchestrator.follower import build_follower_processor
+    from elspeth.engine.orchestrator.preflight import (
+        SinkEffectExecutionPurpose,
+        assemble_and_validate_pipeline_config,
+    )
+
+    settings = _real_follower_settings(tmp_path, processing_yaml=processing_yaml)
+    _plugins, graph, config = _build_runtime_graph(settings)
+    db = LandscapeDB.from_url(settings.landscape.url)
+    payload_store = FilesystemPayloadStore(settings.payload_store.base_path)
+    result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
+    run_id = result.run_id
+    factory = RecorderFactory(db, payload_store=payload_store)
+    source_node_id = graph.get_sources()[0]
+    target_node_id = graph.get_next_node(source_node_id)
+    assert target_node_id is not None
+    token_id = _seed_real_follower_ready_item(
+        db=db,
+        factory=factory,
+        run_id=run_id,
+        row_data=row_data,
+        target_node_id=str(target_node_id),
+        target_step_index=graph.get_node_step_map()[target_node_id],
+    )
+
+    with db.engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+    now = datetime.now(UTC)
+    factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:real-leader",
+        now=now,
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
+    worker_id = Orchestrator(db).join_run(
+        run_id,
+        settings,
+        now=now,
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
+
+    follower_plugins = _instantiate_plugins_for_runtime_preflight(
+        settings,
+        purpose=SinkEffectExecutionPurpose.FOLLOWER,
+    )
+    execution_sinks, execution_modes, admission = _preflight_execution_sinks(
+        settings,
+        follower_plugins,
+        purpose=SinkEffectExecutionPurpose.FOLLOWER,
+    )
+    _validation_graph, execution_graph = _build_resume_graphs(settings, follower_plugins)
+    follower_config = assemble_and_validate_pipeline_config(
+        sources=follower_plugins.sources,
+        transforms=follower_plugins.transforms,
+        sinks=execution_sinks,
+        aggregations=follower_plugins.aggregations,
+        settings=settings,
+        graph=execution_graph,
+        sink_effect_modes=execution_modes,
+        sink_effect_admission=admission,
+    )
+    follower = build_follower_processor(
+        factory=factory,
+        run_id=run_id,
+        worker_id=worker_id,
+        graph=execution_graph,
+        config=follower_config,
+        payload_store=payload_store,
+    )
+    ctx = PluginContext(
+        run_id=run_id,
+        config=resolve_config(settings),
+        landscape=factory.plugin_audit_writer(),
+        payload_store=payload_store,
+    )
+
+    def _stop_after_idle(_seconds: float) -> None:
+        with db.engine.begin() as conn:
+            conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.FAILED.value))
+
+    follower._wait_fn = _stop_after_idle
+    try:
+        _start_follower_plugin_lifecycle(
+            transforms=follower_config.transforms,
+            sinks=execution_sinks,
+            configured_modes=execution_modes,
+            admission=admission,
+            ctx=ctx,
+        )
+        follower.run(ctx)
+    finally:
+        cleanup_plugins(follower_config, ctx, include_source=False)
+
+    return db, run_id, token_id, follower_plugins, tmp_path / "real-follower-output.jsonl"
+
+
+def _observe_follower_sqlite_profile(request: pytest.FixtureRequest, db: Any) -> None:
+    if not request.config.pluginmanager.hasplugin("scripts.state_engine_profile_reporter"):
+        return
+    reporter = cast("RuntimeProfileReporter", request.getfixturevalue("state_engine_profile"))
+    with db.engine.connect() as conn:
+        raw_connection = conn.connection.driver_connection
+        assert isinstance(raw_connection, sqlite3.Connection)
+        reporter.observe_sqlite(raw_connection, deployment="same-host-leader-plus-claim-only-followers")
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_transform_success_hands_off_sink_without_sink_io(tmp_path: Path, request: pytest.FixtureRequest) -> None:
+    db, _run_id, token_id, _plugins, output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: process_row
+    plugin: passthrough
+    input: processing
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+""",
+        row_data={"id": 2, "value": 20},
+    )
+    try:
+        item = _work_item(db, token_id)
+        assert item["status"] == TokenWorkStatus.PENDING_SINK.value
+        assert item["pending_sink_name"] == "output"
+        assert len(output_path.read_text(encoding="utf-8").splitlines()) == 1
+        _observe_follower_sqlite_profile(request, db)
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_gate_traversal_can_terminalize_without_leader_authority(tmp_path: Path) -> None:
+    db, _run_id, token_id, _plugins, output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+gates:
+  - name: positive_only
+    input: processing
+    condition: "row['id'] > 0"
+    routes:
+      'true': discard
+      'false': output
+    on_error: discard
+""",
+        row_data={"id": 3, "value": 30},
+    )
+    try:
+        item = _work_item(db, token_id)
+        assert item["status"] == TokenWorkStatus.TERMINAL.value
+        assert item["pending_sink_name"] is None
+        assert not output_path.exists()
+    finally:
+        db.close()
+
+
+@pytest.mark.timeout(120)
+def test_real_follower_transform_failure_records_one_failed_disposition(tmp_path: Path) -> None:
+    from elspeth.core.landscape.schema import node_states_table, transform_errors_table
+
+    db, run_id, token_id, _plugins, output_path = _run_real_follower(
+        tmp_path,
+        processing_yaml="""
+transforms:
+  - name: policy_filter
+    plugin: keyword_filter
+    input: processing
+    on_success: output
+    on_error: discard
+    options:
+      fields: [value]
+      blocked_patterns: ['20']
+      schema:
+        mode: observed
+""",
+        row_data={"id": 2, "value": 20},
+    )
+    try:
+        item = _work_item(db, token_id)
+        assert item["status"] == TokenWorkStatus.FAILED.value
+        with db.engine.connect() as conn:
+            states = (
+                conn.execute(
+                    select(node_states_table.c.status).where(
+                        node_states_table.c.run_id == run_id,
+                        node_states_table.c.token_id == token_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            errors = (
+                conn.execute(
+                    select(transform_errors_table.c.error_id).where(
+                        transform_errors_table.c.run_id == run_id,
+                        transform_errors_table.c.token_id == token_id,
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert "failed" in states
+        assert len(errors) == 1
+        assert not output_path.exists()
+    finally:
+        db.close()

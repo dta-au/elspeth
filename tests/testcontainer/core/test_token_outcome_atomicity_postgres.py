@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 
 import pytest
@@ -18,16 +19,25 @@ from testcontainers.postgres import PostgresContainer  # type: ignore[import-unt
 from tests.fixtures.landscape import register_test_node
 from tests.fixtures.stores import MockPayloadStore
 
-from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType
+from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema_contract import SchemaContract
+from elspeth.contracts.sink_effects import (
+    SinkEffectInputKind,
+    SinkEffectMember,
+    SinkEffectMemberCandidate,
+    SinkEffectReservationRequest,
+    SinkEffectRole,
+)
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeline_effect_identity, resolve_sink_effect_members
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import artifacts_table, node_states_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import artifacts_table, node_states_table, operations_table, token_outcomes_table, tokens_table
 
 pytestmark = pytest.mark.testcontainer
 
@@ -47,8 +57,16 @@ def postgres_factory(postgres_url: str) -> Iterator[tuple[LandscapeDB, RecorderF
         db.engine.dispose()
 
 
-def _build_token(factory: RecorderFactory) -> tuple[str, str, str]:
-    run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+def _build_token(
+    factory: RecorderFactory,
+    *,
+    leader_worker_id: str | None = None,
+) -> tuple[str, str, str]:
+    run = factory.run_lifecycle.begin_run(
+        config={},
+        canonical_version="v1",
+        leader_worker_id=leader_worker_id,
+    )
     source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
     sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="sink")
     row = factory.data_flow.create_row(
@@ -61,6 +79,51 @@ def _build_token(factory: RecorderFactory) -> tuple[str, str, str]:
     )
     token = factory.data_flow.create_token(row.row_id)
     return run.run_id, token.token_id, sink_id
+
+
+def _pipeline_request(run_id: str, sink_id: str, members: Sequence[SinkEffectMember]) -> SinkEffectReservationRequest:
+    canonical_members = tuple(
+        replace(member, ordinal=ordinal, member_effect_id=None)
+        for ordinal, member in enumerate(sorted(members, key=lambda member: member.ordinal))
+    )
+    identity = compute_pipeline_effect_identity(
+        run_id=run_id,
+        sink_node_id=sink_id,
+        role=SinkEffectRole.PRIMARY,
+        sink_config={"name": "sink"},
+        target_config={"path": "out.jsonl"},
+        members=canonical_members,
+    )
+    return SinkEffectReservationRequest(
+        run_id=run_id,
+        sink_node_id=sink_id,
+        role=SinkEffectRole.PRIMARY,
+        input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        requested_target_hash=identity.requested_target_hash,
+        members=members,
+        audit_export_snapshot_id=None,
+        config_hash=identity.config_hash,
+        replacing_target=False,
+        primary_effect_id=None,
+    )
+
+
+def _reserve_open_effect_operation(factory: RecorderFactory, *, run_id: str, token_id: str, sink_id: str) -> str:
+    factory.execution.begin_node_state(
+        token_id=token_id,
+        node_id=sink_id,
+        run_id=run_id,
+        step_index=0,
+        input_data={"value": 1},
+    )
+    members = resolve_sink_effect_members(
+        factory,
+        (SinkEffectMemberCandidate(token_id=token_id, row={"value": 1}),),
+    )
+    effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members)).new_effect
+    assert effect is not None
+    operation = next(item for item in factory.execution.get_operations_for_run(run_id) if item.sink_effect_id == effect.effect_id)
+    return operation.operation_id
 
 
 def test_postgres_batch_expansion_claims_batch_once_under_contention(
@@ -218,6 +281,203 @@ def _record_while_mutation_contends(
         )
 
 
+def _install_token_lock_probe(db: LandscapeDB) -> tuple[threading.Event, dict[str, int], Any]:
+    attempted = threading.Event()
+    backend: dict[str, int] = {}
+
+    def before_cursor_execute(
+        conn: Any,
+        _cursor: Any,
+        statement: str,
+        _parameters: Any,
+        _context: Any,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.upper()
+        if "FROM TOKENS" not in normalized or "FOR UPDATE" not in normalized:
+            return
+        backend["pid"] = conn.connection.driver_connection.info.backend_pid
+        attempted.set()
+
+    event.listen(db.engine, "before_cursor_execute", before_cursor_execute)
+    return attempted, backend, before_cursor_execute
+
+
+def _assert_postgres_backend_waits_on_lock(db: LandscapeDB, backend_pid: int) -> None:
+    deadline = monotonic() + 5
+    with db.engine.connect() as observer:
+        while monotonic() < deadline:
+            activity = observer.exec_driver_sql(
+                "SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid = %s",
+                (backend_pid,),
+            ).one()
+            if activity.wait_event_type == "Lock":
+                return
+            sleep(0.01)
+    pytest.fail(f"PostgreSQL backend {backend_pid} never entered a lock wait; last activity={activity!r}")
+
+
+def _record_unrouted_failure(factory: RecorderFactory, *, run_id: str, token_id: str) -> None:
+    factory.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token_id, run_id=run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.UNROUTED,
+        error_hash="e" * 64,
+    )
+
+
+def test_postgres_decided_outcome_winning_finalize_race_is_not_abandoned(
+    postgres_factory: tuple[LandscapeDB, RecorderFactory],
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A decided writer holding the token lock wins before finalization.
+
+    Finalization must re-observe the committed outcome after its PostgreSQL
+    lock wait, skip ABANDONED, and still fail the independent open-effect
+    operation sweep in the same fenced terminal transaction.
+    """
+    first_db, first_factory = postgres_factory
+    leader_worker_id = "worker:postgres-finalize-race:decided-first"
+    run_id, token_id, sink_id = _build_token(first_factory, leader_worker_id=leader_worker_id)
+    operation_id = _reserve_open_effect_operation(
+        first_factory,
+        run_id=run_id,
+        token_id=token_id,
+        sink_id=sink_id,
+    )
+    second_db = LandscapeDB(postgres_url)
+    second_factory = RecorderFactory(second_db)
+    outcome_locked = threading.Event()
+    release_outcome = threading.Event()
+    outcomes = second_factory.data_flow.outcomes
+    original_validate = outcomes._validate_cross_table_invariants
+
+    def pause_after_validation(*args: Any, **kwargs: Any) -> None:
+        original_validate(*args, **kwargs)
+        outcome_locked.set()
+        assert release_outcome.wait(timeout=5), "outcome winner was not released"
+
+    monkeypatch.setattr(outcomes, "_validate_cross_table_invariants", pause_after_validation)
+    attempted, backend, listener = _install_token_lock_probe(first_db)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcome_future = pool.submit(_record_unrouted_failure, second_factory, run_id=run_id, token_id=token_id)
+            assert outcome_locked.wait(timeout=5), "decided writer never acquired its token lock"
+            finalize_future = pool.submit(
+                first_factory.run_lifecycle.finalize_run,
+                run_id,
+                RunStatus.FAILED,
+                token=CoordinationToken(run_id=run_id, worker_id=leader_worker_id, leader_epoch=1),
+            )
+            assert attempted.wait(timeout=5), "finalizer never attempted its token lock"
+            _assert_postgres_backend_waits_on_lock(first_db, backend["pid"])
+            release_outcome.set()
+            outcome_future.result(timeout=10)
+            finalize_future.result(timeout=10)
+    finally:
+        release_outcome.set()
+        event.remove(first_db.engine, "before_cursor_execute", listener)
+        second_db.engine.dispose()
+
+    with first_db.read_only_connection() as conn:
+        outcomes_rows = conn.execute(
+            select(token_outcomes_table.c.outcome, token_outcomes_table.c.path, token_outcomes_table.c.completed)
+            .where(token_outcomes_table.c.token_id == token_id)
+            .order_by(token_outcomes_table.c.recorded_at)
+        ).all()
+        operation_row = conn.execute(
+            select(
+                operations_table.c.status,
+                operations_table.c.completed_at,
+                operations_table.c.duration_ms,
+                operations_table.c.error_message,
+            ).where(operations_table.c.operation_id == operation_id)
+        ).one()
+    assert outcomes_rows == [(TerminalOutcome.FAILURE.value, TerminalPath.UNROUTED.value, 1)]
+    assert operation_row.status == "failed"
+    assert operation_row.completed_at is not None
+    assert operation_row.duration_ms is not None and operation_row.duration_ms >= 0.0
+    assert operation_row.error_message == "run finalized as non-resumable before sink effect completed"
+
+
+def test_postgres_finalize_winning_outcome_race_refuses_late_decision(
+    postgres_factory: tuple[LandscapeDB, RecorderFactory],
+    postgres_url: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fenced finalizer that records ABANDONED wins the token lock.
+
+    The already-started decided writer must block, re-observe ABANDONED after
+    the terminal transaction commits, and be refused rather than create the
+    contradictory decided+ABANDONED history.
+    """
+    first_db, first_factory = postgres_factory
+    leader_worker_id = "worker:postgres-finalize-race:finalize-first"
+    run_id, token_id, sink_id = _build_token(first_factory, leader_worker_id=leader_worker_id)
+    operation_id = _reserve_open_effect_operation(
+        first_factory,
+        run_id=run_id,
+        token_id=token_id,
+        sink_id=sink_id,
+    )
+    second_db = LandscapeDB(postgres_url)
+    second_factory = RecorderFactory(second_db)
+    abandonment_inserted = threading.Event()
+    release_finalizer = threading.Event()
+    outcomes = first_factory.run_lifecycle._outcomes_repo
+    original_record = outcomes.record_token_outcome
+
+    def pause_after_abandonment(*args: Any, **kwargs: Any) -> str:
+        outcome_id = original_record(*args, **kwargs)
+        abandonment_inserted.set()
+        assert release_finalizer.wait(timeout=5), "finalizer winner was not released"
+        return outcome_id
+
+    monkeypatch.setattr(outcomes, "record_token_outcome", pause_after_abandonment)
+    attempted, backend, listener = _install_token_lock_probe(second_db)
+
+    def attempt_decision() -> Exception | None:
+        try:
+            _record_unrouted_failure(second_factory, run_id=run_id, token_id=token_id)
+        except Exception as exc:
+            return exc
+        return None
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            finalize_future = pool.submit(
+                first_factory.run_lifecycle.finalize_run,
+                run_id,
+                RunStatus.FAILED,
+                token=CoordinationToken(run_id=run_id, worker_id=leader_worker_id, leader_epoch=1),
+            )
+            assert abandonment_inserted.wait(timeout=5), "finalizer never inserted ABANDONED"
+            outcome_future = pool.submit(attempt_decision)
+            assert attempted.wait(timeout=5), "decided writer never attempted its token lock"
+            _assert_postgres_backend_waits_on_lock(second_db, backend["pid"])
+            release_finalizer.set()
+            finalize_future.result(timeout=10)
+            decision_error = outcome_future.result(timeout=10)
+    finally:
+        release_finalizer.set()
+        event.remove(second_db.engine, "before_cursor_execute", listener)
+        second_db.engine.dispose()
+
+    assert isinstance(decision_error, (AuditIntegrityError, LandscapeRecordError))
+    with first_db.read_only_connection() as conn:
+        outcomes_rows = conn.execute(
+            select(token_outcomes_table.c.outcome, token_outcomes_table.c.path, token_outcomes_table.c.completed).where(
+                token_outcomes_table.c.token_id == token_id
+            )
+        ).all()
+        operation_status = conn.execute(
+            select(operations_table.c.status).where(operations_table.c.operation_id == operation_id)
+        ).scalar_one()
+    assert outcomes_rows == [(None, TerminalPath.ABANDONED.value, 0)]
+    assert operation_status == "failed"
+
+
 def test_postgres_locks_discard_node_states_until_outcome_insert(
     postgres_factory: tuple[LandscapeDB, RecorderFactory],
     monkeypatch: pytest.MonkeyPatch,
@@ -355,7 +615,12 @@ def test_bulk_state_completion_lock_order_is_sorted_across_distinct_postgres_bac
     first_db, first_factory = postgres_factory
     second_db = LandscapeDB(postgres_url)
     second_factory = RecorderFactory(second_db)
-    run = first_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    run = first_factory.run_lifecycle.begin_run(
+        config={},
+        canonical_version="v1",
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
     source_id = register_test_node(first_factory.data_flow, run.run_id, "source-state-lock", node_type=NodeType.SOURCE)
     sink_id = register_test_node(first_factory.data_flow, run.run_id, "sink-state-lock", node_type=NodeType.SINK)
     states = []

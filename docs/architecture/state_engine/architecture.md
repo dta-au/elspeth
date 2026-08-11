@@ -69,9 +69,13 @@ positively established.
 `ABANDONED` is a permanent undecided token fate, not a scheduler work status
 or a completed terminal token outcome. TS-19 writes `(NULL, ABANDONED)` for
 non-resumable pending tokens atomically with fenced terminal run finalization;
-the run is terminal while the token's `TerminalPath.ABANDONED` remains
-non-terminal (`completed=False`). RM-14 and F-14 govern how accounting, resume,
-and illegal re-entry interpret that two-axis state.
+using the same one-time non-resumability decision, it also changes every
+effect-linked operation still `open` to `failed` with bounded categorical
+evidence. Both sweeps share the terminal transaction and neither depends on
+the other finding a candidate. The run is terminal while the token's
+`TerminalPath.ABANDONED` remains non-terminal (`completed=False`). RM-14 and
+F-14 govern how accounting, resume, and illegal re-entry interpret that
+two-axis state.
 
 ### Transition families
 
@@ -84,7 +88,7 @@ and illegal re-entry interpret that two-axis state.
 | TS-15–TS-18 | Barrier consume, sink handoff, and atomic continuation emission |
 | AUX-01–AUX-07 | Heartbeat, lease loss, adoption, branch-loss cursor, membership, and leader fencing |
 | RC-01–RC-07 | Leader seat and worker-registry lifecycle |
-| TS-19 | Fenced run finalization for non-resumable pending tokens |
+| TS-19 | Fenced run finalization for non-resumable pending tokens and open effect-linked operations |
 
 The exact stable leg list and required cases live in the
 [v2 catalog](proof-catalog/v2/catalog.json).
@@ -327,6 +331,7 @@ list; that catalog list remains the machine authority.
 | Returned response | Atomic effect/member/artifact/outcome finalization | Restart must reuse the exact result or reconcile without another publication |
 | Effect finalization | Coordinator response/reuse | A repeated caller must observe the finalized winner without committing again |
 | Sink effect finalization/outcome | TS-11/TS-12/TS-13 scheduler callback | TS-14 repair exists; integrated callback-loss proof remains mandatory |
+| Open effect-linked operation | Non-resumable FAILED/INTERRUPTED finalization | TS-19 atomically fails the operation with the run stamp and token-abandonment sweep; resumable interruption preserves it for retry |
 
 The sink-effect coordinator also holds a generation-fenced lease while calling
 external reconcile/commit. A heartbeat API exists, but current production-path
@@ -342,6 +347,10 @@ recovery, partial sink batches, non-exhaustive barrier completion, stale leader
 mutation, source-boundary queue entry, deleted `WAITING`, and dormant queue-only
 release. `F-14` additionally forbids an `ABANDONED` token from re-entering
 processing or coexisting with a decided terminal outcome.
+
+The same TS-19 boundary forbids an effect-linked operation from remaining
+`open` after fenced non-resumable finalization; already terminal and `pending`
+operation history is never rewritten.
 
 Forbidden paths require positive refusal and zero-mutation evidence. Absence of
 a located caller is not proof of unreachability when static analysis reports

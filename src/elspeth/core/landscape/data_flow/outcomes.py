@@ -201,6 +201,33 @@ class TokenOutcomeRepository:
             )
 
     @staticmethod
+    def _refuse_abandonment_contradiction(
+        ref: TokenRef,
+        *,
+        path: TerminalPath,
+        conn: Connection,
+    ) -> None:
+        """Refuse either half of decided-plus-abandoned after the token lock."""
+        if path is TerminalPath.ABANDONED:
+            contradiction = token_outcomes_table.c.completed == 1
+            description = "a completed terminal outcome"
+        else:
+            contradiction = token_outcomes_table.c.path == TerminalPath.ABANDONED.value
+            description = "an ABANDONED outcome"
+        existing = conn.execute(
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == ref.run_id)
+            .where(token_outcomes_table.c.token_id == ref.token_id)
+            .where(contradiction)
+            .limit(1)
+        ).first()
+        if existing is not None:
+            raise AuditIntegrityError(
+                f"Cannot record {path.value!r} for token {ref.token_id!r}: {description} already exists; "
+                "decided-plus-abandoned history is forbidden (ADR-038)"
+            )
+
+    @staticmethod
     def _validate_outcome_fields(
         outcome: TerminalOutcome | None,
         path: TerminalPath,
@@ -481,6 +508,7 @@ class TokenOutcomeRepository:
             if not dependencies_prelocked:
                 self.lock_token_outcome_dependencies((ref,), conn=active_conn)
             self._ownership.validate_token_run_ownership(ref, conn=active_conn)
+            self._refuse_abandonment_contradiction(ref, path=path, conn=active_conn)
             self._validate_cross_table_invariants(
                 ref,
                 outcome,

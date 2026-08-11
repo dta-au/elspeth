@@ -153,6 +153,16 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-12 — PostgreSQL token-lock classification needs a fresh statement
+  after a lock wait**: do not combine `NOT EXISTS(token_outcomes)` and
+  `SELECT ... FOR UPDATE` when deciding token fate under READ COMMITTED. The
+  predicate can retain the statement's pre-wait snapshot after a competing
+  outcome writer commits. Lock token rows first in stable order, then classify
+  outcomes in a second statement. Every later outcome writer must re-check
+  for an existing `ABANDONED` row after acquiring the same token lock. SQLite
+  cannot prove this protocol because `FOR UPDATE` is inert there; retain the
+  independent PostgreSQL race tests for both lock winners.
+
 - **2026-08-12 — a long-running transform must re-prove scheduler ownership
   before terminal audit writes**: `TransformExecutor` calls the processor's
   rate-limited active-claim heartbeat immediately after plugin return or

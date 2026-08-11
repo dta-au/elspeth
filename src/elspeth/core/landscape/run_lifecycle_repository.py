@@ -54,7 +54,8 @@ from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError, LandscapeRecordNotFoundError
-from elspeth.core.landscape.model_loaders import RunLoader, TokenOutcomeLoader
+from elspeth.core.landscape.execution.operations import OperationRepository
+from elspeth.core.landscape.model_loaders import OperationLoader, RunLoader, TokenOutcomeLoader
 from elspeth.core.landscape.reproducibility import compute_grade
 from elspeth.core.landscape.run_coordination_repository import (
     RunCoordinationRepository,
@@ -147,6 +148,7 @@ _IMMUTABLE_SUCCESS_RUN_STATUS_VALUES = tuple(status.value for status in _IMMUTAB
 
 _AUTH_PROVIDER_TYPES = frozenset({"local", "oidc", "entra"})
 _OPENROUTER_CATALOG_SOURCES = frozenset({"live", "bundled"})
+_NON_RESUMABLE_EFFECT_OPERATION_ERROR: Final[str] = "run finalized as non-resumable before sink effect completed"
 
 # 64 lowercase hex chars — matches the canonical sha256 hex digest format
 # produced by ``hashlib.sha256(...).hexdigest()``. Used by the Tier-1
@@ -234,6 +236,9 @@ class RunLifecycleRepository:
         # so its Tier-1 pair validation applies identically; constructed on
         # first FAILED/INTERRUPTED finalize.
         self._token_outcomes: TokenOutcomeRepository | None = None
+        # Lazy (TS19/F14): non-resumable finalization closes open durable
+        # sink-effect operations through a caller-owned transaction primitive.
+        self._operation_repository: OperationRepository | None = None
 
     @property
     def _coordination_repo(self) -> RunCoordinationRepository:
@@ -251,6 +256,16 @@ class RunLifecycleRepository:
                 ownership=RowTokenOwnership(self._ops),
             )
         return self._token_outcomes
+
+    @property
+    def _operations_repo(self) -> OperationRepository:
+        if self._operation_repository is None:
+            self._operation_repository = OperationRepository(
+                self._db,
+                self._ops,
+                operation_loader=OperationLoader(),
+            )
+        return self._operation_repository
 
     def begin_run(
         self,
@@ -663,7 +678,21 @@ class RunLifecycleRepository:
             # still driving. Those paths deliberately under-abandon — their
             # runs keep closure='open' — rather than risk a false record.
             if token is not None and status in (RunStatus.FAILED, RunStatus.INTERRUPTED):
-                self._abandon_undecided_tokens_in(conn, run_id=run_id, status=status)
+                non_resumable_arms, incomplete_sources = self._non_resumability_in(conn, run_id=run_id)
+                if non_resumable_arms:
+                    self._abandon_undecided_tokens_in(
+                        conn,
+                        run_id=run_id,
+                        status=status,
+                        non_resumable_arms=non_resumable_arms,
+                        incomplete_sources=incomplete_sources,
+                    )
+                    self._operations_repo.fail_open_effect_operations_for_run(
+                        run_id,
+                        completed_at=timestamp,
+                        error_message=_NON_RESUMABLE_EFFECT_OPERATION_ERROR,
+                        conn=conn,
+                    )
 
             # §D follower-departure hygiene (no-op at N=1, evented).
             follower_ids = (
@@ -721,7 +750,38 @@ class RunLifecycleRepository:
                     context={"status": status.value},
                 )
 
-    def _abandon_undecided_tokens_in(self, conn: Connection, *, run_id: str, status: RunStatus) -> None:
+    @staticmethod
+    def _non_resumability_in(conn: Connection, *, run_id: str) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Compute the structural resume refusal once for all finalization sweeps."""
+        source_states = conn.execute(
+            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
+        ).fetchall()
+        incomplete_sources = {
+            str(row.source_name): str(row.lifecycle_state)
+            for row in source_states
+            if str(row.lifecycle_state) not in SOURCE_COMPLETE_LIFECYCLE_STATES
+        }
+        checkpoint_exists = bool(
+            conn.execute(select(select(checkpoints_table.c.checkpoint_id).where(checkpoints_table.c.run_id == run_id).exists())).scalar()
+        )
+        non_resumable_arms: list[str] = []
+        if not checkpoint_exists:
+            non_resumable_arms.append("no_checkpoint")
+        if not source_states:
+            non_resumable_arms.append("no_source_records")
+        if incomplete_sources:
+            non_resumable_arms.append("incomplete_sources")
+        return tuple(non_resumable_arms), incomplete_sources
+
+    def _abandon_undecided_tokens_in(
+        self,
+        conn: Connection,
+        *,
+        run_id: str,
+        status: RunStatus,
+        non_resumable_arms: tuple[str, ...],
+        incomplete_sources: Mapping[str, str],
+    ) -> None:
         """ADR-038: record (NULL, ABANDONED) for tokens nothing will ever decide.
 
         Runs inside :meth:`_complete_run_in`'s transaction — only on the
@@ -743,27 +803,6 @@ class RunLifecycleRepository:
         On any other path the terminal UPDATE's already-terminal refusal is
         the single-winner gate, so the sweep cannot run twice.
         """
-        source_states = conn.execute(
-            select(run_sources_table.c.source_name, run_sources_table.c.lifecycle_state).where(run_sources_table.c.run_id == run_id)
-        ).fetchall()
-        incomplete_sources = {
-            str(row.source_name): str(row.lifecycle_state)
-            for row in source_states
-            if str(row.lifecycle_state) not in SOURCE_COMPLETE_LIFECYCLE_STATES
-        }
-        checkpoint_exists = bool(
-            conn.execute(select(select(checkpoints_table.c.checkpoint_id).where(checkpoints_table.c.run_id == run_id).exists())).scalar()
-        )
-        non_resumable_arms: list[str] = []
-        if not checkpoint_exists:
-            non_resumable_arms.append("no_checkpoint")
-        if not source_states:
-            non_resumable_arms.append("no_source_records")
-        if incomplete_sources:
-            non_resumable_arms.append("incomplete_sources")
-        if not non_resumable_arms:
-            return
-
         decided_or_abandoned = (
             select(token_outcomes_table.c.outcome_id)
             .where(token_outcomes_table.c.run_id == run_id)
@@ -776,29 +815,32 @@ class RunLifecycleRepository:
             )
             .exists()
         )
-        # ``with_for_update`` is the PostgreSQL race mitigation: every
-        # outcome write locks its token FK row first
-        # (``lock_token_outcome_dependencies``), so locking the candidate
-        # tokens rows here serializes the read-then-insert against a
-        # concurrent terminal write under READ COMMITTED — the competing
-        # writer either committed before our lock (the NOT EXISTS sees its
-        # row) or blocks until we commit. SQLite ignores FOR UPDATE; its
-        # single-writer transaction provides the same guarantee.
+        # PostgreSQL needs two statements under READ COMMITTED. First lock
+        # every token for the dying run in stable order. A single
+        # ``NOT EXISTS ... FOR UPDATE`` statement is insufficient: when it
+        # waits behind a decided writer, the subquery may retain the
+        # statement's pre-wait snapshot and still classify that token as
+        # undecided. The second statement below begins only after all token
+        # locks are held, so it receives a fresh snapshot containing every
+        # outcome committed by a lock winner. Outcome writers use the same
+        # token-first order and, after acquiring it, refuse a pre-existing
+        # ABANDONED row. Together those two arms forbid either race winner
+        # from producing decided-plus-abandoned history.
         #
-        # VERIFICATION BOUNDARY: on SQLite ``with_for_update()`` compiles to
-        # a plain SELECT, so the SQLite test suite exercises none of this —
-        # the PostgreSQL serialization rests on the outcome INSERT's FK
-        # taking FOR KEY SHARE on the referenced tokens row (schema.py
-        # composite FK), which conflicts with FOR UPDATE here. A PG-lane
-        # race test is owed with the multi-replica integration
-        # (elspeth-4d6c0dd0f5); a green SQLite run is not evidence for it.
+        # SQLite ignores FOR UPDATE, but its BEGIN IMMEDIATE transaction
+        # already owns the single writer slot for both statements.
+        conn.execute(
+            select(tokens_table.c.token_id)
+            .where(tokens_table.c.run_id == run_id)
+            .order_by(tokens_table.c.token_id)
+            .with_for_update(of=tokens_table)
+        ).fetchall()
         undecided_token_ids = (
             conn.execute(
                 select(tokens_table.c.token_id)
                 .where(tokens_table.c.run_id == run_id)
                 .where(~decided_or_abandoned)
                 .order_by(tokens_table.c.token_id)
-                .with_for_update()
             )
             .scalars()
             .all()
