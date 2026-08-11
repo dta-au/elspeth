@@ -201,6 +201,17 @@ export function YamlView() {
 
   // Empty state
   if (!compositionState || version === null || !hasPipelineContent) {
+    if (pendingYamlProposal !== null) {
+      return (
+        <div className="yaml-view">
+          {pendingYamlProposalPanel}
+          <div className="empty-state">
+            This pipeline proposal has not been applied yet. Review and accept
+            it to generate the authoritative YAML here.
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="empty-state">
         YAML will appear here once your pipeline has components.

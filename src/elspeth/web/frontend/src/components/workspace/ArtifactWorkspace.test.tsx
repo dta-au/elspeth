@@ -246,6 +246,35 @@ describe("ArtifactWorkspace", () => {
     expect(screen.getByRole("tab", { name: "Run" })).toBeEnabled();
   });
 
+  it("enables YAML for a pending pipeline proposal on an empty base state", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: null,
+      compositionProposals: [
+        {
+          id: "proposal-1",
+          session_id: "session-1",
+          tool_call_id: "call-1",
+          tool_name: "set_pipeline",
+          status: "pending",
+          summary: "Replace the pipeline.",
+          rationale: "Requested by the current composer turn.",
+          affects: ["graph", "validation", "yaml"],
+          arguments_redacted_json: {},
+          base_state_id: null,
+          committed_state_id: null,
+          audit_event_id: "event-1",
+          created_at: "2026-08-12T00:00:00Z",
+          updated_at: "2026-08-12T00:00:00Z",
+        },
+      ],
+    });
+
+    renderArtifactWorkspace();
+
+    expect(screen.getByRole("tab", { name: "YAML" })).toBeEnabled();
+  });
+
   it("selects on focus while clicking and roving with wrap, Home, and End", async () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();

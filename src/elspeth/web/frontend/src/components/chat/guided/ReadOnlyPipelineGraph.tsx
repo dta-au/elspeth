@@ -35,6 +35,7 @@ interface ReadOnlyPipelineGraphProps {
 const NODE_WIDTH = 168;
 const NODE_HEIGHT = 62;
 const GRAPH_PADDING = 32;
+const EDGE_LABEL_HORIZONTAL_PADDING = 12;
 const EDGE_LABEL_VERTICAL_PADDING = 12;
 const EDGE_LABEL_DY = -5;
 
@@ -49,7 +50,7 @@ function layoutGraph(
 ): { nodes: PositionedNode[]; width: number; height: number } {
   const graph = new dagre.graphlib.Graph({ multigraph: true });
   graph.setDefaultEdgeLabel(() => ({}));
-  graph.setGraph({ rankdir: "LR", nodesep: 34, ranksep: 72, marginx: GRAPH_PADDING, marginy: GRAPH_PADDING });
+  graph.setGraph({ rankdir: "TB", nodesep: 34, ranksep: 72, marginx: GRAPH_PADDING, marginy: GRAPH_PADDING });
   for (const node of nodes) {
     graph.setNode(node.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
   }
@@ -72,13 +73,13 @@ function edgePath(
   target: PositionedNode,
   laneOffset: number,
 ): string {
-  const startX = source.x + NODE_WIDTH / 2;
-  const endX = target.x - NODE_WIDTH / 2;
-  const bend = Math.max(24, (endX - startX) / 2);
+  const startY = source.y + NODE_HEIGHT / 2;
+  const endY = target.y - NODE_HEIGHT / 2;
+  const bend = Math.max(24, (endY - startY) / 2);
   return (
-    `M ${startX} ${source.y} `
-    + `C ${startX + bend} ${source.y + laneOffset}, `
-    + `${endX - bend} ${target.y + laneOffset}, ${endX} ${target.y}`
+    `M ${source.x} ${startY} `
+    + `C ${source.x + laneOffset} ${startY + bend}, `
+    + `${target.x + laneOffset} ${endY - bend}, ${target.x} ${endY}`
   );
 }
 
@@ -104,19 +105,24 @@ function edgeLaneOffsets(
 function edgeMidpointY(
   source: PositionedNode,
   target: PositionedNode,
+): number {
+  return (source.y + target.y) / 2;
+}
+
+function edgeMidpointX(
+  source: PositionedNode,
+  target: PositionedNode,
   laneOffset: number,
 ): number {
-  // At t=0.5, the cubic weights are 1/8, 3/8, 3/8, 1/8.
-  // Only the two control points carry laneOffset, so the path midpoint carries
-  // three quarters of that offset.
-  return (source.y + target.y) / 2 + laneOffset * 0.75;
+  // At t=0.5, the two cubic control points contribute three quarters of
+  // their shared horizontal lane offset.
+  return (source.x + target.x) / 2 + laneOffset * 0.75;
 }
 
 function graphVerticalBounds(
   layoutHeight: number,
   edges: ReadOnlyPipelineGraphEdge[],
   nodesById: ReadonlyMap<string, PositionedNode>,
-  laneOffsetByEdgeId: ReadonlyMap<string, number>,
 ): { minY: number; height: number } {
   let minY = 0;
   let maxY = layoutHeight;
@@ -125,22 +131,48 @@ function graphVerticalBounds(
     const target = nodesById.get(edge.target);
     if (source === undefined || target === undefined) continue;
 
-    const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
-    const labelY = edgeMidpointY(source, target, laneOffset) + EDGE_LABEL_DY;
+    const labelY = edgeMidpointY(source, target) + EDGE_LABEL_DY;
     minY = Math.min(
       minY,
-      source.y + laneOffset,
-      target.y + laneOffset,
       labelY - EDGE_LABEL_VERTICAL_PADDING,
     );
     maxY = Math.max(
       maxY,
-      source.y + laneOffset,
-      target.y + laneOffset,
       labelY + EDGE_LABEL_VERTICAL_PADDING,
     );
   }
   return { minY, height: maxY - minY };
+}
+
+function graphHorizontalBounds(
+  layoutWidth: number,
+  edges: ReadOnlyPipelineGraphEdge[],
+  nodesById: ReadonlyMap<string, PositionedNode>,
+  laneOffsetByEdgeId: ReadonlyMap<string, number>,
+): { minX: number; width: number } {
+  let minX = 0;
+  let maxX = layoutWidth;
+  for (const edge of edges) {
+    const source = nodesById.get(edge.source);
+    const target = nodesById.get(edge.target);
+    if (source === undefined || target === undefined) continue;
+
+    const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
+    const labelX = edgeMidpointX(source, target, laneOffset);
+    minX = Math.min(
+      minX,
+      source.x + laneOffset,
+      target.x + laneOffset,
+      labelX - EDGE_LABEL_HORIZONTAL_PADDING,
+    );
+    maxX = Math.max(
+      maxX,
+      source.x + laneOffset,
+      target.x + laneOffset,
+      labelX + EDGE_LABEL_HORIZONTAL_PADDING,
+    );
+  }
+  return { minX, width: maxX - minX };
 }
 
 /**
@@ -168,16 +200,25 @@ export function ReadOnlyPipelineGraph({
         layout.height,
         edges,
         byId,
+      ),
+    [layout.height, edges, byId],
+  );
+  const horizontalBounds = useMemo(
+    () =>
+      graphHorizontalBounds(
+        layout.width,
+        edges,
+        byId,
         laneOffsetByEdgeId,
       ),
-    [layout.height, edges, byId, laneOffsetByEdgeId],
+    [layout.width, edges, byId, laneOffsetByEdgeId],
   );
 
   return (
     <div className="guided-readonly-graph">
       <svg
         className="guided-readonly-graph__canvas"
-        viewBox={`0 ${verticalBounds.minY} ${layout.width} ${verticalBounds.height}`}
+        viewBox={`${horizontalBounds.minX} ${verticalBounds.minY} ${horizontalBounds.width} ${verticalBounds.height}`}
         role="img"
         aria-labelledby={titleId}
       >
@@ -190,8 +231,8 @@ export function ReadOnlyPipelineGraph({
               throw new Error(`ReadOnlyPipelineGraph edge ${edge.id} has an unresolved endpoint`);
             }
             const laneOffset = laneOffsetByEdgeId.get(edge.id) ?? 0;
-            const labelX = (source.x + target.x) / 2;
-            const labelY = edgeMidpointY(source, target, laneOffset);
+            const labelX = edgeMidpointX(source, target, laneOffset);
+            const labelY = edgeMidpointY(source, target);
             return (
               <g key={edge.id}>
                 <path

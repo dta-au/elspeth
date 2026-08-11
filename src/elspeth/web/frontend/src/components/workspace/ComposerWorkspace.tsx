@@ -21,6 +21,11 @@ import { useWorkspacePaneState } from "./useWorkspacePaneState";
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
 
 const EMPTY_ARTIFACT_TABS: readonly ArtifactTab[] = ["graph", "run"];
+const PENDING_PIPELINE_ARTIFACT_TABS: readonly ArtifactTab[] = [
+  "graph",
+  "yaml",
+  "run",
+];
 
 type NarrowView = "compose" | "pipeline";
 type FocusIntent = "collapse" | "restore" | null;
@@ -76,9 +81,19 @@ export function ComposerWorkspace({
   const compositionHasContent = useSessionStore((state) =>
     hasCompositionContent(state.compositionState),
   );
+  const hasPendingYamlProposal = useSessionStore((state) =>
+    state.compositionProposals.some(
+      (proposal) =>
+        proposal.session_id === state.activeSessionId &&
+        proposal.status === "pending" &&
+        proposal.affects.includes("yaml"),
+    ),
+  );
   const availableArtifactTabs = compositionHasContent
     ? ARTIFACT_TABS
-    : EMPTY_ARTIFACT_TABS;
+    : hasPendingYamlProposal
+      ? PENDING_PIPELINE_ARTIFACT_TABS
+      : EMPTY_ARTIFACT_TABS;
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [narrowView, setNarrowView] = useState<NarrowView>("compose");
   const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);

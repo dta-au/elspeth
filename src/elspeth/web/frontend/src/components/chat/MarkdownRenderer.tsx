@@ -46,6 +46,19 @@ interface MarkdownRendererProps {
 }
 
 /**
+ * Keep pipeline-shaped flowcharts readable inside the bounded authoring pane.
+ * Mermaid's LR/RL directions make even a modest pipeline wider than the
+ * Composer column. This changes only the flowchart declaration passed to the
+ * renderer; the audited assistant message remains byte-for-byte unchanged.
+ */
+export function verticalisePipelineFlowchart(chart: string): string {
+  return chart.replace(
+    /^(\s*(?:flowchart|graph))\s+(?:LR|RL)\b/im,
+    "$1 TB",
+  );
+}
+
+/**
  * Renders markdown content with GFM support and Mermaid diagram rendering.
  *
  * Mermaid code blocks (```mermaid) are rendered as interactive diagrams.
@@ -204,6 +217,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
   // Counter forces a unique mermaid render ID when the theme changes,
   // since mermaid.render() caches by ID.
   const [renderCount, setRenderCount] = useState(0);
+  const renderedChart = verticalisePipelineFlowchart(chart);
 
   // Re-initialize mermaid when theme changes
   useEffect(() => {
@@ -218,7 +232,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
     let cancelled = false;
 
     mermaid
-      .render(`mermaid-${uniqueId}-${renderCount}`, chart)
+      .render(`mermaid-${uniqueId}-${renderCount}`, renderedChart)
       .then(({ svg }) => {
         if (!cancelled && container) {
           container.innerHTML = DOMPurify.sanitize(svg, {
@@ -228,7 +242,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
       })
       .catch(() => {
         if (!cancelled && container) {
-          container.textContent = chart;
+          container.textContent = renderedChart;
           container.classList.add("mermaid-fallback");
         }
       });
@@ -236,7 +250,7 @@ function MermaidDiagram({ chart }: { chart: string }) {
     return () => {
       cancelled = true;
     };
-  }, [chart, uniqueId, renderCount]);
+  }, [renderedChart, uniqueId, renderCount]);
 
   return (
     <div
