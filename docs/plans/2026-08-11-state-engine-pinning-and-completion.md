@@ -1216,9 +1216,11 @@ git commit -m "test(state-engine): complete lifecycle and abandonment proofs"
 - Create: `tests/integration/plugins/test_state_engine_plugin_lifecycle_matrix.py`
 - Create: `tests/integration/plugins/test_state_engine_plugin_provider_lanes.py`
 - Create: `tests/golden/state_engine/plugin_lifecycle_matrix.json`
-- Create: `tests/golden/state_engine/plugin_evidence_selectors.json`
+- Create: `tests/golden/state_engine/evidence_selectors.json`
 - Modify: `tests/unit/plugins/test_discovery.py`
-- Create: `tests/unit/plugins/test_state_engine_plugin_evidence_selectors.py`
+- Create: `tests/unit/plugins/test_state_engine_evidence_selectors.py`
+- Modify: `tests/unit/architecture/test_state_engine_supported_profiles.py`
+- Create: `tests/unit/architecture/test_state_engine_live_evidence_ingest.py`
 - Create: `tests/unit/cicd/test_live_provider_acceptance_workflow.py`
 - Modify: `tests/conftest.py`
 - Modify: `tests/integration/plugins/sources/test_aws_s3_source_live.py`
@@ -1309,7 +1311,23 @@ record set as assessment schema 2, but requires `schema_version: 3`, catalog
 `elspeth-state-engine-v3`/schema 2, v3 case IDs in coverage and overrides, and
 the completion marker bytes `state-engine-assessment-package-v3\n`.
 Assessment N/A is always derived from catalog cells; schema 3 rejects a
-hand-authored `not_applicable` override.
+hand-authored `not_applicable` override. Schema 3 also replaces the single
+global runner assumption with per-evidence `runner`, exact `argv`, and
+provenance records. Local records bind the checkout-local Python executable and
+platform. GitHub Actions records bind repository, workflow path and digest,
+baseline SHA, run ID and attempt, job ID, runner image, selector-lane ID,
+artifact digest, and scrub-report digest.
+
+Schema 3 baseline records add an exact, file-by-file `publication_paths` list
+(directory entries and globs are forbidden). In current mode the recorded
+frozen executable commit `F` and tree must still exist and match exactly. The
+validator accepts only (a) `HEAD == F` with worktree changes confined exactly
+to the declared prospective publication paths, or (b) a clean `HEAD == P`
+where `P` is a single docs-only publication child whose sole parent is `F` and
+whose `F..P` path set equals `publication_paths`. It rejects intervening
+commits, non-document paths, undeclared files, later descendants, and a changed
+tree for `F`. Add pre-publication, post-publication, extra-file, non-doc,
+intervening-commit, and stale-tree mutation tests.
 
 Add an explicit version-pair dispatcher and mutation tests:
 
@@ -1318,11 +1336,10 @@ Add an explicit version-pair dispatcher and mutation tests:
 - catalog v3 schema 2 / assessment schema 3 is current;
 - every other catalog/assessment pair is rejected.
 
-`init-full` gains an explicit repository-relative `--catalog` option. Task 12
-must initialize with
-`--catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json`;
-omitting it retains the v2 default only for backward compatibility until the
-atomic current-catalog pointer switch. Add CLI positive and mismatch tests in
+`init-full` requires an explicit repository-relative `--catalog` option for
+every version; there is no implicit current catalog. Task 12 must initialize
+with `--catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json`.
+Add CLI missing-option, positive, and version-mismatch tests in
 `operations.py`/the architecture contract suite.
 
 Provider variants are separate evidence subjects and case IDs. At minimum,
@@ -1353,12 +1370,19 @@ global current-catalog pointers on v2 until Task 12 atomically publishes the
 first full v3 assessment and switches the hub, proof matrix, and assessment
 index.
 
-The v3 transition is lossless outside PB-09. The validator must prove that
-every non-PB-09 v2 `(leg, case, profile, dimension)` required/N/A policy maps
-identically into v3; no reason or variant mechanism may narrow it. Only PB-09
-may introduce reviewed provider-variant cases or different applicability.
-Add mutations for every family and specifically PB-11, proving that a changed,
-removed, or newly N/A non-PB-09 cell is rejected.
+The v3 transition is lossless outside PB-09. Pin and compare v2's leg IDs and
+order, families, titles/contracts, non-PB-09 case IDs and order, profile and
+dimension vocabularies, family acceptance rules, hard-gate set and semantics,
+evidence record semantics, and execution-profile definitions. Schema 3's
+per-evidence runner/provenance and publication-path fields are closed
+strengthenings of that evidence contract; they may not remove or relax any v2
+requirement. The validator
+must prove that every non-PB-09 v2 `(leg, case, profile, dimension)`
+required/N/A policy maps identically into v3; no reason or variant mechanism
+may narrow it. The only permitted catalog semantic delta is PB-09's reviewed
+provider-variant cases and applicability. Add mutations for every family and
+specifically PB-11, proving that any other changed, reordered, removed, or
+newly N/A contract element is rejected.
 
 Start this task only after Task 10's production lifecycle/follower harness is
 available and the Python 3.14 lifecycle blocker `elspeth-61350c4744` is closed
@@ -1383,16 +1407,19 @@ live discovery, the golden matrix, catalog inventory, and PB-09 required cases;
 counts and representative names are insufficient. Tests compare the canonical
 mechanical projection and never rewrite the partly curated golden file.
 
-Commit `plugin_evidence_selectors.json` as the non-secret Task 12 handoff. Its
+Commit `evidence_selectors.json` as the non-secret Task 12 handoff. Its
 exact schema is `schema_version`, `catalog_id`, and a closed `lanes` array. Each
 lane records `lane_id`, `workflow_job`, `profile_case`, `marker_expression`,
 exact full `node_ids`, exact `(leg, dimension, case_id, profile_case)` cells,
 approved resource-variable names, and artifact kinds—never values. The
-selector validator must prove that every v3-required PB-09 cell is assigned
-exactly once, every node has one proof subject, every case/variant exists in
-the independently derived inventory, and every live lane maps to one protected
-workflow job. Task 12 reads this manifest rather than reconstructing selectors
-from prose.
+selector validator must prove that every executable v3-required cell across
+TS, AUX, RC, PB, RM, and F is assigned exactly once to the correct local,
+PostgreSQL, or protected-live lane; every node has one proof subject; every
+case exists; PB-09 variants exist in the independently derived inventory; and
+every live lane maps to one protected workflow job. Catalog-approved N/A cells
+must be absent and no selector cell may be invented. Task 12 reads this
+catalog-wide manifest rather than reconstructing selectors from prose or
+cohort-specific files.
 
 **Step 2: Add RED lifecycle tests**
 
@@ -1484,6 +1511,18 @@ canaries and fail if any canary or configured secret value survives. Package
 validation rejects stale/transplanted artifacts whose provenance does not match
 the frozen assessment baseline and selector lane.
 
+Add a trusted `ingest-live-evidence <assessment> <artifact-directory> --lane
+<lane-id>` operation. The workflow produces a closed artifact manifest plus
+JUnit, profile, node-index, and scrub report without printing raw stdout,
+stderr, provider payloads, or environment values to the GitHub log. Ingestion
+must verify the workflow/run/attempt/job identity, full baseline SHA, workflow
+digest, exact selector and collected node set, profile, resource-name allowlist,
+artifact digests, result counts, and successful canary/secret scrubbing before
+materializing a schema-3 evidence record. Reject missing or extra files,
+untrusted producers, lane drift, stale SHAs, and any digest mismatch. Test the
+operation with a synthetic digest-bound artifact envelope and mutations;
+credentials and provider values never enter the repository or assessment.
+
 **Step 6: Fix defects and commit the implementation baseline**
 
 Review `git diff --name-only` against the Task 11 file inventory, including
@@ -1523,6 +1562,11 @@ commit may change only `docs/**` and must include the dated assessment plus
 `docs/architecture/state_engine/README.md`, `proof-matrix.md`, and
 `assessments/README.md`; current-baseline validation cannot be packaged in the
 same commit as production/test changes.
+
+Update `test_state_engine_supported_profiles.py` before this freeze so the
+maintained-current assertion names v3 and PostgreSQL 16 explicitly, while a
+separate immutable-history assertion continues to accept the frozen v2
+package. It must fail if a current pointer silently falls back to v2.
 
 **Definition of Done:**
 
@@ -1613,7 +1657,16 @@ Trust-tier remains baseline-relative and key-free. Wardline must be run for all 
 - Release acceptance: provider-backed plugin lifecycle cases and any environment-dependent recovery gate.
 - Fail when a required case is skipped, deselected, uncollected, or absent from the package.
 
-**Step 4: Derive the verdict mechanically**
+**Step 4: Assemble the prospective publication and derive the verdict**
+
+Before validation, build the complete docs-only publication overlay: the dated
+assessment and retained evidence, hub, architecture summary, proof matrix,
+assessment index, and proof-catalog current pointer. Populate
+`baseline.publication_paths` with every exact file in that overlay. Do not use a
+directory, glob, or post-validation generated file. At this point `HEAD` is
+still frozen commit `F`; `git status --porcelain=v2` may contain only those
+declared paths. The proof-matrix and hub checks therefore validate the exact
+prospective publication rather than the stale pre-assessment documents.
 
 Run:
 
@@ -1633,7 +1686,7 @@ state-engine assessment: valid (... legs, complete)
 
 Do not edit derived totals or the verdict by hand.
 
-**Step 5: Run three independent reviews**
+**Step 5: Run three independent reviews of the exact overlay**
 
 Use separate readers for:
 
@@ -1646,13 +1699,16 @@ Resolve every material finding, rerun affected evidence, and require exactly one
 If a finding changes any non-document file or the catalog, discard every Task
 12 result and restart from Step 0. A docs-only attribution/review correction may
 retain unaffected machine artifacts only when their hashes and frozen baseline
-remain identical.
+remain identical. After any docs correction, update the exact
+`publication_paths`/artifact digests as applicable, rerun validation and link
+checking, and have the affected reviewer inspect the final overlay.
 
-**Step 6: Publish the current hub and compiler handoff**
+**Step 6: Commit the reviewed overlay and validate the published state**
 
-Update the hub and proof matrix only after review. Record:
+The already reviewed hub and proof matrix record:
 
-- final commit/tree;
+- frozen executable commit/tree `F` (the publication commit cannot
+  self-reference its own hash);
 - catalog ID and digest;
 - Landscape schema epoch;
 - supported state stores/deployments/lifecycle modes;
@@ -1660,10 +1716,6 @@ Update the hub and proof matrix only after review. Record:
 - compiler handoff rule: a future `CompiledPipeline` binds the catalog ID/digest and may execute only when runtime assembly reports a compatible state-engine contract.
 
 Do not create a signed plan package, approval sidecar, or document hash manifest. The catalog digest is a runtime compatibility fact; evidence artifact hashes exist only where reproducibility needs them.
-
-**Step 7: Close the tracker tree and publish docs only**
-
-Close only issues whose exit gates are represented by passing cells. Keep future multi-replica work separate.
 
 ```bash
 git add docs/architecture/state_engine/README.md \
@@ -1674,6 +1726,19 @@ git add docs/architecture/state_engine/README.md \
   "docs/architecture/state_engine/assessments/$STATE_ASSESSMENT_ID"
 git commit -m "feat(state-engine): publish the complete v3 contract"
 ```
+
+Require the publication commit `P` to have sole parent `F`, then rerun
+`validate-package`, `collect-evidence`, and `check-links` from the clean `P`.
+Schema-3 docs-only-descendant validation must derive the same complete verdict
+and prove the committed `F..P` path set exactly equals `publication_paths`.
+Do not amend or add another descendant; any change requires a new frozen run.
+
+**Step 7: Close the tracker tree**
+
+Only after the clean published-state validation passes, close issues whose exit
+gates are represented by passing cells. Keep future multi-replica work
+separate. Record `F`, `P`, the catalog digest, workflow run identities, and the
+exact final validator output in the completion comment.
 
 **Definition of Done:**
 
