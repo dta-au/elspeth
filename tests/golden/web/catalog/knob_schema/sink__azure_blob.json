@@ -12,6 +12,21 @@
       },
       {
         "default": null,
+        "description": "Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+        "enum": [
+          "connection_string",
+          "sas_token",
+          "managed_identity",
+          "service_principal"
+        ],
+        "kind": "enum",
+        "label": "Auth Mode",
+        "name": "auth_mode",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
         "description": "Azure Storage connection string",
         "kind": "text",
         "label": "Connection String",
