@@ -12865,9 +12865,534 @@
           }
         },
         {
-          "case_id": "source:azure_blob",
+          "case_id": "source:azure_blob@connection_string",
           "plugin_key": "source:azure_blob",
-          "variant_id": "default",
+          "variant_id": "connection_string",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:azure_blob@sas_token",
+          "plugin_key": "source:azure_blob",
+          "variant_id": "sas_token",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:azure_blob@managed_identity",
+          "plugin_key": "source:azure_blob",
+          "variant_id": "managed_identity",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:azure_blob@service_principal",
+          "plugin_key": "source:azure_blob",
+          "variant_id": "service_principal",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -13390,9 +13915,184 @@
           }
         },
         {
-          "case_id": "source:dataverse",
+          "case_id": "source:dataverse@service_principal",
           "plugin_key": "source:dataverse",
-          "variant_id": "default",
+          "variant_id": "service_principal",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:dataverse@managed_identity",
+          "plugin_key": "source:dataverse",
+          "variant_id": "managed_identity",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -13740,9 +14440,534 @@
           }
         },
         {
-          "case_id": "source:llm",
+          "case_id": "source:llm@azure",
           "plugin_key": "source:llm",
-          "variant_id": "default",
+          "variant_id": "azure",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:llm@openrouter",
+          "plugin_key": "source:llm",
+          "variant_id": "openrouter",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:llm@bedrock",
+          "plugin_key": "source:llm",
+          "variant_id": "bedrock",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "source:llm@gateway",
+          "plugin_key": "source:llm",
+          "variant_id": "gateway",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -14615,9 +15840,9 @@
           }
         },
         {
-          "case_id": "transform:aws_textract_document_analysis",
+          "case_id": "transform:aws_textract_document_analysis@default_chain",
           "plugin_key": "transform:aws_textract_document_analysis",
-          "variant_id": "default",
+          "variant_id": "default_chain",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -14790,9 +16015,359 @@
           }
         },
         {
-          "case_id": "transform:aws_textract_inline_analysis",
+          "case_id": "transform:aws_textract_document_analysis@secret_refs",
+          "plugin_key": "transform:aws_textract_document_analysis",
+          "variant_id": "secret_refs",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:aws_textract_inline_analysis@default_chain",
           "plugin_key": "transform:aws_textract_inline_analysis",
-          "variant_id": "default",
+          "variant_id": "default_chain",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:aws_textract_inline_analysis@secret_refs",
+          "plugin_key": "transform:aws_textract_inline_analysis",
+          "variant_id": "secret_refs",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -18640,9 +20215,534 @@
           }
         },
         {
-          "case_id": "transform:llm",
+          "case_id": "transform:llm@azure",
           "plugin_key": "transform:llm",
-          "variant_id": "default",
+          "variant_id": "azure",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:llm@openrouter",
+          "plugin_key": "transform:llm",
+          "variant_id": "openrouter",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:llm@bedrock",
+          "plugin_key": "transform:llm",
+          "variant_id": "bedrock",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:llm@gateway",
+          "plugin_key": "transform:llm",
+          "variant_id": "gateway",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -18990,9 +21090,709 @@
           }
         },
         {
-          "case_id": "transform:rag_retrieval",
+          "case_id": "transform:rag_retrieval@azure-search-api-key",
           "plugin_key": "transform:rag_retrieval",
-          "variant_id": "default",
+          "variant_id": "azure-search-api-key",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:rag_retrieval@azure-search-managed-identity",
+          "plugin_key": "transform:rag_retrieval",
+          "variant_id": "azure-search-managed-identity",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:rag_retrieval@chroma-ephemeral",
+          "plugin_key": "transform:rag_retrieval",
+          "variant_id": "chroma-ephemeral",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:rag_retrieval@chroma-persistent",
+          "plugin_key": "transform:rag_retrieval",
+          "variant_id": "chroma-persistent",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "transform:rag_retrieval@chroma-client",
+          "plugin_key": "transform:rag_retrieval",
+          "variant_id": "chroma-client",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -20215,9 +23015,9 @@
           }
         },
         {
-          "case_id": "sink:azure_blob",
+          "case_id": "sink:azure_blob@connection_string",
           "plugin_key": "sink:azure_blob",
-          "variant_id": "default",
+          "variant_id": "connection_string",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -20390,9 +23190,709 @@
           }
         },
         {
-          "case_id": "sink:chroma_sink",
+          "case_id": "sink:azure_blob@sas_token",
+          "plugin_key": "sink:azure_blob",
+          "variant_id": "sas_token",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:azure_blob@managed_identity",
+          "plugin_key": "sink:azure_blob",
+          "variant_id": "managed_identity",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:azure_blob@service_principal",
+          "plugin_key": "sink:azure_blob",
+          "variant_id": "service_principal",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:chroma_sink@persistent",
           "plugin_key": "sink:chroma_sink",
-          "variant_id": "default",
+          "variant_id": "persistent",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:chroma_sink@client",
+          "plugin_key": "sink:chroma_sink",
+          "variant_id": "client",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {
@@ -20915,9 +24415,184 @@
           }
         },
         {
-          "case_id": "sink:dataverse",
+          "case_id": "sink:dataverse@service_principal",
           "plugin_key": "sink:dataverse",
-          "variant_id": "default",
+          "variant_id": "service_principal",
+          "cell_applicability": {
+            "sqlite-wal-single-process-leader": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-same-host-leader-plus-claim-only-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            },
+            "postgresql-16-aws-single-leader-landscape": {
+              "production_entry": {
+                "status": "required",
+                "reason": null
+              },
+              "precondition_image": {
+                "status": "required",
+                "reason": null
+              },
+              "success_effects": {
+                "status": "required",
+                "reason": null
+              },
+              "guard_refusal": {
+                "status": "required",
+                "reason": null
+              },
+              "zero_mutation_rollback": {
+                "status": "required",
+                "reason": null
+              },
+              "concurrency": {
+                "status": "required",
+                "reason": null
+              },
+              "crash_restart": {
+                "status": "required",
+                "reason": null
+              },
+              "boundary_composition": {
+                "status": "required",
+                "reason": null
+              },
+              "read_model_truth_table": {
+                "status": "required",
+                "reason": null
+              },
+              "maintenance": {
+                "status": "required",
+                "reason": null
+              }
+            }
+          }
+        },
+        {
+          "case_id": "sink:dataverse@managed_identity",
+          "plugin_key": "sink:dataverse",
+          "variant_id": "managed_identity",
           "cell_applicability": {
             "sqlite-wal-single-process-leader": {
               "production_entry": {

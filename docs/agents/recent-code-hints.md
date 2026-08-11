@@ -8,6 +8,18 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-12 — PB-09 plugin variants are a three-way exact-set contract**:
+  `scripts/state_engine_plugin_matrix.py check` derives the closed variant set
+  from production-owned Pydantic discriminators and registries, constructs
+  every variant through real config validation, and compares the mechanical
+  discovery projection with
+  `tests/golden/state_engine/plugin_lifecycle_matrix.json`. The discovery suite
+  separately pins live plugin keys, golden variants, and v3 PB-09
+  `(plugin_key, variant_id)` pairs. Adding a plugin or a supported auth/provider
+  mode requires updating the reviewed golden fields and v3 PB-09 cases together;
+  `render-skeleton` deliberately exits nonzero while any new reviewed field is
+  `UNCLASSIFIED`. The golden is reviewed evidence, never variant authority.
+
 - **2026-08-12 — follower teardown has one exit seam and partial startup is
   tracked explicitly**: `FollowerProcessor.run()` stops its heartbeat before
   departing the single-use worker on every exit, including unexpected
