@@ -40,6 +40,27 @@ from .common import (
     load_unique_json,
 )
 
+V2_ASSESSMENT_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "assessment_id",
+    "mode",
+    "parent_assessment",
+    "changed_tuples",
+    "changed_gate_ids",
+    "catalog",
+    "baseline",
+    "environment",
+    "structure_snapshot",
+    "tracker_snapshot",
+    "evidence",
+    "legs",
+    "hard_gates",
+    "derived",
+    "limitations",
+    "review_record",
+}
+ASSESSMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
 
 def _initial_derived(catalog: dict[str, Any]) -> dict[str, Any]:
     family_counts: dict[str, dict[str, int]] = {}
@@ -81,7 +102,7 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
     validate_catalog(catalog, catalog_path)
     relative_directory = destination.relative_to(root).as_posix()
     document = {
-        "schema_version": 1,
+        "schema_version": 2,
         "assessment_id": assessment_id,
         "mode": "full",
         "parent_assessment": None,
@@ -149,39 +170,27 @@ def initialize_full(assessment_id: str, output_directory: Path) -> Path:
 
 def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
     baseline = _dict(assessment.get("baseline"), "baseline")
-    fields = (
+    mode = baseline.get("mode")
+    _require(mode in {"current", "historical"}, "baseline mode must be current or historical")
+    identity_fields = {"mode", "commit", "tree"}
+    current_fields = {
+        *identity_fields,
         "repository_root",
         "remote",
         "branch",
-        "commit",
-        "tree",
-        "behavioral_overlay",
         "worktree_status_at_evidence_capture",
         "submodules",
         "worktrees_at_capture",
-    )
-    _require(set(baseline) == set(fields), "baseline has unexpected fields")
-    for field in fields:
+    }
+    expected_fields = current_fields if mode == "current" else identity_fields
+    _require(set(baseline) == expected_fields, f"baseline {mode} schema has unexpected fields")
+    for field in expected_fields:
         _require(field in baseline, f"baseline is missing {field}")
-    repository_root = baseline["repository_root"]
-    _require(isinstance(repository_root, str) and Path(repository_root).is_absolute(), "baseline repository_root must be absolute")
-    for field in ("remote", "branch"):
-        value = baseline[field]
-        _require(isinstance(value, str) and bool(value.strip()), f"baseline {field} must be a non-empty string")
-    _require(
-        isinstance(baseline["commit"], str) and bool(GIT_OBJECT_PATTERN.fullmatch(baseline["commit"])),
-        "baseline commit is not a full Git object ID",
-    )
-    _require(
-        isinstance(baseline["tree"], str) and bool(GIT_OBJECT_PATTERN.fullmatch(baseline["tree"])),
-        "baseline tree is not a full Git object ID",
-    )
-    for field in ("worktree_status_at_evidence_capture", "submodules", "worktrees_at_capture"):
-        _require(isinstance(baseline[field], list), f"baseline {field} must be a list")
-    _require(
-        baseline["behavioral_overlay"] is None or isinstance(baseline["behavioral_overlay"], dict),
-        "baseline behavioral_overlay must be null or an object",
-    )
+    for field in ("commit", "tree"):
+        _require(
+            isinstance(baseline[field], str) and bool(GIT_OBJECT_PATTERN.fullmatch(baseline[field])),
+            f"baseline {field} is not a full Git object ID",
+        )
     tree = subprocess.run(
         ["git", "-C", str(root), "rev-parse", f"{baseline['commit']}^{{tree}}"],
         check=False,
@@ -189,31 +198,47 @@ def _validate_baseline(assessment: dict[str, Any], root: Path) -> None:
         text=True,
     )
     _require(tree.returncode == 0 and tree.stdout.strip() == baseline["tree"], "baseline commit/tree identity does not resolve")
+    if mode == "historical":
+        return
+    repository_root = baseline["repository_root"]
+    _require(isinstance(repository_root, str) and Path(repository_root).is_absolute(), "baseline repository_root must be absolute")
+    for field in ("remote", "branch"):
+        value = baseline[field]
+        _require(isinstance(value, str) and bool(value.strip()), f"baseline {field} must be a non-empty string")
+    for field in ("worktree_status_at_evidence_capture", "submodules", "worktrees_at_capture"):
+        _strings(baseline[field], f"baseline {field}")
     head = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    if baseline["commit"] == head:
-        _require(Path(repository_root).resolve() == root, "baseline current-live repository_root does not match the checkout")
-        branch = subprocess.run(
-            ["git", "-C", str(root), "branch", "--show-current"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        _require(baseline["branch"] == branch, "baseline current-live branch does not match the checkout")
-        remote = subprocess.run(
-            ["git", "-C", str(root), "remote", "get-url", "origin"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        _require(
-            remote.returncode == 0 and baseline["remote"] == remote.stdout.strip(),
-            "baseline current-live remote does not match origin",
-        )
+    _require(baseline["commit"] == head, "baseline current commit does not match live HEAD")
+    live_tree = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _require(baseline["tree"] == live_tree, "baseline current tree does not match live HEAD")
+    _require(Path(repository_root).resolve() == root, "baseline current repository_root does not match the checkout")
+    branch = subprocess.run(
+        ["git", "-C", str(root), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _require(baseline["branch"] == branch, "baseline current branch does not match the checkout")
+    remote = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    _require(
+        remote.returncode == 0 and baseline["remote"] == remote.stdout.strip(),
+        "baseline current remote does not match origin",
+    )
     committed_diff = subprocess.run(
         [
             "git",
@@ -633,6 +658,52 @@ def _validate_placeholders(assessment_path: Path, root: Path) -> None:
     _require(not findings, "unresolved placeholder found:\n" + "\n".join(findings))
 
 
+def _validate_v2_assessment_schema(assessment: dict[str, Any]) -> None:
+    _require(
+        type(assessment.get("schema_version")) is int and assessment["schema_version"] == 2,
+        "assessment schema_version must be integer 2",
+    )
+    _require(set(assessment) == V2_ASSESSMENT_TOP_LEVEL_KEYS, "assessment top-level schema has unexpected fields")
+    assessment_id = _string(assessment.get("assessment_id"), "assessment_id")
+    _require(bool(ASSESSMENT_ID_PATTERN.fullmatch(assessment_id)), "assessment_id has invalid characters or length")
+    catalog_record = _dict(assessment.get("catalog"), "assessment catalog")
+    _require(
+        set(catalog_record) == {"path", "catalog_id", "schema_version", "sha256_at_evidence_capture"},
+        "assessment catalog has unexpected fields",
+    )
+    _require(
+        type(catalog_record.get("schema_version")) is int,
+        "assessment catalog schema_version must be an integer",
+    )
+    limitations = _strings(assessment.get("limitations"), "limitations")
+    _unique(limitations, "limitations")
+    _string(assessment.get("review_record"), "review_record")
+    legs = _list(assessment.get("legs"), "assessment legs")
+    for index, raw_leg in enumerate(legs):
+        leg = _dict(raw_leg, f"assessment leg {index}")
+        _require(
+            set(leg) == {"id", "derived_verdict", "default_status", "reason", "owner_issue", "exit_gate", "overrides"},
+            f"assessment leg {index} has unexpected fields",
+        )
+    derived = _dict(assessment.get("derived"), "derived")
+    _require(
+        set(derived) == {"family_counts", "total", "overall_verdict", "reason"},
+        "derived has unexpected fields",
+    )
+    reason = _string(derived.get("reason"), "derived reason")
+    _require(bool(reason.strip()), "derived reason must be non-empty")
+    for context, raw_counts in [
+        *((f"derived family {family}", value) for family, value in _dict(derived.get("family_counts"), "derived family_counts").items()),
+        ("derived total", derived.get("total")),
+    ]:
+        counts = _dict(raw_counts, context)
+        _require(set(counts) == VERDICTS, f"{context} has wrong verdict keys")
+        _require(
+            all(type(count) is int and count >= 0 for count in counts.values()),
+            f"{context} counts must be non-negative integers",
+        )
+
+
 def _validate_unresolved_metadata(value: dict[str, Any], context: str) -> None:
     for field in ("reason", "exit_gate"):
         field_value = value.get(field)
@@ -731,6 +802,13 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     catalog_path = _repository_path(root, catalog_record.get("path"), "catalog.path")
     catalog = load_unique_json(catalog_path)
     validate_catalog(catalog, catalog_path)
+    if catalog.get("catalog_id") == "elspeth-state-engine-v2":
+        _validate_v2_assessment_schema(assessment)
+    else:
+        _require(
+            type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
+            "historical assessment schema_version must be integer 1",
+        )
     expected_ids = _expected_leg_ids(catalog["catalog_id"])
     _require(catalog_record.get("catalog_id") == catalog["catalog_id"], "assessment catalog_id mismatch")
     _require(catalog_record.get("schema_version") == catalog["schema_version"], "assessment catalog schema mismatch")
@@ -760,7 +838,15 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     v2 = catalog["catalog_id"] == "elspeth-state-engine-v2"
 
     raw_changed = _list(assessment.get("changed_tuples", []), "changed_tuples")
-    changed_keys = {_changed_key(_dict(item, "changed tuple"), v2) for item in raw_changed}
+    changed_keys: set[tuple[str, str, str, str]] = set()
+    for raw_item in raw_changed:
+        item = _dict(raw_item, "changed tuple")
+        if v2:
+            _require(
+                set(item) == {"leg_id", "dimension_id", "case_id", "profile_case"},
+                "changed tuple has unexpected fields",
+            )
+        changed_keys.add(_changed_key(item, v2))
     _require(len(changed_keys) == len(raw_changed), "changed_tuples contains duplicates")
     for leg_id, dimension, case_id, profile_case in changed_keys:
         _require(leg_id in catalog_by_id, "changed_tuples names an unknown leg")
@@ -828,7 +914,21 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
             _require(key in cell_status, f"leg {leg_id} override names an unknown proof cell")
             status = _string(override.get("status"), "override status")
             _require(status in CELL_STATUSES, f"leg {leg_id} override has invalid status")
+            if v2:
+                base_fields = {"dimension", "case", "profile_case", "status", "evidence"}
+                unresolved_fields = {"reason", "owner_issue", "exit_gate"} if status in {"partial", "fail", "unknown"} else set()
+                _require(
+                    set(override) == base_fields | unresolved_fields,
+                    f"leg {leg_id} {status} override has unexpected fields",
+                )
             cited = _strings(override.get("evidence", []), f"leg {leg_id} override evidence")
+            cell_is_applicable = _cell_is_applicable(catalog, catalog_leg, key[0], key[2])
+            if not cell_is_applicable:
+                _require(
+                    status == "not_applicable",
+                    f"leg {leg_id} catalog not_applicable cell must remain not_applicable",
+                )
+                _require(not cited, f"leg {leg_id} not_applicable override cannot cite evidence")
             if status in {"pass", "partial", "fail"}:
                 _require(bool(cited), f"leg {leg_id} {status} override needs evidence")
             if status in {"partial", "fail", "unknown"}:
@@ -837,7 +937,7 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
                 _validate_unresolved_metadata(override, f"leg {leg_id} {status} override")
             if status == "not_applicable":
                 _require(
-                    not _cell_is_applicable(catalog, catalog_leg, key[0], key[2]),
+                    not cell_is_applicable,
                     f"leg {leg_id} cannot waive a required profile cell",
                 )
                 _require(not cited, f"leg {leg_id} not_applicable override cannot cite evidence")

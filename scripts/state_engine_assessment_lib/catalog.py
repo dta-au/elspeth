@@ -10,6 +10,7 @@ from .common import (
     CANONICAL_V2_ACCEPTANCE_SHA256,
     CANONICAL_V2_APPLICABILITY_SHA256,
     CANONICAL_V2_EVIDENCE_CONTRACT_SHA256,
+    CANONICAL_V2_EXECUTION_PROFILES_SHA256,
     CANONICAL_V2_HARD_GATES_SHA256,
     CANONICAL_V2_LEGS_SHA256,
     CANONICAL_V2_TOP_LEVEL_KEYS,
@@ -39,11 +40,23 @@ def _live_plugin_inventory() -> dict[str, list[str]]:
 
 def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
     profiles = _dict(catalog["execution_profiles"], "execution_profiles")
+    _require(
+        set(profiles) == {"state_store", "deployments", "profile_cases", "lifecycle_modes", "first_party_plugins"},
+        "execution_profiles has unexpected fields",
+    )
     stores = _list(profiles.get("state_store"), "execution_profiles.state_store")
     store_by_id: dict[str, dict[str, Any]] = {}
     for index, raw_store in enumerate(stores):
         store = _dict(raw_store, f"state_store[{index}]")
+        _require(
+            set(store) == {"id", "required", "contract_ref", "deployments", "scope"},
+            f"state_store[{index}] has unexpected fields",
+        )
         store_id = _string(store.get("id"), f"state_store[{index}].id")
+        _require(store.get("required") is True, f"state_store[{index}].required must be true")
+        for field in ("contract_ref", "scope"):
+            value = _string(store.get(field), f"state_store[{index}].{field}")
+            _require(bool(value.strip()), f"state_store[{index}].{field} must be non-empty")
         _require(store_id not in store_by_id, f"duplicate state-store profile: {store_id}")
         store_by_id[store_id] = store
 
@@ -117,7 +130,7 @@ def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
 
 
 def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
-    _require(catalog.get("schema_version") == 1, "catalog schema_version must be 1")
+    _require(type(catalog.get("schema_version")) is int and catalog["schema_version"] == 1, "catalog schema_version must be 1")
     catalog_id = _string(catalog.get("catalog_id"), "catalog_id")
     if catalog_id == "elspeth-state-engine-v2":
         _require(set(catalog) == CANONICAL_V2_TOP_LEVEL_KEYS, "canonical v2 top-level schema changed")
@@ -184,6 +197,8 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
         names = _strings(plugin_inventory.get(kind), f"first-party plugin inventory {kind}")
         _require(names == sorted(set(names)), f"first-party plugin inventory {kind} is not sorted/unique")
         _require(names == live_plugins[kind], f"first-party plugin inventory {kind} is stale")
+    inventory_rule = _string(plugin_inventory.get("inventory_rule"), "first-party plugin inventory inventory_rule")
+    _require(bool(inventory_rule.strip()), "first-party plugin inventory inventory_rule must be non-empty")
 
     applicability = _dict(catalog.get("applicability_profiles"), "applicability_profiles")
     _require(
@@ -203,6 +218,10 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
             "catalog vocabularies do not match owned runtime enums",
         )
         profile_case_ids = _validate_profile_cases(catalog)
+        _require(
+            _semantic_sha256(profiles) == CANONICAL_V2_EXECUTION_PROFILES_SHA256,
+            "canonical v2 execution profiles changed without a catalog identity revision",
+        )
         expected_profile_fields = {"default_case_id", "profile_case_applicability", *DIMENSIONS}
     else:
         profile_case_ids = []

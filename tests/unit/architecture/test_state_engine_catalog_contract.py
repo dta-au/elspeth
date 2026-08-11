@@ -562,12 +562,12 @@ def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     commit = _git(repository, "rev-parse", "HEAD")
     tree = _git(repository, "rev-parse", "HEAD^{tree}")
     assessment["baseline"] = {
+        "mode": "current",
         "repository_root": str(repository.resolve()),
         "remote": "fixture://state-engine",
         "branch": _git(repository, "branch", "--show-current"),
         "commit": commit,
         "tree": tree,
-        "behavioral_overlay": None,
         "worktree_status_at_evidence_capture": [],
         "submodules": [],
         "worktrees_at_capture": [],
@@ -725,6 +725,38 @@ def test_validate_catalog_cli_rejects_duplicate_json_keys(tmp_path: Path) -> Non
     assert "duplicate JSON key" in result.stderr
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        pytest.param(lambda catalog: catalog.update({"schema_version": True}), id="boolean-schema-version"),
+        pytest.param(
+            lambda catalog: catalog["execution_profiles"].update({"unversioned_extension": []}),
+            id="extra-profile-block-field",
+        ),
+        pytest.param(
+            lambda catalog: catalog["execution_profiles"]["state_store"][0].update({"unversioned_extension": True}),
+            id="extra-state-store-field",
+        ),
+        pytest.param(
+            lambda catalog: catalog["execution_profiles"]["first_party_plugins"].update({"inventory_rule": True}),
+            id="invalid-inventory-rule-type",
+        ),
+    ],
+)
+def test_validate_catalog_cli_rejects_unversioned_execution_profile_schema_drift(
+    tmp_path: Path,
+    mutation: Any,
+) -> None:
+    catalog = json.loads(V2_CATALOG_PATH.read_text(encoding="utf-8"))
+    mutation(catalog)
+    catalog_path = tmp_path / "catalog.json"
+    _write_json(catalog_path, catalog)
+
+    result = _run_assessment_cli("validate-catalog", str(catalog_path))
+
+    assert result.returncode == 1
+
+
 def test_validate_package_accepts_complete_minimal_manifest(
     assessment_repository: tuple[Path, Path],
 ) -> None:
@@ -736,6 +768,80 @@ def test_validate_package_accepts_complete_minimal_manifest(
     assert "state-engine assessment contract: valid" in result.stdout
     assert "73 legs" in result.stdout
     assert "not_complete" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        pytest.param(lambda value: value.update({"schema_version": True}), "schema_version", id="boolean-schema-version"),
+        pytest.param(lambda value: value.update({"assessment_id": "../escape"}), "assessment_id", id="bad-assessment-id"),
+        pytest.param(lambda value: value.update({"unversioned_extension": True}), "top-level", id="extra-top-level-field"),
+        pytest.param(lambda value: value.pop("limitations"), "top-level", id="missing-top-level-field"),
+        pytest.param(
+            lambda value: value["environment"].update({"unversioned_extension": True}),
+            "environment",
+            id="extra-environment-field",
+        ),
+        pytest.param(
+            lambda value: [
+                counts.update({key: False for key, count in counts.items() if count == 0})
+                for counts in [*value["derived"]["family_counts"].values(), value["derived"]["total"]]
+            ],
+            "derived",
+            id="boolean-derived-counts",
+        ),
+    ],
+)
+def test_validate_package_rejects_assessment_schema_drift(
+    assessment_repository: tuple[Path, Path],
+    mutation: Any,
+    expected_error: str,
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    mutation(assessment)
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert expected_error in result.stderr
+
+
+def test_validate_package_accepts_historical_object_provenance(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"] = {
+        "mode": "historical",
+        "commit": _git(repository, "rev-parse", "HEAD"),
+        "tree": _git(repository, "rev-parse", "HEAD^{tree}"),
+    }
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_validate_package_rejects_current_provenance_for_historical_checkout(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    historical_commit = _git(repository, "rev-parse", "HEAD")
+    historical_tree = _git(repository, "rev-parse", "HEAD^{tree}")
+    (repository / "docs/historical-drift.md").write_text("later documentation\n", encoding="utf-8")
+    _git(repository, "add", "docs/historical-drift.md")
+    _git(repository, "commit", "-qm", "later checkout")
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"].update({"mode": "current", "commit": historical_commit, "tree": historical_tree})
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "current" in result.stderr
 
 
 def test_validate_package_accepts_honest_complete_executable_manifest(
@@ -985,7 +1091,7 @@ def test_validate_package_rejects_current_live_repository_root_mismatch(
     result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
 
     assert result.returncode == 1
-    assert "current-live repository_root" in result.stderr
+    assert "current repository_root" in result.stderr
 
 
 def test_validate_package_rejects_closed_gate_without_derived_support(
@@ -1060,6 +1166,38 @@ def test_validate_package_accepts_catalog_approved_follower_not_applicable(
     result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
 
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("status", ["pass", "partial", "fail", "unknown"])
+def test_validate_package_rejects_status_promotion_of_catalog_not_applicable_cell(
+    assessment_repository: tuple[Path, Path],
+    status: str,
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    rc05 = next(leg for leg in assessment["legs"] if leg["id"] == "RC-05")
+    override: dict[str, Any] = {
+        "dimension": "production_entry",
+        "case": "leg-contract",
+        "profile_case": "postgresql-16-aws-single-leader-landscape",
+        "status": status,
+        "evidence": [],
+    }
+    if status in {"partial", "fail", "unknown"}:
+        override.update(
+            {
+                "reason": "An assessor cannot promote a catalog-N/A cell.",
+                "owner_issue": None,
+                "exit_gate": "Revise the versioned catalog if applicability changes.",
+            }
+        )
+    rc05["overrides"] = [override]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "catalog not_applicable cell must remain not_applicable" in result.stderr
 
 
 def test_validate_package_rejects_assessor_waiver_of_required_profile_cell(
