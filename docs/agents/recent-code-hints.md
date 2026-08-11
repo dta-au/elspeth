@@ -18,6 +18,17 @@ is a working document under the normal delivery posture.
   `cleanup_plugins`; never call `on_complete()` or `close()` on the plugin
   whose startup raised, or on later plugins that were never started.
 
+- **2026-08-12 — Python 3.14 annotation closures expose class namespaces to
+  Runtime-VAL**: PEP 649 `__annotate__` functions close over `__classdict__`
+  and use `LOAD_FROM_DICT_OR_GLOBALS`; never normalize that whole dictionary,
+  because it contains unrelated interpreter state such as `_abc_impl`.
+  Normalize only the exact names read by supported bytecode shapes, including
+  whether each binding resolves from class, module globals, or builtins, and
+  fail closed on any unrecognized dictionary use. Slot member descriptors bind
+  by exact declaring `module:qualname` plus descriptor name. Python 3.14 also
+  emits `slice` objects as code constants, so preserve all three normalized
+  bounds rather than falling back to repr or narrowing supported Python.
+
 ## Whole-tree gates: a green scoped run proves NOTHING
 
 These gates assert over the ENTIRE tree with exact expected sets. Your change

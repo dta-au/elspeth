@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterator
+from types import FunctionType
 from typing import Annotated, ClassVar, Literal, Optional, TypedDict, Union
 
 import pytest
@@ -28,6 +29,7 @@ from elspeth.contracts.runtime_val_manifest import (
     _callable_dependency_hashes,
     _callable_implementation_hash,
     _class_source_hash,
+    _function_builtin_bindings,
     _normalize_code_constant,
     _payload_schema_hash,
     build_runtime_val_manifest,
@@ -64,6 +66,14 @@ class _RuntimeValManifestOpaqueDependency:
 
     def compute(self) -> int:
         return self.factor
+
+
+class _RuntimeValManifestSlotOwnerOne:
+    __slots__ = ("alpha", "bravo")
+
+
+class _RuntimeValManifestSlotOwnerTwo:
+    __slots__ = ("alpha",)
 
 
 class _RuntimeValManifestHelperClass:
@@ -166,6 +176,18 @@ def _runtime_val_manifest_closure_factory(helper: Callable[[], str]) -> Callable
         return helper()
 
     return wrapped
+
+
+def _runtime_val_manifest_classdict_closure_factory() -> tuple[Callable[[], object], dict[str, object]]:
+    __classdict__: dict[str, object] = {
+        "ignored": _RuntimeValManifestExternalOpaque(),
+        "slot": _RuntimeValManifestSlotOwnerOne.alpha,
+    }
+
+    def annotation() -> object:
+        return __classdict__["slot"]
+
+    return annotation, __classdict__
 
 
 def _runtime_val_manifest_mixed_bound_class_factory(
@@ -1587,6 +1609,43 @@ def test_normalize_code_constant_canonicalizes_sets() -> None:
     assert _normalize_code_constant({"bravo", "alpha"}) == {"set": ["alpha", "bravo"]}
 
 
+def test_normalize_code_constant_records_slice_bounds() -> None:
+    assert _normalize_code_constant(slice(1, 5, 2)) == {"slice": {"start": 1, "stop": 5, "step": 2}}
+
+
+def test_normalize_code_constant_records_member_descriptor_owner_and_name() -> None:
+    owner_one_alpha = _normalize_code_constant(_RuntimeValManifestSlotOwnerOne.alpha)
+
+    assert owner_one_alpha == {
+        "member_descriptor": f"{__name__}:_RuntimeValManifestSlotOwnerOne:alpha",
+    }
+    assert owner_one_alpha != _normalize_code_constant(_RuntimeValManifestSlotOwnerOne.bravo)
+    assert owner_one_alpha != _normalize_code_constant(_RuntimeValManifestSlotOwnerTwo.alpha)
+
+
+def test_callable_hash_normalizes_only_classdict_bindings_read_by_annotation_code() -> None:
+    annotation, classdict = _runtime_val_manifest_classdict_closure_factory()
+    baseline = _callable_implementation_hash(annotation)
+
+    classdict["ignored"] = object()
+    assert _callable_implementation_hash(annotation) == baseline
+
+    classdict["slot"] = _RuntimeValManifestSlotOwnerOne.bravo
+    assert _callable_implementation_hash(annotation) != baseline
+
+
+def test_function_builtin_bindings_ignore_later_globals_entry_mutation() -> None:
+    original_builtins = {"type": type}
+    function_globals: dict[str, object] = {"__builtins__": original_builtins}
+    function = FunctionType((lambda: None).__code__, function_globals)
+
+    function_globals["__builtins__"] = {"type": object}
+    assert _function_builtin_bindings(function) is original_builtins
+
+    del function_globals["__builtins__"]
+    assert _function_builtin_bindings(function) is original_builtins
+
+
 def test_normalize_code_constant_rejects_non_string_type_identity() -> None:
     class _BadIdentity:
         pass
@@ -1640,6 +1699,10 @@ def test_payload_schema_hash_canonicalizes_annotation_order() -> None:
 @pytest.mark.parametrize(
     ("annotation", "expected"),
     [
+        (
+            ClassVar,
+            {"typing_special_form": "ClassVar"},
+        ),
         (
             Literal["accepted", "rejected"],
             {

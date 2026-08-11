@@ -88,7 +88,7 @@ class _UnsupportedManifestValue:
 _UNSUPPORTED_MANIFEST_VALUE = _UnsupportedManifestValue()
 _MISSING_CLASS_ATTRIBUTE = object()
 _TYPING_SPECIAL_FORM_MODULES = ("typing", "typing_extensions")
-_TYPING_SPECIAL_FORM_NAMES = ("Annotated", "Literal", "NotRequired", "ReadOnly", "Required", "Union")
+_TYPING_SPECIAL_FORM_NAMES = ("Annotated", "ClassVar", "Literal", "NotRequired", "ReadOnly", "Required", "Union")
 
 
 def _type_identity(cls: type[object]) -> str:
@@ -111,6 +111,18 @@ def _function_module(func: FunctionType) -> str:
 
 def _callable_dependency_key(func: FunctionType) -> str:
     return f"{_function_module(func)}:{func.__qualname__}"
+
+
+def _function_builtin_bindings(func: FunctionType) -> dict[str, object]:
+    # typeshed omits FunctionType.__builtins__, but CPython binds this exact
+    # execution namespace when the function is created.  The globals-table
+    # ``__builtins__`` entry may be changed later without changing execution.
+    builtins_value: object = func.__builtins__  # type: ignore[attr-defined]
+    if type(builtins_value) is dict:
+        return builtins_value
+    if type(builtins_value) is ModuleType:
+        return vars(builtins_value)
+    raise FrameworkBugError(f"Runtime-VAL callable {_callable_dependency_key(func)!r} has invalid builtins namespace")
 
 
 def _module_is_owned(module_name: str, *, owner_module: str) -> bool:
@@ -175,6 +187,15 @@ def _try_normalize_code_constant(value: object) -> object:
         return {"regex": {"pattern": normalized_pattern, "flags": value.flags}}
     if isinstance(value, complex):
         return {"complex": [value.real, value.imag]}
+    if type(value) is slice:
+        normalized_bounds = {
+            "start": _try_normalize_code_constant(value.start),
+            "stop": _try_normalize_code_constant(value.stop),
+            "step": _try_normalize_code_constant(value.step),
+        }
+        if any(bound is _UNSUPPORTED_MANIFEST_VALUE for bound in normalized_bounds.values()):
+            return _UNSUPPORTED_MANIFEST_VALUE
+        return {"slice": normalized_bounds}
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if value is Ellipsis:
@@ -197,6 +218,8 @@ def _try_normalize_code_constant(value: object) -> object:
         return {"typing_special_form": typing_special_form_name}
     if isinstance(value, type):
         return {"type": _type_identity(value)}
+    if type(value) is MemberDescriptorType:
+        return {"member_descriptor": f"{_type_identity(value.__objclass__)}:{value.__name__}"}
     if isinstance(value, BuiltinFunctionType):
         module_name = value.__module__
         if type(module_name) is str:
@@ -276,6 +299,49 @@ def _normalize_instruction(instruction: dis.Instruction) -> dict[str, object]:
     return normalized
 
 
+def _loaded_classdict_binding_names(code: CodeType, *, binding_name: str) -> list[str] | None:
+    """Return the exact names read through a PEP 649 class-dict closure.
+
+    Python 3.14 annotation functions close over the class namespace and use
+    ``LOAD_FROM_DICT_OR_GLOBALS`` for each annotation name.  Normalizing the
+    entire namespace would hash unrelated interpreter bookkeeping (and can
+    encounter opaque values such as ``_abc_data``).  Only accept instruction
+    shapes whose dictionary reads can be named exactly; any other use falls
+    back to the ordinary fail-closed dependency normalizer.
+    """
+    if binding_name != "__classdict__":
+        return None
+    instructions = list(dis.get_instructions(code))
+    names: set[str] = set()
+    saw_binding = False
+    for index, instruction in enumerate(instructions):
+        if instruction.opname != "LOAD_DEREF" or instruction.argval != binding_name:
+            continue
+        saw_binding = True
+        if index + 1 >= len(instructions):
+            return None
+        next_instruction = instructions[index + 1]
+        if next_instruction.opname == "LOAD_FROM_DICT_OR_GLOBALS":
+            dependency_name = next_instruction.argval
+            if type(dependency_name) is not str:
+                return None
+            names.add(dependency_name)
+            continue
+        if index + 2 >= len(instructions) or next_instruction.opname != "LOAD_CONST":
+            return None
+        dependency_name = next_instruction.argval
+        subscript_instruction = instructions[index + 2]
+        is_subscript = subscript_instruction.opname == "BINARY_SUBSCR" or (
+            subscript_instruction.opname == "BINARY_OP" and subscript_instruction.argrepr == "[]"
+        )
+        if type(dependency_name) is not str or not is_subscript:
+            return None
+        names.add(dependency_name)
+    if not saw_binding:
+        return None
+    return sorted(names)
+
+
 def _normalize_bound_value(
     value: object,
     *,
@@ -283,6 +349,8 @@ def _normalize_bound_value(
     code: CodeType,
     load_opnames: frozenset[str],
     owner_module: str,
+    global_bindings: dict[str, object],
+    builtin_bindings: dict[str, object],
     seen_function_ids: frozenset[int],
     seen_dependency_ids: frozenset[int],
 ) -> object:
@@ -292,10 +360,42 @@ def _normalize_bound_value(
         binding_name=binding_name,
         load_opnames=load_opnames,
     )
-    if inspect.isfunction(value):
+    classdict_binding_names = _loaded_classdict_binding_names(code, binding_name=binding_name)
+    normalized_binding: dict[str, object]
+    if type(value) is dict and classdict_binding_names is not None:
+        if id(value) in seen_dependency_ids:
+            raise FrameworkBugError(f"Runtime-VAL dependency {owner_module}:{binding_name} contains a cyclic class dictionary")
+        nested_seen = seen_dependency_ids | frozenset({id(value)})
+        classdict_bindings: list[dict[str, object]] = []
+        for dependency_name in classdict_binding_names:
+            binding_scope = "class"
+            if dependency_name in value:
+                dependency_value = value[dependency_name]
+            elif dependency_name in global_bindings:
+                binding_scope = "global"
+                dependency_value = global_bindings[dependency_name]
+            elif dependency_name in builtin_bindings:
+                binding_scope = "builtin"
+                dependency_value = builtin_bindings[dependency_name]
+            else:
+                raise FrameworkBugError(f"Runtime-VAL cannot resolve PEP 649 class-dict dependency {owner_module}:{dependency_name}")
+            classdict_bindings.append(
+                {
+                    "name": dependency_name,
+                    "scope": binding_scope,
+                    "value": _normalize_dependency_value(
+                        dependency_value,
+                        owner_module=owner_module,
+                        name=f"{binding_name}[{dependency_name}]",
+                        seen=nested_seen,
+                    ),
+                }
+            )
+        normalized_binding = {"classdict_bindings": classdict_bindings}
+    elif inspect.isfunction(value):
         callable_key = _callable_dependency_key(value)
         if not _module_is_owned(_function_module(value), owner_module=owner_module):
-            normalized_binding: dict[str, object] = {"external_callable": callable_key}
+            normalized_binding = {"external_callable": callable_key}
         elif id(value) in seen_function_ids:
             normalized_binding = {"callable_reference": callable_key}
         else:
@@ -396,6 +496,8 @@ def _normalize_callable_closure(
                     code=func.__code__,
                     load_opnames=frozenset({"LOAD_DEREF"}),
                     owner_module=_function_module(func),
+                    global_bindings=func.__globals__,
+                    builtin_bindings=_function_builtin_bindings(func),
                     seen_function_ids=seen_function_ids,
                     seen_dependency_ids=seen_dependency_ids,
                 ),
@@ -424,6 +526,8 @@ def _normalize_callable_defaults(
                     code=code,
                     load_opnames=frozenset({"LOAD_FAST", "LOAD_DEREF"}),
                     owner_module=_function_module(func),
+                    global_bindings=func.__globals__,
+                    builtin_bindings=_function_builtin_bindings(func),
                     seen_function_ids=seen_function_ids,
                     seen_dependency_ids=seen_dependency_ids,
                 ),
@@ -443,6 +547,8 @@ def _normalize_callable_defaults(
                     code=code,
                     load_opnames=frozenset({"LOAD_FAST", "LOAD_DEREF"}),
                     owner_module=_function_module(func),
+                    global_bindings=func.__globals__,
+                    builtin_bindings=_function_builtin_bindings(func),
                     seen_function_ids=seen_function_ids,
                     seen_dependency_ids=seen_dependency_ids,
                 ),
