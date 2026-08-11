@@ -1,0 +1,351 @@
+{
+  "schema": "state-engine-focused-observations.v1",
+  "captured_at": "2026-08-12T03:11:03+10:00",
+  "baseline_commit": "af79b34040f5ce5fd989aa0d42a1b80ad8366829",
+  "baseline_tree": "c4abd284a970783be8a19cb70dccc3e59072ec87",
+  "cwd": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+  "environment": {
+    "python_313": "3.13.1",
+    "python_314": "3.14.3",
+    "pytest": "9.0.3",
+    "sqlite": "3.47.1",
+    "sqlalchemy": "2.0.45",
+    "postgresql_image": "postgres:16-alpine",
+    "sensitive_environment_captured": false
+  },
+  "observations": [
+    {
+      "id": "EV-OBS-01",
+      "python": ".venv/bin/python",
+      "options": [
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0"
+      ],
+      "selectors": [
+        "tests/unit/core/landscape/test_scheduler_fencing.py",
+        "tests/unit/core/landscape/test_scheduler_pending_sink_claim.py"
+      ],
+      "exit_code": 0,
+      "result": {
+        "tests": 46,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "e9be29b1acf839eb1f9f338f27d30435bd1c29942a7a9d7e953e2215a21db690",
+        "stdout": "026f6fb69ff78de4d102402288681f936ad5544c075f105a78d55ee6c8299b0a",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      },
+      "raw_sha": {
+        "junit_xml": "6d5ff263a96dc0b74bda566d14dcdaf0c28a55bbe612c512439a6be26f5b8609",
+        "stdout": "723756462881096f4638a1c69aa824587d74f2f04a27481864867e1eabf6ec92"
+      },
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-01.junit.xml",
+        "tests/unit/core/landscape/test_scheduler_fencing.py",
+        "tests/unit/core/landscape/test_scheduler_pending_sink_claim.py"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-01.junit.xml.gz",
+        "stdout": "EV-OBS-01.stdout.gz",
+        "stderr": "EV-OBS-01.stderr",
+        "exit_code": "EV-OBS-01.exit-code"
+      }
+    },
+    {
+      "id": "EV-OBS-02",
+      "python": ".venv/bin/python",
+      "options": [
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0"
+      ],
+      "selectors": [
+        "tests/integration/pipeline/test_builtin_sink_effect_recovery.py",
+        "tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py"
+      ],
+      "exit_code": 0,
+      "result": {
+        "tests": 39,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "9e28d598fe0e81640675b5cada328a6d7f8194bc7bbcd81b14d625ac1d2344fe",
+        "stdout": "9e7b262413a738be4aa4e38066075be5bba6937de1df0c40b65f2f86bf440e25",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      },
+      "raw_sha": {
+        "junit_xml": "72e4b124f569428fa74995584e2b868e334c850b42c251baf6dd6a067191fb2b",
+        "stdout": "a94afd7405603215d41e1e48063b58766a1ce14f96c03db9bbeb5b9050f46368"
+      },
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-02.junit.xml",
+        "tests/integration/pipeline/test_builtin_sink_effect_recovery.py",
+        "tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-02.junit.xml.gz",
+        "stdout": "EV-OBS-02.stdout.gz",
+        "stderr": "EV-OBS-02.stderr",
+        "exit_code": "EV-OBS-02.exit-code"
+      }
+    },
+    {
+      "id": "EV-OBS-03",
+      "python": ".venv/bin/python",
+      "options": [
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0"
+      ],
+      "selectors": [
+        "tests/unit/core/landscape/test_scheduler_events.py::test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_commits_exact_row_event_and_branch_loss",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_stale_owner_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_departed_member_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_rolls_back_when_event_insert_fails",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_branch_loss_failure_rolls_back_disposition_row_and_event",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_mark_blocked_refuses_missing_release_key_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_mark_pending_sink_rejects_incomplete_bundle_without_mutation"
+      ],
+      "exit_code": 0,
+      "result": {
+        "tests": 30,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "694acd64aa44c40b6b6ec9ca7193f51b1ac7e44d8dddbd869bf8a9780e730a81",
+        "stdout": "11487bb9ead794dc136a815d73ad637c91ce3bd51ea980be1dc35621a192ba36",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      },
+      "raw_sha": {
+        "junit_xml": "119cfebc85aba495f7d046627c7f24923e0debd1c496b9a46a629cf5f3186be8",
+        "stdout": "b22a8fdfa83f4eb48f247e30b5781c9abc5e1d151cbfb9df1721c397beb20cb6"
+      },
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-03.junit.xml",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_normal_dispositions_refuse_reclaimed_sink_redrive_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_commits_exact_row_event_and_branch_loss",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_stale_owner_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_refuses_departed_member_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_transform_disposition_truth_table_rolls_back_when_event_insert_fails",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_branch_loss_failure_rolls_back_disposition_row_and_event",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_mark_blocked_refuses_missing_release_key_without_mutation",
+        "tests/unit/core/landscape/test_scheduler_events.py::test_mark_pending_sink_rejects_incomplete_bundle_without_mutation"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-03.junit.xml.gz",
+        "stdout": "EV-OBS-03.stdout.gz",
+        "stderr": "EV-OBS-03.stderr",
+        "exit_code": "EV-OBS-03.exit-code"
+      }
+    },
+    {
+      "id": "EV-OBS-04",
+      "python": ".venv/bin/python",
+      "options": [
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0"
+      ],
+      "selectors": [
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_records_source_node_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_fenced_ingest_commits_source_completion_before_return",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_fenced_ingest_rolls_source_completion_back_with_scheduler_failure",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_conflicting_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_duplicate_claim_witness",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_mismatched_work_item_witness",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_later_attempt",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_malformed_existing_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_source_impossible_metadata",
+        "tests/e2e/recovery/test_concurrent_resume.py::TestMidClaimCrashResume::test_ts02_source_completion_gap_reconciles_once_before_plugin_execution"
+      ],
+      "exit_code": 0,
+      "result": {
+        "tests": 13,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "f142414055b8fc38c438dcf1f7843c0430a70c9df00e172a9ae1cf491b3cc3b7",
+        "stdout": "b8e7967be27843fbfbe8e4434cb13eb3722af1dd26c74d34d9a9e11b9dc598b4",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      },
+      "raw_sha": {
+        "junit_xml": "f706bae2f33907a07538cf8364ed2b7b8b3740eecde4906428d960e2732ef931",
+        "stdout": "41b8b94d655185974d538f1c53556a7382dcf8687d9e3c31e72116612d6987d2"
+      },
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-04.junit.xml",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_records_source_node_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_fenced_ingest_commits_source_completion_before_return",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_fenced_ingest_rolls_source_completion_back_with_scheduler_failure",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_conflicting_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_duplicate_claim_witness",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_mismatched_work_item_witness",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_later_attempt",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_malformed_existing_state",
+        "tests/unit/engine/test_processor.py::TestProcessRowNoTransforms::test_source_completion_reconciliation_rejects_source_impossible_metadata",
+        "tests/e2e/recovery/test_concurrent_resume.py::TestMidClaimCrashResume::test_ts02_source_completion_gap_reconciles_once_before_plugin_execution"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-04.junit.xml.gz",
+        "stdout": "EV-OBS-04.stdout.gz",
+        "stderr": "EV-OBS-04.stderr",
+        "exit_code": "EV-OBS-04.exit-code"
+      }
+    },
+    {
+      "id": "EV-OBS-PG-01",
+      "python": ".venv/bin/python",
+      "options": [
+        "-q",
+        "-n",
+        "0",
+        "-m",
+        "testcontainer"
+      ],
+      "selectors": [
+        "tests/testcontainer/core/test_scheduler_lease_eviction_postgres.py",
+        "tests/testcontainer/core/test_run_coordination_release_postgres.py"
+      ],
+      "exit_code": 0,
+      "result": {
+        "tests": 4,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "04d65d327b2d3aa36e7995f3835c309545675c2d731afa616c22acedc43086d7",
+        "stdout": "098c03eac92547f7f3a91b9077037cd30ca6649600df4fa579a4bc8875ade6fc",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "9a271f2a916b0b6ee6cecb2426f0b3206ef074578be55d9bc94f6f3fe3ab86aa"
+      },
+      "raw_sha": {
+        "junit_xml": "585b478d8489a59fa1092f48a4afb7ddcf0959f70fa7d8f9c8430736ac0d4abc"
+      },
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-n",
+        "0",
+        "-m",
+        "testcontainer",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-PG-01.junit.xml",
+        "tests/testcontainer/core/test_scheduler_lease_eviction_postgres.py",
+        "tests/testcontainer/core/test_run_coordination_release_postgres.py"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-PG-01.junit.xml.gz",
+        "stdout": "EV-OBS-PG-01.stdout",
+        "stderr": "EV-OBS-PG-01.stderr",
+        "exit_code": "EV-OBS-PG-01.exit-code"
+      }
+    },
+    {
+      "id": "EV-OBS-PY314-FAIL",
+      "python": ".venv-py314/bin/python",
+      "options": [
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0"
+      ],
+      "selectors": [
+        "tests/integration/pipeline/test_builtin_sink_effect_recovery.py",
+        "tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py"
+      ],
+      "exit_code": 1,
+      "result": {
+        "tests": 39,
+        "failures": 9,
+        "errors": 0,
+        "skipped": 0
+      },
+      "sha": {
+        "junit_xml": "d4288fde2390cec4969506a97ec2b8b4b2439dae0c0e65d6f7d1d1c4daad148d",
+        "stdout": "5c2fdc23a9fd6dbf8907fdeeb82303c31e71a092b35b5aeb4212062d27b823a2",
+        "stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "exit_code": "4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"
+      },
+      "raw_sha": {
+        "junit_xml": "6e61e0d8d3d1f6e78f68462269e9ef3c8c3410bccbb04134acd7245b5d0eb978",
+        "stdout": "7f3f59e0068dafce554f9e8eae7e54784b495014a4e088f28ab3d685b1a520d8"
+      },
+      "argv": [
+        ".venv-py314/bin/python",
+        "-m",
+        "pytest",
+        "-p",
+        "no:dotenv",
+        "-q",
+        "-n",
+        "0",
+        "--junitxml=/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/docs/architecture/state_engine/assessments/2026-08-12-0239/artifacts/EV-OBS-PY314-FAIL.junit.xml",
+        "tests/integration/pipeline/test_builtin_sink_effect_recovery.py",
+        "tests/unit/core/landscape/test_scheduler_repository_complete_barrier.py"
+      ],
+      "artifacts": {
+        "junit_xml": "EV-OBS-PY314-FAIL.junit.xml.gz",
+        "stdout": "EV-OBS-PY314-FAIL.stdout.gz",
+        "stderr": "EV-OBS-PY314-FAIL.stderr",
+        "exit_code": "EV-OBS-PY314-FAIL.exit-code"
+      }
+    }
+  ]
+}

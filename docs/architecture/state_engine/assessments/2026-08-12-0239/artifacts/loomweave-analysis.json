@@ -1,0 +1,47 @@
+{
+  "schema": "state-engine-loomweave-observation.v1",
+  "command": [
+    "loomweave",
+    "worktree",
+    "analyze",
+    "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+    "--no-incremental"
+  ],
+  "source_root": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+  "isolated_store_id": "wt-be4cafe43983c9793bbee6fcb29c125233f6f86bd2aa0fb26127a4614031e3bf",
+  "run_id": "1aa9de74-7763-44a5-98e6-07cc88ff0d66",
+  "run_status_in_isolated_database": "completed",
+  "analyzed_at_commit": "af79b34040f5ce5fd989aa0d42a1b80ad8366829",
+  "started_at_utc": "2026-08-11T16:36:11.087Z",
+  "analysis_completed_at_utc": "2026-08-11T16:41:01.927Z",
+  "command_exit_code": 130,
+  "command_timebox_seconds": 2700,
+  "timebox_reason": "The structural run had completed and persisted at the exact commit, but the CLI remained in post-analysis embedding-service work. It was interrupted once at the authorized 45-minute boundary and was not retried.",
+  "stats": {
+    "entities_inserted": 71628,
+    "edges_inserted": 152366,
+    "failure_findings": 7,
+    "source_walk_skipped_entries": 0,
+    "source_walk_errors_omitted": 0,
+    "dropped_edges_total": 0,
+    "ambiguous_edges_total": 85,
+    "unresolved_call_sites_total": 311854,
+    "unresolved_reference_sites_total": 203833,
+    "reference_sites_skipped_by_cap": 2305,
+    "classifier_source_walk_complete": true,
+    "subsystem_count": 129,
+    "clustering_status": "completed",
+    "clustering_modularity_score": 0.18553507421484344
+  },
+  "warning_counts": {
+    "LMWV-PY-CALL-RESOLUTION-TIMEOUT": 2,
+    "LMWV-PY-PYRIGHT-RESTART": 3,
+    "LMWV-PY-PYRIGHT-POISON-FRAME": 1,
+    "LMWV-PY-REFERENCE-SITE-CAP": 1
+  },
+  "limitations": [
+    "No linked-worktree project_status_get response was retained, so this package records exact-commit completed-run identity rather than claiming that response's staleness field.",
+    "Call/reference resolution is incomplete at the seven named warning sites and at the reference-site cap; absence is not unreachability evidence.",
+    "Post-analysis embeddings did not finish before the 45-minute timebox; no semantic-search completeness claim is made."
+  ]
+}

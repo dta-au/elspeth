@@ -17,7 +17,9 @@ The state engine comprises four coupled durable mechanisms:
 The engine holds no scheduler write transaction across source, transform, or
 sink plugin I/O. That design keeps database transactions bounded but creates
 cross-transaction seams that require durable continuation authority and fresh-
-process restart proof.
+process restart proof. The maintained store profiles are SQLite WAL for the
+single-host shapes and PostgreSQL 16 for the AWS single-leader Landscape
+shape. PostgreSQL does not imply multi-replica scheduling support.
 
 ## Token scheduler
 
@@ -64,6 +66,13 @@ fields define these subtypes:
 A queue-only hold remains dormant until reachability and release authority are
 positively established.
 
+`ABANDONED` is a permanent undecided token fate, not a scheduler work status
+or a completed terminal token outcome. TS-19 writes `(NULL, ABANDONED)` for
+non-resumable pending tokens atomically with fenced terminal run finalization;
+the run is terminal while the token's `TerminalPath.ABANDONED` remains
+non-terminal (`completed=False`). RM-14 and F-14 govern how accounting, resume,
+and illegal re-entry interpret that two-axis state.
+
 ### Transition families
 
 | IDs | Responsibility |
@@ -75,9 +84,10 @@ positively established.
 | TS-15–TS-18 | Barrier consume, sink handoff, and atomic continuation emission |
 | AUX-01–AUX-07 | Heartbeat, lease loss, adoption, branch-loss cursor, membership, and leader fencing |
 | RC-01–RC-07 | Leader seat and worker-registry lifecycle |
+| TS-19 | Fenced run finalization for non-resumable pending tokens |
 
 The exact stable leg list and required cases live in the
-[v1 catalog](proof-catalog/v1/catalog.json).
+[v2 catalog](proof-catalog/v2/catalog.json).
 
 ### Write ownership
 
@@ -266,7 +276,9 @@ flowchart LR
 | PB-06 | Sink effect | Reserve, claim preparation, inspect, plan, lease, reconcile/commit, and finalize. |
 | PB-07 | Post-sink repair | TS-14 closes durable scheduler debt without external I/O. |
 | PB-08 | Follower | Claims and row-level traversal; leader retains barrier and sink authority. |
-| PB-09 | Lifecycle | Fresh/resume/follower start and normal/exceptional teardown ordering. |
+| PB-09 | Plugin lifecycle | Every current first-party source, transform, and sink is covered across its applicable lifecycle/profile cases. |
+| PB-10 | Row union | Durable branch membership converges exactly once across arrival, loss, timeout, release, late arrival, and recovery. |
+| PB-11 | PostgreSQL 16 | DB-server time, row-lock ordering, transaction isolation, schema admission/migration, and ambiguous connection loss are proved on a real PostgreSQL 16 service for the AWS single-leader profile. |
 
 ## Read-model authority
 
@@ -288,6 +300,7 @@ flush, resume, relinquish, evict, or complete:
 | RM-11 | Barrier-backed BLOCKED count for completion and resume preflight |
 | RM-12 | Barrier-backed BLOCKED listing for journal restoration |
 | RM-13 | Pending barrier-adoption listing for leader intake |
+| RM-14 | Accounting and resume distinguish decided, resumable pending, abandoned, and contradictory decided-plus-abandoned tokens |
 
 Each truth table must cover positive and negative status/subtype arms, run and
 owner scoping, exact expiry equality, deduplication, and ordering. Scattered
@@ -323,11 +336,12 @@ demonstrates the outcome.
 
 ## Forbidden paths
 
-`F-01` through `F-13` cover illegal final-state jumps, foreign barrier release,
+`F-01` through `F-14` cover illegal final-state jumps, foreign barrier release,
 wrong-owner dispositions, missing release keys, absent membership, unsafe
 recovery, partial sink batches, non-exhaustive barrier completion, stale leader
 mutation, source-boundary queue entry, deleted `WAITING`, and dormant queue-only
-release.
+release. `F-14` additionally forbids an `ABANDONED` token from re-entering
+processing or coexisting with a decided terminal outcome.
 
 Forbidden paths require positive refusal and zero-mutation evidence. Absence of
 a located caller is not proof of unreachability when static analysis reports
