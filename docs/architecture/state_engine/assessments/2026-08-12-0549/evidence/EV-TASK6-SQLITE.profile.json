@@ -1,0 +1,53 @@
+{
+  "schema_version": 2,
+  "producer": "elspeth-state-engine-profile-reporter-v2",
+  "profile_case_id": "sqlite-wal-single-process-leader",
+  "state_store": "sqlite-wal",
+  "deployment": "single-process-leader",
+  "backend_version": "3.47.1",
+  "backend_probe": {
+    "kind": "sqlite-connection-query",
+    "dialect": "sqlite",
+    "query": "SELECT sqlite_version()"
+  },
+  "deployment_probe": {
+    "kind": "trusted-test-runtime-assertion",
+    "node_id": "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_exact_ready_replay_preserves_complete_state_engine_image"
+  },
+  "probe_node_id": "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_exact_ready_replay_preserves_complete_state_engine_image",
+  "node_ids": [
+    "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_exact_ready_replay_preserves_complete_state_engine_image",
+    "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image",
+    "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc01_registration_rolls_back_seat_membership_and_first_event_when_second_event_fails",
+    "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner",
+    "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss",
+    "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc04_exact_release_changes_only_current_seat_member_and_one_event"
+  ],
+  "outcomes": [
+    {
+      "node_id": "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_exact_ready_replay_preserves_complete_state_engine_image",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc01_registration_rolls_back_seat_membership_and_first_event_when_second_event_fails",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc04_exact_release_changes_only_current_seat_member_and_one_event",
+      "outcome": "passed"
+    }
+  ],
+  "warnings": []
+}

@@ -1,0 +1,2066 @@
+{
+  "schema_version": 2,
+  "assessment_id": "2026-08-12-0549",
+  "mode": "delta",
+  "parent_assessment": {
+    "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/assessment.json",
+    "sha256": "12224f47cc7a653f1ffc3de1877f2b800b2406fe12d856dfffb09262d1657ac6"
+  },
+  "changed_tuples": [
+    {
+      "leg_id": "RC-01",
+      "dimension_id": "production_entry",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-01",
+      "dimension_id": "success_effects",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-01",
+      "dimension_id": "zero_mutation_rollback",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-01",
+      "dimension_id": "boundary_composition",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-02",
+      "dimension_id": "success_effects",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-02",
+      "dimension_id": "guard_refusal",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-02",
+      "dimension_id": "zero_mutation_rollback",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    },
+    {
+      "leg_id": "RC-04",
+      "dimension_id": "success_effects",
+      "case_id": "leg-contract",
+      "profile_case": "sqlite-wal-single-process-leader"
+    }
+  ],
+  "changed_gate_ids": [
+    "HG-01-invalid-subtype",
+    "HG-02-authority-downgrade",
+    "HG-04-refusal-mutation",
+    "HG-05-state-evidence-atomicity",
+    "HG-08-plugin-lifecycle-durability",
+    "HG-09-mandatory-leg-unresolved"
+  ],
+  "catalog": {
+    "path": "docs/architecture/state_engine/proof-catalog/v2/catalog.json",
+    "catalog_id": "elspeth-state-engine-v2",
+    "schema_version": 1,
+    "sha256_at_evidence_capture": "802734e04f4292cacac9fd5ffa32a3f6a7e3a1b5200c09a7595a158c6e1e2c6a"
+  },
+  "baseline": {
+    "mode": "current",
+    "repository_root": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan",
+    "remote": "https://github.com/johnm-dta/elspeth.git",
+    "branch": "codex/state-engine-completion-plan",
+    "commit": "e01e7a04feed4e3be548c04ae0760c163374958f",
+    "tree": "f187cb894bb32d866e8e7dd953be698819e44752",
+    "worktree_status_at_evidence_capture": [
+      "# branch.oid e01e7a04feed4e3be548c04ae0760c163374958f",
+      "# branch.head codex/state-engine-completion-plan",
+      "? docs/architecture/state_engine/assessments/2026-08-12-0549/"
+    ],
+    "submodules": [],
+    "worktrees_at_capture": [
+      "/home/john/elspeth release/0.7.2 (shared checkout, untouched)",
+      "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan e01e7a04feed4e3be548c04ae0760c163374958f codex/state-engine-completion-plan",
+      "Other concurrent worktrees were present and were not used or modified."
+    ]
+  },
+  "environment": {
+    "captured_at": "2026-08-12T06:03:08.956246+10:00",
+    "timezone": "Australia/Canberra",
+    "locale": "LANG=C.UTF-8; LC_ALL=C.UTF-8",
+    "kernel": "Linux 6.8.0-136-generic x86_64",
+    "python": "3.13.1",
+    "python_executable": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+    "python_build": "main, Dec 19 2024 14:32:25",
+    "pytest": "9.0.3",
+    "uv": "0.10.2",
+    "git": "2.43.0",
+    "sqlite": "3.47.1",
+    "sqlalchemy": "2.0.45",
+    "multiprocessing_start_method_before_tests": null,
+    "pythonhashseed": "0",
+    "dotenv": "not loaded; no sensitive values captured",
+    "pyproject_sha256": "9747a7130b36b408f14720c7d4a728a53e717881987603cc100eeac4bb3533bb",
+    "uv_lock_sha256": "6658d0e7e14a428b27b261e6f4db7091b89973620595a0f983ddc0c5af787a5f",
+    "database_profile": "SQLite 3.47.1 WAL single-process plus local PostgreSQL 16.13 backend semantics for the maintained AWS single-leader profile; live AWS composition remains unexecuted",
+    "sensitive_environment_captured": false
+  },
+  "structure_snapshot": {
+    "provider": "Task 6 current-source inspection plus reporter-bound executable evidence",
+    "captured_at": "2026-08-12T06:03:08.956246+10:00",
+    "limitation": "No SQLite follower deployment or live AWS composition claim is made by this delta."
+  },
+  "tracker_snapshot": {
+    "provider": "Filigree comments 7488, 7489, and 7490 plus current Task 6 issue dispositions",
+    "captured_at": "2026-08-12T06:03:08.956246+10:00",
+    "limitation": "Broad owners remain open; elspeth-2aba594afb retains the production BranchLossSpec process residual."
+  },
+  "evidence": [
+    {
+      "id": "EV-TASK5-SQLITE",
+      "kind": "pytest",
+      "reproducibility_class": "deterministic",
+      "argv": [
+        "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-n",
+        "0",
+        "-p",
+        "scripts.state_engine_profile_reporter",
+        "--state-engine-profile-report",
+        "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.profile.json",
+        "--junitxml",
+        "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.junit.xml",
+        "tests/unit/core/landscape/test_scheduler_queue_contract.py",
+        "tests/unit/core/landscape/test_scheduler_events.py",
+        "tests/unit/core/landscape/test_scheduler_fencing.py",
+        "tests/e2e/recovery/test_source_ingress_contract.py",
+        "tests/e2e/recovery/test_concurrent_resume.py",
+        "tests/integration/pipeline/test_scheduler_plugin_dispositions.py"
+      ],
+      "cwd_relative": ".",
+      "timeout_seconds": 300,
+      "safe_environment": {
+        "PYTHONHASHSEED": "0",
+        "TZ": "Australia/Canberra",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8"
+      },
+      "resources": [],
+      "started_at": "2026-08-12T04:27:12.460577+10:00",
+      "ended_at": "2026-08-12T04:27:48.907577+10:00",
+      "duration_seconds": 36.447,
+      "exit_code": 0,
+      "result_counts": {
+        "passed": 113,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "warnings": 0
+      },
+      "coverage": [
+        {
+          "leg_id": "TS-00",
+          "dimension_id": "zero_mutation_rollback",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_incompatible_ready_replay_preserves_complete_state_engine_image",
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_reference_validation_refusal_preserves_complete_state_engine_image[token-cross-run]",
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_reference_validation_refusal_preserves_complete_state_engine_image[node-cross-run]",
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_reference_validation_refusal_preserves_complete_state_engine_image[ingest]",
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_new_enqueue_and_claim_event_failure_rolls_back_complete_state_engine_image[enqueue]"
+          ]
+        },
+        {
+          "leg_id": "TS-01",
+          "dimension_id": "zero_mutation_rollback",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_new_enqueue_and_claim_event_failure_rolls_back_complete_state_engine_image[claim_ready]",
+            "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_existing_ready_claim_event_failure_rolls_back_complete_state_engine_image"
+          ]
+        },
+        {
+          "leg_id": "TS-02",
+          "dimension_id": "production_entry",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/e2e/recovery/test_source_ingress_contract.py::test_accepted_source_row_enters_complete_ts02_and_terminalizes"
+          ]
+        },
+        {
+          "leg_id": "F-11",
+          "dimension_id": "guard_refusal",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/e2e/recovery/test_source_ingress_contract.py::test_yielded_row_boundary_failure_records_audit_without_scheduler_admission"
+          ]
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "kind": "junit_xml",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.junit.xml",
+          "sha256": "64f347fd99dc3283d2d148af7c1b81db5a3e32b2b3940c859b284da870aed9eb"
+        },
+        {
+          "kind": "stdout",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.stdout",
+          "sha256": "0362a2e7c5c2c077697905664b1fe4fc0e4843446edf030cb92cb75da75c47ad"
+        },
+        {
+          "kind": "stderr",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.stderr",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "kind": "profile_report",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.profile.json",
+          "sha256": "17677fe359410f65c12dbb146b143d2afd51713305cc60b59efc1849b752d1e2"
+        }
+      ],
+      "collected_node_index": {
+        "kind": "node_index",
+        "path": "docs/architecture/state_engine/assessments/2026-08-12-0425/evidence/EV-TASK5-SQLITE.nodes",
+        "sha256": "f5d091c5219ebb80be25e22fed3ebea1424148d1a31914e2aaa33b214f010ab5"
+      },
+      "collected_nodes": 113,
+      "establishes": [
+        "The cited Task 5 cells pass under the sqlite-wal-single-process-leader profile through exact reporter-bound pytest node identities.",
+        "Queue refusal and injected scheduler-event failures preserve the complete captured durable state-engine image.",
+        "The real orchestration caller reaches TS-02 admission, and the cited F-11 guard raises the exact typed refusal before scheduler admission."
+      ],
+      "does_not_establish": [
+        "Any PostgreSQL 16 AWS profile cell.",
+        "Either supported SQLite follower profile.",
+        "Concurrency, read-model truth tables, or uncited dimensions and legs.",
+        "Completion of TS-00, TS-01, TS-02, PB-01, PB-02, PB-03, or F-11 across all-required-v2 profiles.",
+        "The full CI-equivalent test suite or merge readiness."
+      ]
+    },
+    {
+      "id": "EV-TASK6-SQLITE",
+      "kind": "pytest",
+      "reproducibility_class": "deterministic",
+      "argv": [
+        "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/.venv/bin/python",
+        "-m",
+        "pytest",
+        "-q",
+        "-n",
+        "0",
+        "-p",
+        "scripts.state_engine_profile_reporter",
+        "--state-engine-profile-report",
+        "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.profile.json",
+        "--junitxml",
+        "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.junit.xml",
+        "tests/unit/core/landscape/test_scheduler_queue_contract.py::test_exact_ready_replay_preserves_complete_state_engine_image",
+        "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image",
+        "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc01_registration_rolls_back_seat_membership_and_first_event_when_second_event_fails",
+        "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner",
+        "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss",
+        "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc04_exact_release_changes_only_current_seat_member_and_one_event"
+      ],
+      "cwd_relative": ".",
+      "timeout_seconds": 300,
+      "safe_environment": {
+        "PYTHONHASHSEED": "0",
+        "PYTHONPATH": "/home/john/elspeth/.claude/worktrees/state-engine-completion-plan/src",
+        "TZ": "Australia/Canberra",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8"
+      },
+      "resources": [],
+      "started_at": "2026-08-12T06:06:40.536717+10:00",
+      "ended_at": "2026-08-12T06:06:43.716717+10:00",
+      "duration_seconds": 3.18,
+      "exit_code": 0,
+      "result_counts": {
+        "passed": 6,
+        "failed": 0,
+        "errors": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0,
+        "warnings": 0
+      },
+      "coverage": [
+        {
+          "leg_id": "RC-01",
+          "dimension_id": "production_entry",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image"
+          ]
+        },
+        {
+          "leg_id": "RC-01",
+          "dimension_id": "success_effects",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image"
+          ]
+        },
+        {
+          "leg_id": "RC-01",
+          "dimension_id": "zero_mutation_rollback",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc01_registration_rolls_back_seat_membership_and_first_event_when_second_event_fails"
+          ]
+        },
+        {
+          "leg_id": "RC-01",
+          "dimension_id": "boundary_composition",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/e2e/recovery/test_registered_process_authority.py::test_child_process_initial_run_registration_is_one_atomic_epoch_one_image"
+          ]
+        },
+        {
+          "leg_id": "RC-02",
+          "dimension_id": "success_effects",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner"
+          ]
+        },
+        {
+          "leg_id": "RC-02",
+          "dimension_id": "guard_refusal",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss"
+          ]
+        },
+        {
+          "leg_id": "RC-02",
+          "dimension_id": "zero_mutation_rollback",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc02_takeover_expiry_equality_is_a_zero_mutation_cas_loss"
+          ]
+        },
+        {
+          "leg_id": "RC-04",
+          "dimension_id": "success_effects",
+          "case_id": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "node_ids": [
+            "tests/unit/core/landscape/test_run_coordination_repository.py::TestRunCoordinationTruthTables::test_rc04_exact_release_changes_only_current_seat_member_and_one_event"
+          ]
+        }
+      ],
+      "retained_artifacts": [
+        {
+          "kind": "junit_xml",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.junit.xml",
+          "sha256": "6becc5ac0a482d73b1c5259cbb4a07f211a49c8acbfa5cd6392488d9e9985a40"
+        },
+        {
+          "kind": "stdout",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.stdout",
+          "sha256": "c18e663988f09f8d956015eb8881273a4bb9ca2cda2de64071112897f235da9b"
+        },
+        {
+          "kind": "stderr",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.stderr",
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        {
+          "kind": "profile_report",
+          "path": "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.profile.json",
+          "sha256": "a25d911714ec59497ec24de29b4b5be987e36f101510ffda7c78581bcf6cc2ca"
+        }
+      ],
+      "collected_node_index": {
+        "kind": "node_index",
+        "path": "docs/architecture/state_engine/assessments/2026-08-12-0549/evidence/EV-TASK6-SQLITE.nodes",
+        "sha256": "1727ad60fafbd89cdcfcdcc79126b1e282ae3cf377df357037eb3fa2529fa431"
+      },
+      "collected_nodes": 6,
+      "establishes": [
+        "The cited RC-01, RC-02, and RC-04 cells pass at the committed Task 6 baseline under runtime-observed SQLite 3.47.1 WAL single-process leader.",
+        "RC-01 reaches a registered independent child process; refusal and event-failure cells preserve their cited durable images."
+      ],
+      "does_not_establish": [
+        "PostgreSQL 16 AWS profile cells or live AWS deployment composition.",
+        "Either SQLite follower profile, multi-replica scheduling, or uncited Task 6 cells.",
+        "Completion of any all-required-v2 leg or the full CI-equivalent test suite."
+      ]
+    }
+  ],
+  "legs": [
+    {
+      "id": "TS-00",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "The cited SQLite single-process cells pass, but mandatory PostgreSQL 16 AWS, SQLite follower, and uncited dimension cells remain unknown.",
+      "owner_issue": "elspeth-c0d4a28e11",
+      "exit_gate": "Execute and promote every remaining all-required-v2 dimension/profile cell; PostgreSQL 16 AWS is mandatory.",
+      "overrides": [
+        {
+          "dimension": "zero_mutation_rollback",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK5-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "TS-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "The cited SQLite single-process cells pass, but mandatory PostgreSQL 16 AWS, SQLite follower, and uncited dimension cells remain unknown.",
+      "owner_issue": "elspeth-c0d4a28e11",
+      "exit_gate": "Execute and promote every remaining all-required-v2 dimension/profile cell; PostgreSQL 16 AWS is mandatory.",
+      "overrides": [
+        {
+          "dimension": "zero_mutation_rollback",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK5-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "TS-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "The cited SQLite single-process cells pass, but mandatory PostgreSQL 16 AWS, SQLite follower, and uncited dimension cells remain unknown.",
+      "owner_issue": "elspeth-9cd07962c7",
+      "exit_gate": "Execute and promote every remaining all-required-v2 dimension/profile cell; PostgreSQL 16 AWS is mandatory.",
+      "overrides": [
+        {
+          "dimension": "production_entry",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK5-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "TS-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "TS-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "TS-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "TS-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "TS-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-08",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-09",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-10",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-11",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-12",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-13",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-14",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-15",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-16",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-17",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-18",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "TS-19",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-67be892457",
+      "exit_gate": "Complete Tasks 10 and 11 with ABANDONED, follower, first-party plugin, lifecycle, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "AUX-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RC-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected SQLite single-process Task 6 cells pass, but uncited dimensions and required profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling local PostgreSQL or follower boundaries.",
+      "overrides": [
+        {
+          "dimension": "production_entry",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        },
+        {
+          "dimension": "success_effects",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        },
+        {
+          "dimension": "zero_mutation_rollback",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        },
+        {
+          "dimension": "boundary_composition",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "RC-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected SQLite single-process Task 6 cells pass, but uncited dimensions and required profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling local PostgreSQL or follower boundaries.",
+      "overrides": [
+        {
+          "dimension": "success_effects",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        },
+        {
+          "dimension": "guard_refusal",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        },
+        {
+          "dimension": "zero_mutation_rollback",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "RC-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected Task 5 and Task 6 cells pass, but uncited dimensions and required deployment profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling follower or live-AWS boundaries.",
+      "overrides": []
+    },
+    {
+      "id": "RC-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Selected SQLite single-process Task 6 cells pass, but uncited dimensions and required profiles remain unknown.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute and promote every remaining required dimension/profile cell without relabeling local PostgreSQL or follower boundaries.",
+      "overrides": [
+        {
+          "dimension": "success_effects",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK6-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "RC-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RC-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RC-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-08",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-67be892457",
+      "exit_gate": "Complete Tasks 10 and 11 with ABANDONED, follower, first-party plugin, lifecycle, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-09",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-67be892457",
+      "exit_gate": "Complete Tasks 10 and 11 with ABANDONED, follower, first-party plugin, lifecycle, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-10",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "PB-11",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Execute PB-11's PostgreSQL 16 DB-server-time, row-lock-order, transaction-isolation, schema-admission-migration, and ambiguous-connection-loss cases across every required dimension for the AWS single-leader profile.",
+      "overrides": []
+    },
+    {
+      "id": "RM-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-08",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-09",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-10",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-11",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-12",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-13",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "RM-14",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-01",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-02",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-d262ace360",
+      "exit_gate": "Complete Task 5 with production-boundary, rollback, restart, refusal, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-03",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-04",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-05",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-06",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-07",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-08",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-f227dd8d2f",
+      "exit_gate": "Complete Task 9 with publication, ambiguous-loss, repair, external-provider, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-09",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-10",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-11",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "The cited SQLite single-process cells pass, but mandatory PostgreSQL 16 AWS, SQLite follower, and uncited dimension cells remain unknown.",
+      "owner_issue": "elspeth-9cd07962c7",
+      "exit_gate": "Execute and promote every remaining all-required-v2 dimension/profile cell; PostgreSQL 16 AWS is mandatory.",
+      "overrides": [
+        {
+          "dimension": "guard_refusal",
+          "case": "leg-contract",
+          "profile_case": "sqlite-wal-single-process-leader",
+          "status": "pass",
+          "evidence": [
+            "EV-TASK5-SQLITE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "F-12",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-eefd990b46",
+      "exit_gate": "Complete Tasks 4, 6, and 7 with independent-process, PostgreSQL 16, read-model, and zero-mutation evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-13",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-cc0b256aca",
+      "exit_gate": "Complete Task 8 with aggregation, coalesce, row-union, crash/restart, and supported-profile evidence.",
+      "overrides": []
+    },
+    {
+      "id": "F-14",
+      "derived_verdict": "unknown",
+      "default_status": "unknown",
+      "reason": "Focused current checks pass, but they do not cover every required v2 case, dimension, and execution profile.",
+      "owner_issue": "elspeth-67be892457",
+      "exit_gate": "Complete Tasks 10 and 11 with ABANDONED, follower, first-party plugin, lifecycle, and supported-profile evidence.",
+      "overrides": []
+    }
+  ],
+  "hard_gates": [
+    {
+      "id": "HG-01-invalid-subtype",
+      "status": "unknown",
+      "support": [
+        "EV-TASK6-SQLITE",
+        "EV-TASK5-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-02-authority-downgrade",
+      "status": "unknown",
+      "support": [
+        "EV-TASK6-SQLITE",
+        "EV-TASK5-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-03-double-winner",
+      "status": "unknown",
+      "support": [],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Unknown: independent-process and full PostgreSQL winner/loser matrices remain outstanding."
+    },
+    {
+      "id": "HG-04-refusal-mutation",
+      "status": "unknown",
+      "support": [
+        "EV-TASK5-SQLITE",
+        "EV-TASK6-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-05-state-evidence-atomicity",
+      "status": "unknown",
+      "support": [
+        "EV-TASK5-SQLITE",
+        "EV-TASK6-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-06-restart-loss-or-duplicate",
+      "status": "unknown",
+      "support": [],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Unknown: deterministic restart checks do not cover every abrupt process-death seam."
+    },
+    {
+      "id": "HG-07-read-model-unproved-arm",
+      "status": "unknown",
+      "support": [],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Unknown: complete positive and negative read-model truth tables have not been executed."
+    },
+    {
+      "id": "HG-08-plugin-lifecycle-durability",
+      "status": "unknown",
+      "support": [
+        "EV-TASK6-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-09-mandatory-leg-unresolved",
+      "status": "open",
+      "support": [
+        "EV-TASK5-SQLITE",
+        "EV-TASK6-SQLITE"
+      ],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Task 6 adds exact SQLite single-process support, but required uncited cells keep this gate unresolved."
+    },
+    {
+      "id": "HG-10-normative-contract-drift",
+      "status": "unknown",
+      "support": [],
+      "affected_leg_ids": [
+        "TS-00",
+        "TS-01",
+        "TS-02",
+        "TS-03",
+        "TS-04",
+        "TS-05",
+        "TS-06",
+        "TS-07",
+        "TS-08",
+        "TS-09",
+        "TS-10",
+        "TS-11",
+        "TS-12",
+        "TS-13",
+        "TS-14",
+        "TS-15",
+        "TS-16",
+        "TS-17",
+        "TS-18",
+        "TS-19",
+        "AUX-01",
+        "AUX-02",
+        "AUX-03",
+        "AUX-04",
+        "AUX-05",
+        "AUX-06",
+        "AUX-07",
+        "RC-01",
+        "RC-02",
+        "RC-03",
+        "RC-04",
+        "RC-05",
+        "RC-06",
+        "RC-07",
+        "PB-01",
+        "PB-02",
+        "PB-03",
+        "PB-04",
+        "PB-05",
+        "PB-06",
+        "PB-07",
+        "PB-08",
+        "PB-09",
+        "PB-10",
+        "PB-11",
+        "RM-01",
+        "RM-02",
+        "RM-03",
+        "RM-04",
+        "RM-05",
+        "RM-06",
+        "RM-07",
+        "RM-08",
+        "RM-09",
+        "RM-10",
+        "RM-11",
+        "RM-12",
+        "RM-13",
+        "RM-14",
+        "F-01",
+        "F-02",
+        "F-03",
+        "F-04",
+        "F-05",
+        "F-06",
+        "F-07",
+        "F-08",
+        "F-09",
+        "F-10",
+        "F-11",
+        "F-12",
+        "F-13",
+        "F-14"
+      ],
+      "reason": "Unknown: ADR, catalog, AWS documentation, and source vocabulary agree, but every catalog obligation lacks current executable cell coverage."
+    }
+  ],
+  "derived": {
+    "family_counts": {
+      "transition": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 20
+      },
+      "auxiliary": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 7
+      },
+      "run_coordination": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 7
+      },
+      "production_boundary": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 11
+      },
+      "read_model": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 14
+      },
+      "forbidden": {
+        "confirmed": 0,
+        "gap": 0,
+        "unknown": 14
+      }
+    },
+    "total": {
+      "confirmed": 0,
+      "gap": 0,
+      "unknown": 73
+    },
+    "overall_verdict": "not_complete",
+    "reason": "Task 6 promotes eight exact SQLite single-process coordination cells, while all 73 legs retain required unknown cells and HG-09 remains open."
+  },
+  "limitations": [
+    "Only eight exact SQLite single-process coordination cells are promoted; passing support nodes outside coverage do not change assessment state.",
+    "The local PostgreSQL 16.13 cohort passed as implementation support but cannot be attributed to the combined AWS deployment profile and is not retained as promoting evidence.",
+    "SQLite follower profiles, live AWS composition, read-model truth tables, and multi-replica scheduling are not established.",
+    "AUX-02 and the production BranchLossSpec cleanup proof remain unknown despite the corrected stale-worker fencing path.",
+    "The full CI-equivalent pytest suite is deferred to the final frozen pre-merge checkpoint under the explicit wall-time constraint."
+  ],
+  "review_record": "docs/architecture/state_engine/assessments/2026-08-12-0549/review.md"
+}
