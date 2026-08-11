@@ -59,8 +59,22 @@ describe("projectCompletedGuidedHistory", () => {
 
   it("retains the final current-step decision once the guided session is terminal", () => {
     expect(
-      projectCompletedGuidedHistory([TURN_1, TURN_2], "step_2_sink", true),
+      projectCompletedGuidedHistory(
+        [TURN_1, TURN_2],
+        "step_2_sink",
+        { kind: "completed", reason: null, pipeline_yaml: "source: {}" },
+      ),
     ).toEqual([TURN_1, TURN_2]);
+  });
+
+  it("excludes the current-step decision after exiting to freeform mid-step", () => {
+    expect(
+      projectCompletedGuidedHistory(
+        [TURN_1, TURN_2],
+        "step_2_sink",
+        { kind: "exited_to_freeform", reason: "user_pressed_exit", pipeline_yaml: null },
+      ),
+    ).toEqual([TURN_1]);
   });
 });
 
@@ -120,11 +134,32 @@ describe("GuidedHistory", () => {
           summary: "Connected transform to output",
         }]}
         currentStep="step_4_wire"
-        terminal
+        terminal={{
+          kind: "completed",
+          reason: null,
+          pipeline_yaml: "source: {}",
+        }}
       />,
     );
 
     expect(screen.getByText("Connected transform to output")).toBeInTheDocument();
+  });
+
+  it("does not render the current step after exiting to freeform mid-step", () => {
+    const { container } = render(
+      <GuidedHistory
+        history={[TURN_2]}
+        currentStep="step_2_sink"
+        terminal={{
+          kind: "exited_to_freeform",
+          reason: "user_pressed_exit",
+          pipeline_yaml: null,
+        }}
+      />,
+    );
+
+    expect(container.firstChild).toBeNull();
+    expect(screen.queryByText("Sink configured: jsonl")).toBeNull();
   });
 
   it("renders only the completed rows selected by the shared projection", () => {

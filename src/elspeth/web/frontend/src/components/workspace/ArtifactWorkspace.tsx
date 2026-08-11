@@ -16,6 +16,7 @@ import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -192,11 +193,15 @@ export function ArtifactWorkspaceSurface({
     [actions, announceFallback, state.artifactVisible],
   );
 
-  const queueGraphModal = useCallback((sessionId: string | null): void => {
+  const queueGraphModal = useCallback((
+    sessionId: string | null,
+    intent: number,
+  ): void => {
     queueMicrotask(() => {
       if (
         mountedRef.current &&
-        committedControllerRef.current.sessionId === sessionId
+        committedControllerRef.current.sessionId === sessionId &&
+        isCurrentWorkspaceViewIntent(intent)
       ) {
         window.dispatchEvent(new Event(OPEN_GRAPH_MODAL_EVENT));
       }
@@ -205,9 +210,9 @@ export function ArtifactWorkspaceSurface({
 
   const focusGraph = useCallback((): void => {
     const sessionId = committedControllerRef.current.sessionId;
-    claimWorkspaceViewIntent();
+    const intent = claimWorkspaceViewIntent();
     selectAndFocus("graph");
-    queueGraphModal(sessionId);
+    queueGraphModal(sessionId, intent);
   }, [queueGraphModal, selectAndFocus]);
 
   useEffect(() => {
@@ -220,10 +225,10 @@ export function ArtifactWorkspaceSurface({
       ) {
         return;
       }
-      claimWorkspaceViewIntent();
+      const intent = claimWorkspaceViewIntent();
       selectAndFocus(request.tab);
       if (request.tab === "graph" && request.focusMode) {
-        queueGraphModal(request.sessionId);
+        queueGraphModal(request.sessionId, intent);
       }
     };
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, handleRequest);

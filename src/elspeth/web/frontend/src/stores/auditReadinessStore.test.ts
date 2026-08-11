@@ -255,6 +255,32 @@ describe("useAuditReadinessStore", () => {
     ).toBe("v2 text");
   });
 
+  it.each([
+    ["session", { session_id: OTHER_SESSION_ID }],
+    ["composition version", { composition_version: 3 }],
+  ] as const)(
+    "rejects a current-controller explain with mismatched %s identity",
+    async (_identity, mismatch) => {
+      vi.mocked(api.fetchAuditReadinessExplain).mockResolvedValueOnce({
+        ...explain(2, "foreign narrative"),
+        ...mismatch,
+      });
+
+      await useAuditReadinessStore.getState().loadExplain(SESSION_ID, 2);
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(false);
+      expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBe(
+        "Audit explain response did not match the requested composition.",
+      );
+      expect(JSON.stringify(state.explainsBySession)).not.toContain(
+        "foreign narrative",
+      );
+    },
+  );
+
   it("clearSession removes both snapshot and explain", async () => {
     vi.mocked(api.fetchAuditReadiness).mockResolvedValueOnce(snapshot(1));
     vi.mocked(api.fetchAuditReadinessExplain).mockResolvedValueOnce({
@@ -370,10 +396,11 @@ describe("useAuditReadinessStore", () => {
       expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
       expect(state.errorBySession[SESSION_ID]).toBeNull();
 
-      second.resolve(snapshot(2));
+      const secondSnapshot = snapshot(2);
+      second.resolve(secondSnapshot);
       await secondLoad;
       state = useAuditReadinessStore.getState();
-      expect(state.snapshotsBySession[SESSION_ID]).toEqual(snapshot(2));
+      expect(state.snapshotsBySession[SESSION_ID]).toEqual(secondSnapshot);
     },
   );
 

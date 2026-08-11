@@ -566,6 +566,100 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
+  test("1280 completion actions share one compact row with intact hit targets", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "populated-long-transcript");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await expect(composer.validationStatus()).toHaveAccessibleName(
+        "Validation: Passed",
+      );
+      await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
+      const actionBar = composer.actionBar();
+      const actions = [
+        composer.saveForReview(),
+        composer.runPipeline(),
+        composer.exportYaml(),
+      ];
+      const [actionBarBox, ...actionBoxes] = await Promise.all([
+        actionBar.boundingBox(),
+        ...actions.map((action) => action.boundingBox()),
+      ]);
+      expect(actionBarBox).not.toBeNull();
+      expect(actionBarBox!.height).toBeLessThanOrEqual(64);
+      for (const box of actionBoxes) {
+        expect(box).not.toBeNull();
+        expect(box!.height).toBeGreaterThanOrEqual(36);
+        expect(Math.abs(box!.y - actionBoxes[0]!.y)).toBeLessThanOrEqual(1);
+      }
+      for (const action of actions) {
+        await action.focus();
+        await expect(action).toBeFocused();
+        const hitLabel = await action.evaluate((element) => {
+          const bounds = element.getBoundingClientRect();
+          const hit = document.elementFromPoint(
+            bounds.left + bounds.width / 2,
+            bounds.top + bounds.height / 2,
+          );
+          return hit?.textContent?.trim() ?? null;
+        });
+        expect(hitLabel).toContain((await action.textContent())?.trim());
+      }
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  for (const width of [1280, 980] as const) {
+    test(`workspace navigation/status controls use non-overlapping 36px targets at ${width}px`, async ({
+      page,
+    }) => {
+      await page.setViewportSize({ width, height: 720 });
+      const sessionId = await installWorkspaceScenario(page, "populated-long-transcript");
+      const composer = new ComposerPage(page);
+      try {
+        await composer.goto(sessionId);
+        await composer.waitForChatReady();
+        await expect(composer.validationStatus()).toHaveAccessibleName(
+          "Validation: Passed",
+        );
+        await expect(composer.auditStatus()).toHaveAccessibleName("Audit: Ready");
+        const controls = [
+          composer.artifactTab("Graph"),
+          composer.artifactTab("Spec"),
+          composer.artifactTab("YAML"),
+          composer.artifactTab("Run"),
+          page.getByRole("button", { name: "Focus Graph" }),
+          composer.validationStatus(),
+          composer.auditStatus(),
+          composer.moreActions(),
+        ];
+        const boxes = await Promise.all(
+          controls.map((control) => control.boundingBox()),
+        );
+        for (const [index, box] of boxes.entries()) {
+          expect(box, `control ${index} at ${width}px`).not.toBeNull();
+          expect(box!.height, `control ${index} at ${width}px`).toBe(36);
+          const hit = await controls[index]!.evaluate((element) => {
+            const bounds = element.getBoundingClientRect();
+            const hitElement = document.elementFromPoint(
+              bounds.left + bounds.width / 2,
+              bounds.top + bounds.height / 2,
+            );
+            return hitElement !== null && element.contains(hitElement);
+          });
+          expect(hit, `control ${index} hit target at ${width}px`).toBe(true);
+        }
+      } finally {
+        await deleteWorkspaceScenario(page, sessionId);
+      }
+    });
+  }
+
   test("Ctrl+/ restores collapsed Compose before focusing the chat input", async ({ page }) => {
     await page.setViewportSize({ width: 720, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");

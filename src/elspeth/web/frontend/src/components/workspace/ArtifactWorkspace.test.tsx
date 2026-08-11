@@ -182,6 +182,17 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
+  it("gives artifact toolbar controls the compact 36px hit-target token", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.artifact-workspace-toolbar\s+button[^\{]*\{[^}]*min-height:\s*var\(--size-control-compact\);/s,
+    );
+  });
+
   it("lets the Run artifact panel own long-output scrolling", () => {
     const workspaceCss = readFileSync(join(process.cwd(), "src/components/workspace/workspace.css"), "utf8");
     expect(workspaceCss).toMatch(/\.artifact-workspace-panel\s+\.inline-run-results\s*\{[^}]*max-height:\s*none;[^}]*overflow:\s*visible;[^}]*margin:\s*0;/s);
@@ -802,6 +813,27 @@ describe("ArtifactWorkspace", () => {
 
     expect(modalCount).toBe(0);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
+  });
+
+  it("suppresses an older queued Focus Graph modal after a newer direct Run selection", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    renderArtifactWorkspace();
+    const onOpenGraph = vi.fn();
+    window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
+
+    act(() => {
+      fireEvent.click(screen.getByRole("button", { name: "Focus Graph" }));
+      fireEvent.click(screen.getByRole("tab", { name: "Run" }));
+    });
+    await act(async () => Promise.resolve());
+
+    expect(onOpenGraph).not.toHaveBeenCalled();
+    expect(screen.getByRole("tab", { name: "Run" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
+    window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
   });
 
   it("suppresses a queued Graph modal after unmount", () => {

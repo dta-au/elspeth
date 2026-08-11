@@ -241,6 +241,33 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
 
     try {
       const explain = await fetchAuditReadinessExplain(sessionId, explainController.signal);
+      if (
+        explain.session_id !== sessionId ||
+        explain.composition_version !== compositionVersion
+      ) {
+        set((state) => {
+          if (
+            state.explainAbortControllers[sessionId] !== explainController
+          ) {
+            return state;
+          }
+          const { [sessionId]: _ctrl, ...restCtrl } =
+            state.explainAbortControllers;
+          return {
+            explainAbortControllers: restCtrl,
+            isLoadingExplainBySession: {
+              ...state.isLoadingExplainBySession,
+              [sessionId]: false,
+            },
+            explainErrorBySession: {
+              ...state.explainErrorBySession,
+              [sessionId]:
+                "Audit explain response did not match the requested composition.",
+            },
+          };
+        });
+        return;
+      }
       set((state) => {
         if (
           state.explainAbortControllers[sessionId] !== explainController

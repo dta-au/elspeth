@@ -11,6 +11,22 @@ import { setupWorkspaceScenario } from "./helpers/workspace-setup";
 
 const FIXED_BROWSER_TIME = new Date("2026-08-11T08:00:30.000Z");
 
+function expectedTerminalStatuses(scenario: WorkspaceScenario): {
+  validation: string;
+  audit: string;
+} {
+  if (scenario === "validation-audit-issues") {
+    return {
+      validation: "Validation: 24 errors",
+      audit: "Audit: 2 issues",
+    };
+  }
+  return {
+    validation: "Validation: Passed",
+    audit: "Audit: Ready",
+  };
+}
+
 async function settleGraphViewport(page: Page): Promise<void> {
   const activePanel = page.locator(
     '.artifact-workspace-panel:not([hidden])',
@@ -76,11 +92,12 @@ async function openStableVisualScenario(
       await page.evaluate(async () => {
         await document.fonts.ready;
       });
-      await expect(createdComposer.validationStatus()).not.toHaveAccessibleName(
-        "Validation: Checking",
+      const terminalStatuses = expectedTerminalStatuses(scenario);
+      await expect(createdComposer.validationStatus()).toHaveAccessibleName(
+        terminalStatuses.validation,
       );
-      await expect(createdComposer.auditStatus()).not.toHaveAccessibleName(
-        "Audit: Checking",
+      await expect(createdComposer.auditStatus()).toHaveAccessibleName(
+        terminalStatuses.audit,
       );
       await expect(page.locator(".react-flow__node")).toHaveCount(
         expectedNodeCount,
@@ -127,16 +144,21 @@ test.describe("Composer workspace visual baselines", () => {
           composer.authoringPane().locator(".chat-panel-messages"),
           "bottom",
         );
+        const fractionalEdgeLabel = composer
+          .workspace()
+          .locator(".react-flow__edge-text")
+          .filter({ hasText: "success" });
+        await expect(fractionalEdgeLabel).toHaveText("success");
         await expect(composer.workspace()).toHaveScreenshot(
           `populated-freeform-${viewport.width}x${viewport.height}.png`,
           {
             animations: "disabled",
             caret: "hide",
-            // React Flow centers the edge label on a fractional transform.
-            // Chromium can rasterize that one word differently under the
-            // full browser workload; preserve a tight pixel ceiling so pane,
-            // control, and node geometry changes still fail the baseline.
-            maxDiffPixels: 500,
+            // React Flow centers this one word on a fractional transform.
+            // Mask only that glyph raster; every surrounding pixel remains
+            // an exact geometry and appearance oracle.
+            mask: [fractionalEdgeLabel],
+            maskColor: "#0f2d35",
           },
         );
       } finally {

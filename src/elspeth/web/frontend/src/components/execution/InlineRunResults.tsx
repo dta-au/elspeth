@@ -1,8 +1,8 @@
 // ============================================================================
 // InlineRunResults
 //
-// Mounts in the chat column and renders the active or most-recent run's
-// progress and outputs. Historical access lives in RunsHistoryDrawer.
+// Mounts in the persistent Run artifact and renders the active or most-recent
+// run's progress and outputs. Historical access lives in RunsHistoryDrawer.
 // ============================================================================
 
 import { useEffect, useState } from "react";

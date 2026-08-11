@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -92,6 +95,20 @@ describe("WorkspaceActionBar", () => {
       activeSessionId: "session-1",
       compositionState: makeComposition(4),
     } as never);
+  });
+
+  it("gives status and More actions controls the compact 36px hit-target token", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.workspace-status-control[^\{]*\{[^}]*min-height:\s*var\(--size-control-compact\);/s,
+    );
+    expect(css).toMatch(
+      /\.workspace-more-actions\s*>\s*button[^\{]*\{[^}]*min-height:\s*var\(--size-control-compact\);/s,
+    );
   });
 
   it("always renders text-labelled validation and audit inspector controls", async () => {

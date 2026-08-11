@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { type ReactNode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -101,6 +104,23 @@ describe("CompletionBar", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("keeps the horizontal compact override scoped to the workspace action bar", () => {
+    const css = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*\{[^}]*flex-direction:\s*row;[^}]*flex-wrap:\s*wrap;[^}]*padding:\s*0;/s,
+    );
+    expect(css).toMatch(
+      /\.workspace-action-bar\s+\.completion-bar\s*>\s*\*\s*\{[^}]*flex:\s*1 1 [^;]+;[^}]*width:\s*auto;/s,
+    );
+    expect(css).not.toMatch(
+      /(?:^|\n)\.completion-bar\s*\{[^}]*flex-direction:\s*row;/s,
+    );
   });
 
   it("renders nothing without an active session", () => {

@@ -193,11 +193,13 @@ export function ComposerWorkspace({
   }, [paneState]);
 
   const collapseAuthoring = (): void => {
+    claimWorkspaceViewIntent();
     focusIntentRef.current = "restore";
     paneState.setAuthoringCollapsed(true);
   };
 
   const restoreAuthoring = (): void => {
+    claimWorkspaceViewIntent();
     focusIntentRef.current = "collapse";
     paneState.setAuthoringCollapsed(false);
   };

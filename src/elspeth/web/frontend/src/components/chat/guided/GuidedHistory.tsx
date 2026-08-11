@@ -3,7 +3,7 @@
 // Guided-mode decision summary. This is deliberately not a protocol log: the
 // operator needs a visible recap of choices made so far, while low-level
 // emitter/type/hash details stay out of the default workflow surface.
-import type { GuidedStep, TurnRecord } from "@/types/guided";
+import type { GuidedStep, TerminalState, TurnRecord } from "@/types/guided";
 import { GUIDED_STEP_LABELS } from "./stepLabels";
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -18,8 +18,8 @@ interface Props {
    * recorded a summary.
    */
   currentStep: GuidedStep;
-  /** Terminal sessions have completed their current (final) step. */
-  terminal?: boolean;
+  /** Only a completed terminal includes the current (final) step. */
+  terminal?: TerminalState | null;
 }
 
 /**
@@ -33,11 +33,12 @@ interface Props {
 export function projectCompletedGuidedHistory(
   history: readonly TurnRecord[],
   currentStep: GuidedStep,
-  terminal = false,
+  terminal: TerminalState | null = null,
 ): TurnRecord[] {
+  const currentStepCompleted = terminal?.kind === "completed";
   const latestByStep = new Map<GuidedStep, TurnRecord>();
   for (const turn of history) {
-    if (!terminal && turn.step === currentStep) continue;
+    if (!currentStepCompleted && turn.step === currentStep) continue;
     if (turn.summary === null) continue;
     latestByStep.set(turn.step, turn);
   }
@@ -53,7 +54,7 @@ export function projectCompletedGuidedHistory(
 export function GuidedHistory({
   history,
   currentStep,
-  terminal = false,
+  terminal = null,
 }: Props): React.ReactElement | null {
   const rows = projectCompletedGuidedHistory(history, currentStep, terminal);
 

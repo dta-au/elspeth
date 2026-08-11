@@ -76,6 +76,10 @@
   gap: 0.25rem;
 }
 
+.artifact-workspace-toolbar button {
+  min-height: var(--size-control-compact);
+}
+
 .artifact-workspace-panel {
   position: relative;
   flex: 1 1 auto;
@@ -108,6 +112,18 @@
   background: var(--color-surface, Canvas);
 }
 
+.workspace-action-bar .completion-bar {
+  flex: 1 1 24rem;
+  flex-direction: row;
+  flex-wrap: wrap;
+  padding: 0;
+}
+
+.workspace-action-bar .completion-bar > * {
+  flex: 1 1 8rem;
+  width: auto;
+}
+
 .workspace-status-controls,
 .workspace-more-actions {
   display: flex;
@@ -119,6 +135,7 @@
   display: inline-flex;
   gap: 0.375rem;
   align-items: center;
+  min-height: var(--size-control-compact);
 }
 
 .workspace-status-control[data-tone="busy"],
@@ -132,6 +149,10 @@
 
 .workspace-more-actions {
   position: relative;
+}
+
+.workspace-more-actions > button {
+  min-height: var(--size-control-compact);
 }
 
 .workspace-more-actions-menu {

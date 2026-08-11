@@ -735,4 +735,21 @@ describe("ComposerWorkspace", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Compose" }));
     expect(isCurrentWorkspaceViewIntent(beforeCompose)).toBe(false);
   });
+
+  it("treats Collapse and Restore as newer workspace intents", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+
+    const beforeCollapse = claimWorkspaceViewIntent();
+    await user.click(
+      screen.getByRole("button", { name: "Collapse authoring pane" }),
+    );
+    expect(isCurrentWorkspaceViewIntent(beforeCollapse)).toBe(false);
+
+    const beforeRestore = claimWorkspaceViewIntent();
+    await user.click(
+      screen.getByRole("button", { name: "Restore authoring pane" }),
+    );
+    expect(isCurrentWorkspaceViewIntent(beforeRestore)).toBe(false);
+  });
 });

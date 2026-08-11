@@ -5,8 +5,6 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   REQUEST_ARTIFACT_VIEW_EVENT,
-  claimWorkspaceViewIntent,
-  isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { makeComposition } from "@/test/composerFixtures";
@@ -548,7 +546,6 @@ describe("WorkspaceInspector", () => {
         </>,
       );
       await user.click(screen.getByRole("button", { name: "Open validation" }));
-      const priorIntent = claimWorkspaceViewIntent();
       await user.click(
         screen.getByRole("button", { name: "Validation component" }),
       );
@@ -556,7 +553,6 @@ describe("WorkspaceInspector", () => {
       await act(async () => Promise.resolve());
 
       expect(selectNode).toHaveBeenCalledExactlyOnceWith("select_columns");
-      expect(isCurrentWorkspaceViewIntent(priorIntent)).toBe(false);
       expect(artifactRequests).toEqual([
         { tab: "graph", focusMode: false, sessionId: "session-1" },
       ]);

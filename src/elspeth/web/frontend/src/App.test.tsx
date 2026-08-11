@@ -20,8 +20,6 @@ import {
   FOCUS_AUTHORING_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
-  claimWorkspaceViewIntent,
-  isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "./lib/composer-events";
 import type {
@@ -746,9 +744,7 @@ describe("App banner roles", () => {
     render(<App />);
     await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
 
-    const pendingAuthority = claimWorkspaceViewIntent();
     fireEvent.keyDown(document, { key: "/", ctrlKey: true });
-    expect(isCurrentWorkspaceViewIntent(pendingAuthority)).toBe(false);
     act(() => {
       useSessionStore.setState({ compositionStateLoaded: true });
     });

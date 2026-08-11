@@ -1,12 +1,10 @@
 // WCAG 1.4.10 reflow geometry (elspeth-7aa9787996).
 //
-// The shell pins itself to the viewport at every level (html/body
-// height:100% + overflow:hidden, .app-root 100%, .app-main flex:1, grid
-// minmax(0,1fr)). That is the right model on tall viewports — the inner
-// conversation log scrolls — but nothing floors the chat track, so at
-// 400%-zoom-equivalent (320x256) and short phone viewports the wrapped
-// header plus the stacked side rail can consume the height and collapse the
-// conversation and composer to (near) zero with no document scroll path.
+// The desktop shell pins itself to the viewport and lets the authoring pane
+// own its scroll. At 400%-zoom-equivalent and phone widths the common workspace
+// switches to a single-pane Compose/Pipeline layout, so its narrow-mode scroll
+// path must keep both the conversation and composer reachable below the
+// wrapped header and workspace controls.
 //
 // These tests assert OUTCOMES, not mechanism: at each reflow viewport the
 // conversation log keeps a usable height and the composer textarea remains
