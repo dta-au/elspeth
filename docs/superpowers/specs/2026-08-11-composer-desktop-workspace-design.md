@@ -1,7 +1,7 @@
 # Composer Desktop Workspace Design
 
 Date: 2026-08-11
-Status: Proposed — artifact-first direction approved; detailed design pending review
+Status: Approved for implementation
 
 ## Problem
 
