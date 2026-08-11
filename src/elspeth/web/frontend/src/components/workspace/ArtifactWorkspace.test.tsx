@@ -32,6 +32,7 @@ import {
   ArtifactWorkspace,
   ArtifactWorkspaceSurface,
 } from "./ArtifactWorkspace";
+import { WorkspacePaneProvider } from "./WorkspacePaneContext";
 
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
@@ -94,6 +95,26 @@ function CommitRequestProbe({
   return null;
 }
 
+function LayoutCleanupRequestProbe({
+  onAfterDispatch,
+}: {
+  onAfterDispatch: () => void;
+}): null {
+  useLayoutEffect(
+    () => () => {
+      requestArtifact({
+        tab: "spec",
+        focusMode: false,
+        sessionId: "session-1",
+      });
+      window.dispatchEvent(new Event(OPEN_YAML_MODAL_EVENT));
+      onAfterDispatch();
+    },
+    [onAfterDispatch],
+  );
+  return null;
+}
+
 function requestArtifact(detail: RequestArtifactViewDetail): void {
   window.dispatchEvent(
     new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
@@ -119,7 +140,7 @@ describe("ArtifactWorkspace", () => {
       activeRunId: null,
       progress: null,
       runs: [],
-      loadRuns: vi.fn().mockResolvedValue(undefined),
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
     } as never);
     vi.spyOn(api, "fetchYaml").mockResolvedValue({
       yaml: "sources:\n  input:\n    plugin: csv\n",
@@ -227,7 +248,7 @@ describe("ArtifactWorkspace", () => {
 
   it("mounts only the active body and gives YAML and Run one request owner", async () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
-    const loadRuns = vi.fn().mockResolvedValue(undefined);
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
     useExecutionStore.setState({ loadRuns } as never);
     const user = userEvent.setup();
     renderArtifactWorkspace();
@@ -557,6 +578,75 @@ describe("ArtifactWorkspace", () => {
     );
   });
 
+  it("moves focused selected-tab focus to Graph on a content-preserving session reset", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    renderArtifactWorkspace();
+    await user.click(screen.getByRole("tab", { name: "YAML" }));
+    expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
+
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-2",
+        compositionState: makeComposition(1, {
+          id: "state-2",
+          session_id: "session-2",
+        }),
+      });
+    });
+
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(
+      document.querySelector(".artifact-workspace > [role='status']"),
+    ).toBeEmptyDOMElement();
+  });
+
+  it("moves focused panel content to Graph on a content-preserving session reset", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    const user = userEvent.setup();
+    renderArtifactWorkspace();
+    await user.click(screen.getByRole("tab", { name: "YAML" }));
+    const copyYaml = await screen.findByRole("button", {
+      name: "Copy YAML to clipboard",
+    });
+    copyYaml.focus();
+    expect(copyYaml).toHaveFocus();
+
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-2",
+        compositionState: makeComposition(1, {
+          id: "state-2",
+          session_id: "session-2",
+        }),
+      });
+    });
+
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
+    expect(
+      document.querySelector(".artifact-workspace > [role='status']"),
+    ).toBeEmptyDOMElement();
+  });
+
+  it("does not steal unrelated focus on a content-preserving session reset", () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    renderArtifactWorkspace();
+    const authorControl = screen.getByRole("button", { name: "Author control" });
+    authorControl.focus();
+
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-2",
+        compositionState: makeComposition(1, {
+          id: "state-2",
+          session_id: "session-2",
+        }),
+      });
+    });
+
+    expect(authorControl).toHaveFocus();
+  });
+
   it("focuses Graph before queueing exactly one full-screen modal request", async () => {
     useSessionStore.setState({ compositionState: makeComposition(1) });
     const user = userEvent.setup();
@@ -620,6 +710,50 @@ describe("ArtifactWorkspace", () => {
 
     expect(modalCount).toBe(0);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
+  });
+
+  it("ignores ambient requests between layout and passive unmount cleanup", () => {
+    const outside = document.createElement("button");
+    document.body.append(outside);
+    let focusedDuringCleanup: Element | null = null;
+    const selectArtifactTab = vi.fn();
+    const recordFocus = () => {
+      focusedDuringCleanup = document.activeElement;
+    };
+    const view = render(
+      <WorkspacePaneProvider
+        paneState={
+          {
+            authoringCollapsed: false,
+            availableArtifactTabs: ["graph", "spec", "yaml", "run"],
+            activeArtifactTab: "graph",
+            activeInspectorTab: null,
+            inspectorOpen: false,
+            resizeTransient: vi.fn(),
+            commitResize: vi.fn(),
+            setAuthoringCollapsed: vi.fn(),
+            selectArtifactTab,
+            openInspector: vi.fn(),
+            closeInspector: vi.fn(),
+          } as never
+        }
+      >
+        <ArtifactWorkspaceSurface activeSessionId="session-1" />
+        <LayoutCleanupRequestProbe onAfterDispatch={recordFocus} />
+      </WorkspacePaneProvider>,
+    );
+    let workspaceFocusCount = 0;
+    screen.getByRole("tab", { name: "Graph" }).addEventListener("focus", () => {
+      workspaceFocusCount += 1;
+    });
+    outside.focus();
+
+    view.unmount();
+
+    expect(focusedDuringCleanup).toBe(outside);
+    expect(workspaceFocusCount).toBe(0);
+    expect(selectArtifactTab).not.toHaveBeenCalled();
+    outside.remove();
   });
 
   it("does not let a suspended speculative session render poison a queued modal", async () => {
@@ -771,7 +905,7 @@ describe("ArtifactWorkspace", () => {
 
   it("unmounts Run polling on session switch", async () => {
     vi.useFakeTimers();
-    const loadRuns = vi.fn().mockResolvedValue(undefined);
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
     useExecutionStore.setState({
       loadRuns,
       runs: [{ id: "live", session_id: "session-1", status: "running" }],

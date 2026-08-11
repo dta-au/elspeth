@@ -137,9 +137,8 @@ export function ArtifactWorkspaceSurface({
     yaml: null,
     run: null,
   });
-  const panelRef = useRef<HTMLDivElement | null>(null);
   const previousActiveTabRef = useRef(activeArtifactTab);
-  const priorActiveOwnedFocusRef = useRef(false);
+  const activePanelOwnedFocusRef = useRef(false);
   const mountedRef = useRef(false);
   const committedControllerRef = useRef<CommittedArtifactController>({
     sessionId: activeSessionId,
@@ -206,6 +205,7 @@ export function ArtifactWorkspaceSurface({
 
   useEffect(() => {
     const handleRequest = (event: Event): void => {
+      if (!mountedRef.current) return;
       const request = admitArtifactRequest(event);
       if (
         request === null ||
@@ -219,6 +219,7 @@ export function ArtifactWorkspaceSurface({
       }
     };
     const handleLegacyYamlRequest = (): void => {
+      if (!mountedRef.current) return;
       selectAndFocus("yaml");
     };
 
@@ -232,29 +233,21 @@ export function ArtifactWorkspaceSurface({
 
   useLayoutEffect(() => {
     const previousActiveTab = previousActiveTabRef.current;
-    if (
-      previousActiveTab !== activeArtifactTab &&
-      !availableArtifactTabs.includes(previousActiveTab)
-    ) {
-      announceFallback(previousActiveTab);
+    if (previousActiveTab !== activeArtifactTab) {
+      const previousBecameUnavailable =
+        !availableArtifactTabs.includes(previousActiveTab);
+      if (previousBecameUnavailable) {
+        announceFallback(previousActiveTab);
+      }
       if (
-        priorActiveOwnedFocusRef.current ||
+        activePanelOwnedFocusRef.current ||
         document.activeElement === tabRefs.current[previousActiveTab]
       ) {
-        tabRefs.current.graph?.focus({ preventScroll: true });
+        tabRefs.current[activeArtifactTab]?.focus({ preventScroll: true });
       }
     }
     previousActiveTabRef.current = activeArtifactTab;
-    priorActiveOwnedFocusRef.current = false;
-    const activeTabElement = tabRefs.current[activeArtifactTab];
-    const activePanel = panelRef.current;
-
-    return () => {
-      const focused = document.activeElement;
-      priorActiveOwnedFocusRef.current =
-        focused === activeTabElement ||
-        (focused !== null && activePanel?.contains(focused) === true);
-    };
+    activePanelOwnedFocusRef.current = false;
   }, [activeArtifactTab, announceFallback, availableArtifactTabs]);
 
   const selectTab = (tab: ArtifactTab): void => {
@@ -339,7 +332,6 @@ export function ArtifactWorkspaceSurface({
         return (
           <div
             key={tab}
-            ref={active ? panelRef : undefined}
             className="artifact-workspace-panel"
             role="tabpanel"
             id={`artifact-panel-${tab}`}
@@ -347,6 +339,21 @@ export function ArtifactWorkspaceSurface({
             aria-hidden={!active || undefined}
             hidden={!active}
             {...(!active ? { inert: "" } : {})}
+            onFocusCapture={() => {
+              if (active) activePanelOwnedFocusRef.current = true;
+            }}
+            onBlurCapture={(event) => {
+              const nextTarget = event.relatedTarget;
+              if (
+                active &&
+                !(
+                  nextTarget instanceof Node &&
+                  event.currentTarget.contains(nextTarget)
+                )
+              ) {
+                activePanelOwnedFocusRef.current = false;
+              }
+            }}
           >
             {active && (
               <ErrorBoundary

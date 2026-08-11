@@ -6,7 +6,10 @@
 // ============================================================================
 
 import { useEffect, useState } from "react";
-import { useExecutionStore } from "@/stores/executionStore";
+import {
+  type RunHistoryLoadOutcome,
+  useExecutionStore,
+} from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { ProgressView } from "@/components/execution/ProgressView";
 import { RunOutputsPanel } from "@/components/inspector/RunOutputsPanel";
@@ -220,7 +223,7 @@ export interface InlineRunResultsProps {
 
 interface InitialRunLoadState {
   sessionId: string | null;
-  settled: boolean;
+  status: Exclude<RunHistoryLoadOutcome, "stale"> | "loading";
 }
 
 export function InlineRunResults({
@@ -233,34 +236,35 @@ export function InlineRunResults({
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const [showHistory, setShowHistory] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
+  const [historyRetrySequence, setHistoryRetrySequence] = useState(0);
   const [initialRunLoad, setInitialRunLoad] = useState<InitialRunLoadState>(
     () => ({
       sessionId: activeSessionId,
-      settled: activeSessionId === null,
+      status: activeSessionId === null ? "loaded" : "loading",
     }),
   );
 
   useEffect(() => {
     if (!activeSessionId) {
-      setInitialRunLoad({ sessionId: null, settled: true });
+      setInitialRunLoad({ sessionId: null, status: "loaded" });
       return;
     }
     const sessionId = activeSessionId;
     let cancelled = false;
-    setInitialRunLoad({ sessionId, settled: false });
-    const settle = (): void => {
-      if (cancelled) return;
+    setInitialRunLoad({ sessionId, status: "loading" });
+    const settle = (outcome: RunHistoryLoadOutcome): void => {
+      if (cancelled || outcome === "stale") return;
       setInitialRunLoad((current) =>
         current.sessionId === sessionId
-          ? { sessionId, settled: true }
+          ? { sessionId, status: outcome }
           : current,
       );
     };
-    void loadRuns(sessionId).then(settle, settle);
+    void loadRuns(sessionId).then(settle, () => settle("unavailable"));
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId, loadRuns]);
+  }, [activeSessionId, historyRetrySequence, loadRuns]);
 
   const visibleRuns = activeSessionId
     ? runs.filter((run) => !run.session_id || run.session_id === activeSessionId)
@@ -311,16 +315,34 @@ export function InlineRunResults({
     progressBelongsToActiveRun ? progress : null,
     displayRun,
   );
-  const currentSessionHistorySettled =
-    activeSessionId === null ||
-    (initialRunLoad.sessionId === activeSessionId && initialRunLoad.settled);
+  const currentSessionHistoryStatus =
+    activeSessionId === null
+      ? "loaded"
+      : initialRunLoad.sessionId === activeSessionId
+        ? initialRunLoad.status
+        : "loading";
 
   if (!showProgress && !outputRunId && !hasDrawerRuns) {
-    if (showEmptyState && !currentSessionHistorySettled) {
+    if (showEmptyState && currentSessionHistoryStatus === "loading") {
       return (
         <p className="artifact-empty" role="status" aria-live="polite">
           Loading runs…
         </p>
+      );
+    }
+    if (showEmptyState && currentSessionHistoryStatus === "unavailable") {
+      return (
+        <div className="artifact-empty">
+          <p role="status" aria-live="polite">
+            Run history unavailable.
+          </p>
+          <button
+            type="button"
+            onClick={() => setHistoryRetrySequence((current) => current + 1)}
+          >
+            Retry
+          </button>
+        </div>
       );
     }
     return showEmptyState ? (

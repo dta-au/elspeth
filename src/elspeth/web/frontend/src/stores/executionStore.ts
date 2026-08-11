@@ -40,6 +40,8 @@ const MAX_RECENT_ERRORS = 50;
 const STALE_FANOUT_READINESS_ERROR =
   "This pipeline is no longer ready to run. Validate it again before executing.";
 
+export type RunHistoryLoadOutcome = "loaded" | "stale" | "unavailable";
+
 interface ExecutionState {
   runs: Run[];
   activeRunId: string | null;
@@ -74,7 +76,7 @@ interface ExecutionState {
   acknowledgeRunDisclosure: (sessionId: string) => void;
   clearRunDisclosureAcks: () => void;
   cancel: (runId: string) => Promise<void>;
-  loadRuns: (sessionId: string) => Promise<void>;
+  loadRuns: (sessionId: string) => Promise<RunHistoryLoadOutcome>;
   rehydrateActiveRun: (sessionId: string) => Promise<void>;
   loadRunDiagnostics: (runId: string) => Promise<void>;
   evaluateRunDiagnostics: (runId: string) => Promise<void>;
@@ -632,10 +634,12 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   async loadRuns(sessionId: string) {
     try {
       const runs = await api.fetchRuns(sessionId);
-      if (!shouldApplyRunListResult(sessionId)) return;
+      if (!shouldApplyRunListResult(sessionId)) return "stale";
       set({ runs });
+      return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
+      return "unavailable";
     }
   },
 
