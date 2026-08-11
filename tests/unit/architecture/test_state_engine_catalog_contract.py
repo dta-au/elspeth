@@ -61,7 +61,7 @@ def test_v2_catalog_adds_abandonment_and_row_union_obligations() -> None:
     assert isinstance(legs, list)
     leg_by_id = {leg["id"]: leg for leg in legs}
 
-    assert {"TS-19", "PB-10", "RM-14", "F-14"} <= set(required_leg_ids)
+    assert {"TS-19", "PB-10", "PB-11", "RM-14", "F-14"} <= set(required_leg_ids)
     assert list(leg_by_id) == required_leg_ids
     assert leg_by_id["PB-10"]["required_cases"] == [
         "all-branches-arrive",
@@ -71,6 +71,13 @@ def test_v2_catalog_adds_abandonment_and_row_union_obligations() -> None:
         "late-arrival-after-release",
         "restart-before-release",
         "restart-after-release-before-sink",
+    ]
+    assert leg_by_id["PB-11"]["required_cases"] == [
+        "db-server-time",
+        "row-lock-order",
+        "transaction-isolation",
+        "schema-admission-migration",
+        "ambiguous-connection-loss",
     ]
 
 
@@ -100,9 +107,51 @@ def test_v2_catalog_profile_cases_bind_backend_deployment_and_lifecycle() -> Non
         assert deployment in state_stores[state_store]["deployments"]
         assert set(case["lifecycle_modes"]) <= set(execution_profiles["lifecycle_modes"])
 
-    assert set(applicability_profiles) == {"all-required-v2"}
-    assert applicability_profiles["all-required-v2"]["profile_case_ids"] == case_ids
-    assert {leg["applicability_profile"] for leg in legs} == {"all-required-v2"}
+    all_required = dict.fromkeys(case_ids, "required")
+    followers_only = {
+        case_id: (
+            "required"
+            if case_id
+            in {
+                "sqlite-wal-same-host-leader-plus-claim-only-followers",
+                "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers",
+            }
+            else "not_applicable"
+        )
+        for case_id in case_ids
+    }
+    postgresql_only = {
+        case_id: ("required" if case_id == "postgresql-16-aws-single-leader-landscape" else "not_applicable") for case_id in case_ids
+    }
+    assert set(applicability_profiles) == {
+        "all-required-v2",
+        "sqlite-followers-only-v2",
+        "postgresql-aws-only-v2",
+    }
+    assert applicability_profiles["all-required-v2"]["profile_case_applicability"] == all_required
+    assert applicability_profiles["sqlite-followers-only-v2"]["profile_case_applicability"] == followers_only
+    assert applicability_profiles["postgresql-aws-only-v2"]["profile_case_applicability"] == postgresql_only
+    leg_by_id = {leg["id"]: leg for leg in legs}
+    assert leg_by_id["RC-05"]["applicability_profile"] == "sqlite-followers-only-v2"
+    assert leg_by_id["PB-08"]["applicability_profile"] == "sqlite-followers-only-v2"
+    assert leg_by_id["PB-11"]["applicability_profile"] == "postgresql-aws-only-v2"
+    assert {leg["applicability_profile"] for leg in legs if leg["id"] not in {"RC-05", "PB-08", "PB-11"}} == {"all-required-v2"}
+
+
+def test_v2_catalog_plugin_cases_exhaust_live_inventory() -> None:
+    catalog = _load_catalog(V2_CATALOG_PATH)
+    legs = catalog["legs"]
+    assert isinstance(legs, list)
+    pb09 = next(leg for leg in legs if leg["id"] == "PB-09")
+    discovered = discover_all_plugins()
+    expected = [
+        f"{kind.removesuffix('s')}:{name}"
+        for kind in ("sources", "transforms", "sinks")
+        for name in sorted(cast(Any, plugin).name for plugin in discovered[kind])
+    ]
+
+    assert pb09["required_cases"] == expected
+    assert len(expected) == 51
 
 
 def test_v1_catalog_remains_byte_identical_historical_evidence() -> None:
@@ -149,7 +198,19 @@ def _add_unsupported_postgresql_profile(catalog: dict[str, Any]) -> None:
             "lifecycle_modes": ["fresh", "resume", "leader-takeover"],
         }
     )
-    catalog["applicability_profiles"]["all-required-v2"]["profile_case_ids"].append("postgresql-16-multi-host-replicas")
+    for profile in catalog["applicability_profiles"].values():
+        if "profile_case_applicability" in profile:
+            profile["profile_case_applicability"]["postgresql-16-multi-host-replicas"] = "required"
+        else:
+            profile["profile_case_ids"].append("postgresql-16-multi-host-replicas")
+
+
+def _catalog_leg(catalog: dict[str, Any], leg_id: str) -> dict[str, Any]:
+    return next(leg for leg in catalog["legs"] if leg["id"] == leg_id)
+
+
+def _remove_required_case(catalog: dict[str, Any], leg_id: str) -> None:
+    _catalog_leg(catalog, leg_id)["required_cases"].pop()
 
 
 def _git(repository: Path, *arguments: str) -> str:
@@ -316,6 +377,41 @@ def test_validate_catalog_cli_accepts_current_v2_catalog() -> None:
             "applicability profile namespace",
             id="unused-applicability-profile",
         ),
+        pytest.param(
+            lambda catalog: _remove_required_case(catalog, "PB-06"),
+            "canonical v2 leg manifest",
+            id="reduced-pb06-cases",
+        ),
+        pytest.param(
+            lambda catalog: _remove_required_case(catalog, "PB-07"),
+            "canonical v2 leg manifest",
+            id="reduced-pb07-cases",
+        ),
+        pytest.param(
+            lambda catalog: _catalog_leg(catalog, "TS-00").pop("contract"),
+            "canonical v2 leg manifest",
+            id="missing-leg-contract",
+        ),
+        pytest.param(
+            lambda catalog: catalog["applicability_profiles"]["all-required-v2"].update({"default_case_id": "ignored-drift"}),
+            "canonical v2 applicability",
+            id="changed-default-case",
+        ),
+        pytest.param(
+            lambda catalog: catalog["family_dimension_acceptance"]["transition"].update({"production_entry": 7}),
+            "canonical v2 family acceptance",
+            id="non-string-acceptance",
+        ),
+        pytest.param(
+            lambda catalog: catalog["hard_gates"][0].update({"title": ""}),
+            "canonical v2 hard gates",
+            id="empty-hard-gate-title",
+        ),
+        pytest.param(
+            lambda catalog: _catalog_leg(catalog, "TS-00").update({"ignored_extra": True}),
+            "canonical v2 leg manifest",
+            id="extra-leg-field",
+        ),
     ],
 )
 def test_validate_catalog_cli_rejects_contract_drift(
@@ -353,7 +449,7 @@ def test_validate_package_accepts_complete_minimal_manifest(
 
     assert result.returncode == 0, result.stderr
     assert "state-engine assessment contract: valid" in result.stdout
-    assert "72 legs" in result.stdout
+    assert "73 legs" in result.stdout
     assert "not_complete" in result.stdout
 
 
@@ -379,12 +475,57 @@ def test_validate_package_rejects_dangling_evidence(
     assert "unknown evidence" in result.stderr
 
 
+def test_validate_package_accepts_catalog_approved_follower_not_applicable(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    rc05 = next(leg for leg in assessment["legs"] if leg["id"] == "RC-05")
+    rc05["overrides"] = [
+        {
+            "dimension": "production_entry",
+            "case": "leg-contract",
+            "profile_case": "postgresql-16-aws-single-leader-landscape",
+            "status": "not_applicable",
+            "evidence": [],
+        }
+    ]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_validate_package_rejects_assessor_waiver_of_required_profile_cell(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    ts00 = next(leg for leg in assessment["legs"] if leg["id"] == "TS-00")
+    ts00["overrides"] = [
+        {
+            "dimension": "production_entry",
+            "case": "leg-contract",
+            "profile_case": "postgresql-16-aws-single-leader-landscape",
+            "status": "not_applicable",
+            "evidence": [],
+        }
+    ]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "cannot waive a required profile cell" in result.stderr
+
+
 def test_validate_package_rejects_false_derived_totals_and_verdict(
     assessment_repository: tuple[Path, Path],
 ) -> None:
     repository, assessment_path = assessment_repository
     assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
-    assessment["derived"]["total"] = {"confirmed": 72, "gap": 0, "unknown": 0}
+    assessment["derived"]["total"] = {"confirmed": 73, "gap": 0, "unknown": 0}
     assessment["derived"]["overall_verdict"] = "complete"
     _write_json(assessment_path, assessment)
 

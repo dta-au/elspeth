@@ -1,13 +1,13 @@
 # State Engine Proof Catalog
 
 The [v2 catalog](v2/catalog.json) is the current finite proof universe for
-state-engine assessments. It closes 72 stable legs, ten dimensions, four
+state-engine assessments. It closes 73 stable legs, ten dimensions, four
 required state-store/deployment profile cases, named boundary cases, and ten
 hard gates. Dated `assessment.json` files bind results to one exact code
 baseline.
 
 The stable namespaces are `TS-00..19`, `AUX-01..07`, `RC-01..07`,
-`PB-01..10`, `RM-01..14`, and `F-01..14`. Run-coordination legs are explicit;
+`PB-01..11`, `RM-01..14`, and `F-01..14`. Run-coordination legs are explicit;
 leader-seat and worker-registry changes are not hidden inside a generic fence.
 
 The [v1 catalog](v1/catalog.json) is immutable historical evidence. Its 68-leg
@@ -26,6 +26,10 @@ assessments must use v2.
   `(leg_id, dimension_id, case_id, profile_case)`. The profile case binds one
   supported state store to one deployment and its lifecycle modes; evidence
   for SQLite cannot satisfy PostgreSQL, or vice versa.
+- Applicability is explicit per leg and profile case. RC-05 and PB-08 are
+  required only for the two SQLite follower deployments; their SQLite
+  single-process and PostgreSQL cells are catalog-approved N/A. PB-11 is
+  required only for PostgreSQL 16 on the AWS single-leader Landscape profile.
 - The v2 profile treats every dimension as required. Narrowing a dimension to
   N/A requires a catalog revision with a precise reason; an assessor cannot do
   it ad hoc.
@@ -37,11 +41,14 @@ assessments must use v2.
 - PB-10 declares the complete row-union release matrix: all branches, branch
   loss before or after partial arrival, timeout, late arrival, and restart on
   either side of release.
+- PB-09 names every current first-party plugin as its own required case, while
+  PB-11 names PostgreSQL server-time, row-lock order, isolation, schema
+  admission/migration, and ambiguous connection-loss cases.
 - `maintenance` is always required.
 
 ## Assessment overlay
 
-Each new assessment must contain all 72 v2 leg IDs. To keep unresolved
+Each new assessment must contain all 73 v2 leg IDs. To keep unresolved
 assessments readable, a leg may declare `default_status: unknown`; the default
 expands to every required dimension/case not named by an override. The derived
 verdict remains unresolved until every default is replaced by `pass`, `fail`,

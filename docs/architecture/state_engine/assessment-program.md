@@ -30,7 +30,7 @@ PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
   init-full "${STATE_ASSESSMENT_ID}" "${STATE_ASSESSMENT_DIR}"
 ```
 
-The initializer creates a fully materialized 72-leg v2 manifest plus readable
+The initializer creates a fully materialized 73-leg v2 manifest plus readable
 README, evidence, and review templates. It refuses to overwrite an existing
 `assessment.json`.
 

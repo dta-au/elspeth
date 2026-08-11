@@ -103,9 +103,31 @@ SUPPORTED_PROFILE_CASES = {
 }
 APPLICABILITY_PROFILE_IDS = {
     "elspeth-state-engine-v1": {"all-required-v1"},
-    "elspeth-state-engine-v2": {"all-required-v2"},
+    "elspeth-state-engine-v2": {
+        "all-required-v2",
+        "sqlite-followers-only-v2",
+        "postgresql-aws-only-v2",
+    },
 }
 PLACEHOLDER_PATTERN = re.compile(r"TBD|TODO|FIXME|<timestamp>|<full SHA>")
+CANONICAL_V2_LEGS_SHA256 = "ab579d510d9ed1e0becec9b290de2d598725b25e41d43ac4fe0427be6bf8ff01"
+CANONICAL_V2_ACCEPTANCE_SHA256 = "f56bd4d8bb68b1bc4bc95f718a426bdc5e22d71d12198307337d41c905e29e93"
+CANONICAL_V2_HARD_GATES_SHA256 = "0c5e4b2565e8615083e275d7a14c1a41c827050240399276dca3d49afde24fa3"
+CANONICAL_V2_APPLICABILITY_SHA256 = "e9d4565ecf7eb489f90d4472b1d93315fd9d50161b4a4f922e1fb4fd1c010596"
+CANONICAL_V2_TOP_LEVEL_KEYS = {
+    "schema_version",
+    "catalog_id",
+    "criteria_ref",
+    "architecture_ref",
+    "dimensions",
+    "vocabularies",
+    "execution_profiles",
+    "applicability_profiles",
+    "family_dimension_acceptance",
+    "hard_gates",
+    "required_leg_ids",
+    "legs",
+}
 
 
 class ContractError(ValueError):
@@ -166,6 +188,11 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _semantic_sha256(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _git_root(path: Path) -> Path:
     candidate = path if path.is_dir() else path.parent
     while not candidate.exists():
@@ -199,7 +226,7 @@ def _expected_leg_ids(catalog_id: Any) -> list[str]:
         [f"TS-{number:02d}" for number in range(20 if v2 else 19)]
         + [f"AUX-{number:02d}" for number in range(1, 8)]
         + [f"RC-{number:02d}" for number in range(1, 8)]
-        + [f"PB-{number:02d}" for number in range(1, 11 if v2 else 10)]
+        + [f"PB-{number:02d}" for number in range(1, 12 if v2 else 10)]
         + [f"RM-{number:02d}" for number in range(1, 15 if v2 else 14)]
         + [f"F-{number:02d}" for number in range(1, 15 if v2 else 14)]
     )
@@ -293,6 +320,13 @@ def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
 def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
     _require(catalog.get("schema_version") == 1, "catalog schema_version must be 1")
     catalog_id = _string(catalog.get("catalog_id"), "catalog_id")
+    if catalog_id == "elspeth-state-engine-v2":
+        _require(set(catalog) == CANONICAL_V2_TOP_LEVEL_KEYS, "canonical v2 top-level schema changed")
+        _require(
+            catalog.get("criteria_ref") == "docs/architecture/state_engine/completeness-criteria.md"
+            and catalog.get("architecture_ref") == "docs/architecture/state_engine/architecture.md",
+            "canonical v2 normative references changed",
+        )
     expected_ids = _expected_leg_ids(catalog_id)
     _require(catalog.get("dimensions") == DIMENSIONS, "catalog dimensions do not match the contract")
     _require(
@@ -304,25 +338,42 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
     leg_ids = [_dict(leg, f"catalog leg {index}").get("id") for index, leg in enumerate(legs)]
     _require(leg_ids == expected_ids, "catalog leg ordering does not match required_leg_ids")
     _require(len(set(leg_ids)) == len(leg_ids), "catalog leg IDs contain duplicates")
+    if catalog_id == "elspeth-state-engine-v2":
+        _require(
+            _semantic_sha256(legs) == CANONICAL_V2_LEGS_SHA256,
+            "canonical v2 leg manifest changed without a catalog identity revision",
+        )
     catalog_by_id = {leg["id"]: leg for leg in legs}
     for leg_id, leg in catalog_by_id.items():
+        expected_leg_fields = {"id", "family", "title", "contract", "applicability_profile"}
+        if "required_cases" in leg:
+            expected_leg_fields.add("required_cases")
+        _require(set(leg) == expected_leg_fields, f"catalog leg {leg_id} has unexpected fields")
         _require(leg.get("family") in FAMILY_LABELS, f"catalog leg {leg_id} has unknown family")
+        for field in ("title", "contract", "applicability_profile"):
+            value = leg.get(field)
+            _require(
+                isinstance(value, str) and bool(value.strip()),
+                f"catalog leg {leg_id} {field} must be a non-empty string",
+            )
         cases = _strings(leg.get("required_cases", ["leg-contract"]), f"catalog leg {leg_id} cases")
         _require(bool(cases), f"catalog leg {leg_id} has no required cases")
         _unique(cases, f"catalog leg {leg_id} required_cases")
-    if catalog_id == "elspeth-state-engine-v2":
-        _require(
-            catalog_by_id["PB-10"].get("required_cases") == PB10_CASES,
-            "PB-10 required_cases do not match the row-union contract",
-        )
-
     families = {leg["family"] for leg in legs}
     acceptance = _dict(catalog.get("family_dimension_acceptance"), "family acceptance")
     _require(set(acceptance) == families, "family acceptance does not cover catalog families")
+    if catalog_id == "elspeth-state-engine-v2":
+        _require(
+            _semantic_sha256(acceptance) == CANONICAL_V2_ACCEPTANCE_SHA256,
+            "canonical v2 family acceptance changed without a catalog identity revision",
+        )
     for family, raw_dimensions in acceptance.items():
         dimensions = _dict(raw_dimensions, f"family acceptance {family}")
         _require(list(dimensions) == DIMENSIONS, f"family acceptance {family} is out of order")
-
+        _require(
+            all(isinstance(value, str) and bool(value.strip()) for value in dimensions.values()),
+            f"family acceptance {family} must contain non-empty text",
+        )
     profiles = _dict(catalog.get("execution_profiles"), "execution_profiles")
     plugin_inventory = _dict(profiles.get("first_party_plugins"), "first-party plugin inventory")
     _require(
@@ -353,7 +404,7 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
             "catalog vocabularies do not match owned runtime enums",
         )
         profile_case_ids = _validate_profile_cases(catalog)
-        expected_profile_fields = {"default_case_id", "profile_case_ids", *DIMENSIONS}
+        expected_profile_fields = {"default_case_id", "profile_case_applicability", *DIMENSIONS}
     else:
         profile_case_ids = []
         expected_profile_fields = {"default_case_id", *DIMENSIONS}
@@ -368,19 +419,41 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
             f"applicability profile {profile_id} has an invalid dimension policy",
         )
         if profile_case_ids:
+            case_applicability = _dict(
+                profile.get("profile_case_applicability"),
+                f"applicability profile {profile_id} profile cases",
+            )
             _require(
-                profile.get("profile_case_ids") == profile_case_ids,
-                f"applicability profile {profile_id} must preserve profile-case ordering",
+                list(case_applicability) == profile_case_ids,
+                f"applicability profile {profile_id} must preserve profile-case identity and ordering",
+            )
+            _require(
+                set(case_applicability.values()) <= {"required", "not_applicable"},
+                f"applicability profile {profile_id} has invalid profile-case applicability",
             )
     for leg_id, leg in catalog_by_id.items():
         _require(
             leg.get("applicability_profile") in applicability,
             f"catalog leg {leg_id} references unknown applicability profile",
         )
+    if catalog_id == "elspeth-state-engine-v2":
+        _require(
+            _semantic_sha256(applicability) == CANONICAL_V2_APPLICABILITY_SHA256,
+            "canonical v2 applicability changed without a catalog identity revision",
+        )
 
     gates = _list(catalog.get("hard_gates"), "catalog hard_gates")
     gate_ids = [_dict(gate, f"hard gate {index}").get("id") for index, gate in enumerate(gates)]
     _require(gate_ids == HARD_GATE_IDS, "catalog hard-gate identity or ordering changed")
+    if catalog_id == "elspeth-state-engine-v2":
+        _require(
+            _semantic_sha256(gates) == CANONICAL_V2_HARD_GATES_SHA256,
+            "canonical v2 hard gates changed without a catalog identity revision",
+        )
+    for gate in gates:
+        _require(set(gate) == {"id", "title"}, f"hard gate {gate.get('id')} has unexpected fields")
+        title = gate.get("title")
+        _require(isinstance(title, str) and bool(title.strip()), f"hard gate {gate.get('id')} title must be non-empty")
     _require(catalog_path.is_file(), f"catalog file does not exist: {catalog_path}")
 
 
@@ -570,7 +643,25 @@ def _semantic_cases(leg: dict[str, Any]) -> list[str]:
 
 def _profile_cases(catalog: dict[str, Any], leg: dict[str, Any]) -> list[str]:
     profile = catalog["applicability_profiles"][leg["applicability_profile"]]
-    return _strings(profile.get("profile_case_ids", ["historical-v1"]), "profile-case IDs")
+    if catalog["catalog_id"] == "elspeth-state-engine-v2":
+        applicability = _dict(profile["profile_case_applicability"], "profile-case applicability")
+        return list(applicability)
+    return ["historical-v1"]
+
+
+def _cell_is_applicable(
+    catalog: dict[str, Any],
+    leg: dict[str, Any],
+    dimension: str,
+    profile_case: str,
+) -> bool:
+    profile = catalog["applicability_profiles"][leg["applicability_profile"]]
+    if profile[dimension] != "required":
+        return False
+    if catalog["catalog_id"] == "elspeth-state-engine-v2":
+        applicability = _dict(profile["profile_case_applicability"], "profile-case applicability")
+        return _string(applicability[profile_case], "profile-case policy") == "required"
+    return True
 
 
 def _coverage_key(item: dict[str, Any], v2: bool) -> tuple[str, str, str, str]:
@@ -747,11 +838,12 @@ def _normalized_cells(
     result: dict[tuple[str, str, str, str], tuple[str, tuple[tuple[str, str], ...]]] = {}
     for catalog_leg in catalog["legs"]:
         leg = legs[catalog_leg["id"]]
-        profile = catalog["applicability_profiles"][catalog_leg["applicability_profile"]]
         for dimension in DIMENSIONS:
-            status = leg["default_status"] if profile[dimension] == "required" else "not_applicable"
             for case_id in _semantic_cases(catalog_leg):
                 for profile_case in _profile_cases(catalog, catalog_leg):
+                    status = (
+                        leg["default_status"] if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case) else "not_applicable"
+                    )
                     result[(leg["id"], dimension, case_id, profile_case)] = (status, ())
         for override in leg.get("overrides", []):
             profile_case = override.get("profile_case", "historical-v1")
@@ -881,12 +973,13 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
         if leg["derived_verdict"] in {"gap", "unknown"}:
             _validate_unresolved_metadata(leg, f"leg {leg_id} unresolved")
         catalog_leg = catalog_by_id[leg_id]
-        profile = catalog["applicability_profiles"][catalog_leg["applicability_profile"]]
         cell_status: dict[tuple[str, str, str], str] = {}
         for dimension in DIMENSIONS:
-            status = leg["default_status"] if profile[dimension] == "required" else "not_applicable"
             for case_id in _semantic_cases(catalog_leg):
                 for profile_case in _profile_cases(catalog, catalog_leg):
+                    status = (
+                        leg["default_status"] if _cell_is_applicable(catalog, catalog_leg, dimension, profile_case) else "not_applicable"
+                    )
                     cell_status[(dimension, case_id, profile_case)] = status
         seen: set[tuple[str, str, str]] = set()
         for raw_override in _list(leg.get("overrides", []), f"leg {leg_id} overrides"):
@@ -910,7 +1003,10 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
                     _require(field in override, f"leg {leg_id} {status} override is missing {field}")
                 _validate_unresolved_metadata(override, f"leg {leg_id} {status} override")
             if status == "not_applicable":
-                _require(profile[key[0]] == "not_applicable", f"leg {leg_id} cannot waive a required dimension")
+                _require(
+                    not _cell_is_applicable(catalog, catalog_leg, key[0], key[2]),
+                    f"leg {leg_id} cannot waive a required profile cell",
+                )
                 _require(not cited, f"leg {leg_id} not_applicable override cannot cite evidence")
             _require(set(cited) <= evidence_ids, f"leg {leg_id} override cites unknown evidence")
             for evidence_id in cited:

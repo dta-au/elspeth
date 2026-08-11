@@ -147,12 +147,50 @@
   "applicability_profiles": {
     "all-required-v2": {
       "default_case_id": "leg-contract",
-      "profile_case_ids": [
-        "sqlite-wal-single-process-leader",
-        "sqlite-wal-same-host-leader-plus-claim-only-followers",
-        "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers",
-        "postgresql-16-aws-single-leader-landscape"
-      ],
+      "profile_case_applicability": {
+        "sqlite-wal-single-process-leader": "required",
+        "sqlite-wal-same-host-leader-plus-claim-only-followers": "required",
+        "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": "required",
+        "postgresql-16-aws-single-leader-landscape": "required"
+      },
+      "production_entry": "required",
+      "precondition_image": "required",
+      "success_effects": "required",
+      "guard_refusal": "required",
+      "zero_mutation_rollback": "required",
+      "concurrency": "required",
+      "crash_restart": "required",
+      "boundary_composition": "required",
+      "read_model_truth_table": "required",
+      "maintenance": "required"
+    },
+    "sqlite-followers-only-v2": {
+      "default_case_id": "leg-contract",
+      "profile_case_applicability": {
+        "sqlite-wal-single-process-leader": "not_applicable",
+        "sqlite-wal-same-host-leader-plus-claim-only-followers": "required",
+        "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": "required",
+        "postgresql-16-aws-single-leader-landscape": "not_applicable"
+      },
+      "production_entry": "required",
+      "precondition_image": "required",
+      "success_effects": "required",
+      "guard_refusal": "required",
+      "zero_mutation_rollback": "required",
+      "concurrency": "required",
+      "crash_restart": "required",
+      "boundary_composition": "required",
+      "read_model_truth_table": "required",
+      "maintenance": "required"
+    },
+    "postgresql-aws-only-v2": {
+      "default_case_id": "postgresql-contract",
+      "profile_case_applicability": {
+        "sqlite-wal-single-process-leader": "not_applicable",
+        "sqlite-wal-same-host-leader-plus-claim-only-followers": "not_applicable",
+        "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers": "not_applicable",
+        "postgresql-16-aws-single-leader-landscape": "required"
+      },
       "production_entry": "required",
       "precondition_image": "required",
       "success_effects": "required",
@@ -256,7 +294,7 @@
     "TS-10", "TS-11", "TS-12", "TS-13", "TS-14", "TS-15", "TS-16", "TS-17", "TS-18", "TS-19",
     "AUX-01", "AUX-02", "AUX-03", "AUX-04", "AUX-05", "AUX-06", "AUX-07",
     "RC-01", "RC-02", "RC-03", "RC-04", "RC-05", "RC-06", "RC-07",
-    "PB-01", "PB-02", "PB-03", "PB-04", "PB-05", "PB-06", "PB-07", "PB-08", "PB-09", "PB-10",
+    "PB-01", "PB-02", "PB-03", "PB-04", "PB-05", "PB-06", "PB-07", "PB-08", "PB-09", "PB-10", "PB-11",
     "RM-01", "RM-02", "RM-03", "RM-04", "RM-05", "RM-06", "RM-07", "RM-08", "RM-09", "RM-10", "RM-11", "RM-12", "RM-13", "RM-14",
     "F-01", "F-02", "F-03", "F-04", "F-05", "F-06", "F-07", "F-08", "F-09", "F-10", "F-11", "F-12", "F-13", "F-14"
   ],
@@ -294,7 +332,7 @@
     {"id": "RC-02", "family": "run_coordination", "title": "Acquire or take over run leadership", "contract": "Only an empty or expired seat admits one active worker, increments the epoch, and fences the prior leader.", "applicability_profile": "all-required-v2"},
     {"id": "RC-03", "family": "run_coordination", "title": "Heartbeat registered worker and leader seat", "contract": "An active worker extends its membership window and, only when it owns the seat, the exact leader epoch window.", "applicability_profile": "all-required-v2"},
     {"id": "RC-04", "family": "run_coordination", "title": "Release run leader seat and membership", "contract": "Only the exact run leader and epoch atomically clear the seat and move that run-scoped active membership to DEPARTED; a stale foreign or losing release mutates neither plane.", "applicability_profile": "all-required-v2"},
-    {"id": "RC-05", "family": "run_coordination", "title": "Admit follower worker", "contract": "A live leader seat admits one active claim-only follower with exact run membership and evidence.", "applicability_profile": "all-required-v2"},
+    {"id": "RC-05", "family": "run_coordination", "title": "Admit follower worker", "contract": "A live leader seat admits one active claim-only follower with exact run membership and evidence.", "applicability_profile": "sqlite-followers-only-v2"},
     {"id": "RC-06", "family": "run_coordination", "title": "Depart registered worker", "contract": "Only an active member becomes departed with one durable timestamp and cannot regain authority by heartbeat.", "applicability_profile": "all-required-v2"},
     {"id": "RC-07", "family": "run_coordination", "title": "Evict dead non-leader worker", "contract": "The current leader and repository predicate fence eviction to an eligible expired non-leader in the same run and record the exact terminal membership image.", "applicability_profile": "all-required-v2"},
 
@@ -305,9 +343,10 @@
     {"id": "PB-05", "family": "production_boundary", "title": "Coalesce barrier", "contract": "Durable merge decision parent finalization and barrier continuation converge across replay.", "applicability_profile": "all-required-v2"},
     {"id": "PB-06", "family": "production_boundary", "title": "Sink effect publication", "contract": "Every production sink effect reserves claims preparation plans leases reconciles or commits and finalizes exactly once by contract.", "applicability_profile": "all-required-v2", "required_cases": ["reserve-pipeline-members", "reserve-audit-export-snapshot", "predecessor-wait-and-stream-advance", "claim-preparation-generation", "inspect-or-typed-no-inspection", "prepare-immutable-plan", "expired-preparation-claim-takeover", "death-after-preparation-claim-before-plan", "acquire-generation-fenced-lease", "heartbeat-effect-lease", "expired-generation-takeover", "reconcile-not-applied-commit-once", "reconcile-applied-finalize-without-commit", "reconcile-unknown-blocks", "returned-result-finalization", "finalized-winner-reuse", "zero-publication-inherited-or-virtual", "per-member-partial-progress", "primary-diversion-failsink-ordering", "legacy-write-flush-unreachable"]},
     {"id": "PB-07", "family": "production_boundary", "title": "Post-sink restart and scheduler repair", "contract": "Every sink interruption seam converges and TS-14 repairs scheduler debt without republication.", "applicability_profile": "all-required-v2", "required_cases": ["before-reservation", "after-reservation", "after-inspection", "after-plan-cas", "after-publication-before-response", "after-response-before-finalization", "after-finalization-before-response", "scheduler-ts14-repair-without-republication"]},
-    {"id": "PB-08", "family": "production_boundary", "title": "Follower worker", "contract": "A real follower builds starts traverses dispositions and tears down without assuming leader authority.", "applicability_profile": "all-required-v2"},
-    {"id": "PB-09", "family": "production_boundary", "title": "Plugin lifecycle", "contract": "Fresh resume follower partial-start normal and exceptional teardown honor supported lifecycle ordering.", "applicability_profile": "all-required-v2"},
+    {"id": "PB-08", "family": "production_boundary", "title": "Follower worker", "contract": "A real follower builds starts traverses dispositions and tears down without assuming leader authority.", "applicability_profile": "sqlite-followers-only-v2"},
+    {"id": "PB-09", "family": "production_boundary", "title": "Plugin lifecycle", "contract": "Every first-party plugin honors its applicable fresh resume partial-start normal-teardown and exceptional-teardown ordering.", "applicability_profile": "all-required-v2", "required_cases": ["source:aws_s3", "source:azure_blob", "source:blob_rows", "source:csv", "source:dataverse", "source:json", "source:llm", "source:null", "source:text", "transform:aws_bedrock_content_safety", "transform:aws_bedrock_prompt_shield", "transform:aws_textract_document_analysis", "transform:aws_textract_inline_analysis", "transform:azure_content_safety", "transform:azure_document_intelligence", "transform:azure_prompt_shield", "transform:batch_classifier_metrics", "transform:batch_data_quality_report", "transform:batch_distribution_profile", "transform:batch_drift_compare", "transform:batch_effect_size", "transform:batch_experiment_compare", "transform:batch_outlier_annotator", "transform:batch_paired_preference", "transform:batch_replicate", "transform:batch_stats", "transform:batch_threshold_summary", "transform:batch_top_k", "transform:blob_csv_expand", "transform:blob_fetch", "transform:field_mapper", "transform:json_explode", "transform:keyword_filter", "transform:line_explode", "transform:llm", "transform:passthrough", "transform:rag_retrieval", "transform:report_assemble", "transform:truncate", "transform:type_coerce", "transform:value_transform", "transform:web_scrape", "sink:aws_s3", "sink:azure_blob", "sink:chroma_sink", "sink:csv", "sink:database", "sink:dataverse", "sink:document", "sink:json", "sink:text"]},
     {"id": "PB-10", "family": "production_boundary", "title": "Row-union barrier lifecycle", "contract": "Row-union arrival loss timeout release late-arrival and recovery behavior converge through the production executor without lost duplicated or stranded work.", "applicability_profile": "all-required-v2", "required_cases": ["all-branches-arrive", "branch-loss-before-first-arrival", "branch-loss-after-partial-arrival", "timeout", "late-arrival-after-release", "restart-before-release", "restart-after-release-before-sink"]},
+    {"id": "PB-11", "family": "production_boundary", "title": "PostgreSQL 16 state-engine semantics", "contract": "The maintained AWS single-leader Landscape profile uses PostgreSQL 16 server time row-lock order isolation schema admission and ambiguous connection-loss reconciliation without authorizing multi-replica scheduling.", "applicability_profile": "postgresql-aws-only-v2", "required_cases": ["db-server-time", "row-lock-order", "transaction-isolation", "schema-admission-migration", "ambiguous-connection-loss"]},
 
     {"id": "RM-01", "family": "read_model", "title": "Unresolved producer work", "contract": "Counts exactly READY BLOCKED and transform leases while excluding sink debt and final states.", "applicability_profile": "all-required-v2"},
     {"id": "RM-02", "family": "read_model", "title": "Unquiesced barrier-producing work", "contract": "Counts exactly work that can still create a new barrier arrival.", "applicability_profile": "all-required-v2"},

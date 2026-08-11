@@ -102,6 +102,12 @@ two SQLite follower profiles. The PostgreSQL 16 contract is the maintained AWS
 single-leader Landscape profile; it does not advertise PostgreSQL multi-leader,
 multi-replica, or multi-host scheduling.
 
+The PostgreSQL-only PB-11 cases separately require database-server time,
+row-lock order, transaction isolation, schema admission/migration, and
+ambiguous connection-loss reconciliation. SQLite evidence is catalog-N/A for
+PB-11; follower-only RC-05 and PB-08 cells are catalog-N/A outside the two
+SQLite follower profiles.
+
 ## Evidence hierarchy
 
 Behavioral `pass`, `partial`, or `fail` claims require executed evidence:
@@ -160,7 +166,7 @@ Overall verdicts:
 
 ## Production-supported claim
 
-`complete` proves all 72 legs at every versioned execution profile.
+`complete` proves all 73 legs at every versioned execution profile.
 `production-supported` additionally requires:
 
 - every state-store, deployment, lifecycle, and first-party plugin named in
