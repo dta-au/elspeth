@@ -19,6 +19,10 @@ import { GraphModal } from "./components/sidebar/GraphModal";
 import { ImportYamlModalHost } from "./components/sidebar/ImportYamlModal";
 import { CommandPalette } from "./components/common/CommandPalette";
 import { ConfirmDialog } from "./components/common/ConfirmDialog";
+import {
+  AppNoticeCenter,
+  type AppNotice,
+} from "./components/common/AppNoticeCenter";
 import { ShortcutsHelp } from "./components/common/ShortcutsHelp";
 import { DefaultModeChangedBanner } from "./components/common/DefaultModeChangedBanner";
 import { ChatPanel } from "./components/chat/ChatPanel";
@@ -520,6 +524,122 @@ function App() {
     wasAuthenticatedRef.current = isAuthenticated;
   }, [isAuthenticated, checkHealth]);
 
+  const appNotices = useMemo<AppNotice[]>(() => {
+    const notices: AppNotice[] = [];
+    if (backendAvailable === false) {
+      notices.push({
+        kind: "backend-unavailable",
+        role: "alert",
+        content: (
+          <>
+            <strong>Backend unavailable</strong> — Cannot connect to the
+            ELSPETH server. Check that the backend is running.
+            {lastHealthCheckAt !== null ? (
+              <> Last attempt: {lastHealthCheckAt}.</>
+            ) : null}
+          </>
+        ),
+        action: (
+          <button
+            type="button"
+            onClick={checkHealth}
+            disabled={healthChecking}
+            aria-busy={healthChecking}
+            aria-label="Retry connection"
+            title="Retry connection"
+            className="alert-banner-action"
+          >
+            {healthChecking ? "Checking…" : "Retry"}
+          </button>
+        ),
+      });
+    }
+    if (preferencesWriteError !== null) {
+      notices.push({
+        kind: "preferences",
+        role: "alert",
+        content: (
+          <>
+            <strong>Preferences:</strong> {preferencesWriteError}
+          </>
+        ),
+      });
+    }
+    if (redirectToast !== null) {
+      notices.push({
+        kind: "redirect",
+        role: "alert",
+        tone: "info",
+        content: redirectToast.message,
+        action: (
+          <button
+            type="button"
+            className="alert-banner-action"
+            onClick={redirectToast.dismiss}
+            aria-label="Dismiss"
+          >
+            Dismiss
+          </button>
+        ),
+      });
+    }
+    if (staleBuildDetected) {
+      notices.push({
+        kind: "stale-build",
+        role: "status",
+        content: "A new version of ELSPETH is available — refresh to load it.",
+        action: (
+          <button
+            type="button"
+            onClick={() => window.location.reload()}
+            className="alert-banner-action"
+          >
+            Refresh
+          </button>
+        ),
+      });
+    }
+    if (
+      backendAvailable &&
+      systemStatus !== null &&
+      !systemStatus.composer_available
+    ) {
+      notices.push({
+        kind: "composer-unavailable",
+        role: "status",
+        content: (
+          <>
+            Service unavailable:{" "}
+            {systemStatus.composer_reason ??
+              "The composer cannot reach a usable LLM right now."}
+          </>
+        ),
+        action: (
+          <button
+            type="button"
+            onClick={openSecrets}
+            aria-label="Open secrets settings"
+            title="Configure API keys"
+            className="alert-banner-action"
+          >
+            ⚙ API Keys
+          </button>
+        ),
+      });
+    }
+    return notices;
+  }, [
+    backendAvailable,
+    checkHealth,
+    healthChecking,
+    lastHealthCheckAt,
+    openSecrets,
+    preferencesWriteError,
+    redirectToast,
+    staleBuildDetected,
+    systemStatus,
+  ]);
+
   // Phase 6B Task 8 short-circuit: if the URL hash is `#/shared/{token}`,
   // render the read-only inspect view inside AuthGuard. The token is a
   // CAPABILITY, not an authenticator — the recipient must still be logged
@@ -547,105 +667,7 @@ function App() {
         </a>
         <h1 className="sr-only">ELSPETH Pipeline Composer</h1>
 
-        {/* Redirect toast: shown once when a stale hash fragment (e.g. #/id/runs
-            or #/id/spec) is detected. Dismissed by clicking the button; dismissal
-            is persisted in localStorage so the toast never reappears.
-            Uses role=alert so assistive technology announces it immediately. */}
-        {redirectToast && (
-          <div role="alert" className="alert-banner alert-banner--info">
-            <span>{redirectToast.message}</span>
-            <button
-              type="button"
-              className="alert-banner-action"
-              onClick={redirectToast.dismiss}
-              aria-label="Dismiss"
-            >
-              Dismiss
-            </button>
-          </div>
-        )}
-
-        {/* Backend unavailable banner.
-            role=alert (assertive) because backend-down is a hard outage that
-            blocks every feature in the app; the composer-unavailable banner
-            below is role=status (polite) because it's a soft degradation. */}
-        {backendAvailable === false && (
-          <div role="alert" className="alert-banner">
-            <span>
-              <strong>Backend unavailable</strong> — Cannot connect to the
-              ELSPETH server. Check that the backend is running.
-              {lastHealthCheckAt !== null && (
-                <> Last attempt: {lastHealthCheckAt}.</>
-              )}
-            </span>
-            <button
-              onClick={checkHealth}
-              disabled={healthChecking}
-              aria-busy={healthChecking}
-              aria-label="Retry connection"
-              title="Retry connection"
-              className="alert-banner-action"
-            >
-              {healthChecking ? "Checking…" : "Retry"}
-            </button>
-          </div>
-        )}
-
-        {/* I5: preferences-bootstrap failure banner. The store's bootstrap()
-            is contracted to set writeError on failure (no fabricated defaults);
-            without this always-mounted surface, the writeError would be set
-            but invisible — the other components that read writeError mount
-            conditionally (DefaultModeChangedBanner only on mode-change flows,
-            ComposerPreferencesPanel only when settings is open, and
-            ComposerPreferencesForm explicitly returns null when defaultMode
-            is null, which is exactly the bootstrap-failure shape). Moving the
-            silent failure one layer up would defeat the purpose of I5.
-            Mounting here, alongside the backend-unavailable and
-            composer-unavailable banners, is the standard "always-on chrome"
-            surface for non-blocking failure signals. */}
-        {preferencesWriteError !== null && (
-          <div role="alert" className="alert-banner">
-            <span>
-              <strong>Preferences:</strong> {preferencesWriteError}
-            </span>
-          </div>
-        )}
-
-        {/* Deploy beacon: this tab is running a previous bundle (stale
-            hashed assets may 404 and new features are absent). Non-blocking,
-            persistent once latched; refresh is the only clear. */}
-        {staleBuildDetected && (
-          <div role="status" className="alert-banner">
-            <span>
-              A new version of ELSPETH is available — refresh to load it.
-            </span>
-            <button
-              onClick={() => window.location.reload()}
-              className="alert-banner-action"
-            >
-              Refresh
-            </button>
-          </div>
-        )}
-
-        {/* Composer unavailable banner (backend is up but LLM not configured) */}
-        {backendAvailable && systemStatus && !systemStatus.composer_available && (
-          <div role="status" className="alert-banner">
-            <span>
-              Service unavailable:{" "}
-              {systemStatus.composer_reason ??
-                "The composer cannot reach a usable LLM right now."}
-            </span>
-            <button
-              onClick={openSecrets}
-              aria-label="Open secrets settings"
-              title="Configure API keys"
-              className="alert-banner-action"
-            >
-              ⚙ API Keys
-            </button>
-          </div>
-        )}
+        <AppNoticeCenter notices={appNotices} />
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}

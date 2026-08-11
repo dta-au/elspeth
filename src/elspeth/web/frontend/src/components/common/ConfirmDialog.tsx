@@ -1,4 +1,4 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
 interface ConfirmDialogProps {
@@ -36,6 +36,9 @@ export function ConfirmDialog({
   children,
 }: ConfirmDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const titleId = `${id}-confirm-dialog-title`;
+  const messageId = `${id}-confirm-dialog-message`;
 
   // Focus trap with initial focus on the confirm button.
   // On unmount, focus restores to the element that was focused before the dialog.
@@ -67,31 +70,37 @@ export function ConfirmDialog({
         ref={dialogRef}
         role="alertdialog"
         aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        aria-describedby="confirm-dialog-message"
+        aria-labelledby={titleId}
+        aria-describedby={messageId}
         className="confirm-dialog"
       >
-        <h2 id="confirm-dialog-title" className="confirm-dialog-title">
-          {title}
-        </h2>
-        <p id="confirm-dialog-message" className="confirm-dialog-message">
-          {message}
-        </p>
-        {children}
-        <div className="confirm-dialog-actions">
+        <header className="confirm-dialog-header">
+          <h2 id={titleId} className="confirm-dialog-title">
+            {title}
+          </h2>
+        </header>
+        <div className="confirm-dialog-body">
+          <p id={messageId} className="confirm-dialog-message">
+            {message}
+          </p>
+          {children}
+        </div>
+        <footer className="confirm-dialog-actions">
           <button
+            type="button"
             onClick={onCancel}
             className="btn confirm-dialog-btn"
           >
             {cancelLabel}
           </button>
           <button
+            type="button"
             onClick={onConfirm}
             className={`${confirmBtnClass} confirm-dialog-btn confirm-dialog-confirm-btn`}
           >
             {confirmLabel}
           </button>
-        </div>
+        </footer>
       </div>
     </>
   );

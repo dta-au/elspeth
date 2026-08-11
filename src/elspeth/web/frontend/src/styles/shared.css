@@ -413,11 +413,26 @@
   z-index: var(--z-dialog);
   width: 400px;
   max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
   background-color: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
   padding: var(--space-xl);
+}
+
+.confirm-dialog-header,
+.confirm-dialog-actions {
+  flex-shrink: 0;
+}
+
+.confirm-dialog-body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .confirm-dialog-title {
@@ -443,6 +458,88 @@
 .confirm-dialog-btn {
   min-width: 80px;
   min-height: var(--size-control);
+}
+
+/* The notice center contributes exactly one bounded row to application
+   geometry. Its disclosure floats above the workspace and owns one scroller. */
+.app-notice-center {
+  position: relative;
+  z-index: var(--z-panel-controls);
+  flex: 0 0 auto;
+}
+
+.app-notice-primary.alert-banner {
+  height: var(--size-control);
+  max-height: var(--size-control);
+  gap: var(--space-sm);
+  padding-block: var(--space-xs);
+  overflow: hidden;
+}
+
+.app-notice-primary-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-notice-primary-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+.app-notice-primary-actions .alert-banner-action {
+  margin-left: 0;
+}
+
+.app-notice-popover {
+  position: fixed;
+  z-index: var(--z-popover);
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  width: min(42rem, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-elevated);
+  box-shadow: var(--shadow-popover);
+}
+
+.app-notice-popover-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.app-notice-popover-header h2 {
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+
+.app-notice-list {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.app-notice-item.alert-banner {
+  align-items: flex-start;
+  gap: var(--space-md);
+  border-bottom-color: var(--color-border);
+}
+
+.app-notice-item-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 

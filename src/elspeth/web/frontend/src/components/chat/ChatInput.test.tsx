@@ -514,6 +514,12 @@ describe("ChatInput max length", () => {
 describe("ChatInput mobile density CSS", () => {
   const chatCss = readFileSync("src/components/chat/chat.css", "utf8");
 
+  it("bounds textarea growth against the desktop dynamic viewport", () => {
+    expect(chatCss).toMatch(
+      /\.chat-input-textarea\s*\{[^}]*max-height:\s*min\(28dvh, 240px\);[^}]*overflow-y:\s*auto;/s,
+    );
+  });
+
   // chat.css has FOUR separate `@media (max-width: 760px)` blocks (inline
   // run-results, this composer-density block, inline-source-fallback, and
   // responsive CSS blocks). A plain indexOf lands on whichever comes first in

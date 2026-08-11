@@ -14,6 +14,7 @@ import { resetStore } from "@/test/store-helpers";
 import { useSessionStore } from "./stores/sessionStore";
 import { useExecutionStore } from "./stores/executionStore";
 import { useAuthStore } from "./stores/authStore";
+import { usePreferencesStore } from "./stores/preferencesStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
@@ -279,6 +280,7 @@ describe("App banner roles", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     resetStore(useSessionStore);
+    resetStore(usePreferencesStore);
     useExecutionStore.getState().reset();
     // Seed authStore as authenticated. useSessionLifecycle now reads
     // useAuthStore(selectIsAuthenticated) directly and skips loadSessions
@@ -351,6 +353,33 @@ describe("App banner roles", () => {
     const root = banner.closest(".alert-banner") as HTMLElement | null;
     expect(root).not.toBeNull();
     expect(root!.getAttribute("role")).toBe("status");
+  });
+
+  it("consolidates simultaneous notices into one priority-ordered banner row", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    usePreferencesStore.setState({
+      loaded: true,
+      writeError: "Preferences could not be loaded.",
+    });
+    vi.spyOn(usePreferencesStore.getState(), "bootstrap").mockResolvedValueOnce(
+      undefined,
+    );
+
+    render(<App />);
+
+    const primary = await screen.findByTestId("app-notice-primary");
+    expect(within(primary).getByText(/Backend unavailable/i)).toBeVisible();
+    expect(screen.getAllByTestId("app-notice-primary")).toHaveLength(1);
+    expect(screen.getByRole("button", { name: "1 more notice" })).toBeVisible();
+    expect(screen.queryByText("Preferences could not be loaded.")).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "1 more notice" }));
+    const popover = screen.getByRole("region", { name: "All notices" });
+    expect(within(popover).getByText("Preferences could not be loaded.")).toBeVisible();
+    expect(within(primary).getByRole("button", { name: "Retry connection" }))
+      .toBeVisible();
+    errorSpy.mockRestore();
   });
 
   it("silently canonicalizes stale Runs hashes", async () => {

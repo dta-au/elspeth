@@ -160,6 +160,13 @@
   }
 }
 
+@media (min-width: 961px) and (max-height: 800px) {
+  .app-header {
+    height: calc(var(--size-header-height) - var(--space-sm));
+    padding-inline: var(--space-sm);
+  }
+}
+
 /* The header brand mark is rendered by the canonical <WordMark> primitive
    (components/ui/WordMark.tsx), which owns the mono/uppercase/tracking
    treatment — the rationale (JetBrains Mono = "audit/forensic" register, a

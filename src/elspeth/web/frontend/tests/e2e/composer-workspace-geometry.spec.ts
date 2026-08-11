@@ -136,6 +136,91 @@ test.describe("Composer workspace integration geometry", () => {
     });
   }
 
+  test("multiple notices stay reachable without consuming the 1280x720 workspace", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.route("**/api/system/status", async (route) => {
+      await route.fulfill({
+        json: {
+          composer_available: false,
+          composer_model: "deterministic-e2e",
+          composer_provider: "playwright-route",
+          composer_reason:
+            "The Composer provider is unavailable while its operator checks the configured credentials and deployment policy. "
+            .repeat(70),
+          composer_missing_keys: [],
+          composer_timeout_seconds: 180,
+        },
+      });
+    });
+    await page.route("**/api/composer-preferences", async (route) => {
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail:
+            "The preferences service could not load this account's saved Composer settings. "
+            .repeat(40),
+        }),
+      });
+    });
+
+    const token = tokenFromStorageState(await page.context().storageState());
+    const ctx = await authedContext(token);
+    let sessionId: string | undefined;
+    try {
+      const session = await createSession(ctx, "workspace notice geometry");
+      sessionId = session.id;
+      await seedPopulatedComposition(ctx, sessionId);
+      await page.goto(`/#/${sessionId}`);
+
+      const workspace = page.getByTestId("composer-workspace");
+      const primary = page.getByTestId("app-notice-primary");
+      await expect(primary).toHaveCount(1);
+      await expect(primary).toContainText("Preferences:");
+      const more = page.getByRole("button", { name: "1 more notice" });
+      await expect(more).toBeVisible();
+      const workspaceBefore = await box(workspace);
+
+      await more.click();
+      const popover = page.getByRole("region", { name: "All notices" });
+      await expect(popover).toBeVisible();
+      await expect(popover).toContainText("Couldn't load your preferences");
+      await expect(popover).toContainText("Composer provider is unavailable");
+      const popoverBounds = await popover.boundingBox();
+      expect(popoverBounds).not.toBeNull();
+      expect(popoverBounds!.y).toBeGreaterThanOrEqual(16);
+      expect(popoverBounds!.y + popoverBounds!.height).toBeLessThanOrEqual(704);
+
+      const noticeList = popover.locator(".app-notice-list");
+      const scrollGeometry = await noticeList.evaluate((element) => ({
+        overflowY: window.getComputedStyle(element).overflowY,
+        clientHeight: element.clientHeight,
+        scrollHeight: element.scrollHeight,
+      }));
+      expect(scrollGeometry.overflowY).toBe("auto");
+      expect(scrollGeometry.scrollHeight).toBeGreaterThan(
+        scrollGeometry.clientHeight,
+      );
+
+      const openSecrets = popover.getByRole("button", {
+        name: "Open secrets settings",
+      });
+      await expect(openSecrets).toBeVisible();
+      await openSecrets.click();
+      await expect(
+        page.getByRole("dialog", { name: "Secrets settings" }),
+      ).toBeVisible();
+
+      const workspaceAfter = await box(workspace);
+      expect(Math.abs(workspaceAfter.height - workspaceBefore.height)).toBeLessThanOrEqual(1);
+    } finally {
+      if (sessionId !== undefined) await deleteSession(ctx, sessionId);
+      await ctx.dispose();
+    }
+  });
+
   test("skip link preserves a collapsed narrow Pipeline workspace and active session", async ({
     page,
   }) => {

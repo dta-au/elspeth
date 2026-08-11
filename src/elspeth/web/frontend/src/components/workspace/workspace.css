@@ -360,3 +360,16 @@
     scroll-behavior: auto;
   }
 }
+
+@media (min-width: 961px) and (max-height: 800px) {
+  .artifact-workspace-toolbar,
+  .workspace-action-bar {
+    gap: 0.25rem;
+    padding: 0.25rem 0.5rem;
+  }
+
+  .workspace-collapse-control {
+    min-height: var(--size-control-compact);
+    padding-block: var(--space-2xs);
+  }
+}
