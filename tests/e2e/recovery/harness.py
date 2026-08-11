@@ -183,6 +183,57 @@ def _database_process_target(
         release_reader.close()
 
 
+def _pausable_database_process_target(
+    database_url: str,
+    seam: ProcessSeam,
+    action: Callable[..., None],
+    action_args: tuple[object, ...],
+    ready_writer: Connection,
+    release_reader: Connection,
+) -> None:
+    """Spawn target whose action pauses at its own exact in-operation seam."""
+    database: LandscapeDB | None = None
+    paused = False
+
+    def pause() -> None:
+        nonlocal paused
+        if paused:
+            raise RuntimeError(f"child reached process seam {seam!s} more than once")
+        paused = True
+        ready_writer.send(
+            ProcessSeamReady(
+                pid=os.getpid(),
+                seam=str(seam),
+                database_dialect=database.engine.dialect.name if database is not None else "unopened",
+            )
+        )
+        if not release_reader.poll(_PROCESS_SEAM_MAX_BLOCK_SECONDS):
+            raise TimeoutError(f"child remained blocked at process seam {seam!s} beyond its harness bound")
+        release_reader.recv_bytes()
+
+    try:
+        database = LandscapeDB.from_url(database_url, create_tables=False)
+        action(database, pause, *action_args)
+        if not paused:
+            raise RuntimeError(f"child action returned without reaching process seam {seam!s}")
+    except BaseException as exc:
+        if not paused:
+            with suppress(BrokenPipeError, EOFError, OSError):
+                ready_writer.send(
+                    ProcessSeamFailure(
+                        exception_type=type(exc).__name__,
+                        message=str(exc),
+                        traceback_text=traceback.format_exc(),
+                    )
+                )
+        raise
+    finally:
+        if database is not None:
+            database.close()
+        ready_writer.close()
+        release_reader.close()
+
+
 class SpawnedProcessAtSeam:
     """Bounded readiness, SIGKILL, exit, and cleanup oracle for one child."""
 
@@ -343,6 +394,46 @@ def spawn_database_process_at_seam(
     release_reader, release_writer = context.Pipe(duplex=False)
     process = context.Process(
         target=_database_process_target,
+        args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader),
+        name=f"state-engine:{seam}",
+    )
+    try:
+        process.start()
+    except BaseException:
+        ready_reader.close()
+        ready_writer.close()
+        release_reader.close()
+        release_writer.close()
+        process.close()
+        raise
+    ready_writer.close()
+    release_reader.close()
+    return SpawnedProcessAtSeam(
+        process=process,
+        ready_reader=ready_reader,
+        release_writer=release_writer,
+        seam=ProcessSeam(seam),
+    )
+
+
+def spawn_database_process_with_pause(
+    *,
+    database_url: str,
+    seam: str,
+    action: Callable[..., None],
+    action_args: tuple[object, ...] = (),
+) -> SpawnedProcessAtSeam:
+    """Spawn an action that invokes a supplied callback at its exact crash seam."""
+    if not seam.strip():
+        raise ValueError("process seam name must not be empty")
+    if not isinstance(action, FunctionType) or inspect.iscoroutinefunction(action) or "<locals>" in action.__qualname__:
+        raise TypeError("process seam action must be a synchronous module-level picklable callable")
+
+    context = multiprocessing.get_context("spawn")
+    ready_reader, ready_writer = context.Pipe(duplex=False)
+    release_reader, release_writer = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_pausable_database_process_target,
         args=(database_url, ProcessSeam(seam), action, action_args, ready_writer, release_reader),
         name=f"state-engine:{seam}",
     )
