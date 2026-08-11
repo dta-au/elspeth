@@ -13,7 +13,7 @@ variables, not hardcoded in configuration files.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, Literal, Self, cast
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -21,6 +21,8 @@ from elspeth.plugins.infrastructure.url_validation import validate_credential_sa
 
 if TYPE_CHECKING:
     from azure.storage.blob import BlobServiceClient
+
+AzureAuthMethod = Literal["connection_string", "sas_token", "managed_identity", "service_principal"]
 
 
 class AzureAuthConfig(BaseModel):
@@ -53,6 +55,11 @@ class AzureAuthConfig(BaseModel):
     """
 
     model_config = {"extra": "forbid"}
+
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
 
     # Option 1: Connection string (repr=False prevents credential exposure in stack traces)
     connection_string: str | None = Field(default=None, repr=False)
@@ -155,6 +162,19 @@ class AzureAuthConfig(BaseModel):
                 "service principal (tenant_id + client_id + client_secret + account_url)"
             )
 
+        inferred_mode: AzureAuthMethod
+        if has_conn_string:
+            inferred_mode = "connection_string"
+        elif has_sas_token:
+            inferred_mode = "sas_token"
+        elif has_managed_identity:
+            inferred_mode = "managed_identity"
+        else:
+            inferred_mode = "service_principal"
+        if self.auth_mode is not None and self.auth_mode != inferred_mode:
+            raise ValueError(f"auth_mode {self.auth_mode!r} does not match configured authentication method {inferred_mode!r}")
+        self.auth_mode = inferred_mode
+
         return self
 
     def create_blob_service_client(self) -> BlobServiceClient:
@@ -230,17 +250,12 @@ class AzureAuthConfig(BaseModel):
         return value is not None and bool(value.strip())
 
     @property
-    def auth_method(self) -> str:
+    def auth_method(self) -> AzureAuthMethod:
         """Return the active authentication method name.
 
         Returns:
             One of: 'connection_string', 'sas_token', 'managed_identity', 'service_principal'
         """
-        if self._is_set(self.connection_string):
-            return "connection_string"
-        elif self._is_set(self.sas_token):
-            return "sas_token"
-        elif self.use_managed_identity:
-            return "managed_identity"
-        else:
-            return "service_principal"
+        if self.auth_mode is None:
+            raise RuntimeError("AzureAuthConfig auth_mode invariant violated after validation")
+        return self.auth_mode

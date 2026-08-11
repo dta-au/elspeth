@@ -52,6 +52,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
+    ChromaConnectionMode,
     _validated_chroma_http_client_args,
 )
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig
@@ -104,7 +105,7 @@ class ChromaSinkConfig(DataPluginConfig):
     _plugin_component_type: ClassVar[str | None] = "sink"
 
     collection: str = Field(description="ChromaDB collection name")
-    mode: Literal["persistent", "client"] = Field(description="Connection mode")
+    mode: ChromaConnectionMode = Field(description="Connection mode")
     persist_directory: str | None = Field(default=None, description="Local persistence directory for persistent Chroma mode.")
     host: str | None = Field(default=None, description="Chroma server host for client mode.")
     port: int = Field(default=8000, ge=1, le=65535, description="Chroma server port for client mode.")
@@ -198,7 +199,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a0ab8790a4d281d0"
+    source_file_hash: str | None = "sha256:497661b6b55b3f77"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
