@@ -2,6 +2,21 @@ import { join } from "node:path";
 
 import type { Page, Route } from "@playwright/test";
 
+import type {
+  AuditReadinessSnapshot,
+  ChatMessage,
+  CompositionState,
+  NodeSpec,
+  Run,
+  RunAccounting,
+  ValidationResult,
+} from "@/types";
+import type { GetGuidedResponse } from "@/types/guided";
+import type {
+  InterpretationEvent,
+  ListInterpretationEventsResponse,
+} from "@/types/interpretation";
+
 import {
   authedContext,
   createSession,
@@ -45,6 +60,12 @@ interface InstalledScenario {
   sessionId: string;
   pendingAcknowledgement: DeferredSignal | null;
   telemetry: WorkspaceScenarioTelemetry;
+  noticeMode: "long-content" | "recoverable-backend";
+  noticeBackendRecovered: boolean;
+}
+
+interface InstallWorkspaceScenarioOptions {
+  noticeMode?: InstalledScenario["noticeMode"];
 }
 
 const INSTALLED_SCENARIOS = new WeakMap<Page, InstalledScenario>();
@@ -72,7 +93,7 @@ async function seedCanonicalComposition(
   page: Page,
   sessionId: string,
   scenario: WorkspaceScenario,
-): Promise<Record<string, unknown>> {
+): Promise<CompositionState> {
   const token = tokenFromStorageState(await page.context().storageState());
   const ctx = await authedContext(token);
   try {
@@ -82,21 +103,24 @@ async function seedCanonicalComposition(
       SOURCE_FILENAME,
       "id,category\n1,alpha\n2,beta\n",
     );
-    const tallDialogNodes = scenario === "tall-confirmation-dialog"
+    const tallDialogNodeIds = scenario === "tall-confirmation-dialog"
       ? Array.from({ length: 48 }, (_, index) => {
           const stage = String(index + 1).padStart(3, "0");
-          const id = `llm_stage_${stage}_${"deterministic_review_".repeat(4)}fixture`;
-          return {
-            id,
-            node_type: "transform",
-            plugin: "llm",
-            input: index === 0 ? "source" : `stage_${String(index).padStart(3, "0")}`,
-            on_success: index === 47 ? "results" : `stage_${stage}`,
-            on_error: "discard",
-            options: { model: "fixture/deterministic-model" },
-          };
+          return `llm_stage_${stage}_${"deterministic_review_".repeat(4)}fixture`;
         })
       : [];
+    const tallDialogNodes: NodeSpec[] = tallDialogNodeIds.map((id, index) => ({
+      id,
+      node_type: "transform",
+      plugin: "llm",
+      input: index === 0 ? "source" : tallDialogNodeIds[index - 1]!,
+      on_success:
+        index === tallDialogNodeIds.length - 1
+          ? "results"
+          : tallDialogNodeIds[index + 1]!,
+      on_error: "discard",
+      options: { model: "fixture/deterministic-model" },
+    }));
     return await seedCompositionState(ctx, sessionId, {
       version: 1,
       metadata: {
@@ -135,7 +159,7 @@ async function seedCanonicalComposition(
   }
 }
 
-function longTranscript(sessionId: string): Record<string, unknown>[] {
+function longTranscript(sessionId: string): ChatMessage[] {
   return Array.from({ length: 56 }, (_, index) => {
     const role = index % 2 === 0 ? "user" : "assistant";
     const sequence = index + 1;
@@ -152,14 +176,14 @@ function longTranscript(sessionId: string): Record<string, unknown>[] {
       tool_call_id: null,
       parent_assistant_id: null,
       sequence_no: sequence,
-    };
+    } satisfies ChatMessage;
   });
 }
 
 function guidedFixture(
   sessionId: string,
-  compositionState: Record<string, unknown>,
-): Record<string, unknown> {
+  compositionState: CompositionState,
+): GetGuidedResponse {
   return {
     guided_session: {
       step: "step_1_source",
@@ -198,7 +222,7 @@ function guidedFixture(
   };
 }
 
-function validationIssues(): Record<string, unknown> {
+function validationIssues(): ValidationResult {
   const errors = Array.from({ length: 24 }, (_, index) => ({
     component_id: "source",
     component_type: "source",
@@ -226,7 +250,7 @@ function validationIssues(): Record<string, unknown> {
   };
 }
 
-function validValidation(): Record<string, unknown> {
+function validValidation(): ValidationResult {
   return {
     is_valid: true,
     summary: "The deterministic tall-dialog composition is runnable.",
@@ -245,15 +269,16 @@ function validValidation(): Record<string, unknown> {
 
 function auditIssues(
   sessionId: string,
-  validationResult: Record<string, unknown>,
-): Record<string, unknown> {
+  validationResult: ValidationResult,
+): AuditReadinessSnapshot {
+  const valid = validationResult.is_valid;
   return {
     session_id: sessionId,
     composition_version: 1,
     checked_at: FIXED_TIME,
     rows: [
-      { id: "validation", label: "Validation", status: "error", summary: "24 validation issues require attention.", detail: "The deterministic fixture keeps the inspector tall.", component_ids: ["source"] },
-      { id: "plugin_trust", label: "Plugin trust", status: "warning", summary: "Review the fixed plugin trust warning.", detail: null, component_ids: ["source"] },
+      { id: "validation", label: "Validation", status: valid ? "ok" : "error", summary: valid ? "Validation passed." : "24 validation issues require attention.", detail: valid ? null : "The deterministic fixture keeps the inspector tall.", component_ids: valid ? [] : ["source"] },
+      { id: "plugin_trust", label: "Plugin trust", status: valid ? "ok" : "warning", summary: valid ? "Plugin trust checks passed." : "Review the fixed plugin trust warning.", detail: null, component_ids: valid ? [] : ["source"] },
       { id: "provenance", label: "Provenance", status: "ok", summary: "Source provenance is recorded.", detail: null, component_ids: [] },
       { id: "retention", label: "Retention", status: "not_applicable", summary: "No completed run retention yet.", detail: null, component_ids: [] },
       { id: "llm_interpretations", label: "LLM interpretations", status: "not_applicable", summary: "No interpretation events.", detail: null, component_ids: [] },
@@ -266,7 +291,7 @@ function auditIssues(
 function pendingInterpretation(
   sessionId: string,
   compositionStateId: string,
-): Record<string, unknown> {
+): InterpretationEvent {
   return {
     id: "workspace-interpretation-01",
     session_id: sessionId,
@@ -294,14 +319,14 @@ function pendingInterpretation(
   };
 }
 
-function runFixtures(sessionId: string): Record<string, unknown>[] {
+function runFixtures(sessionId: string): Run[] {
   const accounting = {
     source: { rows_processed: 2, rows_rejected: 0, rows_read: 2 },
     sources: { source: { rows_processed: 2, rows_rejected: 0, rows_read: 2 } },
     tokens: { emitted: 2, terminal: 2, succeeded: 2, failed: 0, structural: 0, pending: 0, abandoned: 0 },
     routing: { routed_success: 2, routed_failure: 0, quarantined: 0, discarded: 0 },
     integrity: { closure: "closed", missing_terminal_outcomes: 0, duplicate_terminal_outcomes: 0 },
-  };
+  } satisfies RunAccounting;
   return [
     { id: "workspace-run-completed", session_id: sessionId, status: "completed", cancel_requested: false, accounting, accounting_corruption: null, error: null, started_at: "2026-08-11T08:00:00.000Z", finished_at: "2026-08-11T08:00:02.000Z", composition_version: 1, discard_summary: null },
     { id: "workspace-run-active", session_id: sessionId, status: "running", cancel_requested: false, accounting: null, accounting_corruption: null, error: null, started_at: "2026-08-11T08:01:00.000Z", finished_at: null, composition_version: 1, discard_summary: null },
@@ -312,7 +337,7 @@ async function fulfillWorkspaceRoute(
   route: Route,
   installed: InstalledScenario,
   scenario: WorkspaceScenario,
-  compositionState: Record<string, unknown> | null,
+  compositionState: CompositionState | null,
 ): Promise<boolean> {
   const request = route.request();
   const { pathname } = new URL(request.url());
@@ -333,7 +358,8 @@ async function fulfillWorkspaceRoute(
   }
   if (pathname === `/api/sessions/${sessionId}/interpretations` && method === "GET") {
     if (scenario !== "pending-acknowledgement") {
-      await route.fulfill({ json: { events: [] } });
+      const response = { events: [] } satisfies ListInterpretationEventsResponse;
+      await route.fulfill({ json: response });
       return true;
     }
     const signal = installed.pendingAcknowledgement;
@@ -341,7 +367,10 @@ async function fulfillWorkspaceRoute(
     await signal.promise;
     const stateId = compositionState?.id;
     if (typeof stateId !== "string") throw new Error("seeded state id missing");
-    await route.fulfill({ json: { events: [pendingInterpretation(sessionId, stateId)] } });
+    const response = {
+      events: [pendingInterpretation(sessionId, stateId)],
+    } satisfies ListInterpretationEventsResponse;
+    await route.fulfill({ json: response });
     return true;
   }
   if (pathname === `/api/sessions/${sessionId}/runs` && method === "GET") {
@@ -371,11 +400,43 @@ async function fulfillWorkspaceRoute(
   }
   if (scenario === "multiple-notices") {
     if (pathname === "/api/system/status" && method === "GET") {
-      await route.fulfill({ json: { composer_available: false, composer_model: "deterministic-e2e-model", composer_provider: "playwright-route", composer_reason: "Composer provider is unavailable for the deterministic notice scenario.", composer_missing_keys: [], composer_timeout_seconds: 180 } });
+      if (
+        installed.noticeMode === "recoverable-backend" &&
+        !installed.noticeBackendRecovered
+      ) {
+        await route.fulfill({
+          status: 503,
+          contentType: "application/json",
+          body: JSON.stringify({ detail: "Temporarily unavailable" }),
+        });
+        return true;
+      }
+      await route.fulfill({
+        json: {
+          composer_available: installed.noticeMode === "recoverable-backend",
+          composer_model: "deterministic-e2e-model",
+          composer_provider: "playwright-route",
+          composer_reason:
+            installed.noticeMode === "long-content"
+              ? "The Composer provider is unavailable while its operator checks the configured credentials and deployment policy. ".repeat(70)
+              : null,
+          composer_missing_keys: [],
+          composer_timeout_seconds: 180,
+        },
+      });
       return true;
     }
     if (pathname === "/api/composer-preferences" && method === "GET") {
-      await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ detail: "Deterministic preferences failure." }) });
+      await route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({
+          detail:
+            installed.noticeMode === "long-content"
+              ? "The preferences service could not load this account's saved Composer settings. ".repeat(40)
+              : "Preferences remain unavailable",
+        }),
+      });
       return true;
     }
   }
@@ -385,6 +446,7 @@ async function fulfillWorkspaceRoute(
 export async function installWorkspaceScenario(
   page: Page,
   scenario: WorkspaceScenario,
+  options: InstallWorkspaceScenarioOptions = {},
 ): Promise<string> {
   const token = tokenFromStorageState(await page.context().storageState());
   const ctx = await authedContext(token);
@@ -394,21 +456,39 @@ export async function installWorkspaceScenario(
   } finally {
     await ctx.dispose();
   }
-  const compositionState = scenario === "empty-freeform"
-    ? null
-    : await seedCanonicalComposition(page, sessionId, scenario);
-  const installed: InstalledScenario = {
-    sessionId,
-    pendingAcknowledgement: scenario === "pending-acknowledgement" ? deferredSignal() : null,
-    telemetry: { runHistoryRequests: 0 },
-  };
-  INSTALLED_SCENARIOS.set(page, installed);
-  await page.route("**/api/**", async (route) => {
-    if (!(await fulfillWorkspaceRoute(route, installed, scenario, compositionState))) {
-      await route.continue();
+  try {
+    const compositionState = scenario === "empty-freeform"
+      ? null
+      : await seedCanonicalComposition(page, sessionId, scenario);
+    const installed: InstalledScenario = {
+      sessionId,
+      pendingAcknowledgement: scenario === "pending-acknowledgement" ? deferredSignal() : null,
+      telemetry: { runHistoryRequests: 0 },
+      noticeMode: options.noticeMode ?? "long-content",
+      noticeBackendRecovered: false,
+    };
+    INSTALLED_SCENARIOS.set(page, installed);
+    await page.route("**/api/**", async (route) => {
+      if (!(await fulfillWorkspaceRoute(route, installed, scenario, compositionState))) {
+        await route.continue();
+      }
+    });
+    return sessionId;
+  } catch (error) {
+    const cleanup = await authedContext(token);
+    try {
+      await deleteSession(cleanup, sessionId);
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        `workspace scenario ${scenario} failed to install and clean up`,
+      );
+    } finally {
+      await cleanup.dispose();
+      INSTALLED_SCENARIOS.delete(page);
     }
-  });
-  return sessionId;
+    throw error;
+  }
 }
 
 export async function deleteWorkspaceScenario(page: Page, sessionId: string): Promise<void> {
@@ -427,6 +507,14 @@ export function releasePendingAcknowledgement(page: Page): void {
   const signal = INSTALLED_SCENARIOS.get(page)?.pendingAcknowledgement;
   if (signal === null || signal === undefined) throw new Error("no pending acknowledgement fixture");
   signal.release();
+}
+
+export function recoverWorkspaceNoticeBackend(page: Page): void {
+  const installed = INSTALLED_SCENARIOS.get(page);
+  if (installed?.noticeMode !== "recoverable-backend") {
+    throw new Error("no recoverable notice backend fixture is installed");
+  }
+  installed.noticeBackendRecovered = true;
 }
 
 export function workspaceScenarioTelemetry(page: Page): WorkspaceScenarioTelemetry {

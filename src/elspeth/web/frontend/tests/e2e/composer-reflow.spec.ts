@@ -114,4 +114,52 @@ test.describe("composer reflow geometry (elspeth-7aa9787996)", () => {
       }
     });
   }
+
+  test("skip link preserves the live session and a collapsed narrow Pipeline view", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 900, height: 720 });
+    await page.addInitScript(() => {
+      window.localStorage.setItem(
+        "elspeth_composer_workspace_layout_v1",
+        JSON.stringify({
+          version: 1,
+          preferredAuthoringWidth: 420,
+          authoringCollapsed: true,
+        }),
+      );
+    });
+    const sessionId = await installWorkspaceScenario(page, "populated-long-transcript");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      const workspace = composer.workspace();
+      await expect(workspace).toHaveAttribute("data-layout-mode", "narrow");
+      await expect(workspace).toHaveAttribute("data-authoring-collapsed", "true");
+      const pipelineTab = composer.pipelineViewTab();
+      await pipelineTab.click();
+      await expect(pipelineTab).toHaveAttribute("aria-selected", "true");
+      await expect(composer.authoringPane()).toBeHidden();
+
+      const sessionSwitcher = page.getByRole("button", {
+        name: "Session switcher: workspace populated-long-transcript",
+      });
+      await expect(sessionSwitcher).toBeVisible();
+      const skipLink = page.getByRole("link", { name: "Skip to main content" });
+      await skipLink.focus();
+      await skipLink.press("Enter");
+
+      const main = page.locator("#composer-main");
+      await expect(main).toBeVisible();
+      await expect(main).not.toHaveAttribute("hidden", "");
+      await expect(main).not.toHaveAttribute("inert", "");
+      await expect(main).toBeFocused();
+      await expect(page).toHaveURL(new RegExp(`#/${sessionId}$`));
+      await expect(sessionSwitcher).toBeVisible();
+      await expect(pipelineTab).toHaveAttribute("aria-selected", "true");
+      await expect(workspace).toHaveAttribute("data-authoring-collapsed", "true");
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
 });

@@ -32,10 +32,9 @@ export class ComposerPage {
   }
 
   chatInput(): Locator {
-    // ChatInput renders a textarea inside an aria-labelled region. Use the
-    // textbox role with the existing label "Message" (or fall back to any
-    // single textarea inside the chat panel).
-    return this.page.getByRole("textbox").filter({ hasText: "" }).first();
+    return this.page
+      .getByLabel("Chat panel")
+      .locator("textarea.chat-input-textarea");
   }
 
   validateButton(): Locator {
@@ -78,6 +77,14 @@ export class ComposerPage {
     return this.page.locator(".workspace-inspector-body");
   }
 
+  inspectorTab(name: "Validation" | "Audit"): Locator {
+    return this.inspector().getByRole("tab", { name, exact: true });
+  }
+
+  closeInspector(): Locator {
+    return this.inspector().getByRole("button", { name: "Close inspector" });
+  }
+
   actionBar(): Locator {
     return this.page.getByRole("group", { name: "Workspace actions" });
   }
@@ -112,5 +119,13 @@ export class ComposerPage {
 
   runPipeline(): Locator {
     return this.page.getByRole("button", { name: "Run pipeline" });
+  }
+
+  saveForReview(): Locator {
+    return this.page.getByRole("button", { name: "Save for review" });
+  }
+
+  exportYaml(): Locator {
+    return this.page.getByRole("button", { name: "Export YAML" });
   }
 }

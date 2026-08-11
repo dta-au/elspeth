@@ -21,6 +21,7 @@ export default tseslint.config(
       "tests/e2e/harness/oidc-*.ts",
       "tests/e2e/composer-workspace-geometry.spec.ts",
       "tests/e2e/composer-reflow.spec.ts",
+      "tests/e2e/helpers/api.ts",
       "tests/e2e/helpers/workspace-*.ts",
       "tests/e2e/page-objects/composer-page.ts",
     ],

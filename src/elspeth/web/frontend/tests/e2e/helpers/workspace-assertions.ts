@@ -11,6 +11,14 @@ interface ScrollCandidate {
   clientWidth: number;
   scrollHeight: number;
   clientHeight: number;
+  owner: "authoring" | "artifact" | "inspector" | "unexpected";
+  vertical: boolean;
+  horizontal: boolean;
+}
+
+export interface WorkspaceControlCapabilities {
+  completion: boolean;
+  moreActions: boolean;
 }
 
 export async function boxWidth(locator: Locator): Promise<number> {
@@ -67,7 +75,7 @@ async function expectControlReachable(control: Locator): Promise<void> {
         bounds.bottom <= document.documentElement.clientHeight,
       uncovered:
         hit !== null &&
-        (hit === element || element.contains(hit) || hit.contains(element)),
+        (hit === element || element.contains(hit)),
     };
   });
   expect(reachable.inside).toBe(true);
@@ -75,18 +83,46 @@ async function expectControlReachable(control: Locator): Promise<void> {
 }
 
 export async function expectPrimaryControlsInViewport(
-  _page: Page,
+  page: Page,
   composer: ComposerPage,
+  capabilities: WorkspaceControlCapabilities,
 ): Promise<void> {
-  const controls = [
-    composer.artifactTab("Graph"),
-    composer.validationStatus(),
-    composer.auditStatus(),
-    composer.collapseAuthoring(),
+  for (const name of ["Graph", "Spec", "YAML", "Run"] as const) {
+    await expectControlReachable(composer.artifactTab(name));
+  }
+  await expectControlReachable(composer.validationStatus());
+  await expectControlReachable(composer.auditStatus());
+
+  const completionControls = [
+    composer.saveForReview(),
+    composer.runPipeline(),
+    composer.exportYaml(),
   ];
-  if (await composer.moreActions().isVisible()) controls.push(composer.moreActions());
-  if (await composer.runPipeline().isVisible()) controls.push(composer.runPipeline());
-  for (const control of controls) await expectControlReachable(control);
+  for (const control of completionControls) {
+    await expect(control).toHaveCount(capabilities.completion ? 1 : 0);
+    if (capabilities.completion) await expectControlReachable(control);
+  }
+  await expect(composer.moreActions()).toHaveCount(
+    capabilities.moreActions ? 1 : 0,
+  );
+  if (capabilities.moreActions) {
+    await expectControlReachable(composer.moreActions());
+  }
+
+  await composer.validationStatus().click();
+  await expect(composer.inspector()).toBeVisible();
+  for (const name of ["Validation", "Audit"] as const) {
+    await expectControlReachable(composer.inspectorTab(name));
+  }
+  await expectControlReachable(composer.closeInspector());
+  await composer.closeInspector().click();
+
+  await expectControlReachable(composer.collapseAuthoring());
+  await composer.collapseAuthoring().click();
+  await expectControlReachable(composer.restoreAuthoring());
+  await composer.restoreAuthoring().click();
+  await expect(composer.collapseAuthoring()).toBeFocused();
+  expect(page.viewportSize()).not.toBeNull();
 }
 
 export async function expectIntendedPaneScrollers(
@@ -96,11 +132,50 @@ export async function expectIntendedPaneScrollers(
     inspectorMustScroll?: boolean;
   } = {},
 ): Promise<void> {
-  const candidates = await page.getByTestId("composer-workspace").evaluate(
-    (workspace): ScrollCandidate[] => {
+  const report = await page.getByTestId("composer-workspace").evaluate(
+    (workspace): { candidates: ScrollCandidate[]; outerOverflow: ScrollCandidate[] } => {
       const result: ScrollCandidate[] = [];
+      const describe = (
+        element: HTMLElement,
+        vertical: boolean,
+        horizontal: boolean,
+      ): ScrollCandidate => {
+        const style = getComputedStyle(element);
+        const owner = element.matches(
+          ".chat-panel-messages, .guided-authoring-scroll",
+        )
+          ? "authoring"
+          : element.matches(".artifact-workspace-panel:not([hidden])")
+            ? "artifact"
+            : element.matches(".workspace-inspector-body") &&
+                element.closest<HTMLElement>(".workspace-inspector")?.hidden === false
+              ? "inspector"
+              : "unexpected";
+        return {
+          selector:
+            element.getAttribute("aria-label") ??
+            element.getAttribute("role") ??
+            element.tagName.toLowerCase(),
+          className: element.className,
+          overflowX: style.overflowX,
+          overflowY: style.overflowY,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          scrollHeight: element.scrollHeight,
+          clientHeight: element.clientHeight,
+          owner,
+          vertical,
+          horizontal,
+        };
+      };
       for (const element of workspace.querySelectorAll<HTMLElement>("*")) {
-        if (element.hidden || element.closest("[hidden]")) continue;
+        if (
+          element.hidden ||
+          element.closest("[hidden]") !== null ||
+          element.getClientRects().length === 0
+        ) {
+          continue;
+        }
         // Text entry controls own bounded internal scrolling after their
         // viewport-relative maximum; they are not pane-level scroll owners.
         if (
@@ -118,36 +193,51 @@ export async function expectIntendedPaneScrollers(
           (style.overflowX === "auto" || style.overflowX === "scroll") &&
           element.scrollWidth > element.clientWidth + 1;
         if (!vertical && !horizontal) continue;
-        result.push({
-          selector:
-            element.getAttribute("aria-label") ??
-            element.getAttribute("role") ??
-            element.tagName.toLowerCase(),
-          className: element.className,
-          overflowX: style.overflowX,
-          overflowY: style.overflowY,
-          scrollWidth: element.scrollWidth,
-          clientWidth: element.clientWidth,
-          scrollHeight: element.scrollHeight,
-          clientHeight: element.clientHeight,
-        });
+        result.push(describe(element, vertical, horizontal));
       }
-      return result;
+      const outerElements = new Set<HTMLElement>([
+        document.documentElement as HTMLElement,
+        document.body,
+        ...document.querySelectorAll<HTMLElement>(".app-root, .app-main"),
+        workspace as HTMLElement,
+      ]);
+      for (let ancestor = workspace.parentElement; ancestor !== null; ancestor = ancestor.parentElement) {
+        outerElements.add(ancestor as HTMLElement);
+      }
+      const outerOverflow = [...outerElements].flatMap((element) => {
+        const vertical = element.scrollHeight > element.clientHeight + 1;
+        const horizontal = element.scrollWidth > element.clientWidth + 1;
+        return vertical || horizontal
+          ? [describe(element, vertical, horizontal)]
+          : [];
+      });
+      return { candidates: result, outerOverflow };
     },
   );
-  const allowedClasses = [
-    "chat-panel-messages",
-    "guided-authoring-scroll",
-    "artifact-workspace-panel",
-    "workspace-inspector-body",
-  ];
-  const unexpected = candidates.filter(
-    (candidate) =>
-      !allowedClasses.some((className) =>
-        candidate.className.split(/\s+/).includes(className),
-      ),
-  );
+  const { candidates, outerOverflow } = report;
+  expect(
+    outerOverflow,
+    `outer desktop surfaces must not scroll: ${JSON.stringify(outerOverflow)}`,
+  ).toEqual([]);
+  const unexpected = candidates.filter((candidate) => candidate.owner === "unexpected");
   expect(unexpected, `unexpected routine scrollers: ${JSON.stringify(unexpected)}`).toEqual([]);
+
+  const unexpectedHorizontal = candidates.filter(
+    (candidate) => candidate.horizontal && candidate.owner !== "artifact",
+  );
+  expect(
+    unexpectedHorizontal,
+    `only the active artifact body may scroll horizontally: ${JSON.stringify(unexpectedHorizontal)}`,
+  ).toEqual([]);
+  for (const owner of ["authoring", "artifact", "inspector"] as const) {
+    const verticalOwners = candidates.filter(
+      (candidate) => candidate.owner === owner && candidate.vertical,
+    );
+    expect(
+      verticalOwners.length,
+      `at most one visible vertical scroll owner is allowed for ${owner}: ${JSON.stringify(verticalOwners)}`,
+    ).toBeLessThanOrEqual(1);
+  }
 
   if (options.transcriptMustScroll) {
     expect(
@@ -166,7 +256,7 @@ export async function expectIntendedPaneScrollers(
 }
 
 export async function expectResizeGeometry(
-  _page: Page,
+  page: Page,
   composer: ComposerPage,
   viewportWidth: number,
 ): Promise<void> {
@@ -174,6 +264,16 @@ export async function expectResizeGeometry(
   const expectedDefault = viewportWidth < 1536 ? 360 : 420;
   const expectedMaximum = Math.min(640, viewportWidth - 640);
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedDefault);
+  const separatorBounds = await separator.boundingBox();
+  if (separatorBounds === null) throw new Error("workspace separator has no pointer target");
+  const startX = separatorBounds.x + separatorBounds.width / 2;
+  const startY = separatorBounds.y + separatorBounds.height / 2;
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  await page.mouse.move(viewportWidth, startY, { steps: 8 });
+  await page.mouse.up();
+  await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedMaximum);
+  await expect.poll(() => boxWidth(composer.artifactRegion())).toBeGreaterThanOrEqual(640);
   await separator.focus();
   await separator.press("Home");
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
