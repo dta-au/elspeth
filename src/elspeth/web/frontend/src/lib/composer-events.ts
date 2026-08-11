@@ -13,21 +13,21 @@ export interface RequestArtifactViewDetail {
   sessionId: string | null;
 }
 
-let artifactIntentSequence = 0;
+let workspaceIntentSequence = 0;
 
-export function claimArtifactViewIntent(): number {
-  artifactIntentSequence += 1;
-  return artifactIntentSequence;
+export function claimWorkspaceViewIntent(): number {
+  workspaceIntentSequence += 1;
+  return workspaceIntentSequence;
 }
 
-export function isCurrentArtifactViewIntent(intent: number): boolean {
-  return intent === artifactIntentSequence;
+export function isCurrentWorkspaceViewIntent(intent: number): boolean {
+  return intent === workspaceIntentSequence;
 }
 
 export function dispatchArtifactViewIntent(
   detail: RequestArtifactViewDetail,
 ): void {
-  claimArtifactViewIntent();
+  claimWorkspaceViewIntent();
   window.dispatchEvent(
     new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
       detail,
@@ -39,10 +39,20 @@ export function dispatchClaimedArtifactViewIntent(
   intent: number,
   detail: RequestArtifactViewDetail,
 ): void {
-  if (!isCurrentArtifactViewIntent(intent)) return;
+  if (!isCurrentWorkspaceViewIntent(intent)) return;
   window.dispatchEvent(
     new CustomEvent<RequestArtifactViewDetail>(REQUEST_ARTIFACT_VIEW_EVENT, {
       detail,
     }),
   );
+}
+
+export function dispatchAuthoringFocusIntent(): void {
+  claimWorkspaceViewIntent();
+  window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
+}
+
+export function dispatchClaimedAuthoringFocusIntent(intent: number): void {
+  if (!isCurrentWorkspaceViewIntent(intent)) return;
+  window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
 }

@@ -167,6 +167,9 @@ describe("executionStore.validate", () => {
     expect(state.validationResult).toBeNull();
     expect(state.isValidating).toBe(false);
     expect(state.error).toContain("internal error");
+    expect(state.validationError).toBe(
+      "Validation encountered an internal error. Please try again.",
+    );
     // Catch path must return false so the caller does not cache this version.
     expect(result).toBe(false);
   });

@@ -11,7 +11,10 @@ import {
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
-import { FOCUS_AUTHORING_EVENT } from "@/lib/composer-events";
+import {
+  FOCUS_AUTHORING_EVENT,
+  claimWorkspaceViewIntent,
+} from "@/lib/composer-events";
 import { WorkspacePaneProvider } from "./WorkspacePaneContext";
 import { WorkspaceSeparator } from "./WorkspaceSeparator";
 import { useWorkspacePaneState } from "./useWorkspacePaneState";
@@ -180,12 +183,14 @@ export function ComposerWorkspace({
 
   useLayoutEffect(() => {
     const focusAuthoring = (): void => {
+      claimWorkspaceViewIntent();
       setNarrowView("compose");
+      paneState.setAuthoringCollapsed(false);
       setAuthoringFocusRequest((current) => current + 1);
     };
     window.addEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
     return () => window.removeEventListener(FOCUS_AUTHORING_EVENT, focusAuthoring);
-  }, []);
+  }, [paneState]);
 
   const collapseAuthoring = (): void => {
     focusIntentRef.current = "restore";
@@ -198,6 +203,7 @@ export function ComposerWorkspace({
   };
 
   const selectNarrowView = (view: NarrowView, moveFocus: boolean): void => {
+    claimWorkspaceViewIntent();
     setNarrowView(view);
     if (moveFocus) {
       const target = view === "compose" ? composeTabRef : pipelineTabRef;

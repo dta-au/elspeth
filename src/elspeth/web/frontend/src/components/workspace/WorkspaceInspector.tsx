@@ -58,6 +58,7 @@ export function WorkspaceInspector({
     projectCompletedGuidedHistory(
       guidedSession.history,
       guidedSession.step,
+      guidedSession.terminal !== null,
     ).length > 0;
   const availableTabs: readonly InspectorTab[] = hasHistory
     ? ["validation", "audit", "history"]
@@ -283,6 +284,7 @@ export function WorkspaceInspector({
               <GuidedHistory
                 history={guidedSession.history}
                 currentStep={guidedSession.step}
+                terminal={guidedSession.terminal !== null}
               />
             </ErrorBoundary>
           </div>

@@ -20,6 +20,8 @@ import {
   FOCUS_AUTHORING_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   REQUEST_RUN_EVENT,
+  claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "./lib/composer-events";
 import type {
@@ -724,16 +726,38 @@ describe("App banner roles", () => {
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
   });
 
-  it("routes Ctrl+/ through the shared authoring focus intent", async () => {
+  it("lets Ctrl+/ supersede a real deferred Spec hash through the shared workspace clock", async () => {
     const onFocusAuthoring = vi.fn();
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
     window.addEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [{ id: "session-1", title: "Session 1" } as never],
+      compositionStateLoaded: false,
+      compositionState: makeState(1),
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
     render(<App />);
     await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
 
+    const pendingAuthority = claimWorkspaceViewIntent();
     fireEvent.keyDown(document, { key: "/", ctrlKey: true });
+    expect(isCurrentWorkspaceViewIntent(pendingAuthority)).toBe(false);
+    act(() => {
+      useSessionStore.setState({ compositionStateLoaded: true });
+    });
+    await act(async () => Promise.resolve());
 
     expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
     window.removeEventListener(FOCUS_AUTHORING_EVENT, onFocusAuthoring);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });
 
   it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {

@@ -106,6 +106,7 @@ test.describe("composer reflow geometry (elspeth-7aa9787996)", () => {
 
         await composeTab.click();
         await expect(composeTab).toHaveAttribute("aria-selected", "true");
+        await expect(composer.separator()).toBeHidden();
         const textareaAfterSwitch = page.locator(".chat-input-textarea");
         await expect(textareaAfterSwitch).toBeVisible();
         await expect(textareaAfterSwitch).toHaveValue("reflow probe");

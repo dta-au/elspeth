@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ReactNode, useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,8 +7,8 @@ import {
   FOCUS_AUTHORING_EVENT,
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
-  claimArtifactViewIntent,
-  isCurrentArtifactViewIntent,
+  claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
   REQUEST_RUN_EVENT,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
@@ -23,6 +23,7 @@ import type { GuidedSession } from "@/types/guided";
 import type { ValidationResult } from "@/types/index";
 import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
 import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
+import { useHashRouter } from "@/hooks/useHashRouter";
 
 vi.mock("@xyflow/react", () => ({
   MarkerType: { ArrowClosed: "arrowclosed" },
@@ -102,10 +103,12 @@ describe("CommandPalette guided-mode commands", () => {
     vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
   });
 
-  it("closes before requesting YAML so final focus lands on the workspace tab", async () => {
+  it("closes before YAML supersedes a deferred Spec hash so final focus lands on YAML", async () => {
     const user = userEvent.setup();
     useSessionStore.setState({
       activeSessionId: "session-1",
+      sessions: [{ id: "session-1", title: "Session 1" }],
+      compositionStateLoaded: false,
       compositionState: {
         id: "state-1",
         version: 1,
@@ -116,8 +119,10 @@ describe("CommandPalette guided-mode commands", () => {
         metadata: { name: null, description: null },
       },
     } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
 
     function Harness() {
+      useHashRouter();
       const [open, setOpen] = useState(false);
       return (
         <>
@@ -142,6 +147,8 @@ describe("CommandPalette guided-mode commands", () => {
     render(<Harness />);
     await user.click(screen.getByRole("button", { name: "Open palette" }));
     await user.click(screen.getByRole("option", { name: /export yaml/i }));
+    act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+    await act(async () => Promise.resolve());
 
     await waitFor(() => {
       expect(screen.queryByRole("dialog", { name: "Command palette" })).toBeNull();
@@ -238,9 +245,9 @@ describe("CommandPalette guided-mode commands", () => {
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
-    const priorIntent = claimArtifactViewIntent();
+    const priorIntent = claimWorkspaceViewIntent();
     fireEvent.click(screen.getByText(/show graph/i));
-    expect(isCurrentArtifactViewIntent(priorIntent)).toBe(false);
+    expect(isCurrentWorkspaceViewIntent(priorIntent)).toBe(false);
     await waitFor(() => {
       expect(artifactRequests).toEqual([
         { tab: "graph", focusMode: false, sessionId: "session-1" },

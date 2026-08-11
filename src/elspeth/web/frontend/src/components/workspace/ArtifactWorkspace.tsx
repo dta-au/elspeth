@@ -15,7 +15,7 @@ import { YamlView } from "@/components/inspector/YamlView";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
-  claimArtifactViewIntent,
+  claimWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -205,6 +205,7 @@ export function ArtifactWorkspaceSurface({
 
   const focusGraph = useCallback((): void => {
     const sessionId = committedControllerRef.current.sessionId;
+    claimWorkspaceViewIntent();
     selectAndFocus("graph");
     queueGraphModal(sessionId);
   }, [queueGraphModal, selectAndFocus]);
@@ -219,7 +220,7 @@ export function ArtifactWorkspaceSurface({
       ) {
         return;
       }
-      claimArtifactViewIntent();
+      claimWorkspaceViewIntent();
       selectAndFocus(request.tab);
       if (request.tab === "graph" && request.focusMode) {
         queueGraphModal(request.sessionId);
@@ -265,7 +266,7 @@ export function ArtifactWorkspaceSurface({
 
   const selectTab = (tab: ArtifactTab): void => {
     if (!availableArtifactTabs.includes(tab)) return;
-    claimArtifactViewIntent();
+    claimWorkspaceViewIntent();
     actions.showPipeline();
     actions.selectArtifactTab(tab);
     tabRefs.current[tab]?.focus({ preventScroll: true });

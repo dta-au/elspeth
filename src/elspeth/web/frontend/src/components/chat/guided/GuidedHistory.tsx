@@ -18,6 +18,8 @@ interface Props {
    * recorded a summary.
    */
   currentStep: GuidedStep;
+  /** Terminal sessions have completed their current (final) step. */
+  terminal?: boolean;
 }
 
 /**
@@ -31,10 +33,11 @@ interface Props {
 export function projectCompletedGuidedHistory(
   history: readonly TurnRecord[],
   currentStep: GuidedStep,
+  terminal = false,
 ): TurnRecord[] {
   const latestByStep = new Map<GuidedStep, TurnRecord>();
   for (const turn of history) {
-    if (turn.step === currentStep) continue;
+    if (!terminal && turn.step === currentStep) continue;
     if (turn.summary === null) continue;
     latestByStep.set(turn.step, turn);
   }
@@ -47,8 +50,12 @@ export function projectCompletedGuidedHistory(
  * Returns null whenever the shared projection finds no completed, summarised
  * prior-step rows, including current-step-only and summary-null history.
  */
-export function GuidedHistory({ history, currentStep }: Props): React.ReactElement | null {
-  const rows = projectCompletedGuidedHistory(history, currentStep);
+export function GuidedHistory({
+  history,
+  currentStep,
+  terminal = false,
+}: Props): React.ReactElement | null {
+  const rows = projectCompletedGuidedHistory(history, currentStep, terminal);
 
   // No completed decisions yet (e.g. still on the first step before any Send):
   // render nothing rather than an empty "Decisions so far" card.
@@ -70,9 +77,8 @@ export function GuidedHistory({ history, currentStep }: Props): React.ReactEleme
             <span className="guided-history-step-name">
               {GUIDED_STEP_LABELS[turn.step]}
             </span>
-            {/* Only past, summarised steps reach here (the current step and
-                summary-null turns are filtered above), so every row has a real
-                summary — no fallback needed. */}
+            {/* Only completed, summarised steps reach here, so every row has a
+                real summary — no fallback needed. */}
             <span className="guided-history-summary">
               {turn.summary}
             </span>

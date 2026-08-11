@@ -155,6 +155,9 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       // Monotonic write guard: discard the response if a newer version has
       // already been stored while this fetch was in flight.
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const current = state.snapshotsBySession[sessionId];
         if (current && current.composition_version > snapshot.composition_version) {
           // Stale response arrived after a newer one was already cached —
@@ -202,6 +205,9 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (state.abortControllers[sessionId] !== controller) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.abortControllers;
         return {
           abortControllers: restCtrl,
@@ -236,6 +242,11 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
     try {
       const explain = await fetchAuditReadinessExplain(sessionId, explainController.signal);
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainsBySession: {
@@ -272,6 +283,11 @@ export const useAuditReadinessStore = create<AuditReadinessState>((set, get) => 
       }
       const apiErr = err as ApiError;
       set((state) => {
+        if (
+          state.explainAbortControllers[sessionId] !== explainController
+        ) {
+          return state;
+        }
         const { [sessionId]: _ctrl, ...restCtrl } = state.explainAbortControllers;
         return {
           explainAbortControllers: restCtrl,

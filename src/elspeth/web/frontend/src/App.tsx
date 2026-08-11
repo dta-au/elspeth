@@ -33,7 +33,7 @@ import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferen
 import { HelloWorldTutorial } from "./components/tutorial";
 import {
   REQUEST_RUN_EVENT,
-  FOCUS_AUTHORING_EVENT,
+  dispatchAuthoringFocusIntent,
   dispatchArtifactViewIntent,
 } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
@@ -425,7 +425,7 @@ function App() {
       // Ctrl+/ / Cmd+/: Focus chat input
       if (e.key === "/" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
+        dispatchAuthoringFocusIntent();
         return;
       }
 

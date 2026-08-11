@@ -56,6 +56,12 @@ describe("projectCompletedGuidedHistory", () => {
       ),
     ).toEqual([latestSource, TURN_2]);
   });
+
+  it("retains the final current-step decision once the guided session is terminal", () => {
+    expect(
+      projectCompletedGuidedHistory([TURN_1, TURN_2], "step_2_sink", true),
+    ).toEqual([TURN_1, TURN_2]);
+  });
 });
 
 describe("GuidedHistory", () => {
@@ -103,6 +109,22 @@ describe("GuidedHistory", () => {
       />,
     );
     expect(container.firstChild).toBeNull();
+  });
+
+  it("renders the final wiring decision for a terminal guided session", () => {
+    render(
+      <GuidedHistory
+        history={[{
+          ...TURN_2,
+          step: "step_4_wire",
+          summary: "Connected transform to output",
+        }]}
+        currentStep="step_4_wire"
+        terminal
+      />,
+    );
+
+    expect(screen.getByText("Connected transform to output")).toBeInTheDocument();
   });
 
   it("renders only the completed rows selected by the shared projection", () => {

@@ -15,7 +15,7 @@ import {
   installWorkspaceScenario,
   recoverWorkspaceNoticeBackend,
   releasePendingAcknowledgement,
-  resetWorkspaceScenarioTelemetry,
+  setRunHistoryRequestPhase,
   WORKSPACE_SCENARIOS,
   workspaceScenarioTelemetry,
   type WorkspaceScenario,
@@ -30,7 +30,7 @@ async function installRunPollingClockProbe(page: ComposerPage["page"]): Promise<
   await page.clock.install();
   const currentBrowserTime = await page.evaluate(() => Date.now());
   await page.clock.pauseAt(currentBrowserTime + 100);
-  await page.evaluate(() => {
+  await page.addInitScript(() => {
     const originalSetInterval = window.setInterval.bind(window);
     const originalClearInterval = window.clearInterval.bind(window);
     const activeIntervalIds = new Set<number>();
@@ -376,32 +376,80 @@ test.describe("Composer deterministic workspace geometry", () => {
 
   test("run-history polling follows the active Run artifact lifecycle once", async ({
     page,
-  }) => {
+  }, testInfo) => {
     await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "active-completed-run");
     const composer = new ComposerPage(page);
     try {
+      await installRunPollingClockProbe(page);
       await composer.goto(sessionId);
       await composer.waitForChatReady();
-      await installRunPollingClockProbe(page);
+      const expectedRunsUrl = new URL(
+        `/api/sessions/${sessionId}/runs`,
+        page.url(),
+      ).href;
+      const mountRequests = workspaceScenarioTelemetry(page).runHistoryRequestLog;
+      expect(mountRequests).toHaveLength(2);
+      expect(mountRequests).toEqual(
+        mountRequests.map((request) => ({
+          url: expectedRunsUrl,
+          timestamp: request.timestamp,
+          phase: "mount",
+        })),
+      );
+      await expect.poll(() => activeRunPollingIntervals(page)).toBe(0);
+
+      setRunHistoryRequestPhase(page, "activate-run");
       await composer.artifactTab("Run").click();
       await expect(page.getByText("Pipeline running.", { exact: true })).toBeVisible();
       await expect.poll(() => activeRunPollingIntervals(page)).toBe(1);
-      resetWorkspaceScenarioTelemetry(page);
+      await expect
+        .poll(() => workspaceScenarioTelemetry(page).runHistoryRequestLog)
+        .toHaveLength(4);
+      const activationRequests = workspaceScenarioTelemetry(page)
+        .runHistoryRequestLog.slice(2);
+      expect(activationRequests).toEqual(
+        activationRequests.map((request) => ({
+          url: expectedRunsUrl,
+          timestamp: request.timestamp,
+          phase: "activate-run",
+        })),
+      );
+
+      setRunHistoryRequestPhase(page, "poll-tick");
+      const activeRequestCount = workspaceScenarioTelemetry(page).runHistoryRequests;
       await page.clock.fastForward(3_000);
       await expect
         .poll(() => workspaceScenarioTelemetry(page).runHistoryRequests, {
           timeout: 5_000,
         })
-        .toBe(1);
-      await page.clock.fastForward(2_999);
-      expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(1);
+        .toBe(activeRequestCount + 1);
+      expect(workspaceScenarioTelemetry(page).runHistoryRequestLog.at(-1)).toMatchObject({
+        url: expectedRunsUrl,
+        phase: "poll-tick",
+      });
 
+      setRunHistoryRequestPhase(page, "before-next-tick");
+      await page.clock.fastForward(2_999);
+      expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(
+        activeRequestCount + 1,
+      );
+
+      setRunHistoryRequestPhase(page, "inactive");
       await composer.artifactTab("Graph").click();
       await expect.poll(() => activeRunPollingIntervals(page)).toBe(0);
-      resetWorkspaceScenarioTelemetry(page);
       await page.clock.fastForward(6_001);
-      expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(0);
+      expect(workspaceScenarioTelemetry(page).runHistoryRequests).toBe(
+        activeRequestCount + 1,
+      );
+      await testInfo.attach("run-history-request-provenance", {
+        body: JSON.stringify(
+          workspaceScenarioTelemetry(page).runHistoryRequestLog,
+          null,
+          2,
+        ),
+        contentType: "application/json",
+      });
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }
@@ -448,6 +496,36 @@ test.describe("Composer deterministic workspace geometry", () => {
       await expect.poll(() => composer.activeArtifactPanel().evaluate(
         (element) => element.scrollHeight > element.clientHeight,
       )).toBe(true);
+      const scrollOwnership = await page.evaluate(() => {
+        const results = document.querySelector<HTMLElement>(
+          '[aria-label="Pipeline run results"]',
+        );
+        const panel = document.querySelector<HTMLElement>(
+          ".artifact-workspace-panel:not([hidden])",
+        );
+        if (results === null || panel === null) {
+          throw new Error("Run scroll ownership surfaces are missing");
+        }
+        results.scrollTop = 300;
+        panel.scrollTop = 300;
+        const root = document.scrollingElement;
+        if (root === null) throw new Error("document scrolling element is missing");
+        return {
+          resultsScrollTop: results.scrollTop,
+          panelScrollTop: panel.scrollTop,
+          documentScrollTop: root.scrollTop,
+          documentScrollHeight: root.scrollHeight,
+          documentClientHeight: root.clientHeight,
+          documentOverflowY: getComputedStyle(root).overflowY,
+        };
+      });
+      expect(scrollOwnership.resultsScrollTop).toBe(0);
+      expect(scrollOwnership.panelScrollTop).toBeGreaterThan(0);
+      expect(scrollOwnership.documentScrollTop).toBe(0);
+      expect(scrollOwnership.documentScrollHeight).toBeLessThanOrEqual(
+        scrollOwnership.documentClientHeight,
+      );
+      expect(scrollOwnership.documentOverflowY).toBe("hidden");
       await expect(composer.artifactTab("Run")).toHaveAttribute("aria-selected", "true");
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
@@ -488,17 +566,52 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
-  test("Ctrl+/ reveals Compose before focusing the chat input", async ({ page }) => {
+  test("Ctrl+/ restores collapsed Compose before focusing the chat input", async ({ page }) => {
     await page.setViewportSize({ width: 720, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");
     const composer = new ComposerPage(page);
     try {
       await composer.goto(sessionId);
       await composer.waitForChatReady();
+      await composer.collapseAuthoring().click();
       await composer.pipelineViewTab().click();
       await page.keyboard.press("Control+/");
+      await expect(composer.workspace()).not.toHaveAttribute(
+        "data-authoring-collapsed",
+      );
       await expect(composer.composeViewTab()).toHaveAttribute("aria-selected", "true");
       await expect(composer.chatInput()).toBeFocused();
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  test("command palette closes after Show Graph and leaves Graph selected and focused", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "populated-long-transcript");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      await composer.artifactTab("Spec").click();
+      // Playwright treats an uppercase chord token as Shift+K; the product
+      // shortcut is the unshifted Ctrl+K key event (KeyboardEvent.key === "k").
+      await page.keyboard.press("Control+k");
+      const palette = page.getByRole("dialog", { name: "Command palette" });
+      await expect(palette).toBeVisible();
+      await palette.getByRole("combobox", { name: "Search commands" }).fill(
+        "Show Graph",
+      );
+      await palette.getByRole("option", { name: /Show Graph/ }).click();
+
+      await expect(palette).toBeHidden();
+      await expect(composer.artifactTab("Graph")).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      await expect(composer.artifactTab("Graph")).toBeFocused();
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

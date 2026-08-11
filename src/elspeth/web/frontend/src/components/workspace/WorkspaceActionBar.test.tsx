@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -140,6 +140,35 @@ describe("WorkspaceActionBar", () => {
     expect(
       screen.queryByRole("button", { name: "Audit: Ready" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("shows validation request progress and a sanitised terminal failure", () => {
+    useExecutionStore.setState({
+      validationResult: null,
+      isValidating: true,
+      validationError: null,
+    } as never);
+    const view = renderActionBar({
+      completion: false,
+      importYaml: false,
+      catalog: false,
+    });
+    expect(
+      screen.getByRole("button", { name: "Validation: Checking" }),
+    ).toHaveAttribute("data-tone", "busy");
+
+    act(() => {
+      useExecutionStore.setState({
+        isValidating: false,
+        validationError: "sensitive upstream validation response",
+      } as never);
+    });
+    expect(
+      screen.getByRole("button", { name: "Validation: Check failed" }),
+    ).toHaveTextContent("ValidationCheck failed");
+    expect(view.container).not.toHaveTextContent(
+      "sensitive upstream validation response",
+    );
   });
 
   it.each([

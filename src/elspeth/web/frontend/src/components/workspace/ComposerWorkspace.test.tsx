@@ -18,6 +18,10 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useSessionStore } from "@/stores/sessionStore";
+import {
+  claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
+} from "@/lib/composer-events";
 import { ComposerWorkspace } from "./ComposerWorkspace";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
 import { useCollapsedAuthoringStatus } from "./useCollapsedAuthoringStatus";
@@ -685,5 +689,50 @@ describe("ComposerWorkspace", () => {
     act(() => window.dispatchEvent(new Event("elspeth:focus-authoring")));
     expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("textbox", { name: "Chat input" })).toHaveFocus();
+  });
+
+  it.each([1280, 720])(
+    "restores collapsed authoring before focusing chat at %ipx",
+    async (width) => {
+      const user = userEvent.setup();
+      renderWorkspace({
+        authoring: <textarea data-chat-input aria-label="Chat input" />,
+      });
+      const root = emitWidth(width);
+      await user.click(
+        screen.getByRole("button", { name: "Collapse authoring pane" }),
+      );
+      if (width < 960) {
+        await user.click(screen.getByRole("tab", { name: "Pipeline" }));
+      }
+
+      act(() => window.dispatchEvent(new Event("elspeth:focus-authoring")));
+
+      expect(root).not.toHaveAttribute("data-authoring-collapsed");
+      if (width < 960) {
+        expect(screen.getByRole("tab", { name: "Compose" })).toHaveAttribute(
+          "aria-selected",
+          "true",
+        );
+      }
+      expect(screen.getByRole("textbox", { name: "Chat input" })).toHaveFocus();
+    },
+  );
+
+  it("treats authoring focus and direct workspace tabs as newer workspace intents", () => {
+    renderWorkspace({ authoring: <textarea data-chat-input aria-label="Chat input" /> });
+    emitWidth(720);
+
+    const beforeFocus = claimWorkspaceViewIntent();
+    act(() => window.dispatchEvent(new Event("elspeth:focus-authoring")));
+    expect(isCurrentWorkspaceViewIntent(beforeFocus)).toBe(false);
+
+    const beforePipeline = claimWorkspaceViewIntent();
+    fireEvent.click(screen.getByRole("tab", { name: "Pipeline" }));
+    expect(isCurrentWorkspaceViewIntent(beforePipeline)).toBe(false);
+
+    const beforeCompose = claimWorkspaceViewIntent();
+    fireEvent.click(screen.getByRole("tab", { name: "Compose" }));
+    expect(isCurrentWorkspaceViewIntent(beforeCompose)).toBe(false);
   });
 });

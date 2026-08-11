@@ -25,6 +25,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition } from "@/test/composerFixtures";
 import { useHashRouter } from "@/hooks/useHashRouter";
+import { ExportYamlButton } from "@/components/sidebar/ExportYamlButton";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
@@ -289,6 +290,55 @@ describe("ArtifactWorkspace", () => {
       "true",
     );
     expect(screen.getByRole("tab", { name: "Run" })).toHaveFocus();
+  });
+
+  it("keeps a real Export YAML intent after an older deferred Spec hash loads", async () => {
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: makeComposition(1),
+      sessions: [{ id: "session-1", title: "Session 1" }],
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+    const user = userEvent.setup();
+    renderArtifactWorkspace({
+      inspector: (
+        <>
+          <HashRouterProbe />
+          <ExportYamlButton />
+        </>
+      ),
+    });
+
+    await user.click(screen.getByRole("button", { name: /export yaml/i }));
+    act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
+  });
+
+  it("keeps a real Focus Graph intent after an older deferred Spec hash loads", async () => {
+    useSessionStore.setState({
+      compositionStateLoaded: false,
+      compositionState: makeComposition(1),
+      sessions: [{ id: "session-1", title: "Session 1" }],
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
+    const user = userEvent.setup();
+    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
+
+    await user.click(screen.getByRole("button", { name: "Focus Graph" }));
+    act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+    await act(async () => Promise.resolve());
+
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Graph" })).toHaveFocus();
   });
 
   it("skips disabled tabs while roving in an empty composition", async () => {

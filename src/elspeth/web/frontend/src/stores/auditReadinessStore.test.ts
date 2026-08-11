@@ -38,6 +38,24 @@ function snapshot(version: number): AuditReadinessSnapshot {
   };
 }
 
+function explain(version: number, narrative = `version ${version}`): AuditReadinessExplain {
+  return {
+    session_id: SESSION_ID,
+    composition_version: version,
+    narrative,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("useAuditReadinessStore", () => {
   beforeEach(() => {
     useAuditReadinessStore.setState(getInitialState());
@@ -323,6 +341,120 @@ describe("useAuditReadinessStore", () => {
     expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
     expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(false);
   });
+
+  it.each(["success", "error"] as const)(
+    "a superseded snapshot %s cannot publish, clear loading, or remove the newer controller",
+    async (outcome) => {
+      const first = deferred<AuditReadinessSnapshot>();
+      const second = deferred<AuditReadinessSnapshot>();
+      vi.mocked(api.fetchAuditReadiness)
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+
+      const firstLoad = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 1);
+      const secondLoad = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 2);
+      const newerController =
+        useAuditReadinessStore.getState().abortControllers[SESSION_ID];
+
+      if (outcome === "success") first.resolve(snapshot(1));
+      else first.reject({ status: 500, detail: "stale snapshot failure" });
+      await firstLoad;
+
+      let state = useAuditReadinessStore.getState();
+      expect(state.abortControllers[SESSION_ID]).toBe(newerController);
+      expect(state.isLoadingBySession[SESSION_ID]).toBe(true);
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBeNull();
+
+      second.resolve(snapshot(2));
+      await secondLoad;
+      state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toEqual(snapshot(2));
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "a snapshot %s settling after clearSession cannot resurrect session state",
+    async (outcome) => {
+      const request = deferred<AuditReadinessSnapshot>();
+      vi.mocked(api.fetchAuditReadiness).mockReturnValueOnce(request.promise);
+      const load = useAuditReadinessStore
+        .getState()
+        .loadSnapshot(SESSION_ID, 1);
+
+      useAuditReadinessStore.getState().clearSession(SESSION_ID);
+      if (outcome === "success") request.resolve(snapshot(1));
+      else request.reject({ status: 500, detail: "late snapshot failure" });
+      await load;
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.snapshotsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.abortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingBySession[SESSION_ID]).toBeUndefined();
+      expect(state.errorBySession[SESSION_ID]).toBeUndefined();
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "a superseded explain %s cannot publish, clear loading, or remove the newer controller",
+    async (outcome) => {
+      const first = deferred<AuditReadinessExplain>();
+      const second = deferred<AuditReadinessExplain>();
+      vi.mocked(api.fetchAuditReadinessExplain)
+        .mockReturnValueOnce(first.promise)
+        .mockReturnValueOnce(second.promise);
+
+      const firstLoad = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 1);
+      const secondLoad = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 2);
+      const newerController =
+        useAuditReadinessStore.getState().explainAbortControllers[SESSION_ID];
+
+      if (outcome === "success") first.resolve(explain(1));
+      else first.reject({ status: 500, detail: "stale explain failure" });
+      await firstLoad;
+
+      let state = useAuditReadinessStore.getState();
+      expect(state.explainAbortControllers[SESSION_ID]).toBe(newerController);
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBe(true);
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBeNull();
+
+      second.resolve(explain(2));
+      await secondLoad;
+      state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toEqual(explain(2));
+    },
+  );
+
+  it.each(["success", "error"] as const)(
+    "an explain %s settling after clearSession cannot resurrect session state",
+    async (outcome) => {
+      const request = deferred<AuditReadinessExplain>();
+      vi.mocked(api.fetchAuditReadinessExplain).mockReturnValueOnce(request.promise);
+      const load = useAuditReadinessStore
+        .getState()
+        .loadExplain(SESSION_ID, 1);
+
+      useAuditReadinessStore.getState().clearSession(SESSION_ID);
+      if (outcome === "success") request.resolve(explain(1));
+      else request.reject({ status: 500, detail: "late explain failure" });
+      await load;
+
+      const state = useAuditReadinessStore.getState();
+      expect(state.explainsBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainAbortControllers[SESSION_ID]).toBeUndefined();
+      expect(state.isLoadingExplainBySession[SESSION_ID]).toBeUndefined();
+      expect(state.explainErrorBySession[SESSION_ID]).toBeUndefined();
+    },
+  );
 
   // --- Monotonic write-guard contract ---
   // This test exercises the version monotonicity guard (loadSnapshot discards

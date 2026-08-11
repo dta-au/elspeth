@@ -115,6 +115,25 @@ describe("workspace status projections", () => {
     });
   });
 
+  it("projects validation request progress and failure without exposing raw details", () => {
+    expect(projectValidationWorkspaceStatus(null, true, null)).toEqual({
+      text: "Checking",
+      tone: "busy",
+      accessibleLabel: "Validation: Checking",
+    });
+    expect(
+      projectValidationWorkspaceStatus(
+        null,
+        false,
+        "sensitive upstream validation response",
+      ),
+    ).toEqual({
+      text: "Check failed",
+      tone: "error",
+      accessibleLabel: "Validation: Check failed",
+    });
+  });
+
   it("never presents a stale or wrong-session audit snapshot as ready", () => {
     const current = auditSnapshot();
     const snapshots = { [SESSION_ID]: current };

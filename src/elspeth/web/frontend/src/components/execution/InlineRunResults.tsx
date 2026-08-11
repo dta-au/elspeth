@@ -287,11 +287,11 @@ export function InlineRunResults({
   const mostRecentRun = !activeRunId ? (visibleRuns[0] ?? null) : null;
   const displayRun = activeRun ?? mostRecentRun;
   // Drawer contents: all terminal runs, including the one already displayed,
-  // PLUS any live (pending/running) run this tab is NOT attached to. An
-  // attached live run already exposes Cancel through ProgressView; an
-  // unattached one (reload where rehydration raced, run started from
-  // another tab) must reach the drawer so its REST-backed Cancel is the
-  // guaranteed fallback (elspeth-90db33baac).
+  // PLUS any live (pending/running) run this browser tab is NOT attached to.
+  // An attached live run already exposes Cancel through ProgressView in the
+  // persistent Run artifact; an unattached one (reload where rehydration
+  // raced, run started from another browser tab) must reach history so its
+  // REST-backed Cancel is the guaranteed fallback (elspeth-90db33baac).
   const drawerRuns = visibleRuns.filter((run) => {
     if (isTerminalRunStatus(run.status)) {
       return true;

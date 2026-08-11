@@ -7,6 +7,7 @@ import {
   type WorkspaceScenario,
 } from "./helpers/workspace-fixtures";
 import { ComposerPage } from "./page-objects/composer-page";
+import { setupWorkspaceScenario } from "./helpers/workspace-setup";
 
 const ACCESSIBILITY_VIEWPORT = { width: 1536, height: 760 };
 const AXE_TAGS = [
@@ -37,10 +38,16 @@ async function openScenario(
   viewport = ACCESSIBILITY_VIEWPORT,
 ): Promise<{ composer: ComposerPage; sessionId: string }> {
   await page.setViewportSize(viewport);
-  const sessionId = await installWorkspaceScenario(page, scenario);
-  const composer = new ComposerPage(page);
-  await composer.goto(sessionId);
-  await composer.waitForChatReady();
+  const { sessionId, value: composer } = await setupWorkspaceScenario(
+    () => installWorkspaceScenario(page, scenario),
+    async (createdSessionId) => {
+      const createdComposer = new ComposerPage(page);
+      await createdComposer.goto(createdSessionId);
+      await createdComposer.waitForChatReady();
+      return createdComposer;
+    },
+    (createdSessionId) => deleteWorkspaceScenario(page, createdSessionId),
+  );
   return { composer, sessionId };
 }
 

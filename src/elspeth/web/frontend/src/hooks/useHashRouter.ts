@@ -20,9 +20,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  claimArtifactViewIntent,
+  claimWorkspaceViewIntent,
   dispatchClaimedArtifactViewIntent,
-  isCurrentArtifactViewIntent,
+  isCurrentWorkspaceViewIntent,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
@@ -116,7 +116,7 @@ export function useHashRouter(
 
   const requestArtifact = useCallback((sessionId: string, tab: ArtifactTab): void => {
     cancelPendingArtifactIntent();
-    const sequence = claimArtifactViewIntent();
+    const sequence = claimWorkspaceViewIntent();
     if (tab !== "spec" && tab !== "yaml") {
       queueMicrotask(() => dispatchArtifactIntent(sequence, sessionId, tab));
       return;
@@ -151,7 +151,7 @@ export function useHashRouter(
       queueMicrotask(() => {
         if (
           pendingArtifactIntent.current !== intent ||
-          !isCurrentArtifactViewIntent(intent.sequence)
+          !isCurrentWorkspaceViewIntent(intent.sequence)
         ) return;
         const committedState = useSessionStore.getState();
         cancelPendingArtifactIntent();

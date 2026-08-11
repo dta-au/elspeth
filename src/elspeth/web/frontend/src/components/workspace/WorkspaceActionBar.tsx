@@ -60,6 +60,10 @@ export function WorkspaceActionBar({
   const validationResult = useExecutionStore(
     (state) => state.validationResult,
   );
+  const isValidating = useExecutionStore((state) => state.isValidating);
+  const validationError = useExecutionStore(
+    (state) => state.validationError,
+  );
   const activeSessionId = useSessionStore(
     (state) => state.activeSessionId,
   );
@@ -77,7 +81,11 @@ export function WorkspaceActionBar({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const pendingMenuFocusRef = useRef<PendingMenuFocus>(null);
   const validationStatus =
-    projectValidationWorkspaceStatus(validationResult);
+    projectValidationWorkspaceStatus(
+      validationResult,
+      isValidating,
+      validationError,
+    );
   const auditStatus = projectAuditWorkspaceStatus({
     activeSessionId,
     compositionVersion,

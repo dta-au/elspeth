@@ -26,7 +26,13 @@ function validationStatus(
 
 export function projectValidationWorkspaceStatus(
   validationResult: ValidationResult | null,
+  isValidating = false,
+  validationError: string | null = null,
 ): WorkspaceStatus {
+  if (isValidating) return validationStatus("Checking", "busy");
+  if (validationError !== null) {
+    return validationStatus("Check failed", "error");
+  }
   if (validationResult === null) {
     return validationStatus("Not checked", "neutral");
   }

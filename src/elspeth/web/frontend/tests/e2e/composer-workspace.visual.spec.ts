@@ -7,6 +7,7 @@ import {
   type WorkspaceScenario,
 } from "./helpers/workspace-fixtures";
 import { ComposerPage } from "./page-objects/composer-page";
+import { setupWorkspaceScenario } from "./helpers/workspace-setup";
 
 const FIXED_BROWSER_TIME = new Date("2026-08-11T08:00:30.000Z");
 
@@ -65,18 +66,30 @@ async function openStableVisualScenario(
   expectedNodeCount: number,
 ): Promise<{ composer: ComposerPage; sessionId: string }> {
   await page.setViewportSize(viewport);
-  const sessionId = await installWorkspaceScenario(page, scenario);
-  const composer = new ComposerPage(page);
-  await composer.goto(sessionId);
-  await composer.waitForChatReady();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.evaluate(async () => {
-    await document.fonts.ready;
-  });
-  await expect(page.locator(".react-flow__node")).toHaveCount(
-    expectedNodeCount,
+  const { sessionId, value: composer } = await setupWorkspaceScenario(
+    () => installWorkspaceScenario(page, scenario),
+    async (createdSessionId) => {
+      const createdComposer = new ComposerPage(page);
+      await createdComposer.goto(createdSessionId);
+      await createdComposer.waitForChatReady();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+      await page.evaluate(async () => {
+        await document.fonts.ready;
+      });
+      await expect(createdComposer.validationStatus()).not.toHaveAccessibleName(
+        "Validation: Checking",
+      );
+      await expect(createdComposer.auditStatus()).not.toHaveAccessibleName(
+        "Audit: Checking",
+      );
+      await expect(page.locator(".react-flow__node")).toHaveCount(
+        expectedNodeCount,
+      );
+      await settleGraphViewport(page);
+      return createdComposer;
+    },
+    (createdSessionId) => deleteWorkspaceScenario(page, createdSessionId),
   );
-  await settleGraphViewport(page);
   return { composer, sessionId };
 }
 
@@ -116,7 +129,15 @@ test.describe("Composer workspace visual baselines", () => {
         );
         await expect(composer.workspace()).toHaveScreenshot(
           `populated-freeform-${viewport.width}x${viewport.height}.png`,
-          { animations: "disabled", caret: "hide" },
+          {
+            animations: "disabled",
+            caret: "hide",
+            // React Flow centers the edge label on a fractional transform.
+            // Chromium can rasterize that one word differently under the
+            // full browser workload; preserve a tight pixel ceiling so pane,
+            // control, and node geometry changes still fail the baseline.
+            maxDiffPixels: 500,
+          },
         );
       } finally {
         await deleteWorkspaceScenario(page, sessionId);

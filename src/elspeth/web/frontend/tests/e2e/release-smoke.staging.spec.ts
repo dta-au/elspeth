@@ -5,7 +5,8 @@
 // dropped singular `state.source` and threw
 //   TypeError: Cannot read properties of undefined (reading 'options')
 // inside ChatPanel (readSourceBlobRef / compositionHasSource), tripping the
-// <ErrorBoundary label="Chat panel"> (Layout.tsx) and blanking the composer on
+// <ErrorBoundary label="Authoring pane"> (ComposerWorkspace.tsx) and blanking
+// the authoring surface on
 // guided source-select AND on reloading any composed session. The deployed
 // dist predated the fix; nothing caught it.
 //

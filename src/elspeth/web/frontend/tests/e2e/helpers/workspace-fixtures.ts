@@ -47,8 +47,22 @@ export const WORKSPACE_SCENARIOS = [
 
 export type WorkspaceScenario = (typeof WORKSPACE_SCENARIOS)[number];
 
+export type RunHistoryRequestPhase =
+  | "mount"
+  | "activate-run"
+  | "poll-tick"
+  | "before-next-tick"
+  | "inactive";
+
+export interface RunHistoryRequestTelemetry {
+  url: string;
+  timestamp: string;
+  phase: RunHistoryRequestPhase;
+}
+
 export interface WorkspaceScenarioTelemetry {
   runHistoryRequests: number;
+  runHistoryRequestLog: RunHistoryRequestTelemetry[];
   tallDialogLivePreflightChecked: boolean;
 }
 
@@ -61,6 +75,7 @@ interface InstalledScenario {
   sessionId: string;
   pendingAcknowledgement: DeferredSignal | null;
   telemetry: WorkspaceScenarioTelemetry;
+  runHistoryRequestPhase: RunHistoryRequestPhase;
   noticeMode: "long-content" | "recoverable-backend";
   noticeBackendRecovered: boolean;
 }
@@ -403,6 +418,11 @@ async function fulfillWorkspaceRoute(
   }
   if (pathname === `/api/sessions/${sessionId}/runs` && method === "GET") {
     installed.telemetry.runHistoryRequests += 1;
+    installed.telemetry.runHistoryRequestLog.push({
+      url: request.url(),
+      timestamp: new Date().toISOString(),
+      phase: installed.runHistoryRequestPhase,
+    });
     await route.fulfill({ json: scenario === "active-completed-run" ? runFixtures(sessionId) : [] });
     return true;
   }
@@ -540,8 +560,10 @@ export async function installWorkspaceScenario(
       pendingAcknowledgement: scenario === "pending-acknowledgement" ? deferredSignal() : null,
       telemetry: {
         runHistoryRequests: 0,
+        runHistoryRequestLog: [],
         tallDialogLivePreflightChecked: scenario === "tall-confirmation-dialog",
       },
+      runHistoryRequestPhase: "mount",
       noticeMode: options.noticeMode ?? "long-content",
       noticeBackendRecovered: false,
     };
@@ -609,8 +631,18 @@ export function workspaceScenarioTelemetry(page: Page): WorkspaceScenarioTelemet
   return installed.telemetry;
 }
 
+export function setRunHistoryRequestPhase(
+  page: Page,
+  phase: RunHistoryRequestPhase,
+): void {
+  const installed = INSTALLED_SCENARIOS.get(page);
+  if (installed === undefined) throw new Error("no workspace scenario is installed");
+  installed.runHistoryRequestPhase = phase;
+}
+
 export function resetWorkspaceScenarioTelemetry(page: Page): void {
   const installed = INSTALLED_SCENARIOS.get(page);
   if (installed === undefined) throw new Error("no workspace scenario is installed");
   installed.telemetry.runHistoryRequests = 0;
+  installed.telemetry.runHistoryRequestLog.length = 0;
 }

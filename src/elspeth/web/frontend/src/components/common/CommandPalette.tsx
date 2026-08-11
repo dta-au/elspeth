@@ -19,9 +19,9 @@ import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { fuzzyMatch } from "@/utils/fuzzyScore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
-  FOCUS_AUTHORING_EVENT,
   REQUEST_RUN_EVENT,
-  claimArtifactViewIntent,
+  claimWorkspaceViewIntent,
+  dispatchClaimedAuthoringFocusIntent,
   dispatchClaimedArtifactViewIntent,
 } from "@/lib/composer-events";
 
@@ -125,9 +125,10 @@ export function CommandPalette({
       category: "action",
       shortcut: "Ctrl+/",
       action: () => {
+        const intent = claimWorkspaceViewIntent();
         onClose();
         queueMicrotask(() => {
-          window.dispatchEvent(new Event(FOCUS_AUTHORING_EVENT));
+          dispatchClaimedAuthoringFocusIntent(intent);
         });
       },
     });
@@ -154,7 +155,7 @@ export function CommandPalette({
       category: "navigation",
       shortcut: "Ctrl+Shift+G",
       action: () => {
-        const intent = claimArtifactViewIntent();
+        const intent = claimWorkspaceViewIntent();
         onClose();
         queueMicrotask(() => {
           dispatchClaimedArtifactViewIntent(intent, {
@@ -176,7 +177,7 @@ export function CommandPalette({
       // path into the near-empty modal (elspeth-bff8043d33 residual).
       enabled: hasCompositionContent(compositionState),
       action: () => {
-        const intent = claimArtifactViewIntent();
+        const intent = claimWorkspaceViewIntent();
         onClose();
         queueMicrotask(() => {
           dispatchClaimedArtifactViewIntent(intent, {

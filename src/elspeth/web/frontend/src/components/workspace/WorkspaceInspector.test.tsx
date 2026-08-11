@@ -5,8 +5,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   REQUEST_ARTIFACT_VIEW_EVENT,
-  claimArtifactViewIntent,
-  isCurrentArtifactViewIntent,
+  claimWorkspaceViewIntent,
+  isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { makeComposition } from "@/test/composerFixtures";
@@ -16,6 +16,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useInlineSourceStore } from "@/stores/inlineSourceStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useHashRouter } from "@/hooks/useHashRouter";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import {
   useWorkspacePaneController,
@@ -33,6 +34,11 @@ const panelState = vi.hoisted(() => ({
   validationUnmounts: 0,
   useRealAudit: false,
 }));
+
+function HashRouterProbe(): null {
+  useHashRouter();
+  return null;
+}
 
 vi.mock("@/components/audit/AuditReadinessPanel", async (importOriginal) => {
   const actual = await importOriginal<
@@ -369,6 +375,27 @@ describe("WorkspaceInspector", () => {
     expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
   });
 
+  it("exposes History for a terminal session whose only summary is the final step", async () => {
+    const guided = activeGuidedSession();
+    useSessionStore.setState({
+      guidedSession: {
+        ...guided,
+        history: [{
+          ...guided.history[0],
+          step: guided.step,
+          summary: "Connected transform to output",
+        }],
+        terminal: { kind: "completed", reason: null },
+      },
+    } as never);
+    render(<InspectorHarness />);
+    await userEvent.setup().click(
+      screen.getByRole("button", { name: "Open validation" }),
+    );
+
+    expect(screen.getByRole("tab", { name: "History" })).toBeInTheDocument();
+  });
+
   it.each([
     ["History tab", "tab"],
     ["History panel descendant", "panel"],
@@ -494,12 +521,18 @@ describe("WorkspaceInspector", () => {
     consoleError.mockRestore();
   });
 
-  it("routes component navigation to Graph focus without opening the graph modal", async () => {
+  it("lets component navigation supersede a deferred Spec hash with Graph", async () => {
     const user = userEvent.setup();
     const selectNode = vi.fn();
     const artifactRequests: RequestArtifactViewDetail[] = [];
     const graphModal = vi.fn();
-    useSessionStore.setState({ selectNode } as never);
+    useSessionStore.setState({
+      selectNode,
+      sessions: [{ id: "session-1", title: "Session 1" }],
+      compositionStateLoaded: false,
+      compositionState: makeComposition(4),
+    } as never);
+    window.history.replaceState(null, "", "#/session-1/spec");
     const onArtifactRequest = (event: Event) => {
       artifactRequests.push(
         (event as CustomEvent<RequestArtifactViewDetail>).detail,
@@ -508,15 +541,22 @@ describe("WorkspaceInspector", () => {
     window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
     window.addEventListener("elspeth-open-graph-modal", graphModal);
     try {
-      render(<InspectorHarness />);
+      render(
+        <>
+          <HashRouterProbe />
+          <InspectorHarness />
+        </>,
+      );
       await user.click(screen.getByRole("button", { name: "Open validation" }));
-      const priorIntent = claimArtifactViewIntent();
+      const priorIntent = claimWorkspaceViewIntent();
       await user.click(
         screen.getByRole("button", { name: "Validation component" }),
       );
+      act(() => useSessionStore.setState({ compositionStateLoaded: true }));
+      await act(async () => Promise.resolve());
 
       expect(selectNode).toHaveBeenCalledExactlyOnceWith("select_columns");
-      expect(isCurrentArtifactViewIntent(priorIntent)).toBe(false);
+      expect(isCurrentWorkspaceViewIntent(priorIntent)).toBe(false);
       expect(artifactRequests).toEqual([
         { tab: "graph", focusMode: false, sessionId: "session-1" },
       ]);

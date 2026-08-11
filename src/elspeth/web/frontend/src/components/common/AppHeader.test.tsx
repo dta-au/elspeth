@@ -5,6 +5,14 @@ import { render, screen } from "@testing-library/react";
 import { AppHeader } from "./AppHeader";
 
 describe("AppHeader", () => {
+  it("sizes the application shell to the dynamic viewport with a legacy fallback", () => {
+    const css = readFileSync("src/components/header/header.css", "utf8");
+    const appRoot = css.match(/\.app-root\s*\{([^}]*)\}/s)?.[1];
+
+    expect(appRoot).toBeDefined();
+    expect(appRoot).toMatch(/height:\s*100vh;\s*height:\s*100dvh;/s);
+  });
+
   it("uses one compact control height for the short desktop header and version trigger", () => {
     const css = readFileSync("src/components/header/header.css", "utf8");
     const shortHeightRule = css.match(

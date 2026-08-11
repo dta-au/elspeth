@@ -1,7 +1,7 @@
 /**
  * AuditReadinessPanel (Phase 2)
  *
- * Persistent right-rail panel showing six rows of audit-readiness state.
+ * Inspector Audit-tab panel showing six rows of audit-readiness state.
  * Auto-fetches on compositionState.version change; collapses to a single
  * "Audit ready ✓" summary when nothing actionable is present.
  *
@@ -366,7 +366,7 @@ export function AuditReadinessPanel({
   // user explicitly clicked Expand).
   //
   // Stored per-session in auditReadinessStore so the preference survives
-  // right-rail remounts. Component-local useState would reset on remount.
+  // Inspector remounts. Component-local useState would reset on remount.
   const userExpanded = useAuditReadinessStore((s) =>
     activeSessionId ? (s.userExpandedBySession[activeSessionId] ?? false) : false,
   );
