@@ -175,7 +175,10 @@ Overall verdicts:
 
 ## Production-supported claim
 
-`complete` proves all 73 legs at every versioned execution profile.
+`complete` proves every applicable required leg, case, and dimension at each
+versioned execution profile. Every non-applicable cell must be explicitly
+catalog-authorized as `not_applicable`; `complete` does not claim that an
+unsupported profile cell was executed.
 `production-supported` additionally requires:
 
 - every state-store, deployment, lifecycle, and first-party plugin named in
