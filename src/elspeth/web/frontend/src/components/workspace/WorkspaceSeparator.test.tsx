@@ -376,4 +376,92 @@ describe("WorkspaceSeparator", () => {
     fireEvent.pointerCancel(separator, { pointerId: 13 });
     expect(onResizeEnd).toHaveBeenCalledTimes(1);
   });
+
+  it("ignores post-disable movement before pointer-up finalizes the pre-disable width", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    const { releasePointerCapture } = installPointerCapture(separator);
+
+    fireEvent.pointerDown(separator, { pointerId: 14, clientX: 100 });
+    fireEvent.pointerMove(separator, { pointerId: 14, clientX: 160 });
+    expect(raf.queuedCount()).toBe(1);
+
+    view.rerender(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    fireEvent.pointerMove(separator, { pointerId: 14, clientX: 320 });
+    fireEvent.pointerUp(separator, { pointerId: 14, clientX: 320 });
+
+    expect(onResize.mock.calls).toEqual([[480]]);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(480);
+    expect(releasePointerCapture).toHaveBeenCalledWith(14);
+    expect(raf.queuedCount()).toBe(0);
+    act(() => raf.flush());
+    expect(onResize.mock.calls).toEqual([[480]]);
+  });
+
+  it("ignores post-disable movement before pointer-cancel finalizes at current bounds", () => {
+    const raf = installRafHarness();
+    const onResize = vi.fn();
+    const onResizeEnd = vi.fn();
+    const view = render(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={640}
+        disabled={false}
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    const separator = screen.getByRole("separator", {
+      name: "Resize authoring pane",
+    });
+    const { releasePointerCapture } = installPointerCapture(separator);
+
+    fireEvent.pointerDown(separator, { pointerId: 15, clientX: 100 });
+    fireEvent.pointerMove(separator, { pointerId: 15, clientX: 300 });
+    expect(raf.queuedCount()).toBe(1);
+
+    view.rerender(
+      <WorkspaceSeparator
+        value={420}
+        min={360}
+        max={460}
+        disabled
+        onResize={onResize}
+        onResizeEnd={onResizeEnd}
+      />,
+    );
+    fireEvent.pointerMove(separator, { pointerId: 15, clientX: 20 });
+    fireEvent.pointerCancel(separator, { pointerId: 15 });
+
+    expect(onResize.mock.calls).toEqual([[460]]);
+    expect(onResizeEnd).toHaveBeenCalledExactlyOnceWith(460);
+    expect(releasePointerCapture).toHaveBeenCalledWith(15);
+    expect(raf.queuedCount()).toBe(0);
+    act(() => raf.flush());
+    expect(onResize.mock.calls).toEqual([[460]]);
+  });
 });

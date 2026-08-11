@@ -164,12 +164,15 @@ export function WorkspaceSeparator({
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>): void => {
     const resize = pointerResizeRef.current;
-    if (resize === null || resize.pointerId !== event.pointerId) {
+    if (
+      resize === null ||
+      resize.pointerId !== event.pointerId ||
+      contractRef.current.disabled
+    ) {
       return;
     }
     resize.queuedWidth = widthAtClientX(event.clientX, resize);
     resize.latestWidth = resize.queuedWidth;
-    if (contractRef.current.disabled) return;
     if (animationFrameRef.current === null) {
       animationFrameRef.current = requestAnimationFrame(flushQueuedMove);
     }
