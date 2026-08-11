@@ -214,7 +214,13 @@ function DiscardSummaryWarning({ run }: { run: Run | null }): JSX.Element | null
   );
 }
 
-export function InlineRunResults(): JSX.Element | null {
+export interface InlineRunResultsProps {
+  showEmptyState?: boolean;
+}
+
+export function InlineRunResults({
+  showEmptyState = false,
+}: InlineRunResultsProps = {}): JSX.Element | null {
   const activeRunId = useExecutionStore((s) => s.activeRunId);
   const progress = useExecutionStore((s) => s.progress);
   const runs = useExecutionStore((s) => s.runs);
@@ -279,7 +285,9 @@ export function InlineRunResults(): JSX.Element | null {
   );
 
   if (!showProgress && !outputRunId && !hasDrawerRuns) {
-    return null;
+    return showEmptyState ? (
+      <p className="artifact-empty">No runs yet.</p>
+    ) : null;
   }
 
   return (

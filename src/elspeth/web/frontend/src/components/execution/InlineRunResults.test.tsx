@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { InlineRunResults } from "./InlineRunResults";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -81,8 +81,13 @@ describe("InlineRunResults", () => {
 
   it("renders nothing when there are no runs", () => {
     const { container } = render(<InlineRunResults />);
-    expect(container.querySelector("[data-testid='progress-view-stub']")).toBeNull();
-    expect(container.querySelector("[data-testid='run-outputs-stub']")).toBeNull();
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders the artifact empty state only when explicitly requested", () => {
+    render(<InlineRunResults showEmptyState />);
+
+    expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
   });
 
   it("renders ProgressView for an active running run", () => {
@@ -526,6 +531,28 @@ describe("InlineRunResults", () => {
     await waitFor(() => {
       expect(loadRuns).toHaveBeenCalledWith("sess-1");
     });
+  });
+
+  it("stops polling run history when its owner unmounts", async () => {
+    vi.useFakeTimers();
+    const loadRuns = vi.fn().mockResolvedValue(undefined);
+    useExecutionStore.setState({
+      loadRuns,
+      runs: [
+        { id: "run-live", session_id: "sess-1", status: "running" } as never,
+      ],
+    } as never);
+    const view = render(<InlineRunResults />);
+
+    await act(async () => Promise.resolve());
+    expect(loadRuns).toHaveBeenCalledTimes(1);
+    act(() => vi.advanceTimersByTime(3000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+
+    view.unmount();
+    act(() => vi.advanceTimersByTime(6000));
+    expect(loadRuns).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
   });
 
   // ==========================================================================
