@@ -4,7 +4,7 @@
 
 **Goal:** Pin ELSPETH's current durable state-engine contract in a versioned, machine-validated proof catalog and close every mandatory implementation and evidence cell needed for a current-baseline `complete` verdict.
 
-**Architecture:** Treat pinning and completion as two distinct gates. First reconcile current source, supported deployment profiles, state vocabulary, plugin inventory, and compiler-facing runtime obligations into a v2 catalog; then execute bounded implementation/proof cohorts until every required v2 cell passes and every hard gate closes. Preserve production authority: tests proceed from real orchestration boundaries inward, independent-process claims use operating-system processes, PostgreSQL claims use a real PostgreSQL 16 service, and missing provider credentials remain `unknown` rather than being replaced by mocks.
+**Architecture:** Treat pinning and completion as two distinct gates. First reconcile current source, supported deployment profiles, state vocabulary, plugin inventory, and compiler-facing runtime obligations into the frozen v2 catalog; then execute bounded implementation/proof cohorts and publish a v3 catalog whose explicit applicability and provider-variant cases can derive the final complete verdict without a false Cartesian product. Preserve production authority: tests proceed from real orchestration boundaries inward, independent-process claims use operating-system processes, PostgreSQL claims use a real PostgreSQL 16 service, and missing provider credentials remain `unknown` rather than being replaced by mocks.
 
 **Tech Stack:** Python 3.12+, pytest/xdist, Hypothesis, SQLAlchemy, SQLite WAL, PostgreSQL 16/testcontainers, Filigree, Loomweave, Warpline, Wardline, and the existing Landscape/scheduler/orchestrator packages.
 
@@ -98,6 +98,15 @@ The JUnit, profile report, and node list must contain the same exact node IDs.
 Skipped, deselected, uncollected, xfailed, xpassed, warning-bearing, or
 profile-mismatched runs are retained as non-pass evidence. Run both
 `validate-package` and `collect-evidence` before any delta is published.
+
+### Test cadence
+
+Do not run the full `pytest tests/` suite during Tasks 1–11. Use directly
+affected focused selectors per implementation slice, one bounded family or
+contract cohort per task, and PostgreSQL/live-provider lanes only at their
+explicit integration milestones. Task 12 runs the CI-equivalent full suite once
+after all implementation churn is frozen; rerun it only if that final gate
+uncovers a fix that changes the frozen commit.
 
 ---
 
@@ -1199,23 +1208,210 @@ git commit -m "test(state-engine): complete lifecycle and abandonment proofs"
 
 ---
 
-### Task 11: Complete the first-party plugin boundary inventory
+### Task 11: Pin the first-party plugin inventory and live-lane contract
 
 **Files:**
 
+- Create: `scripts/state_engine_plugin_matrix.py`
 - Create: `tests/integration/plugins/test_state_engine_plugin_lifecycle_matrix.py`
+- Create: `tests/integration/plugins/test_state_engine_plugin_provider_lanes.py`
 - Create: `tests/golden/state_engine/plugin_lifecycle_matrix.json`
+- Create: `tests/golden/state_engine/plugin_evidence_selectors.json`
 - Modify: `tests/unit/plugins/test_discovery.py`
+- Create: `tests/unit/plugins/test_state_engine_plugin_evidence_selectors.py`
+- Create: `tests/unit/cicd/test_live_provider_acceptance_workflow.py`
+- Modify: `tests/conftest.py`
+- Modify: `tests/integration/plugins/sources/test_aws_s3_source_live.py`
+- Modify: `tests/integration/plugins/sinks/test_aws_s3_sink_live.py`
+- Modify: `tests/integration/plugins/transforms/aws/test_bedrock_guardrails_live.py`
+- Modify: `tests/integration/plugins/transforms/aws/test_textract_document_analysis_live.py`
+- Create or modify as required: maintained live lanes for Azure Blob, Azure AI,
+  Dataverse, LLM/provider, Azure Search, and Chroma-backed plugins
+- Create: `.github/workflows/live-provider-acceptance.yaml`
+- Modify: `pyproject.toml`
 - Modify as defects require: first-party plugins under `src/elspeth/plugins/`
-- Modify: `docs/architecture/state_engine/proof-catalog/v2/catalog.json`
+- Do not modify: `docs/architecture/state_engine/proof-catalog/v2/catalog.json`
+- Create: `docs/architecture/state_engine/proof-catalog/v3/catalog.json`
+- Modify: `scripts/state_engine_assessment_lib/common.py`
+- Modify: `scripts/state_engine_assessment_lib/catalog.py`
+- Modify: `scripts/state_engine_assessment_lib/package.py`
+- Modify: `scripts/state_engine_assessment_lib/operations.py`
+- Modify: `scripts/state_engine_assessment.py`
+- Modify: `tests/unit/architecture/test_state_engine_catalog_contract.py`
+- Modify: `docs/architecture/state_engine/completeness-criteria.md`
+- Modify: `docs/architecture/state_engine/assessment-framework.md`
+- Modify: `docs/architecture/state_engine/assessment-program.md`
+- Modify: `docs/architecture/state_engine/proof-catalog/README.md`
+- Create: `docs/architecture/state_engine/proof-catalog/v3/README.md`
+- Create: `docs/architecture/state_engine/proof-catalog/v3/catalog.schema.json`
+- Create: `docs/architecture/state_engine/proof-catalog/v3/assessment.schema.json`
 
-**Step 1: Generate an exact inventory from discovery**
+**Step 0: Resolve literal applicability and lane capacity before implementation**
 
-The committed matrix must name all live plugins and classify each by source/transform/sink, side-effect semantics, lifecycle hooks, required provider, and applicable state-engine boundary. The generator must fail if discovery and the matrix differ.
+PB-09 currently expands to 51 plugin cases by four required profiles by ten
+required dimensions: 2,040 required cells. That Cartesian product conflates
+state-store semantics, deployment composition, and provider observation. Pin
+the completion path to a new `elspeth-state-engine-v3` catalog identity that
+models reviewed per-plugin/profile/dimension applicability explicitly. Freeze
+v2 as historical input; never rehash or weaken it in place, and never mark a
+v2-required cell N/A in an assessment.
+
+The v3 design must preserve PostgreSQL 16 as required for the maintained AWS
+single-leader Landscape deployment. It may narrow a plugin/provider cell only
+when its catalog reason agrees with production-owned capability discriminators
+and the maintained release lane shows the combination is outside the product contract; it cannot use applicability to
+hide missing credentials, a missing test, or an unsupported PostgreSQL path.
+Because catalog identity changes, v2 deltas cannot parent a v3 assessment.
+Task 12 will publish the first full v3 assessment at the single frozen final
+checkpoint.
+
+Pin v3 to catalog `schema_version: 2` and assessment `schema_version: 3`.
+For every leg, v3 `required_cases` is an array of objects with this exact
+normative shape:
+
+```json
+{
+  "case_id": "source:llm@openrouter",
+  "plugin_key": "source:llm",
+  "variant_id": "openrouter",
+  "cell_applicability": {
+    "sqlite-wal-single-process-leader": {
+      "production_entry": {"status": "required", "reason": null},
+      "boundary_composition": {
+        "status": "not_applicable",
+        "reason": "Reviewed product-contract reason"
+      }
+    }
+  }
+}
+```
+
+Every catalog profile and all ten dimensions must appear exactly once for every
+case. `required` must carry a null reason; `not_applicable` must carry a
+non-empty reviewed reason. The v3 catalog is the sole authority for required
+versus N/A. The golden matrix supplies capability and lane facts that the
+catalog validator must reconcile mechanically, but it cannot waive a product
+cell. Package validation must reject assessment N/A unless the exact v3 cell is
+N/A, and must use an explicit assessment-schema-3 path rather than v2 or the
+historical fallback.
+
+`plugin_key` is a non-empty live discovery key for PB-09 cases and JSON `null`
+for non-plugin legs. `variant_id` is a closed non-empty identifier and is
+`default` when a case has no provider/auth variant. Case IDs must be unique
+within their leg; `(plugin_key, variant_id)` must be unique within PB-09.
+
+The checked-in `catalog.schema.json` and `assessment.schema.json` are the
+machine-readable normative schemas. Catalog v3 has the exact v2 top-level keys
+except `applicability_profiles` is removed; v3 leg records have exactly
+`id`, `family`, `title`, `contract`, and object-valued `required_cases`, with no
+legacy `applicability_profile`. Assessment schema 3 has the same exact top-level
+record set as assessment schema 2, but requires `schema_version: 3`, catalog
+`elspeth-state-engine-v3`/schema 2, v3 case IDs in coverage and overrides, and
+the completion marker bytes `state-engine-assessment-package-v3\n`.
+Assessment N/A is always derived from catalog cells; schema 3 rejects a
+hand-authored `not_applicable` override.
+
+Add an explicit version-pair dispatcher and mutation tests:
+
+- catalog v1 / assessment v1 remains historical-only;
+- catalog v2 schema 1 / assessment schema 2 remains frozen and valid;
+- catalog v3 schema 2 / assessment schema 3 is current;
+- every other catalog/assessment pair is rejected.
+
+`init-full` gains an explicit repository-relative `--catalog` option. Task 12
+must initialize with
+`--catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json`;
+omitting it retains the v2 default only for backward compatibility until the
+atomic current-catalog pointer switch. Add CLI positive and mismatch tests in
+`operations.py`/the architecture contract suite.
+
+Provider variants are separate evidence subjects and case IDs. At minimum,
+split each supported LLM source/transform provider, RAG Chroma versus Azure
+Search, and every supported authentication mode that requires a distinct live
+lane. Separate credentialed processes attach to separate variant cases; a
+single base plugin case cannot conceal a missing provider. Discovery equality
+compares the projected unique `plugin_key` set to the 51-plugin inventory,
+while the validator separately requires the exact independently derived closed
+variant set described below.
+
+The golden and catalog are not the completeness oracle for variants. Derive the
+closed set independently from production-owned configuration discriminators:
+the LLM source/transform `Literal` provider unions and provider map, the RAG
+`PROVIDERS` registry/config union, and each provider plugin's Pydantic
+authentication-mode discriminator/schema. Every derived variant must construct
+through the real production config validator. If a claimed mode has no closed
+production discriminator, it is not a supported variant until that contract is
+added. Compare discovery, golden, and catalog by projected unique `plugin_key`
+(exactly 51), then separately compare PB-09 `case_id`/variant pairs to this
+independently derived closed set. Use direct owned schema/registry APIs; do not
+resolve members through dynamic attribute names.
+
+V1 and v2 catalogs/assessments remain byte- and hash-valid historical inputs.
+Only the current v3 catalog is compared with live discovery, so future plugin
+additions do not retroactively invalidate frozen historical catalogs. Keep all
+global current-catalog pointers on v2 until Task 12 atomically publishes the
+first full v3 assessment and switches the hub, proof matrix, and assessment
+index.
+
+The v3 transition is lossless outside PB-09. The validator must prove that
+every non-PB-09 v2 `(leg, case, profile, dimension)` required/N/A policy maps
+identically into v3; no reason or variant mechanism may narrow it. Only PB-09
+may introduce reviewed provider-variant cases or different applicability.
+Add mutations for every family and specifically PB-11, proving that a changed,
+removed, or newly N/A non-PB-09 cell is rejected.
+
+Start this task only after Task 10's production lifecycle/follower harness is
+available and the Python 3.14 lifecycle blocker `elspeth-61350c4744` is closed
+on both maintained Python versions.
+
+**Step 1: Generate and validate an exact inventory from discovery**
+
+Implement `scripts/state_engine_plugin_matrix.py` as the single generator and
+validator. Its `check <golden>` command validates schema/keysets and compares
+the canonical mechanical projection without writing. Its explicit
+`render-skeleton` command preserves already reviewed fields, marks new reviewed
+fields `UNCLASSIFIED`, and refuses completion until no marker remains. It must
+discover the exact 9 sources, 33 transforms, and 9 sinks and fail on a missing,
+duplicate, or unclassified entry. Generate only mechanical facts: exact plugin
+key, kind, source/class, determinism, execution model, lifecycle method owners,
+sink effect modes, and source hash presence. Keep reviewed facts in the golden
+file: provider variants, external-observation requirement, applicable PB
+boundaries, local fixture, and release lane.
+
+`tests/unit/plugins/test_discovery.py` must assert exact keyset equality among
+live discovery, the golden matrix, catalog inventory, and PB-09 required cases;
+counts and representative names are insufficient. Tests compare the canonical
+mechanical projection and never rewrite the partly curated golden file.
+
+Commit `plugin_evidence_selectors.json` as the non-secret Task 12 handoff. Its
+exact schema is `schema_version`, `catalog_id`, and a closed `lanes` array. Each
+lane records `lane_id`, `workflow_job`, `profile_case`, `marker_expression`,
+exact full `node_ids`, exact `(leg, dimension, case_id, profile_case)` cells,
+approved resource-variable names, and artifact kinds—never values. The
+selector validator must prove that every v3-required PB-09 cell is assigned
+exactly once, every node has one proof subject, every case/variant exists in
+the independently derived inventory, and every live lane maps to one protected
+workflow job. Task 12 reads this manifest rather than reconstructing selectors
+from prose.
 
 **Step 2: Add RED lifecycle tests**
 
-For every plugin, run its production boundary through configure/open/process-or-write/flush/close as applicable. Assert scheduler, audit, outcome, effect, artifact, and cleanup behavior. Local plugins run hermetically; provider-backed plugins run in their maintained live acceptance lane.
+For every plugin, build settings through `instantiate_plugins_from_config`,
+construct `ExecutionGraph` from the real instances, and cross the public
+Orchestrator/follower/resume boundary. Exercise constructor/configuration,
+`on_start`, `load` or `process`/`accept`, `on_complete`, and `close` as the
+plugin kind requires. Route sinks through the recoverable sink-effect
+coordinator; direct legacy `write`/`flush` calls are support-only and cannot
+satisfy the production lifecycle cell. Assert scheduler, audit, outcome,
+effect, artifact, partial-start cleanup, and teardown-order behavior. Local
+plugins run hermetically; provider-backed plugins run in their maintained live
+acceptance lane.
+
+Each parametrized node binds exactly one plugin case and one execution profile.
+Task 10's real same-host follower and CLI/web-hosted lifecycle nodes must be
+attached per plugin; a generic lifecycle result cannot silently pass 51 PB-09
+cases. PostgreSQL testcontainers remain backend support only and cannot promote
+the live AWS deployment profile.
 
 **Step 3: Refuse invalid substitutions**
 
@@ -1236,25 +1432,110 @@ Expected: all local cases pass; live-provider cases are selected only in their d
 
 **Step 5: Run live provider lanes**
 
-Use operator-provided credentials only through the existing acceptance environment. Record safe variable names and resource identities, never values. Each lane must publish exact pass/fail/skip counts and retained non-secret evidence.
+Define protected, manually dispatched acceptance environments. Do not dispatch
+the new workflow until the policy-tested workflow commit exists on the default
+branch; Task 11 local qualification cannot substitute for that activation.
+Task 12 performs the sole promotable dispatch against its frozen SHA. The
+maintained lanes must cover AWS S3, Bedrock, both
+Textract modes, Azure Blob, Azure Content Safety, Azure Document Intelligence,
+Dataverse, each supported LLM/provider variant, Azure Search, and Chroma where
+the v3 applicability table requires them. The reviewed matrix must also classify
+the real `database` sink and decide whether `blob_fetch` and `web_scrape` use a
+maintained real-process HTTP fixture or require external observation. Existing
+direct `load`, private helper, fake-recorder, and sink-protocol live tests are
+support-only until they cross the production boundary above.
 
-**Step 6: Fix defects, update catalog evidence, and commit**
+Every provider lane that promotes an AWS-deployment PB-09 cell must run through
+the real maintained AWS composition with a PostgreSQL 16 Landscape connection;
+a real Azure, OpenRouter, Dataverse, or Chroma call from a local runner is still
+not AWS-deployment evidence.
+
+Record approved variable names and disposable resource identities in the
+evidence `resources` field, never values, URLs, raw provider bodies, or raw
+error text. Create uniquely prefixed resources and clean them in `finally`.
+Missing credentials or unavailable services remain `unknown`; they are never
+reported as local passes. The live workflow must not expose environment secrets
+to fork/PR-controlled code.
+
+Declare a strict `live_provider` marker in `pyproject.toml` (keeping
+`live_aws` as a compatible narrower selector where useful). The focused
+workflow-policy test must pin manual dispatch, a protected environment,
+least-privilege permissions, trusted checkout/ref/SHA behavior, absence of
+`pull_request` and `pull_request_target`, no untrusted ref input, bounded
+artifact retention/redaction, and no secret-bearing command or environment
+echo.
+
+Default pytest addopts must exclude `live_provider`. `tests/conftest.py` must
+require an explicit operator CLI gate such as `--run-live-provider` before any
+marked node can execute, independent of values auto-loaded from `.env`. The
+protected workflow is the maintained invoker and must select exact required
+nodes; any skip, deselection, warning, xfail, or xpass makes that lane
+non-promotable.
+
+At collection, require every live remote-service node—including legacy
+`live_aws` and formerly slow-only S3 nodes—to carry `live_provider`; reject a
+remote node lacking it. Subprocess tests must prove default deselection and CLI
+refusal even when a fixture `.env` contains plausible provider variables.
+Pin every workflow action by full commit SHA. A promotable remote artifact must
+bind catalog digest, baseline `github.sha`, workflow run ID/attempt, job ID,
+runner image, and observed execution profile. Before upload, mechanically scrub
+JUnit/profile/stdout/stderr with injected credential and provider-payload
+canaries and fail if any canary or configured secret value survives. Package
+validation rejects stale/transplanted artifacts whose provenance does not match
+the frozen assessment baseline and selector lane.
+
+**Step 6: Fix defects and commit the implementation baseline**
+
+Review `git diff --name-only` against the Task 11 file inventory, including
+every newly resolved Azure/LLM/Search/Chroma lane and every defect-driven plugin
+file. Construct one explicit `git add` invocation that spells out every
+intended file; preserve that exact path list in the Filigree completion comment.
+Do not use directory arguments or globs. Then commit with:
 
 ```bash
-git add src/elspeth/plugins \
-  tests/integration/plugins/test_state_engine_plugin_lifecycle_matrix.py \
-  tests/golden/state_engine/plugin_lifecycle_matrix.json \
-  tests/unit/plugins/test_discovery.py \
-  docs/architecture/state_engine/proof-catalog/v2/catalog.json \
-  docs/architecture/state_engine/assessments
 git commit -m "test(state-engine): complete plugin lifecycle inventory"
 ```
+
+If any plugin source changes, format first and refresh its PH3
+`source_file_hash` mechanically with `scripts/cicd/plugin_hash.py` last. Run the
+plugin-hash lint and the whole-tree masquerade gate once for the completed
+implementation cohort. Run the exact non-inert project Wardline gate for every
+touched external-input boundary, including catalog, golden, JUnit/profile, and
+workflow-artifact parsers as well as plugin/provider admission. For every source change, compare the
+key-free trust-tier finding corpus before and after; do not sign or hand-edit
+judge metadata.
+
+Resolve the exact changed paths with `git diff --name-only` and stage them
+individually. Do not use broad directory staging for `src/elspeth/plugins` or
+`scripts/state_engine_assessment_lib`, because sibling work may be present.
+
+**Step 7: Freeze selector definitions for the final full v3 assessment**
+
+Execute bounded local qualification from the committed selector manifest. The
+implementation/golden/workflow commit must be clean before capture. These Task
+11 runs are development qualification only: discard their outputs or retain
+them outside the repository, and do not cite them as promotable assessment
+evidence. Do not publish a v2 delta: the catalog identity changed. After the
+workflow is activated on the default branch, Task 12 reruns every local and
+remote selector once at the final frozen commit and publishes the sole
+promotable first full v3 package. That docs-only
+commit may change only `docs/**` and must include the dated assessment plus
+`docs/architecture/state_engine/README.md`, `proof-matrix.md`, and
+`assessments/README.md`; current-baseline validation cannot be packaged in the
+same commit as production/test changes.
 
 **Definition of Done:**
 
 - [ ] Discovery and catalog inventories are identical.
 - [ ] Every local first-party plugin has production-boundary lifecycle evidence.
-- [ ] Every provider-backed plugin has current live evidence for required external cases.
+- [ ] Every provider-backed plugin has a closed protected lane, exact selector
+  and non-secret resource definition, and remains unknown until Task 12's sole
+  promotable live dispatch.
+- [ ] V3 explicitly and reviewably resolves every PB-09
+  plugin/profile/dimension applicability cell without weakening PostgreSQL 16
+  AWS obligations or converting missing evidence into N/A.
+- [ ] Task 10 lifecycle evidence is attached to each plugin/profile case rather
+  than cited generically; PB-11 remains owned by Tasks 4/6/7.
 - [ ] Plugin additions fail the maintained inventory gate until classified and evidenced.
 
 ---
@@ -1267,18 +1548,43 @@ git commit -m "test(state-engine): complete plugin lifecycle inventory"
 - Modify: `docs/architecture/state_engine/architecture.md`
 - Modify: `docs/architecture/state_engine/proof-matrix.md`
 - Modify: `docs/architecture/state_engine/assessments/README.md`
+- Modify: `docs/architecture/state_engine/proof-catalog/README.md`
 - Create: `docs/architecture/state_engine/assessments/<final-timestamp>/README.md`
 - Create: `docs/architecture/state_engine/assessments/<final-timestamp>/assessment.json`
 - Create: `docs/architecture/state_engine/assessments/<final-timestamp>/evidence.md`
 - Create: `docs/architecture/state_engine/assessments/<final-timestamp>/review.md`
 - Modify: `.github/workflows/ci.yaml`
 - Modify: `.github/workflows/build-push.yaml`
+- Create: `tests/unit/cicd/test_state_engine_ci_selection.py`
+
+**Step 0: Install every executable gate before the final freeze**
+
+Finalize and focused-test `.github/workflows/ci.yaml`,
+`.github/workflows/build-push.yaml`, the live-provider workflow, selector
+manifest enforcement, and `tests/unit/cicd/test_state_engine_ci_selection.py`.
+Commit every non-document executable/configuration change first. Require the
+manual live workflow to exist on the default branch with its protected
+environment before proceeding; otherwise stop with provider cells unknown.
+
+Record the resulting clean commit as the frozen baseline. Any later change to
+code, tests, catalog, scripts, configuration, or workflows invalidates every
+Task 12 result and restarts Steps 0–5 from a new frozen commit.
 
 **Step 1: Run every maintained evidence cohort at one frozen commit**
 
-Create a new full assessment at the frozen final commit. The final package may
+Create the first full v3 assessment explicitly:
+
+```bash
+PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
+  init-full "$STATE_ASSESSMENT_ID" \
+  "docs/architecture/state_engine/assessments/$STATE_ASSESSMENT_ID" \
+  --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json
+```
+
+The final package may
 reuse cohort selector definitions, but not their baseline-bound results; rerun
-every exact selector at the frozen final commit. Re-run:
+every exact selector from the committed selector manifest at the frozen final
+commit. Re-run:
 
 - deterministic SQLite repository and production suites;
 - independent-process SQLite recovery/coordination suites;
@@ -1300,7 +1606,7 @@ wardline scan . --fail-on ERROR --fail-on-inert \
 
 Trust-tier remains baseline-relative and key-free. Wardline must be run for all external-input changes and any finding fixed at its boundary.
 
-**Step 3: Install maintained CI/release selection**
+**Step 3: Verify maintained CI/release selection**
 
 - Always-on PR CI: catalog/schema/document validator and deterministic local state-engine contracts.
 - Required integration CI: SQLite process matrix and PostgreSQL 16 testcontainer matrix.
@@ -1337,6 +1643,11 @@ Use separate readers for:
 
 Resolve every material finding, rerun affected evidence, and require exactly one `Review outcome: complete` line. This is technical review, not a signature or approval package.
 
+If a finding changes any non-document file or the catalog, discard every Task
+12 result and restart from Step 0. A docs-only attribution/review correction may
+retain unaffected machine artifacts only when their hashes and frozen baseline
+remain identical.
+
 **Step 6: Publish the current hub and compiler handoff**
 
 Update the hub and proof matrix only after review. Record:
@@ -1350,22 +1661,27 @@ Update the hub and proof matrix only after review. Record:
 
 Do not create a signed plan package, approval sidecar, or document hash manifest. The catalog digest is a runtime compatibility fact; evidence artifact hashes exist only where reproducibility needs them.
 
-**Step 7: Close the tracker tree and commit**
+**Step 7: Close the tracker tree and publish docs only**
 
 Close only issues whose exit gates are represented by passing cells. Keep future multi-replica work separate.
 
 ```bash
-git add docs/architecture/state_engine \
-  .github/workflows \
-  scripts/state_engine_assessment.py \
-  tests
-git commit -m "feat(state-engine): publish the complete v2 contract"
+git add docs/architecture/state_engine/README.md \
+  docs/architecture/state_engine/architecture.md \
+  docs/architecture/state_engine/proof-matrix.md \
+  docs/architecture/state_engine/assessments/README.md \
+  docs/architecture/state_engine/proof-catalog/README.md \
+  "docs/architecture/state_engine/assessments/$STATE_ASSESSMENT_ID"
+git commit -m "feat(state-engine): publish the complete v3 contract"
 ```
 
 **Definition of Done:**
 
 - [ ] The assessment validator derives `complete` at the final commit.
 - [ ] Every required cell is pass or catalog-approved N/A.
+- [ ] Every required provider-backed plugin/variant has current live evidence
+  bound to the frozen SHA, protected workflow provenance, and the real required
+  execution profile.
 - [ ] Every hard gate is closed.
 - [ ] CI/release selection makes future drift fail closed.
 - [ ] Independent review is complete with no unresolved material finding.
@@ -1384,9 +1700,12 @@ PYTHONPATH="$PWD/src" .venv/bin/python -m pytest -q -n 0 \
   tests/unit/architecture/test_state_engine_supported_profiles.py \
   tests/unit/architecture/test_state_engine_catalog_contract.py
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
-  validate-catalog docs/architecture/state_engine/proof-catalog/v2/catalog.json
+  validate-catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json
 git diff --check
 ```
+
+Use the v2 catalog path at checkpoints before the Task 11 v3 commit; use v3 at
+every checkpoint after it. The Task 12 final checkpoint is v3 only.
 
 At the final checkpoint, additionally run the exact full suite, PostgreSQL lane, process matrix, plugin acceptance lanes, trust-tier corpus comparison, Wardline gate, package validator, link validator, and independent reviews described in Task 12.
 
@@ -1398,7 +1717,7 @@ Stop and surface the result rather than narrowing the claim when:
 - a required backend/provider is unavailable;
 - an independent-process scenario is replaced by threads or exception injection;
 - a test proves only repository behavior while the cell requires production composition;
-- a failure reveals a new state/subtype or cross-transaction seam absent from v2;
+- a failure reveals a new state/subtype or cross-transaction seam absent from the current catalog;
 - any required selector skips, times out, or is not collected;
 - Loomweave is stale for a reachability claim or Warpline is stale for a blast-radius claim;
 - Filigree returns `SCHEMA_MISMATCH`;
