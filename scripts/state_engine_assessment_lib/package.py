@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -60,6 +61,7 @@ V2_ASSESSMENT_TOP_LEVEL_KEYS = {
     "review_record",
 }
 ASSESSMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+EVIDENCE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 PYTEST_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 PYTEST_SAFE_ENVIRONMENT = {"PYTHONHASHSEED", "TZ", "LANG", "LC_ALL"}
 PYTEST_FLAGS = {
@@ -530,6 +532,11 @@ def _validate_pytest_command(
         _require(resolved.is_relative_to(root / "tests"), f"pytest selector must be under tests/: {item}")
         if assessment["baseline"]["mode"] == "current":
             _require(resolved.is_file(), f"pytest selector does not exist in the current checkout: {item}")
+        if assessment["derived"]["overall_verdict"] == "complete":
+            _require(
+                _selector_names_declared_test(resolved, item),
+                f"pytest evidence {evidence_id} selector must name a declared test: {item}",
+            )
         selectors.append(item)
         index += 1
     _require(bool(selectors), f"pytest evidence {evidence_id} requires at least one explicit tests/ selector")
@@ -541,6 +548,28 @@ def _validate_pytest_command(
         _require(name in PYTEST_SAFE_ENVIRONMENT, f"evidence {evidence_id} safe_environment name is not permitted: {name}")
         _require(value is None or isinstance(value, str), f"evidence {evidence_id} safe_environment value must be text or null")
     return selectors
+
+
+def _selector_names_declared_test(path: Path, selector: str) -> bool:
+    parts = selector.split("::")
+    if len(parts) not in {2, 3}:
+        return False
+    target_name = re.sub(r"\[[^]]*\]$", "", parts[-1])
+    if not target_name:
+        return False
+    try:
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError):
+        return False
+    if len(parts) == 2:
+        return any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == target_name for node in module.body)
+    class_name = parts[1]
+    return any(
+        isinstance(node, ast.ClassDef)
+        and node.name == class_name
+        and any(isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == target_name for child in node.body)
+        for node in module.body
+    )
 
 
 def _node_matches_selector(node_id: str, selector: str) -> bool:
@@ -772,6 +801,10 @@ def _validate_evidence(
     for index, raw_record in enumerate(records):
         record = _dict(raw_record, f"evidence[{index}]")
         evidence_id = _string(record.get("id"), f"evidence[{index}].id")
+        _require(
+            bool(EVIDENCE_ID_PATTERN.fullmatch(evidence_id)),
+            f"evidence ID has invalid characters or length: {evidence_id!r}",
+        )
         _require(evidence_id not in evidence_by_id, f"duplicate evidence ID: {evidence_id}")
         kind = _string(record.get("kind"), f"evidence {evidence_id} kind")
         _require(kind in allowed_kinds, f"evidence {evidence_id} has unsupported kind: {kind}")
@@ -790,6 +823,10 @@ def _validate_evidence(
             _require(
                 set(record) == {"id", *required_fields},
                 f"documentation evidence {evidence_id} has unexpected fields",
+            )
+            _require(
+                record["result_counts"] is None,
+                f"documentation evidence {evidence_id} result_counts must be null",
             )
         _require(
             record["reproducibility_class"] in {"deterministic", "semantic_comparison", "external_observation"},

@@ -8,6 +8,8 @@ import runpy
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
+from collections import Counter
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -580,8 +582,8 @@ def _pytest_evidence(
         "retained_artifacts": artifacts,
         "collected_node_index": node_index,
         "collected_nodes": len(nodes),
-        "establishes": ["Executable state-engine behavior for the declared proof cells."],
-        "does_not_establish": [],
+        "establishes": ["Synthetic validator-fixture artifact mechanics for declared cells only."],
+        "does_not_establish": ["Does not establish ELSPETH state-engine behavior or production completion."],
     }
 
 
@@ -600,7 +602,7 @@ def _required_cells(catalog: dict[str, Any]) -> list[tuple[dict[str, Any], str, 
     return cells
 
 
-def _materialize_complete_assessment(
+def _materialize_fabricated_complete_assessment(
     repository: Path,
     assessment_path: Path,
     *,
@@ -656,9 +658,9 @@ def _materialize_complete_assessment(
         cells_by_leg.setdefault(cell[0]["id"], []).append(cell)
     for leg in assessment["legs"]:
         leg["derived_verdict"] = "confirmed"
-        leg["reason"] = "Every required cell has executable passing evidence."
+        leg["reason"] = "Fabricated adversarial validator fixture maps every required cell."
         leg["owner_issue"] = None
-        leg["exit_gate"] = "Retain the passing executable selectors."
+        leg["exit_gate"] = "Reject this fabricated validator fixture."
         leg["overrides"] = [
             {
                 "dimension": dimension,
@@ -674,7 +676,7 @@ def _materialize_complete_assessment(
         gate["status"] = "closed"
         gate["support"] = evidence_ids
         gate["affected_leg_ids"] = []
-        gate["reason"] = "All mapped mandatory proof cells have executable passing evidence."
+        gate["reason"] = "Fabricated adversarial validator fixture maps every mandatory cell."
     family_counts = {
         family: {
             "confirmed": sum(leg["family"] == family for leg in catalog["legs"]),
@@ -694,7 +696,270 @@ def _materialize_complete_assessment(
         "family_counts": family_counts,
         "total": {"confirmed": 73, "gap": 0, "unknown": 0},
         "overall_verdict": "complete",
-        "reason": "All mandatory proof cells and hard gates are resolved.",
+        "reason": "Fabricated adversarial validator fixture; this is not product completion evidence.",
+    }
+    _write_json(assessment_path, assessment)
+    _write_complete_proof_matrix(repository / "docs/architecture/state_engine/proof-matrix.md", catalog)
+
+
+def _validator_fixture_module_source(subjects_by_profile: dict[str, list[tuple[str, str, str]]]) -> str:
+    profile_items = list(subjects_by_profile.items())
+    lines = [
+        '"""Synthetic validator mechanics; this is not ELSPETH state-engine evidence."""',
+        "",
+        "from __future__ import annotations",
+        "",
+        "import sqlite3",
+        "",
+        "import pytest",
+        "from sqlalchemy.engine import Connection",
+        "",
+        f"SUBJECTS = {subjects_by_profile!r}",
+        "",
+        "",
+        "class _PostgresqlDialect:",
+        '    name = "postgresql"',
+        "",
+        "",
+        "class _PostgresqlScalarResult:",
+        "    @staticmethod",
+        "    def scalar_one() -> str:",
+        '        return "16.13"',
+        "",
+        "",
+        "class DeterministicPostgresqlConnection(Connection):",
+        '    """Typed deterministic provider for the reporter contract only."""',
+        "",
+        "    def __init__(self) -> None:",
+        "        pass",
+        "",
+        "    @property",
+        "    def dialect(self) -> _PostgresqlDialect:",
+        "        return _PostgresqlDialect()",
+        "",
+        "    def exec_driver_sql(self, statement, parameters=None, execution_options=None):",
+        '        assert statement == "SHOW server_version"',
+        "        assert parameters is None",
+        "        assert execution_options is None",
+        "        return _PostgresqlScalarResult()",
+    ]
+    for profile_index, (profile_case, subjects) in enumerate(profile_items, start=1):
+        test_name = f"test_profile_{profile_index:02d}_validator_mechanics"
+        parameter_ids = [
+            re.sub(r"[^a-z0-9]+", "-", f"{leg_id}-{case_id}".lower()).strip("-") for leg_id, case_id, _profile_case in subjects
+        ]
+        lines.extend(
+            [
+                "",
+                "",
+                f'@pytest.mark.parametrize("subject", SUBJECTS[{profile_case!r}], ids={parameter_ids!r})',
+                f"def {test_name}(subject, state_engine_profile) -> None:",
+                f"    assert subject in SUBJECTS[{profile_case!r}]",
+                f"    if subject != SUBJECTS[{profile_case!r}][0]:",
+                "        return",
+            ]
+        )
+        if profile_case == "postgresql-16-aws-single-leader-landscape":
+            lines.extend(
+                [
+                    "    state_engine_profile.observe_postgresql(",
+                    "        DeterministicPostgresqlConnection(),",
+                    '        deployment="aws-single-leader-landscape",',
+                    "    )",
+                ]
+            )
+        else:
+            deployment = profile_case.removeprefix("sqlite-wal-")
+            lines.extend(
+                [
+                    '    with sqlite3.connect(":memory:") as connection:',
+                    "        state_engine_profile.observe_sqlite(",
+                    "            connection,",
+                    f"            deployment={deployment!r},",
+                    "        )",
+                ]
+            )
+    return "\n".join(lines) + "\n"
+
+
+def _run_validator_fixture_profile(
+    repository: Path,
+    *,
+    profile_index: int,
+    profile_case: str,
+    subjects: list[tuple[str, str, str]],
+    profile_cells: list[tuple[dict[str, Any], str, str, str]],
+) -> dict[str, Any]:
+    evidence_id = f"EV-PROFILE-{profile_index:02d}"
+    stem = f"docs/architecture/state_engine/assessments/minimal-assessment/evidence/{evidence_id.lower()}"
+    junit_relative = f"{stem}.junit.xml"
+    profile_relative = f"{stem}.profile.json"
+    stdout_relative = f"{stem}.stdout"
+    stderr_relative = f"{stem}.stderr"
+    node_relative = f"{stem}.nodes"
+    test_relative = "tests/test_state_engine_validator_mechanics.py"
+    selector = f"{test_relative}::test_profile_{profile_index:02d}_validator_mechanics"
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        PROFILE_REPORTER_PLUGIN,
+        f"--state-engine-profile-report={profile_relative}",
+        f"--junitxml={junit_relative}",
+        selector,
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(REPOSITORY_ROOT),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
+    started_at = datetime.now(UTC)
+    result = subprocess.run(
+        argv,
+        cwd=repository,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    ended_at = datetime.now(UTC)
+    assert result.returncode == 0, result.stderr
+    (repository / stdout_relative).write_text(result.stdout, encoding="utf-8")
+    (repository / stderr_relative).write_text(result.stderr, encoding="utf-8")
+    profile = json.loads((repository / profile_relative).read_text(encoding="utf-8"))
+    nodes = profile["node_ids"]
+    assert len(nodes) == len(subjects)
+    assert all(outcome["outcome"] == "passed" for outcome in profile["outcomes"])
+    node_by_subject = dict(zip(subjects, nodes, strict=True))
+    (repository / node_relative).write_text("".join(f"{node}\n" for node in nodes), encoding="utf-8")
+    outcome_counts = Counter(outcome["outcome"] for outcome in profile["outcomes"])
+    coverage = [
+        {
+            "leg_id": leg["id"],
+            "dimension_id": dimension,
+            "case_id": case_id,
+            "profile_case": cell_profile,
+            "node_ids": [node_by_subject[(leg["id"], case_id, cell_profile)]],
+        }
+        for leg, dimension, case_id, cell_profile in profile_cells
+    ]
+    return {
+        "id": evidence_id,
+        "kind": "pytest",
+        "reproducibility_class": "deterministic",
+        "argv": argv,
+        "cwd_relative": ".",
+        "timeout_seconds": 60,
+        "safe_environment": {"PYTHONHASHSEED": "0"},
+        "resources": [],
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "duration_seconds": (ended_at - started_at).total_seconds(),
+        "exit_code": 0,
+        "result_counts": {
+            "passed": outcome_counts["passed"],
+            "failed": outcome_counts["failed"],
+            "errors": outcome_counts["error"],
+            "skipped": outcome_counts["skipped"],
+            "xfailed": outcome_counts["xfailed"],
+            "xpassed": outcome_counts["xpassed"],
+            "warnings": len(profile["warnings"]),
+        },
+        "coverage": coverage,
+        "retained_artifacts": [
+            _existing_artifact_record(repository, junit_relative, "junit_xml"),
+            _existing_artifact_record(repository, stdout_relative, "stdout"),
+            _existing_artifact_record(repository, stderr_relative, "stderr"),
+            _existing_artifact_record(repository, profile_relative, "profile_report"),
+        ],
+        "collected_node_index": _existing_artifact_record(repository, node_relative, "node_index"),
+        "collected_nodes": len(nodes),
+        "establishes": ["Synthetic validator mechanics for declared fixture proof cells only."],
+        "does_not_establish": ["Does not establish ELSPETH state-engine behavior or production completion."],
+    }
+
+
+def _materialize_executed_validator_fixture_assessment(
+    repository: Path,
+    assessment_path: Path,
+) -> None:
+    catalog = json.loads((repository / "docs/architecture/state_engine/proof-catalog/v2/catalog.json").read_text())
+    assessment = json.loads(assessment_path.read_text())
+    cells = _required_cells(catalog)
+    profile_cases = [profile["id"] for profile in catalog["execution_profiles"]["profile_cases"]]
+    cells_by_profile = {profile_case: [cell for cell in cells if cell[3] == profile_case] for profile_case in profile_cases}
+    subjects_by_profile = {
+        profile_case: list(dict.fromkeys((cell[0]["id"], cell[2], profile_case) for cell in cells_by_profile[profile_case]))
+        for profile_case in profile_cases
+    }
+    test_relative = "tests/test_state_engine_validator_mechanics.py"
+    (repository / test_relative).write_text(_validator_fixture_module_source(subjects_by_profile), encoding="utf-8")
+    _git(repository, "add", test_relative)
+    _git(repository, "commit", "-qm", "add synthetic validator mechanics selectors")
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    records = [
+        _run_validator_fixture_profile(
+            repository,
+            profile_index=index,
+            profile_case=profile_case,
+            subjects=subjects_by_profile[profile_case],
+            profile_cells=cells_by_profile[profile_case],
+        )
+        for index, profile_case in enumerate(profile_cases, start=1)
+    ]
+    evidence_by_profile = dict(zip(profile_cases, (record["id"] for record in records), strict=True))
+    assessment["evidence"] = records
+    cells_by_leg: dict[str, list[tuple[dict[str, Any], str, str, str]]] = {}
+    for cell in cells:
+        cells_by_leg.setdefault(cell[0]["id"], []).append(cell)
+    for leg in assessment["legs"]:
+        leg["derived_verdict"] = "confirmed"
+        leg["reason"] = "Synthetic validator-workflow fixture assigns one executed pytest node to every required subject."
+        leg["owner_issue"] = None
+        leg["exit_gate"] = "Retain the synthetic validator-workflow fixture selectors."
+        leg["overrides"] = [
+            {
+                "dimension": dimension,
+                "case": case_id,
+                "profile_case": profile_case,
+                "status": "pass",
+                "evidence": [evidence_by_profile[profile_case]],
+            }
+            for _catalog_leg, dimension, case_id, profile_case in cells_by_leg[leg["id"]]
+        ]
+    evidence_ids = [record["id"] for record in records]
+    for gate in assessment["hard_gates"]:
+        gate["status"] = "closed"
+        gate["support"] = evidence_ids
+        gate["affected_leg_ids"] = []
+        gate["reason"] = "Synthetic validator-workflow fixture exercises the mapped cells."
+    assessment["derived"] = {
+        "family_counts": {
+            family: {
+                "confirmed": sum(leg["family"] == family for leg in catalog["legs"]),
+                "gap": 0,
+                "unknown": 0,
+            }
+            for family in (
+                "transition",
+                "auxiliary",
+                "run_coordination",
+                "production_boundary",
+                "read_model",
+                "forbidden",
+            )
+        },
+        "total": {"confirmed": 73, "gap": 0, "unknown": 0},
+        "overall_verdict": "complete",
+        "reason": "Synthetic validator-workflow fixture only; this is not product completion evidence.",
     }
     _write_json(assessment_path, assessment)
     _write_complete_proof_matrix(repository / "docs/architecture/state_engine/proof-matrix.md", catalog)
@@ -1228,11 +1493,85 @@ def test_validate_package_and_collect_evidence_accept_same_genuine_runtime_artif
     assert "1 pytest records" in collection.stdout
 
 
-def test_validate_package_ignores_relabelled_human_stdout_when_machine_outcomes_are_unchanged(
+@pytest.mark.parametrize("kind", ["pytest", "documentation"])
+def test_validate_package_rejects_empty_evidence_ids_for_every_kind(
+    assessment_repository: tuple[Path, Path],
+    kind: str,
+) -> None:
+    repository, assessment_path = assessment_repository
+    node = "tests/unit/test_state_engine_contract.py::test_evidence_id"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="",
+        profile_case="sqlite-wal-single-process-leader",
+        coverage=[],
+        nodes=[node],
+    )
+    if kind == "documentation":
+        record["kind"] = "documentation"
+        record["result_counts"] = None
+        record.pop("collected_node_index")
+        record.pop("collected_nodes")
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "evidence ID" in result.stderr
+
+
+def test_validate_package_rejects_boolean_documentation_result_counts(
     assessment_repository: tuple[Path, Path],
 ) -> None:
     repository, assessment_path = assessment_repository
-    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+    node = "tests/unit/test_state_engine_contract.py::test_documentation_counts"
+    record = _pytest_evidence(
+        repository,
+        evidence_id="EV-DOCUMENTATION-COUNTS",
+        profile_case="sqlite-wal-single-process-leader",
+        coverage=[],
+        nodes=[node],
+    )
+    record["kind"] = "documentation"
+    record["result_counts"] = True
+    record.pop("collected_node_index")
+    record.pop("collected_nodes")
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "documentation evidence EV-DOCUMENTATION-COUNTS result_counts must be null" in result.stderr
+
+
+def test_collect_evidence_rejects_complete_package_with_comment_only_selector_module(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_fabricated_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "must name a declared test" in result.stderr
+
+
+def test_executed_complete_validator_fixture_supports_both_commands_and_rejects_mutations(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    _materialize_executed_validator_fixture_assessment(repository, assessment_path)
+
+    for command in ("validate-package", "collect-evidence"):
+        result = _run_assessment_cli(command, str(assessment_path), cwd=repository)
+
+        assert result.returncode == 0, result.stderr
+        assert "valid" in result.stdout
+
     assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
     record = assessment["evidence"][0]
     stdout_record = _artifact_by_kind(record, "stdout")
@@ -1246,18 +1585,28 @@ def test_validate_package_ignores_relabelled_human_stdout_when_machine_outcomes_
     assert result.returncode == 0, result.stderr
     assert "complete" in result.stdout
 
+    selector = record["argv"][-1]
+    record["argv"][-1] = "tests/test_state_engine_validator_mechanics.py::test_missing_selector"
+    _write_json(assessment_path, assessment)
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+    assert result.returncode == 1
+    assert "must name a declared test" in result.stderr
+    record["argv"][-1] = selector
 
-def test_both_validators_reject_complete_package_relabelled_as_xpass_in_machine_outcomes(
-    assessment_repository: tuple[Path, Path],
-) -> None:
-    repository, assessment_path = assessment_repository
-    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
-    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
-    record = assessment["evidence"][0]
-    stdout_record = _artifact_by_kind(record, "stdout")
-    stdout_path = repository / stdout_record["path"]
-    stdout_path.write_text("1 xpassed in 0.01s\n", encoding="utf-8")
-    stdout_record["sha256"] = hashlib.sha256(stdout_path.read_bytes()).hexdigest()
+    node_record = record["collected_node_index"]
+    node_path = repository / node_record["path"]
+    node_content = node_path.read_text(encoding="utf-8")
+    nodes = node_content.splitlines()
+    nodes[0] = f"{nodes[0]}-missing"
+    node_path.write_text("".join(f"{node}\n" for node in nodes), encoding="utf-8")
+    node_record["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
+    _write_json(assessment_path, assessment)
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+    assert result.returncode == 1
+    assert "coverage cites a node outside its collected-node index" in result.stderr
+    node_path.write_text(node_content, encoding="utf-8")
+    node_record["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
+
     profile_record = _artifact_by_kind(record, "profile_report")
     profile_path = repository / profile_record["path"]
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
@@ -1334,7 +1683,7 @@ def test_validate_package_and_collect_evidence_share_command_and_environment_con
     base = json.loads(assessment_path.read_text(encoding="utf-8"))
     base["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
     base["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
-    cases = [
+    cases: list[tuple[str, Callable[[dict[str, Any]], None], str]] = [
         ("command", lambda item: item.update({"argv": [sys.executable, "-c", "raise SystemExit(0)"]}), "trusted pytest"),
         (
             "environment",
@@ -1431,7 +1780,21 @@ def test_validate_package_rejects_one_node_fabricated_complete(
     assessment_repository: tuple[Path, Path],
 ) -> None:
     repository, assessment_path = assessment_repository
-    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=True)
+    _materialize_fabricated_complete_assessment(repository, assessment_path, one_node_per_profile=True)
+    selector_path = repository / "tests/unit/test_state_engine_contract.py"
+    selector_path.write_text(
+        "".join(f"def test_profile_{index}():\n    pass\n\n" for index in range(1, 5)),
+        encoding="utf-8",
+    )
+    _git(repository, "add", "tests/unit/test_state_engine_contract.py")
+    _git(repository, "commit", "-qm", "add adversarial one-node selectors")
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    for record in assessment["evidence"]:
+        profile_index = int(record["id"].rsplit("-", 1)[-1])
+        record["argv"][-1] = f"tests/unit/test_state_engine_contract.py::test_profile_{profile_index}"
+    _write_json(assessment_path, assessment)
 
     result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
 
@@ -1454,6 +1817,7 @@ def test_validate_package_rejects_documentary_evidence_for_behavioral_pass(
         nodes=[node],
     )
     record["kind"] = "documentation"
+    record["result_counts"] = None
     record.pop("collected_node_index")
     record.pop("collected_nodes")
     _attach_ts00_pass(assessment, record, profile_case=profile_case)
@@ -1480,6 +1844,7 @@ def test_validate_package_rejects_documentary_evidence_for_behavioral_fail(
         nodes=[node],
     )
     record["kind"] = "documentation"
+    record["result_counts"] = None
     record.pop("collected_node_index")
     record.pop("collected_nodes")
     assessment["evidence"] = [record]
