@@ -101,6 +101,11 @@ SUPPORTED_PROFILE_CASES = {
         [mode for mode in SUPPORTED_LIFECYCLE_MODES if mode != "follower"],
     ),
 }
+APPLICABILITY_PROFILE_IDS = {
+    "elspeth-state-engine-v1": {"all-required-v1"},
+    "elspeth-state-engine-v2": {"all-required-v2"},
+}
+PLACEHOLDER_PATTERN = re.compile(r"TBD|TODO|FIXME|<timestamp>|<full SHA>")
 
 
 class ContractError(ValueError):
@@ -287,7 +292,7 @@ def _validate_profile_cases(catalog: dict[str, Any]) -> list[str]:
 
 def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
     _require(catalog.get("schema_version") == 1, "catalog schema_version must be 1")
-    catalog_id = catalog.get("catalog_id")
+    catalog_id = _string(catalog.get("catalog_id"), "catalog_id")
     expected_ids = _expected_leg_ids(catalog_id)
     _require(catalog.get("dimensions") == DIMENSIONS, "catalog dimensions do not match the contract")
     _require(
@@ -331,6 +336,10 @@ def validate_catalog(catalog: dict[str, Any], catalog_path: Path) -> None:
         _require(names == live_plugins[kind], f"first-party plugin inventory {kind} is stale")
 
     applicability = _dict(catalog.get("applicability_profiles"), "applicability_profiles")
+    _require(
+        set(applicability) == APPLICABILITY_PROFILE_IDS[catalog_id],
+        "catalog applicability profile namespace does not match the versioned contract",
+    )
     if catalog_id == "elspeth-state-engine-v2":
         from elspeth.contracts.enums import TerminalPath
         from elspeth.contracts.scheduler import TokenWorkStatus
@@ -687,6 +696,42 @@ def _validate_review(assessment: dict[str, Any], assessment_path: Path, root: Pa
     _require(not re.search(r"(?i)\boutcome:\s*pending\b", text), f"review remains pending: {review_path}")
 
 
+def _validate_placeholders(assessment_path: Path, root: Path) -> None:
+    state_engine_root = root / "docs/architecture/state_engine"
+    documents = [
+        state_engine_root / "README.md",
+        state_engine_root / "architecture.md",
+        state_engine_root / "proof-matrix.md",
+        state_engine_root / "completeness-criteria.md",
+        state_engine_root / "assessment-framework.md",
+        assessment_path.parent / "README.md",
+        assessment_path.parent / "evidence.md",
+        assessment_path.parent / "review.md",
+    ]
+    findings: list[str] = []
+    for document in documents:
+        if not document.is_file():
+            continue
+        for line_number, line in enumerate(document.read_text(encoding="utf-8").splitlines(), start=1):
+            for match in PLACEHOLDER_PATTERN.finditer(line):
+                findings.append(f"{document.relative_to(root)}:{line_number}:{match.group(0)}")
+    _require(not findings, "unresolved placeholder found:\n" + "\n".join(findings))
+
+
+def _validate_unresolved_metadata(value: dict[str, Any], context: str) -> None:
+    for field in ("reason", "exit_gate"):
+        field_value = value.get(field)
+        _require(
+            isinstance(field_value, str) and bool(field_value.strip()),
+            f"{context} {field} must be a non-empty string",
+        )
+    owner_issue = value.get("owner_issue")
+    _require(
+        owner_issue is None or (isinstance(owner_issue, str) and bool(owner_issue.strip())),
+        f"{context} owner_issue must be null or a non-empty string",
+    )
+
+
 def _changed_key(item: dict[str, Any], v2: bool) -> tuple[str, str, str, str]:
     return _coverage_key(item, v2)
 
@@ -792,6 +837,7 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
     _validate_baseline(assessment, root)
     _validate_environment(assessment)
     _validate_review(assessment, assessment_path, root)
+    _validate_placeholders(assessment_path, root)
     evidence_by_id, coverage_by_evidence = _validate_evidence(assessment, catalog, root)
     evidence_ids = set(evidence_by_id)
     catalog_by_id = {leg["id"]: leg for leg in catalog["legs"]}
@@ -832,6 +878,8 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
         _require(leg.get("default_status") == "unknown", f"leg {leg_id} default_status must be unknown")
         for field in ("reason", "owner_issue", "exit_gate"):
             _require(field in leg, f"leg {leg_id} is missing {field}")
+        if leg["derived_verdict"] in {"gap", "unknown"}:
+            _validate_unresolved_metadata(leg, f"leg {leg_id} unresolved")
         catalog_leg = catalog_by_id[leg_id]
         profile = catalog["applicability_profiles"][catalog_leg["applicability_profile"]]
         cell_status: dict[tuple[str, str, str], str] = {}
@@ -860,6 +908,7 @@ def validate_package(assessment_path: Path) -> tuple[int, str]:
             if status in {"partial", "fail", "unknown"}:
                 for field in ("reason", "owner_issue", "exit_gate"):
                     _require(field in override, f"leg {leg_id} {status} override is missing {field}")
+                _validate_unresolved_metadata(override, f"leg {leg_id} {status} override")
             if status == "not_applicable":
                 _require(profile[key[0]] == "not_applicable", f"leg {leg_id} cannot waive a required dimension")
                 _require(not cited, f"leg {leg_id} not_applicable override cannot cite evidence")

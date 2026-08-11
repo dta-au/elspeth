@@ -309,6 +309,13 @@ def test_validate_catalog_cli_accepts_current_v2_catalog() -> None:
             "supported state-store profiles",
             id="unsupported-postgresql-multi-host-profile",
         ),
+        pytest.param(
+            lambda catalog: catalog["applicability_profiles"].update(
+                {"unused-extra": dict(catalog["applicability_profiles"]["all-required-v2"])}
+            ),
+            "applicability profile namespace",
+            id="unused-applicability-profile",
+        ),
     ],
 )
 def test_validate_catalog_cli_rejects_contract_drift(
@@ -385,6 +392,61 @@ def test_validate_package_rejects_false_derived_totals_and_verdict(
 
     assert result.returncode == 1
     assert "derived total" in result.stderr
+
+
+@pytest.mark.parametrize("field", ["reason", "owner_issue", "exit_gate"])
+def test_validate_package_rejects_empty_unresolved_leg_metadata(
+    assessment_repository: tuple[Path, Path],
+    field: str,
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["legs"][0][field] = ""
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert f"leg TS-00 unresolved {field}" in result.stderr
+
+
+def test_validate_package_rejects_empty_unresolved_override_metadata(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["legs"][0]["overrides"] = [
+        {
+            "dimension": "production_entry",
+            "case": "leg-contract",
+            "profile_case": "sqlite-wal-single-process-leader",
+            "status": "unknown",
+            "evidence": [],
+            "reason": "",
+            "owner_issue": None,
+            "exit_gate": "Collect production-entry evidence.",
+        }
+    ]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "leg TS-00 unknown override reason" in result.stderr
+
+
+def test_validate_package_rejects_placeholder_in_assessment_readme(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    readme_path = assessment_path.parent / "README.md"
+    readme_path.write_text(readme_path.read_text(encoding="utf-8") + "\nTODO: fill this in.\n", encoding="utf-8")
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "unresolved placeholder found" in result.stderr
+    assert "assessments/minimal-assessment/README.md:5:TODO" in result.stderr
 
 
 def test_collect_evidence_cli_validates_empty_pytest_inventory(
