@@ -35,12 +35,12 @@ The v1 catalog cannot be completed honestly against current source because it is
 The default support decision for this plan is:
 
 1. SQLite WAL remains required for single-process and one-host leader/follower packs.
-2. PostgreSQL 16 becomes required for the maintained single-leader Landscape profile used by AWS deployment.
+2. PostgreSQL 16 is a required first-class backend for the maintained single-leader Landscape profile used by AWS deployment.
 3. Multi-host/multi-replica scheduling remains explicitly unsupported until its separate program changes that claim; a PostgreSQL race test does not by itself advertise multi-replica support.
 4. All current first-party plugins remain in the production-supported inventory. Provider-backed plugins require real provider acceptance for a production-supported verdict; absence of credentials is `unknown`.
 5. Existing v1 leg IDs remain stable. v2 adds explicit obligations for `ABANDONED` and row-union behavior rather than silently folding them into old prose.
 
-If the maintainer instead withdraws PostgreSQL Landscape support, Task 1 must remove or narrow the conflicting deployment claim in the same commit. The implementation must never retain a PostgreSQL production claim while excluding PostgreSQL from the state-engine catalog.
+PostgreSQL support is not an execution fork: Task 1 must include the maintained AWS PostgreSQL 16 single-leader profile in the state-engine catalog. The implementation must never retain that production claim while excluding PostgreSQL from the state-engine catalog.
 
 ## Completion contract
 
@@ -135,7 +135,7 @@ Expected: failure because the v2 catalog and ADR-041 do not exist.
 ADR-041 must state, without aspirational ambiguity:
 
 - SQLite WAL one-host leader/follower support remains governed by ADR-030.
-- PostgreSQL 16 is supported for the maintained single-leader Landscape deployment.
+- PostgreSQL 16 is a required first-class state-engine backend for the maintained single-leader Landscape deployment.
 - PostgreSQL multi-replica scheduling remains unsupported and has a separate owner.
 - DB-server time, row locking, isolation, schema migration, and connection-loss behavior are part of the PostgreSQL state-engine contract.
 - Any future multi-replica enablement requires a new catalog/profile revision and cannot inherit the single-leader evidence.
@@ -172,7 +172,7 @@ git commit -m "docs(state-engine): pin supported runtime profiles"
 
 **Definition of Done:**
 
-- [ ] PostgreSQL is either included in the state-engine claim or withdrawn from maintained deployment claims.
+- [ ] PostgreSQL 16 is included as a required first-class state-engine backend for the maintained AWS single-leader Landscape deployment.
 - [ ] SQLite one-host and PostgreSQL single-leader scopes are mechanically distinct.
 - [ ] Multi-replica remains explicitly out of scope.
 - [ ] The focused test fails before the change and passes afterward.

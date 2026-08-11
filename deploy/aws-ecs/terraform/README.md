@@ -27,6 +27,14 @@ post-enable acceptance program, Scenario B, and upgrade/teardown lifecycle.
 PostgreSQL cluster, separate session and Landscape databases, EFS data storage,
 S3 object storage, logs/metrics/traces, and local ELSPETH authentication.
 
+The maintained Landscape state-engine profile for this topology is
+PostgreSQL 16 single-leader. PostgreSQL 16 is a required first-class state-engine
+backend for the AWS integration: exactly one ELSPETH scheduler leader owns run
+custody against the Landscape database. PostgreSQL multi-replica scheduling
+remains unsupported; database-service redundancy does not authorize multiple
+ELSPETH scheduler leaders, multi-host followers, or multiple web replicas. See
+[ADR-041](../../../docs/architecture/adr/041-state-engine-supported-profiles.md).
+
 ### Scenario B: OIDC acceptance variant
 
 `scenario-b/` exists only for acceptance of the Cognito/OIDC path and upgrade

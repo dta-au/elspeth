@@ -1,11 +1,26 @@
 # ADR-030: Multi-Worker Deployment Shape — One-Host WAL Pack
 
 **Date:** 2026-06-11
-**Status:** Accepted (Proposed at slice 0; Accepted at slice 5 of elspeth-1396d3f790)
+**Status:** Accepted (Proposed at slice 0; Accepted at slice 5 of
+elspeth-1396d3f790; amended by ADR-041 on 2026-08-11)
 **Deciders:** John Morrissey, Claude Fable 5
 **Tags:** scheduler, coordination, multi-worker, deployment, sqlite, wal,
           leader-election, fencing, multi-source-token-scheduler, adr-026,
           precondition-9
+
+## Amendment (2026-08-11)
+
+**Amended by ADR-041:** this document remains the historical decision for the
+0.6.0 SQLite WAL one-host worker pack. ADR-041 supersedes only D7's future-port
+posture and the Supported / NOT supported section's PostgreSQL runtime refusal:
+PostgreSQL 16 single-leader is now a required first-class state-engine backend
+for the maintained AWS Landscape deployment. The SQLite one-host leader/follower
+profile remains governed here. PostgreSQL multi-replica scheduling, multi-host
+follower scheduling, and multiple web replicas remain unsupported and require
+their own catalog/profile revision and evidence.
+
+The original text below is preserved as the dated 0.6.0 decision rather than
+rewritten to appear as though PostgreSQL was supported at that time.
 
 ## Context
 
