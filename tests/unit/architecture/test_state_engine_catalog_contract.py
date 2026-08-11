@@ -7,7 +7,8 @@ import re
 import runpy
 import subprocess
 import sys
-import time
+import xml.etree.ElementTree as ET
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +22,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 V1_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v1/catalog.json"
 V2_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
 ASSESSMENT_SCRIPT_PATH = REPOSITORY_ROOT / "scripts/state_engine_assessment.py"
+PROFILE_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
 V1_CATALOG_SHA256 = "2e025df8fcb61869f4ac2575d2d1b0c5bba5aa63c88c0d059e630431062eef2e"
 
 
@@ -281,19 +283,161 @@ def _artifact_record(repository: Path, path: str, content: str) -> dict[str, str
     return {"path": path, "sha256": hashlib.sha256(content.encode()).hexdigest()}
 
 
-def _profile_provenance(profile_case: str) -> dict[str, str]:
-    if profile_case == "postgresql-16-aws-single-leader-landscape":
-        return {
-            "profile_case_id": profile_case,
-            "state_store": "postgresql-16",
-            "deployment": "aws-single-leader-landscape",
-            "backend_version": "16.13",
+def _existing_artifact_record(repository: Path, path: str, kind: str) -> dict[str, str]:
+    artifact_path = repository / path
+    return {"kind": kind, "path": path, "sha256": hashlib.sha256(artifact_path.read_bytes()).hexdigest()}
+
+
+def _genuine_sqlite_evidence(repository: Path) -> dict[str, Any]:
+    test_relative = "tests/test_state_engine_runtime_profile.py"
+    test_path = repository / test_relative
+    test_path.parent.mkdir(exist_ok=True)
+    test_path.write_text(
+        "import sqlite3\n\n"
+        "def test_runtime_profile(state_engine_profile):\n"
+        "    connection = sqlite3.connect(':memory:')\n"
+        "    assert connection.execute('SELECT 1').fetchone() == (1,)\n"
+        "    state_engine_profile.observe_sqlite(\n"
+        "        connection, deployment='single-process-leader'\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", test_relative)
+    _git(repository, "commit", "-qm", "add genuine profile evidence node")
+    stem = "docs/architecture/state_engine/assessments/minimal-assessment/evidence/ev-genuine"
+    junit_relative = f"{stem}.junit.xml"
+    profile_relative = f"{stem}.profile.json"
+    stdout_relative = f"{stem}.stdout"
+    stderr_relative = f"{stem}.stderr"
+    node_index_relative = f"{stem}.nodes"
+    selector = f"{test_relative}::test_runtime_profile"
+    argv = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "-p",
+        PROFILE_REPORTER_PLUGIN,
+        f"--state-engine-profile-report={profile_relative}",
+        f"--junitxml={junit_relative}",
+        selector,
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(REPOSITORY_ROOT),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            "PYTHONHASHSEED": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
         }
+    )
+    started_at = datetime.now(UTC)
+    result = subprocess.run(
+        argv,
+        cwd=repository,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    ended_at = datetime.now(UTC)
+    assert result.returncode == 0, result.stderr
+    (repository / stdout_relative).write_text(result.stdout, encoding="utf-8")
+    (repository / stderr_relative).write_text(result.stderr, encoding="utf-8")
+    (repository / node_index_relative).write_text(f"{selector}\n", encoding="utf-8")
     return {
+        "id": "EV-GENUINE",
+        "kind": "pytest",
+        "reproducibility_class": "deterministic",
+        "argv": argv,
+        "cwd_relative": ".",
+        "timeout_seconds": 30,
+        "safe_environment": {"PYTHONHASHSEED": "0"},
+        "resources": [],
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "duration_seconds": (ended_at - started_at).total_seconds(),
+        "exit_code": 0,
+        "result_counts": {
+            "passed": 1,
+            "failed": 0,
+            "errors": 0,
+            "skipped": 0,
+            "xfailed": 0,
+            "xpassed": 0,
+            "warnings": 0,
+        },
+        "coverage": [],
+        "retained_artifacts": [
+            _existing_artifact_record(repository, junit_relative, "junit_xml"),
+            _existing_artifact_record(repository, stdout_relative, "stdout"),
+            _existing_artifact_record(repository, stderr_relative, "stderr"),
+            _existing_artifact_record(repository, profile_relative, "profile_report"),
+        ],
+        "collected_node_index": _existing_artifact_record(repository, node_index_relative, "node_index"),
+        "collected_nodes": 1,
+        "establishes": ["The retained artifacts exercise the profile reporter contract."],
+        "does_not_establish": ["This fixture does not establish a state-engine proof cell."],
+    }
+
+
+def _artifact_by_kind(record: dict[str, Any], kind: str) -> dict[str, str]:
+    return next(artifact for artifact in record["retained_artifacts"] if artifact["kind"] == kind)
+
+
+def _replace_genuine_node_identity(repository: Path, record: dict[str, Any], node_id: str) -> None:
+    junit_record = _artifact_by_kind(record, "junit_xml")
+    junit_path = repository / junit_record["path"]
+    junit = ET.parse(junit_path)
+    identity = next(element for element in junit.getroot().iter("property") if element.attrib.get("name") == "elspeth_node_id")
+    identity.set("value", node_id)
+    junit.write(junit_path, encoding="utf-8", xml_declaration=True)
+    junit_record["sha256"] = hashlib.sha256(junit_path.read_bytes()).hexdigest()
+    profile_record = _artifact_by_kind(record, "profile_report")
+    profile_path = repository / profile_record["path"]
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["node_ids"] = [node_id]
+    profile["probe_node_id"] = node_id
+    profile["deployment_probe"]["node_id"] = node_id
+    _write_json(profile_path, profile)
+    profile_record["sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+    node_record = record["collected_node_index"]
+    node_path = repository / node_record["path"]
+    node_path.write_text(f"{node_id}\n", encoding="utf-8")
+    node_record["sha256"] = hashlib.sha256(node_path.read_bytes()).hexdigest()
+
+
+def _profile_provenance(profile_case: str, nodes: list[str]) -> dict[str, Any]:
+    if profile_case == "postgresql-16-aws-single-leader-landscape":
+        state_store = "postgresql-16"
+        deployment = "aws-single-leader-landscape"
+        backend_version = "16.13"
+        backend_probe = {
+            "kind": "postgresql-server-query",
+            "dialect": "postgresql",
+            "query": "SHOW server_version",
+        }
+    else:
+        state_store = "sqlite-wal"
+        deployment = profile_case.removeprefix("sqlite-wal-")
+        backend_version = "3.47.1"
+        backend_probe = {
+            "kind": "sqlite-connection-query",
+            "dialect": "sqlite",
+            "query": "SELECT sqlite_version()",
+        }
+    probe_node_id = nodes[0] if nodes else "tests/unit/test_state_engine_contract.py::missing_probe"
+    return {
+        "schema_version": 1,
+        "producer": "elspeth-state-engine-profile-reporter-v1",
         "profile_case_id": profile_case,
-        "state_store": "sqlite-wal",
-        "deployment": profile_case.removeprefix("sqlite-wal-"),
-        "backend_version": "3.47.1",
+        "state_store": state_store,
+        "deployment": deployment,
+        "backend_version": backend_version,
+        "backend_probe": backend_probe,
+        "deployment_probe": {"kind": "trusted-test-runtime-assertion", "node_id": probe_node_id},
+        "probe_node_id": probe_node_id,
+        "node_ids": nodes,
     }
 
 
@@ -317,26 +461,66 @@ def _pytest_evidence(
     }
     stem = f"docs/architecture/state_engine/assessments/minimal-assessment/evidence/{evidence_id.lower()}"
     junit_tests = sum(result_counts[key] for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
+    testcase_fragments: list[str] = []
+    for index, node in enumerate(nodes):
+        if index < result_counts["failed"]:
+            outcome = "<failure />"
+        elif index < result_counts["failed"] + result_counts["errors"]:
+            outcome = "<error />"
+        elif index < result_counts["failed"] + result_counts["errors"] + result_counts["skipped"] + result_counts["xfailed"]:
+            outcome = "<skipped />"
+        else:
+            outcome = ""
+        testcase_fragments.append(
+            f'<testcase classname="fixture" name="node-{index}"><properties>'
+            f'<property name="elspeth_node_id" value="{node}" /></properties>{outcome}</testcase>'
+        )
+    junit_relative = f"{stem}.junit.xml"
+    profile_relative = f"{stem}.profile.json"
+    stdout_relative = f"{stem}.stdout"
+    stderr_relative = f"{stem}.stderr"
+    node_relative = f"{stem}.nodes"
+
+    def typed_artifact(path: str, content: str, kind: str) -> dict[str, str]:
+        artifact = _artifact_record(repository, path, content)
+        return {"kind": kind, **artifact}
+
     artifacts = [
-        _artifact_record(
-            repository,
-            f"{stem}.junit.xml",
+        typed_artifact(
+            junit_relative,
             (
                 f'<testsuite tests="{junit_tests}" failures="{result_counts["failed"]}" '
                 f'errors="{result_counts["errors"]}" '
-                f'skipped="{result_counts["skipped"] + result_counts["xfailed"]}" />\n'
+                f'skipped="{result_counts["skipped"] + result_counts["xfailed"]}">'
+                f"{''.join(testcase_fragments)}</testsuite>\n"
             ),
+            "junit_xml",
         ),
-        _artifact_record(repository, f"{stem}.stdout", "pytest fixture output\n"),
-        _artifact_record(repository, f"{stem}.stderr", ""),
+        typed_artifact(stdout_relative, "pytest fixture output\n", "stdout"),
+        typed_artifact(stderr_relative, "", "stderr"),
+        typed_artifact(profile_relative, json.dumps(_profile_provenance(profile_case, nodes), indent=2) + "\n", "profile_report"),
     ]
     node_index_content = "".join(f"{node}\n" for node in nodes)
-    node_index = _artifact_record(repository, f"{stem}.nodes", node_index_content)
+    node_index = typed_artifact(node_relative, node_index_content, "node_index")
+    selector_path = repository / "tests/unit/test_state_engine_contract.py"
+    selector_path.parent.mkdir(parents=True, exist_ok=True)
+    if not selector_path.exists():
+        selector_path.write_text("# Synthetic validator fixture selectors.\n", encoding="utf-8")
     return {
         "id": evidence_id,
         "kind": "pytest",
         "reproducibility_class": "deterministic",
-        "argv": [sys.executable, "-m", "pytest", "-q", "tests/unit/test_state_engine_contract.py"],
+        "argv": [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            PROFILE_REPORTER_PLUGIN,
+            f"--state-engine-profile-report={profile_relative}",
+            f"--junitxml={junit_relative}",
+            "tests/unit/test_state_engine_contract.py",
+        ],
         "cwd_relative": ".",
         "timeout_seconds": 30,
         "safe_environment": {"PYTHONHASHSEED": "0"},
@@ -346,7 +530,6 @@ def _pytest_evidence(
         "duration_seconds": 1.0,
         "exit_code": 0,
         "result_counts": result_counts,
-        "execution_profile": _profile_provenance(profile_case),
         "coverage": coverage,
         "retained_artifacts": artifacts,
         "collected_node_index": node_index,
@@ -502,35 +685,6 @@ def _ts00_coverage(profile_case: str, node_ids: list[str]) -> list[dict[str, Any
     ]
 
 
-def _write_collection_manifest(
-    repository: Path,
-    assessment_path: Path,
-    *,
-    argv: list[str],
-    nodes: list[str],
-    safe_environment: dict[str, str | None] | None = None,
-    timeout_seconds: int = 30,
-) -> None:
-    assessment = json.loads(assessment_path.read_text())
-    node_index = _artifact_record(
-        repository,
-        "docs/architecture/state_engine/assessments/minimal-assessment/evidence/collector.nodes",
-        "".join(f"{node}\n" for node in nodes),
-    )
-    assessment["evidence"] = [
-        {
-            "id": "EV-COLLECTOR",
-            "kind": "pytest",
-            "argv": argv,
-            "cwd_relative": ".",
-            "timeout_seconds": timeout_seconds,
-            "safe_environment": safe_environment or {},
-            "collected_node_index": node_index,
-        }
-    ]
-    _write_json(assessment_path, assessment)
-
-
 @pytest.fixture
 def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
     repository = tmp_path / "repository"
@@ -542,11 +696,14 @@ def assessment_repository(tmp_path: Path) -> tuple[Path, Path]:
         catalog,
     )
     (repository / "docs/README.md").write_text("# Documentation\n")
+    synthetic_selector = repository / "tests/unit/test_state_engine_contract.py"
+    synthetic_selector.parent.mkdir(parents=True)
+    synthetic_selector.write_text("# Synthetic validator fixture selectors.\n", encoding="utf-8")
     _git(repository, "init", "-q")
     _git(repository, "config", "user.name", "State Engine Test")
     _git(repository, "config", "user.email", "state-engine-test@example.invalid")
     _git(repository, "remote", "add", "origin", "fixture://state-engine")
-    _git(repository, "add", "docs")
+    _git(repository, "add", "docs", "tests")
     _git(repository, "commit", "-qm", "fixture baseline")
 
     assessment_directory = repository / "docs/architecture/state_engine/assessments/minimal-assessment"
@@ -623,6 +780,77 @@ def test_load_unique_json_rejects_duplicate_keys(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match=r"duplicate JSON key in .*duplicate\.json: catalog_id"):
         load_unique_json(duplicate_path)
+
+
+def test_profile_reporter_emits_sqlite_runtime_observation_and_exact_junit_node(
+    tmp_path: Path,
+) -> None:
+    test_path = tmp_path / "tests/test_runtime_profile.py"
+    test_path.parent.mkdir()
+    test_path.write_text(
+        "import sqlite3\n\n"
+        "def test_runtime_profile(state_engine_profile):\n"
+        "    connection = sqlite3.connect(':memory:')\n"
+        "    assert connection.execute('SELECT 1').fetchone() == (1,)\n"
+        "    state_engine_profile.observe_sqlite(\n"
+        "        connection, deployment='single-process-leader'\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    profile_path = tmp_path / "profile.json"
+    junit_path = tmp_path / "result.junit.xml"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(REPOSITORY_ROOT),
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+        }
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            PROFILE_REPORTER_PLUGIN,
+            f"--state-engine-profile-report={profile_path}",
+            f"--junitxml={junit_path}",
+            "tests/test_runtime_profile.py::test_runtime_profile",
+        ],
+        cwd=tmp_path,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    node_id = "tests/test_runtime_profile.py::test_runtime_profile"
+    assert profile == {
+        "schema_version": 1,
+        "producer": "elspeth-state-engine-profile-reporter-v1",
+        "profile_case_id": "sqlite-wal-single-process-leader",
+        "state_store": "sqlite-wal",
+        "deployment": "single-process-leader",
+        "backend_version": profile["backend_version"],
+        "backend_probe": {
+            "kind": "sqlite-connection-query",
+            "dialect": "sqlite",
+            "query": "SELECT sqlite_version()",
+        },
+        "deployment_probe": {
+            "kind": "trusted-test-runtime-assertion",
+            "node_id": node_id,
+        },
+        "probe_node_id": node_id,
+        "node_ids": [node_id],
+    }
+    assert re.fullmatch(r"3\.\d+(?:\.\d+)?", profile["backend_version"])
+    junit = junit_path.read_text(encoding="utf-8")
+    assert f'name="elspeth_node_id" value="{node_id}"' in junit
 
 
 def test_validate_catalog_cli_accepts_current_v2_catalog() -> None:
@@ -844,16 +1072,124 @@ def test_validate_package_rejects_current_provenance_for_historical_checkout(
     assert "current" in result.stderr
 
 
-def test_validate_package_accepts_honest_complete_executable_manifest(
+def test_validate_package_and_collect_evidence_accept_same_genuine_runtime_artifacts(
     assessment_repository: tuple[Path, Path],
 ) -> None:
     repository, assessment_path = assessment_repository
-    _materialize_complete_assessment(repository, assessment_path, one_node_per_profile=False)
+    record = _genuine_sqlite_evidence(repository)
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    validation = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+    collection = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+    assert validation.returncode == 0, validation.stderr
+    assert collection.returncode == 0, collection.stderr
+    assert "1 pytest records" in collection.stdout
+
+
+def test_validate_package_and_collect_evidence_share_command_and_environment_contract(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    record = _genuine_sqlite_evidence(repository)
+    base = json.loads(assessment_path.read_text(encoding="utf-8"))
+    base["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    base["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    cases = [
+        ("command", lambda item: item.update({"argv": [sys.executable, "-c", "raise SystemExit(0)"]}), "trusted pytest"),
+        (
+            "environment",
+            lambda item: item.update({"safe_environment": {"AWS_SECRET_ACCESS_KEY": "not-a-real-secret"}}),
+            "safe_environment name is not permitted",
+        ),
+    ]
+    for _case, mutation, expected_error in cases:
+        assessment = json.loads(json.dumps(base))
+        evidence = json.loads(json.dumps(record))
+        mutation(evidence)
+        assessment["evidence"] = [evidence]
+        _write_json(assessment_path, assessment)
+
+        validation = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+        collection = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
+        assert validation.returncode == collection.returncode == 1
+        assert expected_error in validation.stderr
+        assert expected_error in collection.stderr
+
+
+def test_validate_package_rejects_junit_node_identity_outside_recorded_selectors(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    record = _genuine_sqlite_evidence(repository)
+    _replace_genuine_node_identity(repository, record, "tests/test_unrelated.py::test_fabricated")
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
 
     result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
 
+    assert result.returncode == 1
+    assert "JUnit node identity is outside the recorded selectors" in result.stderr
+
+
+def test_validate_package_rejects_false_junit_aggregate_counts(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    record = _genuine_sqlite_evidence(repository)
+    junit_record = _artifact_by_kind(record, "junit_xml")
+    junit_path = repository / junit_record["path"]
+    junit = ET.parse(junit_path)
+    suite = next(element for element in junit.getroot().iter("testsuite"))
+    suite.set("tests", "999")
+    junit.write(junit_path, encoding="utf-8", xml_declaration=True)
+    junit_record["sha256"] = hashlib.sha256(junit_path.read_bytes()).hexdigest()
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
+
+    assert result.returncode == 1
+    assert "JUnit aggregate counts disagree with testcase evidence" in result.stderr
+
+
+def test_collect_evidence_is_static_and_does_not_import_recorded_test_modules(
+    assessment_repository: tuple[Path, Path],
+) -> None:
+    repository, assessment_path = assessment_repository
+    record = _genuine_sqlite_evidence(repository)
+    marker = repository / "project-code-executed"
+    test_relative = "tests/test_static_collection.py"
+    node_id = f"{test_relative}::test_static_collection"
+    (repository / test_relative).write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n\ndef test_static_collection():\n    pass\n",
+        encoding="utf-8",
+    )
+    _git(repository, "add", test_relative)
+    _git(repository, "commit", "-qm", "add static collection sentinel")
+    record["argv"][-1] = node_id
+    _replace_genuine_node_identity(repository, record, node_id)
+    assessment = json.loads(assessment_path.read_text(encoding="utf-8"))
+    assessment["baseline"]["commit"] = _git(repository, "rev-parse", "HEAD")
+    assessment["baseline"]["tree"] = _git(repository, "rev-parse", "HEAD^{tree}")
+    assessment["evidence"] = [record]
+    _write_json(assessment_path, assessment)
+
+    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
+
     assert result.returncode == 0, result.stderr
-    assert "complete" in result.stdout
+    assert not marker.exists()
 
 
 def test_validate_package_rejects_one_node_fabricated_complete(
@@ -883,6 +1219,8 @@ def test_validate_package_rejects_documentary_evidence_for_behavioral_pass(
         nodes=[node],
     )
     record["kind"] = "documentation"
+    record.pop("collected_node_index")
+    record.pop("collected_nodes")
     _attach_ts00_pass(assessment, record, profile_case=profile_case)
     _write_json(assessment_path, assessment)
 
@@ -907,6 +1245,8 @@ def test_validate_package_rejects_documentary_evidence_for_behavioral_fail(
         nodes=[node],
     )
     record["kind"] = "documentation"
+    record.pop("collected_node_index")
+    record.pop("collected_nodes")
     assessment["evidence"] = [record]
     ts00 = next(leg for leg in assessment["legs"] if leg["id"] == "TS-00")
     ts00["derived_verdict"] = "gap"
@@ -1005,7 +1345,7 @@ def test_validate_package_rejects_profile_provenance_mismatch(
     result = _run_assessment_cli("validate-package", str(assessment_path), cwd=repository)
 
     assert result.returncode == 1
-    assert "execution profile does not match coverage" in result.stderr
+    assert "runtime profile does not match coverage" in result.stderr
 
 
 def test_validate_package_rejects_non_postgresql_16_provenance(
@@ -1022,7 +1362,12 @@ def test_validate_package_rejects_non_postgresql_16_provenance(
         coverage=_ts00_coverage(profile_case, [node]),
         nodes=[node],
     )
-    record["execution_profile"]["backend_version"] = "15.9"
+    profile_record = _artifact_by_kind(record, "profile_report")
+    profile_path = repository / profile_record["path"]
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    profile["backend_version"] = "15.9"
+    _write_json(profile_path, profile)
+    profile_record["sha256"] = hashlib.sha256(profile_path.read_bytes()).hexdigest()
     _attach_ts00_pass(assessment, record, profile_case=profile_case)
     _write_json(assessment_path, assessment)
 
@@ -1301,7 +1646,7 @@ def test_collect_evidence_cli_validates_empty_pytest_inventory(
     result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
 
     assert result.returncode == 0, result.stderr
-    assert "evidence collection: valid (0 pytest records)" in result.stdout
+    assert "retained evidence validation: valid (0 pytest records)" in result.stdout
 
 
 def test_init_full_rejects_preexisting_destination(
@@ -1356,115 +1701,6 @@ def test_init_full_cleans_staged_directory_after_write_failure(
 
     assert not destination.exists()
     assert list(destination.parent.glob(".write-failure.tmp-*")) == []
-
-
-def test_collect_evidence_rejects_python_wrapper_execution(
-    assessment_repository: tuple[Path, Path],
-) -> None:
-    repository, assessment_path = assessment_repository
-    marker = repository / "wrapper-executed"
-    code = f"from pathlib import Path; Path({str(marker)!r}).write_text('executed')"
-    _write_collection_manifest(
-        repository,
-        assessment_path,
-        argv=[sys.executable, "-c", code, "pytest"],
-        nodes=[],
-    )
-
-    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
-
-    assert result.returncode == 1
-    assert "trusted pytest invocation" in result.stderr
-    assert not marker.exists()
-
-
-def test_collect_evidence_rejects_credential_environment_override(
-    assessment_repository: tuple[Path, Path],
-) -> None:
-    repository, assessment_path = assessment_repository
-    test_path = repository / "tests/test_collector.py"
-    test_path.parent.mkdir()
-    test_path.write_text("def test_collector():\n    pass\n")
-    node = "tests/test_collector.py::test_collector"
-    _write_collection_manifest(
-        repository,
-        assessment_path,
-        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector.py"],
-        nodes=[node],
-        safe_environment={"AWS_SECRET_ACCESS_KEY": "fixture-value"},
-    )
-
-    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
-
-    assert result.returncode == 1
-    assert "safe_environment name is not permitted" in result.stderr
-
-
-def test_collect_evidence_scrubs_ambient_pytest_and_credential_environment(
-    assessment_repository: tuple[Path, Path],
-) -> None:
-    repository, assessment_path = assessment_repository
-    test_path = repository / "tests/test_collector_env.py"
-    test_path.parent.mkdir()
-    test_path.write_text(
-        "import os\n"
-        "assert 'PYTEST_ADDOPTS' not in os.environ\n"
-        "assert 'AWS_SECRET_ACCESS_KEY' not in os.environ\n\n"
-        "def test_environment():\n"
-        "    pass\n"
-    )
-    node = "tests/test_collector_env.py::test_environment"
-    _write_collection_manifest(
-        repository,
-        assessment_path,
-        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector_env.py"],
-        nodes=[node],
-    )
-
-    result = _run_assessment_cli(
-        "collect-evidence",
-        str(assessment_path),
-        cwd=repository,
-        environment_overrides={
-            "PYTEST_ADDOPTS": "--definitely-not-a-valid-pytest-option",
-            "AWS_SECRET_ACCESS_KEY": "ambient-fixture-value",
-        },
-    )
-
-    assert result.returncode == 0, result.stderr
-
-
-def test_collect_evidence_times_out_and_kills_pytest_process_group(
-    assessment_repository: tuple[Path, Path],
-) -> None:
-    repository, assessment_path = assessment_repository
-    marker = repository / "orphan-child-escaped"
-    child_code = f"import time; from pathlib import Path; time.sleep(1.5); Path({str(marker)!r}).write_text('escaped')"
-    test_path = repository / "tests/test_collector_timeout.py"
-    test_path.parent.mkdir()
-    test_path.write_text(
-        "import subprocess\n"
-        "import sys\n"
-        "import time\n\n"
-        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
-        "time.sleep(3)\n\n"
-        "def test_timeout():\n"
-        "    pass\n"
-    )
-    _write_collection_manifest(
-        repository,
-        assessment_path,
-        argv=[sys.executable, "-m", "pytest", "-q", "tests/test_collector_timeout.py"],
-        nodes=["tests/test_collector_timeout.py::test_timeout"],
-        timeout_seconds=1,
-    )
-
-    result = _run_assessment_cli("collect-evidence", str(assessment_path), cwd=repository)
-    time.sleep(2)
-
-    assert result.returncode == 1
-    assert "timed out after 1 seconds" in result.stderr
-    assert not marker.exists()
 
 
 def test_check_links_rejects_absolute_local_target(

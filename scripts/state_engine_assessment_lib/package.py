@@ -14,7 +14,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .catalog import validate_catalog
 from .common import (
@@ -60,6 +60,17 @@ V2_ASSESSMENT_TOP_LEVEL_KEYS = {
     "review_record",
 }
 ASSESSMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+PYTEST_REPORTER_PLUGIN = "scripts.state_engine_profile_reporter"
+PYTEST_SAFE_ENVIRONMENT = {"PYTHONHASHSEED", "TZ", "LANG", "LC_ALL"}
+PYTEST_FLAGS = {
+    "-q",
+    "--quiet",
+    "-x",
+    "--exitfirst",
+    "--strict-config",
+    "--strict-markers",
+    "--disable-warnings",
+}
 
 
 def _initial_derived(catalog: dict[str, Any]) -> dict[str, Any]:
@@ -390,6 +401,208 @@ def _coverage_key(item: dict[str, Any], v2: bool) -> tuple[str, str, str, str]:
     )
 
 
+def _validate_pytest_command(
+    record: dict[str, Any],
+    assessment: dict[str, Any],
+    root: Path,
+    *,
+    junit_relative: str,
+    profile_relative: str,
+) -> list[str]:
+    evidence_id = record["id"]
+    argv = _strings(record.get("argv"), f"evidence {evidence_id} argv")
+    environment = _dict(assessment.get("environment"), "environment")
+    python_executable = _string(environment.get("python_executable"), "environment python_executable")
+    _require(
+        argv[:3] == [python_executable, "-m", "pytest"],
+        f"pytest evidence {evidence_id} must use the trusted pytest invocation recorded by the environment",
+    )
+    selectors: list[str] = []
+    reporter_plugins = 0
+    junit_outputs = 0
+    profile_outputs = 0
+    index = 3
+    while index < len(argv):
+        item = argv[index]
+        if item == "-p":
+            _require(index + 1 < len(argv), "pytest -p requires a plugin name")
+            _require(argv[index + 1] == PYTEST_REPORTER_PLUGIN, f"pytest evidence {evidence_id} uses an untrusted plugin")
+            reporter_plugins += 1
+            index += 2
+            continue
+        if item == "--junitxml":
+            _require(index + 1 < len(argv), "pytest --junitxml requires a path")
+            _require(argv[index + 1] == junit_relative, f"pytest evidence {evidence_id} JUnit output is not retained")
+            junit_outputs += 1
+            index += 2
+            continue
+        if item.startswith("--junitxml="):
+            _require(item.removeprefix("--junitxml=") == junit_relative, f"pytest evidence {evidence_id} JUnit output is not retained")
+            junit_outputs += 1
+            index += 1
+            continue
+        if item == "--state-engine-profile-report":
+            _require(index + 1 < len(argv), "pytest --state-engine-profile-report requires a path")
+            _require(argv[index + 1] == profile_relative, f"pytest evidence {evidence_id} profile output is not retained")
+            profile_outputs += 1
+            index += 2
+            continue
+        if item.startswith("--state-engine-profile-report="):
+            _require(
+                item.removeprefix("--state-engine-profile-report=") == profile_relative,
+                f"pytest evidence {evidence_id} profile output is not retained",
+            )
+            profile_outputs += 1
+            index += 1
+            continue
+        if item in {"-n", "--numprocesses"}:
+            _require(index + 1 < len(argv) and argv[index + 1] == "0", "pytest evidence permits only -n 0")
+            index += 2
+            continue
+        if item in {"-m", "-k"}:
+            _require(index + 1 < len(argv) and bool(argv[index + 1]), f"pytest {item} requires an expression")
+            index += 2
+            continue
+        if (
+            item in PYTEST_FLAGS
+            or re.fullmatch(r"--maxfail=[1-9][0-9]*", item)
+            or re.fullmatch(r"--tb=(?:auto|long|short|line|native|no)", item)
+        ):
+            index += 1
+            continue
+        _require(not item.startswith("-"), f"pytest evidence option is not permitted: {item}")
+        path_text = item.split("::", 1)[0]
+        _require(bool(path_text), f"pytest selector is invalid: {item}")
+        selector_path = Path(path_text)
+        _require(not selector_path.is_absolute(), f"pytest selector must be repository-relative: {item}")
+        resolved = _repository_path(root, path_text, f"pytest selector {item}")
+        _require(resolved.is_relative_to(root / "tests"), f"pytest selector must be under tests/: {item}")
+        if assessment["baseline"]["mode"] == "current":
+            _require(resolved.is_file(), f"pytest selector does not exist in the current checkout: {item}")
+        selectors.append(item)
+        index += 1
+    _require(bool(selectors), f"pytest evidence {evidence_id} requires at least one explicit tests/ selector")
+    _require(reporter_plugins == 1, f"pytest evidence {evidence_id} must load the trusted profile reporter exactly once")
+    _require(junit_outputs == 1, f"pytest evidence {evidence_id} must declare one retained JUnit output")
+    _require(profile_outputs == 1, f"pytest evidence {evidence_id} must declare one retained profile output")
+    safe_environment = _dict(record.get("safe_environment"), f"evidence {evidence_id} safe_environment")
+    for name, value in safe_environment.items():
+        _require(name in PYTEST_SAFE_ENVIRONMENT, f"evidence {evidence_id} safe_environment name is not permitted: {name}")
+        _require(value is None or isinstance(value, str), f"evidence {evidence_id} safe_environment value must be text or null")
+    return selectors
+
+
+def _node_matches_selector(node_id: str, selector: str) -> bool:
+    if "::" not in selector:
+        return node_id == selector or node_id.startswith(f"{selector}::")
+    return node_id == selector or node_id.startswith(f"{selector}::") or node_id.startswith(f"{selector}[")
+
+
+def _junit_node_ids(junit_path: Path, evidence_id: str) -> tuple[list[str], dict[str, int]]:
+    junit_root = ET.parse(junit_path).getroot()
+    testcases = [element for element in junit_root.iter() if element.tag.rsplit("}", 1)[-1] == "testcase"]
+    node_ids: list[str] = []
+    outcomes = {"failures": 0, "errors": 0, "skipped": 0}
+    for testcase in testcases:
+        properties = [element for element in testcase.iter() if element.tag.rsplit("}", 1)[-1] == "property"]
+        identity = [element.attrib.get("value") for element in properties if element.attrib.get("name") == "elspeth_node_id"]
+        _require(
+            len(identity) == 1 and isinstance(identity[0], str) and bool(identity[0]),
+            f"pytest evidence {evidence_id} JUnit testcase must carry one exact elspeth_node_id",
+        )
+        node_ids.append(cast(str, identity[0]))
+        child_tags = {child.tag.rsplit("}", 1)[-1] for child in testcase}
+        outcomes["failures"] += "failure" in child_tags
+        outcomes["errors"] += "error" in child_tags
+        outcomes["skipped"] += "skipped" in child_tags
+    _require(bool(node_ids), f"pytest evidence {evidence_id} JUnit XML has no testcases")
+    _unique(node_ids, f"pytest evidence {evidence_id} JUnit node identities")
+    leaf_suites = [
+        element
+        for element in junit_root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "testsuite" and not any(child.tag.rsplit("}", 1)[-1] == "testsuite" for child in element)
+    ]
+    _require(bool(leaf_suites), f"pytest evidence {evidence_id} JUnit XML has no test suites")
+    try:
+        aggregate = {
+            key: sum(int(suite.attrib.get(key, "0")) for suite in leaf_suites) for key in ("tests", "failures", "errors", "skipped")
+        }
+    except ValueError:
+        _fail(f"pytest evidence {evidence_id} JUnit aggregate counts must be integers")
+    _require(
+        aggregate == {"tests": len(testcases), **outcomes},
+        f"pytest evidence {evidence_id} JUnit aggregate counts disagree with testcase evidence",
+    )
+    return node_ids, outcomes
+
+
+def _validate_profile_report(
+    profile_path: Path,
+    evidence_id: str,
+    profile_case_by_id: dict[str, dict[str, Any]],
+    node_ids: list[str],
+) -> None:
+    profile = load_unique_json(profile_path)
+    expected_fields = {
+        "schema_version",
+        "producer",
+        "profile_case_id",
+        "state_store",
+        "deployment",
+        "backend_version",
+        "backend_probe",
+        "deployment_probe",
+        "probe_node_id",
+        "node_ids",
+    }
+    _require(set(profile) == expected_fields, f"evidence {evidence_id} profile report has unexpected fields")
+    _require(
+        type(profile.get("schema_version")) is int and profile["schema_version"] == 1,
+        f"evidence {evidence_id} profile report schema_version must be integer 1",
+    )
+    _require(
+        profile.get("producer") == "elspeth-state-engine-profile-reporter-v1",
+        f"evidence {evidence_id} profile report has an unknown producer",
+    )
+    profile_case_id = _string(profile.get("profile_case_id"), f"evidence {evidence_id} profile_case_id")
+    _require(profile_case_id in profile_case_by_id, f"evidence {evidence_id} has unknown execution profile")
+    expected_profile = profile_case_by_id[profile_case_id]
+    _require(
+        profile.get("state_store") == expected_profile["state_store"] and profile.get("deployment") == expected_profile["deployment"],
+        f"evidence {evidence_id} runtime profile does not match the catalog",
+    )
+    reported_nodes = _strings(profile.get("node_ids"), f"evidence {evidence_id} profile node_ids")
+    _unique(reported_nodes, f"evidence {evidence_id} profile node_ids")
+    _require(reported_nodes == node_ids, f"evidence {evidence_id} profile node identities do not match JUnit/index evidence")
+    probe_node_id = _string(profile.get("probe_node_id"), f"evidence {evidence_id} profile probe_node_id")
+    _require(probe_node_id in node_ids, f"evidence {evidence_id} profile probe node is not retained")
+    deployment_probe = _dict(profile.get("deployment_probe"), f"evidence {evidence_id} deployment_probe")
+    _require(
+        deployment_probe == {"kind": "trusted-test-runtime-assertion", "node_id": probe_node_id},
+        f"evidence {evidence_id} deployment provenance is not a trusted runtime assertion",
+    )
+    backend_probe = _dict(profile.get("backend_probe"), f"evidence {evidence_id} backend_probe")
+    backend_version = _string(profile.get("backend_version"), f"evidence {evidence_id} backend_version")
+    if profile["state_store"] == "postgresql-16":
+        _require(
+            backend_probe == {"kind": "postgresql-server-query", "dialect": "postgresql", "query": "SHOW server_version"},
+            f"evidence {evidence_id} PostgreSQL profile lacks server-query provenance",
+        )
+        _require(
+            re.fullmatch(r"16(?:\.\d+){0,2}", backend_version) is not None,
+            f"evidence {evidence_id} PostgreSQL backend version must be 16.x",
+        )
+    else:
+        _require(
+            backend_probe == {"kind": "sqlite-connection-query", "dialect": "sqlite", "query": "SELECT sqlite_version()"},
+            f"evidence {evidence_id} SQLite profile lacks connection-query provenance",
+        )
+        _require(
+            re.fullmatch(r"3\.\d+(?:\.\d+)?", backend_version) is not None,
+            f"evidence {evidence_id} SQLite backend version must be 3.x",
+        )
+
+
 def _validate_evidence(
     assessment: dict[str, Any],
     catalog: dict[str, Any],
@@ -423,7 +636,7 @@ def _validate_evidence(
         "establishes",
         "does_not_establish",
     )
-    pytest_only_fields = ("execution_profile", "collected_node_index", "collected_nodes")
+    pytest_only_fields = ("collected_node_index", "collected_nodes")
     pytest_result_keys = ["passed", "failed", "errors", "skipped", "xfailed", "xpassed", "warnings"]
     allowed_kinds = {"pytest", "documentation"} if v2 else {"pytest"}
     profile_case_by_id = {
@@ -445,6 +658,11 @@ def _validate_evidence(
             _require(
                 type(record.get("collected_nodes")) is int and record["collected_nodes"] > 0,
                 f"pytest evidence {evidence_id} must have a positive collected-node count",
+            )
+        elif kind == "documentation" and v2:
+            _require(
+                set(record) == {"id", *required_fields},
+                f"documentation evidence {evidence_id} has unexpected fields",
             )
         _require(
             record["reproducibility_class"] in {"deterministic", "semantic_comparison", "external_observation"},
@@ -513,13 +731,19 @@ def _validate_evidence(
         evidence_by_id[evidence_id] = record
 
         artifacts = _list(record["retained_artifacts"], f"evidence {evidence_id} artifacts")
+        artifacts_by_kind: dict[str, tuple[dict[str, Any], Path]] = {}
         for raw_artifact in artifacts:
             artifact = _dict(raw_artifact, f"evidence {evidence_id} artifact")
-            _require(set(artifact) == {"path", "sha256"}, f"evidence {evidence_id} artifact has unexpected fields")
+            expected_artifact_fields = {"kind", "path", "sha256"} if v2 else {"path", "sha256"}
+            _require(set(artifact) == expected_artifact_fields, f"evidence {evidence_id} artifact has unexpected fields")
             artifact_path = _repository_path(root, artifact.get("path"), f"evidence {evidence_id} artifact path")
             _require(artifact_path.is_file(), f"evidence artifact does not exist: {artifact_path}")
             _require(not artifact_path.is_symlink(), f"evidence artifact cannot be a symlink: {artifact_path}")
             _require(_sha256(artifact_path) == artifact.get("sha256"), f"evidence artifact digest mismatch: {artifact_path}")
+            if v2:
+                artifact_kind = _string(artifact.get("kind"), f"evidence {evidence_id} artifact kind")
+                _require(artifact_kind not in artifacts_by_kind, f"evidence {evidence_id} has duplicate artifact kind")
+                artifacts_by_kind[artifact_kind] = (artifact, artifact_path)
         if kind == "pytest":
             counts = _dict(record["result_counts"], f"evidence {evidence_id} result_counts")
             _require(list(counts) == pytest_result_keys, f"pytest evidence {evidence_id} result_counts has wrong keys")
@@ -530,9 +754,11 @@ def _validate_evidence(
             _require(type(record.get("collected_nodes")) is int, f"pytest evidence {evidence_id} collected_nodes must be an integer")
             index_record = _dict(record.get("collected_node_index"), f"evidence {evidence_id} collected_node_index")
             _require(
-                set(index_record) == {"path", "sha256"},
+                set(index_record) == ({"kind", "path", "sha256"} if v2 else {"path", "sha256"}),
                 f"pytest evidence {evidence_id} collected_node_index has unexpected fields",
             )
+            if v2:
+                _require(index_record.get("kind") == "node_index", f"pytest evidence {evidence_id} node index has wrong kind")
             node_path = _repository_path(root, index_record.get("path"), f"evidence {evidence_id} node index")
             _require(node_path.is_file(), f"pytest node index does not exist: {node_path}")
             _require(not node_path.is_symlink(), f"pytest node index cannot be a symlink: {node_path}")
@@ -546,33 +772,54 @@ def _validate_evidence(
                 set(node_subject) <= set(nodes),
                 f"pytest evidence {evidence_id} coverage cites a node outside its collected-node index",
             )
-            names = [Path(str(_dict(item, "artifact").get("path"))).name for item in artifacts]
-            _require(
-                sum(name.endswith(".junit.xml") for name in names) == 1,
-                f"pytest evidence {evidence_id} must retain one JUnit XML",
-            )
-            _require(
-                sum(name.endswith(".stdout") for name in names) == 1,
-                f"pytest evidence {evidence_id} must retain one stdout",
-            )
-            _require(
-                sum(name.endswith(".stderr") for name in names) == 1,
-                f"pytest evidence {evidence_id} must retain one stderr",
-            )
-            _require(len(artifacts) == 3, f"pytest evidence {evidence_id} must retain exactly three result artifacts")
-            junit_paths = [
-                _repository_path(root, _dict(item, "artifact").get("path"), "JUnit artifact")
-                for item in artifacts
-                if str(_dict(item, "artifact").get("path", "")).endswith(".junit.xml")
-            ]
-            _require(len(junit_paths) == 1, f"pytest evidence {evidence_id} must retain one JUnit XML")
-            junit_root = ET.parse(junit_paths[0]).getroot()
-            suites = (
-                [junit_root] if junit_root.tag.endswith("testsuite") else [child for child in junit_root if child.tag.endswith("testsuite")]
-            )
-            junit_counts = {
-                key: sum(int(suite.attrib.get(key, 0)) for suite in suites) for key in ("tests", "failures", "errors", "skipped")
-            }
+            if v2:
+                expected_artifact_kinds = {"junit_xml", "stdout", "stderr", "profile_report"}
+                _require(
+                    set(artifacts_by_kind) == expected_artifact_kinds and len(artifacts) == len(expected_artifact_kinds),
+                    f"pytest evidence {evidence_id} must retain exactly the four typed result artifacts",
+                )
+                junit_record, junit_path = artifacts_by_kind["junit_xml"]
+                profile_record, profile_path = artifacts_by_kind["profile_report"]
+                selectors = _validate_pytest_command(
+                    record,
+                    assessment,
+                    root,
+                    junit_relative=_string(junit_record.get("path"), "JUnit artifact path"),
+                    profile_relative=_string(profile_record.get("path"), "profile artifact path"),
+                )
+                junit_nodes, junit_outcomes = _junit_node_ids(junit_path, evidence_id)
+                _require(junit_nodes == nodes, f"pytest evidence {evidence_id} JUnit node identities do not match the retained index")
+                _require(
+                    all(any(_node_matches_selector(node_id, selector) for selector in selectors) for node_id in junit_nodes),
+                    f"pytest evidence {evidence_id} JUnit node identity is outside the recorded selectors",
+                )
+                _validate_profile_report(profile_path, evidence_id, profile_case_by_id, nodes)
+                junit_counts = {
+                    "tests": len(junit_nodes),
+                    **junit_outcomes,
+                }
+            else:
+                names = [Path(str(_dict(item, "artifact").get("path"))).name for item in artifacts]
+                _require(
+                    sum(name.endswith(".junit.xml") for name in names) == 1,
+                    f"pytest evidence {evidence_id} must retain one JUnit XML",
+                )
+                _require(len(artifacts) == 3, f"pytest evidence {evidence_id} must retain exactly three result artifacts")
+                junit_paths = [
+                    _repository_path(root, _dict(item, "artifact").get("path"), "JUnit artifact")
+                    for item in artifacts
+                    if str(_dict(item, "artifact").get("path", "")).endswith(".junit.xml")
+                ]
+                _require(len(junit_paths) == 1, f"pytest evidence {evidence_id} must retain one JUnit XML")
+                junit_root = ET.parse(junit_paths[0]).getroot()
+                suites = (
+                    [junit_root]
+                    if junit_root.tag.endswith("testsuite")
+                    else [child for child in junit_root if child.tag.endswith("testsuite")]
+                )
+                junit_counts = {
+                    key: sum(int(suite.attrib.get(key, 0)) for suite in suites) for key in ("tests", "failures", "errors", "skipped")
+                }
             expected_tests = sum(int(counts.get(key, 0)) for key in ("passed", "failed", "errors", "skipped", "xfailed", "xpassed"))
             _require(junit_counts["tests"] == expected_tests == record["collected_nodes"], f"pytest result total mismatch: {evidence_id}")
             _require(junit_counts["failures"] == counts.get("failed", 0), f"pytest failure count mismatch: {evidence_id}")
@@ -582,40 +829,11 @@ def _validate_evidence(
                 f"pytest skipped count mismatch: {evidence_id}",
             )
             if v2:
-                execution_profile = _dict(record.get("execution_profile"), f"evidence {evidence_id} execution_profile")
+                profile = load_unique_json(artifacts_by_kind["profile_report"][1])
                 _require(
-                    set(execution_profile) == {"profile_case_id", "state_store", "deployment", "backend_version"},
-                    f"evidence {evidence_id} execution_profile has unexpected fields",
+                    {key[3] for key in coverage} <= {profile["profile_case_id"]},
+                    f"evidence {evidence_id} runtime profile does not match coverage",
                 )
-                profile_case_id = _string(
-                    execution_profile.get("profile_case_id"),
-                    f"evidence {evidence_id} execution profile_case_id",
-                )
-                _require(profile_case_id in profile_case_by_id, f"evidence {evidence_id} has unknown execution profile")
-                expected_profile = profile_case_by_id[profile_case_id]
-                _require(
-                    execution_profile.get("state_store") == expected_profile["state_store"]
-                    and execution_profile.get("deployment") == expected_profile["deployment"],
-                    f"evidence {evidence_id} execution profile does not match the catalog",
-                )
-                _require(
-                    {key[3] for key in coverage} <= {profile_case_id},
-                    f"evidence {evidence_id} execution profile does not match coverage",
-                )
-                backend_version = _string(
-                    execution_profile.get("backend_version"),
-                    f"evidence {evidence_id} backend_version",
-                )
-                if execution_profile["state_store"] == "postgresql-16":
-                    _require(
-                        bool(re.fullmatch(r"16(?:\.\d+){0,2}", backend_version)),
-                        f"evidence {evidence_id} PostgreSQL backend version must be 16.x",
-                    )
-                else:
-                    _require(
-                        bool(re.fullmatch(r"3\.\d+(?:\.\d+)?", backend_version)),
-                        f"evidence {evidence_id} SQLite backend version must be 3.x",
-                    )
             if (
                 record["exit_code"] == 0
                 and counts["passed"] > 0
@@ -624,6 +842,29 @@ def _validate_evidence(
             ):
                 promotable_evidence.add(evidence_id)
     return evidence_by_id, coverage_by_evidence, promotable_evidence
+
+
+def validate_evidence_artifacts(assessment_path: Path) -> int:
+    """Statically validate retained evidence without executing project-controlled code."""
+
+    assessment_path = assessment_path.resolve()
+    root = _git_root(assessment_path)
+    assessment = load_unique_json(assessment_path)
+    catalog_record = _dict(assessment.get("catalog"), "assessment catalog")
+    catalog_path = _repository_path(root, catalog_record.get("path"), "catalog.path")
+    catalog = load_unique_json(catalog_path)
+    validate_catalog(catalog, catalog_path)
+    if catalog.get("catalog_id") == "elspeth-state-engine-v2":
+        _validate_v2_assessment_schema(assessment)
+    else:
+        _require(
+            type(assessment.get("schema_version")) is int and assessment["schema_version"] == 1,
+            "historical assessment schema_version must be integer 1",
+        )
+    _validate_baseline(assessment, root)
+    _validate_environment(assessment)
+    evidence_by_id, _coverage, _promotable = _validate_evidence(assessment, catalog, root)
+    return sum(record["kind"] == "pytest" for record in evidence_by_id.values())
 
 
 def _validate_review(assessment: dict[str, Any], assessment_path: Path, root: Path) -> None:
