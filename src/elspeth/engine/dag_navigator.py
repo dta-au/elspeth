@@ -127,9 +127,9 @@ class DAGNavigator:
     def resolve_plugin_for_node(self, node_id: NodeID) -> TransformProtocol | GateSettings | None:
         """Resolve the plugin/gate associated with a processing node.
 
-        Returns None for structural nodes (e.g. coalesce points) that exist in
-        the DAG traversal but have no plugin to execute. The caller skips these
-        nodes and continues to the next processing node.
+        Returns None for structural nodes (e.g. coalesce and row-union points)
+        that exist in the DAG traversal but have no plugin to execute. The
+        caller skips these nodes and continues to the next processing node.
 
         Raises OrchestrationInvariantError for unknown nodes that are neither
         plugin-bearing nor structural — this would indicate a graph construction bug.
@@ -139,7 +139,7 @@ class DAGNavigator:
         if node_id in self._structural_node_ids:
             return None
         raise OrchestrationInvariantError(
-            f"Node ID '{node_id}' is neither a plugin node nor a known structural node (coalesce). "
+            f"Node ID '{node_id}' is neither a plugin node nor a known structural node. "
             f"Plugin nodes: {sorted(self._node_to_plugin.keys())}, "
             f"structural nodes: {sorted(self._structural_node_ids)}"
         )
@@ -151,12 +151,10 @@ class DAGNavigator:
         local plugin type probing in the work-item factory. A structural or
         unknown node cannot be a valid fork-origin cursor and fails here.
         """
-        if node_id in self._node_to_plugin:
-            return node_id in self._fork_gate_node_ids
         if node_id in self._structural_node_ids:
             raise OrchestrationInvariantError(f"Node ID '{node_id}' is structural and cannot be used as a fork-origin continuation cursor")
         self.resolve_plugin_for_node(node_id)
-        raise AssertionError("resolve_plugin_for_node returned for an unknown non-plugin node")
+        return node_id in self._fork_gate_node_ids
 
     def resolve_next_node(self, node_id: NodeID) -> NodeID | None:
         """Resolve the next processing node from traversal metadata."""
@@ -247,7 +245,10 @@ class DAGNavigator:
 
             node_id = next_node_id
 
-        if resolved_sink is None and not encountered_gate:
+        if encountered_gate:
+            return None
+
+        if resolved_sink is None:
             raise OrchestrationInvariantError(
                 f"Jump-target sink resolution reached terminal path with no sink from node '{start_node_id}'. "
                 "A gate route jump must resolve to a terminal sink to avoid stale routing state."
@@ -261,26 +262,25 @@ class DAGNavigator:
         return resolved_sink
 
     def resolve_branch_first_node(self, branch_name: str) -> NodeID:
-        """First processing node for a fork branch routed to a coalesce.
+        """First processing node for a fork branch routed to a barrier.
 
         Exposes the _branch_first_node lookup for fresh fork children and the
         resume path (RowProcessor.resume_incomplete_token).
 
-        _branch_first_node covers all coalesce-bound branches (built by
-        ExecutionGraph.get_branch_first_nodes). Callers must only invoke this for
-        branches that are in _branch_to_coalesce; calling it for a fork→sink branch
-        will raise because those branches are not in the map.
+        _branch_first_node covers all coalesce- and row-union-bound branches
+        (built by ExecutionGraph.get_branch_first_nodes). Calling it for a
+        fork-to-sink branch raises because terminal branches are not in the map.
 
         Raises:
             OrchestrationInvariantError: If branch_name is not in the branch_first_node
-                map. This indicates a logic error in the caller: only coalesce-bound
-                branches are registered, not fork→sink branches.
+                map. This indicates a logic error in the caller: only
+                barrier-bound branches are registered, not fork-to-sink branches.
         """
         try:
             return self._branch_first_node[branch_name]
         except KeyError as exc:
             raise OrchestrationInvariantError(
                 f"Unknown branch name '{branch_name}' — not in branch_first_node map. "
-                f"Only coalesce-bound branches are registered here; fork→sink branches "
+                f"Only barrier-bound branches are registered here; fork-to-sink branches "
                 f"are not. Known: {sorted(self._branch_first_node.keys())}"
             ) from exc

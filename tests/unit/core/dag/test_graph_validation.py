@@ -269,6 +269,33 @@ class TestRowUnionSchemaCompatibility:
             ).validate_edge_compatibility()
 
 
+class TestEffectiveProducerSchemaConfig:
+    """Pass-through gates expose a config only when every live input agrees."""
+
+    def test_mixed_known_and_unknown_inputs_abstain(self) -> None:
+        known_config = SchemaConfig(
+            mode="fixed",
+            fields=(FieldDefinition("id", "int"),),
+        )
+        graph = ExecutionGraph()
+        graph.add_node(
+            "known",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="known",
+            output_schema_config=known_config,
+        )
+        graph.add_node(
+            "unknown",
+            node_type=NodeType.TRANSFORM,
+            plugin_name="unknown",
+        )
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="gate")
+        graph.add_edge("known", "gate", label="known", mode=RoutingMode.MOVE)
+        graph.add_edge("unknown", "gate", label="unknown", mode=RoutingMode.MOVE)
+
+        assert schema_validation.get_effective_producer_schema_config(graph, "gate") is None
+
+
 # ---------------------------------------------------------------------------
 # Gap 3: NodeInfo.__post_init__ node_id length validation
 # ---------------------------------------------------------------------------
@@ -1991,6 +2018,22 @@ class TestDualViolationSinkDiagnosisPrecedence:
         message = str(exc_info.value)
         assert "BOTH must be repaired" not in message
         assert "does not guarantee them" not in message
+
+        result = exc_info.value.compatibility_result
+        assert result is not None
+        assert result.missing_fields == ()
+        assert result.extra_fields == ("category", "id", "price", "product")
+
+    def test_locked_sink_without_required_fields_reports_only_extras(self) -> None:
+        """An empty locked sink contract has no missing-field verdict to merge."""
+        from elspeth.core.dag.models import EdgeContractError
+
+        with pytest.raises(EdgeContractError) as exc_info:
+            _build_coalesce_graph(
+                branch_schema=_BRANCH_OBSERVED,
+                sink_fields="""        fields:
+        - 'description: str?'""",
+            )
 
         result = exc_info.value.compatibility_result
         assert result is not None

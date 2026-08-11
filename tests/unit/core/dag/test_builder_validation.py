@@ -67,6 +67,96 @@ class _BuilderValidationTransform:
         self._output_schema_config = output_schema_config
 
 
+class TestBuilderTopLevelAdmission:
+    """Top-level plugin collections fail before partial graph construction."""
+
+    def test_empty_source_map_is_rejected(self) -> None:
+        with pytest.raises(GraphValidationError, match="at least one source"):
+            ExecutionGraph.from_plugin_instances(
+                sources={},
+                source_settings_map={},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_missing_sink_map_is_rejected(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="at least one sink"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks=None,
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_empty_sink_map_is_rejected(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="at least one sink"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="discard", options={})},
+                transforms=[],
+                sinks={},
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_source_plugin_and_settings_names_must_match(self) -> None:
+        source = _BuilderValidationMockSource()
+
+        with pytest.raises(GraphValidationError, match="names must match"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"plugin_name": source},  # type: ignore[arg-type]
+                source_settings_map={"settings_name": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_invalid_raw_source_schema_is_wrapped_as_graph_validation_error(self) -> None:
+        class InvalidSchemaSource(_BuilderValidationMockSource):
+            config: ClassVar[dict[str, Any]] = {"schema": "invalid"}
+
+        source = InvalidSchemaSource()
+
+        with pytest.raises(GraphValidationError, match="Invalid schema config"):
+            ExecutionGraph.from_plugin_instances(
+                sources={"primary": source},  # type: ignore[arg-type]
+                source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+    def test_generated_node_id_length_is_bounded(self) -> None:
+        source = _BuilderValidationMockSource()
+        source_name = "s" * 300
+
+        with pytest.raises(GraphValidationError, match="Generated node_id exceeds"):
+            ExecutionGraph.from_plugin_instances(
+                sources={source_name: source},  # type: ignore[arg-type]
+                source_settings_map={source_name: SourceSettings(plugin=source.name, on_success="output", options={})},
+                transforms=[],
+                sinks={"output": _BuilderValidationMockSink()},  # type: ignore[dict-item]
+                aggregations={},
+                gates=[],
+                coalesce_settings=[],
+            )
+
+
 class TestCoalesceBranchPlanning:
     """Builder should store one coherent plan per coalesce branch."""
 

@@ -195,6 +195,10 @@ class FakeNav:
     def resolve_next_node(self, node_id: NodeID) -> NodeID | None:
         return self.next_node
 
+    def resolve_coalesce_node(self, coalesce_name: CoalesceName) -> NodeID:
+        assert coalesce_name == _COALESCE
+        return NodeID("coalesce-node")
+
 
 def _batch_aware_transform() -> Mock:
     """Specced protocol mock — satisfies the runtime TransformProtocol check."""

@@ -1006,11 +1006,10 @@ def get_effective_producer_schema_config(
         for from_id, _, _key, edge_data in graph._graph.in_edges(node_id, keys=True, data=True)
         if edge_data["mode"] != RoutingMode.DIVERT
     ]
-    known_configs = [config for config in incoming_configs if config is not None]
-    if not known_configs:
+    if not incoming_configs or any(config is None for config in incoming_configs):
         return None
-    first = known_configs[0]
-    return first if all(config == first for config in known_configs[1:]) else None
+    first = incoming_configs[0]
+    return first if all(config == first for config in incoming_configs[1:]) else None
 
 
 def row_union_schema_configs_compatible(
