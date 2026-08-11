@@ -49,16 +49,16 @@ def test_urls_strip_trailing_slash_on_base() -> None:
 
 def test_github_pages_base_builds_public_urls() -> None:
     # The first-run tutorial's synthetic pages are published to the project's
-    # public GitHub Pages (https://johnm-dta.github.io/elspeth/tutorial-site/).
+    # public GitHub Pages (https://dta-au.github.io/elspeth/tutorial-site/).
     # Pointing ``tutorial_sample_base_url`` there makes a loopback dev box scrape
     # a PUBLIC origin, so the tutorial's web_scrape node uses the plugin default
     # ``public_only`` with no server-injected allowlist. This pins the
     # public-hosting decision: the URLs asserted here are the ones served live.
-    base = "https://johnm-dta.github.io/elspeth"
+    base = "https://dta-au.github.io/elspeth"
     assert resolve_tutorial_sample_urls(base_url=base) == (
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
     )
 
 
@@ -72,4 +72,4 @@ def test_base_url_defaults_to_github_pages_when_unset() -> None:
     # which produced loopback URLs the web_scrape SSRF gate refuses).
     settings = _settings()
     assert tutorial_sample_base_url(settings=settings) == TUTORIAL_SAMPLE_PAGES_BASE_URL
-    assert TUTORIAL_SAMPLE_PAGES_BASE_URL == "https://johnm-dta.github.io/elspeth"
+    assert TUTORIAL_SAMPLE_PAGES_BASE_URL == "https://dta-au.github.io/elspeth"

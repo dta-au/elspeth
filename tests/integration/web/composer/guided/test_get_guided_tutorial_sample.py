@@ -51,9 +51,9 @@ def test_tutorial_sample_default_is_github_pages(composer_test_client: TestClien
     body = resp.json()
 
     assert body["sample_urls"] == [
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
     ]
 
 
@@ -61,16 +61,16 @@ def test_tutorial_sample_configured_base_builds_urls_under_it(composer_test_clie
     """A configured (publicly-hosted) base -> the 3 URLs built under that base."""
     session_id = _create_session(composer_test_client)
     _start(composer_test_client, session_id, "tutorial")
-    _set_base_url(composer_test_client, "https://johnm-dta.github.io/elspeth")
+    _set_base_url(composer_test_client, "https://dta-au.github.io/elspeth")
 
     resp = _get_sample(composer_test_client, session_id)
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
     assert body["sample_urls"] == [
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html",
-        "https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-1.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-2.html",
+        "https://dta-au.github.io/elspeth/tutorial-site/project-3.html",
     ]
 
 

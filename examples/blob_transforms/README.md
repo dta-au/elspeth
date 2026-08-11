@@ -39,9 +39,9 @@ every emitted CSV row, so rows from multiple source blobs remain disambiguated.
 
 This example uses the public GitHub Pages tutorial files:
 
-- `https://johnm-dta.github.io/elspeth/tutorial-site/project-1.html`
-- `https://johnm-dta.github.io/elspeth/tutorial-site/project-2.html`
-- `https://johnm-dta.github.io/elspeth/tutorial-site/project-3.html`
+- `https://dta-au.github.io/elspeth/tutorial-site/project-1.html`
+- `https://dta-au.github.io/elspeth/tutorial-site/project-2.html`
+- `https://dta-au.github.io/elspeth/tutorial-site/project-3.html`
 
 Run:
 

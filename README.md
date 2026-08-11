@@ -366,7 +366,7 @@ Then open `http://localhost:5173`.
   token. Normal user access tokens are never accepted for this endpoint.
 - The first-run tutorial scrapes three synthetic pages at
   `{base}/tutorial-site/project-N.html`, where `{base}` defaults to the
-  project's public GitHub Pages copy (`https://johnm-dta.github.io/elspeth`).
+  project's public GitHub Pages copy (`https://dta-au.github.io/elspeth`).
   That base is operator-controlled content that needs no local hosting, so the
   tutorial runs end-to-end on any deployment — including a pure loopback dev box
   — without the app serving the pages itself. The tutorial's `web_scrape` node
