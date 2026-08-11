@@ -4,6 +4,55 @@ import { describe, expect, it } from "vitest";
 import { ReadOnlyPipelineGraph } from "./ReadOnlyPipelineGraph";
 
 describe("ReadOnlyPipelineGraph", () => {
+  it("keeps the proposal viewport while rendering compact cards for long route labels", () => {
+    const { container } = render(
+      <ReadOnlyPipelineGraph
+        ariaLabel="Source and output with discard routes"
+        nodes={[
+          { id: "source-1", label: "source-1", kind: "source", subtitle: "CSV" },
+          { id: "output-1", label: "output-1", kind: "output", subtitle: "json" },
+          { id: "discard", label: "discard", kind: "discard", subtitle: null },
+        ]}
+        edges={[
+          {
+            id: "source-success",
+            source: "source-1",
+            target: "output-1",
+            label: "source-1 on source success → output-1",
+            isError: false,
+          },
+          {
+            id: "source-validation-failure",
+            source: "source-1",
+            target: "discard",
+            label: "source-1 on validation failure → discard",
+            isError: true,
+          },
+          {
+            id: "output-write-failure",
+            source: "output-1",
+            target: "discard",
+            label: "output-1 on write failure → discard",
+            isError: true,
+          },
+        ]}
+      />,
+    );
+
+    const svg = container.querySelector("svg");
+    expect(svg).toHaveAttribute("viewBox", "0 0 287.5 394");
+
+    const cards = Array.from(container.querySelectorAll("rect.guided-readonly-graph__node"));
+    expect(cards).toHaveLength(3);
+    for (const card of cards) {
+      expect(card).toHaveAttribute("width", "136");
+      expect(card).toHaveAttribute("height", "54");
+    }
+
+    const viewBoxWidth = Number(svg!.getAttribute("viewBox")!.split(/\s+/)[2]);
+    expect(136 / viewBoxWidth).toBeLessThan(0.5);
+  });
+
   it("lays a linear pipeline out from top to bottom inside the inline review", () => {
     const { container } = render(
       <ReadOnlyPipelineGraph
