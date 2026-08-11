@@ -184,15 +184,21 @@ count/names, registry, catalog, golden, contracts whitelist).
   cannot prove this protocol because `FOR UPDATE` is inert there; retain the
   independent PostgreSQL race tests for both lock winners.
 
-- **2026-08-12 — non-empty transform aggregation completion owns an epoch-32
+- **2026-08-12 — every successful aggregation completion owns an epoch-32
   result receipt**: validate the plugin output and declaration contract before
   completing anything, then commit the node, batch, ordered payload refs, and
-  exact member dispositions in one transaction. PostgreSQL writers lock
-  member tokens first, then node state, then batch. Restore must load and
-  purely validate every candidate receipt before it expands any candidate;
-  payload retention and affected-run accounting must include the receipt refs.
-  Empty-output and passthrough aggregation do not use this receipt yet and
-  remain separate recovery work.
+  exact member actions in one transaction. PostgreSQL writers lock member
+  tokens first, then node state, then batch. Transform results use a consumed
+  member as the expansion parent; passthrough results carry one output per
+  member and retain the original token identities; empty results carry no
+  output refs. Restore must load and purely validate every candidate receipt
+  before it mutates any candidate. For empty results, terminal member outcomes,
+  branch losses, and BLOCKED-to-TERMINAL scheduler transitions share one barrier
+  transaction. Do not notify or fire a downstream coalesce/row_union from the
+  empty-routing plan: replay the durable loss ledger only after that transaction
+  commits, otherwise a failed aggregation commit can strand a consumed sibling
+  barrier or lose its merged output. Payload retention and affected-run
+  accounting must include the receipt refs.
 
 - **2026-08-12 — completed barrier effects are continuations, not late
   arrivals**: aggregation expansion receipts and completed coalesce-effect

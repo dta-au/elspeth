@@ -31,6 +31,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.scheduler import (
     BarrierEmission,
+    BarrierTerminalOutcomeSpec,
     BatchMembershipSpec,
     BlockedPendingSinkHandoff,
     BranchLossSpec,
@@ -692,6 +693,7 @@ class TokenSchedulerRepository:
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
         branch_losses: Sequence[BranchLossSpec] = (),
+        terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
     ) -> int:
         """Complete a barrier atomically (see :meth:`BarrierJournalRepository.complete_barrier`)."""
         return self.barriers.complete_barrier(
@@ -708,6 +710,7 @@ class TokenSchedulerRepository:
             coordination_token=coordination_token,
             pending_sink_lease_owner=pending_sink_lease_owner,
             branch_losses=branch_losses,
+            terminal_outcomes=terminal_outcomes,
         )
 
     def mark_blocked_barrier_pending_sink_many(

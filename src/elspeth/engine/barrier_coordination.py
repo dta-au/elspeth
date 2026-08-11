@@ -65,7 +65,7 @@ if TYPE_CHECKING:
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
-    from elspeth.engine.processor import _PreparedTransformRoute
+    from elspeth.engine.processor import _PreparedAggregationRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -705,10 +705,14 @@ class BarrierIntakeCoordinator:
 
         Journal-first: the fenced cursor mark commits BEFORE the in-memory
         replay — a crash between mark and replay loses nothing because the
-        takeover restore derives lost_branches from the FULL loss table. At
-        N=1 the replay arm is structurally idle: the producer already
-        notified in-claim (record-then-notify), so ``has_recorded_branch_loss``
-        (or the executor's completed-keys check) dedups every row.
+        takeover restore derives lost_branches from the FULL loss table. For
+        ordinary N=1 claim dispositions the replay arm is structurally
+        idle: the producer already notified in-claim (record-then-notify), so
+        ``has_recorded_branch_loss`` (or the executor's completed-keys check)
+        dedups every row. Empty aggregation is the deliberate exception: it
+        stages without notifying, commits the loss with its own barrier, then
+        calls this intake seam so downstream consequences cannot precede the
+        durable loss.
         """
         dispositions: list[BarrierIntakeDisposition] = []
         if self._coalesce_executor is None and self._row_union_executor is None:
@@ -819,6 +823,10 @@ class BarrierIntakeCoordinator:
             )
         return dispositions
 
+    def replay_durable_branch_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
+        """Replay committed loss-ledger entries after their producer commits."""
+        return tuple(self._replay_branch_losses())
+
 
 class BarrierRecoveryCoordinator:
     """F1 resume restore: rebuild barrier state from journal + audit tables."""
@@ -844,9 +852,9 @@ class BarrierRecoveryCoordinator:
         emit_token_completed: Callable[..., None] | None = None,
         complete_committed_aggregation_residual: Callable[[CommittedAggregationResidual, Sequence[TokenWorkItem]], None] | None = None,
         prepare_committed_aggregation_output: (
-            Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedTransformRoute] | None
+            Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedAggregationRoute] | None
         ) = None,
-        complete_committed_aggregation_output: Callable[[_PreparedTransformRoute], None] | None = None,
+        complete_committed_aggregation_output: Callable[[_PreparedAggregationRoute], None] | None = None,
         complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
     ) -> None:
         self._run_id = run_id
@@ -1001,7 +1009,7 @@ class BarrierRecoveryCoordinator:
         # Per-node batch metadata for every configured aggregation node.
         agg_plans: list[_AggregationRestorePlan] = []
         committed_aggregation_plans: list[tuple[CommittedAggregationResidual, tuple[TokenWorkItem, ...]]] = []
-        committed_aggregation_output_plans: list[_PreparedTransformRoute] = []
+        committed_aggregation_output_plans: list[_PreparedAggregationRoute] = []
         committed_coalesce_plans: list[tuple[CommittedCoalesceResidual, tuple[TokenWorkItem, ...]]] = []
         if self._aggregation_settings:
             members_by_batch: dict[str, list[str]] = {}

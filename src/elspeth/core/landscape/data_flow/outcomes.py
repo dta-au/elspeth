@@ -44,7 +44,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 
-__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded"]
+__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded", "record_terminal_outcome_guarded"]
 
 # IN-clause chunk size for token-id lock queries — stays under SQLite's
 # default 999 bound-parameter ceiling (the node_states.py convention) and
@@ -752,4 +752,48 @@ def record_buffered_outcome_guarded(
         ) from exc
     if result.rowcount == 0:
         raise LandscapeRecordError(f"record_buffered_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
+    return outcome_id
+
+
+def record_terminal_outcome_guarded(
+    conn: Connection,
+    *,
+    run_id: str,
+    token_id: str,
+    outcome: TerminalOutcome,
+    path: TerminalPath,
+    recorded_at: datetime,
+    error_hash: str | None = None,
+) -> str:
+    """Record one terminal outcome inside a caller-owned fenced transaction."""
+    TokenOutcomeRepository._validate_outcome_fields(
+        outcome,
+        path,
+        sink_name=None,
+        batch_id=None,
+        fork_group_id=None,
+        join_group_id=None,
+        expand_group_id=None,
+        error_hash=error_hash,
+    )
+    outcome_id = f"out_{generate_id()[:12]}"
+    try:
+        result = conn.execute(
+            token_outcomes_table.insert().values(
+                outcome_id=outcome_id,
+                run_id=run_id,
+                token_id=token_id,
+                outcome=outcome.value,
+                path=path.value,
+                completed=1,
+                recorded_at=recorded_at,
+                error_hash=error_hash,
+            )
+        )
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"record_terminal_outcome_guarded failed for token_id={token_id!r} — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if result.rowcount == 0:
+        raise LandscapeRecordError(f"record_terminal_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
     return outcome_id

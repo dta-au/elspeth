@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, TypedDict
 
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, AggregationMemberAction, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import require_int
 from elspeth.contracts.node_state_context import NodeStateContext
 
@@ -31,17 +31,27 @@ class AggregationParentDisposition:
 
 
 @dataclass(frozen=True, slots=True)
+class AggregationResultMember:
+    """One ordered member action stored in an aggregation result receipt."""
+
+    member_ref: TokenRef
+    action: AggregationMemberAction
+    error_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class AggregationResultReceipt:
-    """Durable successful non-empty transform-mode output authority."""
+    """Durable successful aggregation output authority."""
 
     batch_id: str
     run_id: str
     aggregation_state_id: str
+    output_mode: str
     output_shape: str
     output_hash: str
     output_refs: tuple[str, ...]
-    member_dispositions: tuple[AggregationParentDisposition, ...]
-    expansion_parent_token_id: str
+    members: tuple[AggregationResultMember, ...]
+    expansion_parent_token_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,12 +85,13 @@ class CommittedAggregationOutputReceipt:
     batch_id: str
     aggregation_node_id: str
     aggregation_state_id: str
+    output_mode: str
     output_shape: str
     output_hash: str
     output_refs: tuple[str, ...]
     member_token_ids: tuple[str, ...]
-    member_dispositions: tuple[AggregationParentDisposition, ...]
-    expansion_parent_token_id: str
+    members: tuple[AggregationResultMember, ...]
+    expansion_parent_token_id: str | None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1858,10 +1858,14 @@ it. Epoch 30 adds `token_work_items.row_union_name` so a recovered scheduler can
 attribute a blocked work item to its declared row_union barrier. Epoch 31
 closes `token_work_items.status` over the public scheduler status enum so a
 removed state such as `waiting` cannot be reintroduced through direct SQL.
-Epoch 32 adds normalized, content-addressed aggregation result receipts. For a
-successful non-empty transform-mode flush, node completion, batch completion, the exact
-ordered outputs, and every member disposition commit in one transaction; resume
-can create the pending expansion without invoking the aggregation plugin again.
+Epoch 32 adds normalized, content-addressed aggregation result receipts. For
+every successful transform or passthrough flush, node completion, batch
+completion, the exact ordered outputs, and every member action commit in one
+transaction. Resume can create a pending transform expansion, continue
+passthrough rows with their original token identities, or finish an empty
+result without invoking the aggregation plugin again. Empty-result member
+outcomes commit with the scheduler barrier transition rather than in a separate
+write.
 See the
 [sink-effect recovery runbook](../runbooks/sink-effect-recovery.md).
 

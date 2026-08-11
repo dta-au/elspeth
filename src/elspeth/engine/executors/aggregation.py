@@ -37,7 +37,7 @@ from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.execution_repository import ExecutionRepository
-from elspeth.engine.aggregation_result import aggregation_parent_dispositions, validated_quarantined_indices
+from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import AggregationJournalRestorer
@@ -531,89 +531,69 @@ class AggregationExecutor:
         """Record successful node-state and batch completion."""
         self._validate_success_outputs(transform, result)
 
-        output_data: dict[str, Any] | list[dict[str, Any]]
-        if result.row is not None:
-            output_data = result.row.to_dict()
-        elif result.rows is not None:
-            output_data = [row.to_dict() for row in result.rows]
-        else:
+        if result.row is None and result.rows is None:
             raise PluginContractViolation(
                 f"Aggregation transform '{transform.name}' returned success status but "
                 f"neither row nor rows contains data. Batch-aware transforms must return "
                 f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
             )
 
+        output_rows = (result.row,) if result.row is not None else tuple(result.rows or ())
+        quarantined_indices = validated_quarantined_indices(
+            result,
+            buffered_token_count=len(buffered_tokens),
+            aggregation_name=node.settings.name,
+        )
         if node.settings.output_mode is OutputMode.TRANSFORM:
-            output_rows = (result.row,) if result.row is not None else tuple(result.rows or ())
             if node.settings.expected_output_count is not None and len(output_rows) != node.settings.expected_output_count:
                 raise PluginContractViolation(
                     f"Aggregation {node.settings.name!r} produced {len(output_rows)} output row(s), "
                     f"but expected_output_count={node.settings.expected_output_count}."
                 )
-            if not output_rows:
-                # Empty-emission completion predates the output receipt and has
-                # no expansion payload or parent. Preserve its existing path;
-                # its pre-routing crash window remains an explicit follow-up.
-                guard.complete(
-                    NodeStateStatus.COMPLETED,
-                    output_data=output_data,
-                    duration_ms=duration_ms,
-                    success_reason=result.success_reason,
-                    context_after=window.flush_context(batch_id=batch_id, trigger_type=trigger_type),
-                )
-                self._execution.complete_batch(
-                    batch_id=batch_id,
-                    status=BatchStatus.COMPLETED,
-                    trigger_type=trigger_type,
-                    state_id=guard.state_id,
-                )
-                node.completed_flush_count += 1
-                return
-            quarantined_indices = validated_quarantined_indices(
-                result,
-                buffered_token_count=len(buffered_tokens),
-                aggregation_name=node.settings.name,
-            )
             non_quarantined_tokens = tuple(token for index, token in enumerate(buffered_tokens) if index not in quarantined_indices)
-            if not non_quarantined_tokens:
+            if output_rows and not non_quarantined_tokens:
                 raise OrchestrationInvariantError(
                     f"Aggregation {node.settings.name!r} emitted output but all buffered tokens were quarantined"
                 )
-            if result.output_hash is None:
-                raise OrchestrationInvariantError("successful transform-mode aggregation lacks output_hash")
-            guard.complete_aggregation_result(
-                batch_id=batch_id,
-                run_id=self._run_id,
-                aggregation_node_id=str(node_id),
-                trigger_type=trigger_type,
-                output_rows=output_rows,
-                output_shape="multi" if result.rows is not None else "single",
-                output_hash=result.output_hash,
-                member_dispositions=aggregation_parent_dispositions(
-                    buffered_tokens,
-                    run_id=self._run_id,
-                    batch_id=batch_id,
-                    quarantined_indices=quarantined_indices,
-                ),
-                expansion_parent_token_id=non_quarantined_tokens[0].token_id,
-                duration_ms=duration_ms,
-                success_reason=result.success_reason,
-                context_after=window.flush_context(batch_id=batch_id, trigger_type=trigger_type),
-            )
+            expansion_parent_token_id = non_quarantined_tokens[0].token_id if output_rows else None
         else:
-            guard.complete(
-                NodeStateStatus.COMPLETED,
-                output_data=output_data,
-                duration_ms=duration_ms,
-                success_reason=result.success_reason,
-                context_after=window.flush_context(batch_id=batch_id, trigger_type=trigger_type),
-            )
-            self._execution.complete_batch(
+            if quarantined_indices:
+                raise OrchestrationInvariantError("passthrough aggregation cannot declare quarantined_indices")
+            if result.rows is None:
+                raise OrchestrationInvariantError(
+                    f"Passthrough mode requires multi-row result, but transform {transform.name!r} returned single row. "
+                    "Use TransformResult.success_multi() for passthrough."
+                )
+            if output_rows and len(output_rows) != len(buffered_tokens):
+                raise OrchestrationInvariantError(
+                    f"Passthrough mode requires same number of output rows as input rows. Transform {transform.name!r} "
+                    f"returned {len(output_rows)} rows but received {len(buffered_tokens)} input rows."
+                )
+            expansion_parent_token_id = None
+        if result.output_hash is None:
+            raise OrchestrationInvariantError("successful aggregation result lacks output_hash")
+        guard.complete_aggregation_result(
+            batch_id=batch_id,
+            run_id=self._run_id,
+            aggregation_node_id=str(node_id),
+            trigger_type=trigger_type,
+            output_mode=node.settings.output_mode,
+            output_rows=output_rows,
+            output_shape="empty" if not output_rows else ("multi" if result.rows is not None else "single"),
+            output_hash=result.output_hash,
+            members=aggregation_result_members(
+                buffered_tokens,
+                run_id=self._run_id,
                 batch_id=batch_id,
-                status=BatchStatus.COMPLETED,
-                trigger_type=trigger_type,
-                state_id=guard.state_id,
-            )
+                output_mode=node.settings.output_mode,
+                output_is_empty=not output_rows,
+                quarantined_indices=quarantined_indices,
+            ),
+            expansion_parent_token_id=expansion_parent_token_id,
+            duration_ms=duration_ms,
+            success_reason=result.success_reason,
+            context_after=window.flush_context(batch_id=batch_id, trigger_type=trigger_type),
+        )
         node.completed_flush_count += 1
 
     def _complete_error_flush(

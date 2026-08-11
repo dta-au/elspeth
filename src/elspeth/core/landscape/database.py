@@ -696,11 +696,12 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("coalesce_effect_members", "ck_coalesce_effect_members_ordinal"),
     ("aggregation_results", "ck_aggregation_results_output_mode"),
     ("aggregation_results", "ck_aggregation_results_output_shape"),
+    ("aggregation_results", "ck_aggregation_results_mode_shape_parent"),
     ("aggregation_results", "ck_aggregation_results_output_hash_hex"),
     ("aggregation_result_outputs", "ck_aggregation_result_outputs_ordinal"),
     ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex"),
     ("aggregation_result_members", "ck_aggregation_result_members_ordinal"),
-    ("aggregation_result_members", "ck_aggregation_result_members_disposition"),
+    ("aggregation_result_members", "ck_aggregation_result_members_action"),
     ("aggregation_result_members", "ck_aggregation_result_members_error_hash_hex"),
 )
 

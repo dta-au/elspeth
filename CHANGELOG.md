@@ -47,9 +47,11 @@ Landscape
 row_union barrier attribution column to scheduler work items, and epoch 31
 constrains scheduler work-item status to the public six-state vocabulary so
 removed states cannot be persisted through direct SQL. Epoch 32 atomically
-records successful non-empty transform-mode aggregation outputs and ordered member
-dispositions with node and batch completion, allowing a replacement process to
-materialize the expansion without replaying the plugin. ELSPETH does not migrate
+records every successful aggregation result and its ordered member actions
+with node and batch completion. A replacement process can materialize
+transform-mode outputs, continue passthrough outputs with their original token
+identities, or finish an empty result without replaying the plugin. Empty-result
+terminal outcomes commit atomically with scheduler barrier completion. ELSPETH does not migrate
 either predecessor database in place before 1.0. Archive or export required
 evidence, stop the old service, recreate stale session and Landscape stores,
 then install

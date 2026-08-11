@@ -24,8 +24,9 @@ from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.scheduler import BarrierEmission, SchedulerEventType, TokenWorkStatus
+from elspeth.contracts.scheduler import BarrierEmission, BarrierTerminalOutcomeSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.errors import LandscapeRecordError
@@ -36,9 +37,55 @@ from elspeth.core.landscape.schema import (
     run_coordination_table,
     runs_table,
     scheduler_events_table,
+    token_outcomes_table,
     token_work_items_table,
     tokens_table,
 )
+
+
+def test_complete_barrier_rolls_back_terminal_outcomes_with_journal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fault during empty-output outcomes exposes neither half of completion."""
+    from elspeth.core.landscape.scheduler import barrier as barrier_module
+
+    engine, repo = _make_repo()
+    _seed_three_blocked(engine, repo)
+    real_record = barrier_module.record_terminal_outcome_guarded
+    calls = 0
+
+    def fail_during_second_outcome(*args: object, **kwargs: object) -> None:
+        nonlocal calls
+        calls += 1
+        real_record(*args, **kwargs)
+        if calls == 2:
+            raise RuntimeError("injected terminal-outcome failure")
+
+    monkeypatch.setattr(barrier_module, "record_terminal_outcome_guarded", fail_during_second_outcome)
+    terminal_outcomes = tuple(
+        BarrierTerminalOutcomeSpec(
+            token_id=token_id,
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.FILTER_DROPPED,
+        )
+        for token_id in ("t1", "t2", "t3")
+    )
+
+    with pytest.raises(RuntimeError, match="injected terminal-outcome failure"):
+        repo.complete_barrier(
+            run_id=RUN_ID,
+            barrier_key=BARRIER_KEY,
+            consumed_token_ids=["t1", "t2", "t3"],
+            emitted_pending_sink=[],
+            emitted_ready=[],
+            now=NOW,
+            intake_snapshot_token_ids=frozenset({"t1", "t2", "t3"}),
+            coordination_token=COORD_TOKEN,
+            terminal_outcomes=terminal_outcomes,
+        )
+
+    assert _statuses(engine, ["t1", "t2", "t3"]) == {TokenWorkStatus.BLOCKED.value}
+    with engine.connect() as conn:
+        assert tuple(conn.execute(select(token_outcomes_table.c.token_id))) == ()
+
 
 RUN_ID = "R"
 BARRIER_KEY = "agg-1"

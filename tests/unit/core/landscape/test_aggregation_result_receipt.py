@@ -7,9 +7,9 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import func, select
 
-from elspeth.contracts import AggregationParentDisposition, BatchStatus, NodeStateStatus, NodeType, TriggerType
+from elspeth.contracts import AggregationResultMember, BatchStatus, NodeStateStatus, NodeType, OutputMode, TriggerType
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import AggregationMemberAction, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.node_state_context import AggregationFlushContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
@@ -69,11 +69,10 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
 
     monkeypatch.setattr(execution.batches, "complete_batch", fail_after_batch_completion)
     output = PipelineRow({"total": 3}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
-    dispositions = tuple(
-        AggregationParentDisposition(
-            parent_ref=TokenRef(token_id=f"tok-{ordinal}", run_id=setup.run_id),
-            outcome=TerminalOutcome.TRANSIENT,
-            path=TerminalPath.BATCH_CONSUMED,
+    members = tuple(
+        AggregationResultMember(
+            member_ref=TokenRef(token_id=f"tok-{ordinal}", run_id=setup.run_id),
+            action=AggregationMemberAction.CONSUME_BATCH,
             error_hash=None,
         )
         for ordinal in range(2)
@@ -86,10 +85,11 @@ def test_completion_failure_rolls_back_node_batch_and_receipt(monkeypatch: pytes
             aggregation_node_id="agg-1",
             state_id=state.state_id,
             trigger_type=TriggerType.END_OF_SOURCE,
+            output_mode=OutputMode.TRANSFORM,
             output_rows=(row,),
             output_shape="single",
             output_hash=stable_hash(row.to_dict()),
-            member_dispositions=dispositions,
+            members=members,
             expansion_parent_token_id="tok-0",
             duration_ms=duration_ms,
             success_reason=None,
@@ -173,14 +173,14 @@ def test_completion_rejects_member_with_buffered_history_and_terminal_outcome() 
             aggregation_node_id="agg-1",
             state_id=state.state_id,
             trigger_type=TriggerType.END_OF_SOURCE,
+            output_mode=OutputMode.TRANSFORM,
             output_rows=(output,),
             output_shape="single",
             output_hash=stable_hash(output.to_dict()),
-            member_dispositions=(
-                AggregationParentDisposition(
-                    parent_ref=ref,
-                    outcome=TerminalOutcome.TRANSIENT,
-                    path=TerminalPath.BATCH_CONSUMED,
+            members=(
+                AggregationResultMember(
+                    member_ref=ref,
+                    action=AggregationMemberAction.CONSUME_BATCH,
                     error_hash=None,
                 ),
             ),

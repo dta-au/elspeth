@@ -303,10 +303,11 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #   31 → token_work_items.status is mechanically closed over TokenWorkStatus.
 #        Removed states such as WAITING can no longer be reintroduced through
 #        direct SQL. This is a pre-1.0 delete-and-recreate boundary.
-#   32 → Successful non-empty transform-mode aggregation completion records
-#        an ordered, self-contained output receipt. A replacement process can
-#        materialize the expansion without replaying the plugin if the leader
-#        dies after node/batch completion and before child creation.
+#   32 → Every successful aggregation completion records an ordered,
+#        self-contained result receipt. A replacement process can materialize
+#        transform outputs, continue passthrough rows with their original
+#        token identities, or finish empty members without replaying the
+#        plugin after node/batch completion.
 SQLITE_SCHEMA_EPOCH = 32
 
 schema_identity_table = create_schema_identity_table(metadata)
@@ -2035,12 +2036,18 @@ aggregation_results_table = Table(
     Column("output_mode", String(16), nullable=False),
     Column("output_shape", String(16), nullable=False),
     Column("output_hash", String(64), nullable=False),
-    Column("expansion_parent_token_id", String(64), nullable=False),
+    Column("expansion_parent_token_id", String(64)),
     Column("created_at", DateTime(timezone=True), nullable=False),
     UniqueConstraint("batch_id", "run_id"),
     UniqueConstraint("aggregation_state_id", "run_id"),
-    CheckConstraint("output_mode = 'transform'", name="ck_aggregation_results_output_mode"),
-    CheckConstraint("output_shape IN ('single', 'multi')", name="ck_aggregation_results_output_shape"),
+    CheckConstraint("output_mode IN ('transform', 'passthrough')", name="ck_aggregation_results_output_mode"),
+    CheckConstraint("output_shape IN ('empty', 'single', 'multi')", name="ck_aggregation_results_output_shape"),
+    CheckConstraint(
+        "(output_mode = 'transform' AND output_shape IN ('single', 'multi') AND expansion_parent_token_id IS NOT NULL) OR "
+        "(output_mode = 'transform' AND output_shape = 'empty' AND expansion_parent_token_id IS NULL) OR "
+        "(output_mode = 'passthrough' AND output_shape IN ('empty', 'multi') AND expansion_parent_token_id IS NULL)",
+        name="ck_aggregation_results_mode_shape_parent",
+    ),
     CheckConstraint(_LowerHex64Check("output_hash"), name="ck_aggregation_results_output_hash_hex"),
     ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
     ForeignKeyConstraint(
@@ -2073,16 +2080,15 @@ aggregation_result_members_table = Table(
     Column("run_id", String(64), nullable=False),
     Column("ordinal", Integer, nullable=False),
     Column("token_id", String(64), nullable=False),
-    Column("outcome", String(32), nullable=False),
-    Column("path", String(64), nullable=False),
+    Column("action", String(32), nullable=False),
     Column("error_hash", String(64)),
     PrimaryKeyConstraint("batch_id", "ordinal"),
     UniqueConstraint("batch_id", "token_id"),
     CheckConstraint("ordinal >= 0", name="ck_aggregation_result_members_ordinal"),
     CheckConstraint(
-        "(outcome = 'transient' AND path = 'batch_consumed' AND error_hash IS NULL) OR "
-        "(outcome = 'failure' AND path = 'quarantined_at_source' AND error_hash IS NOT NULL)",
-        name="ck_aggregation_result_members_disposition",
+        "(action IN ('consume_batch', 'drop_filtered', 'continue_passthrough') AND error_hash IS NULL) OR "
+        "(action = 'quarantine' AND error_hash IS NOT NULL)",
+        name="ck_aggregation_result_members_action",
     ),
     CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_aggregation_result_members_error_hash_hex"),
     ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),

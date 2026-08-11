@@ -20,6 +20,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, cast
 
 from elspeth.contracts import (
+    AggregationMemberAction,
     PayloadNotFoundError,
     RouteDestination,
     RowResult,
@@ -139,6 +140,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import (
     BarrierEmission,
+    BarrierTerminalOutcomeSpec,
     BranchLossSpec,
     TokenWorkItem,
     TokenWorkStatus,
@@ -274,11 +276,12 @@ class _FlushContext:
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedTransformRoute:
-    """Purely validated transform-mode aggregation route plan."""
+class _PreparedAggregationRoute:
+    """Purely validated aggregation receipt route plan."""
 
     context: _FlushContext
     result: TransformResult
+    output_mode: OutputMode
     output_rows: tuple[PipelineRow, ...]
     quarantined_indices: frozenset[int]
     expansion_parent: TokenInfo | None
@@ -1407,50 +1410,63 @@ class RowProcessor:
     def _route_empty_emission_results(
         self,
         fctx: _FlushContext,
+        *,
+        quarantined_indices: frozenset[int] = frozenset(),
     ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
-        """Record terminal outcomes for a successful batch flush with zero rows.
+        """Plan terminal outcomes for a successful batch flush with zero rows.
 
         If these buffered tokens were fork branches awaiting a downstream
-        coalesce, each dropped branch must still notify the coalesce executor
-        so joins do not strand.
+        barrier, each loss is staged but deliberately not notified in memory.
+        The outcome rows and branch-loss evidence commit with scheduler
+        completion first; durable loss intake may trigger downstream barrier
+        consequences only after that transaction succeeds.
         """
         results: list[RowResult] = []
         child_items: list[WorkItem] = []
-        for token in fctx.buffered_tokens:
-            self._record_dropped_by_filter_outcome(
-                token=token,
-                transform_name=fctx.transform.name,
-                node_id=fctx.node_id,
-                path_label="during empty batch flush",
-            )
-            with best_effort(
-                "TokenCompleted telemetry after empty batch-flush audit",
-                run_id=self._run_id,
-                token_id=token.token_id,
-                transform_node_id=fctx.node_id,
-                transform_name=fctx.transform.name,
-            ):
-                self._emit_token_completed(
-                    token,
-                    outcome=TerminalOutcome.SUCCESS,
-                    path=TerminalPath.FILTER_DROPPED,
-                )
+        for index, token in enumerate(fctx.buffered_tokens):
+            quarantined = index in quarantined_indices
+            outcome = TerminalOutcome.FAILURE if quarantined else TerminalOutcome.SUCCESS
+            path = TerminalPath.QUARANTINED_AT_SOURCE if quarantined else TerminalPath.FILTER_DROPPED
+            loss_reason = "quarantined" if quarantined else "dropped_by_filter"
             results.append(
                 RowResult(
                     token=token,
                     final_data=token.row_data,
-                    outcome=TerminalOutcome.SUCCESS,
-                    path=TerminalPath.FILTER_DROPPED,
+                    outcome=outcome,
+                    path=path,
                 )
             )
             results.extend(
                 self._notify_barrier_of_lost_branch(
                     token,
-                    "dropped_by_filter",
+                    loss_reason,
                     child_items,
+                    notify_in_memory=False,
                 )
             )
         return tuple(results), child_items
+
+    @staticmethod
+    def _validate_passthrough_route(
+        fctx: _FlushContext,
+        result: TransformResult,
+    ) -> tuple[PipelineRow, ...]:
+        """Purely validate and return a passthrough aggregation output."""
+        if not result.is_multi_row:
+            raise OrchestrationInvariantError(
+                f"Passthrough mode requires multi-row result, "
+                f"but transform '{fctx.transform.name}' returned single row. "
+                f"Use TransformResult.success_multi() for passthrough."
+            )
+        if result.rows is None:  # pragma: no cover - guaranteed by is_multi_row
+            raise RuntimeError("Multi-row result has rows=None")
+        if len(result.rows) not in {0, len(fctx.buffered_tokens)}:
+            raise OrchestrationInvariantError(
+                f"Passthrough mode requires same number of output rows "
+                f"as input rows. Transform '{fctx.transform.name}' returned "
+                f"{len(result.rows)} rows but received {len(fctx.buffered_tokens)} input rows."
+            )
+        return tuple(result.rows)
 
     def _route_passthrough_results(
         self,
@@ -1463,24 +1479,9 @@ class RowProcessor:
         Validates 1:1 row count, updates token data, and routes to
         downstream processing or COMPLETED outcome.
         """
-        if not result.is_multi_row:
-            raise OrchestrationInvariantError(
-                f"Passthrough mode requires multi-row result, "
-                f"but transform '{fctx.transform.name}' returned single row. "
-                f"Use TransformResult.success_multi() for passthrough."
-            )
-        if result.rows is None:
-            raise RuntimeError("Multi-row result has rows=None")
-        if len(result.rows) == 0:
+        pipeline_rows = self._validate_passthrough_route(fctx, result)
+        if not pipeline_rows:
             return self._route_empty_emission_results(fctx)
-        if len(result.rows) != len(fctx.buffered_tokens):
-            raise OrchestrationInvariantError(
-                f"Passthrough mode requires same number of output rows "
-                f"as input rows. Transform '{fctx.transform.name}' returned "
-                f"{len(result.rows)} rows but received {len(fctx.buffered_tokens)} input rows."
-            )
-
-        pipeline_rows = list(result.rows)
         has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
         first_branch = fctx.buffered_tokens[0].branch_name if fctx.buffered_tokens else None
         needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_branch is not None
@@ -1530,7 +1531,7 @@ class RowProcessor:
         self,
         fctx: _FlushContext,
         result: TransformResult,
-    ) -> _PreparedTransformRoute:
+    ) -> _PreparedAggregationRoute:
         """Validate every transform-route precondition without mutating state."""
         quarantined_index_set = _validated_quarantined_indices(
             result,
@@ -1553,7 +1554,7 @@ class RowProcessor:
                 )
             output_rows = (result.row,)
         if len(output_rows) == 0:
-            return _PreparedTransformRoute(fctx, result, (), frozenset(quarantined_index_set), None)
+            return _PreparedAggregationRoute(fctx, result, OutputMode.TRANSFORM, (), frozenset(quarantined_index_set), None)
 
         # Enforce expected_output_count if configured
         if fctx.settings.expected_output_count is not None:
@@ -1576,9 +1577,10 @@ class RowProcessor:
             if any(token.token_id == fctx.expand_parent_token.token_id for token in non_quarantined_tokens)
             else non_quarantined_tokens[0]
         )
-        return _PreparedTransformRoute(
+        return _PreparedAggregationRoute(
             context=fctx,
             result=result,
+            output_mode=OutputMode.TRANSFORM,
             output_rows=tuple(output_rows),
             quarantined_indices=frozenset(quarantined_index_set),
             expansion_parent=expand_parent_token,
@@ -1589,16 +1591,18 @@ class RowProcessor:
         fctx: _FlushContext,
         result: TransformResult,
         *,
-        prepared: _PreparedTransformRoute | None = None,
+        prepared: _PreparedAggregationRoute | None = None,
     ) -> tuple[tuple[RowResult, ...], list[WorkItem]]:
         """Apply a fully validated transform-mode aggregation route."""
         plan = prepared or self._prepare_transform_route(fctx, result)
         if plan.context is not fctx or plan.result is not result:
             raise OrchestrationInvariantError("prepared transform route does not belong to the supplied flush result")
+        if plan.output_mode is not OutputMode.TRANSFORM:
+            raise OrchestrationInvariantError("prepared transform route has the wrong aggregation output mode")
         output_rows = plan.output_rows
         quarantined_index_set = set(plan.quarantined_indices)
         if not output_rows:
-            return self._route_empty_emission_results(fctx)
+            return self._route_empty_emission_results(fctx, quarantined_indices=frozenset(quarantined_index_set))
         if plan.expansion_parent is None:  # pragma: no cover - guaranteed by preparation
             raise OrchestrationInvariantError("non-empty prepared transform route lacks an expansion parent")
 
@@ -1811,6 +1815,8 @@ class RowProcessor:
                 flush_results,
                 buffered_tokens,
                 child_items,
+                batch_id=batch_id,
+                output_was_empty=result.rows == (),
             )
             return flush_results, child_items
         if settings.output_mode == OutputMode.TRANSFORM:
@@ -1820,6 +1826,8 @@ class RowProcessor:
                 flush_results,
                 buffered_tokens,
                 child_items,
+                batch_id=batch_id,
+                output_was_empty=result.rows == (),
             )
             return flush_results, child_items
         raise OrchestrationInvariantError(f"Unknown output_mode: {settings.output_mode}")
@@ -2935,7 +2943,13 @@ class RowProcessor:
         )
         return True, None
 
-    def _notify_row_union_of_lost_branch(self, current_token: TokenInfo, reason: str) -> list[RowResult]:
+    def _notify_row_union_of_lost_branch(
+        self,
+        current_token: TokenInfo,
+        reason: str,
+        *,
+        notify_in_memory: bool = True,
+    ) -> list[RowResult]:
         """Notify the row_union executor that a forked branch was diverted.
 
         v1 is fail-closed with no partial release, so a lost branch fails the
@@ -2969,7 +2983,7 @@ class RowProcessor:
                 recorded_by=self._scheduler_lease_owner,
             )
         )
-        if self._row_union_executor is None:
+        if self._row_union_executor is None or not notify_in_memory:
             return []
         outcome = self._row_union_executor.notify_branch_lost(
             row_union_name=str(row_union_name),
@@ -3027,6 +3041,8 @@ class RowProcessor:
         current_token: TokenInfo,
         reason: str,
         child_items: list[WorkItem],
+        *,
+        notify_in_memory: bool = True,
     ) -> list[RowResult]:
         """Notify whichever barrier owns this fork branch that it was lost.
 
@@ -3041,8 +3057,19 @@ class RowProcessor:
         A branch belongs to at most ONE barrier — enforced at build time and
         re-checked in this constructor — so at most one arm yields results.
         """
-        results = self._notify_coalesce_of_lost_branch(current_token, reason, child_items)
-        results.extend(self._notify_row_union_of_lost_branch(current_token, reason))
+        results = self._notify_coalesce_of_lost_branch(
+            current_token,
+            reason,
+            child_items,
+            notify_in_memory=notify_in_memory,
+        )
+        results.extend(
+            self._notify_row_union_of_lost_branch(
+                current_token,
+                reason,
+                notify_in_memory=notify_in_memory,
+            )
+        )
         return results
 
     def _notify_coalesce_of_lost_branch(
@@ -3050,6 +3077,8 @@ class RowProcessor:
         current_token: TokenInfo,
         reason: str,
         child_items: list[WorkItem],
+        *,
+        notify_in_memory: bool = True,
     ) -> list[RowResult]:
         """Notify the coalesce executor that a forked branch was diverted.
 
@@ -3102,7 +3131,7 @@ class RowProcessor:
         # In-memory notify: only possible when this worker has a coalesce
         # executor (leader).  Followers skip the in-memory notify; the durable
         # record above is sufficient for the leader's next intake.
-        if self._coalesce_executor is None:
+        if self._coalesce_executor is None or not notify_in_memory:
             return []
 
         outcome = self._coalesce_executor.notify_branch_lost(
@@ -3510,7 +3539,7 @@ class RowProcessor:
         self,
         receipt: CommittedAggregationOutputReceipt,
         blocked_items: Sequence[TokenWorkItem],
-    ) -> _PreparedTransformRoute:
+    ) -> _PreparedAggregationRoute:
         """Load and purely validate a receipt before restore mutates."""
         rows = tuple(
             self._load_committed_barrier_payload(
@@ -3520,12 +3549,33 @@ class RowProcessor:
             )
             for ordinal, token_data_ref in enumerate(receipt.output_refs)
         )
+        if rows:
+            shared_contract = rows[0].contract
+            if any(row.contract != shared_contract for row in rows[1:]):
+                raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} payloads carry divergent schema contracts")
+            # The payload envelope is deliberately self-contained, so each
+            # row deserializes its own equal contract object. Multi-row
+            # TransformResult construction requires the stronger runtime
+            # invariant that every row shares one contract identity.
+            rows = tuple(PipelineRow(row.to_dict(), shared_contract) for row in rows)
         output_data: object = rows[0].to_dict() if receipt.output_shape == "single" else [row.to_dict() for row in rows]
         if stable_hash(output_data) != receipt.output_hash:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} payloads disagree with its output hash")
         fctx, recovered_result = self._build_committed_aggregation_output_context(receipt, blocked_items, rows)
         self._cross_check_flush_output(fctx, recovered_result, record_violation=False)
-        return self._prepare_transform_route(fctx, recovered_result)
+        if receipt.output_mode == OutputMode.TRANSFORM.value:
+            return self._prepare_transform_route(fctx, recovered_result)
+        if receipt.output_mode != OutputMode.PASSTHROUGH.value:
+            raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown output mode")
+        self._validate_passthrough_route(fctx, recovered_result)
+        return _PreparedAggregationRoute(
+            context=fctx,
+            result=recovered_result,
+            output_mode=OutputMode.PASSTHROUGH,
+            output_rows=rows,
+            quarantined_indices=frozenset(),
+            expansion_parent=None,
+        )
 
     def _build_committed_aggregation_output_context(
         self,
@@ -3541,23 +3591,33 @@ class RowProcessor:
         buffered_tokens = tuple(self._work_codec.work_item_from_scheduler(item).token for item in ordered_items)
         tokens_by_id = {token.token_id: token for token in buffered_tokens}
         try:
-            expand_parent = tokens_by_id[receipt.expansion_parent_token_id]
             node_id = NodeID(receipt.aggregation_node_id)
             transform = cast(TransformProtocol, self._node_to_plugin[node_id])
             settings = self._aggregation_settings[node_id]
         except (KeyError, ValueError) as exc:
             raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown routing authority") from exc
-        quarantined_indices = [
-            index for index, disposition in enumerate(receipt.member_dispositions) if disposition.path is TerminalPath.QUARANTINED_AT_SOURCE
-        ]
+        if settings.output_mode.value != receipt.output_mode:
+            raise AuditIntegrityError(
+                f"Committed aggregation output {receipt.batch_id!r} mode {receipt.output_mode!r} "
+                f"disagrees with current graph mode {settings.output_mode.value!r}"
+            )
+        if receipt.expansion_parent_token_id is None:
+            expand_parent = buffered_tokens[0]
+        else:
+            try:
+                expand_parent = tokens_by_id[receipt.expansion_parent_token_id]
+            except KeyError as exc:
+                raise AuditIntegrityError(f"Committed aggregation output {receipt.batch_id!r} has unknown expansion parent") from exc
+        quarantined_indices = [index for index, member in enumerate(receipt.members) if member.action is AggregationMemberAction.QUARANTINE]
         success_reason: dict[str, Any] = {"action": "recovered_aggregation_result"}
         if quarantined_indices:
             success_reason["metadata"] = {"quarantined_indices": quarantined_indices}
-        recovered_result = (
-            TransformResult.success(output_rows[0], success_reason=cast(Any, success_reason))
-            if receipt.output_shape == "single"
-            else TransformResult.success_multi(tuple(output_rows), success_reason=cast(Any, success_reason))
-        )
+        if receipt.output_shape == "empty":
+            recovered_result = TransformResult.success_empty(success_reason=cast(Any, success_reason))
+        elif receipt.output_shape == "single":
+            recovered_result = TransformResult.success(output_rows[0], success_reason=cast(Any, success_reason))
+        else:
+            recovered_result = TransformResult.success_multi(tuple(output_rows), success_reason=cast(Any, success_reason))
         coalesce_node_id, coalesce_name = self._derive_coalesce_from_tokens(list(buffered_tokens))
         row_union_node_id, row_union_name = self._derive_row_union_from_scheduler(node_id, list(buffered_tokens))
         return (
@@ -3580,12 +3640,22 @@ class RowProcessor:
 
     def _complete_committed_aggregation_output(
         self,
-        prepared: _PreparedTransformRoute,
+        prepared: _PreparedAggregationRoute,
     ) -> None:
         """Materialize a durable pre-expansion result and complete its barrier."""
         fctx = prepared.context
-        results, child_items = self._route_transform_results(fctx, prepared.result, prepared=prepared)
-        self._complete_aggregation_flush(fctx.node_id, results, list(fctx.buffered_tokens), child_items)
+        if prepared.output_mode is OutputMode.TRANSFORM:
+            results, child_items = self._route_transform_results(fctx, prepared.result, prepared=prepared)
+        else:
+            results, child_items = self._route_passthrough_results(fctx, prepared.result)
+        self._complete_aggregation_flush(
+            fctx.node_id,
+            results,
+            list(fctx.buffered_tokens),
+            child_items,
+            batch_id=fctx.batch_id,
+            output_was_empty=not prepared.output_rows,
+        )
 
     def _load_committed_barrier_payload(
         self,
@@ -3669,7 +3739,10 @@ class RowProcessor:
         node_id: NodeID,
         results: tuple[RowResult, ...],
         buffered_tokens: Sequence[TokenInfo],
-        child_items: Sequence[WorkItem],
+        child_items: list[WorkItem],
+        *,
+        batch_id: str,
+        output_was_empty: bool,
     ) -> tuple[tuple[RowResult, ...], frozenset[str]]:
         """Complete a successful aggregation flush as ONE atomic journal transition.
 
@@ -3682,14 +3755,11 @@ class RowProcessor:
 
         ORDERING vs batch status: ``execute_flush`` finalizes the batches row
         (``complete_batch`` -> COMPLETED) BEFORE this journal transition. A
-        crash in that window leaves BLOCKED rows with a COMPLETED batch:
-        transform-mode flushes have already recorded terminal token_outcomes
-        (BATCH_CONSUMED), so the journal restore REFUSES loudly
-        (``_derive_restored_batch_id`` requires a live BUFFERED outcome);
-        passthrough flushes still carry BUFFERED outcomes and re-flush from
-        the rebuilt buffer. Do not reorder the two writes without re-deriving
-        the restore arms. This residual crash window is tracked:
-        elspeth-3977d8ab60.
+        crash in that window leaves BLOCKED rows with a COMPLETED batch and a
+        durable epoch-32 result receipt. Restore validates all such receipts
+        before mutating any candidate, then routes transform, passthrough, or
+        empty results without replaying the plugin. Do not reorder the two
+        writes without re-deriving those restore arms.
 
         ``intake_snapshot_token_ids`` (ADR-030 §E.3, slice 3): the firing
         group is exactly this batch's adopted members (``buffered_tokens`` —
@@ -3723,7 +3793,44 @@ class RowProcessor:
             emitted_token_ids.add(token_id)
 
         consumed_token_ids = tuple(token.token_id for token in buffered_tokens if token.token_id not in emitted_token_ids)
+        terminal_outcomes: list[BarrierTerminalOutcomeSpec] = []
+        if output_was_empty:
+            buffered_by_id = {token.token_id: token for token in buffered_tokens}
+            terminal_results: dict[str, RowResult] = {}
+            for result in results:
+                token_id = result.token.token_id
+                if token_id not in buffered_by_id:
+                    continue
+                if token_id in terminal_results:
+                    raise AuditIntegrityError(
+                        f"Empty aggregation flush for node {node_id!r} produced duplicate terminal plans for token_id={token_id!r}."
+                    )
+                terminal_results[token_id] = result
+            if frozenset(terminal_results) != frozenset(buffered_by_id):
+                raise AuditIntegrityError(
+                    f"Empty aggregation flush for node {node_id!r} lacks an exact terminal plan for every batch member."
+                )
+            for ordinal, token in enumerate(buffered_tokens):
+                result = terminal_results[token.token_id]
+                if result.outcome is TerminalOutcome.SUCCESS and result.path is TerminalPath.FILTER_DROPPED:
+                    error_hash = None
+                elif result.outcome is TerminalOutcome.FAILURE and result.path is TerminalPath.QUARANTINED_AT_SOURCE:
+                    error_hash = compute_error_hash(f"quarantined_in_batch:{batch_id}:{ordinal}")
+                else:
+                    raise AuditIntegrityError(
+                        f"Empty aggregation flush for node {node_id!r} has illegal terminal plan "
+                        f"({result.outcome!r}, {result.path!r}) for token_id={token.token_id!r}."
+                    )
+                terminal_outcomes.append(
+                    BarrierTerminalOutcomeSpec(
+                        token_id=token.token_id,
+                        outcome=result.outcome,
+                        path=result.path,
+                        error_hash=error_hash,
+                    )
+                )
 
+        branch_losses = tuple(self._pending_branch_losses)
         self._scheduler.complete_barrier(
             run_id=self._run_id,
             barrier_key=str(node_id),
@@ -3742,8 +3849,31 @@ class RowProcessor:
             # Attributed park (ADR-030): the post-sink strict owner CAS
             # terminalizes these handoffs under this worker's lease identity.
             pending_sink_lease_owner=self._scheduler_lease_owner,
-            branch_losses=self._take_pending_branch_losses(),
+            branch_losses=branch_losses,
+            terminal_outcomes=tuple(terminal_outcomes),
         )
+        if branch_losses:
+            # The producer transaction is now authoritative. Only after it
+            # commits may loss intake mutate a coalesce/row-union executor or
+            # fire that downstream barrier. A crash before this replay leaves
+            # an unadopted durable ledger row for the next intake/restore.
+            del self._pending_branch_losses[: len(branch_losses)]
+            for disposition in self._barrier_intake.replay_durable_branch_losses():
+                results = (*results, *disposition.results)
+                child_items.extend(disposition.child_items)
+
+        for terminal_outcome in terminal_outcomes:
+            with best_effort(
+                "TokenCompleted telemetry after atomic empty batch-flush completion",
+                run_id=self._run_id,
+                token_id=terminal_outcome.token_id,
+                transform_node_id=node_id,
+            ):
+                self._emit_token_completed(
+                    buffered_by_id[terminal_outcome.token_id],
+                    outcome=terminal_outcome.outcome,
+                    path=terminal_outcome.path,
+                )
 
         if not emitted_token_ids:
             return results, frozenset()
@@ -4089,18 +4219,6 @@ class RowProcessor:
     def _row_result_from_pending_sink(self, scheduled: TokenWorkItem) -> RowResult:
         """Rebuild a sink-bound row result without re-running its producer node (delegate)."""
         return self._scheduler_drain.row_result_from_pending_sink(scheduled)
-
-    def _take_pending_branch_losses(self) -> tuple[BranchLossSpec, ...]:
-        """Take-and-clear every staged §E.5 branch-loss record.
-
-        Consumed by ``_complete_aggregation_flush`` so empty-emission losses
-        ride the flush's barrier-completion transaction.
-        """
-        if not self._pending_branch_losses:
-            return ()
-        losses = tuple(self._pending_branch_losses)
-        self._pending_branch_losses.clear()
-        return losses
 
     def _take_claim_branch_loss(self, claimed_token_id: str) -> BranchLossSpec | None:
         """Take the staged §E.5 loss record for the claim being disposed (delegate)."""

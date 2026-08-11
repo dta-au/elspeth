@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from elspeth.contracts import AggregationParentDisposition, TokenInfo, TransformResult
+from elspeth.contracts import AggregationParentDisposition, AggregationResultMember, TokenInfo, TransformResult
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import AggregationMemberAction, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.engine._error_hash import compute_error_hash
 
@@ -68,3 +68,39 @@ def aggregation_parent_dispositions(
         )
         for index, token in enumerate(tokens)
     )
+
+
+def aggregation_result_members(
+    tokens: Sequence[TokenInfo],
+    *,
+    run_id: str,
+    batch_id: str,
+    output_mode: OutputMode,
+    output_is_empty: bool,
+    quarantined_indices: set[int],
+) -> tuple[AggregationResultMember, ...]:
+    """Derive the exact ordered receipt action for every batch member."""
+    if output_mode is OutputMode.PASSTHROUGH and quarantined_indices:
+        raise OrchestrationInvariantError("passthrough aggregation result cannot carry transform quarantine actions")
+    members: list[AggregationResultMember] = []
+    for index, token in enumerate(tokens):
+        if index in quarantined_indices:
+            action = AggregationMemberAction.QUARANTINE
+            error_hash = compute_error_hash(f"quarantined_in_batch:{batch_id}:{index}")
+        elif output_is_empty:
+            action = AggregationMemberAction.DROP_FILTERED
+            error_hash = None
+        elif output_mode is OutputMode.TRANSFORM:
+            action = AggregationMemberAction.CONSUME_BATCH
+            error_hash = None
+        else:
+            action = AggregationMemberAction.CONTINUE_PASSTHROUGH
+            error_hash = None
+        members.append(
+            AggregationResultMember(
+                member_ref=TokenRef(token_id=token.token_id, run_id=run_id),
+                action=action,
+                error_hash=error_hash,
+            )
+        )
+    return tuple(members)

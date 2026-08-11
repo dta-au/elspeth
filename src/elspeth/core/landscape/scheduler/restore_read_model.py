@@ -14,7 +14,8 @@ from typing import Any
 from sqlalchemy import and_, func, select
 
 from elspeth.contracts import (
-    AggregationParentDisposition,
+    AggregationMemberAction,
+    AggregationResultMember,
     CommittedAggregationChild,
     CommittedAggregationOutputReceipt,
     CommittedAggregationResidual,
@@ -23,7 +24,7 @@ from elspeth.contracts import (
     TokenOutcome,
 )
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import BatchStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, OutputMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
@@ -629,7 +630,7 @@ class BarrierRestoreReadModel:
         aggregation_node_id: str,
         blocked_token_ids: Sequence[str],
     ) -> tuple[CommittedAggregationOutputReceipt, ...]:
-        """Return completed transform outputs that have no expansion claim."""
+        """Return completed aggregation outputs that have no routing claim."""
         if not blocked_token_ids:
             return ()
         candidate_batch_ids: set[str] = set()
@@ -691,13 +692,29 @@ class BarrierRestoreReadModel:
                     f"Aggregation result receipt {batch_id!r} already has expansion claim {header.expansion_group_id!r} "
                     "but still has BLOCKED members"
                 )
+            try:
+                output_mode = OutputMode(str(header.output_mode))
+            except ValueError as exc:
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has unknown output mode") from exc
+            shape_parent_valid = (
+                (
+                    output_mode is OutputMode.TRANSFORM
+                    and header.output_shape in {"single", "multi"}
+                    and header.expansion_parent_token_id is not None
+                )
+                or (output_mode is OutputMode.TRANSFORM and header.output_shape == "empty" and header.expansion_parent_token_id is None)
+                or (
+                    output_mode is OutputMode.PASSTHROUGH
+                    and header.output_shape in {"empty", "multi"}
+                    and header.expansion_parent_token_id is None
+                )
+            )
             if (
                 header.aggregation_node_id != aggregation_node_id
                 or header.batch_state_id != header.aggregation_state_id
                 or header.batch_status != BatchStatus.COMPLETED.value
                 or header.node_status != NodeStateStatus.COMPLETED.value
-                or header.output_mode != "transform"
-                or header.output_shape not in {"single", "multi"}
+                or not shape_parent_valid
                 or header.output_hash != header.node_output_hash
                 or type(header.output_hash) is not str
             ):
@@ -725,36 +742,43 @@ class BarrierRestoreReadModel:
                 tuple(int(row.ordinal) for row in disposition_rows) != tuple(range(len(member_ids)))
                 or tuple(str(row.token_id) for row in disposition_rows) != member_ids
             ):
-                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent ordered member dispositions")
-            dispositions: list[AggregationParentDisposition] = []
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent ordered member actions")
+            members: list[AggregationResultMember] = []
             for ordinal, row in enumerate(disposition_rows):
                 try:
-                    outcome = TerminalOutcome(str(row.outcome))
-                    path = TerminalPath(str(row.path))
+                    action = AggregationMemberAction(str(row.action))
                 except ValueError as exc:
-                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has unknown member disposition") from exc
-                consumed = outcome is TerminalOutcome.TRANSIENT and path is TerminalPath.BATCH_CONSUMED and row.error_hash is None
-                quarantined = (
-                    outcome is TerminalOutcome.FAILURE
-                    and path is TerminalPath.QUARANTINED_AT_SOURCE
-                    and row.error_hash == sha256(f"quarantined_in_batch:{batch_id}:{ordinal}".encode()).hexdigest()[:16]
-                )
-                if not (consumed or quarantined):
-                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal member disposition")
-                dispositions.append(
-                    AggregationParentDisposition(
-                        parent_ref=TokenRef(token_id=str(row.token_id), run_id=run_id),
-                        outcome=outcome,
-                        path=path,
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has unknown member action") from exc
+                if action is AggregationMemberAction.QUARANTINE:
+                    if row.error_hash != sha256(f"quarantined_in_batch:{batch_id}:{ordinal}".encode()).hexdigest()[:16]:
+                        raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent quarantine action")
+                elif row.error_hash is not None:
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has error_hash on a non-quarantine action")
+                members.append(
+                    AggregationResultMember(
+                        member_ref=TokenRef(token_id=str(row.token_id), run_id=run_id),
+                        action=action,
                         error_hash=row.error_hash,
                     )
                 )
-            first_consumed = next(
-                (item.parent_ref.token_id for item in dispositions if item.path is TerminalPath.BATCH_CONSUMED),
-                None,
-            )
-            if header.expansion_parent_token_id != first_consumed:
-                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has a divergent expansion parent")
+            actions = tuple(member.action for member in members)
+            if output_mode is OutputMode.TRANSFORM and header.output_shape != "empty":
+                if any(action not in {AggregationMemberAction.CONSUME_BATCH, AggregationMemberAction.QUARANTINE} for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal transform member actions")
+                first_consumed = next(
+                    (member.member_ref.token_id for member in members if member.action is AggregationMemberAction.CONSUME_BATCH),
+                    None,
+                )
+                if first_consumed is None or header.expansion_parent_token_id != first_consumed:
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has a divergent expansion parent")
+            elif output_mode is OutputMode.TRANSFORM:
+                if any(action not in {AggregationMemberAction.DROP_FILTERED, AggregationMemberAction.QUARANTINE} for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal empty transform member actions")
+            elif header.output_shape == "multi":
+                if any(action is not AggregationMemberAction.CONTINUE_PASSTHROUGH for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal passthrough member actions")
+            elif any(action is not AggregationMemberAction.DROP_FILTERED for action in actions):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal empty passthrough member actions")
             terminal_member_ids: list[str] = []
             for i in range(0, len(member_ids), _TOKEN_ID_CHUNK_SIZE):
                 chunk = member_ids[i : i + _TOKEN_ID_CHUNK_SIZE]
@@ -782,9 +806,11 @@ class BarrierRestoreReadModel:
             )
             output_refs = tuple(str(row.token_data_ref) for row in output_rows)
             if (
-                not output_refs
-                or tuple(int(row.ordinal) for row in output_rows) != tuple(range(len(output_rows)))
+                tuple(int(row.ordinal) for row in output_rows) != tuple(range(len(output_rows)))
+                or (header.output_shape == "empty" and len(output_refs) != 0)
                 or (header.output_shape == "single" and len(output_refs) != 1)
+                or (header.output_shape == "multi" and len(output_refs) == 0)
+                or (output_mode is OutputMode.PASSTHROUGH and header.output_shape == "multi" and len(output_refs) != len(member_ids))
                 or any(len(ref) != 64 or any(character not in "0123456789abcdef" for character in ref) for ref in output_refs)
             ):
                 raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has invalid ordered output references")
@@ -793,12 +819,15 @@ class BarrierRestoreReadModel:
                     batch_id=batch_id,
                     aggregation_node_id=aggregation_node_id,
                     aggregation_state_id=str(header.aggregation_state_id),
+                    output_mode=output_mode.value,
                     output_shape=str(header.output_shape),
                     output_hash=str(header.output_hash),
                     output_refs=output_refs,
                     member_token_ids=member_ids,
-                    member_dispositions=tuple(dispositions),
-                    expansion_parent_token_id=str(header.expansion_parent_token_id),
+                    members=tuple(members),
+                    expansion_parent_token_id=(
+                        str(header.expansion_parent_token_id) if header.expansion_parent_token_id is not None else None
+                    ),
                 )
             )
             claimed_member_ids.update(member_ids)

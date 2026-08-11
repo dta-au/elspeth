@@ -76,9 +76,10 @@ transaction-owned sidecar-journal outbox. Epoch 30 adds
 blocked work item to its declared row_union barrier.
 Epoch 31 constrains `token_work_items.status` to the six public scheduler
 states, preventing removed states such as `waiting` from being persisted.
-Epoch 32 adds normalized aggregation result receipts so a committed
-non-empty transform-mode batch can resume expansion after process death without plugin
-replay.
+Epoch 32 adds normalized aggregation result receipts so any committed successful
+batch can resume after process death without plugin replay: transform outputs
+resume expansion, passthrough outputs retain their input token identities, and
+empty outputs finish their member outcomes at the atomic scheduler barrier.
 
 Archive and recreate the session database, its sidecars, and every stale
 Landscape database under the service-stop procedure below. Every predecessor

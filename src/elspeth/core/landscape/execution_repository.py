@@ -26,7 +26,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import (
-    AggregationParentDisposition,
+    AggregationMemberAction,
+    AggregationResultMember,
     AggregationResultReceipt,
     Artifact,
     ArtifactPublicationEvidenceKind,
@@ -45,12 +46,12 @@ from elspeth.contracts import (
     NodeStateStatus,
     Operation,
     OperationType,
+    OutputMode,
     RoutingEvent,
     RoutingMode,
     RoutingReason,
     RoutingSpec,
     RowUnionFailureReason,
-    TerminalOutcome,
     TerminalPath,
     TriggerType,
 )
@@ -625,47 +626,73 @@ class ExecutionRepository:
         aggregation_node_id: str,
         state_id: str,
         trigger_type: TriggerType,
+        output_mode: OutputMode,
         output_rows: Sequence[PipelineRow],
         output_shape: str,
         output_hash: str,
-        member_dispositions: Sequence[AggregationParentDisposition],
-        expansion_parent_token_id: str,
+        members: Sequence[AggregationResultMember],
+        expansion_parent_token_id: str | None,
         duration_ms: float,
         success_reason: TransformSuccessReason | None,
         context_after: NodeStateContext,
     ) -> AggregationResultReceipt:
         """Atomically complete node, batch, and durable aggregation output."""
-        if self._payload_store is None:
-            raise AuditIntegrityError("successful transform-mode aggregation requires a payload store")
+        if type(output_mode) is not OutputMode:
+            raise AuditIntegrityError("aggregation result receipt requires a nominal OutputMode")
         rows = tuple(output_rows)
-        dispositions = tuple(member_dispositions)
-        if output_shape not in {"single", "multi"} or not rows:
-            raise AuditIntegrityError("aggregation result receipt requires a non-empty single or multi output")
-        if output_shape == "single" and len(rows) != 1:
-            raise AuditIntegrityError("single aggregation result receipt requires exactly one output row")
-        if not dispositions:
-            raise AuditIntegrityError("aggregation result receipt requires ordered member dispositions")
-        if any(item.parent_ref.run_id != run_id for item in dispositions):
-            raise AuditIntegrityError("aggregation result receipt dispositions cross run identity")
-        disposition_token_ids = tuple(item.parent_ref.token_id for item in dispositions)
-        if len(set(disposition_token_ids)) != len(disposition_token_ids):
-            raise AuditIntegrityError("aggregation result receipt contains duplicate member dispositions")
-        for ordinal, item in enumerate(dispositions):
-            consumed = item.outcome is TerminalOutcome.TRANSIENT and item.path is TerminalPath.BATCH_CONSUMED and item.error_hash is None
+        receipt_members = tuple(members)
+        if not receipt_members:
+            raise AuditIntegrityError("aggregation result receipt requires ordered members")
+        if any(item.member_ref.run_id != run_id for item in receipt_members):
+            raise AuditIntegrityError("aggregation result receipt members cross run identity")
+        member_token_ids = tuple(item.member_ref.token_id for item in receipt_members)
+        if len(set(member_token_ids)) != len(member_token_ids):
+            raise AuditIntegrityError("aggregation result receipt contains duplicate members")
+        for ordinal, item in enumerate(receipt_members):
             expected_error_hash = sha256(f"quarantined_in_batch:{batch_id}:{ordinal}".encode()).hexdigest()[:16]
-            quarantined = (
-                item.outcome is TerminalOutcome.FAILURE
-                and item.path is TerminalPath.QUARANTINED_AT_SOURCE
-                and item.error_hash == expected_error_hash
-            )
-            if not (consumed or quarantined):
-                raise AuditIntegrityError("aggregation result receipt contains an illegal or divergent member disposition")
-        first_consumed_token_id = next(
-            (item.parent_ref.token_id for item in dispositions if item.path is TerminalPath.BATCH_CONSUMED),
-            None,
-        )
-        if expansion_parent_token_id != first_consumed_token_id:
-            raise AuditIntegrityError("aggregation result receipt expansion parent is not its first consumed batch member")
+            if item.action is AggregationMemberAction.QUARANTINE:
+                if item.error_hash != expected_error_hash:
+                    raise AuditIntegrityError("aggregation result receipt contains a divergent quarantine action")
+            elif item.error_hash is not None:
+                raise AuditIntegrityError("non-quarantine aggregation result member action forbids error_hash")
+
+        if output_mode is OutputMode.TRANSFORM:
+            if rows:
+                if output_shape not in {"single", "multi"}:
+                    raise AuditIntegrityError("non-empty transform aggregation result requires single or multi shape")
+                if output_shape == "single" and len(rows) != 1:
+                    raise AuditIntegrityError("single aggregation result receipt requires exactly one output row")
+                if any(
+                    item.action not in {AggregationMemberAction.CONSUME_BATCH, AggregationMemberAction.QUARANTINE}
+                    for item in receipt_members
+                ):
+                    raise AuditIntegrityError("non-empty transform aggregation result has an illegal member action")
+                first_consumed_token_id = next(
+                    (item.member_ref.token_id for item in receipt_members if item.action is AggregationMemberAction.CONSUME_BATCH),
+                    None,
+                )
+                if expansion_parent_token_id != first_consumed_token_id or first_consumed_token_id is None:
+                    raise AuditIntegrityError("aggregation result expansion parent is not its first consumed batch member")
+            else:
+                if output_shape != "empty" or expansion_parent_token_id is not None:
+                    raise AuditIntegrityError("empty transform aggregation result requires empty shape and no expansion parent")
+                if any(
+                    item.action not in {AggregationMemberAction.DROP_FILTERED, AggregationMemberAction.QUARANTINE}
+                    for item in receipt_members
+                ):
+                    raise AuditIntegrityError("empty transform aggregation result has an illegal member action")
+        elif rows:
+            if output_shape != "multi" or len(rows) != len(receipt_members) or expansion_parent_token_id is not None:
+                raise AuditIntegrityError(
+                    "non-empty passthrough aggregation result requires multi shape, one output per member, and no expansion parent"
+                )
+            if any(item.action is not AggregationMemberAction.CONTINUE_PASSTHROUGH for item in receipt_members):
+                raise AuditIntegrityError("non-empty passthrough aggregation result has an illegal member action")
+        else:
+            if output_shape != "empty" or expansion_parent_token_id is not None:
+                raise AuditIntegrityError("empty passthrough aggregation result requires empty shape and no expansion parent")
+            if any(item.action is not AggregationMemberAction.DROP_FILTERED for item in receipt_members):
+                raise AuditIntegrityError("empty passthrough aggregation result has an illegal member action")
 
         output_data: Mapping[str, object] | list[Mapping[str, object]]
         if output_shape == "single":
@@ -675,17 +702,18 @@ class ExecutionRepository:
         if stable_hash(output_data) != output_hash:
             raise AuditIntegrityError("aggregation result receipt output hash disagrees with output rows")
 
+        if rows and self._payload_store is None:
+            raise AuditIntegrityError("aggregation result rows require a payload store")
         payload_bytes = tuple(
             checkpoint_dumps({"data": row.to_dict(), "contract": row.contract.to_checkpoint_format()}).encode("utf-8") for row in rows
         )
         expected_refs = tuple(sha256(payload).hexdigest() for payload in payload_bytes)
-        stored_refs = tuple(self._payload_store.store(payload) for payload in payload_bytes)
+        stored_refs = tuple(self._payload_store.store(payload) for payload in payload_bytes) if self._payload_store is not None else ()
         if stored_refs != expected_refs:
             raise AuditIntegrityError("aggregation result payload store violated its SHA-256 content-address contract")
 
         expected_member_rows = tuple(
-            (ordinal, item.parent_ref.token_id, item.outcome.value, item.path.value, item.error_hash)
-            for ordinal, item in enumerate(dispositions)
+            (ordinal, item.member_ref.token_id, item.action.value, item.error_hash) for ordinal, item in enumerate(receipt_members)
         )
         expected_success_reason_json = canonical_json(success_reason) if success_reason is not None else None
         expected_context_after_json = canonical_json(context_after.to_dict())
@@ -697,7 +725,7 @@ class ExecutionRepository:
             exact_header = (
                 header.run_id == run_id
                 and header.aggregation_state_id == state_id
-                and header.output_mode == "transform"
+                and header.output_mode == output_mode.value
                 and header.output_shape == output_shape
                 and header.output_hash == output_hash
                 and header.expansion_parent_token_id == expansion_parent_token_id
@@ -722,7 +750,7 @@ class ExecutionRepository:
                 )
             )
             member_rows = tuple(
-                (int(row.ordinal), str(row.token_id), str(row.outcome), str(row.path), row.error_hash)
+                (int(row.ordinal), str(row.token_id), str(row.action), row.error_hash)
                 for row in conn.execute(
                     select(aggregation_result_members_table)
                     .where(aggregation_result_members_table.c.batch_id == batch_id)
@@ -739,10 +767,11 @@ class ExecutionRepository:
             batch_id=batch_id,
             run_id=run_id,
             aggregation_state_id=state_id,
+            output_mode=output_mode.value,
             output_shape=output_shape,
             output_hash=output_hash,
             output_refs=expected_refs,
-            member_dispositions=dispositions,
+            members=receipt_members,
             expansion_parent_token_id=expansion_parent_token_id,
         )
         write_body_completed = False
@@ -750,13 +779,11 @@ class ExecutionRepository:
             with self._db.write_connection() as conn:
                 token_rows = conn.execute(
                     select(tokens_table.c.token_id, tokens_table.c.run_id)
-                    .where(tokens_table.c.token_id.in_(disposition_token_ids))
+                    .where(tokens_table.c.token_id.in_(member_token_ids))
                     .order_by(tokens_table.c.token_id)
                     .with_for_update(of=tokens_table)
                 ).all()
-                if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {
-                    (token_id, run_id) for token_id in disposition_token_ids
-                }:
+                if {(str(row.token_id), str(row.run_id)) for row in token_rows} != {(token_id, run_id) for token_id in member_token_ids}:
                     raise AuditIntegrityError("aggregation result receipt references a missing or foreign member token")
                 state = conn.execute(
                     select(
@@ -797,8 +824,8 @@ class ExecutionRepository:
                         .order_by(batch_members_table.c.ordinal)
                     )
                 )
-                if member_ids != disposition_token_ids:
-                    raise AuditIntegrityError("aggregation result receipt dispositions do not match exact ordered batch membership")
+                if member_ids != member_token_ids:
+                    raise AuditIntegrityError("aggregation result receipt members do not match exact ordered batch membership")
                 if not existing_receipt_is_exact(conn, state=state, batch=batch):
                     if (
                         state.status != NodeStateStatus.OPEN.value
@@ -810,17 +837,17 @@ class ExecutionRepository:
                     live_rows = conn.execute(
                         select(token_outcomes_table.c.token_id)
                         .where(token_outcomes_table.c.run_id == run_id)
-                        .where(token_outcomes_table.c.token_id.in_(disposition_token_ids))
+                        .where(token_outcomes_table.c.token_id.in_(member_token_ids))
                         .where(token_outcomes_table.c.completed == 0)
                         .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
                         .where(token_outcomes_table.c.batch_id == batch_id)
                     ).all()
-                    if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(disposition_token_ids)):
+                    if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(member_token_ids)):
                         raise AuditIntegrityError("aggregation result receipt requires one live BUFFERED outcome for every member")
                     terminal_rows = conn.execute(
                         select(token_outcomes_table.c.token_id)
                         .where(token_outcomes_table.c.run_id == run_id)
-                        .where(token_outcomes_table.c.token_id.in_(disposition_token_ids))
+                        .where(token_outcomes_table.c.token_id.in_(member_token_ids))
                         .where(token_outcomes_table.c.completed == 1)
                     ).all()
                     if terminal_rows:
@@ -851,7 +878,7 @@ class ExecutionRepository:
                             batch_id=batch_id,
                             run_id=run_id,
                             aggregation_state_id=state_id,
-                            output_mode="transform",
+                            output_mode=output_mode.value,
                             output_shape=output_shape,
                             output_hash=output_hash,
                             expansion_parent_token_id=expansion_parent_token_id,
@@ -874,16 +901,15 @@ class ExecutionRepository:
                         ).scalar_one()
                         if inserted_ordinal != ordinal:
                             raise AuditIntegrityError("aggregation result output INSERT returned the wrong ordinal")
-                    for ordinal, item in enumerate(dispositions):
+                    for ordinal, item in enumerate(receipt_members):
                         inserted_ordinal = conn.execute(
                             aggregation_result_members_table.insert()
                             .values(
                                 batch_id=batch_id,
                                 run_id=run_id,
                                 ordinal=ordinal,
-                                token_id=item.parent_ref.token_id,
-                                outcome=item.outcome.value,
-                                path=item.path.value,
+                                token_id=item.member_ref.token_id,
+                                action=item.action.value,
                                 error_hash=item.error_hash,
                             )
                             .returning(aggregation_result_members_table.c.ordinal)

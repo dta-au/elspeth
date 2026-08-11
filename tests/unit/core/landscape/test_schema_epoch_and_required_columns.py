@@ -70,8 +70,9 @@ def test_epoch_32_requires_normalized_aggregation_result_receipts() -> None:
         ("token_id", "run_id"),
     ) in required_foreign_keys
     assert ("aggregation_results", "ck_aggregation_results_output_hash_hex") in required_checks
+    assert ("aggregation_results", "ck_aggregation_results_mode_shape_parent") in required_checks
     assert ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex") in required_checks
-    assert ("aggregation_result_members", "ck_aggregation_result_members_disposition") in required_checks
+    assert ("aggregation_result_members", "ck_aggregation_result_members_action") in required_checks
     assert ("aggregation_results", "ix_aggregation_results_run") in required_indexes
 
 

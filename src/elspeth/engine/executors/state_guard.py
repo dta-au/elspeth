@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from elspeth.contracts import ExecutionError, NodeStateOpen
 from elspeth.contracts.audit_evidence import AuditEvidenceBase
-from elspeth.contracts.enums import NodeStateStatus, TriggerType
+from elspeth.contracts.enums import NodeStateStatus, OutputMode, TriggerType
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
@@ -38,7 +38,7 @@ from elspeth.core.landscape.execution_repository import ExecutionRepository
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from elspeth.contracts import AggregationParentDisposition, PipelineRow
+    from elspeth.contracts import AggregationResultMember, PipelineRow
     from elspeth.contracts.errors import CoalesceFailureReason, TransformErrorReason, TransformSuccessReason
     from elspeth.contracts.node_state_context import NodeStateContext
 
@@ -397,11 +397,12 @@ class NodeStateGuard:
         run_id: str,
         aggregation_node_id: str,
         trigger_type: TriggerType,
+        output_mode: OutputMode,
         output_rows: Sequence[PipelineRow],
         output_shape: str,
         output_hash: str,
-        member_dispositions: Sequence[AggregationParentDisposition],
-        expansion_parent_token_id: str,
+        members: Sequence[AggregationResultMember],
+        expansion_parent_token_id: str | None,
         duration_ms: float,
         success_reason: TransformSuccessReason | None,
         context_after: NodeStateContext,
@@ -414,10 +415,11 @@ class NodeStateGuard:
                 aggregation_node_id=aggregation_node_id,
                 state_id=self.state_id,
                 trigger_type=trigger_type,
+                output_mode=output_mode,
                 output_rows=output_rows,
                 output_shape=output_shape,
                 output_hash=output_hash,
-                member_dispositions=member_dispositions,
+                members=members,
                 expansion_parent_token_id=expansion_parent_token_id,
                 duration_ms=duration_ms,
                 success_reason=success_reason,
