@@ -25,6 +25,8 @@ domain fields as if they were required.
 
 from __future__ import annotations
 
+import hashlib
+import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -33,6 +35,7 @@ from typing import Any, Final, NotRequired, Required, TypedDict
 
 from rfc8785 import CanonicalizationError
 
+from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -96,12 +99,25 @@ class _DiscoveryDigestBudget(TypedDict):
     omitted_public_text_count: int
 
 
+class _ProhibitedPluginDigestEntry(TypedDict):
+    name: str
+    reason: str
+    explanation: str
+
+
+class _ProhibitedPluginDigest(TypedDict):
+    sources: list[_ProhibitedPluginDigestEntry]
+    transforms: list[_ProhibitedPluginDigestEntry]
+    sinks: list[_ProhibitedPluginDigestEntry]
+
+
 class _DiscoveryDigest(TypedDict):
     """Closed plugin-kind inventory rendered from one catalog snapshot."""
 
     sources: list[_PluginDigestEntry]
     transforms: list[_PluginDigestEntry]
     sinks: list[_PluginDigestEntry]
+    prohibited: _ProhibitedPluginDigest
     budget: _DiscoveryDigestBudget
 
 
@@ -930,21 +946,40 @@ _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
 _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
 _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
+_PROHIBITED_REASON: Final[str] = "plugin_not_allowed_on_web"
+_PROHIBITED_EXPLANATION: Final[str] = (
+    "the plugin is installed and authorized for this deployment's runtime but prohibited on the web authoring surface by security policy"
+)
 
 
 def _assert_projection_input_bounds(value: object) -> None:
     """Reject recursive or oversized provider shapes before projection."""
     pending: list[tuple[object, int]] = [(value, 0)]
     visited = 0
+    scalar_bytes = 0
     while pending:
         item, depth = pending.pop()
         visited += 1
         if depth > _PLANNER_CONTRACT_MAX_DEPTH or visited > _PLANNER_CONTRACT_MAX_NODES:
             raise _SchemaContractProjectionUnsupported
         if isinstance(item, dict):
+            if any(type(key) is not str for key in item):
+                raise _SchemaContractProjectionUnsupported
+            scalar_bytes += sum(len(key.encode("utf-8")) for key in item)
             pending.extend((child, depth + 1) for child in item.values())
-        elif isinstance(item, list):
+        elif isinstance(item, list | tuple):
             pending.extend((child, depth + 1) for child in item)
+        elif isinstance(item, str):
+            scalar_bytes += len(item.encode("utf-8"))
+        elif item is None or isinstance(item, bool | int):
+            continue
+        elif isinstance(item, float):
+            if not math.isfinite(item):
+                raise _SchemaContractProjectionUnsupported
+        else:
+            raise _SchemaContractProjectionUnsupported
+        if scalar_bytes > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+            raise _SchemaContractProjectionUnsupported
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,12 +992,15 @@ class PlannerPluginContract:
     knob_schema: Mapping[str, object]
     composer_hints: tuple[str, ...]
 
+    def __post_init__(self) -> None:
+        freeze_fields(self, "json_schema", "knob_schema", "composer_hints")
+
     def to_dict(self) -> dict[str, object]:
         return {
             "plugin_id": self.plugin_id,
             "schema_hash": self.schema_hash,
-            "json_schema": deepcopy(self.json_schema),
-            "knob_schema": deepcopy(self.knob_schema),
+            "json_schema": deep_thaw(self.json_schema),
+            "knob_schema": deep_thaw(self.knob_schema),
             "composer_hints": list(self.composer_hints),
         }
 
@@ -973,6 +1011,7 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
         raise TypeError("schema must be an admitted PluginSchemaInfo")
     _assert_projection_input_bounds(schema.json_schema)
     _assert_projection_input_bounds(schema.knob_schema)
+    _assert_projection_input_bounds(schema.composer_hints)
     json_schema = _contract_json_schema(schema.json_schema)
     knob_schema = _contract_knob_schema(schema.knob_schema)
     if isinstance(json_schema, bool):
@@ -985,7 +1024,7 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     }
     try:
         projected_size = len(canonical_json(projected).encode("utf-8"))
-    except CanonicalizationError as exc:
+    except (CanonicalizationError, TypeError, ValueError) as exc:
         raise _SchemaContractProjectionUnsupported from exc
     if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
         raise _SchemaContractProjectionUnsupported
@@ -993,8 +1032,8 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
     return PlannerPluginContract(
         plugin_id=f"{schema.plugin_type}/{schema.name}",
         schema_hash=stable_hash(contract_shape),
-        json_schema=json_schema,
-        knob_schema=knob_schema,
+        json_schema=deep_freeze(json_schema),
+        knob_schema=deep_freeze(knob_schema),
         composer_hints=tuple(schema.composer_hints),
     )
 
@@ -1373,7 +1412,10 @@ def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str
         value = entry.pop("not_for", None)
     if value is None:
         return False
-    omission: _OmittedPublicText = {"sha256": stable_hash(value), "details_via": details_via}
+    omission: _OmittedPublicText = {
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "details_via": details_via,
+    }
     if field == "purpose":
         entry["purpose_omitted"] = omission
     else:
@@ -1406,6 +1448,20 @@ def discovery_digest(
         "sources": _digest_entries(summaries["source"]),
         "transforms": _digest_entries(summaries["transform"]),
         "sinks": _digest_entries(summaries["sink"]),
+        "prohibited": {
+            "sources": [
+                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
+                for plugin in catalog.list_prohibited_sources()
+            ],
+            "transforms": [
+                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
+                for plugin in catalog.list_prohibited_transforms()
+            ],
+            "sinks": [
+                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
+                for plugin in catalog.list_prohibited_sinks()
+            ],
+        },
         "budget": {
             "max_canonical_bytes": _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES,
             "canonical_bytes_used": 0,
@@ -1452,8 +1508,7 @@ def discovery_digest(
                 for field in ("purpose", "not_for"):
                     if _omit_digest_text(entry, field, details_via=details_via):
                         digest["budget"]["omitted_public_text_count"] += 1
-                        if _digest_size(digest) <= _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
-                            return digest
+        _digest_size(digest)
     if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
         raise RuntimeError("discovery_digest_budget_invariant")
     return digest

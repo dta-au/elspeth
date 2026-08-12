@@ -13,6 +13,8 @@ that direct call, kept separate from the exemplar-validation suite in
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import pytest
 
 from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -117,3 +119,69 @@ def test_planner_plugin_contract_rejects_noncanonical_admitted_scalar() -> None:
 
     with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
+
+
+@pytest.mark.parametrize(
+    "bad_default",
+    [float("nan"), float("inf"), float("-inf"), {"unordered"}, frozenset({"unordered"})],
+)
+def test_planner_plugin_contract_rejects_every_noncanonical_scalar_domain(bad_default: object) -> None:
+    admitted = PluginSchemaInfo(
+        name="noncanonical_transform",
+        plugin_type="transform",
+        description="A schema outside the canonical JSON scalar domain.",
+        json_schema={"type": "object", "default": bad_default},
+        knob_schema={"fields": []},
+    )
+
+    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+        planner_authoring_aids.planner_plugin_contract(admitted)
+
+
+@pytest.mark.parametrize(
+    ("json_schema", "composer_hints"),
+    [
+        ({"type": "object", "default": "x" * (49 * 1024)}, ()),
+        ({"type": "object"}, ("h" * (49 * 1024),)),
+    ],
+)
+def test_planner_plugin_contract_rejects_oversize_scalar_or_hint_before_contract(
+    json_schema: dict[str, object],
+    composer_hints: tuple[str, ...],
+) -> None:
+    admitted = PluginSchemaInfo(
+        name="oversize_transform",
+        plugin_type="transform",
+        description="Oversize public contract fixture.",
+        json_schema=json_schema,
+        knob_schema={"fields": []},
+        composer_hints=composer_hints,
+    )
+
+    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+        planner_authoring_aids.planner_plugin_contract(admitted)
+
+
+def test_planner_plugin_contract_is_deeply_frozen_and_thaws_only_on_export() -> None:
+    admitted = PluginSchemaInfo(
+        name="immutable_transform",
+        plugin_type="transform",
+        description="Immutable contract fixture.",
+        json_schema={"type": "object", "properties": {"enabled": {"type": "boolean"}}},
+        knob_schema={"fields": [{"name": "enabled", "kind": "boolean", "required": True}]},
+    )
+
+    contract = planner_authoring_aids.planner_plugin_contract(admitted)
+    original_hash = contract.schema_hash
+
+    assert isinstance(contract.json_schema, MappingProxyType)
+    with pytest.raises(TypeError):
+        contract.json_schema["type"] = "string"  # type: ignore[index]
+    properties = contract.json_schema["properties"]
+    assert isinstance(properties, MappingProxyType)
+    with pytest.raises(TypeError):
+        properties["enabled"] = {"type": "string"}  # type: ignore[index]
+    exported = contract.to_dict()
+    exported["json_schema"]["type"] = "string"  # type: ignore[index]
+    assert contract.schema_hash == original_hash
+    assert contract.to_dict()["json_schema"]["type"] == "object"  # type: ignore[index]

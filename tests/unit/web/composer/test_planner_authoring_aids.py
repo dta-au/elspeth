@@ -12,6 +12,7 @@ planners an invalid shape.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -1098,6 +1099,30 @@ class TestExemplarDomainDisjointness:
 
 
 class TestDiscoveryDigest:
+    def test_digest_carries_bounded_prohibited_plugin_facts_without_inventory_call(self) -> None:
+        view, _snapshot = _trained_view()
+        prohibited = PluginSummary(
+            name="named_but_prohibited",
+            description="Categorically unavailable on the web surface.",
+            plugin_type="source",
+            config_fields=[],
+        )
+        view.list_prohibited_sources = lambda: [prohibited]  # type: ignore[method-assign]
+
+        digest = discovery_digest(view)
+
+        assert digest["prohibited"]["sources"] == [
+            {
+                "name": "named_but_prohibited",
+                "reason": "plugin_not_allowed_on_web",
+                "explanation": (
+                    "the plugin is installed and authorized for this deployment's runtime but prohibited on the "
+                    "web authoring surface by security policy"
+                ),
+            }
+        ]
+        assert len(planner_authoring_aids.canonical_json(digest).encode("utf-8")) <= 24 * 1024
+
     def test_digest_covers_every_policy_visible_plugin(self) -> None:
         """DISCOVERY_CYCLE churn re-derives the catalog; the digest IS the catalog."""
         view, _snapshot = _trained_view()
@@ -1189,6 +1214,53 @@ class TestDiscoveryDigest:
                 assert "not_for" not in entry
                 assert entry["not_for_omitted"]["sha256"]
                 assert entry["not_for_omitted"]["details_via"] == f"list_{kind}s"
+
+    def test_digest_omission_hash_is_literal_utf8_sha256(self) -> None:
+        view, _snapshot = _trained_view()
+        purpose = "literal-purpose-" + ("p" * 2_000)
+        summaries = {
+            "source": [PluginSummary(name="hashed", description=purpose, plugin_type="source", config_fields=[])],
+            "transform": [],
+            "sink": [],
+        }
+
+        entry = discovery_digest(view, summaries=summaries)["sources"][0]
+
+        assert entry["purpose_omitted"]["sha256"] == hashlib.sha256(purpose.encode("utf-8")).hexdigest()
+
+    def test_digest_budgeting_uses_bounded_envelope_serializations(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        view, _snapshot = _trained_view()
+        summaries = {
+            "source": [
+                PluginSummary(
+                    name=f"bounded_{index:02d}",
+                    description=f"purpose-{index}-" + ("p" * 700),
+                    plugin_type="source",
+                    config_fields=[],
+                    usage_when_not_to_use=f"prohibition-{index}-" + ("n" * 700),
+                )
+                for index in range(40)
+            ],
+            "transform": [],
+            "sink": [],
+        }
+        original = planner_authoring_aids.canonical_json
+        calls = 0
+
+        def counted(value: object) -> str:
+            nonlocal calls
+            calls += 1
+            return original(value)
+
+        monkeypatch.setattr(planner_authoring_aids, "canonical_json", counted)
+
+        digest = discovery_digest(view, summaries=summaries)
+
+        assert len(original(digest).encode("utf-8")) <= 24 * 1024
+        assert calls <= 8
 
     def test_digest_fails_closed_when_identity_facts_alone_exceed_budget(self) -> None:
         view, _snapshot = _trained_view()

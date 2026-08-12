@@ -1567,6 +1567,39 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
 
 
 @pytest.mark.asyncio
+async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    original = planner_module.build_planner_authoring_aids
+
+    def aids_with_prohibition(catalog: PolicyCatalogView) -> dict[str, Any]:
+        aids = original(catalog)
+        aids["discovery_digest"]["plugins"]["prohibited"]["sources"] = [
+            {
+                "name": "named_but_prohibited",
+                "reason": "plugin_not_allowed_on_web",
+                "explanation": "Categorically prohibited by web security policy.",
+            }
+        ]
+        return aids
+
+    monkeypatch.setattr(planner_module, "build_planner_authoring_aids", aids_with_prohibition)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    request = completion.requests[0]
+    payload = json.loads(request["messages"][-1]["content"])
+    assert payload["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"]["sources"][0]["name"] == ("named_but_prohibited")
+    names = {tool["function"]["name"] for tool in request["tools"]}
+    assert not {"list_sources", "list_transforms", "list_sinks"} & names
+
+
+@pytest.mark.asyncio
 async def test_digest_omission_advertises_only_its_kind_inventory_until_details_close(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -1636,6 +1669,28 @@ def test_pipeline_information_semantic_dominance_is_directional() -> None:
     full = empty.with_result(("pipeline.full",), available=True)
     assert full.covers("pipeline.source")
     assert full.covers("pipeline.component:any-node")
+
+
+def test_blob_discovery_information_is_operation_specific_and_order_sensitive() -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    policy = planner_module.PlannerDiscoveryPolicy(
+        manifest=planner_module.PlannerInformationManifest(supplied=frozenset()),
+        discovery_tool_names=("list_blobs", "list_composer_blobs", "get_blob_metadata", "inspect_source"),
+        unresolved_classes=(),
+    )
+    blob_id = "00000000-0000-4000-8000-000000000001"
+    listed = policy.with_manifest(policy.manifest.with_result(("blob.index.session",), available=True))
+    assert listed.discovery_tool_names == ("list_composer_blobs", "get_blob_metadata", "inspect_source")
+    assert listed.manifest.covers("blob.index.session")
+    assert not listed.manifest.covers("blob.index.composer")
+    composer_listed = listed.with_manifest(listed.manifest.with_result(("blob.index.composer",), available=True))
+    assert composer_listed.discovery_tool_names == ("get_blob_metadata", "inspect_source")
+    metadata = composer_listed.with_manifest(composer_listed.manifest.with_result((f"blob.metadata:{blob_id}",), available=True))
+    assert metadata.manifest.covers(f"blob.metadata:{blob_id}")
+    assert not metadata.manifest.covers(f"blob.inspection:{blob_id}")
+    inspected = metadata.with_manifest(metadata.manifest.with_result((f"blob.inspection:{blob_id}",), available=True))
+    assert inspected.manifest.covers(f"blob.inspection:{blob_id}")
 
 
 def test_restricted_policy_never_advertises_unavailable_preview_or_state_round_trip() -> None:
@@ -4612,6 +4667,28 @@ def test_planner_rejects_excessive_tool_call_container_before_argument_parsing()
     )
 
     with pytest.raises(PipelinePlannerError, match="tool call") as caught:
+        _parse_response_tool_calls(response, max_tool_calls=3)
+
+    assert caught.value.code == "MALFORMED_RESPONSE"
+
+
+def test_planner_rejects_duplicate_provider_tool_call_ids() -> None:
+    response = _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(id="duplicate", function=_Function("list_sources", "{}")),
+                        _ToolCall(id="duplicate", function=_Function("list_sinks", "{}")),
+                    ],
+                )
+            )
+        ],
+        usage={"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.01},
+    )
+
+    with pytest.raises(PipelinePlannerError, match="duplicate") as caught:
         _parse_response_tool_calls(response, max_tool_calls=3)
 
     assert caught.value.code == "MALFORMED_RESPONSE"

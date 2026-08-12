@@ -130,7 +130,8 @@ def _valid_information_key(key: str) -> bool:
         "pipeline.full",
         "pipeline.source",
         "model.catalog",
-        "blob.index",
+        "blob.index.session",
+        "blob.index.composer",
         "secret.index",
         "audit.info",
         "expression.grammar",
@@ -142,6 +143,7 @@ def _valid_information_key(key: str) -> bool:
             "plugin.schema:",
             "plugin.assistance:",
             "blob.metadata:",
+            "blob.inspection:",
             "blob.content:",
             "validation.code:",
             "secret.reference:",
@@ -289,10 +291,14 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         return (f"validation.code:{code}",)
     if name == "list_models":
         return ("model.catalog",)
-    if name in {"list_blobs", "list_composer_blobs"}:
-        return ("blob.index",)
-    if name in {"get_blob_metadata", "inspect_source"}:
+    if name == "list_blobs":
+        return ("blob.index.session",)
+    if name == "list_composer_blobs":
+        return ("blob.index.composer",)
+    if name == "get_blob_metadata":
         return (f"blob.metadata:{arguments.get('blob_id')}",)
+    if name == "inspect_source":
+        return (f"blob.inspection:{arguments.get('blob_id')}",)
     if name == "get_blob_content":
         return (f"blob.content:{arguments.get('blob_id')}",)
     if name == "list_secret_refs":
@@ -1167,6 +1173,7 @@ def _parse_response_tool_calls(
     if len(raw_calls) > max_tool_calls:
         raise PipelinePlannerError("planner response exceeds the per-turn tool call limit", code="MALFORMED_RESPONSE")
     parsed: list[_ParsedToolCall] = []
+    seen_call_ids: set[str] = set()
     for raw_call in raw_calls:
         call_id = _provider_field(raw_call, "id")
         function = _provider_field(raw_call, "function")
@@ -1174,6 +1181,9 @@ def _parse_response_tool_calls(
         raw_arguments = _provider_field(function, "arguments")
         if type(call_id) is not str or not call_id or type(name) is not str or not name:
             raise PipelinePlannerError("planner tool call metadata is malformed", code="MALFORMED_RESPONSE")
+        if call_id in seen_call_ids:
+            raise PipelinePlannerError("planner response contains duplicate tool call ids", code="MALFORMED_RESPONSE")
+        seen_call_ids.add(call_id)
         arguments = _parse_json_object(raw_arguments, label=f"{name} arguments")
         parsed.append(_ParsedToolCall(call_id, name, cast(str, raw_arguments), arguments))
     terminal_calls = tuple(call for call in parsed if call.name == _TERMINAL_TOOL_NAME)
@@ -3928,11 +3938,9 @@ async def _plan_pipeline_inner(
 
         if pending:
             await asyncio.gather(*pending)
-        discovery_results = [task.result() for task in discovery_tasks]
-        result_by_call_id = {call.call_id: result for call, result in discovery_results}
+        discovery_results = iter(task.result() for task in discovery_tasks)
         for call in calls:
-            result = result_by_call_id.get(call.call_id)
-            if result is None:
+            if call in no_gain_calls:
                 messages.append(
                     {
                         "role": "tool",
@@ -3948,6 +3956,9 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
+            result_call, result = next(discovery_results)
+            if result_call is not call:
+                raise AuditIntegrityError("planner discovery result order diverged from admitted calls")
             messages.append(
                 {
                     "role": "tool",
@@ -3973,6 +3984,8 @@ async def _plan_pipeline_inner(
                 available=information_available,
             )
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
+        if next(discovery_results, None) is not None:
+            raise AuditIntegrityError("planner discovery produced an unowned result")
         discovery_policy = discovery_policy.with_manifest(information_manifest)
         tools = planner_tool_definitions(discovery_policy)
         trail.log_attempt(
