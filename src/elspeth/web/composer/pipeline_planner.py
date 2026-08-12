@@ -79,6 +79,7 @@ from elspeth.web.composer.pipeline_custody import (
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, ProposalBase, reviewed_anchor_hash
 from elspeth.web.composer.planner_authoring_aids import (
+    PlannerPluginContract,
     SchemaContractProjectionUnsupported,
     build_planner_authoring_aids,
     discovery_digest_detail_tools,
@@ -290,7 +291,7 @@ class PlannerDiscoveryPolicy:
 
 def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
     if name == "get_pipeline_state":
-        component = arguments.get("component")
+        component = arguments["component"] if "component" in arguments else None
         normalized = component.strip().lower() if type(component) is str else ""
         if normalized in _FULL_STATE_ALIASES or component is None or normalized == "set_pipeline_arguments":
             return ("pipeline.full",)
@@ -302,12 +303,18 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
     if name == "list_recipes":
         return (_RECIPE_INDEX_INFORMATION,)
     if name == "get_plugin_schema":
-        return (f"plugin.schema:{arguments.get('plugin_type')}/{arguments.get('name')}",)
+        plugin_type = arguments["plugin_type"] if "plugin_type" in arguments else None
+        plugin_name = arguments["name"] if "name" in arguments else None
+        return (f"plugin.schema:{plugin_type}/{plugin_name}",)
     if name == "get_plugin_assistance":
-        issue = arguments.get("issue_code") or "general"
-        return (f"plugin.assistance:{arguments.get('plugin_type')}/{arguments.get('plugin_name')}:{issue}",)
+        issue = arguments["issue_code"] if "issue_code" in arguments else None
+        plugin_type = arguments["plugin_type"] if "plugin_type" in arguments else None
+        plugin_name = arguments["plugin_name"] if "plugin_name" in arguments else None
+        return (f"plugin.assistance:{plugin_type}/{plugin_name}:{issue or 'general'}",)
     if name == "explain_validation_error":
-        code = arguments.get("error_code") or arguments.get("error_text") or "unknown"
+        error_code = arguments["error_code"] if "error_code" in arguments else None
+        error_text = arguments["error_text"] if "error_text" in arguments else None
+        code = error_code or error_text or "unknown"
         return (f"validation.code:{code}",)
     if name == "list_models":
         return ("model.catalog",)
@@ -316,15 +323,19 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
     if name == "list_composer_blobs":
         return ("blob.index.composer",)
     if name == "get_blob_metadata":
-        return (f"blob.metadata:{arguments.get('blob_id')}",)
+        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        return (f"blob.metadata:{blob_id}",)
     if name == "inspect_source":
-        return (f"blob.inspection:{arguments.get('blob_id')}",)
+        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        return (f"blob.inspection:{blob_id}",)
     if name == "get_blob_content":
-        return (f"blob.content:{arguments.get('blob_id')}",)
+        blob_id = arguments["blob_id"] if "blob_id" in arguments else None
+        return (f"blob.content:{blob_id}",)
     if name == "list_secret_refs":
         return ("secret.index",)
     if name == "validate_secret_ref":
-        return (f"secret.reference:{arguments.get('name')}",)
+        secret_name = arguments["name"] if "name" in arguments else None
+        return (f"secret.reference:{secret_name}",)
     if name == "get_audit_info":
         return ("audit.info",)
     if name == "get_expression_grammar":
@@ -958,9 +969,8 @@ _PLANNER_DECLARED_TOOL_NAMES: Final[frozenset[str]] = frozenset({*PLANNER_DISCOV
 
 
 def _planner_information_class(key: str) -> ComposerPlannerInformationClass:
-    exact = _PLANNER_INFORMATION_EXACT.get(key)
-    if exact is not None:
-        return exact
+    if key in _PLANNER_INFORMATION_EXACT:
+        return _PLANNER_INFORMATION_EXACT[key]
     for prefix, information_class in _PLANNER_INFORMATION_PREFIXES:
         if key.startswith(prefix):
             return information_class
@@ -1016,7 +1026,7 @@ def _candidate_shape_hash(candidate: Mapping[str, Any]) -> str:
     node_types: list[str] = []
     if type(raw_nodes) is list:
         for raw_node in raw_nodes:
-            node_type = raw_node.get("node_type") if type(raw_node) is dict else None
+            node_type = raw_node["node_type"] if type(raw_node) is dict and "node_type" in raw_node else None
             node_types.append(node_type if type(node_type) is str and node_type in COMPOSER_NODE_TYPES else "unknown")
     return stable_hash(
         {
@@ -2419,6 +2429,45 @@ def _canonical_schema_feedback() -> dict[str, Any]:
     }
 
 
+type _TerminalMaterializationOutcome = tuple[dict[str, Any] | None, _FinalizerOwnedRefs, Mapping[str, Any] | None, bool]
+
+
+def _materialize_terminal_payload(
+    *,
+    payload: Mapping[str, Any],
+    terminal_contract: PlannerTerminalContract,
+    seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]],
+) -> _TerminalMaterializationOutcome:
+    """Expand an admitted provider payload into a canonical owned pipeline."""
+    owned_refs = _FINALIZER_OWNS_NOTHING
+    try:
+        materialized = terminal_contract.materialize(payload)
+        if type(materialized) is PlannerTerminalMaterialization:
+            pipeline_result = deep_thaw(materialized.pipeline)
+            owned_refs = _FinalizerOwnedRefs(
+                config=materialized.config_owned_refs,
+                routing=materialized.routing_owned_refs,
+            )
+        else:
+            pipeline_result = materialized
+        if type(pipeline_result) is not dict:
+            raise AuditIntegrityError("planner terminal materializer must return an exact dict")
+        SetPipelineArgumentsModel.model_validate(pipeline_result)
+    except GuidedCandidateBindingRejected as exc:
+        binding_fingerprint = (("pipeline", exc.error_code),)
+        repeated = binding_fingerprint in seen_rejection_fingerprints
+        seen_rejection_fingerprints.add(binding_fingerprint)
+        return (
+            None,
+            owned_refs,
+            _binding_rejection_feedback(exc, repeated_fingerprint=repeated),
+            repeated,
+        )
+    except PydanticValidationError:
+        return None, owned_refs, _canonical_schema_feedback(), False
+    return pipeline_result, owned_refs, None, False
+
+
 def _allowlisted_argument_feedback(error: ToolArgumentError) -> Mapping[str, Any]:
     """Project a semantic argument failure without its message or input."""
     return {
@@ -2508,6 +2557,17 @@ def _serialize_closed_provider_discovery_payload(payload: Mapping[str, Any]) -> 
     return json.dumps(payload, default=pydantic_default)
 
 
+def _project_planner_plugin_contract(data: object) -> tuple[PlannerPluginContract | None, bool]:
+    """Parse unowned schema data into one owned planner contract outcome."""
+    if type(data) is not PluginSchemaInfo:
+        return None, False
+    try:
+        contract = planner_plugin_contract(data)
+    except SchemaContractProjectionUnsupported:
+        return None, False
+    return contract, True
+
+
 @observation_boundary(
     tier=3,
     source="ToolResult.data from executing a model-requested discovery tool call (unpinned payload shape)",
@@ -2545,11 +2605,8 @@ def _serialize_provider_discovery_result(
     """
     restricted = surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}
     if call.name == "get_plugin_schema" and result.success:
-        try:
-            if type(result.data) is not PluginSchemaInfo:
-                raise SchemaContractProjectionUnsupported
-            contract = planner_plugin_contract(result.data)
-        except SchemaContractProjectionUnsupported:
+        contract, projection_available = _project_planner_plugin_contract(result.data)
+        if not projection_available:
             closed = _closed_provider_discovery_payload(result)
             closed["success"] = False
             closed["data"] = {
@@ -2558,6 +2615,7 @@ def _serialize_provider_discovery_result(
                 "next_tool": "get_plugin_assistance",
             }
             return _serialize_closed_provider_discovery_payload(closed)
+        assert contract is not None
         contract_payload = contract.to_dict()
         if (
             schema_contract_budget_remaining is not None
@@ -3352,7 +3410,7 @@ async def _plan_pipeline_inner(
                 arguments = deep_thaw(parsed_call.arguments)
                 if type(arguments) is not dict:
                     continue
-                candidate = arguments.get("pipeline")
+                candidate = arguments["pipeline"] if "pipeline" in arguments else None
                 if type(candidate) is dict:
                     candidate_shape_hash = _candidate_shape_hash(candidate)
                 break
@@ -3785,32 +3843,16 @@ async def _plan_pipeline_inner(
                     elif next(Draft202012Validator(terminal_contract.schema).iter_errors(payload.pipeline), None) is not None:
                         terminal_feedback = _canonical_schema_feedback()
                     else:
-                        try:
-                            materialized = terminal_contract.materialize(payload.pipeline)
-                            if type(materialized) is PlannerTerminalMaterialization:
-                                pipeline_result = deep_thaw(materialized.pipeline)
-                                materializer_owned_refs = _FinalizerOwnedRefs(
-                                    config=materialized.config_owned_refs,
-                                    routing=materialized.routing_owned_refs,
-                                )
-                            else:
-                                pipeline_result = materialized
-                            if type(pipeline_result) is not dict:
-                                raise AuditIntegrityError("planner terminal materializer must return an exact dict")
-                            SetPipelineArgumentsModel.model_validate(pipeline_result)
-                        except GuidedCandidateBindingRejected as exc:
-                            binding_fingerprint = (("pipeline", exc.error_code),)
-                            repeated_binding_fingerprint = binding_fingerprint in seen_rejection_fingerprints
-                            seen_rejection_fingerprints.add(binding_fingerprint)
-                            terminal_feedback = _binding_rejection_feedback(
-                                exc,
-                                repeated_fingerprint=repeated_binding_fingerprint,
-                            )
-                            repeated_terminal_fingerprint = repeated_binding_fingerprint
-                        except PydanticValidationError:
-                            terminal_feedback = _canonical_schema_feedback()
-                        else:
-                            pipeline = pipeline_result
+                        (
+                            pipeline,
+                            materializer_owned_refs,
+                            terminal_feedback,
+                            repeated_terminal_fingerprint,
+                        ) = _materialize_terminal_payload(
+                            payload=payload.pipeline,
+                            terminal_contract=terminal_contract,
+                            seen_rejection_fingerprints=seen_rejection_fingerprints,
+                        )
             finalized_pipeline: Mapping[str, Any] | None = None
             finalizer_owned_refs: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING
             if terminal_feedback is None:
@@ -4472,13 +4514,11 @@ async def _plan_pipeline_inner(
             information_available = result.success
             newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.covers(key))
             if call.name == "get_plugin_schema" and result.success:
-                try:
-                    if type(result.data) is not PluginSchemaInfo:
-                        raise SchemaContractProjectionUnsupported
-                    contract = planner_plugin_contract(result.data)
-                except SchemaContractProjectionUnsupported:
+                contract, projection_available = _project_planner_plugin_contract(result.data)
+                if not projection_available:
                     information_available = False
                 else:
+                    assert contract is not None
                     contract_payload = contract.to_dict()
                     candidate_contracts = [*selected_schema_contracts, contract_payload]
                     if len(canonical_json(candidate_contracts).encode("utf-8")) > 48 * 1024:

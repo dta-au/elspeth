@@ -30,6 +30,7 @@ import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import StrEnum
 from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict, cast
 
@@ -974,7 +975,7 @@ def _contract_json_schema_scalar(key: str, value: object) -> object:
         if type(value) is not bool:
             raise _SchemaContractProjectionUnsupported
     elif key in _JSON_SCHEMA_NUMERIC_SCALAR_KEYS:
-        if type(value) not in {int, float} or (isinstance(value, float) and not math.isfinite(value)):
+        if type(value) not in {int, float} or (type(value) is float and not math.isfinite(value)):
             raise _SchemaContractProjectionUnsupported
         numeric_value = cast(int | float, value)
         if key == "multipleOf" and numeric_value <= 0:
@@ -986,16 +987,16 @@ def _contract_json_schema_scalar(key: str, value: object) -> object:
         if type(value) is str:
             if value not in _JSON_SCHEMA_TYPES:
                 raise _SchemaContractProjectionUnsupported
-        elif isinstance(value, list):
+        elif type(value) is list:
             if not value or any(type(item) is not str or item not in _JSON_SCHEMA_TYPES for item in value) or len(set(value)) != len(value):
                 raise _SchemaContractProjectionUnsupported
         else:
             raise _SchemaContractProjectionUnsupported
     elif key == "enum":
-        if not isinstance(value, list) or not value:
+        if type(value) is not list or not value:
             raise _SchemaContractProjectionUnsupported
     elif key == "$vocabulary" and (
-        not isinstance(value, dict) or any(type(name) is not str or type(required) is not bool for name, required in value.items())
+        type(value) is not dict or any(type(name) is not str or type(required) is not bool for name, required in value.items())
     ):
         raise _SchemaContractProjectionUnsupported
     return deepcopy(value)
@@ -1011,18 +1012,20 @@ def _assert_projection_input_bounds(value: object) -> None:
         visited += 1
         if depth > _PLANNER_CONTRACT_MAX_DEPTH or visited > _PLANNER_CONTRACT_MAX_NODES:
             raise _SchemaContractProjectionUnsupported
-        if isinstance(item, dict):
+        if type(item) is dict:
             if any(type(key) is not str for key in item):
                 raise _SchemaContractProjectionUnsupported
             scalar_bytes += sum(len(key.encode("utf-8")) for key in item)
             pending.extend((child, depth + 1) for child in item.values())
-        elif isinstance(item, list | tuple):
+        elif type(item) is list or type(item) is tuple:
             pending.extend((child, depth + 1) for child in item)
-        elif isinstance(item, str):
+        elif type(item) is str:
             scalar_bytes += len(item.encode("utf-8"))
-        elif item is None or isinstance(item, bool | int):
+        elif issubclass(type(item), StrEnum):
+            scalar_bytes += len(cast(StrEnum, item).value.encode("utf-8"))
+        elif item is None or type(item) in {bool, int}:
             continue
-        elif isinstance(item, float):
+        elif type(item) is float:
             if not math.isfinite(item):
                 raise _SchemaContractProjectionUnsupported
         else:
@@ -1452,11 +1455,13 @@ def _digest_size(digest: _DiscoveryDigest) -> int:
 def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str) -> bool:
     """Replace one whole prose fact with a deterministic JIT disclosure."""
     if field == "purpose":
-        value = entry.pop("purpose", None)
+        if "purpose" not in entry:
+            return False
+        value = entry.pop("purpose")
     else:
-        value = entry.pop("not_for", None)
-    if value is None:
-        return False
+        if "not_for" not in entry:
+            return False
+        value = entry.pop("not_for")
     omission: _OmittedPublicText = {
         "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
         "details_via": details_via,
@@ -1531,7 +1536,10 @@ def discovery_digest(
     for entries, details_via in ordered_sections:
         for entry in entries:
             for field in ("purpose", "not_for"):
-                value = entry.get(field)
+                if field == "purpose":
+                    value = entry["purpose"] if "purpose" in entry else None
+                else:
+                    value = entry["not_for"] if "not_for" in entry else None
                 if (
                     type(value) is str
                     and len(value.encode("utf-8")) > _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES
@@ -1561,7 +1569,9 @@ def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tupl
     required: set[str] = set()
     for entries, expected_tool in section_tools:
         for entry in entries:
-            for omission in (entry.get("purpose_omitted"), entry.get("not_for_omitted")):
+            purpose_omission = entry["purpose_omitted"] if "purpose_omitted" in entry else None
+            prohibition_omission = entry["not_for_omitted"] if "not_for_omitted" in entry else None
+            for omission in (purpose_omission, prohibition_omission):
                 if omission is None:
                     continue
                 if omission["details_via"] != expected_tool:
