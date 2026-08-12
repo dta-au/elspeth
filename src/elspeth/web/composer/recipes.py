@@ -26,6 +26,9 @@ from elspeth.contracts.composer_slots import SlotType as SlotType
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
+_ALTERNATIVE_COORDINATOR_PATTERN: Final[str] = r"(?:or|alternatively|otherwise|instead)"
+_ALTERNATIVE_PREFIX_PATTERN: Final[str] = rf"(?:\s*[,;.]?\s*{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s+|\s*/\s*)"
+
 
 @dataclass(frozen=True, slots=True)
 class InlineRecipeBlob:
@@ -560,18 +563,18 @@ _FORK_NEGATED_TRUNCATE_RE = re.compile(
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_OUTPUT_RE = re.compile(
-    r"\b(?:alternatively|otherwise|or)\s+"
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\s+"
     r"(?:(?:write|save)(?:\s+it)?\s+(?:at|to)\s+)?(?P<path>[^\s,:;]+\.jsonl)\b",
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_SUFFIX_RE = re.compile(
-    r"\b(?:alternatively|otherwise|or)\s+(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\s+(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
     r"(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)",
     re.IGNORECASE,
 )
 _FORK_AMBIGUOUS_KEYS_RE = re.compile(
     r"\bkeys\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+"
-    r"(?:or|alternatively|otherwise)\s+(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
+    rf"{_ALTERNATIVE_COORDINATOR_PATTERN}\s+(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
     r"`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?",
     re.IGNORECASE,
 )
@@ -901,23 +904,22 @@ _RESPONSE_NEGATION_RE = re.compile(
     r"(?:write|produce|generate|create|return|store)\b",
     re.IGNORECASE,
 )
-_PROJECTION_NEGATION_RE = re.compile(
-    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't)\s+(?:keep|retain|project)\b",
-    re.IGNORECASE,
-)
+_PROFILE_ACTION_PATTERN: Final[str] = r"(?:use|using|select|selecting|choose|choosing)"
+_SOURCE_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|read|reading)"
+_OUTPUT_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|write|writing|save|saving)"
 _PROFILE_PREFIX_RE = re.compile(
     r"\b(?:an?\s+)?llm\s+profile\s*(?:(?:is|named)\s+|[:=]\s*)(?:the\s+)?"
     r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))",
     re.IGNORECASE,
 )
 _PROFILE_SUFFIX_RE = re.compile(
-    r"\b(?:use|select|choose)\s+(?:the\s+)?"
+    rf"\b{_PROFILE_ACTION_PATTERN}\s+(?:the\s+)?"
     r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?!(?:an?|the)\b)(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))\s+"
     r"(?:llm\s+)?profile\b",
     re.IGNORECASE,
 )
 _PROFILE_BARE_ALIAS_RE = re.compile(
-    r"\b(?:use|select|choose)\s+(?:the\s+)?"
+    rf"\b{_PROFILE_ACTION_PATTERN}\s+(?:the\s+)?"
     r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9]+-[A-Za-z0-9_-]+))(?![A-Za-z0-9_@-])",
     re.IGNORECASE,
 )
@@ -929,16 +931,16 @@ _FETCH_NEGATION_RE = re.compile(
     r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid)\s+(?:fetch|scrape)\b",
     re.IGNORECASE,
 )
-_NEGATIVE_ACTION_PATTERN: Final[str] = r"(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't)"
+_NEGATIVE_ACTION_PATTERN: Final[str] = r"(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid(?:s|ed|ing)?|without)"
 _SOURCE_AUTHORITY_RE = re.compile(
-    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?(?:use|select|choose|read)\s+"
+    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_SOURCE_ACTION_PATTERN}\s+"
     r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?source\b"
     r"(?:\s+(?:named\s+)?(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_-]*)`|"
     r"(?!(?:for|with|from|rows?|material)\b)(?P<name>[A-Za-z_][A-Za-z0-9_-]*)))?",
     re.IGNORECASE,
 )
 _OUTPUT_AUTHORITY_RE = re.compile(
-    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?(?:write|save|use|select|choose)\s+"
+    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_OUTPUT_ACTION_PATTERN}\s+"
     r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?output\b"
     r"(?:\s+(?:named\s+)?(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_-]*)`|(?P<name>(?!at\b)[A-Za-z_][A-Za-z0-9_-]*)))?"
     r"(?:\s+at\s+(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-]))?",
@@ -955,11 +957,14 @@ _OUTPUT_LEADING_AUTHORITY_RE = re.compile(
     re.IGNORECASE,
 )
 _RESPONSE_DIRECT_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:(?:or|alternatively|otherwise)\s+|/\s*)"
+    rf"^{_ALTERNATIVE_PREFIX_PATTERN}"
     r"(?:an?\s+)?(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)",
     re.IGNORECASE,
 )
-_RESPONSE_DIRECT_COORDINATOR_RE = re.compile(r"^\s*,?\s*(?:and|or|then|alternatively|otherwise)\s*$", re.IGNORECASE)
+_RESPONSE_DIRECT_COORDINATOR_RE = re.compile(
+    rf"^\s*,?\s*(?:and|then|{_ALTERNATIVE_COORDINATOR_PATTERN})\s*$",
+    re.IGNORECASE,
+)
 _PIPELINE_CLEANUP_START_RE = re.compile(
     r"^(?:then\s+|finally\s+)?(?:remove|drop|discard|exclude)\b"
     r"(?=[^.;\n]*(?:\braw\s+(?:(?:page|scraped)\s+)?(?:content|html)\b|\bfingerprint\s+(?:columns?|fields?)\b))",
@@ -973,18 +978,20 @@ _WEB_LOCATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:or|alternatively|otherwise|/)\s+(?:an?\s+|the\s+)?(?:reviewed\s+)?"
+    rf"^{_ALTERNATIVE_PREFIX_PATTERN}(?:{_SOURCE_ACTION_PATTERN}\s+)?"
+    r"(?:an?\s+|the\s+)?(?:reviewed\s+)?"
     r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?source\b",
     re.IGNORECASE,
 )
 _OUTPUT_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:or|alternatively|otherwise|/)\s+(?:(?:write|save|use|select|choose)\s+)?"
+    rf"^{_ALTERNATIVE_PREFIX_PATTERN}(?:{_OUTPUT_ACTION_PATTERN}\s+)?"
     r"(?:an?\s+|the\s+)?(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?output\b",
     re.IGNORECASE,
 )
 _RETENTION_CLAUSE_RE = re.compile(
     r"\b(?:keep|retain|project)\s+(?:only|exactly)\s+(?P<fields>.*?)"
     r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:(?:write|save|send|output)\b|(?:keep|retain|project)\s+(?:only|exactly)\b)"
+    rf"|,?\s+(?:but|while)\s+{_NEGATIVE_ACTION_PATTERN}\s+(?:keep|retain|project)\b"
     r"|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b))",
     re.IGNORECASE | re.DOTALL,
 )
@@ -1029,8 +1036,25 @@ def _match_clause_residue(user_text: str, match: re.Match[str]) -> str:
     return user_text[match.end() : clause_end]
 
 
+def _match_tail(user_text: str, match: re.Match[str]) -> str:
+    """Return text immediately following ``match``, including later clauses."""
+
+    return user_text[match.end() :]
+
+
 def _residue_starts_with_alternative(residue: str) -> bool:
-    return re.match(r"^\s*,?\s*(?:or|alternatively|otherwise)\b|^\s*/", residue, re.IGNORECASE) is not None
+    return re.match(rf"^{_ALTERNATIVE_PREFIX_PATTERN}", residue, re.IGNORECASE) is not None
+
+
+def _residue_starts_with_quoted_value_addition(residue: str) -> bool:
+    return (
+        re.match(
+            r"^(?:\s*[,;.]?\s*(?:and|as\s+well\s+as)\s+|\s*,\s*)['\"]",
+            residue,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _pipeline_cleanup_starts(user_text: str) -> tuple[int, ...]:
@@ -1071,7 +1095,8 @@ def _profile_match_is_subordinate_response_prose(user_text: str, match: re.Match
 def _residue_starts_with_profile_alternative(residue: str) -> bool:
     return (
         re.match(
-            r"^\s*(?:or|and|alternatively|otherwise|/)\s+(?:`?[A-Za-z0-9][A-Za-z0-9_-]*`?)",
+            rf"^(?:{_ALTERNATIVE_PREFIX_PATTERN}|\s*[,;.]?\s*and\s+)"
+            r"(?:`?[A-Za-z0-9][A-Za-z0-9_-]*`?)",
             residue,
             re.IGNORECASE,
         )
@@ -1097,7 +1122,14 @@ def _response_authority_matches(user_text: str, *, start: int, end: int) -> tupl
                 authorities.append(candidate)
             continue
         prefix = user_text[candidate_clause[0] : candidate.start()]
-        if re.fullmatch(r"\s*(?:(?:and|then|or|alternatively|otherwise)\s+)?", prefix, re.IGNORECASE) is not None:
+        if (
+            re.fullmatch(
+                rf"\s*(?:(?:and|then|{_ALTERNATIVE_COORDINATOR_PATTERN})\s+)?",
+                prefix,
+                re.IGNORECASE,
+            )
+            is not None
+        ):
             authorities.append(candidate)
     return tuple(authorities)
 
@@ -1474,7 +1506,7 @@ def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
         return None
     projections: list[tuple[str, ...]] = []
     for clause in clauses:
-        if _match_is_negated(user_text, clause, _PROJECTION_NEGATION_RE):
+        if _match_prefix_is_negated(user_text, clause):
             return None
         raw_fields = clause.group("fields").strip()
         if _PROJECTION_FIELD_LIST_RE.fullmatch(raw_fields) is None:
@@ -1503,7 +1535,7 @@ def _web_abuse_contact(user_text: str) -> str | None:
         return None
     for match in matches:
         residue = _match_clause_residue(user_text, match)
-        if _residue_starts_with_alternative(residue) or re.search(_EMAIL_PATTERN, residue) is not None:
+        if _residue_starts_with_alternative(_match_tail(user_text, match)) or re.search(_EMAIL_PATTERN, residue) is not None:
             return None
     contacts = tuple(match.group("after") or match.group("before") for match in matches)
     contact = contacts[0]
@@ -1521,12 +1553,8 @@ def _web_scraping_reason(user_text: str) -> str | None:
     if not matches:
         return None
     for match in matches:
-        residue = _match_clause_residue(user_text, match)
-        if (
-            _residue_starts_with_alternative(residue)
-            or re.match(r"^\s*,\s*['\"]", residue) is not None
-            or re.match(r"^\s*and\s+['\"]", residue, re.IGNORECASE) is not None
-        ):
+        residue = _match_tail(user_text, match)
+        if _residue_starts_with_alternative(residue) or _residue_starts_with_quoted_value_addition(residue):
             return None
     reasons = tuple(match.group("reason").strip() for match in matches)
     reason = reasons[0]
@@ -1542,7 +1570,8 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     aliases = dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ())
     for alias in aliases:
         negated_alias = re.compile(
-            rf"\b{_NEGATIVE_ACTION_PATTERN}\s+use\s+(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
+            rf"\b{_NEGATIVE_ACTION_PATTERN}\s+{_PROFILE_ACTION_PATTERN}\s+"
+            rf"(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
             re.IGNORECASE,
         )
         if negated_alias.search(context.user_text) is not None:
@@ -1574,10 +1603,10 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
             key=lambda match: match.start(),
         )
     )
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in authority_matches):
+    if any(_match_prefix_is_negated(context.user_text, match) for match in authority_matches):
         return None
     if authority_matches:
-        if any(_residue_starts_with_profile_alternative(_match_clause_residue(context.user_text, match)) for match in authority_matches):
+        if any(_residue_starts_with_profile_alternative(_match_tail(context.user_text, match)) for match in authority_matches):
             return None
         selected = tuple((match.group("quoted") or match.group("plain")) for match in authority_matches)
         profile = selected[0]
@@ -1622,7 +1651,7 @@ def _reviewed_web_authority_is_compatible(
             return False
         if source_authority.group("reviewed") is not None and source_format is None and source_name is None:
             return False
-        if _SOURCE_AUTHORITY_ALTERNATIVE_RE.match(_match_clause_residue(context.user_text, source_authority)) is not None:
+        if _SOURCE_AUTHORITY_ALTERNATIVE_RE.match(_match_tail(context.user_text, source_authority)) is not None:
             return False
 
     output_authorities = tuple(
@@ -1645,7 +1674,7 @@ def _reviewed_web_authority_is_compatible(
             return False
         if output_authority.group("reviewed") is not None and output_format is None and output_name is None:
             return False
-        if _OUTPUT_AUTHORITY_ALTERNATIVE_RE.match(_match_clause_residue(context.user_text, output_authority)) is not None:
+        if _OUTPUT_AUTHORITY_ALTERNATIVE_RE.match(_match_tail(context.user_text, output_authority)) is not None:
             return False
     output_path_authorities = tuple(
         authority
