@@ -13,17 +13,164 @@ slot values they were given.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, Literal, final
 from uuid import UUID
 
 from elspeth.contracts.composer_slots import SlotSpec
 from elspeth.contracts.composer_slots import SlotType as SlotType
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+
+_ALTERNATIVE_COORDINATOR_PATTERN: Final[str] = r"(?:or|alternatively|otherwise|instead)"
+_ALTERNATIVE_PREFIX_PATTERN: Final[str] = rf"(?:\s*[,;.]?\s*{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+|\s*/\s*)"
+_ADDITIVE_COORDINATOR_PATTERN: Final[str] = r"(?:and|as\s+well\s+as|plus)"
+
+
+@dataclass(frozen=True, slots=True)
+class InlineRecipeBlob:
+    """Literal request-owned bytes to settle through normal planner custody."""
+
+    filename: str
+    mime_type: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeReviewedSourceSummary:
+    """Surface-neutral public facts for one reviewed source."""
+
+    name: str
+    plugin: str
+    field_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeReviewedOutputSummary:
+    """Surface-neutral public facts for one reviewed output."""
+
+    name: str
+    plugin: str
+    required_fields: tuple[str, ...]
+
+
+@final
+class ReviewedOutputProjectionConflict(Exception):
+    """Closed conflict between an exact projection and reviewed fields."""
+
+    error_code: Literal["reviewed_output_projection_conflict"] = "reviewed_output_projection_conflict"
+
+    def __init__(self, missing_fields: tuple[str, ...]) -> None:
+        if type(missing_fields) is not tuple:
+            raise TypeError("ReviewedOutputProjectionConflict.missing_fields must be an exact tuple")
+        if not missing_fields:
+            raise ValueError("ReviewedOutputProjectionConflict.missing_fields must not be empty")
+        if any(type(field) is not str or not field for field in missing_fields):
+            raise TypeError("ReviewedOutputProjectionConflict.missing_fields must contain non-empty exact strings")
+        if len(set(missing_fields)) != len(missing_fields):
+            raise ValueError("ReviewedOutputProjectionConflict.missing_fields must be unique")
+        super().__init__("an exact retained-field projection omits reviewed output fields")
+        self.missing_fields = missing_fields
+
+
+def reviewed_output_projection_conflict(
+    *,
+    retained_fields: tuple[str, ...],
+    required_fields: tuple[str, ...],
+) -> ReviewedOutputProjectionConflict | None:
+    """Return the ordered missing-field conflict for one exact projection.
+
+    The caller owns the association between this projection and this reviewed
+    output. Compatibility is set inclusion only: projection order and
+    additional retained fields are permitted, and this helper never mutates
+    either side of the reviewed contract.
+    """
+
+    if type(retained_fields) is not tuple or type(required_fields) is not tuple:
+        raise TypeError("projection field sets must be exact tuples")
+    if any(type(field) is not str or not field for field in (*retained_fields, *required_fields)):
+        raise TypeError("projection field sets must contain non-empty exact strings")
+    retained = set(retained_fields)
+    missing = tuple(dict.fromkeys(field for field in required_fields if field not in retained))
+    if not missing:
+        return None
+    return ReviewedOutputProjectionConflict(missing)
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeSourceBinding:
+    """Exact server-owned source identity available to a recipe matcher."""
+
+    name: str
+    plugin: str
+    blob_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeOutputBinding:
+    """Exact server-owned output destination available to a matcher."""
+
+    name: str
+    plugin: str
+    path: str
+    format: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentContext:
+    """Facts a registry matcher may use without depending on a UI surface."""
+
+    user_text: str
+    reviewed_sources: tuple[RecipeReviewedSourceSummary, ...] = ()
+    reviewed_outputs: tuple[RecipeReviewedOutputSummary, ...] = ()
+    policy_snapshot: PluginAvailabilitySnapshot | None = None
+    source_bindings: tuple[RecipeSourceBinding, ...] = ()
+    output_bindings: tuple[RecipeOutputBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.user_text) is not str:
+            raise TypeError("RecipeIntentContext.user_text must be an exact str")
+        exact_sequences = (
+            (self.reviewed_sources, RecipeReviewedSourceSummary, "reviewed_sources"),
+            (self.reviewed_outputs, RecipeReviewedOutputSummary, "reviewed_outputs"),
+            (self.source_bindings, RecipeSourceBinding, "source_bindings"),
+            (self.output_bindings, RecipeOutputBinding, "output_bindings"),
+        )
+        for values, expected_type, field_name in exact_sequences:
+            if type(values) is not tuple or any(type(value) is not expected_type for value in values):
+                raise TypeError(f"RecipeIntentContext.{field_name} must be an exact tuple of {expected_type.__name__}")
+        if self.policy_snapshot is not None and type(self.policy_snapshot) is not PluginAvailabilitySnapshot:
+            raise TypeError("RecipeIntentContext.policy_snapshot must be an exact PluginAvailabilitySnapshot or None")
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentCandidate:
+    """One recipe-owned sparse slot extraction before registry arbitration."""
+
+    slots: Mapping[str, object]
+    inline_blob: InlineRecipeBlob | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "slots")
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentMatch:
+    """The unique complete executable registry match for one request."""
+
+    recipe_name: str
+    slots: Mapping[str, object]
+    inline_blob: InlineRecipeBlob | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "slots")
+
+
+type RecipeIntentMatcher = Callable[[RecipeIntentContext], RecipeIntentCandidate | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +184,7 @@ class RecipeSpec:
     """Pure function: validated slots → set_pipeline-compatible args dict."""
     required_plugins: frozenset[PluginId] = frozenset()
     alternative_plugin_groups: tuple[frozenset[PluginId], ...] = ()
+    matcher: RecipeIntentMatcher | None = None
 
     def __post_init__(self) -> None:
         # ``frozen=True`` only blocks attribute reassignment; the underlying
@@ -374,9 +522,9 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Recipe 3: fork-coalesce-truncate-jsonl
 #
-#   csv source (blob)  →  fork gate (routes:{all:fork}, fork_to:[a, b])
+#   csv source (blob)  →  fork gate (routes:{all:fork}, fork_to:[path_a, path_b])
 #                       →  passthrough (path A)        + truncate (path B)
-#                       →  coalesce (merge=nested, {key_a:a_out, key_b:b_out})
+#                       →  coalesce (merge=nested, {key_a:path_a_out, key_b:path_b_out})
 #                       →  jsonl sink (one merged output)
 #
 # Wiring discipline (gate.fork_to ↔ path.input/on_success ↔ coalesce.branches)
@@ -387,6 +535,146 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 # transformed copy"; alternative path-A transforms would be a different
 # recipe.
 # ---------------------------------------------------------------------------
+
+
+_INLINE_SOURCE_BLOB_SENTINEL: Final[str] = str(UUID(int=0))
+_FORK_DEFAULT_TRUNCATION_SUFFIX: Final[str] = "..."
+_FORK_CSV_MARKER_RE = re.compile(
+    r"(?:customer\s+rows\s*)?\(csv\):\s*\n(?P<csv>.*?)"
+    r"(?=(?:customer\s+rows\s*)?\(csv\):\s*\n|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_FORK_CSV_LABEL_RE = re.compile(r"(?:customer\s+rows\s*)?\(csv\):", re.IGNORECASE)
+_FORK_OUTPUT_PATH_RE = re.compile(r"\bat\s+(?P<path>[^\s:]+\.jsonl)\b", re.IGNORECASE)
+_JSONL_PATH_TOKEN_RE = re.compile(r"(?P<path>[^\s,:;]+\.jsonl)\b", re.IGNORECASE)
+_FORK_TRUNCATE_RE = re.compile(
+    r"\btruncates?\s+the\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+field\s+to\s+(?P<max_chars>\d+)\s+characters?",
+    re.IGNORECASE,
+)
+_FORK_SUFFIX_RE = re.compile(r"\bsuffix\s+(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)", re.IGNORECASE)
+_QUOTED_VALUE_RE = re.compile(r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)")
+_QUOTED_PROSE_RE = re.compile(r"(?<![A-Za-z0-9])(?P<quote>['\"])[^'\"]+(?P=quote)")
+_FORK_KEYS_RE = re.compile(
+    r"(?:under\s+separate\s+keys|(?:use|select|choose)\s+(?:the\s+)?keys)\s+"
+    r"`(?P<key_a>[A-Za-z_][A-Za-z0-9_]*)`\s+and\s+`(?P<key_b>[A-Za-z_][A-Za-z0-9_]*)`",
+    re.IGNORECASE,
+)
+_FORK_ALTERNATIVE_OUTPUT_RE = re.compile(
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
+    r"(?:(?:write|save)(?:\s+it)?\s+(?:at|to)\s+)?(?P<path>[^\s,:;]+\.jsonl)\b",
+    re.IGNORECASE,
+)
+_FORK_ALTERNATIVE_SUFFIX_RE = re.compile(
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
+    r"(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
+    r"(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)",
+    re.IGNORECASE,
+)
+_FORK_AMBIGUOUS_KEYS_RE = re.compile(
+    r"\bkeys\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+"
+    rf"{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
+    r"(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
+    r"`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?",
+    re.IGNORECASE,
+)
+
+
+def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
+    """Extract required fork semantics and only the optional slots stated."""
+
+    csv_matches = tuple(_FORK_CSV_MARKER_RE.finditer(context.user_text))
+    if len(csv_matches) != len(tuple(_FORK_CSV_LABEL_RE.finditer(context.user_text))) or not csv_matches:
+        return None
+    authority_text = context.user_text[: csv_matches[0].start()]
+    authority = _authority_document(authority_text)
+    lower = authority_text.lower()
+    if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
+        return None
+    for phrase in ("two ways in parallel", "single merged output row"):
+        for phrase_match in re.finditer(re.escape(phrase), authority_text, re.IGNORECASE):
+            if _match_is_negated(authority_text, phrase_match):
+                return None
+    truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(authority_text))
+    if not truncate_matches:
+        return None
+    if authority.has_negated_action(frozenset({"process", "truncate"})):
+        return None
+    if any(_match_is_negated(context.user_text, match) for match in csv_matches):
+        return None
+    if any(_match_is_negated(authority_text, match) for match in truncate_matches):
+        return None
+    truncate_values = tuple((match.group("field"), int(match.group("max_chars"))) for match in truncate_matches)
+    truncate_value = truncate_values[0]
+    if any(candidate != truncate_value for candidate in truncate_values[1:]):
+        return None
+    csv_values = tuple(match.group("csv").strip() for match in csv_matches)
+    csv_content = csv_values[0]
+    if any(candidate != csv_content for candidate in csv_values[1:]):
+        return None
+    if "\n" not in csv_content:
+        return None
+
+    slots: dict[str, object] = {
+        "truncate_field": truncate_value[0],
+        "max_chars": truncate_value[1],
+    }
+    output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match) for match in output_matches):
+        return None
+    if any(authority.has_competing_value(match, _JSONL_PATH_TOKEN_RE) for match in output_matches):
+        return None
+    output_paths = tuple(
+        path_match.group("path")
+        for output_match in output_matches
+        for path_match in _JSONL_PATH_TOKEN_RE.finditer(
+            authority_text,
+            *_clause_bounds(authority_text, output_match.start()),
+        )
+    ) + tuple(match.group("path") for match in _FORK_ALTERNATIVE_OUTPUT_RE.finditer(authority_text) if output_matches)
+    if output_paths and any(candidate != output_paths[0] for candidate in output_paths[1:]):
+        return None
+    if output_paths:
+        slots["output_path"] = output_paths[0]
+    suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match) for match in suffix_matches):
+        return None
+    if any(authority.has_competing_value(match, _QUOTED_VALUE_RE) for match in suffix_matches):
+        return None
+    suffixes = tuple(
+        quoted.group("value")
+        for suffix_match in suffix_matches
+        for quoted in _QUOTED_VALUE_RE.finditer(
+            authority_text,
+            *_clause_bounds(authority_text, suffix_match.start()),
+        )
+    ) + tuple(match.group("suffix") for match in _FORK_ALTERNATIVE_SUFFIX_RE.finditer(authority_text) if suffix_matches)
+    if suffixes and any(candidate != suffixes[0] for candidate in suffixes[1:]):
+        return None
+    if suffixes:
+        slots["truncation_suffix"] = suffixes[0]
+    effective_suffix = suffixes[0] if suffixes else _FORK_DEFAULT_TRUNCATION_SUFFIX
+    if truncate_value[1] <= len(effective_suffix):
+        return None
+    if _FORK_AMBIGUOUS_KEYS_RE.search(authority_text) is not None:
+        return None
+    keys_matches = tuple(_FORK_KEYS_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match) for match in keys_matches):
+        return None
+    keys = tuple((match.group("key_a"), match.group("key_b")) for match in keys_matches)
+    if keys and any(candidate != keys[0] for candidate in keys[1:]):
+        return None
+    if keys:
+        if keys[0][0] == keys[0][1]:
+            return None
+        slots["key_a"], slots["key_b"] = keys[0]
+    return RecipeIntentCandidate(
+        slots=slots,
+        inline_blob=InlineRecipeBlob(
+            filename="inline-fork-coalesce.csv",
+            mime_type="text/csv",
+            content=csv_content,
+        ),
+    )
 
 
 _RECIPE3_SLOTS: Final[dict[str, SlotSpec]] = {
@@ -408,7 +696,7 @@ _RECIPE3_SLOTS: Final[dict[str, SlotSpec]] = {
     "truncation_suffix": SlotSpec(
         slot_type="str",
         required=False,
-        default="...",
+        default=_FORK_DEFAULT_TRUNCATION_SUFFIX,
         description="Suffix appended when truncation occurs on path B (e.g., '...').",
     ),
     "output_path": SlotSpec(
@@ -452,8 +740,14 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
     truncate_field = slots["truncate_field"]
     max_chars = slots["max_chars"]
     suffix = slots["truncation_suffix"]
-    branch_a_output = f"{key_a}_out"
-    branch_b_output = f"{key_b}_out"
+    if key_a == key_b:
+        raise RecipeValidationError("fork/coalesce key_a and key_b must be distinct")
+    if max_chars <= len(suffix):
+        raise RecipeValidationError("fork/coalesce truncation max_chars must be greater than the truncation suffix length")
+    branch_a_input = "path_a"
+    branch_b_input = "path_b"
+    branch_a_output = "path_a_out"
+    branch_b_output = "path_b_out"
     return {
         "source": {
             "plugin": "csv",
@@ -475,17 +769,16 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
                 # while still forking every row.
                 "condition": "'all'",
                 "routes": {"all": "fork"},
-                # fork_to publishes one connection per branch. The branch names
-                # are the user-visible coalesce output keys; the branch mapping
-                # below points each key at the post-transform connection that the
-                # coalesce node consumes.
-                "fork_to": [key_a, key_b],
+                # Internal connection names are fixed and separate from the
+                # user-visible nested merge keys. This prevents a legitimate
+                # output key from colliding with source or sink connections.
+                "fork_to": [branch_a_input, branch_b_input],
             },
             {
                 "id": "path_a_passthrough",
                 "node_type": "transform",
                 "plugin": "passthrough",
-                "input": key_a,
+                "input": branch_a_input,
                 "on_success": branch_a_output,
                 "on_error": "discard",
                 "options": {
@@ -496,7 +789,7 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
                 "id": "path_b_truncate",
                 "node_type": "transform",
                 "plugin": "truncate",
-                "input": key_b,
+                "input": branch_b_input,
                 "on_success": branch_b_output,
                 "on_error": "discard",
                 "options": {
@@ -552,15 +845,15 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Recipe 4: web-scrape-llm-rate-jsonl (D11)
+# Recipe 4: web-scrape-llm-project-jsonl
 #
-#   json/csv URL-row source (blob)  →  web_scrape (fetch page content)
-#                                    →  llm (rate the page)
+#   json/csv locator-row source     →  web_scrape (fetch page content)
+#                                    →  llm (project a named response)
 #                                    →  field_mapper(select_only) cleanup
 #                                    →  jsonl sink (single output)
 #
 # web_scrape is a TRANSFORM, not a source: the head source is a json/csv blob
-# of {url: ...} rows. The field_mapper drops the raw scraped content/fingerprint
+# with one explicitly named locator field. The field_mapper drops the raw scraped content/fingerprint
 # (data minimization) and stages the kind=pipeline_decision raw-HTML cleanup
 # requirement so the blocking cleanup contract (raw_html_cleanup_review_contract_error,
 # interpretation_state.py) passes deterministically.
@@ -576,48 +869,688 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
 # ---------------------------------------------------------------------------
 
 
-_RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
+_GENERIC_WEB_PROMPT_TEMPLATE: Final[str] = "Analyze the following public page and return the requested response:\n\n{{ row['content'] }}"
+_LEGACY_RATING_TEMPLATE: Final[str] = "Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}"
+_RAW_SCRAPE_FIELDS: Final[frozenset[str]] = frozenset({"content", "content_fingerprint"})
+_WEB_SCRAPE_GENERATED_FIELDS: Final[frozenset[str]] = frozenset(
+    {"content", "content_fingerprint", "fetch_status", "fetch_url_final", "fetch_url_final_ip"}
+)
+_FIELD_TOKEN_RE = re.compile(r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`")
+_RESPONSE_FIELD_RE = re.compile(
+    r"\b(?:write|produce|generate|create|return|store)(?:\s+(?:a|an))?(?:\s+(?:short|concise|brief))?\s+"
+    r"(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)`|(?!(?:either|neither)\b)(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
+    re.IGNORECASE,
+)
+_EMAIL_PATTERN: Final[str] = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+_ABUSE_CONTACT_RE = re.compile(
+    rf"(?:\babuse[-_\s]+contact(?:\s+(?:is\s+)?|\s*[:=]\s*)(?P<after>{_EMAIL_PATTERN})"
+    rf"|\b(?P<before>{_EMAIL_PATTERN})\s+as\s+(?:the\s+)?(?:scraping\s+)?abuse[-_\s]+contact\b)",
+    re.IGNORECASE,
+)
+_SCRAPING_REASON_RE = re.compile(
+    r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\s*(?:is|:)?\s*"
+    r"(?P<quote>['\"])(?P<reason>[^'\"]+)(?P=quote)",
+    re.IGNORECASE,
+)
+_ABUSE_CONTACT_LABEL_RE = re.compile(r"\b(?:scraping\s+)?abuse[-_\s]+contact\b", re.IGNORECASE)
+_SCRAPING_REASON_LABEL_RE = re.compile(
+    r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_STRONG_NEGATION_PATTERN: Final[str] = (
+    r"(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|must\s+not|should\s+not|shouldn't|"
+    r"cannot|can't|avoid(?:s|ed|ing)?|without|refus(?:e|es|ed|ing)|declin(?:e|es|ed|ing)|"
+    r"reject(?:s|ed|ing)?|exclud(?:e|es|ed|ing)|omit(?:s|ted|ting)?)"
+)
+_AUTHORITY_NEGATION_RE = re.compile(
+    rf"\b(?:{_AUTHORITY_STRONG_NEGATION_PATTERN}|no|not)\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_COMPETING_BRIDGE_RE = re.compile(
+    rf"\b(?:{_ALTERNATIVE_COORDINATOR_PATTERN}|else|alternative|backup|fallback)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
+_AUTHORITY_ACTION_RE = re.compile(
+    r"\b(?P<action>fetch(?:es|ed|ing)?|scrap(?:e|es|ed|ing)|writ(?:e|es|ing|ten)|produc(?:e|es|ed|ing)|"
+    r"generat(?:e|es|ed|ing)|creat(?:e|es|ed|ing)|return(?:s|ed|ing)?|stor(?:e|es|ed|ing)|"
+    r"keep(?:s|ing)?|kept|retain(?:s|ed|ing)?|project(?:s|ed|ing)?|us(?:e|es|ed|ing)|"
+    r"select(?:s|ed|ing)?|choos(?:e|es|ing)|chose|chosen|read(?:s|ing)?|sav(?:e|es|ed|ing)|"
+    r"process(?:es|ed|ing)?|truncat(?:e|es|ed|ing)|combin(?:e|es|ed|ing))\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_BOUNDARY_RE = re.compile(
+    rf"(?P<hard>;|\r?\n|\.(?=\s|$))|(?P<soft>[,:])|"
+    rf"(?P<alternative>\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b)|"
+    rf"(?P<additive>\b(?:{_ADDITIVE_COORDINATOR_PATTERN}|then)\b)|"
+    r"(?P<contrast>\b(?:but|while|rather\s+than)\b)",
+    re.IGNORECASE,
+)
+_BACKTICK_PROSE_RE = re.compile(r"`[^`]*`")
+_LLM_TOKEN_RE = re.compile(r"\b(?:an?\s+)?llm\b", re.IGNORECASE)
+_PROFILE_ACTION_PATTERN: Final[str] = r"(?:use|using|select|selecting|choose|choosing)"
+_SOURCE_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|read|reading)"
+_OUTPUT_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|write|writing|save|saving)"
+_PROFILE_PREFIX_RE = re.compile(
+    r"\b(?:an?\s+)?llm\s+profile\s*(?:(?:is|named)\s+|[:=]\s*)(?:the\s+)?"
+    r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))",
+    re.IGNORECASE,
+)
+_PROFILE_SUFFIX_RE = re.compile(
+    rf"\b{_PROFILE_ACTION_PATTERN}\s+(?:the\s+)?"
+    r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?!(?:an?|the)\b)(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))\s+"
+    r"(?:llm\s+)?profile\b",
+    re.IGNORECASE,
+)
+_PROFILE_BARE_ALIAS_RE = re.compile(
+    rf"\b{_PROFILE_ACTION_PATTERN}\s+(?:the\s+)?"
+    r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9]+-[A-Za-z0-9_-]+))(?![A-Za-z0-9_@-])",
+    re.IGNORECASE,
+)
+_PROFILE_LABEL_RE = re.compile(
+    r"\b(?:an?\s+)?llm\s+profile\b|\bprofile\s*(?:is\b|named\b|[:=])",
+    re.IGNORECASE,
+)
+_NEGATIVE_ACTION_PATTERN: Final[str] = (
+    r"(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|must\s+not|should\s+not|shouldn't|"
+    r"cannot|can't|avoid(?:s|ed|ing)?|without)"
+)
+_SOURCE_AUTHORITY_RE = re.compile(
+    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_SOURCE_ACTION_PATTERN}\s+"
+    r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?source\b"
+    r"(?:\s+(?:named\s+)?(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_-]*)`|"
+    r"(?!(?:for|with|from|rows?|material)\b)(?P<name>[A-Za-z_][A-Za-z0-9_-]*)))?",
+    re.IGNORECASE,
+)
+_SOURCE_SLOT_VALUE_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?source\b"
+    r"(?:\s+(?:named\s+)?(?:`[A-Za-z_][A-Za-z0-9_-]*`|[A-Za-z_][A-Za-z0-9_-]*))?",
+    re.IGNORECASE,
+)
+_OUTPUT_AUTHORITY_RE = re.compile(
+    rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_OUTPUT_ACTION_PATTERN}\s+"
+    r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?output\b"
+    r"(?:\s+(?:named\s+)?(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_-]*)`|(?P<name>(?!at\b)[A-Za-z_][A-Za-z0-9_-]*)))?"
+    r"(?:\s+at\s+(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-]))?",
+    re.IGNORECASE,
+)
+_OUTPUT_SLOT_VALUE_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?output\b"
+    r"(?:\s+(?:named\s+)?(?:`[A-Za-z_][A-Za-z0-9_-]*`|[A-Za-z_][A-Za-z0-9_-]*))?"
+    r"(?:\s+at\s+[A-Za-z0-9_./-]*[A-Za-z0-9_/-])?",
+    re.IGNORECASE,
+)
+_OUTPUT_PATH_AUTHORITY_RE = re.compile(
+    r"\b(?:write|save)\s+(?:(?:the\s+)?output|it)\s+(?:at|to)\s+"
+    r"(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
+_OUTPUT_LEADING_AUTHORITY_RE = re.compile(
+    rf"\boutput\s+(?:(?P<negative>{_NEGATIVE_ACTION_PATTERN})\s+|(?P<modal>must|should)\s+)?(?:be\s+)?"
+    r"(?P<format>[A-Za-z][A-Za-z0-9_-]*)\b",
+    re.IGNORECASE,
+)
+_RESPONSE_DIRECT_ALTERNATIVE_RE = re.compile(
+    rf"^{_ALTERNATIVE_PREFIX_PATTERN}"
+    r"(?:an?\s+)?(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+_RESPONSE_SUBORDINATE_BRIDGE_RE = re.compile(
+    r"\b(?:explain(?:s|ed|ing)?|describ(?:e|es|ed|ing)|discuss(?:es|ed|ing)?|say(?:s|ing)?|"
+    r"about|how|why|recommend(?:s|ed|ing)?)\b",
+    re.IGNORECASE,
+)
+_RESPONSE_ADJACENT_VALUE_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*", re.IGNORECASE)
+_SOURCE_ADJACENT_VALUE_RE = re.compile(
+    r"\b(?:json|csv|yaml|parquet)\b",
+    re.IGNORECASE,
+)
+_OUTPUT_ADJACENT_VALUE_RE = re.compile(
+    r"\b(?:jsonl|json|csv|yaml|parquet)\b",
+    re.IGNORECASE,
+)
+_STRONG_NEGATED_SOURCE_SLOT_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b[^.;\n]*\b(?:json|csv|yaml|parquet)\s+source\b",
+    re.IGNORECASE,
+)
+_STRONG_NEGATED_OUTPUT_SLOT_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b[^.;\n]*\b(?:jsonl|json|csv|yaml|parquet)\s+output\b",
+    re.IGNORECASE,
+)
+_UNPARSED_SOURCE_AUTHORITY_RE = re.compile(
+    rf"\b{_SOURCE_ACTION_PATTERN}\b[^.;\n]*\b(?:json|csv|yaml|parquet)\s*(?:/|\bor\b)\s*"
+    r"(?:json|csv|yaml|parquet)\s+source\b",
+    re.IGNORECASE,
+)
+_UNPARSED_OUTPUT_AUTHORITY_RE = re.compile(
+    rf"\b{_OUTPUT_ACTION_PATTERN}\b[^.;\n]*\b(?:jsonl|json|csv|yaml|parquet)\s*(?:/|\bor\b)\s*"
+    r"(?:jsonl|json|csv|yaml|parquet)\s+output\b",
+    re.IGNORECASE,
+)
+_NEGATED_RETENTION_CHOICE_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b\s+rather\s+than\s+(?:keep|retain|project)\s+(?:only|exactly)\b",
+    re.IGNORECASE,
+)
+_PIPELINE_CLEANUP_START_RE = re.compile(
+    r"^(?:then\s+|finally\s+)?(?:remove|drop|discard|exclude)\b"
+    r"(?=[^.;\n]*(?:\braw\s+(?:(?:page|scraped)\s+)?(?:content|html)\b|\bfingerprint\s+(?:columns?|fields?)\b))",
+    re.IGNORECASE,
+)
+_WEB_LOCATOR_RE = re.compile(
+    r"\b(?:fetch|scrape)\s+(?:"
+    r"(?:every|each)\s+(?:(?:reviewed\s+)?pages?\s+(?:(?:named\s+by|at(?:\s+its)?)\s+))?"
+    r"|the\s+page\s+at(?:\s+its)?\s+)"
+    r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`",
+    re.IGNORECASE,
+)
+_RETENTION_CLAUSE_RE = re.compile(
+    r"\b(?:keep|retain|project)\s+(?:only|exactly)\s+(?P<fields>.*?)"
+    r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:(?:write|save|send|output)\b|(?:keep|retain|project)\s+(?:only|exactly)\b)"
+    rf"|,?\s+(?:but|while)\s+{_NEGATIVE_ACTION_PATTERN}\s+(?:keep|retain|project)\b"
+    r"|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b))",
+    re.IGNORECASE | re.DOTALL,
+)
+_PROJECTION_FIELD_LIST_RE = re.compile(
+    r"`[A-Za-z_][A-Za-z0-9_]*`"
+    r"(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)`[A-Za-z_][A-Za-z0-9_]*`)*",
+)
+
+
+_AuthorityJoin = Literal["none", "additive", "alternative"]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityAction:
+    """One recognized authority verb with segment-local polarity."""
+
+    name: str
+    start: int
+    end: int
+    negated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthoritySegment:
+    """One bounded lexical segment outside protected content spans."""
+
+    start: int
+    end: int
+    clause_id: int
+    join: _AuthorityJoin
+    actions: tuple[_AuthorityAction, ...]
+    negations: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityDocument:
+    """Bounded lexical authority view; intentionally not an NLP interpretation."""
+
+    user_text: str
+    segments: tuple[_AuthoritySegment, ...]
+
+    def segment_index_at(self, position: int) -> int | None:
+        for index, segment in enumerate(self.segments):
+            if segment.start <= position < segment.end:
+                return index
+        return None
+
+    def action_for_span(self, start: int, end: int) -> _AuthorityAction | None:
+        """Return the declaration action local to a parsed value or label span."""
+
+        segment_index = self.segment_index_at(start)
+        if segment_index is None:
+            return None
+        actions = self.segments[segment_index].actions
+        enclosed = tuple(action for action in actions if start <= action.start < end)
+        if enclosed:
+            return enclosed[0]
+        preceding = tuple(action for action in actions if action.end <= end)
+        return preceding[-1] if preceding else None
+
+    def match_is_negated(self, match: re.Match[str]) -> bool:
+        action = self.action_for_span(match.start(), match.end())
+        if action is not None:
+            return action.negated
+        segment_index = self.segment_index_at(match.start())
+        if segment_index is None:
+            return False
+        return any(end <= match.start() for _start, end in self.segments[segment_index].negations)
+
+    def has_negated_action(
+        self,
+        names: frozenset[str],
+        *,
+        start: int = 0,
+        end: int | None = None,
+        excluded_span: tuple[int, int] | None = None,
+    ) -> bool:
+        limit = len(self.user_text) if end is None else end
+        return any(
+            action.negated
+            and action.name in names
+            and start <= action.start < limit
+            and (excluded_span is None or not (excluded_span[0] <= action.start < excluded_span[1]))
+            for segment in self.segments
+            for action in segment.actions
+        )
+
+    def has_competing_value(
+        self,
+        declaration: re.Match[str],
+        value_pattern: re.Pattern[str],
+        *,
+        excluded_span: tuple[int, int] | None = None,
+        subordinate_bridge: re.Pattern[str] | None = None,
+        adjacent_bare_pattern: re.Pattern[str] | None = None,
+    ) -> bool:
+        """Return whether another slot-shaped value competes with a declaration."""
+
+        segment_index = self.segment_index_at(declaration.start())
+        if segment_index is None:
+            return False
+        segment = self.segments[segment_index]
+        for candidate in value_pattern.finditer(self.user_text, declaration.end(), segment.end):
+            if excluded_span is not None and excluded_span[0] <= candidate.start() < excluded_span[1]:
+                continue
+            if _position_is_in_quoted_prose(self.user_text, candidate.start()):
+                continue
+            bridge = self.user_text[declaration.end() : candidate.start()]
+            if subordinate_bridge is not None and subordinate_bridge.search(bridge) is not None:
+                continue
+            if not self.match_is_negated(candidate):
+                return True
+        adjacent_clause_id = segment.clause_id + 1
+        for following in self.segments[segment_index + 1 :]:
+            if following.clause_id > adjacent_clause_id:
+                break
+            if following.clause_id < segment.clause_id:
+                continue
+            candidates = tuple((candidate, False) for candidate in value_pattern.finditer(self.user_text, following.start, following.end))
+            if adjacent_bare_pattern is not None and following.clause_id == adjacent_clause_id and not following.actions:
+                candidates += tuple(
+                    (bare_candidate, True)
+                    for bare_candidate in adjacent_bare_pattern.finditer(self.user_text, following.start, following.end)
+                    if not self.user_text[bare_candidate.end() : following.end].strip()
+                    and (
+                        not self.user_text[following.start : bare_candidate.start()].strip()
+                        or _AUTHORITY_COMPETING_BRIDGE_RE.fullmatch(self.user_text[following.start : bare_candidate.start()].strip(" ,:"))
+                        is not None
+                    )
+                )
+            if any(
+                candidate.start() >= declaration.end()
+                and (excluded_span is None or not (excluded_span[0] <= candidate.start() < excluded_span[1]))
+                and not _position_is_in_quoted_prose(self.user_text, candidate.start())
+                and (
+                    is_bare
+                    or _AUTHORITY_COMPETING_BRIDGE_RE.search(self.user_text[declaration.end() : candidate.start()]) is not None
+                    or (not is_bare and following.join in {"additive", "alternative"})
+                )
+                and not self.match_is_negated(candidate)
+                for candidate, is_bare in candidates
+            ):
+                return True
+        return False
+
+
+def _canonical_authority_action(token: str) -> str:
+    folded = token.casefold()
+    for prefix, canonical in (
+        ("fetch", "fetch"),
+        ("scrap", "scrape"),
+        ("writ", "write"),
+        ("produc", "produce"),
+        ("generat", "generate"),
+        ("creat", "create"),
+        ("return", "return"),
+        ("stor", "store"),
+        ("keep", "retain"),
+        ("kept", "retain"),
+        ("retain", "retain"),
+        ("project", "retain"),
+        ("us", "use"),
+        ("select", "use"),
+        ("choos", "use"),
+        ("chos", "use"),
+        ("read", "read"),
+        ("sav", "save"),
+        ("process", "process"),
+        ("truncat", "truncate"),
+        ("combin", "combine"),
+    ):
+        if folded.startswith(prefix):
+            return canonical
+    raise AssertionError(f"unrecognized authority action token: {token}")
+
+
+def _position_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _negation_governs_action(user_text: str, negation: re.Match[str], action: re.Match[str]) -> bool:
+    """Return whether a lexical negator governs its nearest following action."""
+
+    token = negation.group(0).casefold()
+    gap = user_text[negation.end() : action.start()].strip()
+    if token == "no":
+        return not gap
+    if token == "not":
+        return re.fullmatch(r"(?:to\s+)?", gap, re.IGNORECASE) is not None
+    return True
+
+
+def _authority_segment(
+    user_text: str,
+    *,
+    start: int,
+    end: int,
+    clause_id: int,
+    join: _AuthorityJoin,
+    protected_spans: tuple[tuple[int, int], ...],
+) -> _AuthoritySegment | None:
+    while start < end and user_text[start].isspace():
+        start += 1
+    while end > start and user_text[end - 1].isspace():
+        end -= 1
+    if start >= end:
+        return None
+    action_matches = tuple(
+        match
+        for match in _AUTHORITY_ACTION_RE.finditer(user_text, start, end)
+        if not _position_is_protected(match.start(), protected_spans)
+    )
+    negation_matches = tuple(
+        match
+        for match in _AUTHORITY_NEGATION_RE.finditer(user_text, start, end)
+        if not _position_is_protected(match.start(), protected_spans)
+    )
+    negated_action_starts: set[int] = set()
+    for negation in negation_matches:
+        action = next((candidate for candidate in action_matches if candidate.start() >= negation.end()), None)
+        if action is not None and _negation_governs_action(user_text, negation, action):
+            negated_action_starts.add(action.start())
+    actions = tuple(
+        _AuthorityAction(
+            name=_canonical_authority_action(action.group("action")),
+            start=action.start(),
+            end=action.end(),
+            negated=action.start() in negated_action_starts,
+        )
+        for action in action_matches
+    )
+    return _AuthoritySegment(
+        start=start,
+        end=end,
+        clause_id=clause_id,
+        join=join,
+        actions=actions,
+        negations=tuple(match.span() for match in negation_matches),
+    )
+
+
+def _authority_document(user_text: str) -> _AuthorityDocument:
+    """Parse bounded authority segments while masking content-only spans."""
+
+    protected_spans = tuple(
+        sorted(
+            (
+                *(match.span() for match in _QUOTED_PROSE_RE.finditer(user_text)),
+                *(match.span() for match in _BACKTICK_PROSE_RE.finditer(user_text)),
+                *(match.span("csv") for match in _FORK_CSV_MARKER_RE.finditer(user_text)),
+                *(match.span() for match in _ABUSE_CONTACT_LABEL_RE.finditer(user_text)),
+                *(match.span() for match in _SCRAPING_REASON_LABEL_RE.finditer(user_text)),
+            )
+        )
+    )
+    segments: list[_AuthoritySegment] = []
+    cursor = 0
+    clause_id = 0
+    pending_join: _AuthorityJoin = "none"
+    for boundary in _AUTHORITY_BOUNDARY_RE.finditer(user_text):
+        if _position_is_protected(boundary.start(), protected_spans):
+            continue
+        segment = _authority_segment(
+            user_text,
+            start=cursor,
+            end=boundary.start(),
+            clause_id=clause_id,
+            join=pending_join,
+            protected_spans=protected_spans,
+        )
+        if segment is not None:
+            segments.append(segment)
+        if boundary.group("hard") is not None:
+            clause_id += 1
+            pending_join = "none"
+        elif boundary.group("alternative") is not None:
+            pending_join = "alternative"
+        elif boundary.group("additive") is not None:
+            pending_join = "additive"
+        elif segment is not None:
+            pending_join = "none"
+        cursor = boundary.end()
+    final_segment = _authority_segment(
+        user_text,
+        start=cursor,
+        end=len(user_text),
+        clause_id=clause_id,
+        join=pending_join,
+        protected_spans=protected_spans,
+    )
+    if final_segment is not None:
+        segments.append(final_segment)
+    return _AuthorityDocument(user_text=user_text, segments=tuple(segments))
+
+
+def _clause_bounds(user_text: str, position: int) -> tuple[int, int]:
+    """Return the delimiter-bounded clause containing ``position``."""
+
+    start = 0
+    for delimiter in _CLAUSE_DELIMITER_RE.finditer(user_text):
+        if delimiter.end() <= position:
+            start = delimiter.end()
+            continue
+        if delimiter.start() >= position:
+            return start, delimiter.start()
+    return start, len(user_text)
+
+
+def _match_is_negated(user_text: str, match: re.Match[str]) -> bool:
+    return _authority_document(user_text).match_is_negated(match)
+
+
+def _match_prefix_is_negated(user_text: str, match: re.Match[str]) -> bool:
+    """Return whether the segment-local declaration for ``match`` is negated."""
+
+    return _authority_document(user_text).match_is_negated(match)
+
+
+def _match_clause_residue(user_text: str, match: re.Match[str]) -> str:
+    """Return text after a parsed authority value in its own clause."""
+
+    _clause_start, clause_end = _clause_bounds(user_text, match.start())
+    return user_text[match.end() : clause_end]
+
+
+def _residue_starts_with_alternative(residue: str) -> bool:
+    return re.match(rf"^{_ALTERNATIVE_PREFIX_PATTERN}", residue, re.IGNORECASE) is not None
+
+
+def _residue_starts_with_quoted_value_addition(residue: str) -> bool:
+    return (
+        re.match(
+            rf"^(?:\s*[,;.]?\s*{_ADDITIVE_COORDINATOR_PATTERN}\s+|\s*,\s*)['\"]",
+            residue,
+            re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _pipeline_cleanup_starts(user_text: str) -> tuple[int, ...]:
+    """Return clause starts that describe a post-LLM projection cleanup."""
+
+    boundaries = (0, *(delimiter.end() for delimiter in _CLAUSE_DELIMITER_RE.finditer(user_text)))
+    starts: list[int] = []
+    for boundary in boundaries:
+        content_start = boundary + len(user_text[boundary:]) - len(user_text[boundary:].lstrip())
+        _clause_start, clause_end = _clause_bounds(user_text, content_start)
+        if _PIPELINE_CLEANUP_START_RE.search(user_text[content_start:clause_end]) is not None:
+            starts.append(content_start)
+    return tuple(starts)
+
+
+def _web_response_semantic_span(user_text: str) -> tuple[int, int] | None:
+    """Return the LLM semantic region before projection/HTTP authority."""
+
+    llm_match = _LLM_TOKEN_RE.search(user_text)
+    if llm_match is None:
+        return None
+    nonsemantic_starts = tuple(
+        match.start() for pattern in (_RETENTION_CLAUSE_RE, _ABUSE_CONTACT_RE, _SCRAPING_REASON_RE) for match in pattern.finditer(user_text)
+    ) + _pipeline_cleanup_starts(user_text)
+    end = min((start for start in nonsemantic_starts if start > llm_match.start()), default=len(user_text))
+    return llm_match.start(), end
+
+
+def _position_is_in_quoted_prose(user_text: str, position: int) -> bool:
+    return any(match.start() < position < match.end() for match in _QUOTED_PROSE_RE.finditer(user_text))
+
+
+def _has_unprotected_authority_match(
+    user_text: str,
+    pattern: re.Pattern[str],
+    *,
+    excluded_span: tuple[int, int] | None = None,
+) -> bool:
+    """Return whether a lexical authority shape appears outside content prose."""
+
+    return any(
+        (excluded_span is None or not (excluded_span[0] <= match.start() < excluded_span[1]))
+        and not _position_is_in_quoted_prose(user_text, match.start())
+        for match in pattern.finditer(user_text)
+    )
+
+
+def _profile_match_is_subordinate_response_prose(user_text: str, match: re.Match[str]) -> bool:
+    semantic_span = _web_response_semantic_span(user_text)
+    return semantic_span is not None and semantic_span[0] <= match.start() < semantic_span[1]
+
+
+def _response_authority_matches(user_text: str, *, start: int, end: int) -> tuple[re.Match[str], ...]:
+    """Return response declarations, excluding subordinate or quoted prose."""
+
+    authority = _authority_document(user_text)
+    candidates = tuple(
+        match for match in _RESPONSE_FIELD_RE.finditer(user_text, start, end) if not _position_is_in_quoted_prose(user_text, match.start())
+    )
+    if not candidates:
+        return ()
+    authorities = [candidates[0]]
+    for candidate in candidates[1:]:
+        candidate_segment_index = authority.segment_index_at(candidate.start())
+        previous_segment_index = authority.segment_index_at(authorities[-1].start())
+        if candidate_segment_index is None or candidate_segment_index == previous_segment_index:
+            continue
+        candidate_segment = authority.segments[candidate_segment_index]
+        action = authority.action_for_span(candidate.start(), candidate.end())
+        if action is not None and not user_text[candidate_segment.start : action.start].strip():
+            authorities.append(candidate)
+    return tuple(authorities)
+
+
+def _response_match_is_negated(user_text: str, match: re.Match[str]) -> bool:
+    return _authority_document(user_text).match_is_negated(match)
+
+
+def _web_locator_field(user_text: str, source_fields: tuple[str, ...]) -> str | None:
+    """Bind the locator only from the fetch/scrape operation's own span."""
+
+    llm_match = _LLM_TOKEN_RE.search(user_text)
+    if llm_match is None:
+        return None
+    unique = _unique_in_order([match.group("field") for match in _WEB_LOCATOR_RE.finditer(user_text, 0, llm_match.start())])
+    if len(unique) != 1 or unique[0] not in source_fields:
+        return None
+    return unique[0]
+
+
+def _llm_generated_fields(response_field: str) -> frozenset[str]:
+    return frozenset({response_field, f"{response_field}_usage", f"{response_field}_model"})
+
+
+def _web_projection_namespace_collisions(
+    *,
+    locator_field: str,
+    response_field: str,
+    upstream_fields: tuple[str, ...],
+) -> frozenset[str]:
+    """Return cross-stage generated-field collisions for the generic graph."""
+
+    upstream = {*upstream_fields, locator_field}
+    llm_generated = _llm_generated_fields(response_field)
+    return frozenset(
+        (upstream & _WEB_SCRAPE_GENERATED_FIELDS) | (upstream & llm_generated) | (_WEB_SCRAPE_GENERATED_FIELDS & llm_generated)
+    )
+
+
+_RECIPE_WEB_PROJECT_SLOTS: Final[dict[str, SlotSpec]] = {
     "source_blob_id": SlotSpec(
         slot_type="blob_id",
-        description="UUID of the operator-supplied URL-list blob (json/csv rows of {url: ...}; use create_blob to wrap inline content first)",
+        description="UUID of the operator-supplied locator-row blob; use create_blob to wrap inline content first",
     ),
     "source_plugin": SlotSpec(
         slot_type="str",
-        description="Resolved URL-row source plugin carried from match_recipe; must be 'json' or 'csv'. Direct apply callers pass the materialised source plugin explicitly.",
+        description="Resolved locator-row source plugin; must be 'json' or 'csv' and match server-owned source authority.",
+    ),
+    "locator_field": SlotSpec(
+        slot_type="str",
+        description="Exact source-row field carrying each page locator.",
     ),
     "profile": SlotSpec(
         slot_type="str",
         description="Opaque operator-approved LLM profile alias",
     ),
-    "rating_template": SlotSpec(
+    "prompt_template": SlotSpec(
         slot_type="str",
         required=False,
-        default="Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}",
-        description="Jinja2 template for the rating prompt; reference scraped content as {{ row['content'] }}",
+        default=_GENERIC_WEB_PROMPT_TEMPLATE,
+        description=(
+            "Jinja2 prompt template. When omitted, the recipe's visible generic default asks the LLM to analyze "
+            "the scraped content and return the requested response."
+        ),
+    ),
+    "response_field": SlotSpec(
+        slot_type="str",
+        description="Exact row field where the LLM response is stored.",
+    ),
+    "required_input_fields": SlotSpec(
+        slot_type="str_list",
+        required=False,
+        default=("content",),
+        description="Exact input fields consumed by prompt_template.",
+    ),
+    "retained_fields": SlotSpec(
+        slot_type="str_list",
+        description="Exact output projection retained after raw scrape cleanup.",
     ),
     "abuse_contact": SlotSpec(
         slot_type="str",
         description=(
             "Operator-owned monitored contact address sent in web_scrape HTTP metadata. "
-            "If the public-fetch request omits it and no deployment/tool identity is visible, "
-            "use abuse-contact-unset@elspeth.foundryside.dev and surface that default after "
-            "the recipe/tool call with a pipeline_decision interpretation review."
+            "It must be supplied explicitly or by exact reviewed server authority; the recipe never invents one."
         ),
     ),
     "scraping_reason": SlotSpec(
         slot_type="str",
         description=(
             "Operator-authored reason for scraping, sent in web_scrape HTTP metadata. "
-            "If the public-fetch request omits it, derive an explicit reason from the user's "
-            "requested public fetch and surface that default after the recipe/tool call with "
-            "a pipeline_decision interpretation review."
+            "It must be supplied explicitly or by exact reviewed server authority; the recipe never derives or guesses one."
         ),
     ),
     "output_path": SlotSpec(
         slot_type="str",
-        required=False,
-        default="outputs/ratings.jsonl",
-        description="JSONL output path",
+        description="Exact reviewed JSONL output path.",
     ),
     "allowed_hosts": SlotSpec(
         slot_type="str_list",
@@ -631,8 +1564,7 @@ _RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
         description=(
             "SSRF allowlist for the web_scrape node, as a list of CIDR strings. "
             "Empty (the default) omits the key so the web_scrape field default "
-            "'public_only' applies — the correct value for a public host, including "
-            "the tutorial's publicly-hosted synthetic pages. SSRF safety comes "
+            "'public_only' applies — the correct value for a public host. SSRF safety comes "
             "from the web_scrape enforcement boundary (CidrStr validation + the "
             "'public_only' field default), not from the slot being unreachable — "
             "apply_pipeline_recipe is a Tier-3 boundary that can forward an "
@@ -642,8 +1574,8 @@ _RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
 }
 
 
-def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
-    """Build set_pipeline args for the web-scrape-llm-rate-jsonl recipe.
+def _build_web_scrape_project_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a source → scrape → LLM → exact projection → JSONL graph.
 
     Emits source → web_scrape → llm → field_mapper(cleanup) → jsonl, named by
     connection labels (NOT EdgeSpec objects — guided passes edges=[]). The
@@ -662,6 +1594,30 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
         RAW_HTML_CLEANUP_USER_TERM,
     )
 
+    source_plugin = slots["source_plugin"]
+    if source_plugin not in {"csv", "json"}:
+        raise RecipeValidationError("web projection recipe source_plugin must be 'csv' or 'json'")
+    locator_field = slots["locator_field"]
+    response_field = slots["response_field"]
+    retained_fields = tuple(slots["retained_fields"])
+    if type(locator_field) is not str or not locator_field:
+        raise RecipeValidationError("web projection recipe locator_field must be non-empty")
+    if type(response_field) is not str or not response_field:
+        raise RecipeValidationError("web projection recipe response_field must be non-empty")
+    namespace_collisions = _web_projection_namespace_collisions(
+        locator_field=locator_field,
+        response_field=response_field,
+        upstream_fields=tuple(field for field in retained_fields if field != response_field),
+    )
+    if namespace_collisions:
+        raise RecipeValidationError(
+            f"web projection recipe generated field namespace collides with raw scrape or LLM outputs: {sorted(namespace_collisions)}"
+        )
+    if not retained_fields or len(set(retained_fields)) != len(retained_fields):
+        raise RecipeValidationError("web projection recipe retained_fields must be a non-empty unique list")
+    if response_field not in retained_fields:
+        raise RecipeValidationError("web projection recipe retained_fields must include response_field")
+
     content_field = "content"
     fingerprint_field = "content_fingerprint"
     cleanup_requirement = {
@@ -671,7 +1627,7 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
     }
     web_scrape_options: dict[str, Any] = {
         "schema": {"mode": "observed"},
-        "url_field": "url",
+        "url_field": locator_field,
         "content_field": content_field,
         "fingerprint_field": fingerprint_field,
         "format": "markdown",
@@ -686,15 +1642,15 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
     }
     allowed_hosts = slots["allowed_hosts"]
     if allowed_hosts:
-        # SSRF allowlist supplied by the deterministic seam (tutorial loopback
-        # CIDR). Empty -> omitted -> the web_scrape field default public_only.
+        # SSRF allowlist supplied by exact reviewed authority. Empty -> omitted
+        # -> the web_scrape field default public_only.
         # The allowlist is a field of ``WebScrapeHTTPConfig`` (web_scrape.py),
         # so it MUST nest under ``http`` beside abuse_contact/scraping_reason —
         # a top-level key is rejected by the plugin (extra:forbid).
         web_scrape_options["http"]["allowed_hosts"] = list(allowed_hosts)
     return {
         "source": {
-            "plugin": slots["source_plugin"],
+            "plugin": source_plugin,
             "blob_id": slots["source_blob_id"],
             "on_success": "rows",
             "options": {
@@ -721,10 +1677,10 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "profile": slots["profile"],
-                    "prompt_template": slots["rating_template"],
-                    "response_field": "rating",
+                    "prompt_template": slots["prompt_template"],
+                    "response_field": response_field,
                     "schema": {"mode": "observed"},
-                    "required_input_fields": [content_field],
+                    "required_input_fields": list(slots["required_input_fields"]),
                 },
             },
             {
@@ -739,10 +1695,7 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
                     "select_only": True,
                     # mapping preserves ONLY the user-facing fields; the raw
                     # content/fingerprint are intentionally absent (dropped).
-                    "mapping": {
-                        "url": "url",
-                        "rating": "rating",
-                    },
+                    "mapping": {field: field for field in retained_fields},
                     INTERPRETATION_REQUIREMENTS_KEY: [cleanup_requirement],
                 },
             },
@@ -763,12 +1716,464 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
             }
         ],
         "metadata": {
-            "name": "web-scrape-llm-rate-jsonl",
+            "name": "web-scrape-llm-project-jsonl",
             "description": (
-                f"Scrape each URL, rate the page with an LLM, drop the raw HTML/fingerprint, and write ratings to {slots['output_path']}"
+                f"Scrape each locator in '{locator_field}', store the LLM response in '{response_field}', "
+                f"retain exactly {list(retained_fields)!r}, and write JSONL to {slots['output_path']}"
             ),
         },
     }
+
+
+_RECIPE_WEB_RATE_SLOTS: Final[dict[str, SlotSpec]] = {
+    "source_blob_id": _RECIPE_WEB_PROJECT_SLOTS["source_blob_id"],
+    "source_plugin": _RECIPE_WEB_PROJECT_SLOTS["source_plugin"],
+    "profile": _RECIPE_WEB_PROJECT_SLOTS["profile"],
+    "rating_template": SlotSpec(
+        slot_type="str",
+        required=False,
+        default=_LEGACY_RATING_TEMPLATE,
+        description="Legacy rating prompt template.",
+    ),
+    "abuse_contact": _RECIPE_WEB_PROJECT_SLOTS["abuse_contact"],
+    "scraping_reason": _RECIPE_WEB_PROJECT_SLOTS["scraping_reason"],
+    "output_path": SlotSpec(
+        slot_type="str",
+        required=False,
+        default="outputs/ratings.jsonl",
+        description="JSONL output path",
+    ),
+    "allowed_hosts": _RECIPE_WEB_PROJECT_SLOTS["allowed_hosts"],
+}
+
+
+def _build_legacy_web_rating_recipe(slots: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Translate the legacy rating slots onto the generic graph builder."""
+
+    return _build_web_scrape_project_recipe(
+        {
+            "source_blob_id": slots["source_blob_id"],
+            "source_plugin": slots["source_plugin"],
+            "locator_field": "url",
+            "profile": slots["profile"],
+            "prompt_template": slots["rating_template"],
+            "response_field": "rating",
+            "required_input_fields": ("content",),
+            "retained_fields": ("url", "rating"),
+            "abuse_contact": slots["abuse_contact"],
+            "scraping_reason": slots["scraping_reason"],
+            "output_path": slots["output_path"],
+            "allowed_hosts": slots["allowed_hosts"],
+        }
+    )
+
+
+def _unique_in_order(values: list[str]) -> tuple[str, ...]:
+    unique: list[str] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return tuple(unique)
+
+
+def _web_response_contract(user_text: str) -> tuple[str, str] | None:
+    """Return one exact response field and semantic instruction, else abstain."""
+
+    semantic_span = _web_response_semantic_span(user_text)
+    if semantic_span is None:
+        return None
+    semantic_start, semantic_end = semantic_span
+    nonsemantic_starts = (semantic_end,)
+    response_matches = _response_authority_matches(user_text, start=semantic_start, end=semantic_end)
+    if not response_matches:
+        return None
+    authority = _authority_document(user_text)
+    contracts: list[tuple[str, str]] = []
+    for index, response_match in enumerate(response_matches):
+        if _response_match_is_negated(user_text, response_match):
+            return None
+        if authority.has_competing_value(
+            response_match,
+            _RESPONSE_FIELD_RE,
+            excluded_span=(semantic_end, len(user_text)),
+            subordinate_bridge=_RESPONSE_SUBORDINATE_BRIDGE_RE,
+            adjacent_bare_pattern=_RESPONSE_ADJACENT_VALUE_RE,
+        ):
+            return None
+        boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
+        if index + 1 < len(response_matches):
+            boundary_starts.append(response_matches[index + 1].start())
+        end = min(boundary_starts, default=len(user_text))
+        response_residue = _match_clause_residue(user_text, response_match)
+        if _RESPONSE_DIRECT_ALTERNATIVE_RE.match(response_residue) is not None:
+            return None
+        clause_start, _clause_end = _clause_bounds(user_text, response_match.start())
+        llm_mentions = tuple(_LLM_TOKEN_RE.finditer(user_text, clause_start, response_match.start()))
+        instruction_start = llm_mentions[-1].end() if llm_mentions else response_match.start()
+        profile_matches = tuple(
+            match
+            for pattern in (_PROFILE_PREFIX_RE, _PROFILE_SUFFIX_RE)
+            for match in pattern.finditer(user_text, clause_start, response_match.start())
+        )
+        if profile_matches:
+            instruction_start = max(match.end() for match in profile_matches)
+        instruction = user_text[instruction_start:end].strip(" ,.;")
+        instruction = re.sub(r"^to\s+", "", instruction, count=1, flags=re.IGNORECASE)
+        instruction = re.sub(r"(?:[,;]\s*)?(?:and|then)\s*$", "", instruction, flags=re.IGNORECASE).strip(" ,.;")
+        field = response_match.group("quoted") or response_match.group("plain")
+        if not instruction or field is None:
+            return None
+        contracts.append((field, " ".join(instruction.split())))
+    contract = contracts[0]
+    if any(candidate != contract for candidate in contracts[1:]):
+        return None
+    field, instruction = contract
+    return field, f"User instruction: {instruction}\n\nPublic page content:\n{{{{ row['content'] }}}}"
+
+
+def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
+    """Return one fully parsed exact retention/projection, else abstain."""
+
+    if _NEGATED_RETENTION_CHOICE_RE.search(user_text) is not None:
+        return None
+    clauses = tuple(_RETENTION_CLAUSE_RE.finditer(user_text))
+    if not clauses:
+        return None
+    projections: list[tuple[str, ...]] = []
+    for clause in clauses:
+        if _match_prefix_is_negated(user_text, clause):
+            return None
+        raw_fields = clause.group("fields").strip()
+        if _PROJECTION_FIELD_LIST_RE.fullmatch(raw_fields) is None:
+            return None
+        fields = tuple(match.group("field") for match in _FIELD_TOKEN_RE.finditer(raw_fields))
+        if not fields or len(set(fields)) != len(fields):
+            return None
+        projections.append(fields)
+    projection = projections[0]
+    if any(candidate != projection for candidate in projections[1:]):
+        return None
+    return projection
+
+
+def _has_negated_label_clause(user_text: str, label_pattern: re.Pattern[str]) -> bool:
+    return any(_match_prefix_is_negated(user_text, label) for label in label_pattern.finditer(user_text))
+
+
+def _web_abuse_contact(user_text: str) -> str | None:
+    """Return one affirmative explicitly labelled abuse contact, else abstain."""
+
+    if _has_negated_label_clause(user_text, _ABUSE_CONTACT_LABEL_RE):
+        return None
+    matches = tuple(_ABUSE_CONTACT_RE.finditer(user_text))
+    if not matches:
+        return None
+    for match in matches:
+        residue = _match_clause_residue(user_text, match)
+        if _residue_starts_with_alternative(residue) or re.search(_EMAIL_PATTERN, residue) is not None:
+            return None
+    contacts = tuple(match.group("after") or match.group("before") for match in matches)
+    contact = contacts[0]
+    if contact is None or any(candidate != contact for candidate in contacts[1:]):
+        return None
+    return contact
+
+
+def _web_scraping_reason(user_text: str) -> str | None:
+    """Return one exact explicitly labelled ASCII scraping reason, else abstain."""
+
+    if _has_negated_label_clause(user_text, _SCRAPING_REASON_LABEL_RE):
+        return None
+    matches = tuple(_SCRAPING_REASON_RE.finditer(user_text))
+    if not matches:
+        return None
+    for match in matches:
+        residue = _match_clause_residue(user_text, match)
+        if (
+            _residue_starts_with_alternative(residue)
+            or _residue_starts_with_quoted_value_addition(residue)
+            or _QUOTED_PROSE_RE.search(residue) is not None
+        ):
+            return None
+    reasons = tuple(match.group("reason").strip() for match in matches)
+    reason = reasons[0]
+    if not reason or not reason.isascii() or any(candidate != reason for candidate in reasons[1:]):
+        return None
+    return reason
+
+
+def _usable_profile_aliases_for(
+    snapshot: PluginAvailabilitySnapshot,
+    plugin_id: PluginId,
+) -> tuple[str, ...]:
+    """Return the aliases explicitly carried by one owned policy snapshot."""
+
+    for candidate_id, aliases in snapshot.usable_profile_aliases:
+        if candidate_id == plugin_id:
+            return aliases
+    return ()
+
+
+def _single_llm_profile(context: RecipeIntentContext) -> str | None:
+    snapshot = context.policy_snapshot
+    if snapshot is None:
+        return None
+    aliases = _usable_profile_aliases_for(snapshot, PluginId("transform", "llm"))
+    alias_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_@-])(?:{'|'.join(re.escape(alias) for alias in aliases)})(?![A-Za-z0-9_@-])",
+        re.IGNORECASE,
+    )
+    semantic_span = _web_response_semantic_span(context.user_text)
+    authority_document = _authority_document(context.user_text)
+    if any(
+        authority_document.match_is_negated(alias_match)
+        for alias_match in alias_pattern.finditer(context.user_text)
+        if authority_document.segment_index_at(alias_match.start()) is not None
+        and (semantic_span is None or not (semantic_span[0] <= alias_match.start() < semantic_span[1]))
+        and not _position_is_in_quoted_prose(context.user_text, alias_match.start())
+    ):
+        return None
+    for alias in aliases:
+        negated_alias = re.compile(
+            rf"\b{_NEGATIVE_ACTION_PATTERN}\s+{_PROFILE_ACTION_PATTERN}\s+"
+            rf"(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
+            re.IGNORECASE,
+        )
+        if negated_alias.search(context.user_text) is not None:
+            return None
+    authority_matches = tuple(
+        sorted(
+            (
+                *(
+                    match
+                    for match in _PROFILE_PREFIX_RE.finditer(context.user_text)
+                    if not _position_is_in_quoted_prose(context.user_text, match.start())
+                ),
+                *(
+                    match
+                    for match in _PROFILE_SUFFIX_RE.finditer(context.user_text)
+                    if not _position_is_in_quoted_prose(context.user_text, match.start())
+                ),
+                *(
+                    match
+                    for match in _PROFILE_BARE_ALIAS_RE.finditer(context.user_text)
+                    if not _position_is_in_quoted_prose(context.user_text, match.start())
+                    and not _profile_match_is_subordinate_response_prose(context.user_text, match)
+                    and (
+                        (match.group("quoted") or match.group("plain")) in aliases
+                        or (match.group("quoted") or match.group("plain") or "").casefold().startswith("profile-")
+                    )
+                ),
+            ),
+            key=lambda match: match.start(),
+        )
+    )
+    if any(_match_prefix_is_negated(context.user_text, match) for match in authority_matches):
+        return None
+    if authority_matches:
+        authority = _authority_document(context.user_text)
+        if any(
+            authority.has_competing_value(
+                match,
+                alias_pattern,
+                excluded_span=semantic_span,
+            )
+            for match in authority_matches
+        ):
+            return None
+        selected = tuple((match.group("quoted") or match.group("plain")) for match in authority_matches)
+        profile = selected[0]
+        if any(candidate != profile for candidate in selected[1:]) or profile not in aliases:
+            return None
+        return profile
+    if _PROFILE_LABEL_RE.search(context.user_text) is not None:
+        return None
+    return aliases[0] if len(aliases) == 1 else None
+
+
+def _reviewed_web_authority_is_compatible(
+    context: RecipeIntentContext,
+    *,
+    source: RecipeReviewedSourceSummary,
+    output: RecipeReviewedOutputSummary,
+    output_binding: RecipeOutputBinding,
+) -> bool:
+    """Return whether explicit source/output prose agrees with reviewed authority."""
+
+    semantic_span = _web_response_semantic_span(context.user_text)
+    authority = _authority_document(context.user_text)
+    if authority.has_negated_action(frozenset({"fetch", "scrape"}), excluded_span=semantic_span):
+        return False
+    if any(
+        _has_unprotected_authority_match(context.user_text, pattern, excluded_span=semantic_span)
+        for pattern in (_STRONG_NEGATED_SOURCE_SLOT_RE, _UNPARSED_SOURCE_AUTHORITY_RE)
+    ):
+        return False
+    if any(
+        _has_unprotected_authority_match(context.user_text, pattern, excluded_span=semantic_span)
+        for pattern in (_STRONG_NEGATED_OUTPUT_SLOT_RE, _UNPARSED_OUTPUT_AUTHORITY_RE)
+    ):
+        return False
+    source_authorities = tuple(
+        authority
+        for authority in _SOURCE_AUTHORITY_RE.finditer(context.user_text)
+        if not _position_is_in_quoted_prose(context.user_text, authority.start())
+        and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
+    )
+    for source_authority in source_authorities:
+        if source_authority.group("negative") is not None or authority.match_is_negated(source_authority):
+            return False
+        source_format = source_authority.group("format")
+        if source_format is not None and source_format.casefold() != source.plugin.casefold():
+            return False
+        source_name = source_authority.group("quoted") or source_authority.group("name")
+        if source_name is not None and source_name != source.name:
+            return False
+        if source_authority.group("reviewed") is not None and source_format is None and source_name is None:
+            return False
+        if authority.has_competing_value(
+            source_authority,
+            _SOURCE_SLOT_VALUE_RE,
+            excluded_span=semantic_span,
+            adjacent_bare_pattern=_SOURCE_ADJACENT_VALUE_RE,
+        ):
+            return False
+
+    output_authorities = tuple(
+        authority
+        for authority in _OUTPUT_AUTHORITY_RE.finditer(context.user_text)
+        if not _position_is_in_quoted_prose(context.user_text, authority.start())
+        and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
+    )
+    for output_authority in output_authorities:
+        if output_authority.group("negative") is not None or authority.match_is_negated(output_authority):
+            return False
+        output_format = output_authority.group("format")
+        if output_format is not None and output_format.casefold() != output_binding.format.casefold():
+            return False
+        output_name = output_authority.group("quoted") or output_authority.group("name")
+        if output_name is not None and output_name != output.name:
+            return False
+        output_path = output_authority.group("path")
+        if output_path is not None and output_path != output_binding.path:
+            return False
+        if output_authority.group("reviewed") is not None and output_format is None and output_name is None:
+            return False
+        if authority.has_competing_value(
+            output_authority,
+            _OUTPUT_SLOT_VALUE_RE,
+            excluded_span=semantic_span,
+            adjacent_bare_pattern=_OUTPUT_ADJACENT_VALUE_RE,
+        ):
+            return False
+    output_path_authorities = tuple(
+        authority
+        for authority in _OUTPUT_PATH_AUTHORITY_RE.finditer(context.user_text)
+        if not _position_is_in_quoted_prose(context.user_text, authority.start())
+        and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
+    )
+    if output_path_authorities:
+        output_paths = tuple(authority.group("path") for authority in output_path_authorities)
+        if any(path != output_binding.path for path in output_paths):
+            return False
+    for output_authority in _OUTPUT_LEADING_AUTHORITY_RE.finditer(context.user_text):
+        clause_start, _clause_end = _clause_bounds(context.user_text, output_authority.start())
+        if context.user_text[clause_start : output_authority.start()].strip():
+            continue
+        if output_authority.group("negative") is not None:
+            return False
+        if output_authority.group("format").casefold() != output_binding.format.casefold():
+            return False
+    return True
+
+
+def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
+    """Match only complete, unambiguous reviewed scrape/project requests."""
+
+    lower = context.user_text.lower()
+    if not any(term in lower for term in ("fetch", "scrape")) or "llm" not in lower:
+        return None
+    if not any(term in lower for term in ("keep only", "retain exactly", "retain only", "keep exactly")):
+        return None
+    if len(context.reviewed_sources) != 1 or len(context.reviewed_outputs) != 1:
+        return None
+    if len(context.source_bindings) != 1 or len(context.output_bindings) != 1:
+        return None
+    source = context.reviewed_sources[0]
+    output = context.reviewed_outputs[0]
+    source_binding = context.source_bindings[0]
+    output_binding = context.output_bindings[0]
+    if (source.name, source.plugin) != (source_binding.name, source_binding.plugin):
+        return None
+    if (output.name, output.plugin) != (output_binding.name, output_binding.plugin):
+        return None
+    if source.plugin not in {"csv", "json"} or output.plugin != "json" or output_binding.format != "jsonl":
+        return None
+    try:
+        UUID(source_binding.blob_id)
+    except ValueError as exc:
+        raise RecipeValidationError("server-owned source binding blob_id must be a valid UUID") from exc
+    if not output_binding.path:
+        return None
+    if not _reviewed_web_authority_is_compatible(
+        context,
+        source=source,
+        output=output,
+        output_binding=output_binding,
+    ):
+        return None
+
+    response_contract = _web_response_contract(context.user_text)
+    if response_contract is None:
+        return None
+    response_field, prompt_template = response_contract
+    locator_field = _web_locator_field(context.user_text, tuple(source.field_names))
+    if locator_field is None or locator_field == response_field:
+        return None
+    if _web_projection_namespace_collisions(
+        locator_field=locator_field,
+        response_field=response_field,
+        upstream_fields=tuple(source.field_names),
+    ):
+        return None
+    explicit_retained_fields = _web_retained_fields(context.user_text)
+    if explicit_retained_fields is None:
+        return None
+    known_fields = {*source.field_names, response_field}
+    if any(field not in known_fields for field in explicit_retained_fields):
+        return None
+    retained_fields = explicit_retained_fields
+    if not retained_fields or response_field not in retained_fields or _RAW_SCRAPE_FIELDS.intersection(retained_fields):
+        return None
+    profile = _single_llm_profile(context)
+    if profile is None:
+        return None
+    abuse_contact = _web_abuse_contact(context.user_text)
+    if abuse_contact is None:
+        return None
+    reason = _web_scraping_reason(context.user_text)
+    if reason is None:
+        return None
+    projection_conflict = reviewed_output_projection_conflict(
+        retained_fields=retained_fields,
+        required_fields=tuple(output.required_fields),
+    )
+    if projection_conflict is not None:
+        raise projection_conflict
+    return RecipeIntentCandidate(
+        slots={
+            "source_blob_id": source_binding.blob_id,
+            "source_plugin": source_binding.plugin,
+            "locator_field": locator_field,
+            "profile": profile,
+            "prompt_template": prompt_template,
+            "response_field": response_field,
+            "retained_fields": retained_fields,
+            "abuse_contact": abuse_contact,
+            "scraping_reason": reason,
+            "output_path": output_binding.path,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +2231,28 @@ _RECIPES: Final[dict[str, RecipeSpec]] = {
                 PluginId("sink", "json"),
             }
         ),
+        matcher=_match_fork_coalesce_intent,
+    ),
+    "web-scrape-llm-project-jsonl": RecipeSpec(
+        name="web-scrape-llm-project-jsonl",
+        description=(
+            "Fetch each page named by an arbitrary source locator field, project an LLM response into an explicitly named "
+            "field, remove the raw fetched content and fingerprint, retain an exact caller-supplied field set, and write "
+            "JSONL through a reviewed destination. The generic prompt has a visible recipe-owned default; response and "
+            "projection fields, HTTP identity, source binding, profile, and output destination are never guessed."
+        ),
+        slots=_RECIPE_WEB_PROJECT_SLOTS,
+        build=_build_web_scrape_project_recipe,
+        required_plugins=frozenset(
+            {
+                PluginId("transform", "web_scrape"),
+                PluginId("transform", "llm"),
+                PluginId("transform", "field_mapper"),
+                PluginId("sink", "json"),
+            }
+        ),
+        alternative_plugin_groups=(frozenset({PluginId("source", "csv"), PluginId("source", "json")}),),
+        matcher=_match_web_scrape_project_intent,
     ),
     "web-scrape-llm-rate-jsonl": RecipeSpec(
         name="web-scrape-llm-rate-jsonl",
@@ -839,8 +2266,8 @@ _RECIPES: Final[dict[str, RecipeSpec]] = {
             "or csv. The raw-HTML cleanup is staged as a pipeline_decision so the "
             "data-minimization contract passes deterministically."
         ),
-        slots=_RECIPE_WEB_SCRAPE_SLOTS,
-        build=_build_web_scrape_recipe,
+        slots=_RECIPE_WEB_RATE_SLOTS,
+        build=_build_legacy_web_rating_recipe,
         required_plugins=frozenset(
             {
                 PluginId("transform", "web_scrape"),
@@ -873,7 +2300,7 @@ def unavailable_recipe_plugin(
             return selected_source
     if "profile" in recipe.slots:
         llm_id = PluginId("transform", "llm")
-        usable_aliases = dict(snapshot.usable_profile_aliases).get(llm_id, ())
+        usable_aliases = _usable_profile_aliases_for(snapshot, llm_id)
         if not usable_aliases:
             return llm_id
         if raw_slots is not None and isinstance(raw_slots.get("profile"), str) and raw_slots["profile"] not in usable_aliases:
@@ -882,6 +2309,66 @@ def unavailable_recipe_plugin(
         if alternatives.isdisjoint(snapshot.available):
             return min(alternatives)
     return None
+
+
+def match_registered_recipe_intent(context: RecipeIntentContext) -> RecipeIntentMatch | None:
+    """Return the unique complete executable recipe match, else fall back.
+
+    Matchers produce sparse values: absent optional slots remain absent here so
+    the recipe declaration's ordinary ``validate_slots`` path remains the sole
+    owner of defaults. A malformed, incomplete, unavailable, or ambiguous
+    candidate never partially applies a recipe.
+    """
+
+    if type(context) is not RecipeIntentContext:
+        raise TypeError("context must be an exact RecipeIntentContext")
+    complete: list[RecipeIntentMatch] = []
+    for recipe in _RECIPES.values():
+        matcher = recipe.matcher
+        if matcher is None:
+            continue
+        candidate = matcher(context)
+        if candidate is None:
+            continue
+        if type(candidate) is not RecipeIntentCandidate:
+            raise TypeError(f"recipe '{recipe.name}' matcher must return RecipeIntentCandidate or None")
+        missing_required = [
+            name
+            for name, spec in recipe.slots.items()
+            if spec.required and name not in candidate.slots and not (candidate.inline_blob is not None and spec.slot_type == "blob_id")
+        ]
+        if missing_required:
+            continue
+        validation_slots = dict(candidate.slots)
+        if candidate.inline_blob is not None:
+            missing_blob_slots = [
+                name
+                for name, spec in recipe.slots.items()
+                if spec.required and spec.slot_type == "blob_id" and name not in validation_slots
+            ]
+            if len(missing_blob_slots) != 1:
+                continue
+            validation_slots[missing_blob_slots[0]] = _INLINE_SOURCE_BLOB_SENTINEL
+        coerced_slots = validate_slots(recipe, validation_slots)
+        if (
+            context.policy_snapshot is not None
+            and unavailable_recipe_plugin(
+                recipe,
+                context.policy_snapshot,
+                raw_slots=candidate.slots,
+            )
+            is not None
+        ):
+            continue
+        recipe.build(coerced_slots)
+        complete.append(
+            RecipeIntentMatch(
+                recipe_name=recipe.name,
+                slots=candidate.slots,
+                inline_blob=candidate.inline_blob,
+            )
+        )
+    return complete[0] if len(complete) == 1 else None
 
 
 def list_recipes(snapshot: PluginAvailabilitySnapshot) -> list[dict[str, Any]]:
@@ -897,7 +2384,7 @@ def list_recipes(snapshot: PluginAvailabilitySnapshot) -> list[dict[str, Any]]:
                     "default": s.default,
                     "description": s.description,
                     **(
-                        {"choices": list(dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ()))}
+                        {"choices": list(_usable_profile_aliases_for(snapshot, PluginId("transform", "llm")))}
                         if slot_name == "profile"
                         else {}
                     ),

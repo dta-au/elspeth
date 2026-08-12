@@ -55,7 +55,12 @@ from elspeth.plugins.infrastructure.validation import (
 )
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
-from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.plugin_policy_disclosure import (
+    WEB_PROHIBITED_PLUGIN_EXPLANATION,
+    ProhibitedPluginDisclosure,
+    prohibited_plugin_section,
+)
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
     CompositionState,
@@ -1486,10 +1491,7 @@ _PLUGIN_UNAVAILABLE_EXPLANATIONS: Final[dict[PluginUnavailableReason, str]] = {
         "the plugin is installed but not turned on in this deployment — no operator profile is "
         "configured for it; an operator must enable one before it can be used"
     ),
-    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
-        "the plugin is installed and authorized for this deployment's runtime but prohibited on the "
-        "web authoring surface by security policy"
-    ),
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: WEB_PROHIBITED_PLUGIN_EXPLANATION,
 }
 
 
@@ -1497,7 +1499,7 @@ def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailab
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
 
 
-def _prohibited_section(items: Sequence[Any]) -> tuple[dict[str, str], ...]:
+def _prohibited_section(items: Sequence[PluginSummary]) -> tuple[ProhibitedPluginDisclosure, ...]:
     """Shape ``PolicyCatalogView.list_prohibited_*`` entries for chat discovery.
 
     Every ``item`` here already cleared ``PolicyCatalogView._prohibited`` —
@@ -1509,9 +1511,7 @@ def _prohibited_section(items: Sequence[Any]) -> tuple[dict[str, str], ...]:
     user naming a prohibited plugin gets the reason without first trying and
     failing.
     """
-    reason = PluginUnavailableReason.WEB_SURFACE_PROHIBITED
-    explanation = _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]
-    return tuple({"name": item.name, "reason": reason.value, "explanation": explanation} for item in items)
+    return prohibited_plugin_section(items)
 
 
 # gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —

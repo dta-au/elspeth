@@ -19,7 +19,24 @@ import pytest
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
-from elspeth.web.composer.audit import BufferingRecorder, audit_envelope, begin_dispatch, dispatch_with_audit, llm_call_audit_envelope
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+    ComposerPlannerInformationClass,
+)
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.audit import (
+    BufferingRecorder,
+    audit_envelope,
+    begin_dispatch,
+    dispatch_with_audit,
+    interleave_planner_audit_records,
+    llm_call_audit_envelope,
+    planner_attempt_audit_envelope,
+    planner_attempt_audit_summary,
+)
 
 
 def _make_invocation(seq: int) -> ComposerToolInvocation:
@@ -43,6 +60,54 @@ def _make_invocation(seq: int) -> ComposerToolInvocation:
         finished_at=t,
         latency_ms=1,
         actor="test",
+    )
+
+
+def _make_planner_attempt(ordinal: int, planner_call_ordinal: int) -> ComposerPlannerAttempt:
+    return ComposerPlannerAttempt(
+        ordinal=ordinal,
+        planner_call_ordinal=planner_call_ordinal,
+        phase=ComposerPlannerAttemptPhase.DISCOVERY,
+        outcome=ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED,
+        planner_code=None,
+        selected_tools=("get_plugin_schema",),
+        requested_information=(ComposerPlannerInformationClass.PLUGIN_SCHEMA,),
+        new_information=(ComposerPlannerInformationClass.PLUGIN_SCHEMA,),
+        rejection_codes=(),
+        candidate_shape_hash=None,
+        repeated_fingerprint=False,
+        led_to=ComposerPlannerAttemptLedTo.CONTINUE,
+    )
+
+
+def _make_planner_llm_call(
+    planner_call_ordinal: int,
+    *,
+    status: ComposerLLMCallStatus = ComposerLLMCallStatus.SUCCESS,
+) -> ComposerLLMCall:
+    t = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    failed = status is not ComposerLLMCallStatus.SUCCESS
+    return ComposerLLMCall(
+        model_requested="test/planner",
+        model_returned=None if failed else "test/planner-v1",
+        status=status,
+        prompt_tokens=None if failed else 13,
+        completion_tokens=None if failed else 8,
+        total_tokens=None if failed else 21,
+        latency_ms=42,
+        provider_request_id=None,
+        messages_hash="m" * 64,
+        tools_spec_hash="t" * 64,
+        declared_tool_names=("emit_pipeline_proposal",),
+        started_at=t,
+        finished_at=t,
+        error_class="APIError" if failed else None,
+        error_message="APIError" if failed else None,
+        temperature=0.0,
+        seed=42,
+        max_completion_tokens_requested=800,
+        planner_policy_hash="a" * 64,
+        planner_call_ordinal=planner_call_ordinal,
     )
 
 
@@ -78,6 +143,91 @@ def test_concurrent_records_all_landed() -> None:
     for t in threads:
         t.join()
     assert len(rec.invocations) == 100
+
+
+def test_planner_attempts_are_buffered_as_immutable_ordered_snapshots() -> None:
+    recorder = BufferingRecorder()
+    recorder.record_planner_attempt(_make_planner_attempt(1, 2))
+    snapshot = recorder.planner_attempts
+    recorder.record_planner_attempt(_make_planner_attempt(2, 4))
+
+    assert [attempt.planner_call_ordinal for attempt in snapshot] == [2]
+    assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == [2, 4]
+
+
+def test_planner_attempt_envelope_and_summary_are_value_free() -> None:
+    attempt = _make_planner_attempt(1, 2)
+
+    envelope = planner_attempt_audit_envelope(attempt)
+    summary = json.loads(planner_attempt_audit_summary(attempt))
+
+    assert envelope == {"_kind": "planner_attempt_audit", "attempt": attempt.to_dict()}
+    assert summary == {
+        "_kind": "planner_attempt_audit",
+        "ordinal": 1,
+        "planner_call_ordinal": 2,
+        "phase": "discovery",
+        "outcome": "discovery_executed",
+        "planner_code": None,
+        "led_to": "continue",
+    }
+    serialized = json.dumps(envelope)
+    assert "argument" not in serialized
+    assert "content" not in serialized
+
+
+def test_planner_rows_interleave_logical_attempt_after_matching_physical_call() -> None:
+    failed_call = _make_planner_llm_call(1, status=ComposerLLMCallStatus.API_ERROR)
+    response_call = _make_planner_llm_call(2)
+    attempt = _make_planner_attempt(1, 2)
+
+    records = interleave_planner_audit_records((failed_call, response_call), (attempt,))
+
+    assert records == (failed_call, response_call, attempt)
+
+
+def test_planner_rows_reject_a_semantic_response_without_exactly_one_attempt() -> None:
+    response_call = _make_planner_llm_call(1)
+
+    with pytest.raises(AuditIntegrityError, match="semantic response has no planner attempt"):
+        interleave_planner_audit_records((response_call,), ())
+
+
+def test_planner_rows_require_strictly_increasing_physical_call_ordinals() -> None:
+    later_call = _make_planner_llm_call(3)
+    earlier_call = _make_planner_llm_call(2)
+
+    with pytest.raises(AuditIntegrityError, match="physical ordinals must be strictly increasing"):
+        interleave_planner_audit_records(
+            (later_call, earlier_call),
+            (_make_planner_attempt(1, 3), _make_planner_attempt(2, 2)),
+        )
+
+
+def test_planner_rows_require_response_order_to_match_attempt_order() -> None:
+    first_response = _make_planner_llm_call(2)
+    second_response = _make_planner_llm_call(5)
+
+    with pytest.raises(AuditIntegrityError, match="response order must match semantic attempt order"):
+        interleave_planner_audit_records(
+            (first_response, second_response),
+            (_make_planner_attempt(1, 5), _make_planner_attempt(2, 2)),
+        )
+
+
+def test_planner_rows_allow_gaps_between_strictly_increasing_physical_ordinals() -> None:
+    first_response = _make_planner_llm_call(2)
+    second_response = _make_planner_llm_call(5)
+
+    assert interleave_planner_audit_records(
+        (first_response, second_response),
+        (_make_planner_attempt(1, 2), _make_planner_attempt(2, 5)),
+    ) == (
+        first_response,
+        _make_planner_attempt(1, 2),
+        second_response,
+        _make_planner_attempt(2, 5),
+    )
 
 
 def test_resolve_session_is_no_op() -> None:

@@ -232,6 +232,9 @@ async def _stage(
             user_id="user-1",
             preferences=_FakePreferences(trust_mode=trust_mode),
             recorder=MagicMock(spec=BufferingRecorder, llm_calls=(), invocations=()),
+            planner_llm_calls=(),
+            planner_attempts=(),
+            planner_invocations=(),
             plugin_snapshot=None,
         )
     return result, sessions

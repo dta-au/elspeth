@@ -38,7 +38,7 @@ from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PipelineCandidatePolicyRejection, PlannerOriginatingMessage
+from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict, PipelineCandidatePolicyRejection, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
@@ -50,7 +50,7 @@ from elspeth.web.composer.protocol import (
     PipelineCommitIntent,
     ToolArgumentError,
 )
-from elspeth.web.composer.recipes import recipe_catalog_content_hash
+from elspeth.web.composer.recipes import RecipeIntentContext, match_registered_recipe_intent, recipe_catalog_content_hash
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerAvailability,
@@ -69,6 +69,8 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
+from elspeth.web.composer.tools._common import ReviewedSourceAuthority
+from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -80,7 +82,7 @@ from elspeth.web.execution.schemas import (
     ValidationResult as ValidationResultModel,
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.protocol import GuidedOperationFence
@@ -201,6 +203,385 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         lease_token=custody_fence.lease_token,
         attempt=custody_fence.attempt,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_path", "include_format", "reviewed_format", "expected_format"),
+    [
+        ("outputs/projected.json", False, None, "json"),
+        ("outputs/projected.jsonl", False, None, "jsonl"),
+        ("outputs/projected.json", True, None, "json"),
+        ("outputs/projected.jsonl", True, "json", "json"),
+        ("outputs/projected.json", True, "jsonl", "jsonl"),
+    ],
+)
+async def test_guided_reviewed_boundary_attempts_registered_recipe_before_provider(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    output_path: str,
+    include_format: bool,
+    reviewed_format: str | None,
+    expected_format: str,
+) -> None:
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "22222222-2222-4222-8222-222222222222"
+    blob_id = str(uuid4())
+    output_options: dict[str, object] = {"path": output_path}
+    if include_format:
+        output_options["format"] = reviewed_format
+    guided = GuidedSession(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        root_intent_message_id="33333333-3333-4333-8333-333333333333",
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="briefs",
+                plugin="json",
+                options={"path": f"blob:{blob_id}"},
+                observed_columns=("document_uri",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="projected",
+                plugin="json",
+                options=output_options,
+                required_fields=("document_uri", "abstract"),
+                schema_mode="observed",
+                on_write_failure="discard",
+            )
+        },
+    )
+    sentinel_plan = object()
+    captured: dict[str, Any] = {}
+    provider_calls: list[dict[str, Any]] = []
+
+    async def capture_registered_recipe(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        context = kwargs["intent_context"]
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        llm_id = PluginId("transform", "llm")
+        single_profile_snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash=snapshot.policy_hash,
+            principal_scope=snapshot.principal_scope,
+            available=snapshot.available,
+            unavailable=snapshot.unavailable,
+            selected=snapshot.selected,
+            usable_profile_aliases=((llm_id, ("approved-summary",)),),
+            selected_profile_aliases=((llm_id, "approved-summary"),),
+            binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
+            control_modes=snapshot.control_modes,
+            authority=snapshot.authority,
+        )
+        match = match_registered_recipe_intent(replace(context, policy_snapshot=single_profile_snapshot))
+        return sentinel_plan if match is not None else None
+
+    async def capture_provider_plan(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        return sentinel_plan
+
+    monkeypatch.setattr("elspeth.web.composer.service.try_prepare_registered_recipe_plan", capture_registered_recipe)
+    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_provider_plan)
+    session_id = uuid4()
+    result, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
+        intent=(
+            "Fetch every `document_uri`, have an LLM write a short `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public-page abstract research'."
+        ),
+        current_state=_empty_state(),
+        guided=guided,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(uuid4()),
+            content="Build the reviewed pipeline.",
+            user_id="test-user",
+        ),
+        base=PresentBase(state_id=uuid4(), composition_content_hash="0" * 64),
+        user_id="test-user",
+        supersedes_draft_hash=None,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id=str(uuid4()),
+            lease_token=uuid4().hex,
+            attempt=1,
+        ),
+    )
+
+    assert result is sentinel_plan
+    context = captured["intent_context"]
+    assert type(context) is RecipeIntentContext
+    assert context.reviewed_sources[0].field_names == ("document_uri",)
+    assert context.reviewed_outputs[0].required_fields == ("document_uri", "abstract")
+    assert context.source_bindings[0].blob_id == blob_id
+    assert context.output_bindings[0].path == output_path
+    assert context.output_bindings[0].format == expected_format
+    assert len(provider_calls) == (1 if expected_format == "json" else 0)
+
+
+@pytest.mark.asyncio
+async def test_complete_registered_recipe_projection_conflict_returns_before_provider(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "22222222-2222-4222-8222-222222222222"
+    blob_id = str(uuid4())
+    guided = GuidedSession(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        root_intent_message_id="33333333-3333-4333-8333-333333333333",
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="briefs",
+                plugin="json",
+                options={"path": f"blob:{blob_id}"},
+                observed_columns=("document_uri",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="projected",
+                plugin="json",
+                options={"path": "outputs/projected.jsonl", "format": "jsonl"},
+                required_fields=("document_uri", "abstract"),
+                schema_mode="observed",
+                on_write_failure="discard",
+            )
+        },
+    )
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    llm_id = PluginId("transform", "llm")
+    single_profile_snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=snapshot.policy_hash,
+        principal_scope=snapshot.principal_scope,
+        available=snapshot.available,
+        unavailable=snapshot.unavailable,
+        selected=snapshot.selected,
+        usable_profile_aliases=((llm_id, ("approved-summary",)),),
+        selected_profile_aliases=((llm_id, "approved-summary"),),
+        binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
+        control_modes=snapshot.control_modes,
+        authority=snapshot.authority,
+    )
+    monkeypatch.setattr(
+        composer_service_with_real_sessions,
+        "_plugin_policy_context",
+        lambda _user_id: (
+            single_profile_snapshot,
+            PolicyCatalogView.for_trained_operator(create_catalog_service(), single_profile_snapshot),
+        ),
+    )
+    monkeypatch.setattr(
+        composer_service_with_real_sessions,
+        "_planner_preview_preflight",
+        AsyncMock(
+            spec=composer_service_with_real_sessions._planner_preview_preflight,
+            return_value=None,
+        ),
+    )
+    provider_calls: list[dict[str, Any]] = []
+
+    async def capture_provider(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        raise AssertionError("complete deterministic conflict must not call the provider")
+
+    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_provider)
+    session_id = uuid4()
+
+    outcome = await composer_service_with_real_sessions.plan_guided_pipeline(
+        intent=(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain only `abstract`. "
+            "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+        ),
+        current_state=_empty_state(),
+        guided=guided,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(uuid4()),
+            content="Build the reviewed pipeline.",
+            user_id="test-user",
+        ),
+        base=PresentBase(state_id=uuid4(), composition_content_hash="0" * 64),
+        user_id="test-user",
+        supersedes_draft_hash=None,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id=str(uuid4()),
+            lease_token=uuid4().hex,
+            attempt=1,
+        ),
+    )
+
+    assert type(outcome) is GuidedPlannerConflict
+    assert outcome.error_code == "reviewed_output_projection_conflict"
+    assert outcome.missing_fields == ("document_uri",)
+    assert provider_calls == []
+
+
+@pytest.mark.asyncio
+async def test_guided_complete_registered_recipe_prepares_real_plan_without_provider_and_preserves_reviewed_authority(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "22222222-2222-4222-8222-222222222222"
+    blob_id = str(uuid4())
+    source_options = {"path": f"blob:{blob_id}", "schema": {"mode": "observed"}}
+    output_options = {
+        "path": "outputs/projected.jsonl",
+        "format": "jsonl",
+        "schema": {"mode": "observed"},
+        "mode": "write",
+        "collision_policy": "auto_increment",
+    }
+    guided = GuidedSession(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        root_intent_message_id="33333333-3333-4333-8333-333333333333",
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="briefs",
+                plugin="json",
+                options=source_options,
+                observed_columns=("document_uri",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="projected",
+                plugin="json",
+                options=output_options,
+                required_fields=("document_uri", "abstract"),
+                schema_mode="observed",
+                on_write_failure="discard",
+            )
+        },
+    )
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = _make_settings(
+        data_dir=tmp_path,
+        llm_profiles={
+            "approved-summary": {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            }
+        },
+        default_llm_profile="approved-summary",
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    full_catalog = create_catalog_service()
+
+    class _NoSecrets:
+        def has_server_ref(self, name: str) -> bool:
+            return False
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return False
+
+    usable = build_plugin_snapshot(
+        policy=policy,
+        catalog=full_catalog,
+        profiles=profiles,
+        principal_scope="local:test-user",
+        secret_inventory=_NoSecrets(),
+        generation_key=b"registered-recipe-service-test",
+    )
+    policy_catalog = PolicyCatalogView(full_catalog, usable, profiles)
+    monkeypatch.setattr(composer_service_with_real_sessions, "_plugin_policy_context", lambda _user_id: (usable, policy_catalog))
+    monkeypatch.setattr(
+        "elspeth.web.composer.service.plan_pipeline",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("complete registered match must not call provider planner")),
+    )
+    monkeypatch.setattr(
+        composer_service_with_real_sessions,
+        "_planner_preview_preflight",
+        AsyncMock(
+            spec=composer_service_with_real_sessions._planner_preview_preflight,
+            return_value=None,
+        ),
+    )
+    session_id = uuid4()
+    canonical_source = tmp_path / "blobs" / str(session_id) / "briefs.json"
+    canonical_source.parent.mkdir(parents=True)
+    canonical_source.write_text('[{"document_uri":"https://agency.gov.au/brief"}]')
+
+    def resolve_test_authority(**kwargs: Any) -> ReviewedSourceAuthority:
+        facts = kwargs["reviewed_facts"]
+        return ReviewedSourceAuthority(
+            session_id=kwargs["session_id"],
+            reviewed_anchor_hash=kwargs["expected_reviewed_anchor_hash"],
+            reviewed_sources=facts["reviewed_sources"],
+            verified_blob_paths={f"blob:{blob_id}": str(canonical_source)},
+        )
+
+    monkeypatch.setattr(
+        "elspeth.web.composer.pipeline_planner.resolve_reviewed_source_authority",
+        resolve_test_authority,
+    )
+    plan, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
+        intent=(
+            "Fetch every `document_uri`, have an LLM write a short `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public-page abstract research'."
+        ),
+        current_state=_empty_state(),
+        guided=guided,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(uuid4()),
+            content="Build the reviewed pipeline.",
+            user_id="test-user",
+        ),
+        base=PresentBase(state_id=uuid4(), composition_content_hash="0" * 64),
+        user_id="test-user",
+        supersedes_draft_hash=None,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id=str(uuid4()),
+            lease_token=uuid4().hex,
+            attempt=1,
+        ),
+    )
+
+    assert plan.provider == "server"
+    assert plan.model_identifier == "composer-server-recipe-router"
+    candidate = plan.candidate_state
+    assert candidate.sources["briefs"].options == {
+        "path": str(canonical_source),
+        "schema": {"mode": "observed"},
+    }
+    assert candidate.sources["briefs"].on_validation_failure == "discard"
+    assert deep_thaw(candidate.outputs[0].options) == {
+        **output_options,
+        "schema": {"mode": "observed", "required_fields": ["document_uri", "abstract"]},
+    }
+    assert candidate.outputs[0].on_write_failure == "discard"
+    assert candidate.nodes[-1].plugin == "field_mapper"
+    assert candidate.nodes[-1].options["mapping"] == {"document_uri": "document_uri", "abstract": "abstract"}
 
 
 @pytest.mark.asyncio

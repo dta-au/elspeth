@@ -19,6 +19,8 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer import planner_authoring_aids
+from elspeth.web.composer.planner_authoring_aids import discovery_digest
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.plugin_policy.models import (
@@ -145,6 +147,30 @@ def test_other_unavailable_reasons_are_not_listed_as_prohibited() -> None:
 
     assert "aws_s3" not in {item.name for item in data["available"]}
     assert data["prohibited"] == ()
+
+
+def test_discovery_digest_and_list_tools_share_exact_prohibited_projection_for_every_kind() -> None:
+    catalog = _mock_catalog()
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    identities = {
+        "source": next(plugin for plugin in unrestricted.available if plugin.kind == "source"),
+        "transform": next(plugin for plugin in unrestricted.available if plugin.kind == "transform"),
+        "sink": next(plugin for plugin in unrestricted.available if plugin.kind == "sink"),
+    }
+    snapshot = _snapshot_with_unavailable(
+        catalog,
+        *(PluginAvailability(plugin_id, PluginUnavailableReason.WEB_SURFACE_PROHIBITED) for plugin_id in identities.values()),
+    )
+    view = _view(catalog, snapshot)
+    digest = discovery_digest(view)
+
+    for kind, tool_name in (("source", "list_sources"), ("transform", "list_transforms"), ("sink", "list_sinks")):
+        result = execute_tool(tool_name, {}, _empty_state(), view, plugin_snapshot=snapshot)
+        assert result.success is True
+        assert digest["prohibited"][f"{kind}s"] == list(result.data["prohibited"])
+
+    assert "_PROHIBITED_REASON" not in planner_authoring_aids.__dict__
+    assert "_PROHIBITED_EXPLANATION" not in planner_authoring_aids.__dict__
 
 
 def test_list_transforms_and_list_sinks_carry_the_same_prohibited_shape() -> None:

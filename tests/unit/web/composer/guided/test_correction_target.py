@@ -233,3 +233,23 @@ def test_synthetic_public_edge_is_authoritative_without_a_private_edge_position(
     _connection(exact_successor, OUTPUT_FAILURE)["to_endpoint"] = _endpoint("node", NODE_B)
     exact_successor["connections"].reverse()  # type: ignore[union-attr]
     require_guided_correction_target_changed(exact_successor, target, _predecessor())
+
+
+def test_edge_acceptance_rejects_a_selected_reroute_that_also_changes_a_sibling_route() -> None:
+    predecessor = _predecessor()
+    wire = _wire()
+    target = resolve_guided_correction_target(
+        requested=ComponentTarget(kind="edge", stable_id=EDGE_A),
+        wire_payload=wire,
+        predecessor=predecessor,
+    )
+    successor_wire = deepcopy(wire)
+    _connection(successor_wire, EDGE_A)["to_endpoint"] = _endpoint("node", NODE_B)
+    _connection(successor_wire, EDGE_B)["to_endpoint"] = _endpoint("node", NODE_A)
+    successor_sources = dict(predecessor.sources)
+    successor_sources["source_a"] = replace(successor_sources["source_a"], on_success="rows_b")
+    successor_sources["source_b"] = replace(successor_sources["source_b"], on_success="rows_a")
+    successor = replace(predecessor, sources=successor_sources)
+
+    with pytest.raises(AuditIntegrityError, match="outside selected edge authority"):
+        require_guided_correction_target_changed(successor_wire, target, successor)

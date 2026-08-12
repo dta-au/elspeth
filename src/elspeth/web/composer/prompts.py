@@ -207,14 +207,12 @@ def build_catalog_context_string(
     transform_plugins = catalog.list_transforms()
     sink_plugins = catalog.list_sinks()
 
-    # No ``plugin_hints`` block: ``authoring_aids.discovery_digest.plugins``
-    # already carries every visible plugin's ``composer_hints`` verbatim, from
-    # the same ``catalog.list_*()`` sweep (``_plugin_summaries``), and emits an
-    # entry per plugin rather than only those with hints — a strict superset.
-    # A separate block restated every visible plugin's hints a second time in
-    # this same message — 21-22 KB of it under the round-3 16-plugin policy
-    # (elspeth-8c457883c2). Surface JIT hints through the digest; do not
-    # reintroduce a parallel carrier here.
+    # No ``plugin_hints`` block: ``authoring_aids.discovery_digest.plugins`` is
+    # the compact, complete selection index. Detailed ``composer_hints`` travel
+    # with the chosen plugin's JIT ``get_plugin_schema`` contract. A separate
+    # block restated every visible plugin's hints in this same message — 21-22
+    # KB under the round-3 16-plugin policy (elspeth-8c457883c2). Keep those
+    # tiers separate; do not reintroduce a parallel carrier here.
     context = {
         "available_plugins": {
             "sources": [p.name for p in source_plugins],

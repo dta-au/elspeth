@@ -169,6 +169,32 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-12 — planner calls and semantic attempts are paired, not counted
+  positionally**: a physical provider transport failure has no semantic
+  attempt. Every response-bearing planner call (`success` or
+  `malformed_response`) has exactly one adjacent `planner_attempt_audit` row,
+  whose logical `ordinal` is contiguous even when physical
+  `planner_call_ordinal` values have retry gaps. Each `plan_pipeline` request
+  restarts both ordinal spaces at 1, so a session transcript can contain
+  multiple valid ordinal-reset cohorts. Persist each request's LLM calls,
+  attempts, then tool invocations through the existing atomic audit writer;
+  never infer attempt/call ownership by array position, and never turn an
+  unavailable or malformed audit view into zero-call evidence.
+
+- **2026-08-12 — restricted planner terminals carry schema and materializer
+  custody together**: `PlannerTerminalContract` owns the exact schema advertised
+  on every normal, repair, and escape-hatch turn plus the function that expands
+  that admitted request shape into the canonical pipeline. Restricted contracts
+  also carry a request instruction that tells the provider to follow the
+  advertised delta rather than the shared core's full-document language. If the materializer
+  restores server-owned source, node, or output configuration, return
+  `PlannerTerminalMaterialization` with those component refs; materialization
+  happens before the ordinary candidate finalizer, so relying only on the
+  finalizer diff would expose private validator detail in repair feedback.
+  Freeform and guided-full keep the canonical identity contract. Reviewed
+  guided initial/correction requests select an authority-derived delta, while
+  prose amend/replace remains full-document authoring.
+
 - **2026-08-11 — the AWS IAM policy templates and the deploy README's floor
   commit are both pinned; editing either without its sibling update is red**:
   `tests/unit/deployment/test_aws_iam_policy_oracles.py` now pins the exact set

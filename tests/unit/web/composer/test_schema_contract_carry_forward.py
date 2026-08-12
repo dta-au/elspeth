@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import cast
 
+import pytest
 from pydantic import SecretBytes
 
 from elspeth.contracts.hashing import canonical_json
@@ -643,7 +644,7 @@ def test_multiple_contracts_are_referenced_first_deterministic_and_fetched_once(
     ]
 
 
-def test_oversize_contract_is_omitted_whole_and_reported_closedly() -> None:
+def test_oversize_contract_is_omitted_as_unsupported_before_envelope_budgeting() -> None:
     identity: tuple[PluginKind, str] = ("source", "huge")
     catalog = _MultiSchemaCatalog((identity,), huge=identity)
     view, _snapshot = _multi_policy_view(catalog)
@@ -657,7 +658,35 @@ def test_oversize_contract_is_omitted_whole_and_reported_closedly() -> None:
     assert evidence["schemas"] == []
     assert evidenced == frozenset()
     assert evidence["canonical_bytes_used"] == len(canonical_json(evidence).encode("utf-8"))
-    assert evidence["omitted"] == [{"plugin_id": "source/huge", "reason": "canonical_byte_budget_exceeded"}]
+    assert evidence["omitted"] == [{"plugin_id": "source/huge", "reason": "schema_projection_unsupported"}]
+
+
+@pytest.mark.parametrize("malformation", ["deep", "noncanonical"])
+def test_unbounded_or_noncanonical_contract_is_omitted_without_escaping(malformation: str) -> None:
+    class _MalformedEvidenceCatalog(_SchemaCatalog):
+        def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
+            schema = super().get_schema(plugin_type, name)
+            raw = schema.model_dump()
+            if malformation == "deep":
+                nested: dict[str, object] = {"type": "string"}
+                for _ in range(80):
+                    nested = {"items": nested}
+                raw["json_schema"] = nested
+            else:
+                raw["json_schema"] = {"type": "object", "default": frozenset({"not-json"})}
+            return PluginSchemaInfo.model_validate(raw)
+
+    view, _snapshot = _policy_view(_MalformedEvidenceCatalog())
+
+    evidence, evidenced = build_schema_contract_evidence(
+        view,
+        schemas_loaded=frozenset({("source", "csv")}),
+        referenced={("source", "csv")},
+    )
+
+    assert evidence["schemas"] == []
+    assert evidenced == frozenset()
+    assert evidence["omitted"] == [{"plugin_id": "source/csv", "reason": "schema_projection_unsupported"}]
 
 
 def test_entry_budget_is_explicit_and_never_emits_a_partial_ninth_contract() -> None:

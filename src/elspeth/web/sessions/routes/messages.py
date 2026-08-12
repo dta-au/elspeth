@@ -998,7 +998,10 @@ def register_message_routes(router: APIRouter) -> None:
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         limit: int = Query(100, ge=1, le=500),
         offset: int = Query(0, ge=0),
-        include_llm_audit: bool = Query(False),
+        include_llm_audit: bool = Query(
+            False,
+            description="Include value-free LLM-call rows and their paired semantic planner-attempt rows.",
+        ),
         include_raw_content: bool = Query(False),
         include_tool_rows: bool = Query(False),
     ) -> list[ChatMessageResponse]:
@@ -1029,8 +1032,10 @@ def register_message_routes(router: APIRouter) -> None:
         # Fetch before slicing so hidden audit rows cannot skew normal-chat
         # pagination. The service remains the durable audit store; this route
         # is the user-facing conversation channel. The eval harness can opt in
-        # to LLM-call sidecars, which contain model/usage/cost metadata but not
-        # raw prompts, provider reasoning artifacts, tool arguments, or tool results.
+        # to paired LLM-call/planner-attempt sidecars. They contain bounded
+        # model/usage/cost metadata and closed decision classifications, but
+        # not raw prompts, provider reasoning artifacts, tool arguments,
+        # candidate values, or tool results.
         messages = await service.get_messages(session.id, limit=None)
         if include_tool_rows and include_llm_audit:
             conversation_messages = _composer_conversation_tool_or_llm_audit_messages(messages)

@@ -4,6 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
@@ -36,7 +37,11 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedCorrectionMessageRef
+from elspeth.web.composer.guided.state_machine import (
+    GUIDED_MAX_CHAT_CONTENT_CHARS,
+    ComponentTarget,
+    GuidedCorrectionMessageRef,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import (
@@ -2642,7 +2647,7 @@ async def post_guided_respond(
         RecoveredPipelineCommit,
         prepare_pipeline_proposal_commit,
     )
-    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PlannerOriginatingMessage
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict, GuidedPlannerDecline, PlannerOriginatingMessage
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
@@ -2676,6 +2681,27 @@ async def post_guided_respond(
     # calls and blank content), but a ChatTurn requires non-empty content.
     # Mirrors guided_plan.py's identical fallback for the guided-full surface.
     _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
+
+    def _projection_conflict_text(conflict: GuidedPlannerConflict) -> str:
+        noun = "field" if len(conflict.missing_fields) == 1 else "fields"
+        prefix = f"The exact retained-field projection omits reviewed output {noun} "
+        suffix = ". Update the projection or the reviewed output contract before planning again."
+        overflow_text = (
+            "The exact retained-field projection omits reviewed output fields whose identifiers are too long "
+            "to display safely. Update the projection or the reviewed output contract before planning again."
+        )
+        rendered_fields: list[str] = []
+        rendered_length = len(prefix) + len(suffix)
+        for name in conflict.missing_fields:
+            separator = ", " if rendered_fields else ""
+            rendered_name = f"`{name}`"
+            rendered_length += len(separator) + len(rendered_name)
+            if rendered_length > GUIDED_MAX_CHAT_CONTENT_CHARS:
+                return overflow_text
+            rendered_fields.append(f"{separator}{rendered_name}")
+        if not rendered_fields:
+            return overflow_text
+        return f"{prefix}{''.join(rendered_fields)}{suffix}"
 
     service: SessionServiceProtocol = request.app.state.session_service
     composer = request.app.state.composer_service
@@ -3408,10 +3434,10 @@ async def post_guided_respond(
                     prepared_next: PreparedGuidedJsonPayload | None = None
                     existing_meta = dict(deep_thaw(state_record.composer_meta)) if state_record and state_record.composer_meta else {}
 
-                    async def _settle_guided_planner_decline(
+                    async def _settle_guided_planner_nonproposal(
                         *,
                         base_guided: GuidedSession,
-                        decline_text: str,
+                        assistant_text: str,
                         current_state: CompositionState,
                         current_state_record: CompositionStateRecord | None,
                         current_meta: Mapping[str, Any],
@@ -3424,14 +3450,14 @@ async def post_guided_respond(
                         tool_invocation_count: int | None = None,
                         user_instruction: str | None = None,
                     ) -> GuidedRespondResponse:
-                        """Persist an escape-hatch decline as an ordinary chat turn.
+                        """Persist a completed planner nonproposal as an ordinary chat turn.
 
-                        Mirrors guided_plan.py's identical PlannerDeclined handling
-                        (a decline is a conversational outcome, never routed
-                        through GuidedOperationFailureCode): the advisor's own
-                        words are appended to ``base_guided.chat_history`` — the
-                        existing channel ``/guided/chat`` already uses for
-                        assistant text, rendered by the frontend's
+                        Both an advisor decline and a deterministic server-owned
+                        conflict are conversational outcomes, never routed through
+                        ``GuidedOperationFailureCode``. The outcome text is appended
+                        to ``base_guided.chat_history`` — the existing channel
+                        ``/guided/chat`` already uses for assistant text, rendered
+                        by the frontend's
                         ``chatHistory={guidedSession.chat_history}`` regardless
                         of endpoint — and the operation completes via the
                         generic state settlement (legal for kind="guided_respond"
@@ -3450,13 +3476,13 @@ async def post_guided_respond(
                         ``user_instruction`` is the author's verbatim prose when
                         this attempt was driven by one (the step-3 revision
                         instruction, the step-4 wiring correction). It is
-                        recorded ahead of the decline so the transcript reads as
-                        a request and its refusal (R2-F6); without it the
-                        decline renders as a reply to nothing. The auto-plan
-                        caller has no author prose and passes nothing.
+                        recorded ahead of the outcome so the transcript reads as
+                        a request and its answer (R2-F6); without it the answer
+                        renders as a reply to nothing. The auto-plan caller has no
+                        author prose and passes nothing.
                         """
 
-                        decline_ts_iso = datetime.now(UTC).isoformat()
+                        outcome_ts_iso = datetime.now(UTC).isoformat()
                         instruction_turns = (
                             ()
                             if user_instruction is None
@@ -3466,40 +3492,40 @@ async def post_guided_respond(
                                     content=user_instruction,
                                     seq=base_guided.chat_turn_seq,
                                     step=base_guided.step,
-                                    ts_iso=decline_ts_iso,
+                                    ts_iso=outcome_ts_iso,
                                 ),
                             )
                         )
-                        declined_guided = _replace(
+                        settled_guided = _replace(
                             base_guided,
                             chat_history=(
                                 *base_guided.chat_history,
                                 *instruction_turns,
                                 ChatTurn(
                                     role=ChatRole.ASSISTANT,
-                                    content=decline_text,
+                                    content=assistant_text,
                                     seq=base_guided.chat_turn_seq + len(instruction_turns),
                                     step=base_guided.step,
-                                    ts_iso=decline_ts_iso,
+                                    ts_iso=outcome_ts_iso,
                                     assistant_message_kind="assistant",
                                 ),
                             ),
                             chat_turn_seq=base_guided.chat_turn_seq + len(instruction_turns) + 1,
                         )
-                        declined_state = _replace(current_state, guided_session=declined_guided)
-                        declined_state_dict = declined_state.to_dict()
-                        decline_is_valid, decline_validation_errors = _guided_persisted_validity(declined_state, catalog=catalog)
-                        decline_meta = dict(current_meta)
-                        decline_meta["guided_session"] = declined_guided.to_dict()
-                        decline_payloads = (
+                        settled_state = _replace(current_state, guided_session=settled_guided)
+                        settled_state_dict = settled_state.to_dict()
+                        settled_is_valid, settled_validation_errors = _guided_persisted_validity(settled_state, catalog=catalog)
+                        settled_meta = dict(current_meta)
+                        settled_meta["guided_session"] = settled_guided.to_dict()
+                        settled_payloads = (
                             pending_payloads
                             if any(payload.payload_id == prepared_current.payload_id for payload in pending_payloads)
                             else (*pending_payloads, prepared_current)
                         )
-                        decline_tool_invocations = tool_recorder.invocations
+                        settled_tool_invocations = tool_recorder.invocations
                         if tool_invocation_count is not None:
-                            decline_tool_invocations = decline_tool_invocations[:tool_invocation_count]
-                        decline_settlement = await service.settle_guided_state_operation(
+                            settled_tool_invocations = settled_tool_invocations[:tool_invocation_count]
+                        nonproposal_settlement = await service.settle_guided_state_operation(
                             GuidedStateOperationCommand(
                                 fence=current_fence,
                                 expected_current_state_id=(current_state_record.id if current_state_record is not None else None),
@@ -3509,14 +3535,14 @@ async def post_guided_respond(
                                 ),
                                 state_id=uuid4(),
                                 state=CompositionStateData(
-                                    sources=declined_state_dict["sources"],
-                                    nodes=declined_state_dict["nodes"],
-                                    edges=declined_state_dict["edges"],
-                                    outputs=declined_state_dict["outputs"],
-                                    metadata_=declined_state_dict["metadata"],
-                                    is_valid=decline_is_valid,
-                                    validation_errors=decline_validation_errors,
-                                    composer_meta=decline_meta,
+                                    sources=settled_state_dict["sources"],
+                                    nodes=settled_state_dict["nodes"],
+                                    edges=settled_state_dict["edges"],
+                                    outputs=settled_state_dict["outputs"],
+                                    metadata_=settled_state_dict["metadata"],
+                                    is_valid=settled_is_valid,
+                                    validation_errors=settled_validation_errors,
+                                    composer_meta=settled_meta,
                                 ),
                                 provenance="convergence_persist",
                                 actor="composer_route",
@@ -3529,16 +3555,17 @@ async def post_guided_respond(
                                     ),
                                     assistant_turn_seq=None,
                                 ),
-                                payloads=decline_payloads,
+                                payloads=settled_payloads,
                                 audit_evidence=GuidedAuditEvidence(
-                                    invocations=(*llm_recorder.invocations, *decline_tool_invocations),
+                                    invocations=(*llm_recorder.invocations, *settled_tool_invocations),
                                     llm_calls=llm_recorder.llm_calls,
+                                    planner_attempts=llm_recorder.planner_attempts,
                                     chat_turns=llm_recorder.chat_turns,
                                 ),
                             ),
                             payload_store=payload_store,
                         )
-                        return _response_from_record(decline_settlement.result_state)
+                        return _response_from_record(nonproposal_settlement.result_state)
 
                     # Mirror the preflight dispatch: an active exit bypasses
                     # the Step 3/4 proposal-action branches (exit is the
@@ -3833,10 +3860,15 @@ async def post_guided_respond(
                                 correction_target=correction_target,
                                 revision_authority=revision_authority,
                             )
-                            if isinstance(outcome, GuidedPlannerDecline):
-                                return await _settle_guided_planner_decline(
+                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
+                                assistant_text = (
+                                    outcome.decline_text.strip() or _empty_decline_fallback
+                                    if isinstance(outcome, GuidedPlannerDecline)
+                                    else _projection_conflict_text(outcome)
+                                )
+                                return await _settle_guided_planner_nonproposal(
                                     base_guided=guided,
-                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    assistant_text=assistant_text,
                                     current_state=state,
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
@@ -4020,6 +4052,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -4286,10 +4319,15 @@ async def post_guided_respond(
                                 progress=planner_progress,
                                 correction_target=correction_target,
                             )
-                            if isinstance(outcome, GuidedPlannerDecline):
-                                return await _settle_guided_planner_decline(
+                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
+                                assistant_text = (
+                                    outcome.decline_text.strip() or _empty_decline_fallback
+                                    if isinstance(outcome, GuidedPlannerDecline)
+                                    else _projection_conflict_text(outcome)
+                                )
+                                return await _settle_guided_planner_nonproposal(
                                     base_guided=guided,
-                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    assistant_text=assistant_text,
                                     current_state=state,
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
@@ -4451,6 +4489,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -4748,9 +4787,9 @@ async def post_guided_respond(
                                 actor=user.user_id,
                             )
                         # Candidate answer/advance evidence is durable only if
-                        # planning succeeds. A decline may retain this prefix,
+                        # planning succeeds. A completed nonproposal may retain this prefix,
                         # including the real prospective turn emission above.
-                        decline_tool_invocation_count = len(recorder.invocations)
+                        nonproposal_tool_invocation_count = len(recorder.invocations)
                         emit_turn_answered(
                             recorder,
                             step=prior_step,
@@ -4879,7 +4918,7 @@ async def post_guided_respond(
                                 operation_fence=fence,
                                 progress=planner_progress,
                             )
-                            if isinstance(outcome, GuidedPlannerDecline):
+                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
                                 # Base off the ORIGINAL unmutated guided (still at
                                 # STEP_2_SINK), not resulting_guided (already
                                 # advanced to STEP_3_TRANSFORMS with no proposal):
@@ -4888,14 +4927,19 @@ async def post_guided_respond(
                                 # (STEP_3_TRANSFORMS requires active_proposal).
                                 # Today's failure path already persists nothing
                                 # and leaves the session at STEP_2_SINK; keeping
-                                # that means the decline is a completed operation
-                                # with the advisor's words visible and no
+                                # that means the nonproposal is a completed operation
+                                # with its assistant text visible and no
                                 # state-machine advance. ``prospective`` differs
                                 # from ``guided`` only when this request must
                                 # materialize the current unanswered occurrence.
-                                return await _settle_guided_planner_decline(
+                                assistant_text = (
+                                    outcome.decline_text.strip() or _empty_decline_fallback
+                                    if isinstance(outcome, GuidedPlannerDecline)
+                                    else _projection_conflict_text(outcome)
+                                )
+                                return await _settle_guided_planner_nonproposal(
                                     base_guided=prospective,
-                                    decline_text=outcome.decline_text.strip() or _empty_decline_fallback,
+                                    assistant_text=assistant_text,
                                     current_state=state,
                                     current_state_record=state_record,
                                     current_meta=existing_meta,
@@ -4905,7 +4949,7 @@ async def post_guided_respond(
                                     current_turn=current_turn,
                                     prepared_current=planned_current,
                                     pending_payloads=tuple(prepared_payloads),
-                                    tool_invocation_count=decline_tool_invocation_count,
+                                    tool_invocation_count=nonproposal_tool_invocation_count,
                                 )
                             plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
@@ -5002,6 +5046,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -5107,6 +5152,7 @@ async def post_guided_respond(
                                     audit_evidence=GuidedAuditEvidence(
                                         invocations=planner_recorder.invocations,
                                         llm_calls=planner_recorder.llm_calls,
+                                        planner_attempts=planner_recorder.planner_attempts,
                                         chat_turns=planner_recorder.chat_turns,
                                     ),
                                 ),
@@ -5121,10 +5167,20 @@ async def post_guided_respond(
                     raise
                 # Only planner terminal exceptions carry this evidence marker.
                 attached_calls = exc_dict["llm_calls"]
+                attached_attempts = exc_dict["planner_attempts"]
                 carrier_error: AuditIntegrityError | None = None
                 if type(attached_calls) is not tuple or attached_calls != planner_recorder.llm_calls:
                     carrier_error = AuditIntegrityError("guided planner cancellation carried malformed or unrelated LLM audit evidence")
                     attached_calls = planner_recorder.llm_calls
+                if (
+                    type(attached_attempts) is not tuple
+                    or any(type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts)
+                    or attached_attempts != planner_recorder.planner_attempts
+                ):
+                    carrier_error = AuditIntegrityError(
+                        "guided planner cancellation carried malformed or unrelated semantic attempt evidence"
+                    )
+                    attached_attempts = planner_recorder.planner_attempts
                 try:
                     await _await_with_deferred_cancellation(
                         service.fail_guided_operation_with_audit(
@@ -5135,6 +5191,7 @@ async def post_guided_respond(
                                 audit_evidence=GuidedAuditEvidence(
                                     invocations=planner_recorder.invocations,
                                     llm_calls=attached_calls,
+                                    planner_attempts=attached_attempts,
                                     chat_turns=planner_recorder.chat_turns,
                                 ),
                             ),
@@ -5187,6 +5244,7 @@ async def post_guided_respond(
                             audit_evidence=GuidedAuditEvidence(
                                 invocations=planner_recorder.invocations,
                                 llm_calls=planner_recorder.llm_calls,
+                                planner_attempts=planner_recorder.planner_attempts,
                                 chat_turns=planner_recorder.chat_turns,
                             ),
                             unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),

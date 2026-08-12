@@ -130,6 +130,38 @@ def _planner_terminal_response() -> _PlannerResponse:
     )
 
 
+def _source_validation_failure_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict
+        and type(connection.get("flow")) is dict
+        and connection["flow"].get("kind") == "source_validation_failure"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
+def _node_error_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict and type(connection.get("flow")) is dict and connection["flow"].get("kind") == "node_error"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
 def _create_session(client: TestClient) -> str:
     """Create a session and return its string id."""
     resp = client.post("/api/sessions", json={"title": "respond-test"})
@@ -1017,7 +1049,6 @@ class TestStep2IntraStep:
             custom_inputs=["client", "amount_aud"],
         )
         guided_facts = _full_guided_session(reviewed)
-        source_name = next(iter(guided_facts["reviewed_sources"].values()))["name"]
         assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
             "order_id",
             "region",
@@ -1068,25 +1099,20 @@ class TestStep2IntraStep:
                 },
             }
         ]
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
+        gap_closing_nodes[0]["on_success"] = reviewed_output_name
         planner_pipeline = {
-            "sources": {
-                source_name: {
-                    "plugin": "csv",
-                    "options": {},
-                    "on_success": "planner_rows" if provider_heeds_gap else "planned_sink",
-                    "on_validation_failure": "discard",
-                }
-            },
-            "nodes": gap_closing_nodes if provider_heeds_gap else [],
-            "edges": [],
-            "outputs": [
+            "source_routes": [
                 {
-                    "sink_name": "planned_sink",
-                    "plugin": "json",
-                    "options": {},
-                    "on_write_failure": "abort",
+                    "stable_id": source_stable_id,
+                    "on_success": "planner_rows" if provider_heeds_gap else reviewed_output_name,
                 }
             ],
+            "nodes": gap_closing_nodes if provider_heeds_gap else [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
         }
 
         async def terminal_completion(**_kwargs: Any) -> _PlannerResponse:
@@ -1171,6 +1197,20 @@ class TestStep2IntraStep:
         assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
         gap = planner_contexts[0]["unproducible_output_fields"]
         assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds
+        assert len(planner_evidence_kinds) % 2 == 0
+        assert all(
+            planner_evidence_kinds[index : index + 2] == ["llm_call_audit", "planner_attempt_audit"]
+            for index in range(0, len(planner_evidence_kinds), 2)
+        )
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
@@ -2118,7 +2158,7 @@ class TestStep2IntraStep:
         staged = self._stage_proposal(composer_test_client, session_id, filename="edge-custody.jsonl")
         turn = staged["next_turn"]
         payload = turn["payload"]
-        edge_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "edge")
+        edge_target = _source_validation_failure_edit_target(payload)
         reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
         assert staged["composition_state"]["sources"] == {}
 
@@ -2997,10 +3037,7 @@ class TestStep2IntraStep:
             "turn_token": wire_turn["turn_token"],
             "proposal_id": wire_payload["proposal_id"],
             "draft_hash": wire_payload["draft_hash"],
-            "edit_target": {
-                "kind": "edge",
-                "stable_id": wire_payload["connections"][0]["stable_id"],
-            },
+            "edit_target": _source_validation_failure_edit_target(wire_payload),
             "correction_feedback": feedback,
         }
 
@@ -4081,6 +4118,383 @@ class TestStep2IntraStep:
         assert last_operation["failure_code"] is None
         assert last_operation["result_kind"] == "composition_state"
 
+    def test_actual_escape_hatch_decline_persists_paired_planner_evidence(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary decline settlement keeps both halves of planner evidence."""
+        session_id = _create_session(composer_test_client)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={
+                "operation_id": str(uuid4()),
+                "intent": "Build a pipeline that annotates each row before saving.",
+            },
+        )
+        assert started.status_code == 200, started.json()
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "actual-decline.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        app = composer_test_client.app
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(
+                update={
+                    "composer_model": "test/guided-planner",
+                    "composer_max_discovery_turns": 1,
+                }
+            ),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        responses = iter(
+            (
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sources",
+                                        function=_PlannerFunction(name="list_sources", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sinks",
+                                        function=_PlannerFunction(name="list_sinks", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content="I cannot produce a safe proposal from the reviewed facts.",
+                                tool_calls=[],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="anthropic/claude-sonnet-4-6",
+                    id="guided-advisor-decline",
+                ),
+            )
+        )
+
+        async def declining_completion(**_kwargs: Any) -> _PlannerResponse:
+            return next(responses)
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", declining_completion)
+
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        assert _full_guided_session(declined.json())["chat_history"][-1]["content"] == (
+            "I cannot produce a safe proposal from the reviewed facts."
+        )
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds == [
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+        ]
+
+    def test_reviewed_projection_conflict_completes_without_proposal_or_failure_and_replays(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "projection-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        before = _get_guided(composer_test_client, session_id)
+        preserved_turn = before["next_turn"]
+        preserved_graph = {key: before["composition_state"][key] for key in ("sources", "nodes", "edges", "outputs")}
+
+        async def conflict_planner(**_kwargs: object) -> object:
+            return GuidedPlannerConflict(missing_fields=("document_uri",))
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            conflict_planner,
+        )
+        operation_id = str(uuid4())
+        request_body = {
+            "operation_id": operation_id,
+            "turn_token": preserved_turn["turn_token"],
+            "component_action": {"action": "finish", "component_kind": "output"},
+        }
+
+        conflicted = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_body,
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        body = conflicted.json()
+        assert body["next_turn"] == preserved_turn
+        assert body["guided_session"]["step"] == "step_2_sink"
+        assert _full_guided_session(body)["active_proposal"] is None
+        assert {key: body["composition_state"][key] for key in ("sources", "nodes", "edges", "outputs")} == preserved_graph
+        assistant_turn = _full_guided_session(body)["chat_history"][-1]
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == (
+            "The exact retained-field projection omits reviewed output field `document_uri`. "
+            "Update the projection or the reviewed output contract before planning again."
+        )
+
+        replayed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_body,
+        )
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == body
+
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            operation = (
+                conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+            )
+        assert operation["status"] == "completed"
+        assert operation["failure_code"] is None
+        assert operation["result_kind"] == "composition_state"
+
+    def test_reviewed_projection_conflict_with_oversized_field_name_settles_with_bounded_text(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_CONTENT_CHARS
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "oversized-projection-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        async def conflict_planner(**_kwargs: object) -> object:
+            return GuidedPlannerConflict(missing_fields=("x" * GUIDED_MAX_CHAT_CONTENT_CHARS,))
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            conflict_planner,
+        )
+
+        operation_id = str(uuid4())
+        conflicted = _post_current_response(
+            composer_test_client,
+            session_id,
+            operation_id=operation_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        assistant_turn = _full_guided_session(conflicted.json())["chat_history"][-1]
+        assert assistant_turn["role"] == "assistant"
+        assert len(assistant_turn["content"]) <= GUIDED_MAX_CHAT_CONTENT_CHARS
+        assert "reviewed output" in assistant_turn["content"]
+        assert "Update the projection" in assistant_turn["content"]
+
+    def test_staged_http_registered_recipe_projection_conflict_never_calls_completion(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={
+                "operation_id": str(uuid4()),
+                "intent": (
+                    "Fetch every `document_uri`, have an LLM write an `abstract`, and retain only `abstract`. "
+                    "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+                ),
+            },
+        )
+        assert started.status_code == 200, started.json()
+
+        _seed_blob(
+            composer_test_client,
+            session_id,
+            content="document_uri\nhttps://example.gov.au/brief\n",
+        )
+        _get_guided(composer_test_client, session_id)
+        selected = _respond(composer_test_client, session_id, chosen=["csv"])
+        inspected = _respond(
+            composer_test_client,
+            session_id,
+            edited_values={"plugin": "csv", "options": selected["next_turn"]["payload"]["prefilled"]},
+        )
+        assert inspected["next_turn"]["type"] == "inspect_and_confirm"
+        _respond(composer_test_client, session_id, edited_values={"columns": ["document_uri"]})
+        _finish_review(composer_test_client, session_id, "source")
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "registered-recipe-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(
+            composer_test_client,
+            session_id,
+            chosen=["document_uri"],
+            custom_inputs=["abstract"],
+        )
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        completion_calls: list[dict[str, object]] = []
+
+        async def poisoned_completion(**kwargs: object) -> _PlannerResponse:
+            completion_calls.append(kwargs)
+            raise AssertionError("a complete deterministic projection conflict must not call completion")
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", poisoned_completion)
+
+        operation_id = str(uuid4())
+        conflicted = _post_current_response(
+            composer_test_client,
+            session_id,
+            operation_id=operation_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        body = conflicted.json()
+        assert body["guided_session"]["step"] == "step_2_sink"
+        assert _full_guided_session(body)["active_proposal"] is None
+        assert _full_guided_session(body)["chat_history"][-1]["content"] == (
+            "The exact retained-field projection omits reviewed output field `document_uri`. "
+            "Update the projection or the reviewed output contract before planning again."
+        )
+        assert completion_calls == []
+        with app.state.session_engine.connect() as conn:
+            proposals = conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == session_id)
+            ).all()
+            operation = (
+                conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+            )
+        assert proposals == []
+        assert operation["status"] == "completed"
+        assert operation["failure_code"] is None
+        assert operation["result_kind"] == "composition_state"
+
     def test_escape_hatch_decline_materializes_a_prospective_current_turn(
         self,
         composer_test_client: TestClient,
@@ -4399,10 +4813,7 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": proposal_payload["proposal_id"],
                 "draft_hash": proposal_payload["draft_hash"],
-                "edit_target": {
-                    "kind": "edge",
-                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
-                },
+                "edit_target": _source_validation_failure_edit_target(turn["payload"]),
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         }
@@ -6276,54 +6687,29 @@ class TestStep2IntraStep:
             del recorder
             source = guided.reviewed_sources[guided.source_order[0]]
             output = guided.reviewed_outputs[guided.output_order[0]]
-            corrected = correction_target is not None and correction_target.owner_kind == "source"
-            source_success = f"{correction_target.owner_key}_corrected_rows" if corrected else "llm_rows"
-            correction_nodes = (
-                [
-                    {
-                        "id": f"{correction_target.owner_key}_correction",
-                        "node_type": "transform",
-                        "plugin": "passthrough",
-                        "input": source_success,
-                        "on_success": "llm_rows",
-                        "on_error": "discard",
-                        "options": {"schema": {"mode": "observed"}},
-                    }
-                ]
-                if corrected
-                else []
-            )
-            correction_edges = (
-                [
-                    {
-                        "id": f"{correction_target.owner_key}_to_correction",
-                        "from_node": correction_target.owner_key,
-                        "to_node": f"{correction_target.owner_key}_correction",
-                        "edge_type": "on_success",
-                        "label": None,
-                    }
-                ]
-                if corrected
-                else []
+            corrected_error_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_error"
             )
             pipeline = {
                 "sources": {
                     source.name: {
                         "plugin": source.plugin,
                         "options": deep_thaw(source.options),
-                        "on_success": source_success,
+                        "on_success": "llm_rows",
                         "on_validation_failure": source.on_validation_failure,
                     }
                 },
                 "nodes": [
-                    *correction_nodes,
                     {
                         "id": "summarize_rows",
                         "node_type": "transform",
                         "plugin": "llm",
                         "input": "llm_rows",
                         "on_success": output.name,
-                        "on_error": "discard",
+                        "on_error": output.name if corrected_error_edge else "discard",
                         "options": {
                             "schema": {"mode": "observed"},
                             "profile": "task-role",
@@ -6332,7 +6718,7 @@ class TestStep2IntraStep:
                         },
                     },
                 ],
-                "edges": correction_edges,
+                "edges": [],
                 "outputs": [
                     {
                         "sink_name": output.name,
@@ -6390,10 +6776,7 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": turn["payload"]["proposal_id"],
                 "draft_hash": turn["payload"]["draft_hash"],
-                "edit_target": {
-                    "kind": "edge",
-                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
-                },
+                "edit_target": _node_error_edit_target(turn["payload"]),
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         )

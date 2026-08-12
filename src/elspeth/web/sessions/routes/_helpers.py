@@ -1305,15 +1305,20 @@ def _is_composer_audit_tool_message(message: ChatMessageRecord) -> bool:
 
 
 def _is_composer_llm_audit_tool_message(message: ChatMessageRecord) -> bool:
-    """Return true only for persisted composer LLM-call audit sidecars.
+    """Return true for the paired planner evidence exposed by the LLM audit view.
 
     Rev-4: LLM-call audit rows are persisted with ``role="audit"`` (they
     have no real OpenAI tool-call identity, so they cannot be ``role="tool"``
-    after the parent-CHECK biconditional landed).
+    after the parent-CHECK biconditional landed). Planner-attempt rows are
+    the value-free semantic half of that physical-call evidence, so the same
+    explicit audit-grade opt-in returns both halves while the default chat
+    view excludes both.
     """
     if message.role != "audit" or message.tool_calls is None:
         return False
-    return any("_kind" in tool_call and tool_call["_kind"] == "llm_call_audit" for tool_call in message.tool_calls)
+    return any(
+        "_kind" in tool_call and tool_call["_kind"] in {"llm_call_audit", "planner_attempt_audit"} for tool_call in message.tool_calls
+    )
 
 
 def _composer_conversation_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
@@ -1322,7 +1327,7 @@ def _composer_conversation_messages(messages: Sequence[ChatMessageRecord]) -> li
 
 
 def _composer_conversation_or_llm_audit_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
-    """Return user-visible conversation plus safe per-LLM-call audit sidecars."""
+    """Return conversation plus paired physical-call and semantic-attempt audit sidecars."""
     return [message for message in messages if not _is_composer_audit_tool_message(message) or _is_composer_llm_audit_tool_message(message)]
 
 
@@ -1333,7 +1338,7 @@ def _composer_conversation_or_tool_messages(messages: Sequence[ChatMessageRecord
 
 
 def _composer_conversation_tool_or_llm_audit_messages(messages: Sequence[ChatMessageRecord]) -> list[ChatMessageRecord]:
-    """Return conversation, tool rows, and safe per-LLM-call audit sidecars."""
+    """Return conversation, tool rows, and paired planner audit sidecars."""
 
     return [
         message

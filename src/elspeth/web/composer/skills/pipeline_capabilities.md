@@ -16,16 +16,23 @@ through its own terminal authoring tool; your interaction rules and
 per-request instructions name yours. Use the read-only discovery tools before
 authoring:
 
-1. Read current pipeline and validation state with `get_pipeline_state`,
-   `diff_pipeline`, or `preview_pipeline` as relevant.
+1. Read the request's information manifest first. Its current pipeline
+   projection and policy snapshot are already supplied facts; do not repeat a
+   state or catalog read that the manifest says is closed.
 2. Consult the authoring_aids discovery digest delivered in the request
-   context first: it is rendered from the live policy-visible catalog at
-   prompt build and is current for this deployment — plan directly from it.
-   Call `list_sources`, `list_transforms`, `list_sinks`, or `list_recipes`
-   only when a needed plugin is absent from the digest.
-3. Call `get_plugin_schema` only when a needed option or output contract is
-   absent from the digest or when repairing against a validation rejection;
-   use `get_plugin_assistance` and `explain_validation_error` for structured
+   context. It is rendered from the live policy-visible catalog at prompt
+   build and is current for this deployment, and it is the complete selection
+   index for that policy snapshot — plan directly from it.
+   A worked example's omission of a plugin is not a reason to list the catalog.
+   Check the digest budget's `omitted_public_text_count`. When it is nonzero,
+   a `sha256` plus `details_via` replaces whole public purpose or prohibition
+   prose; follow `details_via` for a plugin before selecting it. Omitted
+   prohibition text remains binding and is never represented by a partial rule.
+3. Call `get_plugin_schema` for chosen plugins whose detailed option or output
+   contract is not already supplied. The bounded result carries the chosen
+   plugin's public composer hints; use those details only after selection.
+   A successful schema read remains current for the whole request. Use
+   `get_plugin_assistance` and `explain_validation_error` for structured
    repair when a proposal is rejected, rather than guessing.
 4. Use `get_expression_grammar` before authoring conditions. Use blob and
    secret-reference discovery when the request needs them; secret values are
@@ -233,12 +240,12 @@ before the sink, preserve the requested result fields, and make any authored
 retention or removal decision reviewable. Names, labels, sink formats, and
 metadata do not remove data; only discovered transform behavior does.
 
-Plugin schema facts are stable across turns for an unchanged policy catalog and
-composition state. Do not reinterpret a missing config option as a missing
-output field or reverse a validated plugin-contract conclusion from visible
-options alone. Re-read `get_plugin_schema`, `get_plugin_assistance`, or
-`preview_pipeline` before correcting a prior conclusion; dynamic discovery is
-the only authority for plugin-specific fields and output behavior.
+Plugin schema facts are stable across turns for an unchanged policy snapshot.
+Do not reinterpret a missing config option as a missing output field, reverse a
+validated plugin-contract conclusion from visible options alone, or re-read a
+schema already supplied in this request. Issue-specific
+`get_plugin_assistance` and `explain_validation_error` can add repair facts that
+the schema does not contain; use those when correcting a prior conclusion.
 
 [capability:structured-output-repair]
 

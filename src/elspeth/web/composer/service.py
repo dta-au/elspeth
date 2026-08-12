@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
@@ -49,6 +50,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -86,8 +88,11 @@ from elspeth.web.composer.audit import (
     DispatchAudit,
     finish_arg_error,
     finish_success,
+    interleave_planner_audit_records,
     llm_call_audit_envelope,
     llm_call_audit_summary,
+    planner_attempt_audit_envelope,
+    planner_attempt_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
@@ -112,6 +117,8 @@ from elspeth.web.composer.llm_response_parsing import (
     token_usage_from_response,
 )
 from elspeth.web.composer.pipeline_planner import (
+    DELTA_PLANNER_TERMINAL_INSTRUCTION,
+    GuidedPlannerConflict,
     GuidedPlannerDecline,
     PipelineCandidatePolicyRejection,
     PipelinePlannerError,
@@ -124,6 +131,8 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
+    PlannerTerminalContract,
+    PlannerTerminalMaterialization,
     plan_pipeline,
     prepare_pipeline_plan,
 )
@@ -162,11 +171,17 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
-from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.recipes import (
-    RecipeValidationError,
+    RecipeIntentContext,
+    RecipeIntentMatch,
+    RecipeOutputBinding,
+    RecipeReviewedOutputSummary,
+    RecipeReviewedSourceSummary,
+    RecipeSourceBinding,
+    ReviewedOutputProjectionConflict,
     apply_recipe,
     get_recipe,
+    match_registered_recipe_intent,
     recipe_catalog_content_hash,
     unavailable_recipe_plugin,
 )
@@ -389,6 +404,108 @@ _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARG
 
 _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+def _effective_reviewed_output_format(*, plugin: str, path: str, options: Mapping[str, Any]) -> str | None:
+    """Resolve a reviewed sink format without inventing non-JSON defaults."""
+
+    explicit = options["format"] if "format" in options else None
+    if explicit is not None:
+        return explicit if type(explicit) is str else None
+    if plugin != "json":
+        return None
+    return "jsonl" if Path(path).suffix == ".jsonl" else "json"
+
+
+async def try_prepare_registered_recipe_plan(
+    *,
+    intent_context: RecipeIntentContext,
+    current_state: CompositionState,
+    reviewed_facts: Mapping[str, Any],
+    reviewed_planner_context: Mapping[str, Any],
+    supersedes_draft_hash: str | None,
+    surface: PlannerSurface,
+    policy_catalog: PolicyCatalogView,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    originating_message: PlannerOriginatingMessage,
+    base: AbsentBase | PresentBase,
+    custody_config: PlannerCustodyConfig,
+    timeout_seconds: float,
+    candidate_finalizer: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+) -> PipelinePlanResult | None:
+    """Prepare the registry's unique complete match through the common gate."""
+
+    match = match_registered_recipe_intent(intent_context)
+    if match is None:
+        return None
+    if type(match) is not RecipeIntentMatch:
+        raise TypeError("recipe matcher returned a malformed match")
+    recipe = get_recipe(match.recipe_name)
+    if recipe is None:
+        raise AuditIntegrityError("recipe matcher selected an unregistered recipe")
+    if unavailable_recipe_plugin(recipe, plugin_snapshot, raw_slots=match.slots) is not None:
+        return None
+
+    recipe_slots = dict(match.slots)
+    inline_blob = match.inline_blob
+    if inline_blob is not None:
+        blob_slots = [
+            name for name, spec in recipe.slots.items() if spec.required and spec.slot_type == "blob_id" and name not in recipe_slots
+        ]
+        if len(blob_slots) != 1:
+            raise AuditIntegrityError("inline recipe must own exactly one missing required blob slot")
+        recipe_slots[blob_slots[0]] = str(UUID(int=0))
+    recipe_pipeline = apply_recipe(match.recipe_name, recipe_slots)
+    if inline_blob is not None:
+        source = recipe_pipeline.get("source")
+        if type(source) is not dict or source.get("blob_id") != str(UUID(int=0)):
+            raise AuditIntegrityError("inline recipe did not produce the expected source blob slot")
+        source = dict(source)
+        source.pop("blob_id")
+        source["inline_blob"] = {
+            "filename": inline_blob.filename,
+            "mime_type": inline_blob.mime_type,
+            "content": inline_blob.content,
+        }
+        recipe_pipeline["source"] = source
+
+    recipe_pipeline = dict(candidate_finalizer(recipe_pipeline))
+    recipe_contract = canonical_json(
+        {
+            "schema": "composer.server-recipe-router.v1",
+            "recipe": match.recipe_name,
+            "recipe_catalog_content_hash": recipe_catalog_content_hash(),
+        }
+    )
+    return await prepare_pipeline_plan(
+        pipeline=recipe_pipeline,
+        current_state=current_state,
+        reviewed_facts=reviewed_facts,
+        reviewed_planner_context=reviewed_planner_context,
+        supersedes_draft_hash=supersedes_draft_hash,
+        surface=surface,
+        policy_catalog=policy_catalog,
+        plugin_snapshot=plugin_snapshot,
+        originating_message=originating_message,
+        base=base,
+        rendered_skill=recipe_contract,
+        tool_call_id=(
+            "server-recipe-"
+            + stable_hash(
+                {
+                    "schema": "composer.server-recipe-tool-call.v1",
+                    "message_id": originating_message.message_id,
+                    "recipe": match.recipe_name,
+                }
+            )
+        ),
+        model_identifier="composer-server-recipe-router",
+        model_version="composer.server-recipe-router.v1",
+        provider="server",
+        repair_count=0,
+        timeout_seconds=timeout_seconds,
+        custody_config=custody_config,
+    )
 
 
 def _required_controls_candidate_finalizer(
@@ -3544,7 +3661,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline | GuidedPlannerConflict:
         """Run one shared planner call for the current guided checkpoint."""
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
@@ -3554,6 +3671,7 @@ class ComposerServiceImpl:
             bind_guided_prose_revision_candidate,
             bind_guided_reviewed_components,
             build_guided_proposal_projection,
+            guided_authorized_pipeline_schema,
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
@@ -3561,12 +3679,17 @@ class ComposerServiceImpl:
             guided_revision_execution_hash,
             guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
+            materialize_guided_authorized_candidate,
             require_guided_proposal_correction_target_changed,
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
         from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint, StatedPredicateConstraint
         from elspeth.web.composer.guided.state_machine import GuidedSession
+        from elspeth.web.composer.guided_blob_refs import (
+            reviewed_schema_declared_field_names,
+            validate_guided_reviewed_blob_binding,
+        )
 
         if type(guided) is not GuidedSession:
             raise TypeError("guided must be an exact GuidedSession")
@@ -3648,6 +3771,91 @@ class ComposerServiceImpl:
                 attempt=operation_fence.attempt,
             ),
         )
+
+        if correction_target is None and revision_authority is None and supersedes_draft_hash is None:
+            source_summaries = tuple(
+                RecipeReviewedSourceSummary(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    field_names=tuple(
+                        dict.fromkeys(
+                            (
+                                *reviewed.observed_columns,
+                                *(reviewed_schema_declared_field_names(reviewed.options["schema"]) if "schema" in reviewed.options else ()),
+                            )
+                        )
+                    ),
+                )
+                for stable_id in guided.source_order
+                for reviewed in (guided.reviewed_sources[stable_id],)
+            )
+            output_summaries = tuple(
+                RecipeReviewedOutputSummary(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    required_fields=tuple(reviewed.required_fields),
+                )
+                for stable_id in guided.output_order
+                for reviewed in (guided.reviewed_outputs[stable_id],)
+            )
+            source_bindings_list: list[RecipeSourceBinding] = []
+            for stable_id in guided.source_order:
+                reviewed = guided.reviewed_sources[stable_id]
+                reviewed_binding = validate_guided_reviewed_blob_binding(reviewed.options)
+                if reviewed_binding is not None:
+                    source_bindings_list.append(
+                        RecipeSourceBinding(
+                            name=reviewed.name,
+                            plugin=reviewed.plugin,
+                            blob_id=reviewed_binding.blob_ref,
+                        )
+                    )
+            source_bindings = tuple(source_bindings_list)
+            output_bindings = tuple(
+                RecipeOutputBinding(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    path=path,
+                    format=output_format,
+                )
+                for stable_id in guided.output_order
+                for reviewed in (guided.reviewed_outputs[stable_id],)
+                for path in ((reviewed.options["path"],) if "path" in reviewed.options else ())
+                if type(path) is str
+                for output_format in (_effective_reviewed_output_format(plugin=reviewed.plugin, path=path, options=reviewed.options),)
+                if output_format is not None
+            )
+            try:
+                recipe_plan = await try_prepare_registered_recipe_plan(
+                    intent_context=RecipeIntentContext(
+                        user_text=intent,
+                        reviewed_sources=source_summaries,
+                        reviewed_outputs=output_summaries,
+                        policy_snapshot=plugin_snapshot,
+                        source_bindings=source_bindings,
+                        output_bindings=output_bindings,
+                    ),
+                    current_state=current_state,
+                    reviewed_facts=reviewed_facts,
+                    reviewed_planner_context=reviewed_context,
+                    supersedes_draft_hash=None,
+                    surface=planner_surface,
+                    policy_catalog=policy_catalog,
+                    plugin_snapshot=plugin_snapshot,
+                    originating_message=originating_message,
+                    base=base,
+                    custody_config=custody_config,
+                    timeout_seconds=self._timeout_seconds,
+                    candidate_finalizer=_required_controls_candidate_finalizer(
+                        policy_catalog=policy_catalog,
+                        plugin_snapshot=plugin_snapshot,
+                        inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+                    ),
+                )
+            except ReviewedOutputProjectionConflict as conflict:
+                return GuidedPlannerConflict(missing_fields=conflict.missing_fields)
+            if recipe_plan is not None:
+                return recipe_plan, catalog_ids
 
         passthrough_sketch_shape = (
             correction_target is None
@@ -3795,6 +4003,45 @@ class ComposerServiceImpl:
         # every PipelinePlannerError surfaces at ``await``, inside the guard.
         pending_revision_rejection: Literal["guided_amend_contract_violation"] | None = None
 
+        terminal_contract: PlannerTerminalContract | None = None
+        if revision_authority is None:
+
+            def materialize_guided_delta(delta: Mapping[str, Any]) -> PlannerTerminalMaterialization:
+                canonical = materialize_guided_authorized_candidate(
+                    delta,
+                    correction_target,
+                    guided,
+                    current_state,
+                )
+                config_owned_refs = {
+                    *(
+                        "source"
+                        if guided.reviewed_sources[stable_id].name == "source"
+                        else f"source:{guided.reviewed_sources[stable_id].name}"
+                        for stable_id in guided.source_order
+                    ),
+                    *(f"output:{guided.reviewed_outputs[stable_id].name}" for stable_id in guided.output_order),
+                }
+                if correction_target is not None:
+                    # Existing predecessor nodes were materialized from
+                    # private server authority (even when one routing scalar
+                    # was changed by the admitted delta). Mask their config
+                    # facts exactly as the former finalizer-owned binder did.
+                    config_owned_refs.update(f"node:{node.id}" for node in current_state.nodes)
+                return PlannerTerminalMaterialization(
+                    pipeline=dict(canonical),
+                    config_owned_refs=frozenset(config_owned_refs),
+                )
+
+            terminal_contract = PlannerTerminalContract(
+                schema=guided_authorized_pipeline_schema(
+                    guided,
+                    correction_target=correction_target,
+                ),
+                materialize=materialize_guided_delta,
+                instruction=DELTA_PLANNER_TERMINAL_INSTRUCTION,
+            )
+
         def bind_guided_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
             nonlocal pending_revision_rejection
             pending_revision_rejection = None
@@ -3806,12 +4053,11 @@ class ComposerServiceImpl:
                 )
                 pending_revision_rejection = binding.rejection_code
                 return binding.pipeline
-            return bind_guided_reviewed_components(
-                candidate,
-                guided,
-                predecessor=current_state if correction_target is not None else None,
-                correction_target=correction_target,
-            )
+            # Initial/correction deltas have already passed through
+            # materialize_guided_authorized_candidate at the selected terminal
+            # seam.  Rebinding here would misclassify the canonical result as
+            # provider-authored authority and duplicate correction custody.
+            return candidate
 
         candidate_acceptance: Callable[[CompositionState], None] | None = None
         if correction_target is not None or revision_authority is not None:
@@ -3907,6 +4153,7 @@ class ComposerServiceImpl:
                 inner=bind_guided_candidate,
             ),
             candidate_acceptance=candidate_acceptance,
+            terminal_contract=terminal_contract,
         )
         try:
             plan = await guided_planner_call
@@ -3933,30 +4180,44 @@ class ComposerServiceImpl:
         session_id: UUID,
         current_state_id: UUID | None,
         llm_calls: tuple[ComposerLLMCall, ...],
+        planner_attempts: tuple[ComposerPlannerAttempt, ...],
         invocations: tuple[ComposerToolInvocation, ...],
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority.
 
-        The whole evidence set — every LLM call and every discovery
-        invocation of one planning attempt — is one cohort and settles in
-        a single ``add_messages_atomic`` transaction (elspeth-90231248dc).
-        A mid-write failure or cancellation therefore leaves the evidence
-        either fully durable or cleanly absent, never a partial cohort
-        that reads as the complete planning record.
+        The whole evidence set — every physical LLM call, every value-free
+        semantic response disposition, and every discovery invocation of one
+        planning request — is one cohort and settles in a single
+        ``add_messages_atomic`` transaction (elspeth-90231248dc). Provider
+        failures can create physical ordinal gaps; every response row is
+        immediately followed by its logical attempt row. A mid-write failure
+        or cancellation therefore leaves the evidence either fully durable or
+        cleanly absent, never a partial cohort that reads as the complete
+        planning record.
         """
 
         from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
         sessions = self._require_sessions_service()
         drafts: list[AuditMessageDraft] = []
-        for call in llm_calls:
-            drafts.append(
-                AuditMessageDraft(
-                    role="audit",
-                    content=llm_call_audit_summary(call),
-                    tool_calls=(llm_call_audit_envelope(call),),
+        for record in interleave_planner_audit_records(llm_calls, planner_attempts):
+            if type(record) is ComposerLLMCall:
+                drafts.append(
+                    AuditMessageDraft(
+                        role="audit",
+                        content=llm_call_audit_summary(record),
+                        tool_calls=(llm_call_audit_envelope(record),),
+                    )
                 )
-            )
+            else:
+                attempt = cast(ComposerPlannerAttempt, record)
+                drafts.append(
+                    AuditMessageDraft(
+                        role="audit",
+                        content=planner_attempt_audit_summary(attempt),
+                        tool_calls=(planner_attempt_audit_envelope(attempt),),
+                    )
+                )
         for invocation in invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
             drafts.append(
@@ -4042,6 +4303,9 @@ class ComposerServiceImpl:
         user_id: str | None,
         preferences: ComposerSessionPreferencesRecord,
         recorder: BufferingRecorder,
+        planner_llm_calls: tuple[ComposerLLMCall, ...],
+        planner_attempts: tuple[ComposerPlannerAttempt, ...],
+        planner_invocations: tuple[ComposerToolInvocation, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
@@ -4065,8 +4329,9 @@ class ComposerServiceImpl:
         await self._persist_pipeline_planner_audit(
             session_id=session_id,
             current_state_id=current_state_id,
-            llm_calls=recorder.llm_calls,
-            invocations=recorder.invocations,
+            llm_calls=planner_llm_calls,
+            planner_attempts=planner_attempts,
+            invocations=planner_invocations,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -4254,74 +4519,26 @@ class ComposerServiceImpl:
         )
         plan: PipelinePlanResult | None = None
         planner_llm_start = len(recorder.llm_calls)
+        planner_attempt_start = len(recorder.planner_attempts)
         planner_invocation_start = len(recorder.invocations)
-        recipe_match = match_freeform_recipe_intent(message)
-        if recipe_match is not None and recipe_match.inline_blob is not None:
-            recipe = get_recipe(recipe_match.recipe_name)
-            if recipe is not None:
-                try:
-                    unavailable = unavailable_recipe_plugin(
-                        recipe,
-                        plugin_snapshot,
-                        raw_slots=recipe_match.slots,
-                    )
-                    if unavailable is None:
-                        recipe_contract = canonical_json(
-                            {
-                                "schema": "composer.server-recipe-router.v1",
-                                "recipe": recipe_match.recipe_name,
-                                "recipe_catalog_content_hash": recipe_catalog_content_hash(),
-                            }
-                        )
-                        recipe_pipeline = apply_recipe(
-                            recipe_match.recipe_name,
-                            {
-                                **recipe_match.slots,
-                                "source_blob_id": str(UUID(int=0)),
-                            },
-                        )
-                        source = recipe_pipeline.get("source")
-                        if type(source) is not dict or source.get("blob_id") != str(UUID(int=0)):
-                            raise AuditIntegrityError("inline recipe did not produce the expected source blob slot")
-                        source = dict(source)
-                        source.pop("blob_id")
-                        source["inline_blob"] = {
-                            "filename": recipe_match.inline_blob.filename,
-                            "mime_type": recipe_match.inline_blob.mime_type,
-                            "content": recipe_match.inline_blob.content,
-                        }
-                        recipe_pipeline["source"] = source
-                        plan = await prepare_pipeline_plan(
-                            pipeline=recipe_pipeline,
-                            current_state=state,
-                            reviewed_facts={},
-                            reviewed_planner_context={},
-                            supersedes_draft_hash=None,
-                            surface=PlannerSurface.FREEFORM,
-                            policy_catalog=policy_catalog,
-                            plugin_snapshot=plugin_snapshot,
-                            originating_message=origin,
-                            base=base,
-                            rendered_skill=recipe_contract,
-                            tool_call_id=(
-                                "server-recipe-"
-                                + stable_hash(
-                                    {
-                                        "schema": "composer.server-recipe-tool-call.v1",
-                                        "message_id": user_message_id,
-                                        "recipe": recipe_match.recipe_name,
-                                    }
-                                )
-                            ),
-                            model_identifier="composer-server-recipe-router",
-                            model_version="composer.server-recipe-router.v1",
-                            provider="server",
-                            repair_count=0,
-                            timeout_seconds=self._timeout_seconds,
-                            custody_config=custody_config,
-                        )
-                except RecipeValidationError:
-                    plan = None
+        plan = await try_prepare_registered_recipe_plan(
+            intent_context=RecipeIntentContext(user_text=message, policy_snapshot=plugin_snapshot),
+            current_state=state,
+            reviewed_facts={},
+            reviewed_planner_context={},
+            supersedes_draft_hash=None,
+            surface=PlannerSurface.FREEFORM,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            originating_message=origin,
+            base=base,
+            custody_config=custody_config,
+            timeout_seconds=self._timeout_seconds,
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+            ),
+        )
         if plan is None:
             try:
                 plan = await plan_pipeline(
@@ -4390,6 +4607,7 @@ class ComposerServiceImpl:
                     session_id=session_uuid,
                     current_state_id=state_uuid,
                     llm_calls=recorder.llm_calls[planner_llm_start:],
+                    planner_attempts=recorder.planner_attempts[planner_attempt_start:],
                     invocations=recorder.invocations[planner_invocation_start:],
                 )
                 decline_message = declined.decline_text.strip() or (
@@ -4403,11 +4621,19 @@ class ComposerServiceImpl:
                     raise AuditIntegrityError("pipeline planner exception carried malformed LLM audit evidence") from exc
                 if attached_calls != recorder.llm_calls[planner_llm_start:]:
                     raise AuditIntegrityError("pipeline planner exception carried unrelated LLM audit evidence") from exc
+                attached_attempts = exc_dict["planner_attempts"] if "planner_attempts" in exc_dict else ()
+                if type(attached_attempts) is not tuple or any(
+                    type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts
+                ):
+                    raise AuditIntegrityError("pipeline planner exception carried malformed semantic attempt evidence") from exc
+                if attached_attempts != recorder.planner_attempts[planner_attempt_start:]:
+                    raise AuditIntegrityError("pipeline planner exception carried unrelated semantic attempt evidence") from exc
                 _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
                     self._persist_pipeline_planner_audit(
                         session_id=session_uuid,
                         current_state_id=state_uuid,
                         llm_calls=attached_calls,
+                        planner_attempts=attached_attempts,
                         invocations=recorder.invocations[planner_invocation_start:],
                     ),
                     deferred=exc if type(exc) is asyncio.CancelledError else None,
@@ -4427,6 +4653,9 @@ class ComposerServiceImpl:
             user_id=user_id,
             preferences=preferences,
             recorder=recorder,
+            planner_llm_calls=recorder.llm_calls[planner_llm_start:],
+            planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+            planner_invocations=recorder.invocations[planner_invocation_start:],
             plugin_snapshot=plugin_snapshot,
         )
 

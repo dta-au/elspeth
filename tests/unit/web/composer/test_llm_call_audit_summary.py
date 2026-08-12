@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -45,6 +45,12 @@ from elspeth.contracts.composer_llm_audit import (
     PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST,
     ComposerLLMCall,
     ComposerLLMCallStatus,
+)
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
 )
 from elspeth.web.composer.audit import llm_call_audit_summary
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -68,6 +74,7 @@ def _call(
     *,
     finish_reason: str | None = None,
     status: ComposerLLMCallStatus = ComposerLLMCallStatus.SUCCESS,
+    planner_call_ordinal: int | None = None,
 ) -> ComposerLLMCall:
     now = datetime(2026, 7, 31, tzinfo=UTC)
     failed = status is not ComposerLLMCallStatus.SUCCESS
@@ -93,6 +100,26 @@ def _call(
         provider_cost=0.0037,
         provider_cost_source=PROVIDER_COST_SOURCE_RESPONSE_USAGE_COST,
         finish_reason=finish_reason,
+        max_completion_tokens_requested=8192 if planner_call_ordinal is not None else None,
+        planner_policy_hash="b" * 64 if planner_call_ordinal is not None else None,
+        planner_call_ordinal=planner_call_ordinal,
+    )
+
+
+def _attempt(*, planner_call_ordinal: int) -> ComposerPlannerAttempt:
+    return ComposerPlannerAttempt(
+        ordinal=1,
+        planner_call_ordinal=planner_call_ordinal,
+        phase=ComposerPlannerAttemptPhase.CANDIDATE,
+        outcome=ComposerPlannerAttemptOutcome.ACCEPTED,
+        planner_code=None,
+        selected_tools=("emit_pipeline_proposal",),
+        requested_information=(),
+        new_information=(),
+        rejection_codes=(),
+        candidate_shape_hash="a" * 64,
+        repeated_fingerprint=False,
+        led_to=ComposerPlannerAttemptLedTo.DONE,
     )
 
 
@@ -231,6 +258,7 @@ class _CapturingSessionService:
     """Records what a drain site actually asked to persist."""
 
     messages: list[_CapturedMessage] = field(default_factory=list)
+    atomic_calls: int = 0
 
     async def add_message(
         self,
@@ -253,6 +281,7 @@ class _CapturingSessionService:
         # In-memory double: the cohort is trivially atomic, so record one
         # captured message per draft with the same kwargs shape the old
         # per-row add_message calls carried.
+        self.atomic_calls += 1
         for draft in drafts:
             await self.add_message(
                 session_id,
@@ -307,16 +336,23 @@ class TestAllThreeDrainSitesShareOneProjection:
     async def _composer_service_site_content(call: ComposerLLMCall) -> str:
         service = _CapturingSessionService()
         host = _PlannerAuditHost(service)
+        planner_call = replace(
+            call,
+            max_completion_tokens_requested=8192,
+            planner_policy_hash="b" * 64,
+            planner_call_ordinal=1,
+        )
 
         await ComposerServiceImpl._persist_pipeline_planner_audit(
             cast(Any, host),
             session_id=uuid4(),
             current_state_id=None,
-            llm_calls=(call,),
+            llm_calls=(planner_call,),
+            planner_attempts=(_attempt(planner_call_ordinal=1),),
             invocations=(),
         )
 
-        (message,) = service.messages
+        message = service.messages[0]
         return message.content
 
     @staticmethod
@@ -357,3 +393,27 @@ class TestAllThreeDrainSitesShareOneProjection:
 
         for content in (helpers, composer_service, guided):
             assert content == _LEGACY_SUMMARY_JSON
+
+
+@pytest.mark.asyncio
+async def test_freeform_planner_persistence_atomically_interleaves_physical_calls_and_semantic_attempts() -> None:
+    service = _CapturingSessionService()
+    host = _PlannerAuditHost(service)
+    failed_call = _call(status=ComposerLLMCallStatus.API_ERROR, planner_call_ordinal=1)
+    response_call = _call(planner_call_ordinal=2)
+
+    await ComposerServiceImpl._persist_pipeline_planner_audit(
+        cast(Any, host),
+        session_id=uuid4(),
+        current_state_id=None,
+        llm_calls=(failed_call, response_call),
+        planner_attempts=(_attempt(planner_call_ordinal=2),),
+        invocations=(),
+    )
+
+    assert [message.kwargs["tool_calls"][0]["_kind"] for message in service.messages] == [
+        "llm_call_audit",
+        "llm_call_audit",
+        "planner_attempt_audit",
+    ]
+    assert service.atomic_calls == 1

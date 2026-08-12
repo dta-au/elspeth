@@ -25,16 +25,24 @@ domain fields as if they were required.
 
 from __future__ import annotations
 
+import hashlib
+import math
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
+from enum import StrEnum
 from threading import Lock
-from typing import Any, Final, NotRequired, Required, TypedDict
+from typing import Any, Final, NotRequired, Required, TypedDict, cast
 
+from rfc8785 import CanonicalizationError
+
+from elspeth.contracts.freeze import deep_freeze, deep_thaw, freeze_fields
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.catalog.schemas import PluginKind, PluginSummary
+from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
 
 # The registered shield-review constants and the untrusted-producer set are the
 # contract's single source of truth (interpretation_state); importing them —
@@ -60,6 +68,13 @@ PLACEHOLDER_BLOB_ID: Final[str] = "<blob_id copied verbatim from a list_blobs or
 _RAW_HTML_CLEANUP_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
 
 
+class _OmittedPublicText(TypedDict):
+    """Disclosure that public selection prose moved to JIT discovery."""
+
+    sha256: str
+    details_via: str
+
+
 class _PluginDigestEntry(TypedDict):
     """Closed policy-visible plugin summary rendered into the planner prompt.
 
@@ -71,12 +86,25 @@ class _PluginDigestEntry(TypedDict):
     """
 
     name: str
-    purpose: str
+    purpose: NotRequired[str]
     required_options: list[str]
-    composer_hints: list[str]
     not_for: NotRequired[str]
+    purpose_omitted: NotRequired[_OmittedPublicText]
+    not_for_omitted: NotRequired[_OmittedPublicText]
     capability_tags: NotRequired[list[str]]
     profile_aliases: NotRequired[list[str]]
+
+
+class _DiscoveryDigestBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    omitted_public_text_count: int
+
+
+class _ProhibitedPluginDigest(TypedDict):
+    sources: list[ProhibitedPluginDisclosure]
+    transforms: list[ProhibitedPluginDisclosure]
+    sinks: list[ProhibitedPluginDisclosure]
 
 
 class _DiscoveryDigest(TypedDict):
@@ -85,6 +113,8 @@ class _DiscoveryDigest(TypedDict):
     sources: list[_PluginDigestEntry]
     transforms: list[_PluginDigestEntry]
     sinks: list[_PluginDigestEntry]
+    prohibited: _ProhibitedPluginDigest
+    budget: _DiscoveryDigestBudget
 
 
 class _SchemaContractEvidenceEntry(TypedDict):
@@ -896,10 +926,168 @@ _JSON_SCHEMA_SINGLE_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 _JSON_SCHEMA_SCHEMA_LIST_KEYS: Final[frozenset[str]] = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_JSON_SCHEMA_STRING_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$ref",
+        "$anchor",
+        "$dynamicRef",
+        "$dynamicAnchor",
+        "pattern",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+    }
+)
+_JSON_SCHEMA_BOOLEAN_SCALAR_KEYS: Final[frozenset[str]] = frozenset({"deprecated", "readOnly", "writeOnly", "nullable", "uniqueItems"})
+_JSON_SCHEMA_NUMERIC_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
+    {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
+)
+_JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS: Final[frozenset[str]] = frozenset(
+    {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"}
+)
+_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset({"null", "boolean", "object", "array", "number", "string", "integer"})
 
 
 class _SchemaContractProjectionUnsupported(ValueError):
     """A schema carries semantics this bounded projection cannot preserve."""
+
+
+# Public name for callers that must fail closed without depending on an
+# implementation-private spelling. The private alias remains the trust-tier
+# boundary's established exception identity.
+SchemaContractProjectionUnsupported = _SchemaContractProjectionUnsupported
+
+_PLANNER_CONTRACT_MAX_DEPTH: Final[int] = 32
+_PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
+_PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
+_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
+_DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
+
+
+def _contract_json_schema_scalar(key: str, value: object) -> object:
+    """Validate the closed scalar-keyword vocabulary before copying it."""
+    if key in _JSON_SCHEMA_STRING_SCALAR_KEYS:
+        if type(value) is not str:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_BOOLEAN_SCALAR_KEYS:
+        if type(value) is not bool:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_NUMERIC_SCALAR_KEYS:
+        if type(value) not in {int, float} or (type(value) is float and not math.isfinite(value)):
+            raise _SchemaContractProjectionUnsupported
+        numeric_value = cast(int | float, value)
+        if key == "multipleOf" and numeric_value <= 0:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS:
+        if type(value) is not int or value < 0:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "type":
+        if type(value) is str:
+            if value not in _JSON_SCHEMA_TYPES:
+                raise _SchemaContractProjectionUnsupported
+        elif type(value) is list:
+            if not value or any(type(item) is not str or item not in _JSON_SCHEMA_TYPES for item in value) or len(set(value)) != len(value):
+                raise _SchemaContractProjectionUnsupported
+        else:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "enum":
+        if type(value) is not list or not value:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "$vocabulary" and (
+        type(value) is not dict or any(type(name) is not str or type(required) is not bool for name, required in value.items())
+    ):
+        raise _SchemaContractProjectionUnsupported
+    return deepcopy(value)
+
+
+def _assert_projection_input_bounds(value: object) -> None:
+    """Reject recursive or oversized provider shapes before projection."""
+    pending: list[tuple[object, int]] = [(value, 0)]
+    visited = 0
+    scalar_bytes = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        if depth > _PLANNER_CONTRACT_MAX_DEPTH or visited > _PLANNER_CONTRACT_MAX_NODES:
+            raise _SchemaContractProjectionUnsupported
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):
+                raise _SchemaContractProjectionUnsupported
+            scalar_bytes += sum(len(key.encode("utf-8")) for key in item)
+            pending.extend((child, depth + 1) for child in item.values())
+        elif type(item) is list or type(item) is tuple:
+            pending.extend((child, depth + 1) for child in item)
+        elif type(item) is str:
+            scalar_bytes += len(item.encode("utf-8"))
+        elif issubclass(type(item), StrEnum):
+            scalar_bytes += len(cast(StrEnum, item).value.encode("utf-8"))
+        elif item is None or type(item) in {bool, int}:
+            continue
+        elif type(item) is float:
+            if not math.isfinite(item):
+                raise _SchemaContractProjectionUnsupported
+        else:
+            raise _SchemaContractProjectionUnsupported
+        if scalar_bytes > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+            raise _SchemaContractProjectionUnsupported
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerPluginContract:
+    """Owned bounded planner projection of one admitted plugin schema."""
+
+    plugin_id: str
+    schema_hash: str
+    json_schema: Mapping[str, object]
+    knob_schema: Mapping[str, object]
+    composer_hints: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "json_schema", "knob_schema", "composer_hints")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "plugin_id": self.plugin_id,
+            "schema_hash": self.schema_hash,
+            "json_schema": deep_thaw(self.json_schema),
+            "knob_schema": deep_thaw(self.knob_schema),
+            "composer_hints": list(self.composer_hints),
+        }
+
+
+def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
+    """Project one admitted schema into the planner's bounded JIT contract."""
+    if type(schema) is not PluginSchemaInfo:
+        raise TypeError("schema must be an admitted PluginSchemaInfo")
+    _assert_projection_input_bounds(schema.json_schema)
+    _assert_projection_input_bounds(schema.knob_schema)
+    _assert_projection_input_bounds(schema.composer_hints)
+    json_schema = _contract_json_schema(schema.json_schema)
+    knob_schema = _contract_knob_schema(schema.knob_schema)
+    if isinstance(json_schema, bool):
+        raise _SchemaContractProjectionUnsupported
+    projected = {
+        "plugin_id": f"{schema.plugin_type}/{schema.name}",
+        "json_schema": json_schema,
+        "knob_schema": knob_schema,
+        "composer_hints": list(schema.composer_hints),
+    }
+    try:
+        projected_size = len(canonical_json(projected).encode("utf-8"))
+    except (CanonicalizationError, TypeError, ValueError) as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+    if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+        raise _SchemaContractProjectionUnsupported
+    contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema}
+    return PlannerPluginContract(
+        plugin_id=f"{schema.plugin_type}/{schema.name}",
+        schema_hash=stable_hash(contract_shape),
+        json_schema=deep_freeze(json_schema),
+        knob_schema=deep_freeze(knob_schema),
+        composer_hints=tuple(schema.composer_hints),
+    )
 
 
 @trust_boundary(
@@ -939,9 +1127,8 @@ def _contract_discriminator(raw: object) -> dict[str, object]:
     invariant=(
         "raises _SchemaContractProjectionUnsupported on any JSON Schema KEYWORD outside the closed "
         "projected vocabulary, and on any container-valued keyword whose value shape is wrong; the "
-        "boolean schema forms (true/false) pass through unchanged. Deliberately NOT claimed: values of "
-        "_JSON_SCHEMA_SCALAR_KEYS keywords (type/const/enum/default/pattern/minimum/uniqueItems/...) are "
-        "deep-copied through WITHOUT a type check, so e.g. pattern=12345 or minimum='x' is accepted"
+        "boolean schema forms (true/false) pass through unchanged. Known scalar keywords are validated "
+        "against their JSON Schema domains before they are copied into the owned projection"
     ),
     test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_json_schema_rejects_non_dict_non_bool",
     test_fingerprint="88f4d910a5b39715fd50c60330e587e198eddfef3263c5101ed6461593ef561c",
@@ -987,7 +1174,7 @@ def _contract_json_schema(raw: object) -> dict[str, object] | bool:
                     dependent[name] = [required_name for required_name in required_names if required_name not in hidden_properties]
             projected[key] = dependent
         elif key in _JSON_SCHEMA_SCALAR_KEYS:
-            projected[key] = deepcopy(value)
+            projected[key] = _contract_json_schema_scalar(key, value)
         elif key in _JSON_SCHEMA_MAP_KEYS and isinstance(value, dict):
             if any(not isinstance(name, str) for name in value):
                 raise _SchemaContractProjectionUnsupported
@@ -1158,20 +1345,17 @@ def build_schema_contract_evidence(
             omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
             continue
         try:
-            json_schema = _contract_json_schema(schema.json_schema)
-            knob_schema = _contract_knob_schema(schema.knob_schema)
+            projected_contract = planner_plugin_contract(schema)
         except _SchemaContractProjectionUnsupported:
             omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
             continue
-        if isinstance(json_schema, bool):
-            omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
-            continue
-        contract = {"json_schema": json_schema, "knob_schema": knob_schema}
+        json_schema = deep_thaw(projected_contract.json_schema)
+        knob_schema = deep_thaw(projected_contract.knob_schema)
         entry: _SchemaContractEvidenceEntry = {
             "plugin_id": label,
             "policy_hash": snapshot.policy_hash,
             "snapshot_hash": snapshot.snapshot_hash,
-            "schema_hash": stable_hash(contract),
+            "schema_hash": projected_contract.schema_hash,
             "json_schema": json_schema,
             "knob_schema": knob_schema,
         }
@@ -1216,7 +1400,7 @@ def build_schema_contract_evidence(
 
 
 def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
-    """Render one entry per plugin, reference content carried verbatim.
+    """Render one compact selection entry per policy-visible plugin.
 
     ``not_for`` is the plugin's ``usage_when_not_to_use`` — its own stated
     prohibition, already profile-projected when it reaches this function,
@@ -1247,7 +1431,6 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
             "name": plugin.name,
             "purpose": plugin.description,
             "required_options": [field.name for field in plugin.config_fields if field.required],
-            "composer_hints": list(plugin.composer_hints),
         }
         # PluginSummary is a strict Tier-1 response model: the catalog service
         # is the boundary that already rejected a non-str prohibition or a
@@ -1260,6 +1443,36 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     return entries
 
 
+def _digest_size(digest: _DiscoveryDigest) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(digest).encode("utf-8"))
+        if digest["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        digest["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str) -> bool:
+    """Replace one whole prose fact with a deterministic JIT disclosure."""
+    if field == "purpose":
+        if "purpose" not in entry:
+            return False
+        value = entry.pop("purpose")
+    else:
+        if "not_for" not in entry:
+            return False
+        value = entry.pop("not_for")
+    omission: _OmittedPublicText = {
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+        "details_via": details_via,
+    }
+    if field == "purpose":
+        entry["purpose_omitted"] = omission
+    else:
+        entry["not_for_omitted"] = omission
+    return True
+
+
 def discovery_digest(
     catalog: PolicyCatalogView,
     *,
@@ -1270,8 +1483,8 @@ def discovery_digest(
     Targets ``planner_code=DISCOVERY_CYCLE`` churn: a significant share of
     planner calls were ``list_*``/``get_plugin_schema`` rounds re-learning the
     same catalog every session. Each entry carries the plugin's name, one-line
-    purpose, required-knob names, its ``composer_hints`` verbatim, its stated
-    prohibition (``not_for``) and its ``capability_tags``. This is selection
+    purpose, required-knob names, its stated prohibition (``not_for``) and
+    its ``capability_tags``. This is selection
     and coaching metadata, not the plugin's option contract; types, optional
     knobs, defaults, enums, and conditional rules remain schema facts.
 
@@ -1285,6 +1498,16 @@ def discovery_digest(
         "sources": _digest_entries(summaries["source"]),
         "transforms": _digest_entries(summaries["transform"]),
         "sinks": _digest_entries(summaries["sink"]),
+        "prohibited": {
+            "sources": list(prohibited_plugin_section(catalog.list_prohibited_sources())),
+            "transforms": list(prohibited_plugin_section(catalog.list_prohibited_transforms())),
+            "sinks": list(prohibited_plugin_section(catalog.list_prohibited_sinks())),
+        },
+        "budget": {
+            "max_canonical_bytes": _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+            "omitted_public_text_count": 0,
+        },
     }
 
     # Every operator-profiled component carries its live alias enum and public
@@ -1305,20 +1528,73 @@ def discovery_digest(
                 entry["profile_aliases"] = sorted(aliases)
                 entry["required_options"] = public_required
                 break
+    ordered_sections = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    for entries, details_via in ordered_sections:
+        for entry in entries:
+            for field in ("purpose", "not_for"):
+                if field == "purpose":
+                    value = entry["purpose"] if "purpose" in entry else None
+                else:
+                    value = entry["not_for"] if "not_for" in entry else None
+                if (
+                    type(value) is str
+                    and len(value.encode("utf-8")) > _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES
+                    and _omit_digest_text(entry, field, details_via=details_via)
+                ):
+                    digest["budget"]["omitted_public_text_count"] += 1
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        for entries, details_via in ordered_sections:
+            for entry in entries:
+                for field in ("purpose", "not_for"):
+                    if _omit_digest_text(entry, field, details_via=details_via):
+                        digest["budget"]["omitted_public_text_count"] += 1
+        _digest_size(digest)
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        raise RuntimeError("discovery_digest_budget_invariant")
     return digest
+
+
+def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
+    """Return the exact inventory tools needed to rehydrate omitted prose."""
+    digest = authoring_aids["discovery_digest"]["plugins"]
+    section_tools = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    required: set[str] = set()
+    for entries, expected_tool in section_tools:
+        for entry in entries:
+            purpose_omission = entry["purpose_omitted"] if "purpose_omitted" in entry else None
+            prohibition_omission = entry["not_for_omitted"] if "not_for_omitted" in entry else None
+            for omission in (purpose_omission, prohibition_omission):
+                if omission is None:
+                    continue
+                if omission["details_via"] != expected_tool:
+                    raise RuntimeError("discovery_digest_details_tool_invariant")
+                required.add(expected_tool)
+    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in required)
 
 
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "This digest is rendered from the live policy-visible catalog at prompt "
     "build and is current for this deployment. For plugin selection, plan directly from it; "
-    "it is selection and hints only, "
+    "it is the complete selection and hints only index, "
     "not a full option contract: required-option names are incomplete without "
     "types, optional knobs, defaults, enums, and conditional rules. Author "
     "options only from schema_contract_evidence for this request or a current "
-    "get_plugin_schema result. An entry's not_for is that plugin's own stated "
+    "get_plugin_schema result. Detailed composer hints are disclosed only in "
+    "the bounded contract for a chosen plugin. An entry's not_for is that plugin's own stated "
     "prohibition and is binding on selection: when the value you intend to "
     "write matches it, choose a different plugin or reshape the value upstream "
     "first. capability_tags is the plugin's declared capability vocabulary. "
+    "The budget block reports canonical_bytes_used and omitted_public_text_count. "
+    "When public purpose or prohibition prose is omitted, its whole sha256 and details_via marker "
+    "replace it; follow details_via before selecting that plugin because omitted prohibition text is still binding. "
     "Entries carry no worked example; the worked shapes validated for this "
     "deployment are the other authoring_aids sections. "
     "You rarely need list_sources/list_transforms/"
@@ -2001,10 +2277,14 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
 
 __all__ = [
     "PLACEHOLDER_BLOB_ID",
+    "PlannerPluginContract",
+    "SchemaContractProjectionUnsupported",
     "build_planner_authoring_aids",
     "build_schema_contract_evidence",
     "discovery_digest",
+    "discovery_digest_detail_tools",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",
+    "planner_plugin_contract",
     "source_custody_exemplar_args",
 ]
