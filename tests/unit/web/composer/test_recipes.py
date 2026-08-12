@@ -15,6 +15,7 @@ Covers:
 from __future__ import annotations
 
 import hashlib
+import inspect
 from pathlib import Path
 from typing import ClassVar
 from uuid import uuid4
@@ -29,12 +30,18 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm import LLMSource
 from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.recipes import (
+    RecipeIntentContext,
+    RecipeOutputBinding,
+    RecipeReviewedOutputSummary,
+    RecipeReviewedSourceSummary,
+    RecipeSourceBinding,
     RecipeSpec,
     RecipeValidationError,
     SlotSpec,
     apply_recipe,
     get_recipe,
     list_recipes,
+    match_registered_recipe_intent,
     recipe_catalog_content_hash,
 )
 from elspeth.web.config import WebSettings
@@ -85,6 +92,7 @@ class TestRecipeRegistry:
             "classify-rows-llm-jsonl",
             "split-by-numeric-threshold",
             "fork-coalesce-truncate-jsonl",
+            "web-scrape-llm-project-jsonl",
             "web-scrape-llm-rate-jsonl",
         }
 
@@ -147,6 +155,246 @@ class TestRecipeRegistry:
         spec = get_recipe("web-scrape-llm-rate-jsonl")
         assert spec is not None
         assert spec.alternative_plugin_groups == (frozenset({PluginId("source", "csv"), PluginId("source", "json")}),)
+
+
+class TestRegisteredRecipeIntentMatching:
+    def _context(
+        self,
+        text: str,
+        *,
+        source_name: str = "briefs",
+        locator_field: str = "document_uri",
+        response_field: str = "abstract",
+        aliases: tuple[str, ...] = ("approved-summary",),
+    ) -> RecipeIntentContext:
+        blob_id = str(uuid4())
+        return RecipeIntentContext(
+            user_text=text,
+            reviewed_sources=(
+                RecipeReviewedSourceSummary(
+                    name=source_name,
+                    plugin="json",
+                    field_names=(locator_field,),
+                ),
+            ),
+            reviewed_outputs=(
+                RecipeReviewedOutputSummary(
+                    name="projected",
+                    plugin="json",
+                    required_fields=(locator_field, response_field),
+                ),
+            ),
+            policy_snapshot=_snapshot_with_llm_profiles(*aliases),
+            source_bindings=(
+                RecipeSourceBinding(
+                    name=source_name,
+                    plugin="json",
+                    blob_id=blob_id,
+                ),
+            ),
+            output_bindings=(
+                RecipeOutputBinding(
+                    name="projected",
+                    plugin="json",
+                    path="outputs/projected.jsonl",
+                    format="jsonl",
+                ),
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("text", "locator_field", "response_field"),
+        [
+            (
+                "Fetch every page named by `document_uri`, have an LLM write a short `abstract`, "
+                "and retain exactly `document_uri` and `abstract`. Contact ops@agency.gov.au; "
+                "scraping reason: 'Public-page abstract research'.",
+                "document_uri",
+                "abstract",
+            ),
+            (
+                "Scrape each `page_ref`, use the LLM to produce `digest`, then keep only `page_ref` and `digest`. "
+                "Use web-team@agency.gov.au; reason for the scrape is 'Accessibility research'.",
+                "page_ref",
+                "digest",
+            ),
+        ],
+    )
+    def test_generic_web_projection_matches_arbitrary_field_names(
+        self,
+        text: str,
+        locator_field: str,
+        response_field: str,
+    ) -> None:
+        match = match_registered_recipe_intent(self._context(text, locator_field=locator_field, response_field=response_field))
+
+        assert match is not None
+        assert match.recipe_name == "web-scrape-llm-project-jsonl"
+        assert match.slots["locator_field"] == locator_field
+        assert match.slots["response_field"] == response_field
+        assert match.slots["retained_fields"] == (locator_field, response_field)
+        assert match.slots["profile"] == "approved-summary"
+
+    def test_missing_response_field_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri` and have an LLM analyze it; retain exactly `document_uri`. "
+            "Contact ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_conflicting_reviewed_projection_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, write an `abstract`, and retain only `abstract`. "
+            "Contact ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_multiple_usable_profiles_are_ambiguous(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, write an `abstract`, and retain exactly `document_uri` and `abstract`. "
+            "Contact ops@agency.gov.au; scraping reason: 'Public analysis'.",
+            aliases=("profile-a", "profile-b"),
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_multiple_source_bindings_are_ambiguous(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, write an `abstract`, and retain exactly `document_uri` and `abstract`. "
+            "Contact ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+        context = RecipeIntentContext(
+            user_text=context.user_text,
+            reviewed_sources=context.reviewed_sources,
+            reviewed_outputs=context.reviewed_outputs,
+            policy_snapshot=context.policy_snapshot,
+            source_bindings=(
+                *context.source_bindings,
+                RecipeSourceBinding(name="other", plugin="json", blob_id=str(uuid4())),
+            ),
+            output_bindings=context.output_bindings,
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_multiple_output_bindings_are_ambiguous(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, write an `abstract`, and retain exactly `document_uri` and `abstract`. "
+            "Contact ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+        context = RecipeIntentContext(
+            user_text=context.user_text,
+            reviewed_sources=context.reviewed_sources,
+            reviewed_outputs=context.reviewed_outputs,
+            policy_snapshot=context.policy_snapshot,
+            source_bindings=context.source_bindings,
+            output_bindings=(
+                *context.output_bindings,
+                RecipeOutputBinding(name="other", plugin="json", path="outputs/other.jsonl", format="jsonl"),
+            ),
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            (
+                "Fetch every `document_uri`, write an `abstract`, and retain exactly `document_uri` and `abstract`. "
+                "Scraping reason: 'Public analysis'."
+            ),
+            (
+                "Fetch every `document_uri`, write an `abstract`, and retain exactly `document_uri` and `abstract`. "
+                "Contact ops@agency.gov.au."
+            ),
+        ],
+    )
+    def test_missing_http_identity_falls_back(self, text: str) -> None:
+        assert match_registered_recipe_intent(self._context(text)) is None
+
+    def test_production_matcher_has_no_tutorial_identity_dependency(self) -> None:
+        import elspeth.web.composer.recipe_intent_routing as routing_module
+
+        source = inspect.getsource(recipes_module._match_web_scrape_project_intent) + inspect.getsource(routing_module)
+
+        assert "tutorial" not in source.casefold()
+        assert "session_id" not in source
+        assert "TUTORIAL_" not in source
+
+
+class TestGenericWebProjectionRecipe:
+    def test_build_uses_exact_arbitrary_projection(self) -> None:
+        args = apply_recipe(
+            "web-scrape-llm-project-jsonl",
+            {
+                "source_blob_id": str(uuid4()),
+                "source_plugin": "json",
+                "locator_field": "page_ref",
+                "profile": "approved-summary",
+                "response_field": "digest",
+                "required_input_fields": ["content"],
+                "retained_fields": ["page_ref", "digest"],
+                "abuse_contact": "web-team@agency.gov.au",
+                "scraping_reason": "Public accessibility research",
+                "output_path": "outputs/digests.jsonl",
+            },
+        )
+
+        web_scrape, llm, field_mapper = args["nodes"]
+        assert web_scrape["options"]["url_field"] == "page_ref"
+        assert llm["options"]["response_field"] == "digest"
+        assert field_mapper["options"]["mapping"] == {"page_ref": "page_ref", "digest": "digest"}
+
+    @pytest.mark.parametrize("raw_field", ["content", "content_fingerprint"])
+    def test_raw_scrape_fields_cannot_be_retained(self, raw_field: str) -> None:
+        with pytest.raises(RecipeValidationError, match="raw scrape"):
+            apply_recipe(
+                "web-scrape-llm-project-jsonl",
+                {
+                    "source_blob_id": str(uuid4()),
+                    "source_plugin": "json",
+                    "locator_field": "page_ref",
+                    "profile": "approved-summary",
+                    "response_field": "digest",
+                    "retained_fields": ["page_ref", "digest", raw_field],
+                    "abuse_contact": "web-team@agency.gov.au",
+                    "scraping_reason": "Public accessibility research",
+                    "output_path": "outputs/digests.jsonl",
+                },
+            )
+
+    def test_legacy_rating_is_a_specialization_of_generic_graph(self) -> None:
+        source_blob_id = str(uuid4())
+        legacy = apply_recipe(
+            "web-scrape-llm-rate-jsonl",
+            {
+                "source_blob_id": source_blob_id,
+                "source_plugin": "json",
+                "profile": "approved-rating",
+                "abuse_contact": "web-team@agency.gov.au",
+                "scraping_reason": "Public page rating",
+            },
+        )
+        generic = apply_recipe(
+            "web-scrape-llm-project-jsonl",
+            {
+                "source_blob_id": source_blob_id,
+                "source_plugin": "json",
+                "locator_field": "url",
+                "profile": "approved-rating",
+                "prompt_template": ("Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}"),
+                "response_field": "rating",
+                "required_input_fields": ["content"],
+                "retained_fields": ["url", "rating"],
+                "abuse_contact": "web-team@agency.gov.au",
+                "scraping_reason": "Public page rating",
+                "output_path": "outputs/ratings.jsonl",
+            },
+        )
+
+        assert legacy == generic
 
 
 # --------------------------------------------------------------------------

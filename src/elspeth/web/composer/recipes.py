@@ -13,6 +13,7 @@ slot values they were given.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import cache
@@ -27,6 +28,105 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 
 
 @dataclass(frozen=True, slots=True)
+class InlineRecipeBlob:
+    """Literal request-owned bytes to settle through normal planner custody."""
+
+    filename: str
+    mime_type: str
+    content: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeReviewedSourceSummary:
+    """Surface-neutral public facts for one reviewed source."""
+
+    name: str
+    plugin: str
+    field_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeReviewedOutputSummary:
+    """Surface-neutral public facts for one reviewed output."""
+
+    name: str
+    plugin: str
+    required_fields: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeSourceBinding:
+    """Exact server-owned source identity available to a recipe matcher."""
+
+    name: str
+    plugin: str
+    blob_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeOutputBinding:
+    """Exact server-owned output destination available to a matcher."""
+
+    name: str
+    plugin: str
+    path: str
+    format: str
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentContext:
+    """Facts a registry matcher may use without depending on a UI surface."""
+
+    user_text: str
+    reviewed_sources: tuple[RecipeReviewedSourceSummary, ...] = ()
+    reviewed_outputs: tuple[RecipeReviewedOutputSummary, ...] = ()
+    policy_snapshot: PluginAvailabilitySnapshot | None = None
+    source_bindings: tuple[RecipeSourceBinding, ...] = ()
+    output_bindings: tuple[RecipeOutputBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.user_text) is not str:
+            raise TypeError("RecipeIntentContext.user_text must be an exact str")
+        exact_sequences = (
+            (self.reviewed_sources, RecipeReviewedSourceSummary, "reviewed_sources"),
+            (self.reviewed_outputs, RecipeReviewedOutputSummary, "reviewed_outputs"),
+            (self.source_bindings, RecipeSourceBinding, "source_bindings"),
+            (self.output_bindings, RecipeOutputBinding, "output_bindings"),
+        )
+        for values, expected_type, field_name in exact_sequences:
+            if type(values) is not tuple or any(type(value) is not expected_type for value in values):
+                raise TypeError(f"RecipeIntentContext.{field_name} must be an exact tuple of {expected_type.__name__}")
+        if self.policy_snapshot is not None and type(self.policy_snapshot) is not PluginAvailabilitySnapshot:
+            raise TypeError("RecipeIntentContext.policy_snapshot must be an exact PluginAvailabilitySnapshot or None")
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentCandidate:
+    """One recipe-owned sparse slot extraction before registry arbitration."""
+
+    slots: Mapping[str, object]
+    inline_blob: InlineRecipeBlob | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "slots")
+
+
+@dataclass(frozen=True, slots=True)
+class RecipeIntentMatch:
+    """The unique complete executable registry match for one request."""
+
+    recipe_name: str
+    slots: Mapping[str, object]
+    inline_blob: InlineRecipeBlob | None = None
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "slots")
+
+
+type RecipeIntentMatcher = Callable[[RecipeIntentContext], RecipeIntentCandidate | None]
+
+
+@dataclass(frozen=True, slots=True)
 class RecipeSpec:
     """Declares a recipe — its slot schema and the scaffold function."""
 
@@ -37,6 +137,7 @@ class RecipeSpec:
     """Pure function: validated slots → set_pipeline-compatible args dict."""
     required_plugins: frozenset[PluginId] = frozenset()
     alternative_plugin_groups: tuple[frozenset[PluginId], ...] = ()
+    matcher: RecipeIntentMatcher | None = None
 
     def __post_init__(self) -> None:
         # ``frozen=True`` only blocks attribute reassignment; the underlying
@@ -389,6 +490,58 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_INLINE_SOURCE_BLOB_SENTINEL: Final[str] = str(UUID(int=0))
+_FORK_CSV_MARKER_RE = re.compile(r"(?:customer\s+rows\s*)?\(csv\):\s*\n(?P<csv>.+)\Z", re.IGNORECASE | re.DOTALL)
+_FORK_OUTPUT_PATH_RE = re.compile(r"\bat\s+(?P<path>[^\s:]+\.jsonl)\b", re.IGNORECASE)
+_FORK_TRUNCATE_RE = re.compile(
+    r"\btruncates?\s+the\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+field\s+to\s+(?P<max_chars>\d+)\s+characters?",
+    re.IGNORECASE,
+)
+_FORK_SUFFIX_RE = re.compile(r"\bsuffix\s+(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)", re.IGNORECASE)
+_FORK_KEYS_RE = re.compile(
+    r"under\s+separate\s+keys\s+`(?P<key_a>[A-Za-z_][A-Za-z0-9_]*)`\s+and\s+`(?P<key_b>[A-Za-z_][A-Za-z0-9_]*)`",
+    re.IGNORECASE,
+)
+
+
+def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
+    """Extract required fork semantics and only the optional slots stated."""
+
+    lower = context.user_text.lower()
+    if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
+        return None
+    csv_match = _FORK_CSV_MARKER_RE.search(context.user_text)
+    truncate_match = _FORK_TRUNCATE_RE.search(context.user_text)
+    if csv_match is None or truncate_match is None:
+        return None
+    csv_content = csv_match.group("csv").strip()
+    if "\n" not in csv_content:
+        return None
+
+    slots: dict[str, object] = {
+        "truncate_field": truncate_match.group("field"),
+        "max_chars": int(truncate_match.group("max_chars")),
+    }
+    output_match = _FORK_OUTPUT_PATH_RE.search(context.user_text)
+    if output_match is not None:
+        slots["output_path"] = output_match.group("path")
+    suffix_match = _FORK_SUFFIX_RE.search(context.user_text)
+    if suffix_match is not None:
+        slots["truncation_suffix"] = suffix_match.group("suffix")
+    keys_match = _FORK_KEYS_RE.search(context.user_text)
+    if keys_match is not None:
+        slots["key_a"] = keys_match.group("key_a")
+        slots["key_b"] = keys_match.group("key_b")
+    return RecipeIntentCandidate(
+        slots=slots,
+        inline_blob=InlineRecipeBlob(
+            filename="inline-fork-coalesce.csv",
+            mime_type="text/csv",
+            content=csv_content,
+        ),
+    )
+
+
 _RECIPE3_SLOTS: Final[dict[str, SlotSpec]] = {
     "source_blob_id": SlotSpec(
         slot_type="blob_id",
@@ -552,15 +705,15 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
 
 
 # ---------------------------------------------------------------------------
-# Recipe 4: web-scrape-llm-rate-jsonl (D11)
+# Recipe 4: web-scrape-llm-project-jsonl
 #
-#   json/csv URL-row source (blob)  →  web_scrape (fetch page content)
-#                                    →  llm (rate the page)
+#   json/csv locator-row source     →  web_scrape (fetch page content)
+#                                    →  llm (project a named response)
 #                                    →  field_mapper(select_only) cleanup
 #                                    →  jsonl sink (single output)
 #
 # web_scrape is a TRANSFORM, not a source: the head source is a json/csv blob
-# of {url: ...} rows. The field_mapper drops the raw scraped content/fingerprint
+# with one explicitly named locator field. The field_mapper drops the raw scraped content/fingerprint
 # (data minimization) and stages the kind=pipeline_decision raw-HTML cleanup
 # requirement so the blocking cleanup contract (raw_html_cleanup_review_contract_error,
 # interpretation_state.py) passes deterministically.
@@ -576,48 +729,79 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
 # ---------------------------------------------------------------------------
 
 
-_RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
+_GENERIC_WEB_PROMPT_TEMPLATE: Final[str] = "Analyze the following public page and return the requested response:\n\n{{ row['content'] }}"
+_LEGACY_RATING_TEMPLATE: Final[str] = "Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}"
+_RAW_SCRAPE_FIELDS: Final[frozenset[str]] = frozenset({"content", "content_fingerprint"})
+_FIELD_TOKEN_RE = re.compile(r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`")
+_RESPONSE_FIELD_RE = re.compile(
+    r"\b(?:write|produce|generate|create|return|store)(?:\s+(?:a|an))?(?:\s+(?:short|concise|brief))?\s+"
+    r"(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)`|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
+    re.IGNORECASE,
+)
+_ABUSE_CONTACT_RE = re.compile(r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_SCRAPING_REASON_RE = re.compile(
+    r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\s*(?:is|:)?\s*"
+    r"(?P<quote>['\"])(?P<reason>[^'\"]+)(?P=quote)",
+    re.IGNORECASE,
+)
+
+_RECIPE_WEB_PROJECT_SLOTS: Final[dict[str, SlotSpec]] = {
     "source_blob_id": SlotSpec(
         slot_type="blob_id",
-        description="UUID of the operator-supplied URL-list blob (json/csv rows of {url: ...}; use create_blob to wrap inline content first)",
+        description="UUID of the operator-supplied locator-row blob; use create_blob to wrap inline content first",
     ),
     "source_plugin": SlotSpec(
         slot_type="str",
-        description="Resolved URL-row source plugin carried from match_recipe; must be 'json' or 'csv'. Direct apply callers pass the materialised source plugin explicitly.",
+        description="Resolved locator-row source plugin; must be 'json' or 'csv' and match server-owned source authority.",
+    ),
+    "locator_field": SlotSpec(
+        slot_type="str",
+        description="Exact source-row field carrying each page locator.",
     ),
     "profile": SlotSpec(
         slot_type="str",
         description="Opaque operator-approved LLM profile alias",
     ),
-    "rating_template": SlotSpec(
+    "prompt_template": SlotSpec(
         slot_type="str",
         required=False,
-        default="Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}",
-        description="Jinja2 template for the rating prompt; reference scraped content as {{ row['content'] }}",
+        default=_GENERIC_WEB_PROMPT_TEMPLATE,
+        description=(
+            "Jinja2 prompt template. When omitted, the recipe's visible generic default asks the LLM to analyze "
+            "the scraped content and return the requested response."
+        ),
+    ),
+    "response_field": SlotSpec(
+        slot_type="str",
+        description="Exact row field where the LLM response is stored.",
+    ),
+    "required_input_fields": SlotSpec(
+        slot_type="str_list",
+        required=False,
+        default=("content",),
+        description="Exact input fields consumed by prompt_template.",
+    ),
+    "retained_fields": SlotSpec(
+        slot_type="str_list",
+        description="Exact output projection retained after raw scrape cleanup.",
     ),
     "abuse_contact": SlotSpec(
         slot_type="str",
         description=(
             "Operator-owned monitored contact address sent in web_scrape HTTP metadata. "
-            "If the public-fetch request omits it and no deployment/tool identity is visible, "
-            "use abuse-contact-unset@elspeth.foundryside.dev and surface that default after "
-            "the recipe/tool call with a pipeline_decision interpretation review."
+            "It must be supplied explicitly or by exact reviewed server authority; the recipe never invents one."
         ),
     ),
     "scraping_reason": SlotSpec(
         slot_type="str",
         description=(
             "Operator-authored reason for scraping, sent in web_scrape HTTP metadata. "
-            "If the public-fetch request omits it, derive an explicit reason from the user's "
-            "requested public fetch and surface that default after the recipe/tool call with "
-            "a pipeline_decision interpretation review."
+            "It must be supplied explicitly or by exact reviewed server authority; the recipe never derives or guesses one."
         ),
     ),
     "output_path": SlotSpec(
         slot_type="str",
-        required=False,
-        default="outputs/ratings.jsonl",
-        description="JSONL output path",
+        description="Exact reviewed JSONL output path.",
     ),
     "allowed_hosts": SlotSpec(
         slot_type="str_list",
@@ -631,8 +815,7 @@ _RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
         description=(
             "SSRF allowlist for the web_scrape node, as a list of CIDR strings. "
             "Empty (the default) omits the key so the web_scrape field default "
-            "'public_only' applies — the correct value for a public host, including "
-            "the tutorial's publicly-hosted synthetic pages. SSRF safety comes "
+            "'public_only' applies — the correct value for a public host. SSRF safety comes "
             "from the web_scrape enforcement boundary (CidrStr validation + the "
             "'public_only' field default), not from the slot being unreachable — "
             "apply_pipeline_recipe is a Tier-3 boundary that can forward an "
@@ -642,8 +825,8 @@ _RECIPE_WEB_SCRAPE_SLOTS: Final[dict[str, SlotSpec]] = {
 }
 
 
-def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
-    """Build set_pipeline args for the web-scrape-llm-rate-jsonl recipe.
+def _build_web_scrape_project_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
+    """Build a source → scrape → LLM → exact projection → JSONL graph.
 
     Emits source → web_scrape → llm → field_mapper(cleanup) → jsonl, named by
     connection labels (NOT EdgeSpec objects — guided passes edges=[]). The
@@ -662,6 +845,24 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
         RAW_HTML_CLEANUP_USER_TERM,
     )
 
+    source_plugin = slots["source_plugin"]
+    if source_plugin not in {"csv", "json"}:
+        raise RecipeValidationError("web projection recipe source_plugin must be 'csv' or 'json'")
+    locator_field = slots["locator_field"]
+    response_field = slots["response_field"]
+    retained_fields = tuple(slots["retained_fields"])
+    if type(locator_field) is not str or not locator_field:
+        raise RecipeValidationError("web projection recipe locator_field must be non-empty")
+    if type(response_field) is not str or not response_field:
+        raise RecipeValidationError("web projection recipe response_field must be non-empty")
+    if not retained_fields or len(set(retained_fields)) != len(retained_fields):
+        raise RecipeValidationError("web projection recipe retained_fields must be a non-empty unique list")
+    raw_retained = _RAW_SCRAPE_FIELDS.intersection(retained_fields)
+    if raw_retained:
+        raise RecipeValidationError(f"web projection recipe cannot retain raw scrape field(s): {sorted(raw_retained)}")
+    if response_field not in retained_fields:
+        raise RecipeValidationError("web projection recipe retained_fields must include response_field")
+
     content_field = "content"
     fingerprint_field = "content_fingerprint"
     cleanup_requirement = {
@@ -671,7 +872,7 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
     }
     web_scrape_options: dict[str, Any] = {
         "schema": {"mode": "observed"},
-        "url_field": "url",
+        "url_field": locator_field,
         "content_field": content_field,
         "fingerprint_field": fingerprint_field,
         "format": "markdown",
@@ -686,15 +887,15 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
     }
     allowed_hosts = slots["allowed_hosts"]
     if allowed_hosts:
-        # SSRF allowlist supplied by the deterministic seam (tutorial loopback
-        # CIDR). Empty -> omitted -> the web_scrape field default public_only.
+        # SSRF allowlist supplied by exact reviewed authority. Empty -> omitted
+        # -> the web_scrape field default public_only.
         # The allowlist is a field of ``WebScrapeHTTPConfig`` (web_scrape.py),
         # so it MUST nest under ``http`` beside abuse_contact/scraping_reason —
         # a top-level key is rejected by the plugin (extra:forbid).
         web_scrape_options["http"]["allowed_hosts"] = list(allowed_hosts)
     return {
         "source": {
-            "plugin": slots["source_plugin"],
+            "plugin": source_plugin,
             "blob_id": slots["source_blob_id"],
             "on_success": "rows",
             "options": {
@@ -721,10 +922,10 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
                 "on_error": "discard",
                 "options": {
                     "profile": slots["profile"],
-                    "prompt_template": slots["rating_template"],
-                    "response_field": "rating",
+                    "prompt_template": slots["prompt_template"],
+                    "response_field": response_field,
                     "schema": {"mode": "observed"},
-                    "required_input_fields": [content_field],
+                    "required_input_fields": list(slots["required_input_fields"]),
                 },
             },
             {
@@ -739,10 +940,7 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
                     "select_only": True,
                     # mapping preserves ONLY the user-facing fields; the raw
                     # content/fingerprint are intentionally absent (dropped).
-                    "mapping": {
-                        "url": "url",
-                        "rating": "rating",
-                    },
+                    "mapping": {field: field for field in retained_fields},
                     INTERPRETATION_REQUIREMENTS_KEY: [cleanup_requirement],
                 },
             },
@@ -763,12 +961,159 @@ def _build_web_scrape_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
             }
         ],
         "metadata": {
-            "name": "web-scrape-llm-rate-jsonl",
+            "name": "web-scrape-llm-project-jsonl",
             "description": (
-                f"Scrape each URL, rate the page with an LLM, drop the raw HTML/fingerprint, and write ratings to {slots['output_path']}"
+                f"Scrape each locator in '{locator_field}', store the LLM response in '{response_field}', "
+                f"retain exactly {list(retained_fields)!r}, and write JSONL to {slots['output_path']}"
             ),
         },
     }
+
+
+_RECIPE_WEB_RATE_SLOTS: Final[dict[str, SlotSpec]] = {
+    "source_blob_id": _RECIPE_WEB_PROJECT_SLOTS["source_blob_id"],
+    "source_plugin": _RECIPE_WEB_PROJECT_SLOTS["source_plugin"],
+    "profile": _RECIPE_WEB_PROJECT_SLOTS["profile"],
+    "rating_template": SlotSpec(
+        slot_type="str",
+        required=False,
+        default=_LEGACY_RATING_TEMPLATE,
+        description="Legacy rating prompt template.",
+    ),
+    "abuse_contact": _RECIPE_WEB_PROJECT_SLOTS["abuse_contact"],
+    "scraping_reason": _RECIPE_WEB_PROJECT_SLOTS["scraping_reason"],
+    "output_path": SlotSpec(
+        slot_type="str",
+        required=False,
+        default="outputs/ratings.jsonl",
+        description="JSONL output path",
+    ),
+    "allowed_hosts": _RECIPE_WEB_PROJECT_SLOTS["allowed_hosts"],
+}
+
+
+def _build_legacy_web_rating_recipe(slots: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Translate the legacy rating slots onto the generic graph builder."""
+
+    return _build_web_scrape_project_recipe(
+        {
+            "source_blob_id": slots["source_blob_id"],
+            "source_plugin": slots["source_plugin"],
+            "locator_field": "url",
+            "profile": slots["profile"],
+            "prompt_template": slots["rating_template"],
+            "response_field": "rating",
+            "required_input_fields": ("content",),
+            "retained_fields": ("url", "rating"),
+            "abuse_contact": slots["abuse_contact"],
+            "scraping_reason": slots["scraping_reason"],
+            "output_path": slots["output_path"],
+            "allowed_hosts": slots["allowed_hosts"],
+        }
+    )
+
+
+def _unique_in_order(values: list[str]) -> tuple[str, ...]:
+    unique: list[str] = []
+    for value in values:
+        if value not in unique:
+            unique.append(value)
+    return tuple(unique)
+
+
+def _web_response_field(user_text: str) -> str | None:
+    match = _RESPONSE_FIELD_RE.search(user_text)
+    if match is None:
+        return None
+    return match.group("quoted") or match.group("plain")
+
+
+def _single_llm_profile(context: RecipeIntentContext) -> str | None:
+    snapshot = context.policy_snapshot
+    if snapshot is None:
+        return None
+    aliases = dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ())
+    named = tuple(alias for alias in aliases if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(alias)}(?![A-Za-z0-9_-])", context.user_text))
+    if len(named) == 1:
+        return named[0]
+    if named:
+        return None
+    return aliases[0] if len(aliases) == 1 else None
+
+
+def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
+    """Match only complete, unambiguous reviewed scrape/project requests."""
+
+    lower = context.user_text.lower()
+    if not any(term in lower for term in ("fetch", "scrape")) or "llm" not in lower:
+        return None
+    if not any(term in lower for term in ("keep only", "retain exactly", "retain only", "keep exactly")):
+        return None
+    if len(context.reviewed_sources) != 1 or len(context.reviewed_outputs) != 1:
+        return None
+    if len(context.source_bindings) != 1 or len(context.output_bindings) != 1:
+        return None
+    source = context.reviewed_sources[0]
+    output = context.reviewed_outputs[0]
+    source_binding = context.source_bindings[0]
+    output_binding = context.output_bindings[0]
+    if (source.name, source.plugin) != (source_binding.name, source_binding.plugin):
+        return None
+    if (output.name, output.plugin) != (output_binding.name, output_binding.plugin):
+        return None
+    if source.plugin not in {"csv", "json"} or output.plugin != "json" or output_binding.format != "jsonl":
+        return None
+    try:
+        UUID(source_binding.blob_id)
+    except ValueError:
+        return None
+    if not output_binding.path:
+        return None
+
+    response_field = _web_response_field(context.user_text)
+    if response_field is None:
+        return None
+    mentioned_source_fields = tuple(
+        field
+        for field in source.field_names
+        if field != response_field and re.search(rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])", context.user_text, re.IGNORECASE)
+    )
+    if len(mentioned_source_fields) != 1:
+        return None
+    locator_field = mentioned_source_fields[0]
+    quoted_fields = _unique_in_order([match.group("field") for match in _FIELD_TOKEN_RE.finditer(context.user_text)])
+    retained_fields = tuple(field for field in quoted_fields if field in {*source.field_names, response_field})
+    if not retained_fields and "keep only" in lower:
+        retained_fields = (response_field,)
+    if not retained_fields or response_field not in retained_fields or _RAW_SCRAPE_FIELDS.intersection(retained_fields):
+        return None
+    if output.required_fields and tuple(output.required_fields) != retained_fields:
+        return None
+    profile = _single_llm_profile(context)
+    if profile is None:
+        return None
+    contact_match = _ABUSE_CONTACT_RE.search(context.user_text)
+    if contact_match is None:
+        return None
+    reason_match = _SCRAPING_REASON_RE.search(context.user_text)
+    if reason_match is None:
+        return None
+    reason = reason_match.group("reason").strip()
+    if not reason or not reason.isascii():
+        return None
+    return RecipeIntentCandidate(
+        slots={
+            "source_blob_id": source_binding.blob_id,
+            "source_plugin": source_binding.plugin,
+            "locator_field": locator_field,
+            "profile": profile,
+            "response_field": response_field,
+            "retained_fields": retained_fields,
+            "abuse_contact": contact_match.group(0),
+            "scraping_reason": reason,
+            "output_path": output_binding.path,
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -826,6 +1171,28 @@ _RECIPES: Final[dict[str, RecipeSpec]] = {
                 PluginId("sink", "json"),
             }
         ),
+        matcher=_match_fork_coalesce_intent,
+    ),
+    "web-scrape-llm-project-jsonl": RecipeSpec(
+        name="web-scrape-llm-project-jsonl",
+        description=(
+            "Fetch each page named by an arbitrary source locator field, project an LLM response into an explicitly named "
+            "field, remove the raw fetched content and fingerprint, retain an exact caller-supplied field set, and write "
+            "JSONL through a reviewed destination. The generic prompt has a visible recipe-owned default; response and "
+            "projection fields, HTTP identity, source binding, profile, and output destination are never guessed."
+        ),
+        slots=_RECIPE_WEB_PROJECT_SLOTS,
+        build=_build_web_scrape_project_recipe,
+        required_plugins=frozenset(
+            {
+                PluginId("transform", "web_scrape"),
+                PluginId("transform", "llm"),
+                PluginId("transform", "field_mapper"),
+                PluginId("sink", "json"),
+            }
+        ),
+        alternative_plugin_groups=(frozenset({PluginId("source", "csv"), PluginId("source", "json")}),),
+        matcher=_match_web_scrape_project_intent,
     ),
     "web-scrape-llm-rate-jsonl": RecipeSpec(
         name="web-scrape-llm-rate-jsonl",
@@ -839,8 +1206,8 @@ _RECIPES: Final[dict[str, RecipeSpec]] = {
             "or csv. The raw-HTML cleanup is staged as a pipeline_decision so the "
             "data-minimization contract passes deterministically."
         ),
-        slots=_RECIPE_WEB_SCRAPE_SLOTS,
-        build=_build_web_scrape_recipe,
+        slots=_RECIPE_WEB_RATE_SLOTS,
+        build=_build_legacy_web_rating_recipe,
         required_plugins=frozenset(
             {
                 PluginId("transform", "web_scrape"),
@@ -882,6 +1249,68 @@ def unavailable_recipe_plugin(
         if alternatives.isdisjoint(snapshot.available):
             return min(alternatives)
     return None
+
+
+def match_registered_recipe_intent(context: RecipeIntentContext) -> RecipeIntentMatch | None:
+    """Return the unique complete executable recipe match, else fall back.
+
+    Matchers produce sparse values: absent optional slots remain absent here so
+    the recipe declaration's ordinary ``validate_slots`` path remains the sole
+    owner of defaults. A malformed, incomplete, unavailable, or ambiguous
+    candidate never partially applies a recipe.
+    """
+
+    if type(context) is not RecipeIntentContext:
+        raise TypeError("context must be an exact RecipeIntentContext")
+    complete: list[RecipeIntentMatch] = []
+    for recipe in _RECIPES.values():
+        matcher = recipe.matcher
+        if matcher is None:
+            continue
+        candidate = matcher(context)
+        if candidate is None:
+            continue
+        if type(candidate) is not RecipeIntentCandidate:
+            raise TypeError(f"recipe '{recipe.name}' matcher must return RecipeIntentCandidate or None")
+        missing_required = [
+            name
+            for name, spec in recipe.slots.items()
+            if spec.required and name not in candidate.slots and not (candidate.inline_blob is not None and spec.slot_type == "blob_id")
+        ]
+        if missing_required:
+            continue
+        try:
+            validation_slots = dict(candidate.slots)
+            if candidate.inline_blob is not None:
+                missing_blob_slots = [
+                    name
+                    for name, spec in recipe.slots.items()
+                    if spec.required and spec.slot_type == "blob_id" and name not in validation_slots
+                ]
+                if len(missing_blob_slots) != 1:
+                    continue
+                validation_slots[missing_blob_slots[0]] = _INLINE_SOURCE_BLOB_SENTINEL
+            validate_slots(recipe, validation_slots)
+            if (
+                context.policy_snapshot is not None
+                and unavailable_recipe_plugin(
+                    recipe,
+                    context.policy_snapshot,
+                    raw_slots=candidate.slots,
+                )
+                is not None
+            ):
+                continue
+        except RecipeValidationError:
+            continue
+        complete.append(
+            RecipeIntentMatch(
+                recipe_name=recipe.name,
+                slots=candidate.slots,
+                inline_blob=candidate.inline_blob,
+            )
+        )
+    return complete[0] if len(complete) == 1 else None
 
 
 def list_recipes(snapshot: PluginAvailabilitySnapshot) -> list[dict[str, Any]]:

@@ -165,11 +165,16 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
-from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.recipes import (
-    RecipeValidationError,
+    RecipeIntentContext,
+    RecipeIntentMatch,
+    RecipeOutputBinding,
+    RecipeReviewedOutputSummary,
+    RecipeReviewedSourceSummary,
+    RecipeSourceBinding,
     apply_recipe,
     get_recipe,
+    match_registered_recipe_intent,
     recipe_catalog_content_hash,
     unavailable_recipe_plugin,
 )
@@ -392,6 +397,97 @@ _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARG
 
 _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+async def try_prepare_registered_recipe_plan(
+    *,
+    intent_context: RecipeIntentContext,
+    current_state: CompositionState,
+    reviewed_facts: Mapping[str, Any],
+    reviewed_planner_context: Mapping[str, Any],
+    supersedes_draft_hash: str | None,
+    surface: PlannerSurface,
+    policy_catalog: PolicyCatalogView,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    originating_message: PlannerOriginatingMessage,
+    base: AbsentBase | PresentBase,
+    custody_config: PlannerCustodyConfig,
+    timeout_seconds: float,
+    candidate_finalizer: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+) -> PipelinePlanResult | None:
+    """Prepare the registry's unique complete match through the common gate."""
+
+    match = match_registered_recipe_intent(intent_context)
+    if match is None:
+        return None
+    if type(match) is not RecipeIntentMatch:
+        raise TypeError("recipe matcher returned a malformed match")
+    recipe = get_recipe(match.recipe_name)
+    if recipe is None:
+        raise AuditIntegrityError("recipe matcher selected an unregistered recipe")
+    if unavailable_recipe_plugin(recipe, plugin_snapshot, raw_slots=match.slots) is not None:
+        return None
+
+    recipe_slots = dict(match.slots)
+    inline_blob = match.inline_blob
+    if inline_blob is not None:
+        blob_slots = [
+            name for name, spec in recipe.slots.items() if spec.required and spec.slot_type == "blob_id" and name not in recipe_slots
+        ]
+        if len(blob_slots) != 1:
+            raise AuditIntegrityError("inline recipe must own exactly one missing required blob slot")
+        recipe_slots[blob_slots[0]] = str(UUID(int=0))
+    recipe_pipeline = apply_recipe(match.recipe_name, recipe_slots)
+    if inline_blob is not None:
+        source = recipe_pipeline.get("source")
+        if type(source) is not dict or source.get("blob_id") != str(UUID(int=0)):
+            raise AuditIntegrityError("inline recipe did not produce the expected source blob slot")
+        source = dict(source)
+        source.pop("blob_id")
+        source["inline_blob"] = {
+            "filename": inline_blob.filename,
+            "mime_type": inline_blob.mime_type,
+            "content": inline_blob.content,
+        }
+        recipe_pipeline["source"] = source
+
+    recipe_pipeline = dict(candidate_finalizer(recipe_pipeline))
+    recipe_contract = canonical_json(
+        {
+            "schema": "composer.server-recipe-router.v1",
+            "recipe": match.recipe_name,
+            "recipe_catalog_content_hash": recipe_catalog_content_hash(),
+        }
+    )
+    return await prepare_pipeline_plan(
+        pipeline=recipe_pipeline,
+        current_state=current_state,
+        reviewed_facts=reviewed_facts,
+        reviewed_planner_context=reviewed_planner_context,
+        supersedes_draft_hash=supersedes_draft_hash,
+        surface=surface,
+        policy_catalog=policy_catalog,
+        plugin_snapshot=plugin_snapshot,
+        originating_message=originating_message,
+        base=base,
+        rendered_skill=recipe_contract,
+        tool_call_id=(
+            "server-recipe-"
+            + stable_hash(
+                {
+                    "schema": "composer.server-recipe-tool-call.v1",
+                    "message_id": originating_message.message_id,
+                    "recipe": match.recipe_name,
+                }
+            )
+        ),
+        model_identifier="composer-server-recipe-router",
+        model_version="composer.server-recipe-router.v1",
+        provider="server",
+        repair_count=0,
+        timeout_seconds=timeout_seconds,
+        custody_config=custody_config,
+    )
 
 
 def _required_controls_candidate_finalizer(
@@ -3555,6 +3651,7 @@ class ComposerServiceImpl:
             GuidedCorrectionTarget,
             GuidedRevisionAuthority,
             bind_guided_prose_revision_candidate,
+            bind_guided_reviewed_components,
             build_guided_proposal_projection,
             guided_authorized_pipeline_schema,
             guided_private_reviewed_facts,
@@ -3571,6 +3668,10 @@ class ComposerServiceImpl:
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
         from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint, StatedPredicateConstraint
         from elspeth.web.composer.guided.state_machine import GuidedSession
+        from elspeth.web.composer.guided_blob_refs import (
+            reviewed_schema_declared_field_names,
+            validate_guided_reviewed_blob_binding,
+        )
 
         if type(guided) is not GuidedSession:
             raise TypeError("guided must be an exact GuidedSession")
@@ -3652,6 +3753,87 @@ class ComposerServiceImpl:
                 attempt=operation_fence.attempt,
             ),
         )
+
+        if correction_target is None and revision_authority is None and supersedes_draft_hash is None:
+            source_summaries = tuple(
+                RecipeReviewedSourceSummary(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    field_names=tuple(
+                        dict.fromkeys(
+                            (
+                                *reviewed.observed_columns,
+                                *reviewed_schema_declared_field_names(reviewed.options.get("schema")),
+                            )
+                        )
+                    ),
+                )
+                for stable_id in guided.source_order
+                for reviewed in (guided.reviewed_sources[stable_id],)
+            )
+            output_summaries = tuple(
+                RecipeReviewedOutputSummary(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    required_fields=tuple(reviewed.required_fields),
+                )
+                for stable_id in guided.output_order
+                for reviewed in (guided.reviewed_outputs[stable_id],)
+            )
+            source_bindings_list: list[RecipeSourceBinding] = []
+            for stable_id in guided.source_order:
+                reviewed = guided.reviewed_sources[stable_id]
+                reviewed_binding = validate_guided_reviewed_blob_binding(reviewed.options)
+                if reviewed_binding is not None:
+                    source_bindings_list.append(
+                        RecipeSourceBinding(
+                            name=reviewed.name,
+                            plugin=reviewed.plugin,
+                            blob_id=reviewed_binding.blob_ref,
+                        )
+                    )
+            source_bindings = tuple(source_bindings_list)
+            output_bindings = tuple(
+                RecipeOutputBinding(
+                    name=reviewed.name,
+                    plugin=reviewed.plugin,
+                    path=path,
+                    format=output_format,
+                )
+                for stable_id in guided.output_order
+                for reviewed in (guided.reviewed_outputs[stable_id],)
+                for path in (reviewed.options.get("path"),)
+                for output_format in (reviewed.options.get("format") if "format" in reviewed.options else "jsonl",)
+                if type(path) is str and type(output_format) is str
+            )
+            recipe_plan = await try_prepare_registered_recipe_plan(
+                intent_context=RecipeIntentContext(
+                    user_text=intent,
+                    reviewed_sources=source_summaries,
+                    reviewed_outputs=output_summaries,
+                    policy_snapshot=plugin_snapshot,
+                    source_bindings=source_bindings,
+                    output_bindings=output_bindings,
+                ),
+                current_state=current_state,
+                reviewed_facts=reviewed_facts,
+                reviewed_planner_context=reviewed_context,
+                supersedes_draft_hash=None,
+                surface=planner_surface,
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+                originating_message=originating_message,
+                base=base,
+                custody_config=custody_config,
+                timeout_seconds=self._timeout_seconds,
+                candidate_finalizer=_required_controls_candidate_finalizer(
+                    policy_catalog=policy_catalog,
+                    plugin_snapshot=plugin_snapshot,
+                    inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+                ),
+            )
+            if recipe_plan is not None:
+                return recipe_plan, catalog_ids
 
         passthrough_sketch_shape = (
             correction_target is None
@@ -4298,73 +4480,24 @@ class ComposerServiceImpl:
         plan: PipelinePlanResult | None = None
         planner_llm_start = len(recorder.llm_calls)
         planner_invocation_start = len(recorder.invocations)
-        recipe_match = match_freeform_recipe_intent(message)
-        if recipe_match is not None and recipe_match.inline_blob is not None:
-            recipe = get_recipe(recipe_match.recipe_name)
-            if recipe is not None:
-                try:
-                    unavailable = unavailable_recipe_plugin(
-                        recipe,
-                        plugin_snapshot,
-                        raw_slots=recipe_match.slots,
-                    )
-                    if unavailable is None:
-                        recipe_contract = canonical_json(
-                            {
-                                "schema": "composer.server-recipe-router.v1",
-                                "recipe": recipe_match.recipe_name,
-                                "recipe_catalog_content_hash": recipe_catalog_content_hash(),
-                            }
-                        )
-                        recipe_pipeline = apply_recipe(
-                            recipe_match.recipe_name,
-                            {
-                                **recipe_match.slots,
-                                "source_blob_id": str(UUID(int=0)),
-                            },
-                        )
-                        source = recipe_pipeline.get("source")
-                        if type(source) is not dict or source.get("blob_id") != str(UUID(int=0)):
-                            raise AuditIntegrityError("inline recipe did not produce the expected source blob slot")
-                        source = dict(source)
-                        source.pop("blob_id")
-                        source["inline_blob"] = {
-                            "filename": recipe_match.inline_blob.filename,
-                            "mime_type": recipe_match.inline_blob.mime_type,
-                            "content": recipe_match.inline_blob.content,
-                        }
-                        recipe_pipeline["source"] = source
-                        plan = await prepare_pipeline_plan(
-                            pipeline=recipe_pipeline,
-                            current_state=state,
-                            reviewed_facts={},
-                            reviewed_planner_context={},
-                            supersedes_draft_hash=None,
-                            surface=PlannerSurface.FREEFORM,
-                            policy_catalog=policy_catalog,
-                            plugin_snapshot=plugin_snapshot,
-                            originating_message=origin,
-                            base=base,
-                            rendered_skill=recipe_contract,
-                            tool_call_id=(
-                                "server-recipe-"
-                                + stable_hash(
-                                    {
-                                        "schema": "composer.server-recipe-tool-call.v1",
-                                        "message_id": user_message_id,
-                                        "recipe": recipe_match.recipe_name,
-                                    }
-                                )
-                            ),
-                            model_identifier="composer-server-recipe-router",
-                            model_version="composer.server-recipe-router.v1",
-                            provider="server",
-                            repair_count=0,
-                            timeout_seconds=self._timeout_seconds,
-                            custody_config=custody_config,
-                        )
-                except RecipeValidationError:
-                    plan = None
+        plan = await try_prepare_registered_recipe_plan(
+            intent_context=RecipeIntentContext(user_text=message, policy_snapshot=plugin_snapshot),
+            current_state=state,
+            reviewed_facts={},
+            reviewed_planner_context={},
+            supersedes_draft_hash=None,
+            surface=PlannerSurface.FREEFORM,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            originating_message=origin,
+            base=base,
+            custody_config=custody_config,
+            timeout_seconds=self._timeout_seconds,
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+            ),
+        )
         if plan is None:
             try:
                 plan = await plan_pipeline(
