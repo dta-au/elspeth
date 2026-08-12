@@ -133,4 +133,45 @@ describe("UserAdminDialog", () => {
     await userEvent.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalled();
   });
+
+  it("moves focus to the password banner after a create", async () => {
+    createAdminUser.mockResolvedValue({ user_id: "bob", password: "s3cretpw" });
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    await screen.findByText("Alice");
+
+    await userEvent.type(screen.getByLabelText(/username/i), "bob");
+    await userEvent.type(screen.getByLabelText(/display name/i), "Bob");
+    await userEvent.click(screen.getByRole("button", { name: /create/i }));
+
+    const banner = await screen.findByRole("status");
+    await waitFor(() => expect(document.activeElement).toBe(banner));
+  });
+
+  it("announces a clipboard failure instead of failing silently", async () => {
+    resetAdminUserPassword.mockResolvedValue({
+      user_id: "alice",
+      password: "n3wpw",
+    });
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    await screen.findByText("Alice");
+    await userEvent.click(
+      screen.getAllByRole("button", { name: /reset password/i })[1],
+    );
+    await screen.findByTestId("generated-password");
+
+    // jsdom ships no navigator.clipboard; install a failing one.
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: vi.fn().mockRejectedValue(new Error("denied")) },
+    });
+    await userEvent.click(screen.getByRole("button", { name: /copy/i }));
+
+    expect(await screen.findByText(/copy failed/i)).toBeInTheDocument();
+  });
+
+  it("shows an empty state when no accounts exist", async () => {
+    fetchAdminUsers.mockResolvedValue({ users: [] });
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    expect(await screen.findByText(/no accounts yet/i)).toBeInTheDocument();
+  });
 });
