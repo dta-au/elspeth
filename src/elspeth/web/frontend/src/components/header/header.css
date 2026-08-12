@@ -216,7 +216,12 @@
   font-weight: 400;
   color: var(--color-text-muted);
   min-width: 0;
-  max-width: 36ch;
+
+  /* 48ch: wide enough for a full provider/vendor/model id like
+     "openrouter/anthropic/claude-sonnet-5" (36 chars) with headroom, while
+     still fencing a pathological id away from the session switcher at the
+     1280px minimum supported width. */
+  max-width: 48ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
