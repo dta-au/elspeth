@@ -112,6 +112,7 @@ from elspeth.web.composer.llm_response_parsing import (
     token_usage_from_response,
 )
 from elspeth.web.composer.pipeline_planner import (
+    DELTA_PLANNER_TERMINAL_INSTRUCTION,
     GuidedPlannerDecline,
     PipelineCandidatePolicyRejection,
     PipelinePlannerError,
@@ -124,6 +125,8 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
+    PlannerTerminalContract,
+    PlannerTerminalMaterialization,
     plan_pipeline,
     prepare_pipeline_plan,
 )
@@ -3552,8 +3555,8 @@ class ComposerServiceImpl:
             GuidedCorrectionTarget,
             GuidedRevisionAuthority,
             bind_guided_prose_revision_candidate,
-            bind_guided_reviewed_components,
             build_guided_proposal_projection,
+            guided_authorized_pipeline_schema,
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
@@ -3561,6 +3564,7 @@ class ComposerServiceImpl:
             guided_revision_execution_hash,
             guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
+            materialize_guided_authorized_candidate,
             require_guided_proposal_correction_target_changed,
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
@@ -3795,6 +3799,45 @@ class ComposerServiceImpl:
         # every PipelinePlannerError surfaces at ``await``, inside the guard.
         pending_revision_rejection: Literal["guided_amend_contract_violation"] | None = None
 
+        terminal_contract: PlannerTerminalContract | None = None
+        if revision_authority is None:
+
+            def materialize_guided_delta(delta: Mapping[str, Any]) -> PlannerTerminalMaterialization:
+                canonical = materialize_guided_authorized_candidate(
+                    delta,
+                    correction_target,
+                    guided,
+                    current_state,
+                )
+                config_owned_refs = {
+                    *(
+                        "source"
+                        if guided.reviewed_sources[stable_id].name == "source"
+                        else f"source:{guided.reviewed_sources[stable_id].name}"
+                        for stable_id in guided.source_order
+                    ),
+                    *(f"output:{guided.reviewed_outputs[stable_id].name}" for stable_id in guided.output_order),
+                }
+                if correction_target is not None:
+                    # Existing predecessor nodes were materialized from
+                    # private server authority (even when one routing scalar
+                    # was changed by the admitted delta). Mask their config
+                    # facts exactly as the former finalizer-owned binder did.
+                    config_owned_refs.update(f"node:{node.id}" for node in current_state.nodes)
+                return PlannerTerminalMaterialization(
+                    pipeline=dict(canonical),
+                    config_owned_refs=frozenset(config_owned_refs),
+                )
+
+            terminal_contract = PlannerTerminalContract(
+                schema=guided_authorized_pipeline_schema(
+                    guided,
+                    correction_target=correction_target,
+                ),
+                materialize=materialize_guided_delta,
+                instruction=DELTA_PLANNER_TERMINAL_INSTRUCTION,
+            )
+
         def bind_guided_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
             nonlocal pending_revision_rejection
             pending_revision_rejection = None
@@ -3806,12 +3849,11 @@ class ComposerServiceImpl:
                 )
                 pending_revision_rejection = binding.rejection_code
                 return binding.pipeline
-            return bind_guided_reviewed_components(
-                candidate,
-                guided,
-                predecessor=current_state if correction_target is not None else None,
-                correction_target=correction_target,
-            )
+            # Initial/correction deltas have already passed through
+            # materialize_guided_authorized_candidate at the selected terminal
+            # seam.  Rebinding here would misclassify the canonical result as
+            # provider-authored authority and duplicate correction custody.
+            return candidate
 
         candidate_acceptance: Callable[[CompositionState], None] | None = None
         if correction_target is not None or revision_authority is not None:
@@ -3907,6 +3949,7 @@ class ComposerServiceImpl:
                 inner=bind_guided_candidate,
             ),
             candidate_acceptance=candidate_acceptance,
+            terminal_contract=terminal_contract,
         )
         try:
             plan = await guided_planner_call

@@ -12,6 +12,7 @@ validation with "unknown node" and the repair loop burns to REPAIR_EXHAUSTED
 from __future__ import annotations
 
 import pytest
+from jsonschema import Draft202012Validator
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided import planning as guided_planning
@@ -20,6 +21,8 @@ from elspeth.web.composer.guided.planning import (
     GuidedCorrectionTarget,
     GuidedRevisionAuthority,
     bind_guided_reviewed_components,
+    guided_authorized_pipeline_schema,
+    materialize_guided_authorized_candidate,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
@@ -112,6 +115,171 @@ def test_bind_rewrites_invented_output_name_in_edges_and_routing() -> None:
     assert bound["edges"] == [
         {"id": "e1", "from_node": "source", "to_node": "output", "edge_type": "on_success"},
     ]
+
+
+def test_initial_guided_delta_schema_excludes_reviewed_configuration_authority() -> None:
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=None)
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"source_routes", "nodes", "edges", "output_targets", "metadata"}
+    source_item = schema["properties"]["source_routes"]["items"]
+    output_item = schema["properties"]["output_targets"]["items"]
+    assert set(source_item["properties"]) == {"stable_id", "on_success"}
+    assert set(output_item["properties"]) == {"stable_id"}
+    assert source_item["additionalProperties"] is False
+    assert output_item["additionalProperties"] is False
+    assert schema["properties"]["nodes"]["items"]["additionalProperties"] is False
+    assert schema["properties"]["edges"]["items"]["additionalProperties"] is False
+    serialized = repr(schema)
+    assert "blob_id" not in serialized
+    assert "inline_blob" not in serialized
+    assert "on_validation_failure" not in serialized
+    assert "on_write_failure" not in serialized
+    assert "outputs/colours.json" not in serialized
+
+    validator = Draft202012Validator(schema)
+    base = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": "output"}],
+        "nodes": [],
+        "edges": [],
+        "output_targets": [{"stable_id": OUTPUT_ID}],
+    }
+    adversarial = (
+        {**base, "source_routes": [{**base["source_routes"][0], "plugin": "json"}]},
+        {**base, "source_routes": [{**base["source_routes"][0], "options": {"path": "/tmp/replaced"}}]},
+        {**base, "source_routes": [{**base["source_routes"][0], "blob_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}]},
+        {**base, "output_targets": [{**base["output_targets"][0], "plugin": "csv"}]},
+        {**base, "output_targets": [{**base["output_targets"][0], "options": {"schema": {"required_fields": []}}}]},
+        {**base, "output_targets": [{**base["output_targets"][0], "on_write_failure": None}]},
+    )
+    assert all(list(validator.iter_errors(candidate)) for candidate in adversarial)
+
+
+def test_initial_guided_delta_materializes_reviewed_authority_server_side() -> None:
+    delta = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": "clean_rows"}],
+        "nodes": [
+            {
+                "id": "clean_rows",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "clean_rows",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        ],
+        "edges": [],
+        "output_targets": [{"stable_id": OUTPUT_ID}],
+        "metadata": {"name": "Generic linear pipeline"},
+    }
+
+    bound = materialize_guided_authorized_candidate(
+        delta,
+        authority=None,
+        guided=_guided(),
+        current_state=CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        ),
+    )
+
+    assert bound["sources"] == {
+        "source": {
+            "plugin": "csv",
+            "options": {"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+            "on_success": "clean_rows",
+            "on_validation_failure": "discard",
+        }
+    }
+    assert bound["outputs"] == [
+        {
+            "sink_name": "output",
+            "plugin": "json",
+            "options": {"path": "outputs/colours.json"},
+            "on_write_failure": "discard",
+        }
+    ]
+    assert bound["nodes"] == delta["nodes"]
+
+
+def test_guided_delta_cannot_evade_reviewed_required_fields() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/generic.jsonl", "schema": {"mode": "observed"}},
+    )
+    bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": "output"}],
+            "nodes": [],
+            "edges": [],
+            "output_targets": [{"stable_id": OUTPUT_ID}],
+        },
+        authority=None,
+        guided=guided,
+        current_state=CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        ),
+    )
+
+    assert bound["outputs"][0]["options"]["schema"]["required_fields"] == ["document_uri", "abstract"]
+
+
+@pytest.mark.parametrize(
+    ("source_routes", "output_targets", "expected_code"),
+    (
+        (
+            [{"stable_id": "99999999-9999-4999-8999-999999999999", "on_success": "output"}],
+            [{"stable_id": OUTPUT_ID}],
+            "guided_delta_unknown_stable_id",
+        ),
+        (
+            [{"stable_id": SOURCE_ID, "on_success": "output"}, {"stable_id": SOURCE_ID, "on_success": "output"}],
+            [{"stable_id": OUTPUT_ID}],
+            "guided_delta_duplicate_stable_id",
+        ),
+        (
+            [{"stable_id": SOURCE_ID, "on_success": "output"}],
+            [{"stable_id": OUTPUT_ID}, {"stable_id": OUTPUT_ID}],
+            "guided_delta_duplicate_stable_id",
+        ),
+    ),
+)
+def test_guided_delta_rejects_unknown_or_duplicate_stable_ids(
+    source_routes: list[dict[str, str]],
+    output_targets: list[dict[str, str]],
+    expected_code: str,
+) -> None:
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": source_routes,
+                "nodes": [],
+                "edges": [],
+                "output_targets": output_targets,
+            },
+            authority=None,
+            guided=_guided(),
+            current_state=CompositionState(
+                source=None,
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+        )
+
+    assert raised.value.error_code == expected_code
 
 
 def test_bind_rewrites_invented_output_name_in_gate_routes() -> None:
@@ -1725,3 +1893,193 @@ class TestBindDeclaredRequiredFields:
             "guaranteed_fields": ["email"],
             "required_fields": ["email"],
         }
+
+
+def _source_correction_target() -> GuidedCorrectionTarget:
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="source", stable_id=SOURCE_ID),
+        owner_kind="source",
+        owner_key="source",
+        authority_key="source",
+        public_target={"kind": "source", "stable_id": SOURCE_ID},
+        before_fingerprint="1" * 64,
+    )
+
+
+def _output_correction_target() -> GuidedCorrectionTarget:
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="output", stable_id=OUTPUT_ID),
+        owner_kind="output",
+        owner_key="output",
+        authority_key="output",
+        public_target={"kind": "output", "stable_id": OUTPUT_ID},
+        before_fingerprint="2" * 64,
+    )
+
+
+def test_initial_guided_delta_materializes_fork_coalesce_and_multi_output_topologies() -> None:
+    fork = _fork_coalesce_pipeline()
+    fork_bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": fork["sources"]["source"]["on_success"]}],
+            "nodes": fork["nodes"],
+            "edges": fork["edges"],
+            "output_targets": [{"stable_id": OUTPUT_ID}],
+        },
+        authority=None,
+        guided=_guided(),
+        current_state=_correction_predecessor(),
+    )
+    assert [node["node_type"] for node in fork_bound["nodes"]] == [
+        "gate",
+        "transform",
+        "transform",
+        "coalesce",
+        "transform",
+    ]
+    assert fork_bound["nodes"][3]["branches"] == {"branch_a": "tone_done", "branch_b": "usage_done"}
+
+    multi = _two_output_candidate("output", "quarantine")
+    multi_bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": multi["sources"]["source"]["on_success"]}],
+            "nodes": multi["nodes"],
+            "edges": multi["edges"],
+            "output_targets": [{"stable_id": OUTPUT_ID}, {"stable_id": OUTPUT_B_ID}],
+        },
+        authority=None,
+        guided=_guided_two_outputs(),
+        current_state=_correction_predecessor(),
+    )
+    assert [output["sink_name"] for output in multi_bound["outputs"]] == ["output", "quarantine"]
+    assert multi_bound["nodes"][0]["on_success"] == "output"
+    assert multi_bound["nodes"][0]["on_error"] == "quarantine"
+
+
+def test_source_correction_changes_only_selected_route_and_may_add_topology() -> None:
+    predecessor = _correction_predecessor()
+    before = predecessor.to_dict()
+    target = _source_correction_target()
+    bound = materialize_guided_authorized_candidate(
+        {
+            "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+            "nodes": [
+                {
+                    "id": "screen_rows",
+                    "node_type": "transform",
+                    "plugin": "passthrough",
+                    "input": "screen_input",
+                    "on_success": "amount_gate",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                }
+            ],
+            "edges": [
+                {
+                    "id": "source_to_screen",
+                    "from_node": "source",
+                    "to_node": "screen_rows",
+                    "edge_type": "on_success",
+                }
+            ],
+        },
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["sources"]["source"]["on_success"] == "screen_input"
+    assert bound["sources"]["source"]["plugin"] == "csv"
+    assert bound["sources"]["source"]["options"] == {"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    assert bound["nodes"][:-1] == before["nodes"]
+    assert bound["nodes"][-1]["id"] == "screen_rows"
+
+
+def test_node_correction_materializer_preserves_every_unselected_node_byte() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    selected = candidate["nodes"][2]
+    bound = materialize_guided_authorized_candidate(
+        {"nodes": [selected], "edges": []},
+        authority=_format_node_correction_target(),
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before_nodes = predecessor.to_dict()["nodes"]
+    assert bound["nodes"][0] == before_nodes[0]
+    assert bound["nodes"][1] == before_nodes[1]
+    assert bound["nodes"][2]["options"] == {
+        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "select_only": True,
+        "schema": {"mode": "observed", "required_fields": ["amount"]},
+    }
+    assert bound["outputs"][0]["options"] == {"path": "outputs/colours.json"}
+
+
+def test_output_correction_reconnects_upstream_scalar_and_preserves_sink_authority() -> None:
+    predecessor = _correction_predecessor()
+    target = _output_correction_target()
+    bound = materialize_guided_authorized_candidate(
+        {
+            "output_targets": [{"stable_id": OUTPUT_ID}],
+            "edges": [
+                {
+                    "id": "format_to_output",
+                    "from_node": "format_high_value",
+                    "to_node": "output",
+                    "edge_type": "on_success",
+                }
+            ],
+        },
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    assert bound["nodes"][2]["on_success"] == "output"
+    assert bound["outputs"] == [
+        {
+            "sink_name": "output",
+            "plugin": "json",
+            "options": {"path": "outputs/colours.json"},
+            "on_write_failure": "discard",
+        }
+    ]
+
+
+def test_correction_delta_rejects_unselected_identity_and_nonincident_routing() -> None:
+    predecessor = _correction_predecessor()
+    target = _source_correction_target()
+    with pytest.raises(GuidedCandidateBindingRejected) as duplicate:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "rows"}],
+                "nodes": [predecessor.to_dict()["nodes"][0]],
+                "edges": [],
+            },
+            authority=target,
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert duplicate.value.error_code == "guided_delta_duplicate_stable_id"
+
+    with pytest.raises(GuidedCandidateBindingRejected) as nonincident:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": "rows"}],
+                "nodes": [],
+                "edges": [
+                    {
+                        "id": "unrelated",
+                        "from_node": "amount_gate",
+                        "to_node": "output",
+                        "edge_type": "on_success",
+                    }
+                ],
+            },
+            authority=target,
+            guided=_guided(),
+            current_state=predecessor,
+        )
+    assert nonincident.value.error_code == "guided_delta_nonincident_route"

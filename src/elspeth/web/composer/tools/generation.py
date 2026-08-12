@@ -732,6 +732,36 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
+        r"guided_delta_unknown_stable_id",
+        "A guided topology delta references a reviewed stable identity that is not part of this request's mutation authority.",
+        "Copy only stable_id values from the current reviewed planner context and re-emit the selected delta without inventing or substituting an identity.",
+    ),
+    (
+        r"guided_delta_duplicate_stable_id",
+        "A guided topology delta repeats a reviewed component or authored routing identity, so the server cannot bind it exactly once.",
+        "Emit each reviewed stable_id and each edge/node id exactly once in the selected delta.",
+    ),
+    (
+        r"guided_delta_authority_violation",
+        "The guided proposal includes a field or component outside the current reviewed mutation authority.",
+        "Re-emit only the fields advertised by the current emit_pipeline_proposal schema; reviewed source/output configuration is installed by the server.",
+    ),
+    (
+        r"guided_delta_nonincident_route",
+        "A correction delta changes routing that is not incident to the selected component.",
+        "Keep every unrelated route unchanged and emit only edges that touch the selected owner or newly added topology named by this correction.",
+    ),
+    (
+        r"guided_delta_unknown_reference",
+        "A correction route names an upstream owner or route kind that does not exist in the authoritative predecessor.",
+        "Use an exact existing source or node id from current_state and one of the route fields admitted by the selected correction schema.",
+    ),
+    (
+        r"guided_delta_reviewed_failure_route_required",
+        "A reviewed source/output failure policy names a destination that is not present in the reviewed output authority. The planner cannot rewrite that reviewed policy.",
+        "Return to the reviewed source/output settings form and add or correct the required failure sink before planning topology again.",
+    ),
+    (
         r"guided_route_target_unknown",
         "A routing destination (source/node on_success, node on_error, or edge to_node) names neither a declared "
         "output, a node id, a connection another node consumes, nor 'discard'. The reviewed-output binder cannot "
@@ -1111,6 +1141,13 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # protected-change attempts and no-op candidates stay inside repair/hatch.
     "guided_amend_contract_violation",
     "guided_revision_unchanged",
+    # ── Request-derived guided topology authority ──────────────────────────
+    "guided_delta_unknown_stable_id",
+    "guided_delta_duplicate_stable_id",
+    "guided_delta_authority_violation",
+    "guided_delta_nonincident_route",
+    "guided_delta_unknown_reference",
+    "guided_delta_reviewed_failure_route_required",
     # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
     # Planner-loop only: pairs the reviewed guided facts (what the sources
     # carry vs what the outputs declare) with the candidate's node count.

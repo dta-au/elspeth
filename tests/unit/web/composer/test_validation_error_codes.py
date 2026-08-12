@@ -428,6 +428,28 @@ class TestClosedCodeCatalogueInvariants:
         assert "private" not in explanation.lower()
         assert "private" not in fix.lower()
 
+    @pytest.mark.parametrize(
+        "code",
+        (
+            "guided_delta_unknown_stable_id",
+            "guided_delta_duplicate_stable_id",
+            "guided_delta_authority_violation",
+            "guided_delta_nonincident_route",
+            "guided_delta_unknown_reference",
+            "guided_delta_reviewed_failure_route_required",
+        ),
+    )
+    def test_guided_delta_codes_are_closed_and_actionable(self, code: str) -> None:
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "tutorial" not in explanation.lower()
+        assert "tutorial" not in fix.lower()
+        assert "private" not in explanation.lower()
+        assert "private" not in fix.lower()
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 

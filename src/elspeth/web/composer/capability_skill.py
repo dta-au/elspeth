@@ -192,6 +192,7 @@ def build_planner_capability_manifest(
     messages: Sequence[Mapping[str, Any]],
     tools: Sequence[Mapping[str, Any]],
     canonical_schema: Mapping[str, Any],
+    capability_schema: Mapping[str, Any] | None = None,
     tool_surface: str = "full",
 ) -> PlannerCapabilityManifest:
     """Validate and hash the exact messages/tools used by one planner call.
@@ -241,7 +242,12 @@ def build_planner_capability_manifest(
     advertised_schema = _schema_mapping(properties["pipeline"], path="$tools[-1].function.parameters.properties.pipeline")
     if stable_hash(advertised_schema) != stable_hash(canonical_schema):
         raise AuditIntegrityError("planner terminal does not advertise the canonical pipeline schema")
-    validate_capability_field_contract(canonical_schema, core)
+    # Restricted request terminals are projections of the canonical authoring
+    # language, so their root field inventory intentionally differs.  The
+    # static capability core still documents that full language and remains
+    # pinned against its canonical schema independently of the exact selected
+    # terminal hashed above.
+    validate_capability_field_contract(capability_schema or canonical_schema, core)
 
     return PlannerCapabilityManifest(
         surface=surface,

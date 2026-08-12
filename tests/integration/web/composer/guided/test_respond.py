@@ -1017,7 +1017,6 @@ class TestStep2IntraStep:
             custom_inputs=["client", "amount_aud"],
         )
         guided_facts = _full_guided_session(reviewed)
-        source_name = next(iter(guided_facts["reviewed_sources"].values()))["name"]
         assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
             "order_id",
             "region",
@@ -1068,25 +1067,20 @@ class TestStep2IntraStep:
                 },
             }
         ]
+        source_stable_id = next(iter(guided_facts["reviewed_sources"]))
+        output_stable_id = next(iter(guided_facts["reviewed_outputs"]))
+        reviewed_output_name = guided_facts["reviewed_outputs"][output_stable_id]["name"]
+        gap_closing_nodes[0]["on_success"] = reviewed_output_name
         planner_pipeline = {
-            "sources": {
-                source_name: {
-                    "plugin": "csv",
-                    "options": {},
-                    "on_success": "planner_rows" if provider_heeds_gap else "planned_sink",
-                    "on_validation_failure": "discard",
-                }
-            },
-            "nodes": gap_closing_nodes if provider_heeds_gap else [],
-            "edges": [],
-            "outputs": [
+            "source_routes": [
                 {
-                    "sink_name": "planned_sink",
-                    "plugin": "json",
-                    "options": {},
-                    "on_write_failure": "abort",
+                    "stable_id": source_stable_id,
+                    "on_success": "planner_rows" if provider_heeds_gap else reviewed_output_name,
                 }
             ],
+            "nodes": gap_closing_nodes if provider_heeds_gap else [],
+            "edges": [],
+            "output_targets": [{"stable_id": output_stable_id}],
         }
 
         async def terminal_completion(**_kwargs: Any) -> _PlannerResponse:

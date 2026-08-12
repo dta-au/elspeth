@@ -26,6 +26,7 @@ from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, 
 from uuid import UUID
 
 import structlog
+from jsonschema import Draft202012Validator
 from litellm.exceptions import APIError as LiteLLMAPIError
 from litellm.exceptions import AuthenticationError as LiteLLMAuthError
 from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
@@ -787,6 +788,73 @@ type PipelineCandidateAcceptance = Callable[[CompositionState], None]
 type PipelineClaimEvaluator = Callable[[CompositionState, tuple[str, ...]], tuple[str, ...]]
 
 
+def _canonical_terminal_materializer(pipeline: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Identity materializer for unrestricted full-document authoring."""
+    return pipeline
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerTerminalMaterialization:
+    """Canonical terminal result plus server-owned feedback custody refs."""
+
+    pipeline: Mapping[str, Any]
+    config_owned_refs: frozenset[str] = frozenset()
+    routing_owned_refs: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if type(self.pipeline) is not dict:
+            raise TypeError("PlannerTerminalMaterialization.pipeline must be an exact dict")
+        for field_name, refs in (
+            ("config_owned_refs", self.config_owned_refs),
+            ("routing_owned_refs", self.routing_owned_refs),
+        ):
+            if type(refs) is not frozenset or any(type(ref) is not str or not ref for ref in refs):
+                raise TypeError(f"PlannerTerminalMaterialization.{field_name} must be an exact non-empty string frozenset")
+        freeze_fields(self, "pipeline")
+
+
+type PipelineTerminalMaterializer = Callable[
+    [Mapping[str, Any]],
+    Mapping[str, Any] | PlannerTerminalMaterialization,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerTerminalContract:
+    """One request-owned advertised proposal schema and canonical materializer.
+
+    The provider validates against ``schema``. ``materialize`` then converts
+    that admitted request shape into the ordinary canonical set-pipeline
+    document consumed by every existing finalizer, candidate check, custody
+    step, and proposal seal.  Keeping the two values in one owned object makes
+    it impossible for repair or escape-hatch turns to advertise one contract
+    while parsing another.
+    """
+
+    schema: Mapping[str, Any]
+    materialize: PipelineTerminalMaterializer
+    instruction: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not dict:
+            raise TypeError("PlannerTerminalContract.schema must be an exact dict")
+        Draft202012Validator.check_schema(self.schema)
+        canonical_json(self.schema)
+        if not callable(self.materialize):
+            raise TypeError("PlannerTerminalContract.materialize must be callable")
+        if self.instruction is not None and (type(self.instruction) is not str or not self.instruction.strip()):
+            raise TypeError("PlannerTerminalContract.instruction must be a non-empty exact string or None")
+        freeze_fields(self, "schema")
+
+
+def canonical_planner_terminal_contract() -> PlannerTerminalContract:
+    """Return the byte-compatible full-document planner contract."""
+    return PlannerTerminalContract(
+        schema=dict(canonical_set_pipeline_schema()),
+        materialize=_canonical_terminal_materializer,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerCustodyConfig:
     data_dir: str
@@ -1041,8 +1109,11 @@ def _claimed_deferred_intent_schema() -> _ClaimedDeferredIntentSchema:
     return cast(_ClaimedDeferredIntentSchema, schema)
 
 
-def planner_terminal_tool_definition() -> dict[str, Any]:
-    """Return the sole terminal with the exact registered pipeline schema."""
+def planner_terminal_tool_definition(
+    terminal_contract: PlannerTerminalContract | None = None,
+) -> dict[str, Any]:
+    """Return the sole terminal with the exact request-selected schema."""
+    selected = terminal_contract or canonical_planner_terminal_contract()
     return {
         "type": "function",
         "function": {
@@ -1051,7 +1122,7 @@ def planner_terminal_tool_definition() -> dict[str, Any]:
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pipeline": canonical_set_pipeline_schema(),
+                    "pipeline": deep_thaw(selected.schema),
                     "claimed_deferred_intent_ids": _claimed_deferred_intent_schema(),
                 },
                 "required": ["pipeline"],
@@ -1061,7 +1132,11 @@ def planner_terminal_tool_definition() -> dict[str, Any]:
     }
 
 
-def planner_tool_definitions(policy: PlannerDiscoveryPolicy | None = None) -> list[dict[str, Any]]:
+def planner_tool_definitions(
+    policy: PlannerDiscoveryPolicy | None = None,
+    *,
+    terminal_contract: PlannerTerminalContract | None = None,
+) -> list[dict[str, Any]]:
     """Return an ordered request-owned read-only subset and sole terminal."""
     registered = {definition["name"]: definition for definition in get_tool_definitions()}
     missing = _PLANNER_DISCOVERY_TOOL_NAME_SET - registered.keys()
@@ -1081,7 +1156,7 @@ def planner_tool_definitions(policy: PlannerDiscoveryPolicy | None = None) -> li
         }
         for name in names
     ]
-    return [*discovery, planner_terminal_tool_definition()]
+    return [*discovery, planner_terminal_tool_definition(terminal_contract)]
 
 
 def _assert_planner_call_matches_manifest(
@@ -1234,6 +1309,13 @@ _CANDIDATE_SHAPE_INTEGRITY_PREFIX: Final[str] = "guided planner candidate"
 PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
     "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
     "with one complete canonical set_pipeline argument object."
+)
+
+DELTA_PLANNER_TERMINAL_INSTRUCTION: Final[str] = (
+    "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once. "
+    "Set pipeline to exactly the mutable fields admitted by its advertised schema; "
+    "do not emit omitted source, output, storage, failure-policy, or other reviewed authority. "
+    "The server materializes those omitted fields into the canonical set_pipeline document."
 )
 
 
@@ -2666,6 +2748,7 @@ async def plan_pipeline(
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
     candidate_acceptance: PipelineCandidateAcceptance | None = None,
+    terminal_contract: PlannerTerminalContract | None = None,
 ) -> PipelinePlanResult:
     """Plan and validate one proposal without publishing state or DB rows."""
     if type(intent) is not str or not intent.strip():
@@ -2687,6 +2770,9 @@ async def plan_pipeline(
         raise TypeError("candidate_finalizer must be callable")
     if candidate_acceptance is not None and not callable(candidate_acceptance):
         raise TypeError("candidate_acceptance must be callable or None")
+    if terminal_contract is not None and type(terminal_contract) is not PlannerTerminalContract:
+        raise TypeError("terminal_contract must be an exact PlannerTerminalContract or None")
+    selected_terminal_contract = terminal_contract or canonical_planner_terminal_contract()
     if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
         raise TypeError("unproducible_output_fields must be an exact string tuple")
     if type(eligible_deferred_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in eligible_deferred_intent_ids):
@@ -2743,6 +2829,7 @@ async def plan_pipeline(
                 recorder=recorder,
                 candidate_finalizer=candidate_finalizer,
                 candidate_acceptance=candidate_acceptance,
+                terminal_contract=selected_terminal_contract,
             )
         outcome = "complete"
         trail.log_summary("accepted")
@@ -2798,6 +2885,7 @@ async def _plan_pipeline_inner(
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
     candidate_acceptance: PipelineCandidateAcceptance | None,
+    terminal_contract: PlannerTerminalContract,
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
     deadline = asyncio.get_running_loop().time() + model_config.timeout_seconds
@@ -2855,7 +2943,7 @@ async def _plan_pipeline_inner(
     information_manifest = discovery_policy.manifest
     declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
     pending_information = set(declared_pending_information)
-    tools = planner_tool_definitions(discovery_policy)
+    tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state,
@@ -2865,7 +2953,7 @@ async def _plan_pipeline_inner(
             discoverable_classes=discovery_policy.unresolved_classes,
             unresolved_keys=frozenset(pending_information),
         ),
-        "instruction": PLANNER_TERMINAL_INSTRUCTION,
+        "instruction": terminal_contract.instruction or PLANNER_TERMINAL_INSTRUCTION,
     }
     if conversation_context is not None:
         provider_request["conversation_context"] = conversation_context.to_dict()
@@ -2931,7 +3019,8 @@ async def _plan_pipeline_inner(
             profile=profile,
             messages=marked_messages,
             tools=marked_tools,
-            canonical_schema=canonical_set_pipeline_schema(),
+            canonical_schema=terminal_contract.schema,
+            capability_schema=canonical_set_pipeline_schema(),
             tool_surface="full" if tools_override is None else "terminal_only",
         )
         request_size = len(canonical_json({"messages": marked_messages, "tools": marked_tools}).encode("utf-8"))
@@ -3233,7 +3322,7 @@ async def _plan_pipeline_inner(
                 assert hatch_error is not None
                 message, calls, audited_call = await call_model(
                     model_override=model_config.escape_hatch_model,
-                    tools_override=[planner_terminal_tool_definition()],
+                    tools_override=[planner_terminal_tool_definition(terminal_contract)],
                     allow_text_reply=True,
                     reasoning_effort=model_config.candidate_reasoning_effort,
                 )
@@ -3347,6 +3436,7 @@ async def _plan_pipeline_inner(
             # deferred-claim feedback carry no rejection identity to compare.
             repeated_terminal_fingerprint = False
             pipeline: dict[str, Any] | None = None
+            materializer_owned_refs = _FINALIZER_OWNS_NOTHING
             claimed_deferred_intent_ids: tuple[str, ...] = ()
             allowed_terminal_keys = {"pipeline", "claimed_deferred_intent_ids"}
             if "pipeline" not in call.arguments or set(call.arguments) - allowed_terminal_keys:
@@ -3354,17 +3444,44 @@ async def _plan_pipeline_inner(
             else:
                 try:
                     payload = _PlannerTerminalPayload.model_validate(deep_thaw(call.arguments))
-                    SetPipelineArgumentsModel.model_validate(payload.pipeline)
                 except ValueError as exc:
                     claim_shape_error = isinstance(exc, PydanticValidationError) and any(
                         error["loc"] and error["loc"][0] == "claimed_deferred_intent_ids" for error in exc.errors()
                     )
                     terminal_feedback = _deferred_intent_claim_feedback() if claim_shape_error else _canonical_schema_feedback()
                 else:
-                    pipeline = payload.pipeline
                     claimed_deferred_intent_ids = tuple(str(intent_id) for intent_id in payload.claimed_deferred_intent_ids)
                     if not set(claimed_deferred_intent_ids).issubset(eligible_deferred_intent_ids):
                         terminal_feedback = _deferred_intent_claim_feedback()
+                    elif next(Draft202012Validator(terminal_contract.schema).iter_errors(payload.pipeline), None) is not None:
+                        terminal_feedback = _canonical_schema_feedback()
+                    else:
+                        try:
+                            materialized = terminal_contract.materialize(payload.pipeline)
+                            if type(materialized) is PlannerTerminalMaterialization:
+                                pipeline_result = deep_thaw(materialized.pipeline)
+                                materializer_owned_refs = _FinalizerOwnedRefs(
+                                    config=materialized.config_owned_refs,
+                                    routing=materialized.routing_owned_refs,
+                                )
+                            else:
+                                pipeline_result = materialized
+                            if type(pipeline_result) is not dict:
+                                raise AuditIntegrityError("planner terminal materializer must return an exact dict")
+                            SetPipelineArgumentsModel.model_validate(pipeline_result)
+                        except GuidedCandidateBindingRejected as exc:
+                            binding_fingerprint = (("pipeline", exc.error_code),)
+                            repeated_binding_fingerprint = binding_fingerprint in seen_rejection_fingerprints
+                            seen_rejection_fingerprints.add(binding_fingerprint)
+                            terminal_feedback = _binding_rejection_feedback(
+                                exc,
+                                repeated_fingerprint=repeated_binding_fingerprint,
+                            )
+                            repeated_terminal_fingerprint = repeated_binding_fingerprint
+                        except PydanticValidationError:
+                            terminal_feedback = _canonical_schema_feedback()
+                        else:
+                            pipeline = pipeline_result
             finalized_pipeline: Mapping[str, Any] | None = None
             finalizer_owned_refs: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING
             if terminal_feedback is None:
@@ -3419,7 +3536,11 @@ async def _plan_pipeline_inner(
                         # derived by diff HERE, not self-reported by the
                         # finalizer, so a pass that mutates without declaring
                         # can never leak server-bound validator detail.
-                        finalizer_owned_refs = _derive_finalizer_owned_refs(pipeline, finalizer_result)
+                        finalizer_refs = _derive_finalizer_owned_refs(pipeline, finalizer_result)
+                        finalizer_owned_refs = _FinalizerOwnedRefs(
+                            config=materializer_owned_refs.config | finalizer_refs.config,
+                            routing=materializer_owned_refs.routing | finalizer_refs.routing,
+                        )
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
@@ -4028,7 +4149,7 @@ async def _plan_pipeline_inner(
         if next(discovery_results, None) is not None:
             raise AuditIntegrityError("planner discovery produced an unowned result")
         discovery_policy = discovery_policy.with_manifest(information_manifest)
-        tools = planner_tool_definitions(discovery_policy)
+        tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
         trail.log_attempt(
             "discovery",
             "discovery_executed",
@@ -4062,6 +4183,9 @@ __all__ = [
     "PlannerModelConfig",
     "PlannerOriginatingMessage",
     "PlannerRequestLifecycle",
+    "PlannerTerminalContract",
+    "PlannerTerminalMaterialization",
+    "canonical_planner_terminal_contract",
     "plan_pipeline",
     "planner_discovery_information_keys",
     "planner_terminal_tool_definition",

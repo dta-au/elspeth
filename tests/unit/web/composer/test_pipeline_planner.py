@@ -55,6 +55,8 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
+    PlannerTerminalContract,
+    PlannerTerminalMaterialization,
     _allowlisted_candidate_feedback,
     _derive_finalizer_owned_refs,
     _feedback_error_codes,
@@ -635,6 +637,7 @@ async def _plan(
     unproducible_output_fields: tuple[str, ...] = (),
     conversation_context: PlannerConversationContext | None = None,
     information_aware: bool = False,
+    terminal_contract: PlannerTerminalContract | None = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -684,6 +687,7 @@ async def _plan(
             recorder=recorder or BufferingRecorder(),
             candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
             candidate_acceptance=candidate_acceptance,
+            terminal_contract=terminal_contract,
         )
 
 
@@ -732,6 +736,145 @@ def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> N
     serialized = canonical_json(terminal)
     assert "rationale" not in serialized
     assert '"base"' not in serialized
+
+
+@pytest.mark.asyncio
+async def test_request_owned_terminal_contract_drives_schema_manifest_and_materialization(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exact advertised delta is validated and materialized before canonical admission."""
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    selected_schema = {
+        "type": "object",
+        "properties": {"route": {"type": "string"}},
+        "required": ["route"],
+        "additionalProperties": False,
+    }
+    canonical = _pipeline(tmp_path)
+    materialized: list[Mapping[str, Any]] = []
+
+    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
+        materialized.append(delta)
+        candidate = deepcopy(canonical)
+        candidate["source"]["on_success"] = delta["route"]
+        return candidate
+
+    selected_instruction = "Emit only this request's selected terminal projection."
+    contract = PlannerTerminalContract(
+        schema=selected_schema,
+        materialize=materialize,
+        instruction=selected_instruction,
+    )
+    manifests: list[Any] = []
+    real_builder = planner_module.build_planner_capability_manifest
+
+    def capture_manifest(**kwargs: Any) -> Any:
+        manifest = real_builder(**kwargs)
+        manifests.append(manifest)
+        return manifest
+
+    monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": {"route": "rows"}})))
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        terminal_contract=contract,
+    )
+
+    assert result.proposal.pipeline["source"]["on_success"] == "rows"
+    assert materialized == [{"route": "rows"}]
+    advertised = completion.requests[0]["tools"][-1]["function"]["parameters"]["properties"]["pipeline"]
+    assert advertised == selected_schema
+    request_payload = json.loads(completion.requests[0]["messages"][1]["content"])
+    assert request_payload["instruction"] == selected_instruction
+    assert manifests[0].canonical_schema_hash == stable_hash(selected_schema)
+
+
+@pytest.mark.asyncio
+async def test_selected_terminal_contract_is_reused_for_repair_and_escape_hatch(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    selected_schema = {
+        "type": "object",
+        "properties": {"route": {"type": "string"}},
+        "required": ["route"],
+        "additionalProperties": False,
+    }
+    canonical = _pipeline(tmp_path)
+
+    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
+        candidate = deepcopy(canonical)
+        candidate["source"]["on_success"] = delta["route"]
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": {"unexpected": "value"}})),
+        _response(("emit_pipeline_proposal", {"pipeline": {"unexpected": "again"}})),
+    )
+    contract = PlannerTerminalContract(schema=selected_schema, materialize=materialize)
+
+    with pytest.raises(PipelinePlannerError, match="repair budget exhausted"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=0,
+            terminal_contract=contract,
+            model_overrides={
+                "escape_hatch_model": "anthropic/advisor",
+                "escape_hatch_provider": "test-provider",
+            },
+        )
+
+    assert len(completion.requests) == 2
+    for request in completion.requests:
+        assert request["tools"][-1]["function"]["parameters"]["properties"]["pipeline"] == selected_schema
+
+
+@pytest.mark.asyncio
+async def test_terminal_materializer_owned_configuration_stays_out_of_repair_feedback(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    private_canary = "PRIVATE-MATERIALIZER-OPTION-CANARY"
+    selected_schema = {
+        "type": "object",
+        "properties": {"route": {"type": "string"}},
+        "required": ["route"],
+        "additionalProperties": False,
+    }
+
+    def materialize(_delta: Mapping[str, Any]) -> PlannerTerminalMaterialization:
+        candidate = _pipeline(tmp_path)
+        candidate["source"]["options"]["unknown_private_option"] = private_canary
+        return PlannerTerminalMaterialization(
+            pipeline=candidate,
+            config_owned_refs=frozenset({"source"}),
+        )
+
+    completion = _ScriptedCompletion(
+        _response_with_call_id("materialized-first", "emit_pipeline_proposal", {"pipeline": {"route": "rows"}}),
+        _response_with_call_id("materialized-repeat", "emit_pipeline_proposal", {"pipeline": {"route": "rows"}}),
+    )
+    with pytest.raises(PipelinePlannerError, match="short-circuited"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=5,
+            terminal_contract=PlannerTerminalContract(schema=selected_schema, materialize=materialize),
+        )
+
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["pipeline"]
+    assert "detail" not in feedback["validation"]["errors"][0]
+    assert private_canary not in canonical_json(completion.requests)
 
 
 @pytest.mark.asyncio
