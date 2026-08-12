@@ -47,6 +47,25 @@ def test_contract_json_schema_accepts_bare_bool() -> None:
     assert _contract_json_schema(False) is False
 
 
+@pytest.mark.parametrize(
+    "schema",
+    [
+        {"type": "not-a-json-type"},
+        {"type": ["string", "string"]},
+        {"pattern": 123},
+        {"minimum": "zero"},
+        {"multipleOf": 0},
+        {"minItems": -1},
+        {"uniqueItems": "yes"},
+        {"enum": "not-an-array"},
+        {"$vocabulary": {"https://example.invalid/vocab": "required"}},
+    ],
+)
+def test_contract_json_schema_rejects_invalid_scalar_keyword_domains(schema: dict[str, object]) -> None:
+    with pytest.raises(_SchemaContractProjectionUnsupported):
+        _contract_json_schema(schema)
+
+
 def test_contract_knob_schema_rejects_missing_fields_key() -> None:
     with pytest.raises(_SchemaContractProjectionUnsupported):
         _contract_knob_schema({"not_fields": []})
@@ -101,6 +120,19 @@ def test_planner_plugin_contract_rejects_recursive_projection_overflow() -> None
         plugin_type="transform",
         description="A recursive projection fixture.",
         json_schema=nested,
+        knob_schema={"fields": []},
+    )
+
+    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+        planner_authoring_aids.planner_plugin_contract(admitted)
+
+
+def test_planner_plugin_contract_rejects_more_than_4096_input_nodes() -> None:
+    admitted = PluginSchemaInfo(
+        name="wide_transform",
+        plugin_type="transform",
+        description="A wide projection fixture.",
+        json_schema={"type": "object", "enum": [None] * 4096},
         knob_schema={"fields": []},
     )
 
@@ -168,7 +200,16 @@ def test_planner_plugin_contract_is_deeply_frozen_and_thaws_only_on_export() -> 
         plugin_type="transform",
         description="Immutable contract fixture.",
         json_schema={"type": "object", "properties": {"enabled": {"type": "boolean"}}},
-        knob_schema={"fields": [{"name": "enabled", "kind": "boolean", "required": True}]},
+        knob_schema={
+            "fields": [
+                {
+                    "name": "enabled",
+                    "kind": "boolean",
+                    "required": True,
+                    "visible_when": {"field": "mode", "equals": {"one_of": ["active"]}},
+                }
+            ]
+        },
     )
 
     contract = planner_authoring_aids.planner_plugin_contract(admitted)
@@ -181,6 +222,12 @@ def test_planner_plugin_contract_is_deeply_frozen_and_thaws_only_on_export() -> 
     assert isinstance(properties, MappingProxyType)
     with pytest.raises(TypeError):
         properties["enabled"] = {"type": "string"}  # type: ignore[index]
+    knob_fields = contract.knob_schema["fields"]
+    visible_when = knob_fields[0]["visible_when"]  # type: ignore[index]
+    assert isinstance(visible_when, MappingProxyType)
+    assert isinstance(visible_when["equals"], MappingProxyType)
+    with pytest.raises(TypeError):
+        visible_when["equals"] = {"one_of": ["inactive"]}  # type: ignore[index]
     exported = contract.to_dict()
     exported["json_schema"]["type"] = "string"  # type: ignore[index]
     assert contract.schema_hash == original_hash

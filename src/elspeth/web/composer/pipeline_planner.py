@@ -201,13 +201,19 @@ class PlannerInformationManifest:
             unresolved=self.unresolved - frozenset(keys),
         )
 
-    def provider_payload(self, *, unresolved_classes: tuple[str, ...]) -> dict[str, object]:
+    def provider_payload(
+        self,
+        *,
+        discoverable_classes: tuple[str, ...],
+        unresolved_keys: frozenset[str],
+    ) -> dict[str, object]:
         return {
             "supplied": {
                 "pipeline_state": "current_projection",
                 "plugin_selection": "policy_snapshot",
             },
-            "unresolved_classes": list(unresolved_classes),
+            "discoverable_classes": list(discoverable_classes),
+            "unresolved": sorted(unresolved_keys),
         }
 
 
@@ -2193,6 +2199,7 @@ def _serialize_provider_discovery_result(
     result: ToolResult,
     surface: PlannerSurface,
     provider_current_state: Mapping[str, Any],
+    schema_contract_budget_remaining: int | None = None,
 ) -> str:
     """Serialize one discovery result through the planner surface disclosure.
 
@@ -2223,11 +2230,24 @@ def _serialize_provider_discovery_result(
                 "next_tool": "get_plugin_assistance",
             }
             return _serialize_closed_provider_discovery_payload(closed)
+        contract_payload = contract.to_dict()
+        if (
+            schema_contract_budget_remaining is not None
+            and len(canonical_json(contract_payload).encode("utf-8")) > schema_contract_budget_remaining
+        ):
+            closed = _closed_provider_discovery_payload(result)
+            closed["success"] = False
+            closed["data"] = {
+                "error": "The selected plugin contracts exceed the aggregate planner schema budget. Use get_plugin_assistance.",
+                "error_code": "schema_contract_budget_exceeded",
+                "next_tool": "get_plugin_assistance",
+            }
+            return _serialize_closed_provider_discovery_payload(closed)
         if restricted:
             closed = _closed_provider_discovery_payload(result)
-            closed["data"] = contract.to_dict()
+            closed["data"] = contract_payload
             return _serialize_closed_provider_discovery_payload(closed)
-        return serialize_tool_result(replace(result, data=contract.to_dict()))
+        return serialize_tool_result(replace(result, data=contract_payload))
     if not restricted:
         return serialize_tool_result(result)
     payload = _closed_provider_discovery_payload(result)
@@ -2833,13 +2853,17 @@ async def _plan_pipeline_inner(
         required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
+    pending_information = set(information_manifest.unresolved) | set(_intent_selected_schema_keys(intent))
     tools = planner_tool_definitions(discovery_policy)
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state,
         "reviewed_facts": reviewed_planner_context,
         "authoring_aids": authoring_aids,
-        "information_manifest": information_manifest.provider_payload(unresolved_classes=discovery_policy.unresolved_classes),
+        "information_manifest": information_manifest.provider_payload(
+            discoverable_classes=discovery_policy.unresolved_classes,
+            unresolved_keys=frozenset(pending_information),
+        ),
         "instruction": PLANNER_TERMINAL_INSTRUCTION,
     }
     if conversation_context is not None:
@@ -2865,8 +2889,8 @@ async def _plan_pipeline_inner(
     stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
-    no_gain_events_in_round = 0
-    pending_information = set(_intent_selected_schema_keys(intent))
+    no_gain_calls_in_round = 0
+    schema_contract_bytes_used = 0
     # (component, code) fingerprints of every candidate rejection so far in
     # this request. A repeat means the intervening repair changed nothing that
     # mattered — the feedback then says so explicitly (repeat_notice) instead
@@ -3791,7 +3815,7 @@ async def _plan_pipeline_inner(
             # schema is not forgotten just because a candidate was rejected.
             seen_discovery.clear()
             seen_discovery_round = repair_count
-            no_gain_events_in_round = 0
+            no_gain_calls_in_round = 0
         information_keys = {call.call_id: planner_discovery_information_keys(call) for call in calls}
         no_gain_calls = tuple(
             call
@@ -3799,8 +3823,8 @@ async def _plan_pipeline_inner(
             if information_keys[call.call_id] and all(information_manifest.covers(key) for key in information_keys[call.call_id])
         )
         useful_calls = tuple(call for call in calls if call not in no_gain_calls)
-        no_gain_events_in_round += int(bool(no_gain_calls))
-        escalate_no_gain = bool(no_gain_calls) and no_gain_events_in_round >= 2
+        no_gain_calls_in_round += len(no_gain_calls)
+        escalate_no_gain = bool(no_gain_calls) and no_gain_calls_in_round >= 2
         for call in useful_calls:
             pending_information.update(information_keys[call.call_id])
         keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls)
@@ -3849,7 +3873,7 @@ async def _plan_pipeline_inner(
                 raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
             continue
 
-        async def execute_one_discovery(call: _ParsedToolCall) -> tuple[_ParsedToolCall, ToolResult]:
+        async def execute_one_discovery(call: _ParsedToolCall) -> tuple[_ParsedToolCall, ToolResult, bool]:
             dispatch = begin_dispatch(
                 call.call_id,
                 call.name,
@@ -3894,15 +3918,19 @@ async def _plan_pipeline_inner(
                 # repair next turn. Raising here would crash the whole request
                 # as a non-PipelinePlannerError 500 with no disposition.
                 feedback = _allowlisted_argument_feedback(exc)
-                return call, ToolResult(
-                    success=False,
-                    updated_state=current_state,
-                    validation=current_state.validate(),
-                    affected_nodes=(),
-                    data=dict(feedback),
+                return (
+                    call,
+                    ToolResult(
+                        success=False,
+                        updated_state=current_state,
+                        validation=current_state.validate(),
+                        affected_nodes=(),
+                        data=dict(feedback),
+                    ),
+                    False,
                 )
             result = cast(_AuditedDiscoveryResult, audited.result).result
-            return call, result
+            return call, result, True
 
         discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in useful_calls]
         try:
@@ -3956,19 +3984,22 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
-            result_call, result = next(discovery_results)
+            result_call, result, information_resolved = next(discovery_results)
             if result_call is not call:
                 raise AuditIntegrityError("planner discovery result order diverged from admitted calls")
+            budget_remaining = 48 * 1024 - schema_contract_bytes_used
+            serialized_result = _serialize_provider_discovery_result(
+                call=call,
+                result=result,
+                surface=surface,
+                provider_current_state=provider_current_state,
+                schema_contract_budget_remaining=budget_remaining,
+            )
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call.call_id,
-                    "content": _serialize_provider_discovery_result(
-                        call=call,
-                        result=result,
-                        surface=surface,
-                        provider_current_state=provider_current_state,
-                    ),
+                    "content": serialized_result,
                 }
             )
             information_available = result.success
@@ -3976,13 +4007,20 @@ async def _plan_pipeline_inner(
                 try:
                     if type(result.data) is not PluginSchemaInfo:
                         raise SchemaContractProjectionUnsupported
-                    planner_plugin_contract(result.data)
+                    contract = planner_plugin_contract(result.data)
                 except SchemaContractProjectionUnsupported:
                     information_available = False
-            information_manifest = information_manifest.with_result(
-                information_keys[call.call_id],
-                available=information_available,
-            )
+                else:
+                    contract_bytes = len(canonical_json(contract.to_dict()).encode("utf-8"))
+                    if contract_bytes > budget_remaining:
+                        information_available = False
+                    else:
+                        schema_contract_bytes_used += contract_bytes
+            if information_resolved:
+                information_manifest = information_manifest.with_result(
+                    information_keys[call.call_id],
+                    available=information_available,
+                )
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         if next(discovery_results, None) is not None:
             raise AuditIntegrityError("planner discovery produced an unowned result")

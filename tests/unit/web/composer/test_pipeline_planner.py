@@ -1557,20 +1557,29 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
         "pipeline_state": "current_projection",
         "plugin_selection": "policy_snapshot",
     }
+    assert "plugin.schema" in payload["information_manifest"]["discoverable_classes"]
+    assert payload["information_manifest"]["unresolved"] == []
+    assert "unresolved_classes" not in payload["information_manifest"]
     names = [tool["function"]["name"] for tool in request["tools"]]
     assert not {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"} & set(names)
     assert names[-1] == "emit_pipeline_proposal"
-    fixed_scaffolding = {
+    fixed_payload = {
         key: value for key, value in payload.items() if key not in {"intent", "conversation_context", "current_state", "reviewed_facts"}
+    }
+    fixed_scaffolding = {
+        "messages": [request["messages"][0], {"role": "user", "content": canonical_json(fixed_payload)}],
+        "tools": request["tools"],
     }
     assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= 96 * 1024
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["sources", "transforms", "sinks"])
 async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls(
     tmp_path: Path,
     tool_context: ToolContext,
     monkeypatch: pytest.MonkeyPatch,
+    kind: str,
 ) -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
@@ -1578,7 +1587,7 @@ async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls
 
     def aids_with_prohibition(catalog: PolicyCatalogView) -> dict[str, Any]:
         aids = original(catalog)
-        aids["discovery_digest"]["plugins"]["prohibited"]["sources"] = [
+        aids["discovery_digest"]["plugins"]["prohibited"][kind] = [
             {
                 "name": "named_but_prohibited",
                 "reason": "plugin_not_allowed_on_web",
@@ -1594,7 +1603,7 @@ async def test_supplied_prohibited_plugin_fact_does_not_reenable_inventory_calls
 
     request = completion.requests[0]
     payload = json.loads(request["messages"][-1]["content"])
-    assert payload["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"]["sources"][0]["name"] == ("named_but_prohibited")
+    assert payload["authoring_aids"]["discovery_digest"]["plugins"]["prohibited"][kind][0]["name"] == ("named_but_prohibited")
     names = {tool["function"]["name"] for tool in request["tools"]}
     assert not {"list_sources", "list_transforms", "list_sinks"} & names
 
@@ -1647,7 +1656,7 @@ async def test_digest_omission_advertises_only_its_kind_inventory_until_details_
     ]
     assert {omission["details_via"] for omission in omissions} <= set(initial_names)
     assert "list_sources" in initial_names
-    assert "catalog.details.source" in payload["information_manifest"]["unresolved_classes"]
+    assert "catalog.details.source" in payload["information_manifest"]["unresolved"]
     assert not {"list_transforms", "list_sinks"} & set(initial_names)
 
     second_names = [tool["function"]["name"] for tool in completion.requests[1]["tools"]]
@@ -1662,11 +1671,15 @@ def test_pipeline_information_semantic_dominance_is_directional() -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 
     empty = planner_module.PlannerInformationManifest(supplied=frozenset())
-    source_only = empty.with_result(("pipeline.source",), available=True)
+    source_call = planner_module._ParsedToolCall(
+        call_id="source", name="get_pipeline_state", arguments={"component": "source"}, raw_arguments='{"component":"source"}'
+    )
+    full_call = planner_module._ParsedToolCall(call_id="full", name="get_pipeline_state", arguments={}, raw_arguments="{}")
+    source_only = empty.with_result(planner_module.planner_discovery_information_keys(source_call), available=True)
     assert source_only.covers("pipeline.source")
     assert not source_only.covers("pipeline.full")
 
-    full = empty.with_result(("pipeline.full",), available=True)
+    full = empty.with_result(planner_module.planner_discovery_information_keys(full_call), available=True)
     assert full.covers("pipeline.source")
     assert full.covers("pipeline.component:any-node")
 
@@ -1889,6 +1902,55 @@ async def test_failed_selected_schema_does_not_emit_false_gap_closure(
 
 
 @pytest.mark.asyncio
+async def test_selected_schema_contracts_share_one_48kib_request_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    def large_schema(
+        name: str,
+        arguments: Mapping[str, Any],
+        state: CompositionState,
+        context: ToolContext,
+    ) -> ToolResult:
+        del name, context
+        schema = PluginSchemaInfo(
+            name=cast(str, arguments["name"]),
+            plugin_type=cast(str, arguments["plugin_type"]),
+            description="Large but individually admissible contract.",
+            json_schema={"type": "object", "default": "x" * 19_500},
+            knob_schema={"fields": []},
+        )
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=state.validate(),
+            affected_nodes=(),
+            data=schema,
+        )
+
+    monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", large_schema)
+    completion = _ScriptedCompletion(
+        _response(
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "one"}),
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "two"}),
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "three"}),
+        ),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    payloads = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert [payload["success"] for payload in payloads] == [True, True, False]
+    assert payloads[2]["data"]["error_code"] == "schema_contract_budget_exceeded"
+    admitted_bytes = sum(len(canonical_json(payload["data"]).encode("utf-8")) for payload in payloads if payload["success"])
+    assert admitted_bytes <= 48 * 1024
+
+
+@pytest.mark.asyncio
 async def test_explicit_multi_turn_selected_schema_set_closes_only_after_last_schema(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -1908,12 +1970,18 @@ async def test_explicit_multi_turn_selected_schema_set_closes_only_after_last_sc
     )
 
     notice = "All declared information gaps are closed; emit the terminal proposal now."
+    initial_payload = json.loads(completion.requests[0]["messages"][-1]["content"])
+    assert initial_payload["information_manifest"]["unresolved"] == [
+        "plugin.schema:transform/field_mapper",
+        "plugin.schema:transform/web_scrape",
+    ]
+    assert "plugin.schema" in initial_payload["information_manifest"]["discoverable_classes"]
     assert not any(message.get("content") == notice for message in completion.requests[1]["messages"])
     assert completion.requests[2]["messages"][-1]["content"] == notice
 
 
 @pytest.mark.asyncio
-async def test_two_no_gain_calls_in_one_turn_are_one_feedback_event(
+async def test_two_no_gain_calls_in_one_batch_complete_protocol_then_hatch(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
@@ -1929,10 +1997,15 @@ async def test_two_no_gain_calls_in_one_turn_are_one_feedback_event(
         completion=completion,
         recorder=recorder,
         information_aware=True,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
     )
 
     tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [result["error_code"] for result in tool_results] == ["DISCOVERY_NO_GAIN", "DISCOVERY_NO_GAIN"]
+    assert completion.requests[1]["model"] == "openrouter/advisor-under-test"
     assert recorder.invocations == ()
 
 
@@ -6986,7 +7059,8 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     session bf109c43 — get_plugin_schema plugin_type='node' → ToolArgumentError
     → HTTP 500, no disposition)."""
     completion = _ScriptedCompletion(
-        _response(("get_plugin_schema", {"plugin_type": "node", "name": "coalesce"})),
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv", "unexpected": True})),
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
     recorder = BufferingRecorder()
@@ -6994,12 +7068,17 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-    assert len(completion.requests) == 2
+    assert len(completion.requests) == 3
     # The bad-arg call fed back a failure tool message the model saw next turn.
     tool_messages = [m for m in completion.requests[1]["messages"] if m["role"] == "tool"]
     assert len(tool_messages) == 1
     payload = json.loads(tool_messages[0]["content"])
     assert payload["success"] is False
+    repaired_messages = [m for m in completion.requests[2]["messages"] if m["role"] == "tool"]
+    assert len(repaired_messages) == 2
+    repaired_payload = json.loads(repaired_messages[-1]["content"])
+    assert repaired_payload["success"] is True
+    assert repaired_payload.get("error_code") != "DISCOVERY_NO_GAIN"
     # The invocation is still audited as an argument error.
     assert recorder.invocations[0].status.value == "arg_error"
 

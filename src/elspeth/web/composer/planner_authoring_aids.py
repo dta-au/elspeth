@@ -31,7 +31,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Final, NotRequired, Required, TypedDict
+from typing import Any, Final, NotRequired, Required, TypedDict, cast
 
 from rfc8785 import CanonicalizationError
 
@@ -930,6 +930,28 @@ _JSON_SCHEMA_SINGLE_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 _JSON_SCHEMA_SCHEMA_LIST_KEYS: Final[frozenset[str]] = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+_JSON_SCHEMA_STRING_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$ref",
+        "$anchor",
+        "$dynamicRef",
+        "$dynamicAnchor",
+        "pattern",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+    }
+)
+_JSON_SCHEMA_BOOLEAN_SCALAR_KEYS: Final[frozenset[str]] = frozenset({"deprecated", "readOnly", "writeOnly", "nullable", "uniqueItems"})
+_JSON_SCHEMA_NUMERIC_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
+    {"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"}
+)
+_JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS: Final[frozenset[str]] = frozenset(
+    {"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties", "minContains", "maxContains"}
+)
+_JSON_SCHEMA_TYPES: Final[frozenset[str]] = frozenset({"null", "boolean", "object", "array", "number", "string", "integer"})
 
 
 class _SchemaContractProjectionUnsupported(ValueError):
@@ -950,6 +972,42 @@ _PROHIBITED_REASON: Final[str] = "plugin_not_allowed_on_web"
 _PROHIBITED_EXPLANATION: Final[str] = (
     "the plugin is installed and authorized for this deployment's runtime but prohibited on the web authoring surface by security policy"
 )
+
+
+def _contract_json_schema_scalar(key: str, value: object) -> object:
+    """Validate the closed scalar-keyword vocabulary before copying it."""
+    if key in _JSON_SCHEMA_STRING_SCALAR_KEYS:
+        if type(value) is not str:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_BOOLEAN_SCALAR_KEYS:
+        if type(value) is not bool:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_NUMERIC_SCALAR_KEYS:
+        if type(value) not in {int, float} or (isinstance(value, float) and not math.isfinite(value)):
+            raise _SchemaContractProjectionUnsupported
+        numeric_value = cast(int | float, value)
+        if key == "multipleOf" and numeric_value <= 0:
+            raise _SchemaContractProjectionUnsupported
+    elif key in _JSON_SCHEMA_NONNEGATIVE_INTEGER_KEYS:
+        if type(value) is not int or value < 0:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "type":
+        if type(value) is str:
+            if value not in _JSON_SCHEMA_TYPES:
+                raise _SchemaContractProjectionUnsupported
+        elif isinstance(value, list):
+            if not value or any(type(item) is not str or item not in _JSON_SCHEMA_TYPES for item in value) or len(set(value)) != len(value):
+                raise _SchemaContractProjectionUnsupported
+        else:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "enum":
+        if not isinstance(value, list) or not value:
+            raise _SchemaContractProjectionUnsupported
+    elif key == "$vocabulary" and (
+        not isinstance(value, dict) or any(type(name) is not str or type(required) is not bool for name, required in value.items())
+    ):
+        raise _SchemaContractProjectionUnsupported
+    return deepcopy(value)
 
 
 def _assert_projection_input_bounds(value: object) -> None:
@@ -1075,9 +1133,8 @@ def _contract_discriminator(raw: object) -> dict[str, object]:
     invariant=(
         "raises _SchemaContractProjectionUnsupported on any JSON Schema KEYWORD outside the closed "
         "projected vocabulary, and on any container-valued keyword whose value shape is wrong; the "
-        "boolean schema forms (true/false) pass through unchanged. Deliberately NOT claimed: values of "
-        "_JSON_SCHEMA_SCALAR_KEYS keywords (type/const/enum/default/pattern/minimum/uniqueItems/...) are "
-        "deep-copied through WITHOUT a type check, so e.g. pattern=12345 or minimum='x' is accepted"
+        "boolean schema forms (true/false) pass through unchanged. Known scalar keywords are validated "
+        "against their JSON Schema domains before they are copied into the owned projection"
     ),
     test_ref="tests/unit/web/composer/test_schema_contract_projection_boundaries.py::test_contract_json_schema_rejects_non_dict_non_bool",
     test_fingerprint="88f4d910a5b39715fd50c60330e587e198eddfef3263c5101ed6461593ef561c",
@@ -1123,7 +1180,7 @@ def _contract_json_schema(raw: object) -> dict[str, object] | bool:
                     dependent[name] = [required_name for required_name in required_names if required_name not in hidden_properties]
             projected[key] = dependent
         elif key in _JSON_SCHEMA_SCALAR_KEYS:
-            projected[key] = deepcopy(value)
+            projected[key] = _contract_json_schema_scalar(key, value)
         elif key in _JSON_SCHEMA_MAP_KEYS and isinstance(value, dict):
             if any(not isinstance(name, str) for name in value):
                 raise _SchemaContractProjectionUnsupported
