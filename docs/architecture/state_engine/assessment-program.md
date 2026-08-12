@@ -314,7 +314,7 @@ one frozen selector lane:
 export ELSPETH_GITHUB_ACTIONS_READ_TOKEN="<read-only token>"
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
   ingest-live-evidence "$STATE_ASSESSMENT_PATH" /path/to/downloaded-artifact \
-  --lane protected-live-aws
+  --lane protected-live-source-aws_s3-default
 unset ELSPETH_GITHUB_ACTIONS_READ_TOKEN
 ```
 

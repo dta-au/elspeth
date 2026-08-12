@@ -319,7 +319,7 @@ _PUBLISHED_AT_CRASH: frozenset[SinkEffectExecutionSeam] = frozenset(
 
 @dataclass(frozen=True)
 class _AwsLiveLane:
-    """Resolved protected-live-aws lane resources for this matrix."""
+    """Resolved postgresql-16-aws composition-lane resources for this matrix."""
 
     database_url: str
     region: str
