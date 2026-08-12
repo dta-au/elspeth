@@ -38,7 +38,6 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_schema_form,
 )
 from elspeth.web.composer.guided.state_machine import (
-    GUIDED_MAX_CHAT_CONTENT_CHARS,
     ComponentTarget,
     GuidedCorrectionMessageRef,
 )
@@ -2647,7 +2646,7 @@ async def post_guided_respond(
         RecoveredPipelineCommit,
         prepare_pipeline_proposal_commit,
     )
-    from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict, GuidedPlannerDecline, PlannerOriginatingMessage
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PlannerOriginatingMessage
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.redaction import redact_tool_call_arguments
     from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
@@ -2681,27 +2680,6 @@ async def post_guided_respond(
     # calls and blank content), but a ChatTurn requires non-empty content.
     # Mirrors guided_plan.py's identical fallback for the guided-full surface.
     _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
-
-    def _projection_conflict_text(conflict: GuidedPlannerConflict) -> str:
-        noun = "field" if len(conflict.missing_fields) == 1 else "fields"
-        prefix = f"The exact retained-field projection omits reviewed output {noun} "
-        suffix = ". Update the projection or the reviewed output contract before planning again."
-        overflow_text = (
-            "The exact retained-field projection omits reviewed output fields whose identifiers are too long "
-            "to display safely. Update the projection or the reviewed output contract before planning again."
-        )
-        rendered_fields: list[str] = []
-        rendered_length = len(prefix) + len(suffix)
-        for name in conflict.missing_fields:
-            separator = ", " if rendered_fields else ""
-            rendered_name = f"`{name}`"
-            rendered_length += len(separator) + len(rendered_name)
-            if rendered_length > GUIDED_MAX_CHAT_CONTENT_CHARS:
-                return overflow_text
-            rendered_fields.append(f"{separator}{rendered_name}")
-        if not rendered_fields:
-            return overflow_text
-        return f"{prefix}{''.join(rendered_fields)}{suffix}"
 
     service: SessionServiceProtocol = request.app.state.session_service
     composer = request.app.state.composer_service
@@ -3860,12 +3838,8 @@ async def post_guided_respond(
                                 correction_target=correction_target,
                                 revision_authority=revision_authority,
                             )
-                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
-                                assistant_text = (
-                                    outcome.decline_text.strip() or _empty_decline_fallback
-                                    if isinstance(outcome, GuidedPlannerDecline)
-                                    else _projection_conflict_text(outcome)
-                                )
+                            if isinstance(outcome, GuidedPlannerDecline):
+                                assistant_text = outcome.decline_text.strip() or _empty_decline_fallback
                                 return await _settle_guided_planner_nonproposal(
                                     base_guided=guided,
                                     assistant_text=assistant_text,
@@ -4319,12 +4293,8 @@ async def post_guided_respond(
                                 progress=planner_progress,
                                 correction_target=correction_target,
                             )
-                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
-                                assistant_text = (
-                                    outcome.decline_text.strip() or _empty_decline_fallback
-                                    if isinstance(outcome, GuidedPlannerDecline)
-                                    else _projection_conflict_text(outcome)
-                                )
+                            if isinstance(outcome, GuidedPlannerDecline):
+                                assistant_text = outcome.decline_text.strip() or _empty_decline_fallback
                                 return await _settle_guided_planner_nonproposal(
                                     base_guided=guided,
                                     assistant_text=assistant_text,
@@ -4918,7 +4888,7 @@ async def post_guided_respond(
                                 operation_fence=fence,
                                 progress=planner_progress,
                             )
-                            if isinstance(outcome, (GuidedPlannerDecline, GuidedPlannerConflict)):
+                            if isinstance(outcome, GuidedPlannerDecline):
                                 # Base off the ORIGINAL unmutated guided (still at
                                 # STEP_2_SINK), not resulting_guided (already
                                 # advanced to STEP_3_TRANSFORMS with no proposal):
@@ -4932,11 +4902,7 @@ async def post_guided_respond(
                                 # state-machine advance. ``prospective`` differs
                                 # from ``guided`` only when this request must
                                 # materialize the current unanswered occurrence.
-                                assistant_text = (
-                                    outcome.decline_text.strip() or _empty_decline_fallback
-                                    if isinstance(outcome, GuidedPlannerDecline)
-                                    else _projection_conflict_text(outcome)
-                                )
+                                assistant_text = outcome.decline_text.strip() or _empty_decline_fallback
                                 return await _settle_guided_planner_nonproposal(
                                     base_guided=prospective,
                                     assistant_text=assistant_text,

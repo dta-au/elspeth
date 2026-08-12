@@ -21,6 +21,26 @@ conflicting, or only partially parsed authority falls back to the planner.
 Durable planner evidence records physical provider calls separately from
 semantic response attempts, including retry gaps and ordinal-reset cohorts.
 
+**Amendment (2026-08-13): Task 5's intent matching EXCISED.** The operator
+ruled that prose-intent → zero-provider recipe synthesis is the banned
+`recipe_match` anti-pattern (`.superpowers/sdd/INTENT-guided-stepped-orchestrator.md`
+§6): the tutorial must converge because it is easy, through the composer LLM,
+never through a deterministic server path keyed on user text. A multi-agent
+review also confirmed three high-severity defects living entirely in the
+matcher (comma-interjection negation fails open end-to-end; quadratic
+authority parsing blocks the event loop ~37 s at the 64 KiB message cap;
+unmodeled trailing instruction clauses silently dropped on the zero-call
+route). Deleted: `match_registered_recipe_intent` and all prose-parsing
+machinery in `recipes.py` (~1,200 lines), `recipe_intent_routing.py`,
+`try_prepare_registered_recipe_plan` plus both `service.py` call sites, the
+`no_tool_policy.py` recipe-envelope production, `GuidedPlannerConflict`
+(recipe-route-only), and the harness's zero-call acceptance arm — zero
+provider calls now FAILS the staging efficiency gate. Kept: the recipe
+registry, slot validation, builders, `apply_recipe` (explicit invocation is
+deliberate, not prose-guessed), the projection-conflict rule, and all of
+Tasks 1–4 and 6–8. Tracked residue: elspeth-a0a830fc95 (guided mirror-edge
+reconciliation, found by the same review), elspeth-9fd227b528 (low findings).
+
 ---
 
 ## Constraints and success criteria

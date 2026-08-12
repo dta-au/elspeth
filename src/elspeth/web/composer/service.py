@@ -25,7 +25,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
@@ -118,7 +117,6 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.pipeline_planner import (
     DELTA_PLANNER_TERMINAL_INSTRUCTION,
-    GuidedPlannerConflict,
     GuidedPlannerDecline,
     PipelineCandidatePolicyRejection,
     PipelinePlannerError,
@@ -171,20 +169,6 @@ from elspeth.web.composer.protocol import (
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
 from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
-from elspeth.web.composer.recipes import (
-    RecipeIntentContext,
-    RecipeIntentMatch,
-    RecipeOutputBinding,
-    RecipeReviewedOutputSummary,
-    RecipeReviewedSourceSummary,
-    RecipeSourceBinding,
-    ReviewedOutputProjectionConflict,
-    apply_recipe,
-    get_recipe,
-    match_registered_recipe_intent,
-    recipe_catalog_content_hash,
-    unavailable_recipe_plugin,
-)
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.required_controls import wire_required_controls
@@ -404,108 +388,6 @@ _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARG
 
 _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
-
-
-def _effective_reviewed_output_format(*, plugin: str, path: str, options: Mapping[str, Any]) -> str | None:
-    """Resolve a reviewed sink format without inventing non-JSON defaults."""
-
-    explicit = options["format"] if "format" in options else None
-    if explicit is not None:
-        return explicit if type(explicit) is str else None
-    if plugin != "json":
-        return None
-    return "jsonl" if Path(path).suffix == ".jsonl" else "json"
-
-
-async def try_prepare_registered_recipe_plan(
-    *,
-    intent_context: RecipeIntentContext,
-    current_state: CompositionState,
-    reviewed_facts: Mapping[str, Any],
-    reviewed_planner_context: Mapping[str, Any],
-    supersedes_draft_hash: str | None,
-    surface: PlannerSurface,
-    policy_catalog: PolicyCatalogView,
-    plugin_snapshot: PluginAvailabilitySnapshot,
-    originating_message: PlannerOriginatingMessage,
-    base: AbsentBase | PresentBase,
-    custody_config: PlannerCustodyConfig,
-    timeout_seconds: float,
-    candidate_finalizer: Callable[[Mapping[str, Any]], Mapping[str, Any]],
-) -> PipelinePlanResult | None:
-    """Prepare the registry's unique complete match through the common gate."""
-
-    match = match_registered_recipe_intent(intent_context)
-    if match is None:
-        return None
-    if type(match) is not RecipeIntentMatch:
-        raise TypeError("recipe matcher returned a malformed match")
-    recipe = get_recipe(match.recipe_name)
-    if recipe is None:
-        raise AuditIntegrityError("recipe matcher selected an unregistered recipe")
-    if unavailable_recipe_plugin(recipe, plugin_snapshot, raw_slots=match.slots) is not None:
-        return None
-
-    recipe_slots = dict(match.slots)
-    inline_blob = match.inline_blob
-    if inline_blob is not None:
-        blob_slots = [
-            name for name, spec in recipe.slots.items() if spec.required and spec.slot_type == "blob_id" and name not in recipe_slots
-        ]
-        if len(blob_slots) != 1:
-            raise AuditIntegrityError("inline recipe must own exactly one missing required blob slot")
-        recipe_slots[blob_slots[0]] = str(UUID(int=0))
-    recipe_pipeline = apply_recipe(match.recipe_name, recipe_slots)
-    if inline_blob is not None:
-        source = recipe_pipeline.get("source")
-        if type(source) is not dict or source.get("blob_id") != str(UUID(int=0)):
-            raise AuditIntegrityError("inline recipe did not produce the expected source blob slot")
-        source = dict(source)
-        source.pop("blob_id")
-        source["inline_blob"] = {
-            "filename": inline_blob.filename,
-            "mime_type": inline_blob.mime_type,
-            "content": inline_blob.content,
-        }
-        recipe_pipeline["source"] = source
-
-    recipe_pipeline = dict(candidate_finalizer(recipe_pipeline))
-    recipe_contract = canonical_json(
-        {
-            "schema": "composer.server-recipe-router.v1",
-            "recipe": match.recipe_name,
-            "recipe_catalog_content_hash": recipe_catalog_content_hash(),
-        }
-    )
-    return await prepare_pipeline_plan(
-        pipeline=recipe_pipeline,
-        current_state=current_state,
-        reviewed_facts=reviewed_facts,
-        reviewed_planner_context=reviewed_planner_context,
-        supersedes_draft_hash=supersedes_draft_hash,
-        surface=surface,
-        policy_catalog=policy_catalog,
-        plugin_snapshot=plugin_snapshot,
-        originating_message=originating_message,
-        base=base,
-        rendered_skill=recipe_contract,
-        tool_call_id=(
-            "server-recipe-"
-            + stable_hash(
-                {
-                    "schema": "composer.server-recipe-tool-call.v1",
-                    "message_id": originating_message.message_id,
-                    "recipe": match.recipe_name,
-                }
-            )
-        ),
-        model_identifier="composer-server-recipe-router",
-        model_version="composer.server-recipe-router.v1",
-        provider="server",
-        repair_count=0,
-        timeout_seconds=timeout_seconds,
-        custody_config=custody_config,
-    )
 
 
 def _required_controls_candidate_finalizer(
@@ -3661,7 +3543,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline | GuidedPlannerConflict:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run one shared planner call for the current guided checkpoint."""
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
@@ -3669,7 +3551,6 @@ class ComposerServiceImpl:
             GuidedCorrectionTarget,
             GuidedRevisionAuthority,
             bind_guided_prose_revision_candidate,
-            bind_guided_reviewed_components,
             build_guided_proposal_projection,
             guided_authorized_pipeline_schema,
             guided_private_reviewed_facts,
@@ -3686,10 +3567,6 @@ class ComposerServiceImpl:
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
         from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint, StatedPredicateConstraint
         from elspeth.web.composer.guided.state_machine import GuidedSession
-        from elspeth.web.composer.guided_blob_refs import (
-            reviewed_schema_declared_field_names,
-            validate_guided_reviewed_blob_binding,
-        )
 
         if type(guided) is not GuidedSession:
             raise TypeError("guided must be an exact GuidedSession")
@@ -3771,91 +3648,6 @@ class ComposerServiceImpl:
                 attempt=operation_fence.attempt,
             ),
         )
-
-        if correction_target is None and revision_authority is None and supersedes_draft_hash is None:
-            source_summaries = tuple(
-                RecipeReviewedSourceSummary(
-                    name=reviewed.name,
-                    plugin=reviewed.plugin,
-                    field_names=tuple(
-                        dict.fromkeys(
-                            (
-                                *reviewed.observed_columns,
-                                *(reviewed_schema_declared_field_names(reviewed.options["schema"]) if "schema" in reviewed.options else ()),
-                            )
-                        )
-                    ),
-                )
-                for stable_id in guided.source_order
-                for reviewed in (guided.reviewed_sources[stable_id],)
-            )
-            output_summaries = tuple(
-                RecipeReviewedOutputSummary(
-                    name=reviewed.name,
-                    plugin=reviewed.plugin,
-                    required_fields=tuple(reviewed.required_fields),
-                )
-                for stable_id in guided.output_order
-                for reviewed in (guided.reviewed_outputs[stable_id],)
-            )
-            source_bindings_list: list[RecipeSourceBinding] = []
-            for stable_id in guided.source_order:
-                reviewed = guided.reviewed_sources[stable_id]
-                reviewed_binding = validate_guided_reviewed_blob_binding(reviewed.options)
-                if reviewed_binding is not None:
-                    source_bindings_list.append(
-                        RecipeSourceBinding(
-                            name=reviewed.name,
-                            plugin=reviewed.plugin,
-                            blob_id=reviewed_binding.blob_ref,
-                        )
-                    )
-            source_bindings = tuple(source_bindings_list)
-            output_bindings = tuple(
-                RecipeOutputBinding(
-                    name=reviewed.name,
-                    plugin=reviewed.plugin,
-                    path=path,
-                    format=output_format,
-                )
-                for stable_id in guided.output_order
-                for reviewed in (guided.reviewed_outputs[stable_id],)
-                for path in ((reviewed.options["path"],) if "path" in reviewed.options else ())
-                if type(path) is str
-                for output_format in (_effective_reviewed_output_format(plugin=reviewed.plugin, path=path, options=reviewed.options),)
-                if output_format is not None
-            )
-            try:
-                recipe_plan = await try_prepare_registered_recipe_plan(
-                    intent_context=RecipeIntentContext(
-                        user_text=intent,
-                        reviewed_sources=source_summaries,
-                        reviewed_outputs=output_summaries,
-                        policy_snapshot=plugin_snapshot,
-                        source_bindings=source_bindings,
-                        output_bindings=output_bindings,
-                    ),
-                    current_state=current_state,
-                    reviewed_facts=reviewed_facts,
-                    reviewed_planner_context=reviewed_context,
-                    supersedes_draft_hash=None,
-                    surface=planner_surface,
-                    policy_catalog=policy_catalog,
-                    plugin_snapshot=plugin_snapshot,
-                    originating_message=originating_message,
-                    base=base,
-                    custody_config=custody_config,
-                    timeout_seconds=self._timeout_seconds,
-                    candidate_finalizer=_required_controls_candidate_finalizer(
-                        policy_catalog=policy_catalog,
-                        plugin_snapshot=plugin_snapshot,
-                        inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
-                    ),
-                )
-            except ReviewedOutputProjectionConflict as conflict:
-                return GuidedPlannerConflict(missing_fields=conflict.missing_fields)
-            if recipe_plan is not None:
-                return recipe_plan, catalog_ids
 
         passthrough_sketch_shape = (
             correction_target is None
@@ -4517,133 +4309,111 @@ class ComposerServiceImpl:
                 llm_calls=recorder.llm_calls,
             ),
         )
-        plan: PipelinePlanResult | None = None
         planner_llm_start = len(recorder.llm_calls)
         planner_attempt_start = len(recorder.planner_attempts)
         planner_invocation_start = len(recorder.invocations)
-        plan = await try_prepare_registered_recipe_plan(
-            intent_context=RecipeIntentContext(user_text=message, policy_snapshot=plugin_snapshot),
-            current_state=state,
-            reviewed_facts={},
-            reviewed_planner_context={},
-            supersedes_draft_hash=None,
-            surface=PlannerSurface.FREEFORM,
-            policy_catalog=policy_catalog,
-            plugin_snapshot=plugin_snapshot,
-            originating_message=origin,
-            base=base,
-            custody_config=custody_config,
-            timeout_seconds=self._timeout_seconds,
-            candidate_finalizer=_required_controls_candidate_finalizer(
+        try:
+            plan = await plan_pipeline(
+                intent=message,
+                conversation_context=_freeform_planner_conversation_context(message, messages),
+                current_state=state,
+                provider_current_state=state.to_dict(),
+                reviewed_facts={},
+                reviewed_planner_context={},
+                # Freeform has no reviewed guided output, so no operator
+                # has declared a sink field contract a gap could exist
+                # against.
+                unproducible_output_fields=(),
+                eligible_deferred_intent_ids=(),
+                claim_evaluator=None,
+                supersedes_draft_hash=None,
+                surface=PlannerSurface.FREEFORM,
+                profile="ordinary",
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
-            ),
-        )
-        if plan is None:
-            try:
-                plan = await plan_pipeline(
-                    intent=message,
-                    conversation_context=_freeform_planner_conversation_context(message, messages),
-                    current_state=state,
-                    provider_current_state=state.to_dict(),
-                    reviewed_facts={},
-                    reviewed_planner_context={},
-                    # Freeform has no reviewed guided output, so no operator
-                    # has declared a sink field contract a gap could exist
-                    # against.
-                    unproducible_output_fields=(),
-                    eligible_deferred_intent_ids=(),
-                    claim_evaluator=None,
-                    supersedes_draft_hash=None,
-                    surface=PlannerSurface.FREEFORM,
-                    profile="ordinary",
+                originating_message=origin,
+                base=base,
+                model_config=PlannerModelConfig(
+                    completion=_litellm_acompletion,
+                    model_identifier=self._model,
+                    provider=self._availability.provider or "unknown",
+                    temperature=self._settings.composer_temperature,
+                    seed=self._settings.composer_seed,
+                    timeout_seconds=self._timeout_seconds,
+                    max_composition_turns=self._max_composition_turns,
+                    max_discovery_turns=self._max_discovery_turns,
+                    max_tool_calls_per_turn=self._max_tool_calls_per_turn,
+                    max_api_attempts=_LLM_API_MAX_ATTEMPTS,
+                    api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
+                    discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
+                    candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
+                    escape_hatch_model=self._settings.composer_advisor_model,
+                    escape_hatch_provider=self._advisor_provider,
+                    api_base=self._endpoint_base_url,
+                    api_key=self._endpoint_api_key,
+                    escape_hatch_api_base=self._advisor_endpoint_base_url,
+                    escape_hatch_api_key=self._advisor_endpoint_api_key,
+                ),
+                rendered_skill=rendered_skill,
+                repair_budget=self._settings.composer_planner_repair_budget,
+                budget_policy=PlannerBudgetPolicy(
+                    max_total_provider_calls=self._settings.composer_planner_max_provider_calls,
+                    max_request_bytes=self._settings.composer_planner_max_request_bytes,
+                    max_completion_tokens=self._settings.composer_planner_max_completion_tokens,
+                    max_cumulative_provider_cost=self._settings.composer_planner_max_cumulative_provider_cost,
+                ),
+                custody_config=custody_config,
+                lifecycle=self._planner_request_lifecycle(progress),
+                recorder=recorder,
+                candidate_finalizer=_required_controls_candidate_finalizer(
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
-                    originating_message=origin,
-                    base=base,
-                    model_config=PlannerModelConfig(
-                        completion=_litellm_acompletion,
-                        model_identifier=self._model,
-                        provider=self._availability.provider or "unknown",
-                        temperature=self._settings.composer_temperature,
-                        seed=self._settings.composer_seed,
-                        timeout_seconds=self._timeout_seconds,
-                        max_composition_turns=self._max_composition_turns,
-                        max_discovery_turns=self._max_discovery_turns,
-                        max_tool_calls_per_turn=self._max_tool_calls_per_turn,
-                        max_api_attempts=_LLM_API_MAX_ATTEMPTS,
-                        api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
-                        discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
-                        candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
-                        escape_hatch_model=self._settings.composer_advisor_model,
-                        escape_hatch_provider=self._advisor_provider,
-                        api_base=self._endpoint_base_url,
-                        api_key=self._endpoint_api_key,
-                        escape_hatch_api_base=self._advisor_endpoint_base_url,
-                        escape_hatch_api_key=self._advisor_endpoint_api_key,
-                    ),
-                    rendered_skill=rendered_skill,
-                    repair_budget=self._settings.composer_planner_repair_budget,
-                    budget_policy=PlannerBudgetPolicy(
-                        max_total_provider_calls=self._settings.composer_planner_max_provider_calls,
-                        max_request_bytes=self._settings.composer_planner_max_request_bytes,
-                        max_completion_tokens=self._settings.composer_planner_max_completion_tokens,
-                        max_cumulative_provider_cost=self._settings.composer_planner_max_cumulative_provider_cost,
-                    ),
-                    custody_config=custody_config,
-                    lifecycle=self._planner_request_lifecycle(progress),
-                    recorder=recorder,
-                    candidate_finalizer=_required_controls_candidate_finalizer(
-                        policy_catalog=policy_catalog,
-                        plugin_snapshot=plugin_snapshot,
-                    ),
-                )
-            except PlannerDeclined as declined:
-                # Honest decline from the escape-hatch advisor turn: a
-                # successful conversational outcome, not a provider failure.
-                # Mirror the success path's audit persistence, then surface
-                # the advisor's own words as the assistant message.
-                await self._persist_pipeline_planner_audit(
+                ),
+            )
+        except PlannerDeclined as declined:
+            # Honest decline from the escape-hatch advisor turn: a
+            # successful conversational outcome, not a provider failure.
+            # Mirror the success path's audit persistence, then surface
+            # the advisor's own words as the assistant message.
+            await self._persist_pipeline_planner_audit(
+                session_id=session_uuid,
+                current_state_id=state_uuid,
+                llm_calls=recorder.llm_calls[planner_llm_start:],
+                planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+                invocations=recorder.invocations[planner_invocation_start:],
+            )
+            decline_message = declined.decline_text.strip() or (
+                "I could not find a way to build this pipeline with the available components."
+            )
+            return ComposerResult(message=decline_message, state=state)
+        except BaseException as exc:
+            exc_dict = exc.__dict__
+            attached_calls = exc_dict["llm_calls"] if "llm_calls" in exc_dict else ()
+            if type(attached_calls) is not tuple or any(type(call) is not ComposerLLMCall for call in attached_calls):
+                raise AuditIntegrityError("pipeline planner exception carried malformed LLM audit evidence") from exc
+            if attached_calls != recorder.llm_calls[planner_llm_start:]:
+                raise AuditIntegrityError("pipeline planner exception carried unrelated LLM audit evidence") from exc
+            attached_attempts = exc_dict["planner_attempts"] if "planner_attempts" in exc_dict else ()
+            if type(attached_attempts) is not tuple or any(type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts):
+                raise AuditIntegrityError("pipeline planner exception carried malformed semantic attempt evidence") from exc
+            if attached_attempts != recorder.planner_attempts[planner_attempt_start:]:
+                raise AuditIntegrityError("pipeline planner exception carried unrelated semantic attempt evidence") from exc
+            _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
+                self._persist_pipeline_planner_audit(
                     session_id=session_uuid,
                     current_state_id=state_uuid,
-                    llm_calls=recorder.llm_calls[planner_llm_start:],
-                    planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+                    llm_calls=attached_calls,
+                    planner_attempts=attached_attempts,
                     invocations=recorder.invocations[planner_invocation_start:],
-                )
-                decline_message = declined.decline_text.strip() or (
-                    "I could not find a way to build this pipeline with the available components."
-                )
-                return ComposerResult(message=decline_message, state=state)
-            except BaseException as exc:
-                exc_dict = exc.__dict__
-                attached_calls = exc_dict["llm_calls"] if "llm_calls" in exc_dict else ()
-                if type(attached_calls) is not tuple or any(type(call) is not ComposerLLMCall for call in attached_calls):
-                    raise AuditIntegrityError("pipeline planner exception carried malformed LLM audit evidence") from exc
-                if attached_calls != recorder.llm_calls[planner_llm_start:]:
-                    raise AuditIntegrityError("pipeline planner exception carried unrelated LLM audit evidence") from exc
-                attached_attempts = exc_dict["planner_attempts"] if "planner_attempts" in exc_dict else ()
-                if type(attached_attempts) is not tuple or any(
-                    type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts
-                ):
-                    raise AuditIntegrityError("pipeline planner exception carried malformed semantic attempt evidence") from exc
-                if attached_attempts != recorder.planner_attempts[planner_attempt_start:]:
-                    raise AuditIntegrityError("pipeline planner exception carried unrelated semantic attempt evidence") from exc
-                _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
-                    self._persist_pipeline_planner_audit(
-                        session_id=session_uuid,
-                        current_state_id=state_uuid,
-                        llm_calls=attached_calls,
-                        planner_attempts=attached_attempts,
-                        invocations=recorder.invocations[planner_invocation_start:],
-                    ),
-                    deferred=exc if type(exc) is asyncio.CancelledError else None,
-                )
-                exc_dict["llm_calls_durable"] = True
-                if deferred is not None:
-                    if deferred is exc:
-                        raise
-                    raise deferred from exc
-                raise
+                ),
+                deferred=exc if type(exc) is asyncio.CancelledError else None,
+            )
+            exc_dict["llm_calls_durable"] = True
+            if deferred is not None:
+                if deferred is exc:
+                    raise
+                raise deferred from exc
+            raise
         return await self._stage_pipeline_plan(
             plan=plan,
             state=state,

@@ -2,20 +2,17 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from io import StringIO
 from typing import Any, ClassVar, Final, Literal
 
 from opentelemetry import metrics
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.state_claim_grounding import (
     GROUNDING_CORRECTION_HEADER,
@@ -404,20 +401,6 @@ _QUOTE_TERMINATORS: Final = {
     "\u201c": "\u201d",
     "\u2018": "\u2019",
 }
-_REGISTERED_RECIPE_DELIMITER_PATTERN: Final = re.compile(
-    r"customer\s+rows\s*\(csv\):",
-    re.IGNORECASE,
-)
-_REGISTERED_RECIPE_ENVELOPE_PATTERN: Final = re.compile(
-    r"please create a pipeline that processes the following customer rows\. "
-    r"each row should be processed two ways in parallel and combined into a single merged output row at "
-    r"[^\s:]+\.jsonl: path a keeps the original row unchanged, path b truncates the "
-    r"[a-z_][a-z0-9_]* field to \d+ characters? with suffix '[^'\r\n]*'\. "
-    r"combine both branches under separate keys `[a-z_][a-z0-9_]*` and `[a-z_][a-z0-9_]*` "
-    r"in each merged output row -- one input row produces one output row containing both branches side-by-side\. "
-    r"customer rows \(csv\):",
-    re.IGNORECASE,
-)
 _ANY_MUTATION_ACTION_PATTERN: Final = re.compile(rf"\b{_MUTATION_ACTION_PATTERN}\b", re.IGNORECASE)
 
 _AugmentationBranch = Literal[
@@ -806,27 +789,6 @@ def _strip_quoted_text(message: str) -> tuple[str, bool, bool]:
     return "".join(output), closing_quote is None, quoted_material_seen
 
 
-def _matches_complete_registered_recipe_request(message: str) -> bool:
-    """Recognize one registered full-request production with shaped CSV data."""
-    delimiters = tuple(_REGISTERED_RECIPE_DELIMITER_PATTERN.finditer(message))
-    if len(delimiters) != 1:
-        return False
-    normalized_envelope = " ".join(message[: delimiters[0].end()].split())
-    if _REGISTERED_RECIPE_ENVELOPE_PATTERN.fullmatch(normalized_envelope) is None:
-        return False
-    match = match_freeform_recipe_intent(message)
-    if match is None or match.inline_blob is None:
-        return False
-    try:
-        rows = list(csv.reader(StringIO(match.inline_blob.content)))
-    except csv.Error:
-        return False
-    if len(rows) < 2 or len(rows[0]) < 2:
-        return False
-    column_count = len(rows[0])
-    return all(len(row) == column_count for row in rows[1:])
-
-
 def _matches_complete_multi_clause_pipeline_request(message: str) -> bool:
     """Recognize a positive pipeline root followed by a complete specification."""
     if "?" in message or _REQUEST_REVOCATION_PATTERN.search(message) is not None:
@@ -855,8 +817,7 @@ def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDec
 
     Classification contract: EXPLICIT_MUTATION requires the complete bounded
     request to match a closed positive production. Quoted material cannot be
-    elided to manufacture a match; only a complete registered recipe envelope
-    may contain its prescribed quotes. Multi-clause productions require a
+    elided to manufacture a match. Multi-clause productions require a
     pipeline-build or data-source root and reject request revocation.
     Unmatched governing prefixes, bare questions, unrelated objects, and
     oversized input fail closed to clarification on the conversational path.
@@ -873,8 +834,6 @@ def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDec
     multi_clause_request = _matches_complete_multi_clause_pipeline_request(unquoted)
     if _ANY_MUTATION_ACTION_PATTERN.search(unquoted) is None and not multi_clause_request:
         return PipelineMutationIntentDecision.CONVERSATIONAL
-    if _matches_complete_registered_recipe_request(message):
-        return PipelineMutationIntentDecision.EXPLICIT_MUTATION
     if quoted_material_seen:
         return PipelineMutationIntentDecision.AMBIGUOUS
     if multi_clause_request or any(pattern.fullmatch(unquoted) is not None for pattern in _COMPLETE_EXPLICIT_REQUEST_PATTERNS):
@@ -949,13 +908,9 @@ def is_referential_pipeline_mutation_intent(message: str) -> bool:
     mutation authority (that is ``trust_mode``; see the classifier's
     docstring). This second decision reuses that closed grammar, then
     identifies only deictic request shapes whose current text cannot specify
-    the requested topology by itself. Complete registered recipes are
-    self-contained even if their inline data happens to contain a matching
-    phrase.
+    the requested topology by itself.
     """
     if classify_pipeline_mutation_intent(message) is not PipelineMutationIntentDecision.EXPLICIT_MUTATION:
-        return False
-    if _matches_complete_registered_recipe_request(message):
         return False
     unquoted_text, quotes_balanced, _quoted_material_seen = _strip_quoted_text(message)
     if not quotes_balanced:

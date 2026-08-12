@@ -167,7 +167,7 @@ export interface PlannerAuditEvidence {
 export interface PlannerEfficiency {
   evidence_status: "complete" | "unavailable";
   passed: boolean;
-  route: "zero_call_server" | "generic" | "invalid" | "unknown";
+  route: "generic" | "invalid" | "unknown";
   provider_calls: number | null;
   useful_discovery_turns: number | null;
   no_gain_turns: number | null;
@@ -508,7 +508,10 @@ export function classifyPlannerEfficiency(
     violations.push("functional completion is required for efficiency acceptance");
   }
   if (calls.length === 0) {
-    if (attempts.length > 0) violations.push("zero-call route must not contain planner attempts");
+    // The tutorial must exercise the composer LLM planner: a zero-call walk
+    // means the audit view is empty or a deterministic path bypassed the
+    // model, and neither is acceptable evidence of planner efficiency.
+    violations.push("the tutorial must converge through the LLM planner; zero provider calls is not a valid route");
   } else {
     if (evidence.cohorts.length !== 1) {
       violations.push("generic route must use exactly one semantic planning cohort");
@@ -545,12 +548,7 @@ export function classifyPlannerEfficiency(
   return {
     evidence_status: "complete",
     passed: violations.length === 0,
-    route:
-      violations.length > 0
-        ? "invalid"
-        : calls.length === 0
-          ? "zero_call_server"
-          : "generic",
+    route: violations.length > 0 ? "invalid" : "generic",
     provider_calls: calls.length,
     useful_discovery_turns: usefulDiscoveryTurns,
     no_gain_turns: noGainTurns,

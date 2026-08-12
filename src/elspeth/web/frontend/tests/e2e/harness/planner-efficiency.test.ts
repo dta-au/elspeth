@@ -69,7 +69,7 @@ function plannerAttempt(
 }
 
 describe("parsePlannerAuditMessages", () => {
-  it("treats a session with only non-planner LLM audit as zero planner calls", () => {
+  it("fails a session with zero planner calls: the tutorial must exercise the LLM planner", () => {
     const evidence = parsePlannerAuditMessages([
       ordinaryMessage("user-1"),
       plannerCall(null),
@@ -78,10 +78,10 @@ describe("parsePlannerAuditMessages", () => {
 
     expect(evidence).toEqual({ calls: [], attempts: [], cohorts: [] });
     expect(classifyPlannerEfficiency(evidence, true)).toMatchObject({
-      passed: true,
-      route: "zero_call_server",
+      passed: false,
+      route: "invalid",
       provider_calls: 0,
-      violations: [],
+      violations: ["the tutorial must converge through the LLM planner; zero provider calls is not a valid route"],
     });
   });
 
@@ -347,11 +347,14 @@ describe("parsePlannerAuditMessages", () => {
 });
 
 describe("classifyPlannerEfficiency", () => {
-  it("requires functional completion for the zero-call route", () => {
+  it("reports both violations for an incomplete zero-call session", () => {
     expect(classifyPlannerEfficiency({ calls: [], attempts: [], cohorts: [] }, false)).toMatchObject({
       passed: false,
       route: "invalid",
-      violations: ["functional completion is required for efficiency acceptance"],
+      violations: [
+        "functional completion is required for efficiency acceptance",
+        "the tutorial must converge through the LLM planner; zero provider calls is not a valid route",
+      ],
     });
   });
 

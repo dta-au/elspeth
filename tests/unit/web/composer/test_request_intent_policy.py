@@ -14,16 +14,6 @@ from elspeth.web.composer.no_tool_policy import (
     is_referential_pipeline_mutation_intent,
 )
 
-_REGISTERED_RECIPE_PREAMBLE = (
-    "Please create a pipeline that processes the following customer rows. "
-    "Each row should be processed two ways in parallel and combined into "
-    "a single merged output row at outputs/merged.jsonl: path A keeps the "
-    "original row unchanged, path B truncates the description field to 30 "
-    "characters with suffix '...'. Combine both branches under separate "
-    "keys `path_a` and `path_b` in each merged output row -- one input row "
-    "produces one output row containing both branches side-by-side."
-)
-_REGISTERED_RECIPE_CSV = "Customer rows (CSV):\nname,description\nalice,this is a moderately long description\nbob,short note"
 _PARITY_FIXTURE_DIR = Path(__file__).resolve().parents[4] / "evals" / "composer-parity" / "fixtures"
 _COMPLETE_MULTI_CLAUSE_REQUESTS = (
     pytest.param(
@@ -43,11 +33,6 @@ _COMPLETE_MULTI_CLAUSE_REQUESTS = (
         for path in sorted(_PARITY_FIXTURE_DIR.glob("*.json"))
     ),
 )
-
-
-def _registered_recipe_request(*, envelope_insertion: str = "") -> str:
-    insertion = f" {envelope_insertion}" if envelope_insertion else ""
-    return f"{_REGISTERED_RECIPE_PREAMBLE}{insertion} {_REGISTERED_RECIPE_CSV}"
 
 
 @pytest.mark.parametrize(
@@ -534,25 +519,6 @@ def test_whole_request_polarity_and_direct_object_binding_fail_closed(message: s
     ],
 )
 def test_authorizing_action_must_be_terminal_with_approved_prefix(message: str) -> None:
-    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
-
-
-def test_complete_registered_recipe_request_is_explicit() -> None:
-    assert classify_pipeline_mutation_intent(_registered_recipe_request()) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
-
-
-@pytest.mark.parametrize(
-    "insertion",
-    [
-        "Actually, cancel that.",
-        "Do not build this pipeline.",
-        "I changed my mind.",
-        "Undo that request.",
-    ],
-)
-def test_registered_recipe_requires_exact_complete_instruction_envelope(insertion: str) -> None:
-    message = _registered_recipe_request(envelope_insertion=insertion)
-
     assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.AMBIGUOUS
 
 

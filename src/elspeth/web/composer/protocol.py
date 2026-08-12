@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
     from elspeth.web.composer.pipeline_planner import (
-        GuidedPlannerConflict,
         GuidedPlannerDecline,
         PipelinePlanResult,
         PlannerOriginatingMessage,
@@ -1299,7 +1298,7 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline | GuidedPlannerConflict:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run the shared planner once with split private/provider-safe facts."""
         ...
 

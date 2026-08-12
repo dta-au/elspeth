@@ -20,7 +20,6 @@ This conftest builds ONE production stack that all parity surfaces share:
   module global ``elspeth.web.composer.service._litellm_acompletion`` so the
   real planner response parser, custody, candidate validation, and audited
   ``set_pipeline`` commit are all exercised;
-* the registry-owned recipe fast-path bypass (``match_registered_recipe_intent`` → None)
   so freeform provably traverses ``plan_pipeline`` +
   ``build_planner_capability_manifest`` rather than a recipe-router graph
   (design false-green trap #2).
@@ -819,12 +818,6 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
         "_compute_availability",
         lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
     )
-    # Registry-owned recipe fast-path bypass (false-green trap #2): guarantee
-    # non-match so freeform provably traverses plan_pipeline plus
-    # build_planner_capability_manifest. Patch the symbol production calls;
-    # the compatibility wrapper is no longer service authority.
-    monkeypatch.setattr("elspeth.web.composer.service.match_registered_recipe_intent", lambda _context: None)
-
     # Production wires the composer service in WEB mode — operator_profile_registry
     # plus a user-id-keyed snapshot factory (app.py create_app), NOT
     # for_trained_operator. Match that so freeform PLANNING and guided-full

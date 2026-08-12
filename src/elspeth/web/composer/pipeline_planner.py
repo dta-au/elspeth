@@ -492,26 +492,6 @@ class GuidedPlannerDecline:
             raise TypeError("GuidedPlannerDecline.decline_text must be an exact str")
 
 
-@final
-@dataclass(frozen=True, slots=True)
-class GuidedPlannerConflict:
-    """Server-owned deterministic conflict carried as a completed nonproposal."""
-
-    missing_fields: tuple[str, ...]
-    error_code: Literal["reviewed_output_projection_conflict"] = field(
-        default="reviewed_output_projection_conflict",
-        init=False,
-    )
-
-    def __post_init__(self) -> None:
-        if type(self.missing_fields) is not tuple or not self.missing_fields:
-            raise TypeError("GuidedPlannerConflict.missing_fields must be a non-empty exact tuple")
-        if any(type(name) is not str or not name for name in self.missing_fields):
-            raise TypeError("GuidedPlannerConflict.missing_fields must contain non-empty exact strings")
-        if len(set(self.missing_fields)) != len(self.missing_fields):
-            raise ValueError("GuidedPlannerConflict.missing_fields must be unique")
-
-
 class _PipelineCandidateRejected(RuntimeError):
     def __init__(self, result: ToolResult) -> None:
         super().__init__("pipeline candidate was not acceptable")
@@ -4560,7 +4540,6 @@ async def _plan_pipeline_inner(
 
 __all__ = [
     "PLANNER_DISCOVERY_TOOL_NAMES",
-    "GuidedPlannerConflict",
     "GuidedPlannerDecline",
     "PipelineCustodyResult",
     "PipelinePlanResult",
