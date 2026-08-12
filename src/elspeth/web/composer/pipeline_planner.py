@@ -2853,7 +2853,8 @@ async def _plan_pipeline_inner(
         required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
     )
     information_manifest = discovery_policy.manifest
-    pending_information = set(information_manifest.unresolved) | set(_intent_selected_schema_keys(intent))
+    declared_pending_information = frozenset(information_manifest.unresolved) | frozenset(_intent_selected_schema_keys(intent))
+    pending_information = set(declared_pending_information)
     tools = planner_tool_definitions(discovery_policy)
     provider_request: dict[str, Any] = {
         "intent": intent,
@@ -4021,6 +4022,8 @@ async def _plan_pipeline_inner(
                     information_keys[call.call_id],
                     available=information_available,
                 )
+            else:
+                pending_information.difference_update(set(information_keys[call.call_id]) - declared_pending_information)
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         if next(discovery_results, None) is not None:
             raise AuditIntegrityError("planner discovery produced an unowned result")

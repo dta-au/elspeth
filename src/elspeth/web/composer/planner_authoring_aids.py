@@ -41,6 +41,7 @@ from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.plugin_policy_disclosure import ProhibitedPluginDisclosure, prohibited_plugin_section
 
 # The registered shield-review constants and the untrusted-producer set are the
 # contract's single source of truth (interpretation_state); importing them —
@@ -99,16 +100,10 @@ class _DiscoveryDigestBudget(TypedDict):
     omitted_public_text_count: int
 
 
-class _ProhibitedPluginDigestEntry(TypedDict):
-    name: str
-    reason: str
-    explanation: str
-
-
 class _ProhibitedPluginDigest(TypedDict):
-    sources: list[_ProhibitedPluginDigestEntry]
-    transforms: list[_ProhibitedPluginDigestEntry]
-    sinks: list[_ProhibitedPluginDigestEntry]
+    sources: list[ProhibitedPluginDisclosure]
+    transforms: list[ProhibitedPluginDisclosure]
+    sinks: list[ProhibitedPluginDisclosure]
 
 
 class _DiscoveryDigest(TypedDict):
@@ -968,10 +963,6 @@ _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
 _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
 _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
-_PROHIBITED_REASON: Final[str] = "plugin_not_allowed_on_web"
-_PROHIBITED_EXPLANATION: Final[str] = (
-    "the plugin is installed and authorized for this deployment's runtime but prohibited on the web authoring surface by security policy"
-)
 
 
 def _contract_json_schema_scalar(key: str, value: object) -> object:
@@ -1351,20 +1342,17 @@ def build_schema_contract_evidence(
             omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
             continue
         try:
-            json_schema = _contract_json_schema(schema.json_schema)
-            knob_schema = _contract_knob_schema(schema.knob_schema)
+            projected_contract = planner_plugin_contract(schema)
         except _SchemaContractProjectionUnsupported:
             omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
             continue
-        if isinstance(json_schema, bool):
-            omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
-            continue
-        contract = {"json_schema": json_schema, "knob_schema": knob_schema}
+        json_schema = deep_thaw(projected_contract.json_schema)
+        knob_schema = deep_thaw(projected_contract.knob_schema)
         entry: _SchemaContractEvidenceEntry = {
             "plugin_id": label,
             "policy_hash": snapshot.policy_hash,
             "snapshot_hash": snapshot.snapshot_hash,
-            "schema_hash": stable_hash(contract),
+            "schema_hash": projected_contract.schema_hash,
             "json_schema": json_schema,
             "knob_schema": knob_schema,
         }
@@ -1506,18 +1494,9 @@ def discovery_digest(
         "transforms": _digest_entries(summaries["transform"]),
         "sinks": _digest_entries(summaries["sink"]),
         "prohibited": {
-            "sources": [
-                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
-                for plugin in catalog.list_prohibited_sources()
-            ],
-            "transforms": [
-                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
-                for plugin in catalog.list_prohibited_transforms()
-            ],
-            "sinks": [
-                {"name": plugin.name, "reason": _PROHIBITED_REASON, "explanation": _PROHIBITED_EXPLANATION}
-                for plugin in catalog.list_prohibited_sinks()
-            ],
+            "sources": list(prohibited_plugin_section(catalog.list_prohibited_sources())),
+            "transforms": list(prohibited_plugin_section(catalog.list_prohibited_transforms())),
+            "sinks": list(prohibited_plugin_section(catalog.list_prohibited_sinks())),
         },
         "budget": {
             "max_canonical_bytes": _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES,
@@ -1594,7 +1573,7 @@ def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tupl
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "This digest is rendered from the live policy-visible catalog at prompt "
     "build and is current for this deployment. For plugin selection, plan directly from it; "
-    "it is the complete selection index, "
+    "it is the complete selection and hints only index, "
     "not a full option contract: required-option names are incomplete without "
     "types, optional knobs, defaults, enums, and conditional rules. Author "
     "options only from schema_contract_evidence for this request or a current "

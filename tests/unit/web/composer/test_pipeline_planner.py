@@ -7059,13 +7059,19 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     session bf109c43 — get_plugin_schema plugin_type='node' → ToolArgumentError
     → HTTP 500, no disposition)."""
     completion = _ScriptedCompletion(
-        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv", "unexpected": True})),
+        _response(("get_plugin_schema", {"plugin_type": "node", "name": "coalesce"})),
         _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
     recorder = BufferingRecorder()
 
-    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        intent="Use source:csv for this pipeline.",
+    )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert len(completion.requests) == 3
@@ -7079,6 +7085,9 @@ async def test_discovery_argument_error_is_recoverable_not_fatal(
     repaired_payload = json.loads(repaired_messages[-1]["content"])
     assert repaired_payload["success"] is True
     assert repaired_payload.get("error_code") != "DISCOVERY_NO_GAIN"
+    closure_notice = "All declared information gaps are closed; emit the terminal proposal now."
+    assert not any(message.get("content") == closure_notice for message in completion.requests[1]["messages"])
+    assert sum(message.get("content") == closure_notice for message in completion.requests[2]["messages"]) == 1
     # The invocation is still audited as an argument error.
     assert recorder.invocations[0].status.value == "arg_error"
 
