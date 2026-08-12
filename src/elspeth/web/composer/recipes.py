@@ -538,6 +538,7 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 
 
 _INLINE_SOURCE_BLOB_SENTINEL: Final[str] = str(UUID(int=0))
+_FORK_DEFAULT_TRUNCATION_SUFFIX: Final[str] = "..."
 _FORK_CSV_MARKER_RE = re.compile(
     r"(?:customer\s+rows\s*)?\(csv\):\s*\n(?P<csv>.*?)"
     r"(?=(?:customer\s+rows\s*)?\(csv\):\s*\n|\Z)",
@@ -556,11 +557,6 @@ _QUOTED_PROSE_RE = re.compile(r"(?<![A-Za-z0-9])(?P<quote>['\"])[^'\"]+(?P=quote
 _FORK_KEYS_RE = re.compile(
     r"(?:under\s+separate\s+keys|(?:use|select|choose)\s+(?:the\s+)?keys)\s+"
     r"`(?P<key_a>[A-Za-z_][A-Za-z0-9_]*)`\s+and\s+`(?P<key_b>[A-Za-z_][A-Za-z0-9_]*)`",
-    re.IGNORECASE,
-)
-_FORK_NEGATED_TRUNCATE_RE = re.compile(
-    r"\b(?:do(?:es)?\s+not|don't|doesn't|must\s+not|should\s+not|shouldn't|never|avoid(?:s|ed|ing)?|without)\b"
-    r"[^.;\n]*\btruncat(?:e|es|ed|ing)\b",
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_OUTPUT_RE = re.compile(
@@ -590,6 +586,7 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     if len(csv_matches) != len(tuple(_FORK_CSV_LABEL_RE.finditer(context.user_text))) or not csv_matches:
         return None
     authority_text = context.user_text[: csv_matches[0].start()]
+    authority = _authority_document(authority_text)
     lower = authority_text.lower()
     if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
         return None
@@ -600,7 +597,7 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(authority_text))
     if not truncate_matches:
         return None
-    if _FORK_NEGATED_TRUNCATE_RE.search(authority_text) is not None:
+    if authority.has_negated_action(frozenset({"process", "truncate"})):
         return None
     if any(_match_is_negated(context.user_text, match) for match in csv_matches):
         return None
@@ -624,6 +621,8 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(authority_text))
     if any(_match_is_negated(authority_text, match) for match in output_matches):
         return None
+    if any(authority.has_competing_value(match, _JSONL_PATH_TOKEN_RE) for match in output_matches):
+        return None
     output_paths = tuple(
         path_match.group("path")
         for output_match in output_matches
@@ -639,6 +638,8 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(authority_text))
     if any(_match_is_negated(authority_text, match) for match in suffix_matches):
         return None
+    if any(authority.has_competing_value(match, _QUOTED_VALUE_RE) for match in suffix_matches):
+        return None
     suffixes = tuple(
         quoted.group("value")
         for suffix_match in suffix_matches
@@ -651,6 +652,9 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
         return None
     if suffixes:
         slots["truncation_suffix"] = suffixes[0]
+    effective_suffix = suffixes[0] if suffixes else _FORK_DEFAULT_TRUNCATION_SUFFIX
+    if truncate_value[1] <= len(effective_suffix):
+        return None
     if _FORK_AMBIGUOUS_KEYS_RE.search(authority_text) is not None:
         return None
     keys_matches = tuple(_FORK_KEYS_RE.finditer(authority_text))
@@ -660,6 +664,8 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     if keys and any(candidate != keys[0] for candidate in keys[1:]):
         return None
     if keys:
+        if keys[0][0] == keys[0][1]:
+            return None
         slots["key_a"], slots["key_b"] = keys[0]
     return RecipeIntentCandidate(
         slots=slots,
@@ -690,7 +696,7 @@ _RECIPE3_SLOTS: Final[dict[str, SlotSpec]] = {
     "truncation_suffix": SlotSpec(
         slot_type="str",
         required=False,
-        default="...",
+        default=_FORK_DEFAULT_TRUNCATION_SUFFIX,
         description="Suffix appended when truncation occurs on path B (e.g., '...').",
     ),
     "output_path": SlotSpec(
@@ -891,9 +897,17 @@ _SCRAPING_REASON_LABEL_RE = re.compile(
     r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b",
     re.IGNORECASE,
 )
+_AUTHORITY_STRONG_NEGATION_PATTERN: Final[str] = (
+    r"(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|must\s+not|should\s+not|shouldn't|"
+    r"cannot|can't|avoid(?:s|ed|ing)?|without|refus(?:e|es|ed|ing)|declin(?:e|es|ed|ing)|"
+    r"reject(?:s|ed|ing)?|exclud(?:e|es|ed|ing))"
+)
 _AUTHORITY_NEGATION_RE = re.compile(
-    r"\b(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|no|not|must\s+not|should\s+not|shouldn't|"
-    r"cannot|can't|avoid(?:s|ed|ing)?|without)\b",
+    rf"\b(?:{_AUTHORITY_STRONG_NEGATION_PATTERN}|no|not)\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_COMPETING_BRIDGE_RE = re.compile(
+    rf"\b(?:{_ALTERNATIVE_COORDINATOR_PATTERN}|else|alternative|backup|fallback)\b",
     re.IGNORECASE,
 )
 _CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
@@ -986,6 +1000,7 @@ _RESPONSE_SUBORDINATE_BRIDGE_RE = re.compile(
     r"about|how|why|recommend(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
+_BARE_AUTHORITY_VALUE_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_]*`|\b[A-Za-z_][A-Za-z0-9_]*\b")
 _PIPELINE_CLEANUP_START_RE = re.compile(
     r"^(?:then\s+|finally\s+)?(?:remove|drop|discard|exclude)\b"
     r"(?=[^.;\n]*(?:\braw\s+(?:(?:page|scraped)\s+)?(?:content|html)\b|\bfingerprint\s+(?:columns?|fields?)\b))",
@@ -1096,6 +1111,7 @@ class _AuthorityDocument:
         *,
         excluded_span: tuple[int, int] | None = None,
         subordinate_bridge: re.Pattern[str] | None = None,
+        adjacent_bare_pattern: re.Pattern[str] | None = None,
     ) -> bool:
         """Return whether another slot-shaped value competes with a declaration."""
 
@@ -1113,17 +1129,30 @@ class _AuthorityDocument:
                 continue
             if not self.match_is_negated(candidate):
                 return True
-        if segment_index + 1 >= len(self.segments):
-            return False
-        following = self.segments[segment_index + 1]
-        if following.join not in {"additive", "alternative"}:
-            return False
-        return any(
-            (excluded_span is None or not (excluded_span[0] <= candidate.start() < excluded_span[1]))
-            and not _position_is_in_quoted_prose(self.user_text, candidate.start())
-            and not self.match_is_negated(candidate)
-            for candidate in value_pattern.finditer(self.user_text, following.start, following.end)
-        )
+        adjacent_clause_id = segment.clause_id + 1
+        for following in self.segments[segment_index + 1 :]:
+            if following.clause_id > adjacent_clause_id:
+                break
+            if following.clause_id < segment.clause_id:
+                continue
+            candidates = tuple((candidate, False) for candidate in value_pattern.finditer(self.user_text, following.start, following.end))
+            if adjacent_bare_pattern is not None and following.clause_id == adjacent_clause_id and not following.actions:
+                candidates += tuple(
+                    (candidate, True) for candidate in adjacent_bare_pattern.finditer(self.user_text, following.start, following.end)
+                )
+            if any(
+                candidate.start() >= declaration.end()
+                and (excluded_span is None or not (excluded_span[0] <= candidate.start() < excluded_span[1]))
+                and not _position_is_in_quoted_prose(self.user_text, candidate.start())
+                and (
+                    _AUTHORITY_COMPETING_BRIDGE_RE.search(self.user_text[declaration.end() : candidate.start()]) is not None
+                    or (not is_bare and following.join in {"additive", "alternative"})
+                )
+                and not self.match_is_negated(candidate)
+                for candidate, is_bare in candidates
+            ):
+                return True
+        return False
 
 
 def _canonical_authority_action(token: str) -> str:
@@ -1160,6 +1189,18 @@ def _position_is_protected(position: int, spans: tuple[tuple[int, int], ...]) ->
     return any(start <= position < end for start, end in spans)
 
 
+def _negation_governs_action(user_text: str, negation: re.Match[str], action: re.Match[str]) -> bool:
+    """Return whether a lexical negator governs its nearest following action."""
+
+    token = negation.group(0).casefold()
+    gap = user_text[negation.end() : action.start()].strip()
+    if token == "no":
+        return not gap
+    if token == "not":
+        return re.fullmatch(r"(?:to\s+)?", gap, re.IGNORECASE) is not None
+    return True
+
+
 def _authority_segment(
     user_text: str,
     *,
@@ -1185,13 +1226,11 @@ def _authority_segment(
         for match in _AUTHORITY_NEGATION_RE.finditer(user_text, start, end)
         if not _position_is_protected(match.start(), protected_spans)
     )
-    negated_action_starts = frozenset(
-        action.start()
-        for negation in negation_matches
-        for action in action_matches
-        if action.start() >= negation.end()
-        and not any(candidate.start() < action.start() for candidate in action_matches if candidate.start() >= negation.end())
-    )
+    negated_action_starts: set[int] = set()
+    for negation in negation_matches:
+        action = next((candidate for candidate in action_matches if candidate.start() >= negation.end()), None)
+        if action is not None and _negation_governs_action(user_text, negation, action):
+            negated_action_starts.add(action.start())
     actions = tuple(
         _AuthorityAction(
             name=_canonical_authority_action(action.group("action")),
@@ -1293,12 +1332,6 @@ def _match_clause_residue(user_text: str, match: re.Match[str]) -> str:
 
     _clause_start, clause_end = _clause_bounds(user_text, match.start())
     return user_text[match.end() : clause_end]
-
-
-def _match_tail(user_text: str, match: re.Match[str]) -> str:
-    """Return text immediately following ``match``, including later clauses."""
-
-    return user_text[match.end() :]
 
 
 def _residue_starts_with_alternative(residue: str) -> bool:
@@ -1711,6 +1744,7 @@ def _web_response_contract(user_text: str) -> tuple[str, str] | None:
             _RESPONSE_FIELD_RE,
             excluded_span=(semantic_end, len(user_text)),
             subordinate_bridge=_RESPONSE_SUBORDINATE_BRIDGE_RE,
+            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
         ):
             return None
         boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
@@ -1781,7 +1815,7 @@ def _web_abuse_contact(user_text: str) -> str | None:
         return None
     for match in matches:
         residue = _match_clause_residue(user_text, match)
-        if _residue_starts_with_alternative(_match_tail(user_text, match)) or re.search(_EMAIL_PATTERN, residue) is not None:
+        if _residue_starts_with_alternative(residue) or re.search(_EMAIL_PATTERN, residue) is not None:
             return None
     contacts = tuple(match.group("after") or match.group("before") for match in matches)
     contact = contacts[0]
@@ -1799,7 +1833,7 @@ def _web_scraping_reason(user_text: str) -> str | None:
     if not matches:
         return None
     for match in matches:
-        residue = _match_tail(user_text, match)
+        residue = _match_clause_residue(user_text, match)
         if _residue_starts_with_alternative(residue) or _residue_starts_with_quoted_value_addition(residue):
             return None
     reasons = tuple(match.group("reason").strip() for match in matches)
@@ -1809,11 +1843,23 @@ def _web_scraping_reason(user_text: str) -> str | None:
     return reason
 
 
+def _usable_profile_aliases_for(
+    snapshot: PluginAvailabilitySnapshot,
+    plugin_id: PluginId,
+) -> tuple[str, ...]:
+    """Return the aliases explicitly carried by one owned policy snapshot."""
+
+    for candidate_id, aliases in snapshot.usable_profile_aliases:
+        if candidate_id == plugin_id:
+            return aliases
+    return ()
+
+
 def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     snapshot = context.policy_snapshot
     if snapshot is None:
         return None
-    aliases = dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ())
+    aliases = _usable_profile_aliases_for(snapshot, PluginId("transform", "llm"))
     for alias in aliases:
         negated_alias = re.compile(
             rf"\b{_NEGATIVE_ACTION_PATTERN}\s+{_PROFILE_ACTION_PATTERN}\s+"
@@ -1906,7 +1952,12 @@ def _reviewed_web_authority_is_compatible(
             return False
         if source_authority.group("reviewed") is not None and source_format is None and source_name is None:
             return False
-        if authority.has_competing_value(source_authority, _SOURCE_SLOT_VALUE_RE, excluded_span=semantic_span):
+        if authority.has_competing_value(
+            source_authority,
+            _SOURCE_SLOT_VALUE_RE,
+            excluded_span=semantic_span,
+            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
+        ):
             return False
 
     output_authorities = tuple(
@@ -1929,7 +1980,12 @@ def _reviewed_web_authority_is_compatible(
             return False
         if output_authority.group("reviewed") is not None and output_format is None and output_name is None:
             return False
-        if authority.has_competing_value(output_authority, _OUTPUT_SLOT_VALUE_RE, excluded_span=semantic_span):
+        if authority.has_competing_value(
+            output_authority,
+            _OUTPUT_SLOT_VALUE_RE,
+            excluded_span=semantic_span,
+            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
+        ):
             return False
     output_path_authorities = tuple(
         authority
@@ -1976,8 +2032,8 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
         return None
     try:
         UUID(source_binding.blob_id)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise RecipeValidationError("server-owned source binding blob_id must be a valid UUID") from exc
     if not output_binding.path:
         return None
     if not _reviewed_web_authority_is_compatible(
@@ -2165,7 +2221,7 @@ def unavailable_recipe_plugin(
             return selected_source
     if "profile" in recipe.slots:
         llm_id = PluginId("transform", "llm")
-        usable_aliases = dict(snapshot.usable_profile_aliases).get(llm_id, ())
+        usable_aliases = _usable_profile_aliases_for(snapshot, llm_id)
         if not usable_aliases:
             return llm_id
         if raw_slots is not None and isinstance(raw_slots.get("profile"), str) and raw_slots["profile"] not in usable_aliases:
@@ -2204,31 +2260,28 @@ def match_registered_recipe_intent(context: RecipeIntentContext) -> RecipeIntent
         ]
         if missing_required:
             continue
-        try:
-            validation_slots = dict(candidate.slots)
-            if candidate.inline_blob is not None:
-                missing_blob_slots = [
-                    name
-                    for name, spec in recipe.slots.items()
-                    if spec.required and spec.slot_type == "blob_id" and name not in validation_slots
-                ]
-                if len(missing_blob_slots) != 1:
-                    continue
-                validation_slots[missing_blob_slots[0]] = _INLINE_SOURCE_BLOB_SENTINEL
-            coerced_slots = validate_slots(recipe, validation_slots)
-            recipe.build(coerced_slots)
-            if (
-                context.policy_snapshot is not None
-                and unavailable_recipe_plugin(
-                    recipe,
-                    context.policy_snapshot,
-                    raw_slots=candidate.slots,
-                )
-                is not None
-            ):
+        validation_slots = dict(candidate.slots)
+        if candidate.inline_blob is not None:
+            missing_blob_slots = [
+                name
+                for name, spec in recipe.slots.items()
+                if spec.required and spec.slot_type == "blob_id" and name not in validation_slots
+            ]
+            if len(missing_blob_slots) != 1:
                 continue
-        except RecipeValidationError:
+            validation_slots[missing_blob_slots[0]] = _INLINE_SOURCE_BLOB_SENTINEL
+        coerced_slots = validate_slots(recipe, validation_slots)
+        if (
+            context.policy_snapshot is not None
+            and unavailable_recipe_plugin(
+                recipe,
+                context.policy_snapshot,
+                raw_slots=candidate.slots,
+            )
+            is not None
+        ):
             continue
+        recipe.build(coerced_slots)
         complete.append(
             RecipeIntentMatch(
                 recipe_name=recipe.name,
@@ -2252,7 +2305,7 @@ def list_recipes(snapshot: PluginAvailabilitySnapshot) -> list[dict[str, Any]]:
                     "default": s.default,
                     "description": s.description,
                     **(
-                        {"choices": list(dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ()))}
+                        {"choices": list(_usable_profile_aliases_for(snapshot, PluginId("transform", "llm")))}
                         if slot_name == "profile"
                         else {}
                     ),
