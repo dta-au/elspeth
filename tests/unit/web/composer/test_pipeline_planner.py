@@ -32,6 +32,7 @@ from elspeth.contracts.composer_planner_audit import (
     ComposerPlannerAttemptLedTo,
     ComposerPlannerAttemptOutcome,
     ComposerPlannerAttemptPhase,
+    ComposerPlannerCode,
     ComposerPlannerInformationClass,
 )
 from elspeth.contracts.errors import AuditIntegrityError
@@ -5891,6 +5892,7 @@ async def test_settlement_failure_after_success_fails_the_request(
     tool_context: ToolContext,
 ) -> None:
     completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
 
     class SettlementFailure(RuntimeError):
         pass
@@ -5905,10 +5907,37 @@ async def test_settlement_failure_after_success_fails_the_request(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
+            recorder=recorder,
             lifecycle=replace(_lifecycle(), on_settled=fail_settlement),
         )
 
     assert caught.value is settlement_failure
+    assert caught.value.__dict__["llm_calls"] == recorder.llm_calls
+    assert caught.value.__dict__["planner_attempts"] == recorder.planner_attempts
+
+
+@pytest.mark.asyncio
+async def test_settlement_cancellation_after_success_carries_both_planner_evidence_channels(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+    recorder = BufferingRecorder()
+
+    async def cancel_settlement(_outcome: str) -> None:
+        raise asyncio.CancelledError("planner settlement cancelled")
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            lifecycle=replace(_lifecycle(), on_settled=cancel_settlement),
+        )
+
+    assert caught.value.__dict__["llm_calls"] == recorder.llm_calls
+    assert caught.value.__dict__["planner_attempts"] == recorder.planner_attempts
 
 
 @pytest.mark.asyncio
@@ -6431,6 +6460,122 @@ async def test_escape_hatch_non_terminal_reply_reraises_original_exhaustion(
 
     assert excinfo.value.code == "DISCOVERY_EXHAUSTED"
     assert not isinstance(excinfo.value, PlannerDeclined)
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_finalizer_rejection_records_candidate_classification_before_original_exhaustion(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    finalizer_calls = 0
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        nonlocal finalizer_calls
+        finalizer_calls += 1
+        if finalizer_calls == 2:
+            raise _binding_rejection()
+        return candidate
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            repair_budget=0,
+            candidate_finalizer=finalizer,
+            model_overrides={
+                "escape_hatch_model": "openrouter/advisor-under-test",
+                "escape_hatch_provider": "openrouter",
+            },
+        )
+
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    hatch_attempt = recorder.planner_attempts[-1]
+    assert hatch_attempt.phase is ComposerPlannerAttemptPhase.HATCH
+    assert hatch_attempt.outcome is ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED
+    assert hatch_attempt.rejection_codes == ("validation_error",)
+    assert hatch_attempt.planner_code is None
+    assert hatch_attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_internal_finalizer_failure_records_internal_error_before_original_exhaustion(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+    finalizer_calls = 0
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        nonlocal finalizer_calls
+        finalizer_calls += 1
+        if finalizer_calls == 2:
+            raise RuntimeError("internal finalizer failure")
+        return candidate
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            repair_budget=0,
+            candidate_finalizer=finalizer,
+            model_overrides={
+                "escape_hatch_model": "openrouter/advisor-under-test",
+                "escape_hatch_provider": "openrouter",
+            },
+        )
+
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    hatch_attempt = recorder.planner_attempts[-1]
+    assert hatch_attempt.phase is ComposerPlannerAttemptPhase.HATCH
+    assert hatch_attempt.outcome is ComposerPlannerAttemptOutcome.INTERNAL_ERROR
+    assert hatch_attempt.planner_code is None
+    assert hatch_attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_undeclared_tool_records_guard_classification_before_original_exhaustion(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("invented_hatch_tool", {})),
+    )
+    recorder = BufferingRecorder()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            recorder=recorder,
+            repair_budget=0,
+            model_overrides={
+                "escape_hatch_model": "openrouter/advisor-under-test",
+                "escape_hatch_provider": "openrouter",
+            },
+        )
+
+    assert caught.value.code == "REPAIR_EXHAUSTED"
+    hatch_attempt = recorder.planner_attempts[-1]
+    assert hatch_attempt.phase is ComposerPlannerAttemptPhase.HATCH
+    assert hatch_attempt.outcome is ComposerPlannerAttemptOutcome.GUARD_FIRED
+    assert hatch_attempt.planner_code is ComposerPlannerCode.DISCOVERY_ONLY
+    assert hatch_attempt.selected_tools == ("undeclared_tool",)
+    assert hatch_attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
 
 
 @pytest.mark.asyncio

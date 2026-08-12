@@ -405,13 +405,18 @@ def interleave_planner_audit_records(
         attempts_by_physical[attempt.planner_call_ordinal] = attempt
     records: list[ComposerLLMCall | ComposerPlannerAttempt] = []
     observed_physical: set[int] = set()
+    previous_physical_ordinal: int | None = None
+    expected_semantic_ordinal = 1
     for call in llm_calls:
         planner_call_ordinal = call.planner_call_ordinal
         if planner_call_ordinal is None:
             raise AuditIntegrityError("planner LLM call is missing its physical ordinal")
         if planner_call_ordinal in observed_physical:
             raise AuditIntegrityError("planner LLM physical ordinals must be unique")
+        if previous_physical_ordinal is not None and planner_call_ordinal <= previous_physical_ordinal:
+            raise AuditIntegrityError("planner LLM physical ordinals must be strictly increasing")
         observed_physical.add(planner_call_ordinal)
+        previous_physical_ordinal = planner_call_ordinal
         records.append(call)
         matching_attempt = attempts_by_physical.get(planner_call_ordinal)
         response_received = call.status in {
@@ -423,7 +428,10 @@ def interleave_planner_audit_records(
         if not response_received and matching_attempt is not None:
             raise AuditIntegrityError("provider transport failure cannot own a semantic planner attempt")
         if matching_attempt is not None:
+            if matching_attempt.ordinal != expected_semantic_ordinal:
+                raise AuditIntegrityError("planner response order must match semantic attempt order")
             records.append(matching_attempt)
+            expected_semantic_ordinal += 1
     if set(attempts_by_physical) - observed_physical:
         raise AuditIntegrityError("planner attempt references an absent physical call")
     return tuple(records)

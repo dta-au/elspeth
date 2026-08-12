@@ -53,6 +53,7 @@ from elspeth.web.composer.guided.state_machine import GuidedSession, GuidedStep,
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResult, ComposerService, PipelineCommitIntent
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
+from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -4620,6 +4621,172 @@ class TestMessageRoutes:
         ]
         assert messages[1]["tool_calls"][0]["call"]["provider_cost"] == 0.0037
         assert all("call-tool" not in str(message.get("tool_calls")) for message in messages)
+
+    def test_real_planner_audit_redacts_prompt_option_path_and_validator_canaries_from_storage_and_get(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        prompt_canary = "PROMPT_CANARY_9c0b3d"
+        option_canary = "OPTION_CANARY_314a7e"
+        path_canary = "PATH_CANARY_820f65"
+        validator_message_canary = "VALIDATOR_MESSAGE_CANARY_51d82a"
+        canaries = {
+            "prompt": prompt_canary,
+            "option": option_canary,
+            "path": path_canary,
+            "validator_message": validator_message_canary,
+        }
+
+        app, service = _make_app(tmp_path)
+        app.state.settings = app.state.settings.model_copy(
+            update={
+                "composer_model": "test/planner",
+                "composer_boot_probe_enabled": False,
+                "composer_planner_repair_budget": 0,
+            }
+        )
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(available=True, provider="test", model="test/planner", reason=None),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings,
+            sessions_service=service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=app.state.plugin_snapshot_factory,
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        client = TestClient(app, raise_server_exceptions=False)
+        session_response = client.post("/api/sessions", json={"title": "Planner redaction matrix"})
+        assert session_response.status_code == 201, session_response.json()
+        session_id = session_response.json()["id"]
+
+        rejected_pipeline = {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {
+                    "path": str(tmp_path / "blobs" / session_id / "input.csv"),
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            },
+            "nodes": [
+                {
+                    "id": "map_fields",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "rows",
+                    "on_success": validator_message_canary,
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "mapping": {"text": option_canary},
+                    },
+                }
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": "rows",
+                    "plugin": "json",
+                    "options": {
+                        "path": str(tmp_path / "outputs" / session_id / f"result-{path_canary}.jsonl"),
+                        "schema": {"mode": "observed"},
+                        "format": "jsonl",
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    "on_write_failure": "discard",
+                }
+            ],
+        }
+
+        responses = iter(
+            (
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content=None,
+                                tool_calls=[
+                                    SimpleNamespace(
+                                        id="redaction-candidate",
+                                        function=SimpleNamespace(
+                                            name="emit_pipeline_proposal",
+                                            arguments=json.dumps({"pipeline": rejected_pipeline}),
+                                        ),
+                                    )
+                                ],
+                            ),
+                            finish_reason="tool_calls",
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="provider/planner-v1",
+                    id="redaction-primary",
+                ),
+                SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            message=SimpleNamespace(
+                                content="I cannot safely complete that pipeline.",
+                                tool_calls=[],
+                            ),
+                            finish_reason="stop",
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="anthropic/claude-sonnet-4-6",
+                    id="redaction-advisor",
+                ),
+            )
+        )
+        provider_requests: list[dict[str, Any]] = []
+
+        async def completion(**kwargs: Any) -> Any:
+            provider_requests.append(kwargs)
+            return next(responses)
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+        sent = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": f"Build a pipeline that reads {prompt_canary}.csv and writes rows to results.jsonl."},
+        )
+
+        assert sent.status_code == 200, sent.json()
+        assert len(provider_requests) == 2
+        advisor_context = json.dumps(provider_requests[1]["messages"])
+        assert all(canary in advisor_context for canary in canaries.values())
+        validator_feedback = next(message["content"] for message in reversed(provider_requests[1]["messages"]) if message["role"] == "tool")
+        assert validator_message_canary in validator_feedback
+
+        persisted_messages = asyncio.run(service.get_messages(uuid.UUID(session_id), limit=None))
+        persisted_audit = [message for message in persisted_messages if message.role == "audit"]
+        included = client.get(f"/api/sessions/{session_id}/messages?include_llm_audit=true")
+        assert included.status_code == 200, included.json()
+        returned_audit = [message for message in included.json() if message["role"] == "audit"]
+        audit_surfaces = {
+            "persisted": json.dumps(
+                [{"content": message.content, "tool_calls": deep_thaw(message.tool_calls)} for message in persisted_audit],
+                sort_keys=True,
+            ),
+            "GET": json.dumps(returned_audit, sort_keys=True),
+        }
+        assert [message.tool_calls[0]["_kind"] for message in persisted_audit if message.tool_calls] == [
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+        ]
+        for surface_name, surface_payload in audit_surfaces.items():
+            for canary_name, canary in canaries.items():
+                assert canary not in surface_payload, f"{canary_name} canary leaked through {surface_name} planner audit"
 
     def test_get_messages_can_include_raw_content_for_intercepted_assistant_turns(self, tmp_path) -> None:
         """raw_content (model's actual prose) is exposed only when explicitly requested.

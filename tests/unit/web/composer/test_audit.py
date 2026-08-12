@@ -193,6 +193,43 @@ def test_planner_rows_reject_a_semantic_response_without_exactly_one_attempt() -
         interleave_planner_audit_records((response_call,), ())
 
 
+def test_planner_rows_require_strictly_increasing_physical_call_ordinals() -> None:
+    later_call = _make_planner_llm_call(3)
+    earlier_call = _make_planner_llm_call(2)
+
+    with pytest.raises(AuditIntegrityError, match="physical ordinals must be strictly increasing"):
+        interleave_planner_audit_records(
+            (later_call, earlier_call),
+            (_make_planner_attempt(1, 3), _make_planner_attempt(2, 2)),
+        )
+
+
+def test_planner_rows_require_response_order_to_match_attempt_order() -> None:
+    first_response = _make_planner_llm_call(2)
+    second_response = _make_planner_llm_call(5)
+
+    with pytest.raises(AuditIntegrityError, match="response order must match semantic attempt order"):
+        interleave_planner_audit_records(
+            (first_response, second_response),
+            (_make_planner_attempt(1, 5), _make_planner_attempt(2, 2)),
+        )
+
+
+def test_planner_rows_allow_gaps_between_strictly_increasing_physical_ordinals() -> None:
+    first_response = _make_planner_llm_call(2)
+    second_response = _make_planner_llm_call(5)
+
+    assert interleave_planner_audit_records(
+        (first_response, second_response),
+        (_make_planner_attempt(1, 2), _make_planner_attempt(2, 5)),
+    ) == (
+        first_response,
+        _make_planner_attempt(1, 2),
+        second_response,
+        _make_planner_attempt(2, 5),
+    )
+
+
 def test_resolve_session_is_no_op() -> None:
     """The web recorder's session_id is known up front; resolve is no-op."""
     rec = BufferingRecorder()

@@ -2672,6 +2672,19 @@ async def _settle_lifecycle(lifecycle: PlannerRequestLifecycle, outcome: Planner
         raise
 
 
+def _attach_planner_evidence(
+    exc: BaseException,
+    recorder: BufferingRecorder,
+    *,
+    llm_call_start: int,
+    planner_attempt_start: int,
+) -> None:
+    """Attach both halves of this planner operation's paired audit evidence."""
+    attach_llm_calls(exc, recorder, start_index=llm_call_start)
+    exc_with_evidence = cast(Any, exc)
+    exc_with_evidence.planner_attempts = recorder.planner_attempts[planner_attempt_start:]
+
+
 async def _build_valid_pipeline_plan(
     *,
     pipeline: Mapping[str, Any],
@@ -3085,9 +3098,12 @@ async def plan_pipeline(
     except BaseException as exc:
         primary_error = exc
         trail.finalize_active_exception(exc)
-        attach_llm_calls(exc, recorder, start_index=llm_call_start)
-        exc_with_attempts = cast(Any, exc)
-        exc_with_attempts.planner_attempts = recorder.planner_attempts[planner_attempt_start:]
+        _attach_planner_evidence(
+            exc,
+            recorder,
+            llm_call_start=llm_call_start,
+            planner_attempt_start=planner_attempt_start,
+        )
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
             trail.log_summary("cancelled")
@@ -3104,6 +3120,12 @@ async def plan_pipeline(
             await _settle_lifecycle(lifecycle, outcome)
         except BaseException as settlement_error:
             if primary_error is None:
+                _attach_planner_evidence(
+                    settlement_error,
+                    recorder,
+                    llm_call_start=llm_call_start,
+                    planner_attempt_start=planner_attempt_start,
+                )
                 raise
             primary_error.add_note(f"planner lifecycle settlement also failed ({type(settlement_error).__name__})")
 
@@ -3806,12 +3828,13 @@ async def _plan_pipeline_inner(
                     try:
                         finalizer_result = candidate_finalizer(pipeline)
                     except AuditIntegrityError as exc:
-                        if is_hatch_turn:
-                            assert hatch_error is not None
-                            raise hatch_error from None
                         if not str(exc).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX):
                             # Not a candidate-shape complaint: a genuine
                             # integrity breach stays terminal.
+                            if is_hatch_turn:
+                                trail.finalize_active_exception(exc)
+                                assert hatch_error is not None
+                                raise hatch_error from None
                             raise
                         # The reviewed-authority binder rejected the shape the
                         # planner authored — repairable in one budgeted turn,
@@ -3827,17 +3850,20 @@ async def _plan_pipeline_inner(
                             terminal_feedback = _binding_rejection_feedback(exc, repeated_fingerprint=repeated_binding_fingerprint)
                         else:
                             terminal_feedback = _canonical_schema_feedback()
-                    except Exception:
+                    except Exception as exc:
                         if is_hatch_turn:
+                            trail.finalize_active_exception(exc)
                             assert hatch_error is not None
                             raise hatch_error from None
                         raise
                     else:
                         if type(finalizer_result) is not dict:
+                            finalizer_error = AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
                             if is_hatch_turn:
+                                trail.finalize_active_exception(finalizer_error)
                                 assert hatch_error is not None
                                 raise hatch_error from None
-                            raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
+                            raise finalizer_error
                         finalized_pipeline = finalizer_result
                         # Entry-scoped custody attribution (elspeth-5904b1683a):
                         # derived by diff HERE, not self-reported by the
@@ -4208,8 +4234,9 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
-            except Exception:
+            except Exception as exc:
                 if is_hatch_turn:
+                    trail.finalize_active_exception(exc)
                     assert hatch_error is not None
                     raise hatch_error from None
                 raise
@@ -4220,6 +4247,13 @@ async def _plan_pipeline_inner(
             # The advisor did anything other than one clean terminal proposal
             # or an honest text decline: the hatch is spent, the original
             # exhaustion stands.
+            trail.finish_attempt(
+                "hatch",
+                "guard_fired",
+                planner_code="DISCOVERY_ONLY",
+                led_to="terminal",
+                tool_calls=len(calls),
+            )
             assert hatch_error is not None
             raise hatch_error
         if any(call.name not in _PLANNER_DISCOVERY_TOOL_NAME_SET for call in calls):

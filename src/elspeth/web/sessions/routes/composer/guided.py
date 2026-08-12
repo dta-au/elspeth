@@ -3559,6 +3559,7 @@ async def post_guided_respond(
                                 audit_evidence=GuidedAuditEvidence(
                                     invocations=(*llm_recorder.invocations, *settled_tool_invocations),
                                     llm_calls=llm_recorder.llm_calls,
+                                    planner_attempts=llm_recorder.planner_attempts,
                                     chat_turns=llm_recorder.chat_turns,
                                 ),
                             ),

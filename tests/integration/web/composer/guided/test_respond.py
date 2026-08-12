@@ -4118,6 +4118,146 @@ class TestStep2IntraStep:
         assert last_operation["failure_code"] is None
         assert last_operation["result_kind"] == "composition_state"
 
+    def test_actual_escape_hatch_decline_persists_paired_planner_evidence(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary decline settlement keeps both halves of planner evidence."""
+        session_id = _create_session(composer_test_client)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={
+                "operation_id": str(uuid4()),
+                "intent": "Build a pipeline that annotates each row before saving.",
+            },
+        )
+        assert started.status_code == 200, started.json()
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "actual-decline.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        app = composer_test_client.app
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(
+                update={
+                    "composer_model": "test/guided-planner",
+                    "composer_max_discovery_turns": 1,
+                }
+            ),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        responses = iter(
+            (
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sources",
+                                        function=_PlannerFunction(name="list_sources", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content=None,
+                                tool_calls=[
+                                    _PlannerToolCall(
+                                        id="discover-sinks",
+                                        function=_PlannerFunction(name="list_sinks", arguments="{}"),
+                                    )
+                                ],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                ),
+                _PlannerResponse(
+                    choices=[
+                        _PlannerChoice(
+                            message=_PlannerMessage(
+                                content="I cannot produce a safe proposal from the reviewed facts.",
+                                tool_calls=[],
+                            )
+                        )
+                    ],
+                    usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+                    model="anthropic/claude-sonnet-4-6",
+                    id="guided-advisor-decline",
+                ),
+            )
+        )
+
+        async def declining_completion(**_kwargs: Any) -> _PlannerResponse:
+            return next(responses)
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", declining_completion)
+
+        declined = _post_current_response(
+            composer_test_client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert declined.status_code == 200, declined.json()
+        assert _full_guided_session(declined.json())["chat_history"][-1]["content"] == (
+            "I cannot produce a safe proposal from the reviewed facts."
+        )
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds == [
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+            "llm_call_audit",
+            "planner_attempt_audit",
+        ]
+
     def test_reviewed_projection_conflict_completes_without_proposal_or_failure_and_replays(
         self,
         composer_test_client: TestClient,
