@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict
 
+from rfc8785 import CanonicalizationError
+
 from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -61,6 +63,13 @@ PLACEHOLDER_BLOB_ID: Final[str] = "<blob_id copied verbatim from a list_blobs or
 _RAW_HTML_CLEANUP_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
 
 
+class _OmittedPublicText(TypedDict):
+    """Disclosure that public selection prose moved to JIT discovery."""
+
+    sha256: str
+    details_via: str
+
+
 class _PluginDigestEntry(TypedDict):
     """Closed policy-visible plugin summary rendered into the planner prompt.
 
@@ -72,11 +81,19 @@ class _PluginDigestEntry(TypedDict):
     """
 
     name: str
-    purpose: str
+    purpose: NotRequired[str]
     required_options: list[str]
     not_for: NotRequired[str]
+    purpose_omitted: NotRequired[_OmittedPublicText]
+    not_for_omitted: NotRequired[_OmittedPublicText]
     capability_tags: NotRequired[list[str]]
     profile_aliases: NotRequired[list[str]]
+
+
+class _DiscoveryDigestBudget(TypedDict):
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    omitted_public_text_count: int
 
 
 class _DiscoveryDigest(TypedDict):
@@ -85,6 +102,7 @@ class _DiscoveryDigest(TypedDict):
     sources: list[_PluginDigestEntry]
     transforms: list[_PluginDigestEntry]
     sinks: list[_PluginDigestEntry]
+    budget: _DiscoveryDigestBudget
 
 
 class _SchemaContractEvidenceEntry(TypedDict):
@@ -910,6 +928,8 @@ SchemaContractProjectionUnsupported = _SchemaContractProjectionUnsupported
 _PLANNER_CONTRACT_MAX_DEPTH: Final[int] = 32
 _PLANNER_CONTRACT_MAX_NODES: Final[int] = 4096
 _PLANNER_CONTRACT_MAX_CANONICAL_BYTES: Final[int] = 48 * 1024
+_DISCOVERY_DIGEST_MAX_CANONICAL_BYTES: Final[int] = 24 * 1024
+_DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES: Final[int] = 1024
 
 
 def _assert_projection_input_bounds(value: object) -> None:
@@ -963,7 +983,11 @@ def planner_plugin_contract(schema: PluginSchemaInfo) -> PlannerPluginContract:
         "knob_schema": knob_schema,
         "composer_hints": list(schema.composer_hints),
     }
-    if len(canonical_json(projected).encode("utf-8")) > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
+    try:
+        projected_size = len(canonical_json(projected).encode("utf-8"))
+    except CanonicalizationError as exc:
+        raise _SchemaContractProjectionUnsupported from exc
+    if projected_size > _PLANNER_CONTRACT_MAX_CANONICAL_BYTES:
         raise _SchemaContractProjectionUnsupported
     contract_shape = {"json_schema": json_schema, "knob_schema": knob_schema}
     return PlannerPluginContract(
@@ -1332,6 +1356,31 @@ def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     return entries
 
 
+def _digest_size(digest: _DiscoveryDigest) -> int:
+    """Settle the self-describing canonical byte count."""
+    while True:
+        rendered_size = len(canonical_json(digest).encode("utf-8"))
+        if digest["budget"]["canonical_bytes_used"] == rendered_size:
+            return rendered_size
+        digest["budget"]["canonical_bytes_used"] = rendered_size
+
+
+def _omit_digest_text(entry: _PluginDigestEntry, field: str, *, details_via: str) -> bool:
+    """Replace one whole prose fact with a deterministic JIT disclosure."""
+    if field == "purpose":
+        value = entry.pop("purpose", None)
+    else:
+        value = entry.pop("not_for", None)
+    if value is None:
+        return False
+    omission: _OmittedPublicText = {"sha256": stable_hash(value), "details_via": details_via}
+    if field == "purpose":
+        entry["purpose_omitted"] = omission
+    else:
+        entry["not_for_omitted"] = omission
+    return True
+
+
 def discovery_digest(
     catalog: PolicyCatalogView,
     *,
@@ -1357,6 +1406,11 @@ def discovery_digest(
         "sources": _digest_entries(summaries["source"]),
         "transforms": _digest_entries(summaries["transform"]),
         "sinks": _digest_entries(summaries["sink"]),
+        "budget": {
+            "max_canonical_bytes": _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES,
+            "canonical_bytes_used": 0,
+            "omitted_public_text_count": 0,
+        },
     }
 
     # Every operator-profiled component carries its live alias enum and public
@@ -1377,6 +1431,31 @@ def discovery_digest(
                 entry["profile_aliases"] = sorted(aliases)
                 entry["required_options"] = public_required
                 break
+    ordered_sections = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    for entries, details_via in ordered_sections:
+        for entry in entries:
+            for field in ("purpose", "not_for"):
+                value = entry.get(field)
+                if (
+                    type(value) is str
+                    and len(value.encode("utf-8")) > _DISCOVERY_DIGEST_MAX_PUBLIC_TEXT_BYTES
+                    and _omit_digest_text(entry, field, details_via=details_via)
+                ):
+                    digest["budget"]["omitted_public_text_count"] += 1
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        for entries, details_via in ordered_sections:
+            for entry in entries:
+                for field in ("purpose", "not_for"):
+                    if _omit_digest_text(entry, field, details_via=details_via):
+                        digest["budget"]["omitted_public_text_count"] += 1
+                        if _digest_size(digest) <= _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+                            return digest
+    if _digest_size(digest) > _DISCOVERY_DIGEST_MAX_CANONICAL_BYTES:
+        raise RuntimeError("discovery_digest_budget_invariant")
     return digest
 
 
@@ -1392,6 +1471,9 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "prohibition and is binding on selection: when the value you intend to "
     "write matches it, choose a different plugin or reshape the value upstream "
     "first. capability_tags is the plugin's declared capability vocabulary. "
+    "The budget block reports canonical_bytes_used and omitted_public_text_count. "
+    "When public purpose or prohibition prose is omitted, its whole sha256 and details_via marker "
+    "replace it; follow details_via before selecting that plugin because omitted prohibition text is still binding. "
     "Entries carry no worked example; the worked shapes validated for this "
     "deployment are the other authoring_aids sections. "
     "You rarely need list_sources/list_transforms/"

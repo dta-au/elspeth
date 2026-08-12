@@ -1155,6 +1155,60 @@ class TestDiscoveryDigest:
 
         assert len(rendered) <= 24 * 1024
 
+    def test_digest_bounds_synthetic_public_prose_without_losing_plugin_identities(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        view, _snapshot = _trained_view()
+        summaries: dict[str, list[PluginSummary]] = {"source": [], "transform": [], "sink": []}
+        for kind in summaries:
+            summaries[kind] = [
+                PluginSummary(
+                    name=f"synthetic_{kind}_{index:02d}",
+                    description=f"purpose-{index}-" + ("p" * 12_000),
+                    plugin_type=kind,
+                    config_fields=[],
+                    usage_when_not_to_use=f"prohibition-{index}-" + ("n" * 12_000),
+                    capability_tags=("synthetic",),
+                )
+                for index in range(12)
+            ]
+
+        digest = discovery_digest(view, summaries=summaries)
+
+        assert len(canonical_json(digest).encode("utf-8")) <= 24 * 1024
+        assert digest["budget"]["max_canonical_bytes"] == 24 * 1024
+        assert digest["budget"]["canonical_bytes_used"] <= digest["budget"]["max_canonical_bytes"]
+        assert digest["budget"]["omitted_public_text_count"] > 0
+        for kind, entries in (("source", digest["sources"]), ("transform", digest["transforms"]), ("sink", digest["sinks"])):
+            assert [entry["name"] for entry in entries] == [plugin.name for plugin in summaries[kind]]
+            for entry in entries:
+                assert entry["required_options"] == []
+                assert "purpose" not in entry
+                assert entry["purpose_omitted"]["sha256"]
+                assert entry["purpose_omitted"]["details_via"] == f"list_{kind}s"
+                assert "not_for" not in entry
+                assert entry["not_for_omitted"]["sha256"]
+                assert entry["not_for_omitted"]["details_via"] == f"list_{kind}s"
+
+    def test_digest_fails_closed_when_identity_facts_alone_exceed_budget(self) -> None:
+        view, _snapshot = _trained_view()
+        summaries = {
+            "source": [
+                PluginSummary(
+                    name=f"identity_{index:04d}_" + ("x" * 96),
+                    description="",
+                    plugin_type="source",
+                    config_fields=[],
+                )
+                for index in range(400)
+            ],
+            "transform": [],
+            "sink": [],
+        }
+
+        with pytest.raises(RuntimeError, match="discovery_digest_budget_invariant"):
+            discovery_digest(view, summaries=summaries)
+
     def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
         from elspeth.core.canonical import canonical_json
 
@@ -1259,6 +1313,8 @@ class TestDiscoveryDigest:
         assert "rarely need" in guidance
         assert "get_plugin_schema" in guidance
         assert "current" in guidance
+        assert "omitted_public_text_count" in guidance
+        assert "details_via" in guidance
         # The digest short-circuits catalog re-discovery only: model ids still
         # come solely from list_models, and structured-repair tooling
         # (get_plugin_assistance) keeps its role.

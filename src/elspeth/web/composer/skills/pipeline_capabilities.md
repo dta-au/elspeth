@@ -24,6 +24,10 @@ authoring:
    build and is current for this deployment, and it is the complete selection
    index for that policy snapshot — plan directly from it.
    A worked example's omission of a plugin is not a reason to list the catalog.
+   Check the digest budget's `omitted_public_text_count`. When it is nonzero,
+   a `sha256` plus `details_via` replaces whole public purpose or prohibition
+   prose; follow `details_via` for a plugin before selecting it. Omitted
+   prohibition text remains binding and is never represented by a partial rule.
 3. Call `get_plugin_schema` for chosen plugins whose detailed option or output
    contract is not already supplied. The bounded result carries the chosen
    plugin's public composer hints; use those details only after selection.

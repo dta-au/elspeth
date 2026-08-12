@@ -159,6 +159,13 @@ class PlannerInformationManifest:
         is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
         return is_state_projection and (_PIPELINE_CURRENT_INFORMATION in self.supplied or "pipeline.full" in self.supplied)
 
+    def supplies(self, key: str) -> bool:
+        """Return whether usable information, rather than an omission, closes key."""
+        if key in self.supplied:
+            return True
+        is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
+        return is_state_projection and (_PIPELINE_CURRENT_INFORMATION in self.supplied or "pipeline.full" in self.supplied)
+
     def with_result(self, keys: tuple[str, ...], *, available: bool) -> PlannerInformationManifest:
         target = self.supplied if available else self.unavailable
         updated = target | frozenset(keys)
@@ -269,6 +276,13 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
 def planner_discovery_information_keys(call: _ParsedToolCall) -> tuple[str, ...]:
     """Map one admitted discovery call to its closed information identities."""
     return _tool_information_keys(call.name, call.arguments)
+
+
+def _intent_selected_schema_keys(intent: str) -> frozenset[str]:
+    """Extract only explicit kind-qualified plugin selections from a request."""
+    return frozenset(
+        f"plugin.schema:{kind}/{name}" for kind, name in re.findall(r"\b(source|transform|sink):([a-z0-9][a-z0-9_.-]*)\b", intent.lower())
+    )
 
 
 class _Completion(Protocol):
@@ -2801,7 +2815,8 @@ async def _plan_pipeline_inner(
     stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
-    no_gain_calls_in_round = 0
+    no_gain_events_in_round = 0
+    pending_information = set(_intent_selected_schema_keys(intent))
     # (component, code) fingerprints of every candidate rejection so far in
     # this request. A repeat means the intervening repair changed nothing that
     # mattered — the feedback then says so explicitly (repeat_notice) instead
@@ -3726,7 +3741,7 @@ async def _plan_pipeline_inner(
             # schema is not forgotten just because a candidate was rejected.
             seen_discovery.clear()
             seen_discovery_round = repair_count
-            no_gain_calls_in_round = 0
+            no_gain_events_in_round = 0
         information_keys = {call.call_id: planner_discovery_information_keys(call) for call in calls}
         no_gain_calls = tuple(
             call
@@ -3734,7 +3749,10 @@ async def _plan_pipeline_inner(
             if information_keys[call.call_id] and all(information_manifest.covers(key) for key in information_keys[call.call_id])
         )
         useful_calls = tuple(call for call in calls if call not in no_gain_calls)
-        no_gain_calls_in_round += len(no_gain_calls)
+        no_gain_events_in_round += int(bool(no_gain_calls))
+        escalate_no_gain = bool(no_gain_calls) and no_gain_events_in_round >= 2
+        for call in useful_calls:
+            pending_information.update(information_keys[call.call_id])
         keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls)
         if any(key in seen_discovery for key in keys) or len(set(keys)) != len(keys):
             # A cycling planner is stuck by definition — hand the puzzle to
@@ -3746,8 +3764,19 @@ async def _plan_pipeline_inner(
             trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="terminal", tool_calls=len(calls))
             raise PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE")
         seen_discovery.update(keys)
-        if no_gain_calls_in_round >= 2:
-            messages.append(_assistant_tool_calls_message(message, calls))
+        await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
+        messages.append(_assistant_tool_calls_message(message, calls))
+        for call in useful_calls:
+            await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
+
+        if not useful_calls:
+            trail.log_attempt(
+                "discovery",
+                "guard_fired",
+                planner_code="DISCOVERY_NO_GAIN",
+                led_to="hatch" if escalate_no_gain and _hatch_available() else "terminal" if escalate_no_gain else "continue",
+                tool_calls=len(calls),
+            )
             for call in no_gain_calls:
                 messages.append(
                     {
@@ -3763,40 +3792,11 @@ async def _plan_pipeline_inner(
                         ),
                     }
                 )
-            if _hatch_available():
-                trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_NO_GAIN", led_to="hatch")
-                _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
-                continue
-            trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_NO_GAIN", led_to="terminal")
-            raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
-        trail.log_attempt(
-            "discovery",
-            "discovery_executed" if useful_calls else "guard_fired",
-            planner_code=None if useful_calls else "DISCOVERY_NO_GAIN",
-            led_to="continue",
-            tool_calls=len(calls),
-        )
-        await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
-        messages.append(_assistant_tool_calls_message(message, calls))
-        for call in useful_calls:
-            await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
-
-        if not useful_calls:
-            call = no_gain_calls[0]
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.call_id,
-                    "content": canonical_json(
-                        {
-                            "success": False,
-                            "error_code": "DISCOVERY_NO_GAIN",
-                            "information_keys": list(information_keys[call.call_id]),
-                            "message": "The requested information is already supplied or unavailable.",
-                        }
-                    ),
-                }
-            )
+            if escalate_no_gain:
+                if _hatch_available():
+                    _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
+                    continue
+                raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
             continue
 
         async def execute_one_discovery(call: _ParsedToolCall) -> tuple[_ParsedToolCall, ToolResult]:
@@ -3935,10 +3935,23 @@ async def _plan_pipeline_inner(
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
         discovery_policy = discovery_policy.with_manifest(information_manifest)
         tools = planner_tool_definitions(discovery_policy)
+        trail.log_attempt(
+            "discovery",
+            "discovery_executed",
+            planner_code="DISCOVERY_NO_GAIN" if escalate_no_gain else None,
+            led_to="hatch" if escalate_no_gain and _hatch_available() else "terminal" if escalate_no_gain else "continue",
+            tool_calls=len(calls),
+        )
+        if escalate_no_gain:
+            if _hatch_available():
+                _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
+                continue
+            raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
         remaining_discovery = model_config.max_discovery_turns - discovery_turns
         if remaining_discovery == 2:
             messages.append({"role": "user", "content": _discovery_pressure_notice(remaining_discovery)})
-        messages.append({"role": "user", "content": _ALL_INFORMATION_GAPS_CLOSED_NOTICE})
+        if pending_information and all(information_manifest.supplies(key) for key in pending_information):
+            messages.append({"role": "user", "content": _ALL_INFORMATION_GAPS_CLOSED_NOTICE})
 
 
 __all__ = [

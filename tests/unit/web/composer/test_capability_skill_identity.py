@@ -89,6 +89,13 @@ def test_planner_request_instruction_carries_the_terminal_contract() -> None:
     assert "set_pipeline" in PLANNER_TERMINAL_INSTRUCTION
 
 
+def test_capability_core_explains_digest_budget_omissions() -> None:
+    core = load_pipeline_capability_core()
+
+    assert "omitted_public_text_count" in core
+    assert "details_via" in core
+
+
 def test_guided_chat_prompts_are_interaction_only_and_advertise_no_planner_terminal() -> None:
     core = load_pipeline_capability_core()
 

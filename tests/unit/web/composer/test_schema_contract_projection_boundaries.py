@@ -104,3 +104,16 @@ def test_planner_plugin_contract_rejects_recursive_projection_overflow() -> None
 
     with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
         planner_authoring_aids.planner_plugin_contract(admitted)
+
+
+def test_planner_plugin_contract_rejects_noncanonical_admitted_scalar() -> None:
+    admitted = PluginSchemaInfo(
+        name="noncanonical_transform",
+        plugin_type="transform",
+        description="A schema whose admitted default is outside the JSON domain.",
+        json_schema={"type": "object", "default": object()},
+        knob_schema={"fields": []},
+    )
+
+    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+        planner_authoring_aids.planner_plugin_contract(admitted)

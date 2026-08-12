@@ -33,6 +33,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
@@ -1730,6 +1731,171 @@ async def test_generic_linear_plan_reuses_initial_information_and_needs_one_disc
         contract = json.loads(message["content"])["data"]
         assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints"}
     assert final_messages[-1]["content"] == "All declared information gaps are closed; emit the terminal proposal now."
+
+
+@pytest.mark.asyncio
+async def test_failed_selected_schema_does_not_emit_false_gap_closure(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    original = planner_module.execute_discovery_tool_with_context
+
+    def unsupported_schema(name: str, arguments: dict[str, Any], *args: Any, **kwargs: Any) -> ToolResult:
+        result = original(name, arguments, *args, **kwargs)
+        if name != "get_plugin_schema":
+            return result
+        return replace(
+            result,
+            data=PluginSchemaInfo(
+                name="csv",
+                plugin_type="source",
+                description="Noncanonical selected schema.",
+                json_schema={"type": "object", "default": object()},
+                knob_schema={"fields": []},
+            ),
+        )
+
+    monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", unsupported_schema)
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    messages = completion.requests[1]["messages"]
+    schema_result = next(json.loads(message["content"]) for message in messages if message["role"] == "tool")
+    assert schema_result["data"]["error_code"] == "schema_projection_unavailable"
+    assert not any(
+        message.get("content") == "All declared information gaps are closed; emit the terminal proposal now." for message in messages
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_multi_turn_selected_schema_set_closes_only_after_last_schema(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"})),
+        _response(("get_plugin_schema", {"plugin_type": "transform", "name": "field_mapper"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        information_aware=True,
+        intent="Use transform:web_scrape and transform:field_mapper in the requested pipeline.",
+    )
+
+    notice = "All declared information gaps are closed; emit the terminal proposal now."
+    assert not any(message.get("content") == notice for message in completion.requests[1]["messages"])
+    assert completion.requests[2]["messages"][-1]["content"] == notice
+
+
+@pytest.mark.asyncio
+async def test_two_no_gain_calls_in_one_turn_are_one_feedback_event(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {}), ("list_sinks", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        information_aware=True,
+    )
+
+    tool_results = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert [result["error_code"] for result in tool_results] == ["DISCOVERY_NO_GAIN", "DISCOVERY_NO_GAIN"]
+    assert recorder.invocations == ()
+
+
+@pytest.mark.asyncio
+async def test_second_no_gain_event_mixed_batch_completes_protocol_before_hatch(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(
+            ("get_plugin_schema", {"plugin_type": "source", "name": "csv"}),
+            ("get_plugin_schema", {"plugin_type": "sink", "name": "json"}),
+        ),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        information_aware=True,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
+    )
+
+    hatch_messages = completion.requests[3]["messages"]
+    mixed_assistant_index = max(
+        index for index, message in enumerate(hatch_messages) if message["role"] == "assistant" and len(message.get("tool_calls", ())) == 2
+    )
+    mixed_replies = hatch_messages[mixed_assistant_index + 1 : mixed_assistant_index + 3]
+    assert [message["role"] for message in mixed_replies] == ["tool", "tool"]
+    assert [message["tool_call_id"] for message in mixed_replies] == ["call-1", "call-2"]
+    assert json.loads(mixed_replies[0]["content"])["error_code"] == "DISCOVERY_NO_GAIN"
+    assert json.loads(mixed_replies[1]["content"])["success"] is True
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["get_plugin_schema", "get_plugin_schema"]
+
+
+def test_noncanonical_schema_serializer_fails_closed() -> None:
+    current_state = _empty_state()
+    result = ToolResult(
+        success=True,
+        updated_state=current_state,
+        validation=current_state.validate(),
+        affected_nodes=(),
+        data=PluginSchemaInfo(
+            name="noncanonical_transform",
+            plugin_type="transform",
+            description="A noncanonical projection fixture.",
+            json_schema={"type": "object", "default": object()},
+            knob_schema={"fields": []},
+        ),
+    )
+    call = _ParsedToolCall(
+        call_id="call-noncanonical",
+        name="get_plugin_schema",
+        raw_arguments='{"plugin_type":"transform","name":"noncanonical_transform"}',
+        arguments={"plugin_type": "transform", "name": "noncanonical_transform"},
+    )
+
+    payload = json.loads(
+        _serialize_provider_discovery_result(
+            call=call,
+            result=result,
+            surface=PlannerSurface.FREEFORM,
+            provider_current_state=current_state.to_dict(),
+        )
+    )
+
+    assert payload["success"] is False
+    assert payload["data"]["error_code"] == "schema_projection_unavailable"
+    assert payload["data"]["next_tool"] == "get_plugin_assistance"
 
 
 @pytest.mark.asyncio
