@@ -63,11 +63,25 @@ AZURE_RESOURCES = (
     "ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT",
     "ELSPETH_TEST_AZURE_DOCUMENT_INTELLIGENCE_MODEL",
     "ELSPETH_TEST_AZURE_DOCUMENT_URL",
+    # Credential variable NAMES only (never values): the safety/document
+    # transforms read these through their production-declared
+    # discovery_secret_requirements, and the service-principal blob variant
+    # reads azure-identity's EnvironmentCredential trio.
+    "AZURE_CONTENT_SAFETY_KEY",
+    "AZURE_DOCUMENT_INTELLIGENCE_KEY",
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
 )
 DATAVERSE_RESOURCES = (
     "ELSPETH_TEST_DATAVERSE_URL",
     "ELSPETH_TEST_DATAVERSE_ENTITY",
     "ELSPETH_TEST_DATAVERSE_ROW_PREFIX",
+    # azure-identity EnvironmentCredential trio for the service_principal
+    # variant (names owned by the SDK contract, values never recorded).
+    "AZURE_TENANT_ID",
+    "AZURE_CLIENT_ID",
+    "AZURE_CLIENT_SECRET",
 )
 CHROMA_RESOURCES = (
     "ELSPETH_TEST_CHROMA_HOST",
@@ -86,6 +100,13 @@ PROVIDER_RESOURCES = (
     "ELSPETH_TEST_LLM_GATEWAY_MODEL",
     "ELSPETH_TEST_AZURE_SEARCH_ENDPOINT",
     "ELSPETH_TEST_AZURE_SEARCH_INDEX",
+    # Credential variable NAMES only (never values): the repository's
+    # established production credential names for the four credentialed
+    # provider variants (azure / openrouter / gateway LLM, azure-search).
+    "AZURE_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GATEWAY_BEARER",
+    "AZURE_SEARCH_API_KEY",
     *CHROMA_RESOURCES,
 )
 
