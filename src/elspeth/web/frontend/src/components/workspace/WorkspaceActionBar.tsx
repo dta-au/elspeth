@@ -42,7 +42,7 @@ function StatusButton({
   return (
     <button
       type="button"
-      className="workspace-status-control"
+      className="btn-compact workspace-status-control"
       data-tone={status.tone}
       aria-label={status.accessibleLabel}
       onClick={onClick}
@@ -199,6 +199,7 @@ export function WorkspaceActionBar({
           <button
             ref={moreButtonRef}
             type="button"
+            className="btn-compact"
             aria-label="More actions"
             aria-controls="workspace-more-actions-panel"
             aria-expanded={menuOpen}

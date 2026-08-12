@@ -280,6 +280,7 @@ export function ComposerWorkspace({
           <button
             ref={composeTabRef}
             type="button"
+            className="artifact-tab"
             role={narrow ? "tab" : undefined}
             id={narrow ? "workspace-compose-tab" : undefined}
             aria-controls={narrow ? "workspace-authoring-panel" : undefined}
@@ -293,6 +294,7 @@ export function ComposerWorkspace({
           <button
             ref={pipelineTabRef}
             type="button"
+            className="artifact-tab"
             role={narrow ? "tab" : undefined}
             id={narrow ? "workspace-pipeline-tab" : undefined}
             aria-controls={narrow ? "workspace-artifact-panel" : undefined}
@@ -333,7 +335,7 @@ export function ComposerWorkspace({
             <button
               ref={collapseControlRef}
               type="button"
-              className="workspace-collapse-control"
+              className="btn-compact workspace-collapse-control"
               aria-label="Collapse authoring pane"
               onClick={collapseAuthoring}
             >
@@ -351,6 +353,7 @@ export function ComposerWorkspace({
               <button
                 ref={restoreControlRef}
                 type="button"
+                className="btn-compact"
                 aria-label="Restore authoring pane"
                 aria-describedby="workspace-collapsed-status"
                 onClick={restoreAuthoring}

@@ -221,6 +221,50 @@
   cursor: not-allowed;
 }
 
+/* Tab chrome for role="tab" controls in bordered toolbar rows (artifact
+   toolbar, inspector tabs, narrow workspace view tabs). Segmented-control
+   idiom rather than .tab-strip's underline: these rows carry padding and
+   sibling commands, so a flush underline has no container edge to sit on.
+   Selected state reads as "current view", not "pressed" — which is why this
+   is not a .btn composition. Hover guards live in :where() for the same
+   cascade reason as .btn:hover above (buttonCascade.test.ts). */
+.artifact-tab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-xs);
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background-color: transparent;
+  color: var(--color-text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  min-height: var(--size-control-compact);
+  cursor: pointer;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
+  white-space: nowrap;
+}
+
+.artifact-tab:hover:where(:not(:disabled)):where(:not([aria-selected="true"])) {
+  background-color: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
+.artifact-tab[aria-selected="true"] {
+  background-color: var(--color-surface-elevated);
+  border-color: var(--color-border);
+  color: var(--color-text);
+}
+
+.artifact-tab:disabled {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
 .btn-primary {
   background-color: var(--color-btn-primary-bg);
   border-color: var(--color-btn-primary-bg);

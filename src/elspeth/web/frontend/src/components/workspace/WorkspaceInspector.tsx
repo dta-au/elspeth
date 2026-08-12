@@ -202,6 +202,7 @@ export function WorkspaceInspector({
         <h2 id="workspace-inspector-heading">Inspector</h2>
         <button
           type="button"
+          className="btn-compact"
           aria-label="Close inspector"
           onClick={closeInspector}
         >
@@ -222,6 +223,7 @@ export function WorkspaceInspector({
                 tabRefs.current[tab] = element;
               }}
               type="button"
+              className="artifact-tab"
               role="tab"
               id={`workspace-inspector-tab-${tab}`}
               aria-controls={`workspace-inspector-panel-${tab}`}

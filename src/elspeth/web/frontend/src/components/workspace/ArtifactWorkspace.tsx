@@ -322,6 +322,7 @@ export function ArtifactWorkspaceSurface({
                   tabRefs.current[tab] = element;
                 }}
                 type="button"
+                className="artifact-tab"
                 role="tab"
                 id={`artifact-tab-${tab}`}
                 aria-controls={`artifact-panel-${tab}`}
@@ -336,7 +337,7 @@ export function ArtifactWorkspaceSurface({
             );
           })}
         </div>
-        <button type="button" onClick={focusGraph}>
+        <button type="button" className="btn-compact" onClick={focusGraph}>
           Focus Graph
         </button>
       </div>

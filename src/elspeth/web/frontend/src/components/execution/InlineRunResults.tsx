@@ -338,6 +338,7 @@ export function InlineRunResults({
           </p>
           <button
             type="button"
+            className="btn-compact"
             onClick={() => setHistoryRetrySequence((current) => current + 1)}
           >
             Retry
