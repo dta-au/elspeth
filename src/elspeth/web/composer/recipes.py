@@ -878,7 +878,7 @@ _WEB_SCRAPE_GENERATED_FIELDS: Final[frozenset[str]] = frozenset(
 _FIELD_TOKEN_RE = re.compile(r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`")
 _RESPONSE_FIELD_RE = re.compile(
     r"\b(?:write|produce|generate|create|return|store)(?:\s+(?:a|an))?(?:\s+(?:short|concise|brief))?\s+"
-    r"(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)`|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
+    r"(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)`|(?!(?:either|neither)\b)(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
     re.IGNORECASE,
 )
 _EMAIL_PATTERN: Final[str] = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
@@ -900,7 +900,7 @@ _SCRAPING_REASON_LABEL_RE = re.compile(
 _AUTHORITY_STRONG_NEGATION_PATTERN: Final[str] = (
     r"(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|must\s+not|should\s+not|shouldn't|"
     r"cannot|can't|avoid(?:s|ed|ing)?|without|refus(?:e|es|ed|ing)|declin(?:e|es|ed|ing)|"
-    r"reject(?:s|ed|ing)?|exclud(?:e|es|ed|ing))"
+    r"reject(?:s|ed|ing)?|exclud(?:e|es|ed|ing)|omit(?:s|ted|ting)?)"
 )
 _AUTHORITY_NEGATION_RE = re.compile(
     rf"\b(?:{_AUTHORITY_STRONG_NEGATION_PATTERN}|no|not)\b",
@@ -1000,7 +1000,37 @@ _RESPONSE_SUBORDINATE_BRIDGE_RE = re.compile(
     r"about|how|why|recommend(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
-_BARE_AUTHORITY_VALUE_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_]*`|\b[A-Za-z_][A-Za-z0-9_]*\b")
+_RESPONSE_ADJACENT_VALUE_RE = re.compile(r"`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*", re.IGNORECASE)
+_SOURCE_ADJACENT_VALUE_RE = re.compile(
+    r"\b(?:json|csv|yaml|parquet)\b",
+    re.IGNORECASE,
+)
+_OUTPUT_ADJACENT_VALUE_RE = re.compile(
+    r"\b(?:jsonl|json|csv|yaml|parquet)\b",
+    re.IGNORECASE,
+)
+_STRONG_NEGATED_SOURCE_SLOT_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b[^.;\n]*\b(?:json|csv|yaml|parquet)\s+source\b",
+    re.IGNORECASE,
+)
+_STRONG_NEGATED_OUTPUT_SLOT_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b[^.;\n]*\b(?:jsonl|json|csv|yaml|parquet)\s+output\b",
+    re.IGNORECASE,
+)
+_UNPARSED_SOURCE_AUTHORITY_RE = re.compile(
+    rf"\b{_SOURCE_ACTION_PATTERN}\b[^.;\n]*\b(?:json|csv|yaml|parquet)\s*(?:/|\bor\b)\s*"
+    r"(?:json|csv|yaml|parquet)\s+source\b",
+    re.IGNORECASE,
+)
+_UNPARSED_OUTPUT_AUTHORITY_RE = re.compile(
+    rf"\b{_OUTPUT_ACTION_PATTERN}\b[^.;\n]*\b(?:jsonl|json|csv|yaml|parquet)\s*(?:/|\bor\b)\s*"
+    r"(?:jsonl|json|csv|yaml|parquet)\s+output\b",
+    re.IGNORECASE,
+)
+_NEGATED_RETENTION_CHOICE_RE = re.compile(
+    rf"\b{_AUTHORITY_STRONG_NEGATION_PATTERN}\b\s+rather\s+than\s+(?:keep|retain|project)\s+(?:only|exactly)\b",
+    re.IGNORECASE,
+)
 _PIPELINE_CLEANUP_START_RE = re.compile(
     r"^(?:then\s+|finally\s+)?(?:remove|drop|discard|exclude)\b"
     r"(?=[^.;\n]*(?:\braw\s+(?:(?:page|scraped)\s+)?(?:content|html)\b|\bfingerprint\s+(?:columns?|fields?)\b))",
@@ -1138,14 +1168,22 @@ class _AuthorityDocument:
             candidates = tuple((candidate, False) for candidate in value_pattern.finditer(self.user_text, following.start, following.end))
             if adjacent_bare_pattern is not None and following.clause_id == adjacent_clause_id and not following.actions:
                 candidates += tuple(
-                    (candidate, True) for candidate in adjacent_bare_pattern.finditer(self.user_text, following.start, following.end)
+                    (bare_candidate, True)
+                    for bare_candidate in adjacent_bare_pattern.finditer(self.user_text, following.start, following.end)
+                    if not self.user_text[bare_candidate.end() : following.end].strip()
+                    and (
+                        not self.user_text[following.start : bare_candidate.start()].strip()
+                        or _AUTHORITY_COMPETING_BRIDGE_RE.fullmatch(self.user_text[following.start : bare_candidate.start()].strip(" ,:"))
+                        is not None
+                    )
                 )
             if any(
                 candidate.start() >= declaration.end()
                 and (excluded_span is None or not (excluded_span[0] <= candidate.start() < excluded_span[1]))
                 and not _position_is_in_quoted_prose(self.user_text, candidate.start())
                 and (
-                    _AUTHORITY_COMPETING_BRIDGE_RE.search(self.user_text[declaration.end() : candidate.start()]) is not None
+                    is_bare
+                    or _AUTHORITY_COMPETING_BRIDGE_RE.search(self.user_text[declaration.end() : candidate.start()]) is not None
                     or (not is_bare and following.join in {"additive", "alternative"})
                 )
                 and not self.match_is_negated(candidate)
@@ -1377,6 +1415,21 @@ def _web_response_semantic_span(user_text: str) -> tuple[int, int] | None:
 
 def _position_is_in_quoted_prose(user_text: str, position: int) -> bool:
     return any(match.start() < position < match.end() for match in _QUOTED_PROSE_RE.finditer(user_text))
+
+
+def _has_unprotected_authority_match(
+    user_text: str,
+    pattern: re.Pattern[str],
+    *,
+    excluded_span: tuple[int, int] | None = None,
+) -> bool:
+    """Return whether a lexical authority shape appears outside content prose."""
+
+    return any(
+        (excluded_span is None or not (excluded_span[0] <= match.start() < excluded_span[1]))
+        and not _position_is_in_quoted_prose(user_text, match.start())
+        for match in pattern.finditer(user_text)
+    )
 
 
 def _profile_match_is_subordinate_response_prose(user_text: str, match: re.Match[str]) -> bool:
@@ -1744,14 +1797,14 @@ def _web_response_contract(user_text: str) -> tuple[str, str] | None:
             _RESPONSE_FIELD_RE,
             excluded_span=(semantic_end, len(user_text)),
             subordinate_bridge=_RESPONSE_SUBORDINATE_BRIDGE_RE,
-            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
+            adjacent_bare_pattern=_RESPONSE_ADJACENT_VALUE_RE,
         ):
             return None
         boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
         if index + 1 < len(response_matches):
             boundary_starts.append(response_matches[index + 1].start())
         end = min(boundary_starts, default=len(user_text))
-        response_residue = user_text[response_match.end() : end]
+        response_residue = _match_clause_residue(user_text, response_match)
         if _RESPONSE_DIRECT_ALTERNATIVE_RE.match(response_residue) is not None:
             return None
         clause_start, _clause_end = _clause_bounds(user_text, response_match.start())
@@ -1781,6 +1834,8 @@ def _web_response_contract(user_text: str) -> tuple[str, str] | None:
 def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
     """Return one fully parsed exact retention/projection, else abstain."""
 
+    if _NEGATED_RETENTION_CHOICE_RE.search(user_text) is not None:
+        return None
     clauses = tuple(_RETENTION_CLAUSE_RE.finditer(user_text))
     if not clauses:
         return None
@@ -1834,7 +1889,11 @@ def _web_scraping_reason(user_text: str) -> str | None:
         return None
     for match in matches:
         residue = _match_clause_residue(user_text, match)
-        if _residue_starts_with_alternative(residue) or _residue_starts_with_quoted_value_addition(residue):
+        if (
+            _residue_starts_with_alternative(residue)
+            or _residue_starts_with_quoted_value_addition(residue)
+            or _QUOTED_PROSE_RE.search(residue) is not None
+        ):
             return None
     reasons = tuple(match.group("reason").strip() for match in matches)
     reason = reasons[0]
@@ -1860,6 +1919,20 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     if snapshot is None:
         return None
     aliases = _usable_profile_aliases_for(snapshot, PluginId("transform", "llm"))
+    alias_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_@-])(?:{'|'.join(re.escape(alias) for alias in aliases)})(?![A-Za-z0-9_@-])",
+        re.IGNORECASE,
+    )
+    semantic_span = _web_response_semantic_span(context.user_text)
+    authority_document = _authority_document(context.user_text)
+    if any(
+        authority_document.match_is_negated(alias_match)
+        for alias_match in alias_pattern.finditer(context.user_text)
+        if authority_document.segment_index_at(alias_match.start()) is not None
+        and (semantic_span is None or not (semantic_span[0] <= alias_match.start() < semantic_span[1]))
+        and not _position_is_in_quoted_prose(context.user_text, alias_match.start())
+    ):
+        return None
     for alias in aliases:
         negated_alias = re.compile(
             rf"\b{_NEGATIVE_ACTION_PATTERN}\s+{_PROFILE_ACTION_PATTERN}\s+"
@@ -1898,16 +1971,12 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     if any(_match_prefix_is_negated(context.user_text, match) for match in authority_matches):
         return None
     if authority_matches:
-        alias_pattern = re.compile(
-            rf"(?<![A-Za-z0-9_@-])(?:{'|'.join(re.escape(alias) for alias in aliases)})(?![A-Za-z0-9_@-])",
-            re.IGNORECASE,
-        )
         authority = _authority_document(context.user_text)
         if any(
             authority.has_competing_value(
                 match,
                 alias_pattern,
-                excluded_span=_web_response_semantic_span(context.user_text),
+                excluded_span=semantic_span,
             )
             for match in authority_matches
         ):
@@ -1935,6 +2004,16 @@ def _reviewed_web_authority_is_compatible(
     authority = _authority_document(context.user_text)
     if authority.has_negated_action(frozenset({"fetch", "scrape"}), excluded_span=semantic_span):
         return False
+    if any(
+        _has_unprotected_authority_match(context.user_text, pattern, excluded_span=semantic_span)
+        for pattern in (_STRONG_NEGATED_SOURCE_SLOT_RE, _UNPARSED_SOURCE_AUTHORITY_RE)
+    ):
+        return False
+    if any(
+        _has_unprotected_authority_match(context.user_text, pattern, excluded_span=semantic_span)
+        for pattern in (_STRONG_NEGATED_OUTPUT_SLOT_RE, _UNPARSED_OUTPUT_AUTHORITY_RE)
+    ):
+        return False
     source_authorities = tuple(
         authority
         for authority in _SOURCE_AUTHORITY_RE.finditer(context.user_text)
@@ -1956,7 +2035,7 @@ def _reviewed_web_authority_is_compatible(
             source_authority,
             _SOURCE_SLOT_VALUE_RE,
             excluded_span=semantic_span,
-            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
+            adjacent_bare_pattern=_SOURCE_ADJACENT_VALUE_RE,
         ):
             return False
 
@@ -1984,7 +2063,7 @@ def _reviewed_web_authority_is_compatible(
             output_authority,
             _OUTPUT_SLOT_VALUE_RE,
             excluded_span=semantic_span,
-            adjacent_bare_pattern=_BARE_AUTHORITY_VALUE_RE,
+            adjacent_bare_pattern=_OUTPUT_ADJACENT_VALUE_RE,
         ):
             return False
     output_path_authorities = tuple(
