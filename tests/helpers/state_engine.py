@@ -54,6 +54,9 @@ EXCLUDED_STATE_ENGINE_TABLES: tuple[str, ...] = (
 # pins this against live metadata so schema growth cannot silently escape the
 # complete-image oracle.
 STATE_ENGINE_TABLES: tuple[str, ...] = (
+    "aggregation_result_members",
+    "aggregation_result_outputs",
+    "aggregation_results",
     "artifacts",
     "audit_export_snapshot_chunks",
     "audit_export_snapshots",
