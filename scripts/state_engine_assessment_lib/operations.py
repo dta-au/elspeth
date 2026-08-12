@@ -222,7 +222,7 @@ def _load_live_lane(root: Path, lane_id: str) -> dict[str, Any]:
     selector = load_unique_json(selector_path)
     _require(
         set(selector) == {"schema_version", "catalog_id", "lanes"}
-        and selector.get("schema_version") == 1
+        and selector.get("schema_version") == 2
         and selector.get("catalog_id") == "elspeth-state-engine-v3",
         "v3 evidence selector manifest has an unsupported schema",
     )
@@ -257,13 +257,24 @@ def _load_live_lane(root: Path, lane_id: str) -> dict[str, Any]:
     )
     cells = _list(lane.get("cells"), f"live evidence lane {lane_id} cells")
     _require(bool(cells), f"live evidence lane {lane_id} has no proof cells")
+    base_cell_fields = {"leg_id", "dimension_id", "case_id", "profile_case"}
     for raw_cell in cells:
         cell = _dict(raw_cell, f"live evidence lane {lane_id} cell")
         _require(
-            set(cell) == {"leg_id", "dimension_id", "case_id", "profile_case"},
+            set(cell) in (base_cell_fields, base_cell_fields | {"node_ids"}),
             f"live evidence lane {lane_id} cell has unexpected fields",
         )
         _require(cell.get("profile_case") == lane["profile_case"], f"live evidence lane {lane_id} cell profile drifts")
+        if "node_ids" in cell:
+            cell_nodes = _strings(cell.get("node_ids"), f"live evidence lane {lane_id} cell node_ids")
+            _require(
+                bool(cell_nodes) and len(cell_nodes) == len(set(cell_nodes)),
+                f"live evidence lane {lane_id} cell node_ids must be non-empty and unique",
+            )
+            _require(
+                set(cell_nodes) <= set(nodes),
+                f"live evidence lane {lane_id} cell node_ids must be a subset of the lane node_ids",
+            )
     return lane
 
 
@@ -514,7 +525,10 @@ def _expected_github_repository(remote: Any) -> str:
 
 
 def _materialization_paths(assessment_path: Path, lane_id: str) -> dict[str, Path]:
-    _require(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", lane_id) is not None, "live evidence lane ID is not filename-safe")
+    # Underscores are admitted because derived per-case lane identities embed
+    # plugin names (e.g. protected-live-source-aws_s3-default); the grammar
+    # stays a closed filename-safe alphabet with a leading alphanumeric.
+    _require(re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", lane_id) is not None, "live evidence lane ID is not filename-safe")
     directory = assessment_path.parent / "evidence"
     basename = f"live-{lane_id}"
     return {
@@ -571,7 +585,6 @@ def ingest_live_evidence(
     scrub_digest = _validate_scrub_report(envelope["scrub-report.json"])
     nodes = envelope["nodes.txt"].decode("utf-8").splitlines()
     _require(nodes == lane["node_ids"], "live evidence node index does not match the frozen lane")
-    _require(len(nodes) == len(lane["cells"]), "live evidence selector must map each node to exactly one proof subject")
     junit_temp = artifact_directory / "junit.xml"
     profile_temp = artifact_directory / "profile.json"
     junit_nodes, junit_outcomes = _junit_node_ids(junit_temp, manifest["evidence_id"])
@@ -627,10 +640,25 @@ def ingest_live_evidence(
         all(not isinstance(item, dict) or item.get("id") != evidence_id for item in existing),
         f"duplicate evidence ID: {evidence_id}",
     )
+    # Coverage is the explicit schema-2 mapping: exactly the lane cells that
+    # carry node_ids claim proof; cells without node_ids stay honestly
+    # unknown. Every executed node must prove at least one mapped cell.
     coverage = [
-        {**_dict(raw_cell, f"live evidence lane {lane_id} cell"), "node_ids": [nodes[index]]}
-        for index, raw_cell in enumerate(lane["cells"])
+        {
+            "leg_id": cell["leg_id"],
+            "dimension_id": cell["dimension_id"],
+            "case_id": cell["case_id"],
+            "profile_case": cell["profile_case"],
+            "node_ids": list(cell["node_ids"]),
+        }
+        for cell in (_dict(raw_cell, f"live evidence lane {lane_id} cell") for raw_cell in lane["cells"])
+        if "node_ids" in cell
     ]
+    referenced_nodes = {node for entry in coverage for node in entry["node_ids"]}
+    _require(
+        set(nodes) <= referenced_nodes,
+        "live evidence lane contains orphan nodes referenced by no mapped proof cell",
+    )
     retained = [
         {
             "kind": kind,

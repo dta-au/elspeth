@@ -31,6 +31,19 @@ from scripts.state_engine_assessment_lib.package import (
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 V3_CATALOG = json.loads((REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json").read_text())
 
+# One real derived per-case protected lane identity (schema-2 selector world).
+INGEST_LANE_ID = "protected-live-source-aws_s3-default"
+
+
+def _deterministic_publication_paths() -> list[str]:
+    return [
+        "docs/architecture/state_engine/assessments/run/assessment.json",
+        *[
+            f"docs/architecture/state_engine/assessments/run/evidence/live-{INGEST_LANE_ID}.{suffix}"
+            for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
+        ],
+    ]
+
 
 def _run_git(repository: Path, *arguments: str) -> str:
     result = subprocess.run(
@@ -260,7 +273,7 @@ def _write_live_envelope(directory: Path, *, baseline_sha: str, workflow_digest:
         "schema_version": 1,
         "producer": "elspeth-state-engine-live-evidence-v1",
         "evidence_id": "EV-live-aws-provider",
-        "lane_id": "protected-live-aws",
+        "lane_id": INGEST_LANE_ID,
         "catalog_id": "elspeth-state-engine-v3",
         "catalog_sha256": "c" * 64,
         "repository": "example/elspeth",
@@ -272,7 +285,7 @@ def _write_live_envelope(directory: Path, *, baseline_sha: str, workflow_digest:
         "runner_image": "ubuntu-24.04",
         "ref": "refs/heads/main",
         "head_sha": baseline_sha,
-        "artifact_name": "state-engine-live-protected-live-aws",
+        "artifact_name": f"state-engine-live-{INGEST_LANE_ID}",
         "started_at": "2026-08-12T01:00:00+00:00",
         "ended_at": "2026-08-12T01:00:01+00:00",
         "duration_seconds": 1,
@@ -346,11 +359,11 @@ def _assessment_and_selector(repository: Path, baseline_sha: str, publication_pa
     selector_path = repository / "docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json"
     selector_path.parent.mkdir(parents=True, exist_ok=True)
     selector = {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_id": "elspeth-state-engine-v3",
         "lanes": [
             {
-                "lane_id": "protected-live-aws",
+                "lane_id": INGEST_LANE_ID,
                 "workflow_job": "live_aws",
                 "profile_case": "postgresql-16-aws-single-leader-landscape",
                 "marker_expression": "live_provider and live_aws",
@@ -361,7 +374,16 @@ def _assessment_and_selector(repository: Path, baseline_sha: str, publication_pa
                         "dimension_id": "boundary_composition",
                         "case_id": "source:aws_s3",
                         "profile_case": "postgresql-16-aws-single-leader-landscape",
-                    }
+                        "node_ids": ["tests/live/test_provider.py::test_lane"],
+                    },
+                    {
+                        # Assigned-but-not-yet-provable: no node_ids, so this
+                        # cell must never enter ingested coverage.
+                        "leg_id": "PB-09",
+                        "dimension_id": "crash_restart",
+                        "case_id": "source:aws_s3",
+                        "profile_case": "postgresql-16-aws-single-leader-landscape",
+                    },
                 ],
                 "resource_variables": ["AWS_REGION", "ELSPETH_LANDSCAPE_URL"],
                 "artifact_kinds": ["manifest", "junit_xml", "profile_report", "node_index", "scrub_report"],
@@ -370,6 +392,13 @@ def _assessment_and_selector(repository: Path, baseline_sha: str, publication_pa
     }
     selector_path.write_text(json.dumps(selector) + "\n", encoding="utf-8")
     return assessment_path
+
+
+def _rewrite_selector_lanes(repository: Path, mutate: Any) -> None:
+    selector_path = repository / "docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json"
+    selector = json.loads(selector_path.read_text(encoding="utf-8"))
+    mutate(selector)
+    selector_path.write_text(json.dumps(selector) + "\n", encoding="utf-8")
 
 
 def _archive_bytes(directory: Path) -> bytes:
@@ -442,29 +471,32 @@ def test_ingest_live_evidence_authenticates_and_materializes_closed_envelope(tmp
     workflow_digest = hashlib.sha256(workflow).hexdigest()
     envelope = tmp_path / "artifact"
     manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=workflow_digest)
-    deterministic = [
-        "docs/architecture/state_engine/assessments/run/assessment.json",
-        *[
-            f"docs/architecture/state_engine/assessments/run/evidence/live-protected-live-aws.{suffix}"
-            for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
-        ],
-    ]
-    assessment_path = _assessment_and_selector(repository, baseline_sha, deterministic)
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
     client = _AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
 
-    record = ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=client)
+    record = ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=client)
 
     assert record["runner"] == "github_actions"
     assert record["provenance"]["run_attempt"] == 2
     assert record["provenance"]["job_id"] == 303
-    assert record["coverage"][0]["case_id"] == "source:aws_s3"
+    # Coverage carries exactly the MAPPED cells: the unmapped crash_restart
+    # cell stays honestly unknown and never enters the record.
+    assert record["coverage"] == [
+        {
+            "leg_id": "PB-09",
+            "dimension_id": "boundary_composition",
+            "case_id": "source:aws_s3",
+            "profile_case": "postgresql-16-aws-single-leader-landscape",
+            "node_ids": ["tests/live/test_provider.py::test_lane"],
+        }
+    ]
     assert json.loads(assessment_path.read_text(encoding="utf-8"))["evidence"] == [record]
     assert sorted(path.name for path in (assessment_path.parent / "evidence").iterdir()) == [
-        "live-protected-live-aws.junit.xml",
-        "live-protected-live-aws.manifest.json",
-        "live-protected-live-aws.nodes.txt",
-        "live-protected-live-aws.profile.json",
-        "live-protected-live-aws.scrub-report.json",
+        f"live-{INGEST_LANE_ID}.junit.xml",
+        f"live-{INGEST_LANE_ID}.manifest.json",
+        f"live-{INGEST_LANE_ID}.nodes.txt",
+        f"live-{INGEST_LANE_ID}.profile.json",
+        f"live-{INGEST_LANE_ID}.scrub-report.json",
     ]
 
 
@@ -490,17 +522,7 @@ def test_ingest_live_evidence_rejects_untrusted_producer_facts(
         baseline_sha=baseline_sha,
         workflow_digest=hashlib.sha256(workflow).hexdigest(),
     )
-    assessment_path = _assessment_and_selector(
-        repository,
-        baseline_sha,
-        [
-            "docs/architecture/state_engine/assessments/run/assessment.json",
-            *[
-                f"docs/architecture/state_engine/assessments/run/evidence/live-protected-live-aws.{suffix}"
-                for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
-            ],
-        ],
-    )
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
     responses = _github_responses(manifest, workflow, envelope)
     run = responses[f"repos/{manifest['repository']}/actions/runs/{manifest['run_id']}"]
     artifacts = responses[f"repos/{manifest['repository']}/actions/runs/{manifest['run_id']}/artifacts"]
@@ -515,7 +537,7 @@ def test_ingest_live_evidence_rejects_untrusted_producer_facts(
         artifacts["artifacts"][0]["digest"] = "sha256:" + "e" * 64
 
     with pytest.raises(ContractError, match=message):
-        ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=_AuthenticatedGitHub(responses))
+        ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(responses))
 
 
 def test_ingest_live_evidence_rejects_extra_files_and_failed_canary_scrub(tmp_path: Path) -> None:
@@ -523,21 +545,11 @@ def test_ingest_live_evidence_rejects_extra_files_and_failed_canary_scrub(tmp_pa
     workflow = b"name: state engine live\n"
     envelope = tmp_path / "artifact"
     manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
-    assessment_path = _assessment_and_selector(
-        repository,
-        baseline_sha,
-        [
-            "docs/architecture/state_engine/assessments/run/assessment.json",
-            *[
-                f"docs/architecture/state_engine/assessments/run/evidence/live-protected-live-aws.{suffix}"
-                for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
-            ],
-        ],
-    )
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
     client = _AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
     (envelope / "stdout.txt").write_text("raw output\n", encoding="utf-8")
     with pytest.raises(ContractError, match="five-file envelope"):
-        ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=client)
+        ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=client)
     (envelope / "stdout.txt").unlink()
     scrub_path = envelope / "scrub-report.json"
     scrub = json.loads(scrub_path.read_text(encoding="utf-8"))
@@ -547,7 +559,7 @@ def test_ingest_live_evidence_rejects_extra_files_and_failed_canary_scrub(tmp_pa
     (envelope / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
     client = _AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
     with pytest.raises(ContractError, match="scrub"):
-        ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=client)
+        ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=client)
 
 
 @pytest.mark.parametrize("archive_mutation", ["duplicate", "traversal", "extra"])
@@ -556,17 +568,7 @@ def test_ingest_live_evidence_rejects_unsafe_authenticated_archives(tmp_path: Pa
     workflow = b"name: state engine live\n"
     envelope = tmp_path / "artifact"
     manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
-    assessment_path = _assessment_and_selector(
-        repository,
-        baseline_sha,
-        [
-            "docs/architecture/state_engine/assessments/run/assessment.json",
-            *[
-                f"docs/architecture/state_engine/assessments/run/evidence/live-protected-live-aws.{suffix}"
-                for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
-            ],
-        ],
-    )
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
     responses = _github_responses(manifest, workflow, envelope)
     base_names = [(name, name) for name in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")]
     if archive_mutation == "duplicate":
@@ -589,7 +591,7 @@ def test_ingest_live_evidence_rejects_unsafe_authenticated_archives(tmp_path: Pa
     )
 
     with pytest.raises(ContractError, match="archive"):
-        ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=_AuthenticatedGitHub(responses))
+        ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(responses))
 
 
 def test_ingest_live_evidence_rejects_transplanted_directory_bytes(tmp_path: Path) -> None:
@@ -597,17 +599,7 @@ def test_ingest_live_evidence_rejects_transplanted_directory_bytes(tmp_path: Pat
     workflow = b"name: state engine live\n"
     envelope = tmp_path / "artifact"
     manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
-    assessment_path = _assessment_and_selector(
-        repository,
-        baseline_sha,
-        [
-            "docs/architecture/state_engine/assessments/run/assessment.json",
-            *[
-                f"docs/architecture/state_engine/assessments/run/evidence/live-protected-live-aws.{suffix}"
-                for suffix in ("manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json")
-            ],
-        ],
-    )
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
     responses = _github_responses(manifest, workflow, envelope)
     junit_path = envelope / "junit.xml"
     junit_path.write_bytes(junit_path.read_bytes() + b"\n")
@@ -615,4 +607,79 @@ def test_ingest_live_evidence_rejects_transplanted_directory_bytes(tmp_path: Pat
     (envelope / "manifest.json").write_text(json.dumps(manifest) + "\n", encoding="utf-8")
 
     with pytest.raises(ContractError, match="differs from authenticated archive"):
-        ingest_live_evidence(assessment_path, envelope, "protected-live-aws", client=_AuthenticatedGitHub(responses))
+        ingest_live_evidence(assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(responses))
+
+
+def test_ingest_live_evidence_rejects_mapped_node_ids_outside_the_lane(tmp_path: Path) -> None:
+    repository, baseline_sha, _tree = _git_repository(tmp_path)
+    workflow = b"name: state engine live\n"
+    envelope = tmp_path / "artifact"
+    manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
+
+    def mutate(selector: dict[str, Any]) -> None:
+        selector["lanes"][0]["cells"][0]["node_ids"] = ["tests/live/test_provider.py::test_not_in_this_lane"]
+
+    _rewrite_selector_lanes(repository, mutate)
+
+    with pytest.raises(ContractError, match="subset of the lane node_ids"):
+        ingest_live_evidence(
+            assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
+        )
+
+
+def test_ingest_live_evidence_rejects_orphan_nodes_no_cell_references(tmp_path: Path) -> None:
+    repository, baseline_sha, _tree = _git_repository(tmp_path)
+    workflow = b"name: state engine live\n"
+    envelope = tmp_path / "artifact"
+    manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
+
+    def mutate(selector: dict[str, Any]) -> None:
+        # Strip every per-cell mapping: the executed node then proves nothing.
+        for cell in selector["lanes"][0]["cells"]:
+            cell.pop("node_ids", None)
+
+    _rewrite_selector_lanes(repository, mutate)
+
+    with pytest.raises(ContractError, match="orphan nodes"):
+        ingest_live_evidence(
+            assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
+        )
+
+
+def test_ingest_live_evidence_rejects_a_local_lane_carrying_cell_node_ids(tmp_path: Path) -> None:
+    repository, baseline_sha, _tree = _git_repository(tmp_path)
+    workflow = b"name: state engine live\n"
+    envelope = tmp_path / "artifact"
+    manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
+
+    def mutate(selector: dict[str, Any]) -> None:
+        # A local lane must never be live-ingestable, per-cell mapping or not.
+        selector["lanes"][0]["workflow_job"] = None
+
+    _rewrite_selector_lanes(repository, mutate)
+
+    with pytest.raises(ContractError, match="workflow_job"):
+        ingest_live_evidence(
+            assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
+        )
+
+
+def test_ingest_live_evidence_rejects_schema_version_1_selector(tmp_path: Path) -> None:
+    repository, baseline_sha, _tree = _git_repository(tmp_path)
+    workflow = b"name: state engine live\n"
+    envelope = tmp_path / "artifact"
+    manifest = _write_live_envelope(envelope, baseline_sha=baseline_sha, workflow_digest=hashlib.sha256(workflow).hexdigest())
+    assessment_path = _assessment_and_selector(repository, baseline_sha, _deterministic_publication_paths())
+
+    def mutate(selector: dict[str, Any]) -> None:
+        selector["schema_version"] = 1
+
+    _rewrite_selector_lanes(repository, mutate)
+
+    with pytest.raises(ContractError, match="unsupported schema"):
+        ingest_live_evidence(
+            assessment_path, envelope, INGEST_LANE_ID, client=_AuthenticatedGitHub(_github_responses(manifest, workflow, envelope))
+        )
