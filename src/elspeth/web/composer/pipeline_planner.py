@@ -2999,7 +2999,11 @@ async def _plan_pipeline_inner(
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
     no_gain_calls_in_round = 0
-    schema_contract_bytes_used = 0
+    # Account for selected plugin contracts as the exact canonical aggregate
+    # supplied to the planner, including the enclosing list and separators.
+    # Summing each contract independently creates a small but real gap at the
+    # 48 KiB boundary.
+    selected_schema_contracts: list[dict[str, Any]] = []
     # (component, code) fingerprints of every candidate rejection so far in
     # this request. A repeat means the intervening repair changed nothing that
     # mattered — the feedback then says so explicitly (repeat_notice) instead
@@ -4129,7 +4133,8 @@ async def _plan_pipeline_inner(
             result_call, result, information_resolved = next(discovery_results)
             if result_call is not call:
                 raise AuditIntegrityError("planner discovery result order diverged from admitted calls")
-            budget_remaining = 48 * 1024 - schema_contract_bytes_used
+            encoded_contracts = len(canonical_json(selected_schema_contracts).encode("utf-8"))
+            budget_remaining = 48 * 1024 - encoded_contracts - (1 if selected_schema_contracts else 0)
             serialized_result = _serialize_provider_discovery_result(
                 call=call,
                 result=result,
@@ -4153,11 +4158,12 @@ async def _plan_pipeline_inner(
                 except SchemaContractProjectionUnsupported:
                     information_available = False
                 else:
-                    contract_bytes = len(canonical_json(contract.to_dict()).encode("utf-8"))
-                    if contract_bytes > budget_remaining:
+                    contract_payload = contract.to_dict()
+                    candidate_contracts = [*selected_schema_contracts, contract_payload]
+                    if len(canonical_json(candidate_contracts).encode("utf-8")) > 48 * 1024:
                         information_available = False
                     else:
-                        schema_contract_bytes_used += contract_bytes
+                        selected_schema_contracts.append(contract_payload)
             if information_resolved:
                 information_manifest = information_manifest.with_result(
                     information_keys[call.call_id],

@@ -223,9 +223,16 @@ def test_planner_plugin_contract_is_deeply_frozen_and_thaws_only_on_export() -> 
     with pytest.raises(TypeError):
         properties["enabled"] = {"type": "string"}  # type: ignore[index]
     knob_fields = contract.knob_schema["fields"]
+    assert isinstance(knob_fields, tuple)
     visible_when = knob_fields[0]["visible_when"]  # type: ignore[index]
     assert isinstance(visible_when, MappingProxyType)
     assert isinstance(visible_when["equals"], MappingProxyType)
+    one_of = visible_when["equals"]["one_of"]
+    assert isinstance(one_of, tuple)
+    with pytest.raises(TypeError):
+        knob_fields[0] = {"name": "replacement"}  # type: ignore[index]
+    with pytest.raises(TypeError):
+        one_of[0] = "inactive"  # type: ignore[index]
     with pytest.raises(TypeError):
         visible_when["equals"] = {"one_of": ["inactive"]}  # type: ignore[index]
     exported = contract.to_dict()

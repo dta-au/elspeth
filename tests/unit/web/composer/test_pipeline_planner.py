@@ -1883,16 +1883,39 @@ def test_blob_discovery_information_is_operation_specific_and_order_sensitive() 
         unresolved_classes=(),
     )
     blob_id = "00000000-0000-4000-8000-000000000001"
-    listed = policy.with_manifest(policy.manifest.with_result(("blob.index.session",), available=True))
+    list_session = planner_module._ParsedToolCall(call_id="session", name="list_blobs", arguments={}, raw_arguments="{}")
+    list_composer = planner_module._ParsedToolCall(call_id="composer", name="list_composer_blobs", arguments={}, raw_arguments="{}")
+    get_metadata = planner_module._ParsedToolCall(
+        call_id="metadata",
+        name="get_blob_metadata",
+        arguments={"blob_id": blob_id},
+        raw_arguments=canonical_json({"blob_id": blob_id}),
+    )
+    inspect = planner_module._ParsedToolCall(
+        call_id="inspect",
+        name="inspect_source",
+        arguments={"blob_id": blob_id},
+        raw_arguments=canonical_json({"blob_id": blob_id}),
+    )
+
+    listed = policy.with_manifest(
+        policy.manifest.with_result(planner_module.planner_discovery_information_keys(list_session), available=True)
+    )
     assert listed.discovery_tool_names == ("list_composer_blobs", "get_blob_metadata", "inspect_source")
     assert listed.manifest.covers("blob.index.session")
     assert not listed.manifest.covers("blob.index.composer")
-    composer_listed = listed.with_manifest(listed.manifest.with_result(("blob.index.composer",), available=True))
+    composer_listed = listed.with_manifest(
+        listed.manifest.with_result(planner_module.planner_discovery_information_keys(list_composer), available=True)
+    )
     assert composer_listed.discovery_tool_names == ("get_blob_metadata", "inspect_source")
-    metadata = composer_listed.with_manifest(composer_listed.manifest.with_result((f"blob.metadata:{blob_id}",), available=True))
+    metadata = composer_listed.with_manifest(
+        composer_listed.manifest.with_result(planner_module.planner_discovery_information_keys(get_metadata), available=True)
+    )
     assert metadata.manifest.covers(f"blob.metadata:{blob_id}")
     assert not metadata.manifest.covers(f"blob.inspection:{blob_id}")
-    inspected = metadata.with_manifest(metadata.manifest.with_result((f"blob.inspection:{blob_id}",), available=True))
+    inspected = metadata.with_manifest(
+        metadata.manifest.with_result(planner_module.planner_discovery_information_keys(inspect), available=True)
+    )
     assert inspected.manifest.covers(f"blob.inspection:{blob_id}")
 
 
@@ -2136,8 +2159,54 @@ async def test_selected_schema_contracts_share_one_48kib_request_budget(
     payloads = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
     assert [payload["success"] for payload in payloads] == [True, True, False]
     assert payloads[2]["data"]["error_code"] == "schema_contract_budget_exceeded"
-    admitted_bytes = sum(len(canonical_json(payload["data"]).encode("utf-8")) for payload in payloads if payload["success"])
+    admitted_contracts = [payload["data"] for payload in payloads if payload["success"]]
+    admitted_bytes = len(canonical_json(admitted_contracts).encode("utf-8"))
     assert admitted_bytes <= 48 * 1024
+
+
+@pytest.mark.asyncio
+async def test_selected_schema_contract_budget_includes_aggregate_envelope_bytes(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    def boundary_schema(
+        name: str,
+        arguments: Mapping[str, Any],
+        state: CompositionState,
+        context: ToolContext,
+    ) -> ToolResult:
+        del name, context
+        return ToolResult(
+            success=True,
+            updated_state=state,
+            validation=state.validate(),
+            affected_nodes=(),
+            data=PluginSchemaInfo(
+                name=cast(str, arguments["name"]),
+                plugin_type=cast(str, arguments["plugin_type"]),
+                description="Envelope-boundary contract.",
+                json_schema={"type": "object", "default": "x" * 24_373},
+                knob_schema={"fields": []},
+            ),
+        )
+
+    monkeypatch.setattr(planner_module, "execute_discovery_tool_with_context", boundary_schema)
+    completion = _ScriptedCompletion(
+        _response(
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "one"}),
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "two"}),
+        ),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    payloads = [json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool"]
+    assert [payload["success"] for payload in payloads] == [True, False]
+    assert payloads[1]["data"]["error_code"] == "schema_contract_budget_exceeded"
 
 
 @pytest.mark.asyncio
