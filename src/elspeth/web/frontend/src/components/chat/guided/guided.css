@@ -130,19 +130,20 @@
   min-height: 0;
   overflow-y: auto;
   padding: var(--space-lg) var(--space-md);
-  /* Chat-style bottom anchoring: when the conversation UNDERFLOWS the
-     region (early tutorial steps), content must hug the composer — not
-     float at the top with a viewport-sized void between the decision card
-     and the input (the operator-observed "misshapen" state on tall
-     monitors). flex column + margin-top:auto on the first child pushes
-     sparse content down; once content overflows, the auto margin resolves
-     to zero and scrolling is unchanged. */
+  /* Top-anchored on purpose (elspeth-8fa71e6d15, operator decision D4).
+     Guided is a wizard/form, not a chat log: its convention is progress →
+     content → next action flowing from the top. The previous chat-style
+     bottom anchor (margin-top:auto on the first child) pushed sparse
+     content down to hug the composer, which relocated the underflow void to
+     BETWEEN the pinned step strip and the decision card — two pieces of
+     navigation chrome with ~245px of nothing separating them at 1080p.
+     Trailing whitespace below the decision card is where a short form's
+     empty space normally lives; the void is relocated, not eliminated, and
+     that placement is the fix. Do not reintroduce the bottom anchor for
+     underflow aesthetics — that was the prior "misshapen" remedy and it
+     traded one void position for a worse one. */
   display: flex;
   flex-direction: column;
-}
-
-.guided-authoring-scroll > :first-child {
-  margin-top: auto;
 }
 
 /* Keyboard-focusable scroll region (tabIndex=0 in ChatPanel): the standard
