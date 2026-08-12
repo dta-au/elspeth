@@ -555,21 +555,23 @@ _FORK_KEYS_RE = re.compile(
     re.IGNORECASE,
 )
 _FORK_NEGATED_TRUNCATE_RE = re.compile(
-    r"\b(?:do(?:es)?\s+not|must\s+not|never|avoid(?:s|ed|ing)?|without)\b[^.;\n]*\btruncat(?:e|es|ed|ing)\b",
+    r"\b(?:do(?:es)?\s+not|don't|doesn't|must\s+not|should\s+not|shouldn't|never|avoid(?:s|ed|ing)?|without)\b"
+    r"[^.;\n]*\btruncat(?:e|es|ed|ing)\b",
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_OUTPUT_RE = re.compile(
-    r"\b(?:alternatively|or)\s+(?:(?:write|save)(?:\s+it)?\s+at\s+)?(?P<path>[^\s,:;]+\.jsonl)\b",
+    r"\b(?:alternatively|otherwise|or)\s+"
+    r"(?:(?:write|save)(?:\s+it)?\s+(?:at|to)\s+)?(?P<path>[^\s,:;]+\.jsonl)\b",
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_SUFFIX_RE = re.compile(
-    r"\b(?:alternatively|or)\s+(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
+    r"\b(?:alternatively|otherwise|or)\s+(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
     r"(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)",
     re.IGNORECASE,
 )
 _FORK_AMBIGUOUS_KEYS_RE = re.compile(
     r"\bkeys\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+"
-    r"(?:or|alternatively)\s+(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
+    r"(?:or|alternatively|otherwise)\s+(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
     r"`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?",
     re.IGNORECASE,
 )
@@ -578,24 +580,25 @@ _FORK_AMBIGUOUS_KEYS_RE = re.compile(
 def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
     """Extract required fork semantics and only the optional slots stated."""
 
-    lower = context.user_text.lower()
-    if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
-        return None
-    for phrase in ("two ways in parallel", "single merged output row"):
-        for phrase_match in re.finditer(re.escape(phrase), context.user_text, re.IGNORECASE):
-            if _match_is_negated(context.user_text, phrase_match, _AUTHORITY_NEGATION_RE):
-                return None
     csv_matches = tuple(_FORK_CSV_MARKER_RE.finditer(context.user_text))
     if len(csv_matches) != len(tuple(_FORK_CSV_LABEL_RE.finditer(context.user_text))) or not csv_matches:
         return None
-    truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(context.user_text))
+    authority_text = context.user_text[: csv_matches[0].start()]
+    lower = authority_text.lower()
+    if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
+        return None
+    for phrase in ("two ways in parallel", "single merged output row"):
+        for phrase_match in re.finditer(re.escape(phrase), authority_text, re.IGNORECASE):
+            if _match_is_negated(authority_text, phrase_match, _AUTHORITY_NEGATION_RE):
+                return None
+    truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(authority_text))
     if not truncate_matches:
         return None
-    if _FORK_NEGATED_TRUNCATE_RE.search(context.user_text) is not None:
+    if _FORK_NEGATED_TRUNCATE_RE.search(authority_text) is not None:
         return None
     if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in csv_matches):
         return None
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in truncate_matches):
+    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in truncate_matches):
         return None
     truncate_values = tuple((match.group("field"), int(match.group("max_chars"))) for match in truncate_matches)
     truncate_value = truncate_values[0]
@@ -612,40 +615,40 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
         "truncate_field": truncate_value[0],
         "max_chars": truncate_value[1],
     }
-    output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(context.user_text))
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in output_matches):
+    output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in output_matches):
         return None
     output_paths = tuple(
         path_match.group("path")
         for output_match in output_matches
         for path_match in _JSONL_PATH_TOKEN_RE.finditer(
-            context.user_text,
-            *_clause_bounds(context.user_text, output_match.start()),
+            authority_text,
+            *_clause_bounds(authority_text, output_match.start()),
         )
-    ) + tuple(match.group("path") for match in _FORK_ALTERNATIVE_OUTPUT_RE.finditer(context.user_text) if output_matches)
+    ) + tuple(match.group("path") for match in _FORK_ALTERNATIVE_OUTPUT_RE.finditer(authority_text) if output_matches)
     if output_paths and any(candidate != output_paths[0] for candidate in output_paths[1:]):
         return None
     if output_paths:
         slots["output_path"] = output_paths[0]
-    suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(context.user_text))
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in suffix_matches):
+    suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in suffix_matches):
         return None
     suffixes = tuple(
         quoted.group("value")
         for suffix_match in suffix_matches
         for quoted in _QUOTED_VALUE_RE.finditer(
-            context.user_text,
-            *_clause_bounds(context.user_text, suffix_match.start()),
+            authority_text,
+            *_clause_bounds(authority_text, suffix_match.start()),
         )
-    ) + tuple(match.group("suffix") for match in _FORK_ALTERNATIVE_SUFFIX_RE.finditer(context.user_text) if suffix_matches)
+    ) + tuple(match.group("suffix") for match in _FORK_ALTERNATIVE_SUFFIX_RE.finditer(authority_text) if suffix_matches)
     if suffixes and any(candidate != suffixes[0] for candidate in suffixes[1:]):
         return None
     if suffixes:
         slots["truncation_suffix"] = suffixes[0]
-    if _FORK_AMBIGUOUS_KEYS_RE.search(context.user_text) is not None:
+    if _FORK_AMBIGUOUS_KEYS_RE.search(authority_text) is not None:
         return None
-    keys_matches = tuple(_FORK_KEYS_RE.finditer(context.user_text))
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in keys_matches):
+    keys_matches = tuple(_FORK_KEYS_RE.finditer(authority_text))
+    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in keys_matches):
         return None
     keys = tuple((match.group("key_a"), match.group("key_b")) for match in keys_matches)
     if keys and any(candidate != keys[0] for candidate in keys[1:]):
@@ -882,19 +885,24 @@ _SCRAPING_REASON_LABEL_RE = re.compile(
     r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b",
     re.IGNORECASE,
 )
-_AUTHORITY_NEGATION_RE = re.compile(r"\b(?:do\s+not|don't|never|no|not)\b", re.IGNORECASE)
+_AUTHORITY_NEGATION_RE = re.compile(
+    r"\b(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|no|not|must\s+not|should\s+not|shouldn't|"
+    r"cannot|can't|avoid(?:s|ed|ing)?|without)\b",
+    re.IGNORECASE,
+)
 _CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
 _LLM_TOKEN_RE = re.compile(r"\b(?:an?\s+)?llm\b", re.IGNORECASE)
 _RESPONSE_NEGATION_RE = re.compile(
-    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|avoid|without)\s+"
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid|without)\s+"
     r"(?:(?:have|having|let|ask|asking|use|using)\s+)?(?:an?\s+|the\s+)?llm\b(?:\s+to)?[^.;\n]*"
     r"\b(?:write|produce|generate|create|return|store)\b"
     r"|\bllm\b[^.;\n,]{0,80}\b(?:must\s+)?not\s+(?:write|produce|generate|create|return|store)\b"
-    r"|\b(?:do\s+not|don't|never|must\s+not|avoid)\s+(?:write|produce|generate|create|return|store)\b",
+    r"|\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid)\s+"
+    r"(?:write|produce|generate|create|return|store)\b",
     re.IGNORECASE,
 )
 _PROJECTION_NEGATION_RE = re.compile(
-    r"\b(?:(?:do\s+not|don't|never)\s+|must\s+not\s+)(?:keep|retain|project)\b",
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't)\s+(?:keep|retain|project)\b",
     re.IGNORECASE,
 )
 _PROFILE_PREFIX_RE = re.compile(
@@ -918,10 +926,10 @@ _PROFILE_LABEL_RE = re.compile(
     re.IGNORECASE,
 )
 _FETCH_NEGATION_RE = re.compile(
-    r"\b(?:(?:do\s+not|don't|never|avoid)\s+|must\s+not\s+)(?:fetch|scrape)\b",
+    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid)\s+(?:fetch|scrape)\b",
     re.IGNORECASE,
 )
-_NEGATIVE_ACTION_PATTERN: Final[str] = r"(?:do\s+not|don't|never|must\s+not|should\s+not)"
+_NEGATIVE_ACTION_PATTERN: Final[str] = r"(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't)"
 _SOURCE_AUTHORITY_RE = re.compile(
     rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?(?:use|select|choose|read)\s+"
     r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?source\b"
@@ -936,16 +944,22 @@ _OUTPUT_AUTHORITY_RE = re.compile(
     r"(?:\s+at\s+(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-]))?",
     re.IGNORECASE,
 )
+_OUTPUT_PATH_AUTHORITY_RE = re.compile(
+    r"\b(?:write|save)\s+(?:(?:the\s+)?output|it)\s+(?:at|to)\s+"
+    r"(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
 _OUTPUT_LEADING_AUTHORITY_RE = re.compile(
     rf"\boutput\s+(?:(?P<negative>{_NEGATIVE_ACTION_PATTERN})\s+|(?P<modal>must|should)\s+)?(?:be\s+)?"
     r"(?P<format>[A-Za-z][A-Za-z0-9_-]*)\b",
     re.IGNORECASE,
 )
 _RESPONSE_DIRECT_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:or\s+|/\s*)(?:an?\s+)?(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)",
+    r"^\s*(?:(?:or|alternatively|otherwise)\s+|/\s*)"
+    r"(?:an?\s+)?(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)",
     re.IGNORECASE,
 )
-_RESPONSE_DIRECT_COORDINATOR_RE = re.compile(r"^\s*,?\s*(?:and|or|then|alternatively)\s*$", re.IGNORECASE)
+_RESPONSE_DIRECT_COORDINATOR_RE = re.compile(r"^\s*,?\s*(?:and|or|then|alternatively|otherwise)\s*$", re.IGNORECASE)
 _PIPELINE_CLEANUP_START_RE = re.compile(
     r"^(?:then\s+|finally\s+)?(?:remove|drop|discard|exclude)\b"
     r"(?=[^.;\n]*(?:\braw\s+(?:(?:page|scraped)\s+)?(?:content|html)\b|\bfingerprint\s+(?:columns?|fields?)\b))",
@@ -959,12 +973,12 @@ _WEB_LOCATOR_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:or|alternatively|/)\s+(?:an?\s+|the\s+)?(?:reviewed\s+)?"
+    r"^\s*(?:or|alternatively|otherwise|/)\s+(?:an?\s+|the\s+)?(?:reviewed\s+)?"
     r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?source\b",
     re.IGNORECASE,
 )
 _OUTPUT_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    r"^\s*(?:or|alternatively|/)\s+(?:(?:write|save|use|select|choose)\s+)?"
+    r"^\s*(?:or|alternatively|otherwise|/)\s+(?:(?:write|save|use|select|choose)\s+)?"
     r"(?:an?\s+|the\s+)?(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?output\b",
     re.IGNORECASE,
 )
@@ -996,6 +1010,16 @@ def _clause_bounds(user_text: str, position: int) -> tuple[int, int]:
 def _match_is_negated(user_text: str, match: re.Match[str], negation: re.Pattern[str]) -> bool:
     start, end = _clause_bounds(user_text, match.start())
     return negation.search(user_text[start:end]) is not None
+
+
+def _match_prefix_is_negated(user_text: str, match: re.Match[str]) -> bool:
+    """Return whether unquoted authority leading into ``match`` is negated."""
+
+    clause_start, _clause_end = _clause_bounds(user_text, match.start())
+    return any(
+        not _position_is_in_quoted_prose(user_text, negation.start())
+        for negation in _AUTHORITY_NEGATION_RE.finditer(user_text, clause_start, match.end())
+    )
 
 
 def _match_clause_residue(user_text: str, match: re.Match[str]) -> str:
@@ -1040,16 +1064,19 @@ def _position_is_in_quoted_prose(user_text: str, position: int) -> bool:
 
 
 def _profile_match_is_subordinate_response_prose(user_text: str, match: re.Match[str]) -> bool:
-    clause_start, _clause_end = _clause_bounds(user_text, match.start())
-    response_match = _RESPONSE_FIELD_RE.search(user_text, clause_start, match.start())
-    if response_match is None:
-        return False
-    residue = user_text[response_match.end() : match.start()]
-    return re.search(r"\b(?:explain(?:ing)?|describ(?:e|ing)|discuss(?:ing)?|says?|about|how|why)\b", residue, re.IGNORECASE) is not None
+    semantic_span = _web_response_semantic_span(user_text)
+    return semantic_span is not None and semantic_span[0] <= match.start() < semantic_span[1]
 
 
 def _residue_starts_with_profile_alternative(residue: str) -> bool:
-    return re.match(r"^\s*(?:or|alternatively|/)\s+(?:`?[A-Za-z0-9][A-Za-z0-9_-]*`?)", residue, re.IGNORECASE) is not None
+    return (
+        re.match(
+            r"^\s*(?:or|and|alternatively|otherwise|/)\s+(?:`?[A-Za-z0-9][A-Za-z0-9_-]*`?)",
+            residue,
+            re.IGNORECASE,
+        )
+        is not None
+    )
 
 
 def _response_authority_matches(user_text: str, *, start: int, end: int) -> tuple[re.Match[str], ...]:
@@ -1070,7 +1097,7 @@ def _response_authority_matches(user_text: str, *, start: int, end: int) -> tupl
                 authorities.append(candidate)
             continue
         prefix = user_text[candidate_clause[0] : candidate.start()]
-        if re.fullmatch(r"\s*(?:(?:and|then|or|alternatively)\s+)?", prefix, re.IGNORECASE) is not None:
+        if re.fullmatch(r"\s*(?:(?:and|then|or|alternatively|otherwise)\s+)?", prefix, re.IGNORECASE) is not None:
             authorities.append(candidate)
     return tuple(authorities)
 
@@ -1463,10 +1490,7 @@ def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
 
 
 def _has_negated_label_clause(user_text: str, label_pattern: re.Pattern[str]) -> bool:
-    return any(
-        label_pattern.search(clause) is not None and _AUTHORITY_NEGATION_RE.search(clause) is not None
-        for clause in _CLAUSE_DELIMITER_RE.split(user_text)
-    )
+    return any(_match_prefix_is_negated(user_text, label) for label in label_pattern.finditer(user_text))
 
 
 def _web_abuse_contact(user_text: str) -> str | None:
@@ -1518,7 +1542,7 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     aliases = dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ())
     for alias in aliases:
         negated_alias = re.compile(
-            rf"\b(?:do\s+not|don't|never)\s+use\s+(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
+            rf"\b{_NEGATIVE_ACTION_PATTERN}\s+use\s+(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
             re.IGNORECASE,
         )
         if negated_alias.search(context.user_text) is not None:
@@ -1574,9 +1598,13 @@ def _reviewed_web_authority_is_compatible(
 ) -> bool:
     """Return whether explicit source/output prose agrees with reviewed authority."""
 
-    if _FETCH_NEGATION_RE.search(context.user_text) is not None:
-        return False
     semantic_span = _web_response_semantic_span(context.user_text)
+    if any(
+        not _position_is_in_quoted_prose(context.user_text, fetch_negation.start())
+        and (semantic_span is None or not (semantic_span[0] <= fetch_negation.start() < semantic_span[1]))
+        for fetch_negation in _FETCH_NEGATION_RE.finditer(context.user_text)
+    ):
+        return False
     source_authorities = tuple(
         authority
         for authority in _SOURCE_AUTHORITY_RE.finditer(context.user_text)
@@ -1618,6 +1646,16 @@ def _reviewed_web_authority_is_compatible(
         if output_authority.group("reviewed") is not None and output_format is None and output_name is None:
             return False
         if _OUTPUT_AUTHORITY_ALTERNATIVE_RE.match(_match_clause_residue(context.user_text, output_authority)) is not None:
+            return False
+    output_path_authorities = tuple(
+        authority
+        for authority in _OUTPUT_PATH_AUTHORITY_RE.finditer(context.user_text)
+        if not _position_is_in_quoted_prose(context.user_text, authority.start())
+        and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
+    )
+    if output_path_authorities:
+        output_paths = tuple(authority.group("path") for authority in output_path_authorities)
+        if any(path != output_binding.path for path in output_paths):
             return False
     for output_authority in _OUTPUT_LEADING_AUTHORITY_RE.finditer(context.user_text):
         clause_start, _clause_end = _clause_bounds(context.user_text, output_authority.start())
