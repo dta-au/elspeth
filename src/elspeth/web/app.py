@@ -54,6 +54,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.audit_readiness.service import ReadinessService, build_boot_plugin_policy_readiness
+from elspeth.web.auth.admin_routes import create_dev_admin_router
 from elspeth.web.auth.audit import AuthAuditRecorder
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.protocol import AuthProvider
@@ -1443,6 +1444,7 @@ def _create_app(
 
     # --- Register routers ---
     app.include_router(create_auth_router())
+    app.include_router(create_dev_admin_router())
     app.include_router(create_session_router())
     app.include_router(create_preferences_router())
     app.include_router(create_tutorial_run_router())

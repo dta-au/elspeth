@@ -97,6 +97,7 @@ describe("CatalogDrawer", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });
@@ -637,6 +638,7 @@ describe("CatalogDrawer — internal plugins", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });

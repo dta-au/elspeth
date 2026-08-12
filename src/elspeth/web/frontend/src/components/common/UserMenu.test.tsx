@@ -197,3 +197,54 @@ describe("UserMenu", () => {
     expect(trigger).toHaveAttribute("aria-haspopup", "true");
   });
 });
+
+describe("UserMenu dev-admin entry", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.removeAttribute("data-theme");
+    document.documentElement.style.colorScheme = "";
+  });
+
+  it("hides User management when onOpenUserManagement is absent", async () => {
+    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(
+      screen.queryByRole("button", { name: /user management/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows User management and invokes the callback, then closes", async () => {
+    const openUserManagement = vi.fn();
+    render(
+      <UserMenu
+        onOpenSettings={vi.fn()}
+        onSignOut={vi.fn()}
+        onOpenUserManagement={openUserManagement}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    await userEvent.click(
+      screen.getByRole("button", { name: /user management/i }),
+    );
+    expect(openUserManagement).toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: /user management/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("returns focus to the Account trigger when User management is chosen", async () => {
+    render(
+      <UserMenu
+        onOpenSettings={vi.fn()}
+        onSignOut={vi.fn()}
+        onOpenUserManagement={vi.fn()}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: /account/i });
+    await userEvent.click(trigger);
+    await userEvent.click(
+      screen.getByRole("button", { name: /user management/i }),
+    );
+    expect(document.activeElement).toBe(trigger);
+  });
+});

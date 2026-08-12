@@ -2150,3 +2150,41 @@ def test_settings_from_env_retains_well_formed_unsupported_region_for_scoped_una
 
 def test_direct_web_settings_construction_may_inject_deployment_region() -> None:
     assert _settings(deployment_aws_region="eu-west-1").deployment_aws_region == "eu-west-1"
+
+
+class TestDevAdminUser:
+    """dev_admin_user gates the short-term dev user-management surface."""
+
+    def test_defaults_to_disabled(self) -> None:
+        assert _settings().dev_admin_user is None
+
+    def test_accepts_a_local_auth_username(self) -> None:
+        assert _settings(dev_admin_user="john").dev_admin_user == "john"
+
+    def test_rejected_for_oidc_provider(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user"):
+            _settings(
+                auth_provider="oidc",
+                oidc_issuer="https://issuer.example.com",
+                oidc_audience="aud",
+                oidc_client_id="client",
+                dev_admin_user="john",
+            )
+
+    def test_rejected_for_entra_provider(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user"):
+            _settings(
+                auth_provider="entra",
+                oidc_audience="aud",
+                oidc_client_id="client",
+                entra_tenant_id="tenant",
+                dev_admin_user="john",
+            )
+
+    def test_rejected_when_blank(self) -> None:
+        with pytest.raises(ValidationError, match="dev_admin_user"):
+            _settings(dev_admin_user="   ")
+
+    def test_settable_from_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ELSPETH_WEB__DEV_ADMIN_USER", "john")
+        assert web_config.settings_from_env().dev_admin_user == "john"

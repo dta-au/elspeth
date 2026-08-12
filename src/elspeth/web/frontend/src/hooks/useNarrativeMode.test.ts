@@ -48,6 +48,7 @@ describe("useNarrativeMode", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });

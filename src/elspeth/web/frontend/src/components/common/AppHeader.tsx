@@ -17,11 +17,14 @@ import { WordMark } from "@/components/ui";
 interface AppHeaderProps {
   onOpenSettings: () => void;
   onSignOut: () => void;
+  /** Forwarded to UserMenu; present only for the env-flagged dev admin. */
+  onOpenUserManagement?: () => void;
 }
 
 export function AppHeader({
   onOpenSettings,
   onSignOut,
+  onOpenUserManagement,
 }: AppHeaderProps): JSX.Element {
   return (
     <header className="app-header" role="banner">
@@ -39,7 +42,11 @@ export function AppHeader({
         <ModelChip />
       </div>
       <div className="app-header-right">
-        <UserMenu onOpenSettings={onOpenSettings} onSignOut={onSignOut} />
+        <UserMenu
+          onOpenSettings={onOpenSettings}
+          onSignOut={onSignOut}
+          onOpenUserManagement={onOpenUserManagement}
+        />
       </div>
     </header>
   );

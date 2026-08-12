@@ -206,6 +206,7 @@ vi.mock("./hooks/useAuth", () => ({
       display_name: null,
       email: null,
       groups: [],
+      dev_admin: false,
     } satisfies UserProfile,
     loginError: null,
     login: vi.fn(),
@@ -297,6 +298,7 @@ describe("App banner roles", () => {
         display_name: null,
         email: null,
         groups: [],
+        dev_admin: false,
       } as never,
     } as never);
     localStorage.clear();
@@ -927,6 +929,7 @@ describe("App compose timeout readiness (bootstrap race)", () => {
         display_name: null,
         email: null,
         groups: [],
+        dev_admin: false,
       } as never,
     } as never);
     localStorage.clear();
@@ -1463,6 +1466,7 @@ describe("App shared-route Layout suppression (Phase 6B Task 8)", () => {
         display_name: null,
         email: null,
         groups: [],
+        dev_admin: false,
       } as never,
     } as never);
     localStorage.clear();
@@ -1531,6 +1535,7 @@ describe("App empty landing and auto-resume", () => {
         display_name: null,
         email: null,
         groups: [],
+        dev_admin: false,
       } as never,
     } as never);
     localStorage.clear();

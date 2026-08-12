@@ -130,6 +130,9 @@ class UserProfileResponse(_StrictResponse):
     display_name: str | None = None
     email: str | None = None
     groups: list[str] = []
+    # True only for the local-auth user named by WebSettings.dev_admin_user;
+    # the frontend uses it to reveal the dev user-management menu entry.
+    dev_admin: bool = False
 
 
 class AuthConfigResponse(_StrictResponse):
@@ -531,6 +534,9 @@ def create_auth_router() -> APIRouter:
             display_name=profile.display_name,
             email=profile.email,
             groups=list(profile.groups),
+            dev_admin=(
+                settings.auth_provider == "local" and settings.dev_admin_user is not None and profile.user_id == settings.dev_admin_user
+            ),
         )
 
     return router

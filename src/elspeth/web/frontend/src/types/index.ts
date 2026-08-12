@@ -36,6 +36,25 @@ export interface UserProfile {
   display_name: string | null;
   email: string | null;
   groups: string[];
+  /** True only for the local-auth user named by the backend's
+   *  dev_admin_user setting; reveals the dev user-management menu entry. */
+  dev_admin: boolean;
+}
+
+// ── Dev-admin user management (env-gated, local auth only) ──────────────────
+
+/** One account row from GET /api/auth/admin/users. */
+export interface AdminUserSummary {
+  user_id: string;
+  display_name: string;
+  email: string | null;
+  email_verified: boolean;
+}
+
+/** A server-generated password, returned exactly once by create/reset. */
+export interface AdminGeneratedPassword {
+  user_id: string;
+  password: string;
 }
 
 // ── Sessions ────────────────────────────────────────────────────────────────

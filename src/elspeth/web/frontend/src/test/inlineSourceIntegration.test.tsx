@@ -132,6 +132,7 @@ vi.mock("../hooks/useAuth", () => ({
       display_name: null,
       email: null,
       groups: [],
+      dev_admin: false,
     } satisfies UserProfile,
     loginError: null,
     login: vi.fn(),
@@ -368,6 +369,7 @@ describe("Phase 5a Task 6 — chat input → set_pipeline → inline-source widg
         display_name: null,
         email: null,
         groups: [],
+        dev_admin: false,
       } as never,
     } as never);
     // Seed an active session so ChatPanel renders the chat body (not

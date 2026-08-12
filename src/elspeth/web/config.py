@@ -189,6 +189,11 @@ class WebSettings(BaseModel):
     # authentication. Generate with ``openssl rand -base64 32``.
     operator_metrics_bearer_token: SecretStr | None = None
     registration_mode: Literal["open", "email_verified", "closed"] = "open"
+    # Short-term dev deployments only: names the ONE local-auth user granted
+    # the in-app user-management surface (/api/auth/admin/users). Unset (the
+    # default) removes the surface entirely; production deployments use the
+    # IdP (Entra/OIDC) and must leave this unset.
+    dev_admin_user: str | None = None
     cors_origins: tuple[str, ...] = ("http://localhost:5173",)
     data_dir: Path = Field(default=Path("data"), validate_default=True)
     # Trusted externally visible origin used for generated user-facing links.
@@ -857,6 +862,12 @@ class WebSettings(BaseModel):
                 raise ValueError("email_verified registration on a non-local host requires public_base_url")
             if _is_loopback_or_private_origin(self.public_base_url):
                 raise ValueError("public_base_url for a non-local email_verified host must be publicly reachable")
+
+        if self.dev_admin_user is not None:
+            if self.auth_provider != "local":
+                raise ValueError("dev_admin_user requires auth_provider=local; IdP deployments must not carry it")
+            if not self.dev_admin_user.strip():
+                raise ValueError("dev_admin_user must name a local-auth user, not be blank")
 
         if self.auth_provider == "local":
             if self.oidc_audience_claim != "aud":

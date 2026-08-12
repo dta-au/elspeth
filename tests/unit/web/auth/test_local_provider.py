@@ -1361,3 +1361,53 @@ class TestRefresh:
         provider.create_user("alice", "pw", display_name="Alice")
         with pytest.raises(AuthenticationError, match="Token missing iat"):
             await provider.refresh("alice", "alice", original_iat=None)
+
+
+class TestListUsers:
+    """list_users powers the dev-admin user management surface."""
+
+    def test_lists_accounts_sorted_by_user_id(self, provider) -> None:
+        provider.create_user("bob", "password123", display_name="Bob", email="bob@example.com")
+        provider.create_user("alice", "password123", display_name="Alice")
+
+        accounts = provider.list_users()
+
+        assert [account.user_id for account in accounts] == ["alice", "bob"]
+        assert accounts[0].display_name == "Alice"
+        assert accounts[0].email is None
+        assert accounts[0].email_verified is True
+        assert accounts[1].email == "bob@example.com"
+
+    def test_reports_unverified_accounts(self, provider, tmp_path) -> None:
+        provider.create_user("carol", "password123", display_name="Carol", email_verified=False)
+
+        accounts = provider.list_users()
+
+        assert [account.email_verified for account in accounts] == [False]
+
+    def test_empty_store_lists_nothing(self, provider) -> None:
+        assert provider.list_users() == []
+
+
+class TestSetPassword:
+    """set_password backs the dev-admin reset flow."""
+
+    @pytest.mark.asyncio
+    async def test_new_password_logs_in_and_old_password_fails(self, provider) -> None:
+        provider.create_user("alice", "old-password-1", display_name="Alice")
+
+        provider.set_password("alice", "new-password-2")
+
+        token = await provider.login("alice", "new-password-2")
+        assert token
+        with pytest.raises(AuthenticationError):
+            await provider.login("alice", "old-password-1")
+
+    def test_unknown_user_raises(self, provider) -> None:
+        with pytest.raises(ValueError, match="alice"):
+            provider.set_password("alice", "new-password-2")
+
+    def test_oversized_password_rejected(self, provider) -> None:
+        provider.create_user("alice", "old-password-1", display_name="Alice")
+        with pytest.raises(ValueError, match="72"):
+            provider.set_password("alice", "x" * 80)

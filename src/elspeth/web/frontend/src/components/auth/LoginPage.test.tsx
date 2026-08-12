@@ -166,6 +166,7 @@ describe("LoginPage", () => {
           display_name: null,
           email: null,
           groups: [],
+          dev_admin: false,
         });
         vi.mocked(fetch).mockResolvedValue(
           new Response(JSON.stringify({ token_type: tokenType, access_token: "access-token" }), {
@@ -316,6 +317,7 @@ describe("LoginPage", () => {
         display_name: null,
         email: "verified@example.com",
         groups: [],
+        dev_admin: false,
       });
       render(<LoginPage />);
       await waitFor(() => expect(api.verifyEmail).toHaveBeenCalledWith("email-token"));
@@ -437,6 +439,7 @@ describe("LoginPage", () => {
         display_name: "newuser",
         email: null,
         groups: [],
+        dev_admin: false,
       });
       const user = userEvent.setup();
       render(<LoginPage />);

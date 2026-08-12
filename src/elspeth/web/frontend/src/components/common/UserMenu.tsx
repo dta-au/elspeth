@@ -10,6 +10,9 @@ import { useTheme } from "@/hooks/useTheme";
 interface UserMenuProps {
   onOpenSettings: () => void;
   onSignOut: () => void;
+  /** Present only when the signed-in user is the env-flagged dev admin
+   *  (/api/auth/me dev_admin); absent, the item is not rendered. */
+  onOpenUserManagement?: () => void;
 }
 
 /**
@@ -44,6 +47,7 @@ export const HELP_DOCS_URL = "https://github.com/johnm-dta/elspeth/tree/main/doc
 export function UserMenu({
   onOpenSettings,
   onSignOut,
+  onOpenUserManagement,
 }: UserMenuProps): JSX.Element {
   const [open, setOpen] = useState(false);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -92,6 +96,14 @@ export function UserMenu({
     setOpen(false);
     onOpenSettings();
   }, [onOpenSettings]);
+
+  // Same focus-return-before-unmount move as onSettings: the user-management
+  // dialog's focus trap needs a live element to save and restore.
+  const onUserManagement = useCallback(() => {
+    triggerRef.current?.focus();
+    setOpen(false);
+    onOpenUserManagement?.();
+  }, [onOpenUserManagement]);
 
   const onSignOutClick = useCallback(() => {
     setOpen(false);
@@ -158,6 +170,17 @@ export function UserMenu({
               Composer preferences
             </button>
           </li>
+          {onOpenUserManagement !== undefined && (
+            <li className="user-menu-item">
+              <button
+                type="button"
+                onClick={onUserManagement}
+                className="user-menu-action"
+              >
+                User management
+              </button>
+            </li>
+          )}
           <li className="user-menu-item">
             {/* One honest help entry (elspeth-8225736807): the project's
                 documentation directory, opened in a new tab. Not a help

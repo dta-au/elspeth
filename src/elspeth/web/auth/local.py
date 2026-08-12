@@ -17,6 +17,7 @@ import stat
 import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlencode
@@ -52,6 +53,16 @@ MAX_BCRYPT_PASSWORD_BYTES = 72
 
 class LocalAuthRegistrationConflict(ValueError):
     """A requested local registration conflicts with an existing account."""
+
+
+@dataclass(frozen=True)
+class LocalUserAccount:
+    """One local-auth account row as listed to the dev-admin surface."""
+
+    user_id: str
+    display_name: str
+    email: str | None
+    email_verified: bool
 
 
 class LocalAuthStorageSecurityError(RuntimeError):
@@ -516,6 +527,37 @@ class LocalAuthProvider:
         """Delete a local auth user and any pending verification tokens."""
         with self._connect() as conn:
             return self._delete_user_rows(conn, user_id)
+
+    def list_users(self) -> list[LocalUserAccount]:
+        """List every local account, ordered by user_id."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT user_id, display_name, email, email_verified FROM users ORDER BY user_id").fetchall()
+        return [
+            LocalUserAccount(
+                user_id=row[0],
+                display_name=row[1],
+                email=row[2],
+                email_verified=bool(row[3]),
+            )
+            for row in rows
+        ]
+
+    def set_password(self, user_id: str, password: str) -> None:
+        """Replace a user's password hash (dev-admin reset path).
+
+        Raises ValueError if the user does not exist or the password
+        exceeds bcrypt's byte limit. Outstanding JWTs are NOT revoked --
+        there is no session store to revoke against; they expire on their
+        own schedule.
+        """
+        password_hash = bcrypt.hashpw(bcrypt_password_bytes(password), bcrypt.gensalt()).decode()
+        with self._connect() as conn:
+            updated = conn.execute(
+                "UPDATE users SET password_hash = ? WHERE user_id = ?",
+                (password_hash, user_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"User not found: {user_id}")
 
     def create_email_verification_token(
         self,

@@ -35,6 +35,8 @@ import type {
   WebSocketTicketResponse,
   SecretInventoryItem,
   Session,
+  AdminGeneratedPassword,
+  AdminUserSummary,
   UserProfile,
   ValidationResult,
   SystemStatus,
@@ -461,6 +463,53 @@ export async function fetchCurrentUser(): Promise<UserProfile> {
     headers: authHeaders(),
   });
   return parseResponse<UserProfile>(response);
+}
+
+// ── Dev-admin user management (env-gated; 404 unless the backend's
+//    dev_admin_user names the current local-auth user) ──────────────────────
+
+/** List every local-auth account (dev admin only). */
+export async function fetchAdminUsers(): Promise<{ users: AdminUserSummary[] }> {
+  const response = await fetch("/api/auth/admin/users", {
+    headers: authHeaders(),
+  });
+  return parseResponse<{ users: AdminUserSummary[] }>(response);
+}
+
+/** Create a local-auth account; the server generates and returns the password once. */
+export async function createAdminUser(body: {
+  username: string;
+  display_name: string;
+  email?: string;
+}): Promise<AdminGeneratedPassword> {
+  const response = await fetch("/api/auth/admin/users", {
+    method: "POST",
+    headers: authHeaders("application/json"),
+    body: JSON.stringify(body),
+  });
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Reset an account's password; the server generates and returns it once. */
+export async function resetAdminUserPassword(
+  userId: string,
+): Promise<AdminGeneratedPassword> {
+  const response = await fetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}/reset-password`,
+    { method: "POST", headers: authHeaders() },
+  );
+  return parseResponse<AdminGeneratedPassword>(response);
+}
+
+/** Delete a local-auth account. Backend returns 204 No Content. */
+export async function deleteAdminUser(userId: string): Promise<void> {
+  const response = await fetch(
+    `/api/auth/admin/users/${encodeURIComponent(userId)}`,
+    { method: "DELETE", headers: authHeaders() },
+  );
+  if (!response.ok) {
+    await parseResponse<never>(response);
+  }
 }
 
 /** Return boot-time system readiness for the web UX. */

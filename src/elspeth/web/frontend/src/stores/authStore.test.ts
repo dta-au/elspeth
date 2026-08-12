@@ -68,6 +68,7 @@ describe("authStore interactive login", () => {
       display_name: "Alice",
       email: null,
       groups: [],
+      dev_admin: false,
     });
 
     const succeeded = await useAuthStore.getState().login("alice", "pw");
@@ -102,6 +103,7 @@ describe("authStore account-scoped store reset", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });
@@ -213,6 +215,7 @@ describe("authStore account-scoped store reset", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });
@@ -257,6 +260,7 @@ describe("authStore account-scoped store reset", () => {
         display_name: "Alice",
         email: null,
         groups: [],
+        dev_admin: false,
       },
       isLoading: false,
     });

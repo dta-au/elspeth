@@ -30,6 +30,7 @@ import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
 import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
+import { UserAdminDialog } from "./components/settings/UserAdminDialog";
 import { HelloWorldTutorial } from "./components/tutorial";
 import {
   REQUEST_RUN_EVENT,
@@ -115,6 +116,10 @@ function App() {
   const [tutorialResetEpoch, setTutorialResetEpoch] = useState(0);
   const [catalogOpen, setCatalogOpen] = useState(false);
   const logout = useAuthStore((s) => s.logout);
+  const authUser = useAuthStore((s) => s.user);
+  const [showUserAdmin, setShowUserAdmin] = useState(false);
+  const openUserAdmin = useCallback(() => setShowUserAdmin(true), []);
+  const closeUserAdmin = useCallback(() => setShowUserAdmin(false), []);
   const openComposerSettings = useCallback(
     () => setShowComposerSettings(true),
     [],
@@ -666,6 +671,9 @@ function App() {
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
+          onOpenUserManagement={
+            authUser?.dev_admin === true ? openUserAdmin : undefined
+          }
         />
         {showTutorial ? (
           <div id="composer-main" className="app-main" tabIndex={-1}>
@@ -749,6 +757,12 @@ function App() {
           <ComposerPreferencesPanel
             onClose={closeComposerSettings}
             onResetTutorialComplete={handleResetTutorialComplete}
+          />
+        )}
+        {showUserAdmin && authUser !== null && (
+          <UserAdminDialog
+            onClose={closeUserAdmin}
+            currentUserId={authUser.user_id}
           />
         )}
         <CommandPalette
