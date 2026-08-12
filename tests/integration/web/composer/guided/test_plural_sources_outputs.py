@@ -71,13 +71,18 @@ def _review_items(body: dict) -> list[dict]:
     return body["next_turn"]["payload"]["items"]
 
 
-def _stage_minimal_plural_proposal(client: TestClient, *, suffix: str) -> tuple[str, dict]:
-    """Stage a fresh ordered 2-source/2-output proposal through public HTTP."""
+def _stage_minimal_plural_proposal(
+    client: TestClient,
+    *,
+    suffix: str,
+    source_count: int = 2,
+) -> tuple[str, dict]:
+    """Stage an ordered multi-source/2-output proposal through public HTTP."""
 
     session_id = _create_session(client)
     source_ids: list[str] = []
-    for index in (1, 2):
-        if index == 2:
+    for index in range(1, source_count + 1):
+        if index > 1:
             _respond(client, session_id, component_action={"action": "add", "component_kind": "source"})
         _respond(client, session_id, chosen=["csv"])
         reviewed = _respond(
@@ -86,7 +91,7 @@ def _stage_minimal_plural_proposal(client: TestClient, *, suffix: str) -> tuple[
             edited_values={
                 "plugin": "csv",
                 "options": {
-                    "path": f"{suffix}-input-{index}.csv",
+                    "path": _source_path(client, session_id, f"{suffix}-input-{index}.csv"),
                     "schema": {"mode": "observed"},
                     "on_validation_failure": "discard",
                 },

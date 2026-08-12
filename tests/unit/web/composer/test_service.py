@@ -383,7 +383,10 @@ async def test_complete_registered_recipe_projection_conflict_returns_before_pro
     monkeypatch.setattr(
         composer_service_with_real_sessions,
         "_planner_preview_preflight",
-        AsyncMock(return_value=None),
+        AsyncMock(
+            spec=composer_service_with_real_sessions._planner_preview_preflight,
+            return_value=None,
+        ),
     )
     provider_calls: list[dict[str, Any]] = []
 
@@ -515,7 +518,10 @@ async def test_guided_complete_registered_recipe_prepares_real_plan_without_prov
     monkeypatch.setattr(
         composer_service_with_real_sessions,
         "_planner_preview_preflight",
-        AsyncMock(return_value=None),
+        AsyncMock(
+            spec=composer_service_with_real_sessions._planner_preview_preflight,
+            return_value=None,
+        ),
     )
     session_id = uuid4()
     canonical_source = tmp_path / "blobs" / str(session_id) / "briefs.json"

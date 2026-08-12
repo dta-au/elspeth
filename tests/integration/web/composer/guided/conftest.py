@@ -229,6 +229,20 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                 and correction_target.edge_routing is not None
                 and correction_target.edge_routing.field == "on_validation_failure"
             )
+            corrected_success_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_success"
+            )
+            corrected_success_destination = None
+            if corrected_success_edge:
+                corrected_success_destination = next(
+                    (output_name for output_name in output_names if output_name != correction_target.edge_routing.before_destination),
+                    None,
+                )
+                if corrected_success_destination is None:
+                    raise AssertionError("guided edge-correction fixture requires another reviewed output")
             prose_revision = revision_authority is not None
             pipeline = {
                 "sources": {
@@ -236,7 +250,9 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                         "plugin": guided.reviewed_sources[stable_id].plugin,
                         "options": deep_thaw(guided.reviewed_sources[stable_id].options),
                         "on_success": (
-                            f"{correction_target.owner_key}_corrected_rows"
+                            corrected_success_destination
+                            if corrected_success_edge and guided.reviewed_sources[stable_id].name == correction_target.owner_key
+                            else f"{correction_target.owner_key}_corrected_rows"
                             if corrected_source and guided.reviewed_sources[stable_id].name == correction_target.owner_key
                             else (f"guided_revision_{index}_rows" if prose_revision else output_names[index % len(output_names)])
                         ),

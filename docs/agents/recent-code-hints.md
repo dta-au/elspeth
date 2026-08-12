@@ -169,6 +169,18 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-12 — planner calls and semantic attempts are paired, not counted
+  positionally**: a physical provider transport failure has no semantic
+  attempt. Every response-bearing planner call (`success` or
+  `malformed_response`) has exactly one adjacent `planner_attempt_audit` row,
+  whose logical `ordinal` is contiguous even when physical
+  `planner_call_ordinal` values have retry gaps. Each `plan_pipeline` request
+  restarts both ordinal spaces at 1, so a session transcript can contain
+  multiple valid ordinal-reset cohorts. Persist each request's LLM calls,
+  attempts, then tool invocations through the existing atomic audit writer;
+  never infer attempt/call ownership by array position, and never turn an
+  unavailable or malformed audit view into zero-call evidence.
+
 - **2026-08-12 — restricted planner terminals carry schema and materializer
   custody together**: `PlannerTerminalContract` owns the exact schema advertised
   on every normal, repair, and escape-hatch turn plus the function that expands

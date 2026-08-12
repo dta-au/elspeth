@@ -440,12 +440,12 @@ class TestBuildContextString:
         ):
             assert private not in context
 
-    def test_context_includes_discovery_time_composer_hints(self) -> None:
-        """The LLM sees JIT hints even when it does not call list_* first.
+    def test_context_keeps_detailed_hints_out_of_selection_digest(self) -> None:
+        """The initial context is a compact selection index, not a schema dump.
 
-        The discovery digest is the sole carrier: the duplicate top-level
-        ``plugin_hints`` block was deleted (elspeth-8c457883c2), so this
-        guarantee now rests entirely on the digest entries.
+        Detailed composer hints travel with the chosen plugin's JIT schema
+        contract.  They must not be duplicated in either the digest or a
+        parallel top-level block.
         """
         catalog = _stub_catalog()
 
@@ -453,10 +453,9 @@ class TestBuildContextString:
         parsed = json.loads(context.split("\n", 1)[1])
 
         digest = parsed["authoring_aids"]["discovery_digest"]["plugins"]
-        hints = {kind: {entry["name"]: entry["composer_hints"] for entry in entries} for kind, entries in digest.items()}
-
-        assert hints["sources"]["csv"] == ["Declare headerless CSV columns before routing by field."]
-        assert hints["sinks"]["csv"] == ["Prefer json format=jsonl when the user asks for one record per line."]
+        assert [entry["name"] for entry in digest["sources"]] == ["csv"]
+        assert [entry["name"] for entry in digest["sinks"]] == ["csv"]
+        assert all("composer_hints" not in entry for entries in digest.values() for entry in entries)
         assert "plugin_hints" not in parsed
 
     def test_snapshot_unavailable_prompt_shield_is_hidden_from_dynamic_context(self) -> None:
@@ -682,13 +681,14 @@ class TestBuildSystemPrompt:
         assert "commit the buildable scaffold with a named gap" in flattened
 
     def test_core_skill_rejects_plugin_contract_whiplash(self) -> None:
-        """Plugin facts remain stable, but only live discovery defines them."""
+        """Selection and detailed contracts remain stable at their own tiers."""
         result = build_system_prompt(None)
         flattened = " ".join(result.split())
 
         assert "Plugin schema facts are stable across turns" in flattened
         assert "Do not reinterpret a missing config option as a missing output field" in flattened
-        assert "dynamic discovery is the only authority for plugin-specific fields and output behavior" in flattened
+        assert "complete selection index for that policy snapshot" in flattened
+        assert "Call `get_plugin_schema` for chosen plugins whose detailed option or output contract is not already supplied" in flattened
         assert "For `batch_stats`" not in result
 
     def test_core_skill_treats_authored_rubrics_as_reviewable(self) -> None:

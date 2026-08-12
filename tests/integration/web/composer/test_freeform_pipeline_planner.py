@@ -1142,6 +1142,8 @@ async def test_matching_recipe_stages_without_provider_or_planner_attempt_rows(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from elspeth.web.composer import service as composer_service
+
     message = (
         "Please create a pipeline that processes the following customer rows. Each row should be processed two ways "
         "in parallel and combined into a single merged output row at outputs/merged.jsonl: path A keeps the original "
@@ -1155,7 +1157,10 @@ async def test_matching_recipe_stages_without_provider_or_planner_attempt_rows(
         monkeypatch,
         message=message,
     )
-    provider = AsyncMock(side_effect=AssertionError("a matching recipe must not call the provider"))
+    provider = AsyncMock(
+        spec=composer_service._litellm_acompletion,
+        side_effect=AssertionError("a matching recipe must not call the provider"),
+    )
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", provider)
 
     await composer.compose(

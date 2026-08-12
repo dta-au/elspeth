@@ -742,9 +742,10 @@ def test_send_message_freeform_planner_decline_is_a_normal_assistant_message(
     progress = client.get(f"/api/sessions/{session_id}/composer-progress").json()
     assert progress.get("phase") != "failed"
 
-    # The planner's LLM audit evidence is durable: three primary discovery
-    # calls plus the advisor overtime turn.
-    assert len(_llm_audit_rows(engine)) == 4
+    # The planner's LLM audit evidence is durable: the first no-gain discovery
+    # response earns one bounded retry, the second opens the escape hatch, and
+    # the advisor then records the honest decline.
+    assert len(_llm_audit_rows(engine)) == 3
 
     # The decline lands in the visible conversation as an assistant message.
     with engine.connect() as conn:

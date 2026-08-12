@@ -18,6 +18,7 @@ from sqlalchemy import select, update
 
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
+from tests.integration.web.composer.guided.test_plural_sources_outputs import _stage_minimal_plural_proposal
 from tests.integration.web.composer.guided.test_respond import (
     TestStep2IntraStep as _Step2Journey,
 )
@@ -43,6 +44,11 @@ def _bound_action(turn: dict, *, chosen: list[str], operation_id: str | None = N
         "draft_hash": turn["payload"]["draft_hash"],
         "chosen": chosen,
     }
+
+
+def _source_success_edge(turn: dict) -> dict:
+    """Select a success edge that can move to the other reviewed output."""
+    return next(connection for connection in turn["payload"]["connections"] if connection["flow"]["kind"] == "source_success")
 
 
 class _SimulatedWorkerCrash(BaseException):
@@ -257,7 +263,11 @@ def test_wire_projection_uses_the_pending_candidate_stable_ids_and_exact_contrac
 def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     composer_test_client: TestClient,
 ) -> None:
-    session_id, staged = _stage(composer_test_client, filename="corrected-wire.jsonl")
+    session_id, staged = _stage_minimal_plural_proposal(
+        composer_test_client,
+        suffix="corrected-wire",
+        source_count=3,
+    )
     original = staged["next_turn"]["payload"]
     reviewed = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
@@ -265,9 +275,10 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     )
     assert reviewed.status_code == 200, reviewed.json()
     wire_turn = reviewed.json()["next_turn"]
+    selected_edge = _source_success_edge(wire_turn)
     target = {
         "kind": "edge",
-        "stable_id": wire_turn["payload"]["connections"][0]["stable_id"],
+        "stable_id": selected_edge["stable_id"],
     }
     operation_id = str(uuid4())
     correction_request = {
@@ -276,7 +287,7 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
         "proposal_id": original["proposal_id"],
         "draft_hash": original["draft_hash"],
         "edit_target": target,
-        "correction_feedback": "Route the reviewed source through the requested processing before the output.",
+        "correction_feedback": "Route the reviewed source to the other reviewed output.",
     }
     service = composer_test_client.app.state.session_service
     messages_before = asyncio.run(service.get_messages(UUID(session_id), limit=None))
@@ -523,7 +534,11 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     wire_action: str,
     winner: str,
 ) -> None:
-    session_id, staged = _stage(composer_test_client, filename=f"revert-{winner}-wire-{wire_action}.jsonl")
+    session_id, staged = _stage_minimal_plural_proposal(
+        composer_test_client,
+        suffix=f"revert-{winner}-wire-{wire_action}",
+        source_count=3,
+    )
     proposal = staged["next_turn"]["payload"]
     reviewed = composer_test_client.post(
         f"/api/sessions/{session_id}/guided/respond",
@@ -539,12 +554,13 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
     versions = asyncio.run(service.get_state_versions(UUID(session_id)))
     target_state_id = str(versions[0].id)
     state_count_before = len(versions)
-    correction_feedback = "Route the source through the corrected topology before confirmation."
+    correction_feedback = "Route the reviewed source to the other reviewed output."
     wire_operation_id = str(uuid4())
     if wire_action == "confirm":
         wire_request = _bound_action(wire_turn, chosen=["confirm_wiring"], operation_id=wire_operation_id)
         original_wire = service.admit_guided_pipeline_confirmation
     else:
+        selected_edge = _source_success_edge(wire_turn)
         wire_request = {
             "operation_id": wire_operation_id,
             "turn_token": wire_turn["turn_token"],
@@ -552,7 +568,7 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
             "draft_hash": proposal["draft_hash"],
             "edit_target": {
                 "kind": "edge",
-                "stable_id": wire_turn["payload"]["connections"][0]["stable_id"],
+                "stable_id": selected_edge["stable_id"],
             },
             "correction_feedback": correction_feedback,
         }
