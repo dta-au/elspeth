@@ -274,6 +274,124 @@ class TestRegisteredRecipeIntentMatching:
         assert "ops@agency.gov.au" not in prompt_template
         assert "scraping reason" not in prompt_template.casefold()
 
+    def test_semantic_constraint_after_semicolon_is_preserved_until_projection(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri` and have an LLM write a short `abstract`; "
+            "it must be no more than 50 words; retain exactly `document_uri` and `abstract`. "
+            "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        match = match_registered_recipe_intent(context)
+
+        assert match is not None
+        prompt_template = match.slots["prompt_template"]
+        assert type(prompt_template) is str
+        assert "it must be no more than 50 words" in prompt_template
+        assert "retain" not in prompt_template.casefold()
+
+    def test_conflicting_response_contracts_fall_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract` and produce a `digest`, "
+            "then retain exactly `document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_conflicting_projection_clauses_fall_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, retain exactly "
+            "`document_uri` and `abstract`, then keep only `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_conflicting_abuse_contacts_fall_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "abuse contact: retired@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_conflicting_scraping_reasons_fall_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'; scraping reason: 'Private analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_single_negated_scraping_reason_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "do not use scraping reason: 'Private analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_negated_and_positive_identical_scraping_reason_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "do not use scraping reason: 'Public analysis'; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_negated_abuse_contact_falls_back_instead_of_selecting_it(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Do not use retired@agency.gov.au as abuse contact; "
+            "abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_single_negated_reverse_form_contact_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            "`document_uri` and `abstract`. Do not use retired@agency.gov.au as abuse contact; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    @pytest.mark.parametrize(
+        "contact_clause",
+        [
+            "There is no abuse contact ops@agency.gov.au",
+            "This is not abuse contact ops@agency.gov.au",
+        ],
+    )
+    def test_same_clause_contact_negation_falls_back(self, contact_clause: str) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly "
+            f"`document_uri` and `abstract`. {contact_clause}; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_identical_repeated_contract_values_remain_unambiguous(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write a short `abstract`; write a short `abstract`; "
+            "retain exactly `document_uri` and `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Abuse contact: ops@agency.gov.au; abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'; scraping reason: 'Public analysis'."
+        )
+
+        match = match_registered_recipe_intent(context)
+
+        assert match is not None
+        assert match.slots["response_field"] == "abstract"
+        assert match.slots["retained_fields"] == ("document_uri", "abstract")
+        assert match.slots["abuse_contact"] == "ops@agency.gov.au"
+        assert match.slots["scraping_reason"] == "Public analysis"
+
     def test_missing_response_field_falls_back(self) -> None:
         context = self._context(
             "Fetch every `document_uri` and have an LLM analyze it; retain exactly `document_uri`. "
@@ -417,6 +535,22 @@ class TestRegisteredRecipeIntentMatching:
         assert match_registered_recipe_intent(context) is None
 
     @pytest.mark.parametrize(
+        "projection",
+        [
+            "`document_uri`, `abstract`, and mystery",
+            "`document_uri`, `abstract`, plus mystery",
+            "`document_uri`, `abstract`, and `mystery-field`",
+        ],
+    )
+    def test_unparsed_projection_residue_falls_back_instead_of_narrowing(self, projection: str) -> None:
+        context = self._context(
+            f"Fetch every `document_uri`, have an LLM write an `abstract`, and retain exactly {projection}. "
+            "Abuse contact: crawler-ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    @pytest.mark.parametrize(
         ("output_path", "output_format"),
         [
             ("outputs/projected.json", "json"),
@@ -430,6 +564,18 @@ class TestRegisteredRecipeIntentMatching:
             "scraping reason: 'Public analysis'.",
             output_path=output_path,
             output_format=output_format,
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_fork_recipe_equal_visible_merge_keys_fall_back(self) -> None:
+        context = RecipeIntentContext(
+            user_text=(
+                "Process these rows two ways in parallel and produce a single merged output row. "
+                "Path B truncates the description field to 30 characters. Combine the branches "
+                "under separate keys `same` and `same`. Customer rows (CSV):\n"
+                "name,description\nalice,a long description"
+            )
         )
 
         assert match_registered_recipe_intent(context) is None
@@ -928,9 +1074,8 @@ class TestForkCoalesceTruncateRecipe:
         a ``fork_to`` list naming the per-branch published connections.
         Both must be present together — either alone misroutes.
 
-        ``fork_to`` entries are the user-facing branch keys. The coalesce
-        branch mapping points those keys at the post-transform output
-        connections.
+        ``fork_to`` entries are fixed internal branch connections. The
+        coalesce mapping separately gives their results user-facing keys.
         """
         result = self._apply()
         gate = next(n for n in result["nodes"] if n["node_type"] == "gate")
@@ -938,11 +1083,10 @@ class TestForkCoalesceTruncateRecipe:
         assert gate["routes"] == {"all": "fork"}
         assert gate["fork_to"] == ["path_a", "path_b"]
 
-    def test_path_a_passthrough_consumes_branch_a_input_and_publishes_key_a(self) -> None:
+    def test_path_a_passthrough_uses_fixed_internal_connections(self) -> None:
         """Path A's ``input`` must equal one of ``gate.fork_to`` entries
-        and its ``on_success`` must equal ``key_a`` (the connection name
-        that ``coalesce.branches`` and the ``merge: nested`` output key
-        share).
+        and its ``on_success`` must publish the fixed connection consumed by
+        ``coalesce.branches`` independently of the nested output key.
         """
         result = self._apply()
         path_a = next(n for n in result["nodes"] if n["id"] == "path_a_passthrough")
@@ -951,7 +1095,7 @@ class TestForkCoalesceTruncateRecipe:
         assert path_a["on_success"] == "path_a_out"
         assert path_a["options"]["schema"] == {"mode": "observed"}
 
-    def test_path_b_truncate_consumes_branch_b_input_and_publishes_key_b(self) -> None:
+    def test_path_b_truncate_uses_fixed_internal_connections(self) -> None:
         result = self._apply(truncate_field="notes", max_chars=42, truncation_suffix="…")
         path_b = next(n for n in result["nodes"] if n["id"] == "path_b_truncate")
         assert path_b["plugin"] == "truncate"
@@ -961,13 +1105,13 @@ class TestForkCoalesceTruncateRecipe:
         assert path_b["options"]["suffix"] == "…"
         assert path_b["options"]["schema"] == {"mode": "observed"}
 
-    def test_coalesce_branches_list_form_uses_user_keys(self) -> None:
+    def test_coalesce_branches_mapping_uses_user_keys(self) -> None:
         """Mapping-form branches preserve output keys separately from
         the post-transform connections consumed by coalesce.
         """
         result = self._apply(key_a="original", key_b="truncated")
         coalesce = next(n for n in result["nodes"] if n["node_type"] == "coalesce")
-        assert coalesce["branches"] == {"original": "original_out", "truncated": "truncated_out"}
+        assert coalesce["branches"] == {"original": "path_a_out", "truncated": "path_b_out"}
         assert coalesce["policy"] == "require_all"
         assert coalesce["merge"] == "nested"
         assert coalesce["on_success"] == "merged_rows"
@@ -976,23 +1120,42 @@ class TestForkCoalesceTruncateRecipe:
         # the established convention for the required-by-NodeSpec input.
         assert coalesce["input"] == "branches"
 
-    def test_custom_keys_propagate_to_gate_fork_to_and_path_publishers(self) -> None:
-        """Renaming the user keys cascades through the entire wiring.
+    def test_custom_keys_only_name_nested_output_fields(self) -> None:
+        """Visible merge keys never become internal connection identities."""
 
-        Gate branches use the bare keys, path-transforms consume the bare
-        keys and publish suffixed output connections, and coalesce maps
-        bare keys to those suffixed connections. This pins the cross-node
-        naming-correspondence invariant at one place.
-        """
         result = self._apply(key_a="raw", key_b="trimmed")
         gate = next(n for n in result["nodes"] if n["node_type"] == "gate")
         path_a = next(n for n in result["nodes"] if n["id"] == "path_a_passthrough")
         path_b = next(n for n in result["nodes"] if n["id"] == "path_b_truncate")
         coalesce = next(n for n in result["nodes"] if n["node_type"] == "coalesce")
-        assert gate["fork_to"] == ["raw", "trimmed"]
-        assert path_a["input"] == "raw" and path_a["on_success"] == "raw_out"
-        assert path_b["input"] == "trimmed" and path_b["on_success"] == "trimmed_out"
-        assert coalesce["branches"] == {"raw": "raw_out", "trimmed": "trimmed_out"}
+        assert gate["fork_to"] == ["path_a", "path_b"]
+        assert path_a["input"] == "path_a" and path_a["on_success"] == "path_a_out"
+        assert path_b["input"] == "path_b" and path_b["on_success"] == "path_b_out"
+        assert coalesce["branches"] == {"raw": "path_a_out", "trimmed": "path_b_out"}
+
+    @pytest.mark.parametrize(
+        ("key_a", "key_b"),
+        [
+            ("rows", "a_out"),
+            ("merged_rows", "custom"),
+            ("custom", "merged_rows"),
+        ],
+    )
+    def test_visible_keys_cannot_collide_with_internal_connections(self, key_a: str, key_b: str) -> None:
+        result = self._apply(key_a=key_a, key_b=key_b)
+        gate = next(n for n in result["nodes"] if n["node_type"] == "gate")
+        path_a = next(n for n in result["nodes"] if n["id"] == "path_a_passthrough")
+        path_b = next(n for n in result["nodes"] if n["id"] == "path_b_truncate")
+        coalesce = next(n for n in result["nodes"] if n["node_type"] == "coalesce")
+
+        assert gate["fork_to"] == ["path_a", "path_b"]
+        assert (path_a["input"], path_a["on_success"]) == ("path_a", "path_a_out")
+        assert (path_b["input"], path_b["on_success"]) == ("path_b", "path_b_out")
+        assert coalesce["branches"] == {key_a: "path_a_out", key_b: "path_b_out"}
+
+    def test_equal_visible_keys_are_rejected_before_building(self) -> None:
+        with pytest.raises(RecipeValidationError, match="distinct"):
+            self._apply(key_a="same", key_b="same")
 
     def test_default_keys_match_scenario_request(self) -> None:
         """Scenario fork_and_coalesce asks for keys 'path_a' and 'path_b';

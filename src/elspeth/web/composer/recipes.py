@@ -475,9 +475,9 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Recipe 3: fork-coalesce-truncate-jsonl
 #
-#   csv source (blob)  →  fork gate (routes:{all:fork}, fork_to:[a, b])
+#   csv source (blob)  →  fork gate (routes:{all:fork}, fork_to:[path_a, path_b])
 #                       →  passthrough (path A)        + truncate (path B)
-#                       →  coalesce (merge=nested, {key_a:a_out, key_b:b_out})
+#                       →  coalesce (merge=nested, {key_a:path_a_out, key_b:path_b_out})
 #                       →  jsonl sink (one merged output)
 #
 # Wiring discipline (gate.fork_to ↔ path.input/on_success ↔ coalesce.branches)
@@ -605,10 +605,14 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
     truncate_field = slots["truncate_field"]
     max_chars = slots["max_chars"]
     suffix = slots["truncation_suffix"]
+    if key_a == key_b:
+        raise RecipeValidationError("fork/coalesce key_a and key_b must be distinct")
     if max_chars <= len(suffix):
         raise RecipeValidationError("fork/coalesce truncation max_chars must be greater than the truncation suffix length")
-    branch_a_output = f"{key_a}_out"
-    branch_b_output = f"{key_b}_out"
+    branch_a_input = "path_a"
+    branch_b_input = "path_b"
+    branch_a_output = "path_a_out"
+    branch_b_output = "path_b_out"
     return {
         "source": {
             "plugin": "csv",
@@ -630,17 +634,16 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
                 # while still forking every row.
                 "condition": "'all'",
                 "routes": {"all": "fork"},
-                # fork_to publishes one connection per branch. The branch names
-                # are the user-visible coalesce output keys; the branch mapping
-                # below points each key at the post-transform connection that the
-                # coalesce node consumes.
-                "fork_to": [key_a, key_b],
+                # Internal connection names are fixed and separate from the
+                # user-visible nested merge keys. This prevents a legitimate
+                # output key from colliding with source or sink connections.
+                "fork_to": [branch_a_input, branch_b_input],
             },
             {
                 "id": "path_a_passthrough",
                 "node_type": "transform",
                 "plugin": "passthrough",
-                "input": key_a,
+                "input": branch_a_input,
                 "on_success": branch_a_output,
                 "on_error": "discard",
                 "options": {
@@ -651,7 +654,7 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
                 "id": "path_b_truncate",
                 "node_type": "transform",
                 "plugin": "truncate",
-                "input": key_b,
+                "input": branch_b_input,
                 "on_success": branch_b_output,
                 "on_error": "discard",
                 "options": {
@@ -751,14 +754,22 @@ _SCRAPING_REASON_RE = re.compile(
     r"(?P<quote>['\"])(?P<reason>[^'\"]+)(?P=quote)",
     re.IGNORECASE,
 )
+_ABUSE_CONTACT_LABEL_RE = re.compile(r"\b(?:scraping\s+)?abuse[-_\s]+contact\b", re.IGNORECASE)
+_SCRAPING_REASON_LABEL_RE = re.compile(
+    r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_NEGATION_RE = re.compile(r"\b(?:do\s+not|don't|never|no|not)\b", re.IGNORECASE)
+_CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
 _RETENTION_CLAUSE_RE = re.compile(
     r"\b(?:keep|retain|project)\s+(?:only|exactly)\s+(?P<fields>.*?)"
-    r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:write|save|send|output)\b|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b))",
+    r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:(?:write|save|send|output)\b|(?:keep|retain|project)\s+(?:only|exactly)\b)"
+    r"|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b))",
     re.IGNORECASE | re.DOTALL,
 )
-_SEMANTIC_METADATA_BOUNDARY_RE = re.compile(
-    r"(?:[.;]|,?\s+(?:and|then)\s+(?:keep|retain|project)\b|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b)",
-    re.IGNORECASE,
+_PROJECTION_FIELD_LIST_RE = re.compile(
+    r"`[A-Za-z_][A-Za-z0-9_]*`"
+    r"(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)`[A-Za-z_][A-Za-z0-9_]*`)*",
 )
 
 _RECIPE_WEB_PROJECT_SLOTS: Final[dict[str, SlotSpec]] = {
@@ -1037,43 +1048,90 @@ def _unique_in_order(values: list[str]) -> tuple[str, ...]:
     return tuple(unique)
 
 
-def _web_response_field(user_text: str) -> str | None:
-    match = _RESPONSE_FIELD_RE.search(user_text)
-    if match is None:
-        return None
-    return match.group("quoted") or match.group("plain")
+def _web_response_contract(user_text: str) -> tuple[str, str] | None:
+    """Return one exact response field and semantic instruction, else abstain."""
 
-
-def _web_semantic_prompt_template(user_text: str) -> str | None:
-    """Render only the explicit response instruction into an LLM prompt."""
-
-    response_match = _RESPONSE_FIELD_RE.search(user_text)
-    if response_match is None:
+    response_matches = tuple(_RESPONSE_FIELD_RE.finditer(user_text))
+    if not response_matches:
         return None
-    remainder = user_text[response_match.start() :]
-    boundary = _SEMANTIC_METADATA_BOUNDARY_RE.search(remainder, response_match.end() - response_match.start())
-    instruction = remainder[: boundary.start() if boundary is not None else None].strip(" ,.;")
-    if not instruction:
+    nonsemantic_starts = tuple(
+        match.start() for pattern in (_RETENTION_CLAUSE_RE, _ABUSE_CONTACT_RE, _SCRAPING_REASON_RE) for match in pattern.finditer(user_text)
+    )
+    contracts: list[tuple[str, str]] = []
+    for index, response_match in enumerate(response_matches):
+        boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
+        if index + 1 < len(response_matches):
+            boundary_starts.append(response_matches[index + 1].start())
+        end = min(boundary_starts, default=len(user_text))
+        instruction = user_text[response_match.start() : end].strip(" ,.;")
+        instruction = re.sub(r"(?:[,;]\s*)?(?:and|then)\s*$", "", instruction, flags=re.IGNORECASE).strip(" ,.;")
+        field = response_match.group("quoted") or response_match.group("plain")
+        if not instruction or field is None:
+            return None
+        contracts.append((field, " ".join(instruction.split())))
+    contract = contracts[0]
+    if any(candidate != contract for candidate in contracts[1:]):
         return None
-    return f"User instruction: {instruction}\n\nPublic page content:\n{{{{ row['content'] }}}}"
+    field, instruction = contract
+    return field, f"User instruction: {instruction}\n\nPublic page content:\n{{{{ row['content'] }}}}"
 
 
 def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
-    """Return backtick fields from the explicit retention/projection clause."""
+    """Return one fully parsed exact retention/projection, else abstain."""
 
-    clause = _RETENTION_CLAUSE_RE.search(user_text)
-    if clause is None:
+    clauses = tuple(_RETENTION_CLAUSE_RE.finditer(user_text))
+    if not clauses:
         return None
-    return _unique_in_order([match.group("field") for match in _FIELD_TOKEN_RE.finditer(clause.group("fields"))])
+    projections: list[tuple[str, ...]] = []
+    for clause in clauses:
+        raw_fields = clause.group("fields").strip()
+        if _PROJECTION_FIELD_LIST_RE.fullmatch(raw_fields) is None:
+            return None
+        fields = tuple(match.group("field") for match in _FIELD_TOKEN_RE.finditer(raw_fields))
+        if not fields or len(set(fields)) != len(fields):
+            return None
+        projections.append(fields)
+    projection = projections[0]
+    if any(candidate != projection for candidate in projections[1:]):
+        return None
+    return projection
+
+
+def _has_negated_label_clause(user_text: str, label_pattern: re.Pattern[str]) -> bool:
+    return any(
+        label_pattern.search(clause) is not None and _AUTHORITY_NEGATION_RE.search(clause) is not None
+        for clause in _CLAUSE_DELIMITER_RE.split(user_text)
+    )
 
 
 def _web_abuse_contact(user_text: str) -> str | None:
-    """Return an email only when explicitly labelled as the abuse contact."""
+    """Return one affirmative explicitly labelled abuse contact, else abstain."""
 
-    match = _ABUSE_CONTACT_RE.search(user_text)
-    if match is None:
+    if _has_negated_label_clause(user_text, _ABUSE_CONTACT_LABEL_RE):
         return None
-    return match.group("after") or match.group("before")
+    matches = tuple(_ABUSE_CONTACT_RE.finditer(user_text))
+    if not matches:
+        return None
+    contacts = tuple(match.group("after") or match.group("before") for match in matches)
+    contact = contacts[0]
+    if contact is None or any(candidate != contact for candidate in contacts[1:]):
+        return None
+    return contact
+
+
+def _web_scraping_reason(user_text: str) -> str | None:
+    """Return one exact explicitly labelled ASCII scraping reason, else abstain."""
+
+    if _has_negated_label_clause(user_text, _SCRAPING_REASON_LABEL_RE):
+        return None
+    matches = tuple(_SCRAPING_REASON_RE.finditer(user_text))
+    if not matches:
+        return None
+    reasons = tuple(match.group("reason").strip() for match in matches)
+    reason = reasons[0]
+    if not reason or not reason.isascii() or any(candidate != reason for candidate in reasons[1:]):
+        return None
+    return reason
 
 
 def _single_llm_profile(context: RecipeIntentContext) -> str | None:
@@ -1118,12 +1176,10 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     if not output_binding.path:
         return None
 
-    response_field = _web_response_field(context.user_text)
-    if response_field is None:
+    response_contract = _web_response_contract(context.user_text)
+    if response_contract is None:
         return None
-    prompt_template = _web_semantic_prompt_template(context.user_text)
-    if prompt_template is None:
-        return None
+    response_field, prompt_template = response_contract
     mentioned_source_fields = tuple(
         field
         for field in source.field_names
@@ -1149,11 +1205,8 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     abuse_contact = _web_abuse_contact(context.user_text)
     if abuse_contact is None:
         return None
-    reason_match = _SCRAPING_REASON_RE.search(context.user_text)
-    if reason_match is None:
-        return None
-    reason = reason_match.group("reason").strip()
-    if not reason or not reason.isascii():
+    reason = _web_scraping_reason(context.user_text)
+    if reason is None:
         return None
     return RecipeIntentCandidate(
         slots={
