@@ -1,69 +1,37 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it } from "vitest";
 
 import { ModelChip } from "./ModelChip";
-import * as apiClient from "@/api/client";
-import type { SystemStatus } from "@/types/index";
+import { useSessionStore } from "@/stores/sessionStore";
+import { resetStore } from "@/test/store-helpers";
 
-vi.mock("@/api/client", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("@/api/client")>();
-  return {
-    ...actual,
-    fetchSystemStatus: vi.fn(),
-  };
-});
-
-const fetchSystemStatus = vi.mocked(apiClient.fetchSystemStatus);
-
-function makeStatus(overrides: Partial<SystemStatus> = {}): SystemStatus {
-  return {
-    composer_available: true,
-    composer_model: "anthropic/claude-sonnet-4.6",
-    composer_provider: "openrouter",
-    composer_reason: null,
-    composer_missing_keys: [],
-    ...overrides,
-  };
-}
+// The chip is a pure store reader: App's health poll is the app's single
+// /api/system/status consumer and publishes composerModel into the session
+// store (one derivation per surface — a chip-owned fetch raced sequenced
+// test doubles and double-fetched in production, elspeth-8fa71e6d15).
 
 describe("ModelChip", () => {
   beforeEach(() => {
-    vi.resetAllMocks();
+    resetStore(useSessionStore);
   });
 
-  it("shows the composer model from system status with an accessible label", async () => {
-    fetchSystemStatus.mockResolvedValue(makeStatus());
+  it("shows the composer model from the store with an accessible label", () => {
+    useSessionStore.setState({
+      composerModel: "anthropic/claude-sonnet-4.6",
+    });
 
     render(<ModelChip />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-      ).toBeInTheDocument();
-    });
+    expect(
+      screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
+    ).toBeInTheDocument();
     expect(screen.getByText("anthropic/claude-sonnet-4.6")).toBeInTheDocument();
   });
 
-  it("renders nothing while the model is unknown or the status call fails", async () => {
-    fetchSystemStatus.mockRejectedValue(new Error("offline"));
-
+  it("renders nothing while no model is known", () => {
+    // Absence of chrome, never a fabricated model name. composerModel stays
+    // null until a successful health poll reports a non-empty model.
     const { container } = render(<ModelChip />);
-
-    // Absence of chrome, never a fabricated model name.
-    await waitFor(() => {
-      expect(fetchSystemStatus).toHaveBeenCalled();
-    });
-    expect(container).toBeEmptyDOMElement();
-  });
-
-  it("renders nothing when the deployment reports no composer model", async () => {
-    fetchSystemStatus.mockResolvedValue(makeStatus({ composer_model: "" }));
-
-    const { container } = render(<ModelChip />);
-
-    await waitFor(() => {
-      expect(fetchSystemStatus).toHaveBeenCalled();
-    });
     expect(container).toBeEmptyDOMElement();
   });
 });

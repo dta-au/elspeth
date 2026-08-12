@@ -283,6 +283,18 @@ function App() {
     try {
       const status = await api.fetchSystemStatus();
       setSystemStatus(status);
+      // Publish the deployment's composer-model identity for the AppHeader
+      // chip. One derivation per surface: this poll is the app's single
+      // /api/system/status consumer — the chip must never fetch on its own
+      // (a second consumer raced sequenced test doubles and double-fetched
+      // in production). Set on success only; a later failed poll keeps the
+      // last known value (the backend banner owns unreachability).
+      if (
+        typeof status.composer_model === "string" &&
+        status.composer_model.length > 0
+      ) {
+        useSessionStore.getState().setComposerModel(status.composer_model);
+      }
       // Derive the compose abort ceiling from the deployment's configured
       // wall clock — a hard-coded client cap only satisfies the
       // client-outlives-server invariant for the checked-in defaults.

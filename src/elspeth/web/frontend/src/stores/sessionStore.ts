@@ -1104,6 +1104,16 @@ interface SessionState {
    */
   composerTimeoutUnavailable: boolean;
   setComposerTimeoutUnavailable: (unavailable: boolean) => void;
+  /**
+   * Deployment-level composer model identity (ELSPETH_WEB__COMPOSER_MODEL),
+   * written by App's health poll — the single /api/system/status consumer —
+   * and read by the AppHeader ModelChip. NULL until a successful poll
+   * reports a non-empty model; a later failed poll does not clear it (the
+   * fact is deployment configuration, not liveness — the backend banner
+   * owns unreachability).
+   */
+  composerModel: string | null;
+  setComposerModel: (model: string | null) => void;
   stateVersions: CompositionStateVersion[];
   error: string | null;
   /**
@@ -1284,6 +1294,7 @@ const initialState = {
   isComposing: false,
   composeTimeoutReady: false,
   composerTimeoutUnavailable: false,
+  composerModel: null as string | null,
   stateVersions: [] as CompositionStateVersion[],
   isLoadingVersions: false,
   error: null as string | null,
@@ -1306,6 +1317,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
 
   setComposerTimeoutUnavailable(unavailable) {
     set({ composerTimeoutUnavailable: unavailable });
+  },
+
+  setComposerModel(model) {
+    set({ composerModel: model });
   },
 
   async loadSessions() {

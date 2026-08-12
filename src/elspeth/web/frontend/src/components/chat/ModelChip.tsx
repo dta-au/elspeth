@@ -1,42 +1,23 @@
 // src/components/chat/ModelChip.tsx
 //
-// Persistent composer-model identity chip for the chat header
-// (elspeth-e9f7678de8). ELSPETH is an auditability product whose runs record
-// model identity — the authoring surface should show which model is doing the
-// composing, not leave it discoverable only through an LLM-side list_models
-// lookup.
+// Composer-model identity chip in the AppHeader identity cluster
+// (elspeth-e9f7678de8; relocated from the chat-panel headers by
+// elspeth-8fa71e6d15). ELSPETH is an auditability product whose runs record
+// model identity — the authoring surface should show which model is doing
+// the composing, not leave it discoverable only through an LLM-side
+// list_models lookup.
 //
-// The model comes from GET /api/system/status (`composer_model`), the same
-// deployment-level source App.tsx polls for the composer-availability banner.
-// It is deployment configuration (ELSPETH_WEB__COMPOSER_MODEL), not per-turn
-// state, so a single fetch on mount is sufficient. When the status endpoint
-// is unreachable or reports no model, the chip renders nothing — absence of
-// chrome, never a fabricated model name.
+// The model is deployment configuration (ELSPETH_WEB__COMPOSER_MODEL),
+// published into the session store by App's health poll — the app's single
+// /api/system/status consumer. The chip deliberately does NOT fetch: a
+// second consumer of that endpoint double-fetched in production and raced
+// sequenced test doubles. When no model is known the chip renders nothing —
+// absence of chrome, never a fabricated model name.
 
-import { useEffect, useState } from "react";
-
-import { fetchSystemStatus } from "@/api/client";
+import { useSessionStore } from "@/stores/sessionStore";
 
 export function ModelChip() {
-  const [model, setModel] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const status = await fetchSystemStatus();
-        if (!cancelled && typeof status?.composer_model === "string" && status.composer_model.length > 0) {
-          setModel(status.composer_model);
-        }
-      } catch {
-        // Status endpoint unreachable — App.tsx's health banner owns that
-        // failure story; the chip simply stays absent.
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  const model = useSessionStore((s) => s.composerModel);
 
   if (model === null) return null;
 
