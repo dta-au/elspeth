@@ -624,7 +624,11 @@ class TestTransformExecutor:
 
         factory = _make_factory()
         ownership_loss = SchedulerLeaseLostError(work_item_id="work-old", lease_owner="worker-old", run_id="run_1")
-        before_terminal_audit = MagicMock(side_effect=ownership_loss)
+
+        def heartbeat_seam() -> None:
+            """Spec target matching TransformExecutor's ``before_terminal_audit: Callable[[], None]``."""
+
+        before_terminal_audit = MagicMock(spec=heartbeat_seam, side_effect=ownership_loss)
         executor = TransformExecutor(
             factory.execution,
             _make_span_factory(),
