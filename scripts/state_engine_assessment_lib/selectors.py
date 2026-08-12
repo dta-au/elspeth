@@ -284,7 +284,10 @@ def _validate_full_node_id(repository_root: Path, lane_id: str, node_id: str) ->
     path = _repository_path(repository_root, selector_path, f"selector lane {lane_id} node")
     _require(path.is_relative_to(repository_root / "tests"), f"selector lane {lane_id} node must be under tests/")
     _require(path.is_file(), f"selector lane {lane_id} node path does not exist: {selector_path}")
-    leaf = node_id.rsplit("::", 1)[-1]
+    # A parametrization ID may legally contain "::" (e.g. the plugin lifecycle
+    # matrix's "profile::plugin" case IDs), so derive the function leaf from
+    # the node ID with any "[...]" suffix removed.
+    leaf = node_id.split("[", 1)[0].rsplit("::", 1)[-1]
     _require(leaf.startswith("test_"), f"selector lane {lane_id} node must be a full pytest node ID")
 
 

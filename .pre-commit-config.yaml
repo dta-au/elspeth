@@ -23,6 +23,10 @@ repos:
       - id: check-toml
       - id: check-added-large-files
         args: ['--maxkb=1000']
+        # The v3 evidence selector manifest legitimately carries all 7,010
+        # required-cell assignments; its integrity is guarded by its own
+        # validator (validate-selectors CLI + architecture test), not by size.
+        exclude: '^docs/architecture/state_engine/proof-catalog/v3/evidence_selectors\.json$'
       - id: check-merge-conflict
       - id: debug-statements
 

@@ -133,7 +133,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         joined = "\n".join(f"- {node_id}" for node_id in sorted(uncontained_remote_nodes))
         raise pytest.UsageError("remote-service test nodes must carry @pytest.mark.live_provider:\n" + joined)
     selected_live_nodes = [item.nodeid for item in items if item.get_closest_marker("live_provider") is not None]
-    if selected_live_nodes and not config.getoption("run_live_provider"):
+    if selected_live_nodes and not config.getoption("run_live_provider") and not config.getoption("collectonly"):
+        # Collection-only inventory (the selector-manifest validator's exact
+        # node accounting) is authority-free; execution stays double-gated by
+        # this check and pytest_runtest_setup below.
         raise pytest.UsageError("--run-live-provider is required to select @pytest.mark.live_provider nodes")
 
 

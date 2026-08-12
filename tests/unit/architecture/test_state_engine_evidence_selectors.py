@@ -15,6 +15,7 @@ from scripts.state_engine_assessment_lib.selectors import (
     ARTIFACT_KINDS,
     LANE_SPECS,
     _collect_pytest_node_ids,
+    validate_selector_manifest,
     validate_selector_manifest_data,
 )
 
@@ -312,3 +313,13 @@ def test_real_pytest_collector_returns_the_exact_requested_node_without_executio
     )
 
     assert _collect_pytest_node_ids(REPOSITORY_ROOT, "not live_provider", [node_id]) == [node_id]
+
+
+def test_committed_selector_manifest_validates_against_the_v3_catalog() -> None:
+    """The checked-in manifest is the Task 12 handoff: every executable
+    v3-required cell assigned exactly once, every node collectible in its lane."""
+    validate_selector_manifest(
+        REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json",
+        CATALOG_PATH,
+        repository_root=REPOSITORY_ROOT,
+    )
