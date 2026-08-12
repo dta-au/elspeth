@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
@@ -397,6 +398,17 @@ _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARG
 
 _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
+
+
+def _effective_reviewed_output_format(*, plugin: str, path: str, options: Mapping[str, Any]) -> str | None:
+    """Resolve a reviewed sink format without inventing non-JSON defaults."""
+
+    explicit = options["format"] if "format" in options else None
+    if explicit is not None:
+        return explicit if type(explicit) is str else None
+    if plugin != "json":
+        return None
+    return "jsonl" if Path(path).suffix == ".jsonl" else "json"
 
 
 async def try_prepare_registered_recipe_plan(
@@ -3803,8 +3815,9 @@ class ComposerServiceImpl:
                 for stable_id in guided.output_order
                 for reviewed in (guided.reviewed_outputs[stable_id],)
                 for path in (reviewed.options.get("path"),)
-                for output_format in (reviewed.options.get("format") if "format" in reviewed.options else "jsonl",)
-                if type(path) is str and type(output_format) is str
+                if type(path) is str
+                for output_format in (_effective_reviewed_output_format(plugin=reviewed.plugin, path=path, options=reviewed.options),)
+                if output_format is not None
             )
             recipe_plan = await try_prepare_registered_recipe_plan(
                 intent_context=RecipeIntentContext(

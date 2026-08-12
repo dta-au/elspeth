@@ -605,6 +605,8 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
     truncate_field = slots["truncate_field"]
     max_chars = slots["max_chars"]
     suffix = slots["truncation_suffix"]
+    if max_chars <= len(suffix):
+        raise RecipeValidationError("fork/coalesce truncation max_chars must be greater than the truncation suffix length")
     branch_a_output = f"{key_a}_out"
     branch_b_output = f"{key_b}_out"
     return {
@@ -738,10 +740,24 @@ _RESPONSE_FIELD_RE = re.compile(
     r"(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)`|(?P<plain>[A-Za-z_][A-Za-z0-9_]*))",
     re.IGNORECASE,
 )
-_ABUSE_CONTACT_RE = re.compile(r"\b[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_EMAIL_PATTERN: Final[str] = r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"
+_ABUSE_CONTACT_RE = re.compile(
+    rf"(?:\babuse[-_\s]+contact(?:\s+(?:is\s+)?|\s*[:=]\s*)(?P<after>{_EMAIL_PATTERN})"
+    rf"|\b(?P<before>{_EMAIL_PATTERN})\s+as\s+(?:the\s+)?(?:scraping\s+)?abuse[-_\s]+contact\b)",
+    re.IGNORECASE,
+)
 _SCRAPING_REASON_RE = re.compile(
     r"\b(?:scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\s*(?:is|:)?\s*"
     r"(?P<quote>['\"])(?P<reason>[^'\"]+)(?P=quote)",
+    re.IGNORECASE,
+)
+_RETENTION_CLAUSE_RE = re.compile(
+    r"\b(?:keep|retain|project)\s+(?:only|exactly)\s+(?P<fields>.*?)"
+    r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:write|save|send|output)\b|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b))",
+    re.IGNORECASE | re.DOTALL,
+)
+_SEMANTIC_METADATA_BOUNDARY_RE = re.compile(
+    r"(?:[.;]|,?\s+(?:and|then)\s+(?:keep|retain|project)\b|,?\s+(?:and\s+)?(?:abuse[-_\s]+contact|scraping\s+reason|reason\s+for\s+(?:the\s+)?(?:scrape|fetch))\b)",
     re.IGNORECASE,
 )
 
@@ -1028,6 +1044,38 @@ def _web_response_field(user_text: str) -> str | None:
     return match.group("quoted") or match.group("plain")
 
 
+def _web_semantic_prompt_template(user_text: str) -> str | None:
+    """Render only the explicit response instruction into an LLM prompt."""
+
+    response_match = _RESPONSE_FIELD_RE.search(user_text)
+    if response_match is None:
+        return None
+    remainder = user_text[response_match.start() :]
+    boundary = _SEMANTIC_METADATA_BOUNDARY_RE.search(remainder, response_match.end() - response_match.start())
+    instruction = remainder[: boundary.start() if boundary is not None else None].strip(" ,.;")
+    if not instruction:
+        return None
+    return f"User instruction: {instruction}\n\nPublic page content:\n{{{{ row['content'] }}}}"
+
+
+def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
+    """Return backtick fields from the explicit retention/projection clause."""
+
+    clause = _RETENTION_CLAUSE_RE.search(user_text)
+    if clause is None:
+        return None
+    return _unique_in_order([match.group("field") for match in _FIELD_TOKEN_RE.finditer(clause.group("fields"))])
+
+
+def _web_abuse_contact(user_text: str) -> str | None:
+    """Return an email only when explicitly labelled as the abuse contact."""
+
+    match = _ABUSE_CONTACT_RE.search(user_text)
+    if match is None:
+        return None
+    return match.group("after") or match.group("before")
+
+
 def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     snapshot = context.policy_snapshot
     if snapshot is None:
@@ -1073,6 +1121,9 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     response_field = _web_response_field(context.user_text)
     if response_field is None:
         return None
+    prompt_template = _web_semantic_prompt_template(context.user_text)
+    if prompt_template is None:
+        return None
     mentioned_source_fields = tuple(
         field
         for field in source.field_names
@@ -1081,10 +1132,13 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     if len(mentioned_source_fields) != 1:
         return None
     locator_field = mentioned_source_fields[0]
-    quoted_fields = _unique_in_order([match.group("field") for match in _FIELD_TOKEN_RE.finditer(context.user_text)])
-    retained_fields = tuple(field for field in quoted_fields if field in {*source.field_names, response_field})
-    if not retained_fields and "keep only" in lower:
-        retained_fields = (response_field,)
+    explicit_retained_fields = _web_retained_fields(context.user_text)
+    if explicit_retained_fields is None:
+        return None
+    known_fields = {*source.field_names, response_field}
+    if any(field not in known_fields for field in explicit_retained_fields):
+        return None
+    retained_fields = explicit_retained_fields
     if not retained_fields or response_field not in retained_fields or _RAW_SCRAPE_FIELDS.intersection(retained_fields):
         return None
     if output.required_fields and tuple(output.required_fields) != retained_fields:
@@ -1092,8 +1146,8 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     profile = _single_llm_profile(context)
     if profile is None:
         return None
-    contact_match = _ABUSE_CONTACT_RE.search(context.user_text)
-    if contact_match is None:
+    abuse_contact = _web_abuse_contact(context.user_text)
+    if abuse_contact is None:
         return None
     reason_match = _SCRAPING_REASON_RE.search(context.user_text)
     if reason_match is None:
@@ -1107,9 +1161,10 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
             "source_plugin": source_binding.plugin,
             "locator_field": locator_field,
             "profile": profile,
+            "prompt_template": prompt_template,
             "response_field": response_field,
             "retained_fields": retained_fields,
-            "abuse_contact": contact_match.group(0),
+            "abuse_contact": abuse_contact,
             "scraping_reason": reason,
             "output_path": output_binding.path,
         }
@@ -1290,7 +1345,8 @@ def match_registered_recipe_intent(context: RecipeIntentContext) -> RecipeIntent
                 if len(missing_blob_slots) != 1:
                     continue
                 validation_slots[missing_blob_slots[0]] = _INLINE_SOURCE_BLOB_SENTINEL
-            validate_slots(recipe, validation_slots)
+            coerced_slots = validate_slots(recipe, validation_slots)
+            recipe.build(coerced_slots)
             if (
                 context.policy_snapshot is not None
                 and unavailable_recipe_plugin(

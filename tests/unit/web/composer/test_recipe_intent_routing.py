@@ -52,6 +52,16 @@ alice,a sufficiently long note"""
     assert match.slots == {"truncate_field": "notes", "max_chars": 12}
 
 
+def test_fork_match_rejects_sparse_slots_when_defaults_violate_build_constraints() -> None:
+    prompt = """Process these rows two ways in parallel and combine them into a single merged output row.
+Path A keeps each row unchanged and path B truncates the notes field to 2 characters.
+Customer rows (CSV):
+name,notes
+alice,a sufficiently long note"""
+
+    assert match_freeform_recipe_intent(prompt) is None
+
+
 def test_freeform_recipe_intent_match_deep_freezes_slots() -> None:
     match = FreeformRecipeIntentMatch(
         recipe_name="example",

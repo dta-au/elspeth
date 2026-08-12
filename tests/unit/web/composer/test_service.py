@@ -50,7 +50,7 @@ from elspeth.web.composer.protocol import (
     PipelineCommitIntent,
     ToolArgumentError,
 )
-from elspeth.web.composer.recipes import RecipeIntentContext, recipe_catalog_content_hash
+from elspeth.web.composer.recipes import RecipeIntentContext, match_registered_recipe_intent, recipe_catalog_content_hash
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerAvailability,
@@ -82,7 +82,7 @@ from elspeth.web.execution.schemas import (
     ValidationResult as ValidationResultModel,
 )
 from elspeth.web.interpretation_state import INTERPRETATION_REVIEW_PENDING_CODE
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.protocol import GuidedOperationFence
@@ -206,13 +206,30 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("output_path", "include_format", "reviewed_format", "expected_format"),
+    [
+        ("outputs/projected.json", False, None, "json"),
+        ("outputs/projected.jsonl", False, None, "jsonl"),
+        ("outputs/projected.json", True, None, "json"),
+        ("outputs/projected.jsonl", True, "json", "json"),
+        ("outputs/projected.json", True, "jsonl", "jsonl"),
+    ],
+)
 async def test_guided_reviewed_boundary_attempts_registered_recipe_before_provider(
     composer_service_with_real_sessions: ComposerServiceImpl,
     monkeypatch: pytest.MonkeyPatch,
+    output_path: str,
+    include_format: bool,
+    reviewed_format: str | None,
+    expected_format: str,
 ) -> None:
     source_id = "11111111-1111-4111-8111-111111111111"
     output_id = "22222222-2222-4222-8222-222222222222"
     blob_id = str(uuid4())
+    output_options: dict[str, object] = {"path": output_path}
+    if include_format:
+        output_options["format"] = reviewed_format
     guided = GuidedSession(
         step=GuidedStep.STEP_3_TRANSFORMS,
         root_intent_message_id="33333333-3333-4333-8333-333333333333",
@@ -232,7 +249,7 @@ async def test_guided_reviewed_boundary_attempts_registered_recipe_before_provid
             output_id: SinkOutputResolved(
                 name="projected",
                 plugin="json",
-                options={"path": "outputs/projected.jsonl", "format": "jsonl"},
+                options=output_options,
                 required_fields=("document_uri", "abstract"),
                 schema_mode="observed",
                 on_write_failure="discard",
@@ -241,21 +258,39 @@ async def test_guided_reviewed_boundary_attempts_registered_recipe_before_provid
     )
     sentinel_plan = object()
     captured: dict[str, Any] = {}
+    provider_calls: list[dict[str, Any]] = []
 
     async def capture_registered_recipe(**kwargs: Any) -> object:
         captured.update(kwargs)
+        context = kwargs["intent_context"]
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+        llm_id = PluginId("transform", "llm")
+        single_profile_snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash=snapshot.policy_hash,
+            principal_scope=snapshot.principal_scope,
+            available=snapshot.available,
+            unavailable=snapshot.unavailable,
+            selected=snapshot.selected,
+            usable_profile_aliases=((llm_id, ("approved-summary",)),),
+            selected_profile_aliases=((llm_id, "approved-summary"),),
+            binding_generation_fingerprint=snapshot.binding_generation_fingerprint,
+            control_modes=snapshot.control_modes,
+            authority=snapshot.authority,
+        )
+        match = match_registered_recipe_intent(replace(context, policy_snapshot=single_profile_snapshot))
+        return sentinel_plan if match is not None else None
+
+    async def capture_provider_plan(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
         return sentinel_plan
 
     monkeypatch.setattr("elspeth.web.composer.service.try_prepare_registered_recipe_plan", capture_registered_recipe)
-    monkeypatch.setattr(
-        "elspeth.web.composer.service.plan_pipeline",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("registered recipe should run before provider")),
-    )
+    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_provider_plan)
     session_id = uuid4()
     result, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
         intent=(
             "Fetch every `document_uri`, have an LLM write a short `abstract`, and retain exactly "
-            "`document_uri` and `abstract`. Contact ops@agency.gov.au; "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
             "scraping reason: 'Public-page abstract research'."
         ),
         current_state=_empty_state(),
@@ -284,7 +319,9 @@ async def test_guided_reviewed_boundary_attempts_registered_recipe_before_provid
     assert context.reviewed_sources[0].field_names == ("document_uri",)
     assert context.reviewed_outputs[0].required_fields == ("document_uri", "abstract")
     assert context.source_bindings[0].blob_id == blob_id
-    assert context.output_bindings[0].path == "outputs/projected.jsonl"
+    assert context.output_bindings[0].path == output_path
+    assert context.output_bindings[0].format == expected_format
+    assert len(provider_calls) == (1 if expected_format == "json" else 0)
 
 
 @pytest.mark.asyncio
@@ -400,7 +437,7 @@ async def test_guided_complete_registered_recipe_prepares_real_plan_without_prov
     plan, _catalog_ids = await composer_service_with_real_sessions.plan_guided_pipeline(
         intent=(
             "Fetch every `document_uri`, have an LLM write a short `abstract`, and retain exactly "
-            "`document_uri` and `abstract`. Contact ops@agency.gov.au; "
+            "`document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
             "scraping reason: 'Public-page abstract research'."
         ),
         current_state=_empty_state(),
