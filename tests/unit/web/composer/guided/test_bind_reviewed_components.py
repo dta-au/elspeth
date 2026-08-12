@@ -24,6 +24,7 @@ from elspeth.web.composer.guided import planning as guided_planning
 from elspeth.web.composer.guided.planning import (
     GuidedCandidateBindingRejected,
     GuidedCorrectionTarget,
+    GuidedEdgeRoutingAuthority,
     GuidedRevisionAuthority,
     bind_guided_reviewed_components,
     guided_authorized_pipeline_schema,
@@ -161,6 +162,93 @@ def test_initial_guided_delta_schema_excludes_reviewed_configuration_authority()
         {**base, "output_targets": [{**base["output_targets"][0], "on_write_failure": None}]},
     )
     assert all(list(validator.iter_errors(candidate)) for candidate in adversarial)
+
+
+def test_edge_correction_schema_exposes_only_one_selected_routing_patch() -> None:
+    target = GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="edge", stable_id="77777777-7777-4777-8777-777777777777"),
+        owner_kind="node",
+        owner_key="amount_gate",
+        authority_key=None,
+        public_target={
+            "stable_id": "77777777-7777-4777-8777-777777777777",
+            "from_endpoint": {"kind": "node", "stable_id": "66666666-6666-4666-8666-666666666666"},
+            "to_endpoint": {"kind": "node", "stable_id": "55555555-5555-4555-8555-555555555555"},
+            "flow": {"kind": "gate_route", "route": "route-1", "branch": None},
+        },
+        before_fingerprint="3" * 64,
+    )
+
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=target)
+
+    assert set(schema["properties"]) == {"edge_patch"}
+    patch_schema = schema["properties"]["edge_patch"]
+    assert set(patch_schema["properties"]) == {"stable_id", "to_node"}
+    assert patch_schema["properties"]["stable_id"]["const"] == target.requested.stable_id
+    validator = Draft202012Validator(schema)
+    valid = {"edge_patch": {"stable_id": target.requested.stable_id, "to_node": "revised_rows"}}
+    assert not list(validator.iter_errors(valid))
+    assert list(validator.iter_errors({**valid, "nodes": []}))
+    assert list(
+        validator.iter_errors(
+            {
+                "edge_patch": {
+                    **valid["edge_patch"],
+                    "condition": "True",
+                    "routes": {"false": "discard"},
+                }
+            }
+        )
+    )
+
+
+def test_edge_correction_materializer_reroutes_only_the_selected_gate_route() -> None:
+    predecessor = _correction_predecessor()
+    edge_id = "77777777-7777-4777-8777-777777777777"
+    target = GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="edge", stable_id=edge_id),
+        owner_kind="node",
+        owner_key="amount_gate",
+        authority_key=None,
+        public_target={
+            "stable_id": edge_id,
+            "from_endpoint": {"kind": "node", "stable_id": "66666666-6666-4666-8666-666666666666"},
+            "to_endpoint": {"kind": "node", "stable_id": "55555555-5555-4555-8555-555555555555"},
+            "flow": {"kind": "gate_route", "route": "route-1", "branch": None},
+        },
+        before_fingerprint="3" * 64,
+        edge_routing=GuidedEdgeRoutingAuthority(
+            field="routes",
+            route_key="true",
+            fork_index=None,
+            before_destination="high_value",
+        ),
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"edge_patch": {"stable_id": edge_id, "to_node": "standard"}},
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][0]
+    assert bound["nodes"][0]["routes"] == {"true": "standard", "false": "standard"}
+    assert bound["nodes"][0]["condition"] == before["condition"]
+    assert bound["nodes"][0].get("fork_to") == before.get("fork_to")
+    assert bound["nodes"][0]["options"] == before["options"]
+    assert bound["nodes"][1:] == predecessor.to_dict()["nodes"][1:]
+
+
+def test_node_correction_schema_exposes_a_public_patch_not_a_canonical_node() -> None:
+    schema = guided_authorized_pipeline_schema(_guided(), correction_target=_format_node_correction_target())
+
+    assert set(schema["properties"]) == {"node_patch", "edges"}
+    patch_schema = schema["properties"]["node_patch"]
+    assert patch_schema["properties"]["stable_id"]["const"] == _format_node_correction_target().requested.stable_id
+    assert "id" not in patch_schema["properties"]
+    assert "node_type" not in patch_schema["properties"]
+    assert "plugin" not in patch_schema["properties"]
 
 
 def test_initial_guided_delta_materializes_reviewed_authority_server_side() -> None:
@@ -1071,9 +1159,20 @@ def _node_correction_target(owner_key: str, *, stable_id: str) -> GuidedCorrecti
 
 
 def _format_node_correction_target() -> GuidedCorrectionTarget:
-    return _node_correction_target(
-        "format_high_value",
-        stable_id="44444444-4444-4444-8444-444444444444",
+    stable_id = "44444444-4444-4444-8444-444444444444"
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="node", stable_id=stable_id),
+        owner_kind="node",
+        owner_key="format_high_value",
+        authority_key="format_high_value",
+        public_target={
+            "stable_id": stable_id,
+            "node_type": "transform",
+            "plugin": {"kind": "transform", "id": "field_mapper"},
+            "behavior": {"kind": "transform"},
+            "node_options_summary": [],
+        },
+        before_fingerprint="0" * 64,
     )
 
 
@@ -1182,7 +1281,7 @@ def test_bind_rejects_malformed_selected_node_options_as_repairable_candidate_sh
     else:
         candidate["nodes"][2]["options"] = malformed_options
 
-    with pytest.raises(AuditIntegrityError) as raised:
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
         bind_guided_reviewed_components(
             candidate,
             _guided(),
@@ -1190,6 +1289,7 @@ def test_bind_rejects_malformed_selected_node_options_as_repairable_candidate_sh
             correction_target=_format_node_correction_target(),
         )
     assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
+    assert raised.value.error_code == "guided_delta_authority_violation"
 
 
 def test_bind_rejects_selected_gate_replaced_with_passthrough_transform() -> None:
@@ -2008,7 +2108,16 @@ def test_node_correction_materializer_preserves_every_unselected_node_byte() -> 
     candidate = _planner_correction_candidate()
     selected = candidate["nodes"][2]
     bound = materialize_guided_authorized_candidate(
-        {"nodes": [selected], "edges": []},
+        {
+            "node_patch": {
+                "stable_id": _format_node_correction_target().requested.stable_id,
+                "options": {
+                    "mapping": selected["options"]["mapping"],
+                    "select_only": selected["options"]["select_only"],
+                },
+            },
+            "edges": [],
+        },
         authority=_format_node_correction_target(),
         guided=_guided(),
         current_state=predecessor,
@@ -2023,6 +2132,129 @@ def test_node_correction_materializer_preserves_every_unselected_node_byte() -> 
         "schema": {"mode": "observed", "required_fields": ["amount"]},
     }
     assert bound["outputs"][0]["options"] == {"path": "outputs/colours.json"}
+
+
+def _public_node_correction_target(
+    owner_key: str,
+    *,
+    stable_id: str,
+    node_type: str,
+    plugin: str | None,
+    behavior: dict[str, object],
+) -> GuidedCorrectionTarget:
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(kind="node", stable_id=stable_id),
+        owner_kind="node",
+        owner_key=owner_key,
+        authority_key=owner_key,
+        public_target={
+            "stable_id": stable_id,
+            "node_type": node_type,
+            "plugin": ({"kind": "transform", "id": plugin} if plugin is not None else None),
+            "behavior": behavior,
+            "node_options_summary": [],
+        },
+        before_fingerprint="4" * 64,
+    )
+
+
+def test_node_patch_overlays_gate_condition_without_reauthoring_hidden_routes() -> None:
+    predecessor = _correction_predecessor()
+    stable_id = "66666666-6666-4666-8666-666666666666"
+    target = _public_node_correction_target(
+        "amount_gate",
+        stable_id=stable_id,
+        node_type="gate",
+        plugin=None,
+        behavior={
+            "kind": "gate",
+            "condition": "row['amount'] > 500",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [],
+        },
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"node_patch": {"stable_id": stable_id, "condition": "row['amount'] >= 500"}, "edges": []},
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][0]
+    assert bound["nodes"][0]["condition"] == "row['amount'] >= 500"
+    assert bound["nodes"][0]["routes"] == before["routes"]
+    assert bound["nodes"][0].get("fork_to") == before.get("fork_to")
+    assert bound["nodes"][0]["options"] == before["options"]
+
+
+def test_node_patch_overlays_coalesce_policy_without_reauthoring_hidden_branches() -> None:
+    predecessor = _coalesce_correction_predecessor()
+    stable_id = "77777777-7777-4777-8777-777777777777"
+    target = _public_node_correction_target(
+        "merge_branches",
+        stable_id=stable_id,
+        node_type="coalesce",
+        plugin=None,
+        behavior={
+            "kind": "coalesce",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "merge": "union",
+            "timeout_seconds": None,
+        },
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"node_patch": {"stable_id": stable_id, "policy": "best_effort"}, "edges": []},
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][3]
+    assert bound["nodes"][3]["policy"] == "best_effort"
+    assert bound["nodes"][3]["branches"] == before["branches"]
+    assert bound["nodes"][3]["merge"] == before["merge"]
+    assert bound["nodes"][3]["options"] == before["options"]
+
+
+def test_node_patch_overlays_row_union_timeout_without_reauthoring_hidden_branches() -> None:
+    coalesce = _coalesce_correction_predecessor()
+    row_union = replace(
+        coalesce.nodes[3],
+        node_type="row_union",
+        policy=None,
+        merge=None,
+        timeout_seconds=15.0,
+    )
+    predecessor = replace(coalesce, nodes=(*coalesce.nodes[:3], row_union, *coalesce.nodes[4:]))
+    stable_id = "88888888-8888-4888-8888-888888888888"
+    target = _public_node_correction_target(
+        "merge_branches",
+        stable_id=stable_id,
+        node_type="row_union",
+        plugin=None,
+        behavior={
+            "kind": "row_union",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "timeout_seconds": 15.0,
+        },
+    )
+
+    bound = materialize_guided_authorized_candidate(
+        {"node_patch": {"stable_id": stable_id, "timeout_seconds": 30.0}, "edges": []},
+        authority=target,
+        guided=_guided(),
+        current_state=predecessor,
+    )
+
+    before = predecessor.to_dict()["nodes"][3]
+    assert bound["nodes"][3]["timeout_seconds"] == 30.0
+    assert bound["nodes"][3]["branches"] == before["branches"]
+    assert bound["nodes"][3]["options"] == before["options"]
 
 
 def test_output_correction_reconnects_upstream_scalar_and_preserves_sink_authority() -> None:
@@ -2382,7 +2614,16 @@ def test_selected_node_correction_delta_matches_equivalent_full_candidate_state(
     guided = _boundary_valid_correction_guided()
     predecessor = _boundary_valid_correction_predecessor()
     selected = deepcopy(_planner_correction_candidate()["nodes"][2])
-    delta = {"nodes": [selected], "edges": []}
+    delta = {
+        "node_patch": {
+            "stable_id": _format_node_correction_target().requested.stable_id,
+            "options": {
+                "mapping": selected["options"]["mapping"],
+                "select_only": selected["options"]["select_only"],
+            },
+        },
+        "edges": [],
+    }
     full = _set_pipeline_document(predecessor)
     full["nodes"][2]["options"] = {
         "mapping": {"amount": "amount", "tier": "'priority'"},

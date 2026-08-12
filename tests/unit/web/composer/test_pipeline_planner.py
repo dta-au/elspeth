@@ -796,6 +796,53 @@ async def test_request_owned_terminal_contract_drives_schema_manifest_and_materi
 
 
 @pytest.mark.asyncio
+async def test_typed_terminal_materializer_rejection_repairs_then_succeeds(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Schema-valid guided deltas rejected by binding stay inside the repair loop."""
+
+    selected_schema = {
+        "type": "object",
+        "properties": {"route": {"type": "string"}},
+        "required": ["route"],
+        "additionalProperties": False,
+    }
+    canonical = _pipeline(tmp_path)
+    attempts: list[Mapping[str, Any]] = []
+
+    def materialize(delta: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(delta)
+        if len(attempts) == 1:
+            raise GuidedCandidateBindingRejected(
+                "guided planner candidate delta violates reviewed mutation authority",
+                error_code="guided_delta_authority_violation",
+                connectivity={},
+            )
+        candidate = deepcopy(canonical)
+        candidate["source"]["on_success"] = delta["route"]
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": {"route": "first_slip"}})),
+        _response(("emit_pipeline_proposal", {"pipeline": {"route": "rows"}})),
+    )
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        terminal_contract=PlannerTerminalContract(schema=selected_schema, materialize=materialize),
+    )
+
+    assert result.proposal.repair_count == 1
+    assert attempts == [{"route": "first_slip"}, {"route": "rows"}]
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["validation"]["errors"][0]["error_code"] == "guided_delta_authority_violation"
+
+
+@pytest.mark.asyncio
 async def test_selected_terminal_contract_is_reused_for_repair_and_escape_hatch(
     tmp_path: Path,
     tool_context: ToolContext,

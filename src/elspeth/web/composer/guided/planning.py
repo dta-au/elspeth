@@ -114,6 +114,16 @@ class _ProjectionKindSummary(TypedDict):
 
 
 @dataclass(frozen=True, slots=True)
+class GuidedEdgeRoutingAuthority:
+    """Private scalar slot that owns one public connection."""
+
+    field: Literal["on_success", "on_error", "on_validation_failure", "on_write_failure", "routes", "fork_to"]
+    route_key: str | None
+    fork_index: int | None
+    before_destination: str
+
+
+@dataclass(frozen=True, slots=True)
 class GuidedCorrectionTarget:
     """One closed public selection plus its authoritative private owner."""
 
@@ -123,10 +133,17 @@ class GuidedCorrectionTarget:
     authority_key: str | None
     public_target: Mapping[str, Any]
     before_fingerprint: str
+    edge_routing: GuidedEdgeRoutingAuthority | None = None
+    edge_preserved_fingerprint: str | None = None
+    edge_sibling_fingerprints: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.requested.kind == "edge") != (self.authority_key is None):
             raise ValueError("edge correction targets must not claim a private positional edge identity")
+        if self.requested.kind != "edge" and (
+            self.edge_routing is not None or self.edge_preserved_fingerprint is not None or self.edge_sibling_fingerprints
+        ):
+            raise ValueError("non-edge correction targets must not claim edge routing authority")
         freeze_fields(self, "public_target")
 
     def planner_context(self) -> dict[str, object]:
@@ -281,6 +298,212 @@ def _wire_target_fingerprint(
     return stable_hash(component)
 
 
+def _edge_owner_payload(
+    state: CompositionState,
+    *,
+    owner_kind: Literal["source", "node", "output"],
+    owner_key: str,
+) -> MutableMapping[str, Any]:
+    payload = cast(dict[str, Any], deep_thaw(state.to_dict()))
+    if owner_kind == "source":
+        sources = payload.get("sources")
+        if type(sources) is not dict or type(sources.get(owner_key)) is not dict:
+            raise AuditIntegrityError("guided edge routing source owner is malformed")
+        return cast(dict[str, Any], sources[owner_key])
+    if owner_kind == "output":
+        outputs = payload.get("outputs")
+        if type(outputs) is not list:
+            raise AuditIntegrityError("guided edge routing output owner is malformed")
+        matches = [item for item in outputs if type(item) is dict and item.get("name") == owner_key]
+        if len(matches) != 1:
+            raise AuditIntegrityError("guided edge routing output owner does not resolve exactly once")
+        return cast(dict[str, Any], matches[0])
+    nodes = payload.get("nodes")
+    if type(nodes) is not list:
+        raise AuditIntegrityError("guided edge routing node owner is malformed")
+    matches = [item for item in nodes if type(item) is dict and item.get("id") == owner_key]
+    if len(matches) != 1:
+        raise AuditIntegrityError("guided edge routing node owner does not resolve exactly once")
+    return cast(dict[str, Any], matches[0])
+
+
+def _edge_route_key_from_public_alias(
+    wire_payload: Mapping[str, Any],
+    *,
+    origin_stable_id: str,
+    route_alias: object,
+) -> str:
+    nodes = wire_payload.get("nodes")
+    if type(nodes) is not list:
+        raise AuditIntegrityError("guided edge routing lost public node authority")
+    matches = [item for item in nodes if type(item) is dict and item.get("stable_id") == origin_stable_id]
+    if len(matches) != 1 or type(matches[0].get("behavior")) is not dict:
+        raise AuditIntegrityError("guided edge routing lost public gate behavior")
+    routes = matches[0]["behavior"].get("routes")
+    if type(routes) is not list:
+        raise AuditIntegrityError("guided edge routing lost public gate routes")
+    route_matches = [item for item in routes if type(item) is dict and item.get("alias") == route_alias]
+    if len(route_matches) != 1 or type(route_matches[0].get("key")) is not str:
+        raise AuditIntegrityError("guided edge routing route alias does not resolve exactly once")
+    return cast(str, route_matches[0]["key"])
+
+
+def _edge_fork_index_from_public_alias(
+    wire_payload: Mapping[str, Any],
+    *,
+    origin_stable_id: str,
+    branch_alias: object,
+) -> int:
+    nodes = wire_payload.get("nodes")
+    if type(nodes) is not list:
+        raise AuditIntegrityError("guided edge routing lost public node authority")
+    matches = [item for item in nodes if type(item) is dict and item.get("stable_id") == origin_stable_id]
+    if len(matches) != 1 or type(matches[0].get("behavior")) is not dict:
+        raise AuditIntegrityError("guided edge routing lost public gate behavior")
+    branches = matches[0]["behavior"].get("fork_branches")
+    if type(branches) is not list:
+        raise AuditIntegrityError("guided edge routing lost public fork branches")
+    positions = [index for index, item in enumerate(branches) if type(item) is dict and item.get("branch") == branch_alias]
+    if len(positions) != 1:
+        raise AuditIntegrityError("guided edge routing fork alias does not resolve exactly once")
+    return positions[0]
+
+
+def _resolve_edge_routing_authority(
+    *,
+    wire_payload: Mapping[str, Any],
+    public_target: Mapping[str, Any],
+    predecessor: CompositionState,
+    owner_kind: Literal["source", "node", "output"],
+    owner_key: str,
+) -> GuidedEdgeRoutingAuthority | None:
+    """Bind a public connection to its one writable private routing scalar."""
+
+    flow = public_target.get("flow")
+    origin = public_target.get("from_endpoint")
+    if type(flow) is not dict or type(origin) is not dict:
+        raise AuditIntegrityError("guided edge routing target has malformed public semantics")
+    flow_kind = flow.get("kind")
+    if type(flow_kind) is not str:
+        flow_kind = flow.get("role")
+    if type(flow_kind) is not str:
+        raise AuditIntegrityError("guided edge routing target has no public flow kind")
+    owner = _edge_owner_payload(predecessor, owner_kind=owner_kind, owner_key=owner_key)
+    field: Literal["on_success", "on_error", "on_validation_failure", "on_write_failure", "routes", "fork_to"]
+    route_key: str | None = None
+    fork_index: int | None = None
+    if owner_kind == "source":
+        if flow_kind in {"source_success", "on_success"}:
+            field = "on_success"
+        elif flow_kind == "source_validation_failure":
+            field = "on_validation_failure"
+        else:
+            return None
+    elif owner_kind == "output":
+        if flow_kind != "output_write_failure":
+            return None
+        field = "on_write_failure"
+    elif flow_kind in {"node_success", "coalesce_success", "row_union_success", "on_success"}:
+        field = "on_success"
+    elif flow_kind in {"node_error", "on_error"}:
+        field = "on_error"
+    elif flow_kind in {"gate_route", "route"}:
+        origin_stable_id = origin.get("stable_id")
+        if type(origin_stable_id) is not str:
+            raise AuditIntegrityError("guided edge routing gate origin has no stable identity")
+        field = "routes"
+        route_key = _edge_route_key_from_public_alias(
+            wire_payload,
+            origin_stable_id=origin_stable_id,
+            route_alias=flow.get("route"),
+        )
+    elif flow_kind == "gate_fork":
+        origin_stable_id = origin.get("stable_id")
+        if type(origin_stable_id) is not str:
+            raise AuditIntegrityError("guided edge routing fork origin has no stable identity")
+        field = "fork_to"
+        fork_index = _edge_fork_index_from_public_alias(
+            wire_payload,
+            origin_stable_id=origin_stable_id,
+            branch_alias=flow.get("branch"),
+        )
+    else:
+        # Queue continuation and any future implicit structural flow have no
+        # independently writable scalar. They remain selectable for review,
+        # but the terminal materializer rejects an attempted mutation rather
+        # than widening authority to the whole origin node.
+        return None
+
+    raw_destination: object
+    if field == "routes":
+        routes = owner.get("routes")
+        if type(routes) is not dict or route_key is None:
+            raise AuditIntegrityError("guided edge routing private gate routes are malformed")
+        raw_destination = routes.get(route_key)
+    elif field == "fork_to":
+        branches = owner.get("fork_to")
+        if type(branches) is not list or fork_index is None or fork_index >= len(branches):
+            raise AuditIntegrityError("guided edge routing private fork branches are malformed")
+        raw_destination = branches[fork_index]
+    else:
+        raw_destination = owner.get(field)
+    if type(raw_destination) is not str:
+        return None
+    return GuidedEdgeRoutingAuthority(
+        field=field,
+        route_key=route_key,
+        fork_index=fork_index,
+        before_destination=raw_destination,
+    )
+
+
+def _edge_preserved_state_fingerprint(
+    state: CompositionState,
+    *,
+    owner_kind: Literal["source", "node", "output"],
+    owner_key: str,
+    routing: GuidedEdgeRoutingAuthority,
+) -> str:
+    """Hash all private state except the one selected routing scalar."""
+
+    payload = cast(dict[str, Any], deep_thaw(state.to_dict()))
+    if owner_kind == "source":
+        sources = payload.get("sources")
+        if type(sources) is not dict or type(sources.get(owner_key)) is not dict:
+            raise AuditIntegrityError("guided edge preservation source owner is malformed")
+        owner = cast(dict[str, Any], sources[owner_key])
+    elif owner_kind == "output":
+        outputs = payload.get("outputs")
+        if type(outputs) is not list:
+            raise AuditIntegrityError("guided edge preservation output owner is malformed")
+        matches = [item for item in outputs if type(item) is dict and item.get("name") == owner_key]
+        if len(matches) != 1:
+            raise AuditIntegrityError("guided edge preservation output owner does not resolve exactly once")
+        owner = cast(dict[str, Any], matches[0])
+    else:
+        nodes = payload.get("nodes")
+        if type(nodes) is not list:
+            raise AuditIntegrityError("guided edge preservation node owner is malformed")
+        matches = [item for item in nodes if type(item) is dict and item.get("id") == owner_key]
+        if len(matches) != 1:
+            raise AuditIntegrityError("guided edge preservation node owner does not resolve exactly once")
+        owner = cast(dict[str, Any], matches[0])
+    marker = "__ELSPETH_SELECTED_EDGE_AUTHORITY__"
+    if routing.field == "routes":
+        routes = owner.get("routes")
+        if type(routes) is not dict or routing.route_key is None or routing.route_key not in routes:
+            raise AuditIntegrityError("guided edge preservation routes are malformed")
+        routes[routing.route_key] = marker
+    elif routing.field == "fork_to":
+        branches = owner.get("fork_to")
+        if type(branches) is not list or routing.fork_index is None or routing.fork_index >= len(branches):
+            raise AuditIntegrityError("guided edge preservation fork branches are malformed")
+        branches[routing.fork_index] = marker
+    else:
+        owner[routing.field] = marker
+    return stable_hash(payload)
+
+
 def resolve_guided_correction_target(
     *,
     requested: ComponentTarget,
@@ -313,6 +536,9 @@ def resolve_guided_correction_target(
             raise AuditIntegrityError("guided correction output target differs from private authority")
         return "output", predecessor.outputs[index].name, index
 
+    edge_routing: GuidedEdgeRoutingAuthority | None = None
+    edge_preserved_fingerprint: str | None = None
+    edge_sibling_fingerprints: tuple[str, ...] = ()
     if requested.kind == "edge":
         connections = wire_payload.get("connections")
         if type(connections) is not list:
@@ -326,6 +552,20 @@ def resolve_guided_correction_target(
         collection: Literal["sources", "nodes", "connections", "outputs"] = "connections"
         authority_key = None
         public_target = matches[0]
+        edge_routing = _resolve_edge_routing_authority(
+            wire_payload=wire_payload,
+            public_target=public_target,
+            predecessor=predecessor,
+            owner_kind=owner_kind,
+            owner_key=owner_key,
+        )
+        if edge_routing is not None:
+            edge_preserved_fingerprint = _edge_preserved_state_fingerprint(
+                predecessor,
+                owner_kind=owner_kind,
+                owner_key=owner_key,
+                routing=edge_routing,
+            )
     else:
         owner_kind, owner_key, collection_index = resolve_owner(requested.kind, requested.stable_id)
         authority_key = owner_key
@@ -363,6 +603,20 @@ def resolve_guided_correction_target(
         )
         if matching_fingerprints != 1:
             raise AuditIntegrityError("guided correction edge semantics do not resolve exactly once")
+        siblings: list[str] = []
+        for index in range(len(edge_connections)):
+            if index == collection_index:
+                continue
+            fingerprint = _wire_target_fingerprint(
+                wire_payload,
+                collection="connections",
+                index=index,
+                authority=predecessor,
+            )
+            if fingerprint is None:
+                raise AuditIntegrityError("guided correction sibling edge has no stable semantics")
+            siblings.append(fingerprint)
+        edge_sibling_fingerprints = tuple(sorted(siblings))
     return GuidedCorrectionTarget(
         requested=requested,
         owner_kind=owner_kind,
@@ -370,6 +624,9 @@ def resolve_guided_correction_target(
         authority_key=authority_key,
         public_target=public_target,
         before_fingerprint=before_fingerprint,
+        edge_routing=edge_routing,
+        edge_preserved_fingerprint=edge_preserved_fingerprint,
+        edge_sibling_fingerprints=edge_sibling_fingerprints,
     )
 
 
@@ -433,6 +690,23 @@ def require_guided_correction_target_changed(
         )
         if target.before_fingerprint in fingerprints:
             raise AuditIntegrityError("guided correction planner did not change the selected component")
+        unmatched = list(fingerprints)
+        for sibling in target.edge_sibling_fingerprints:
+            try:
+                unmatched.remove(sibling)
+            except ValueError as exc:
+                raise AuditIntegrityError("guided correction changed state outside selected edge authority") from exc
+        if target.edge_sibling_fingerprints and len(unmatched) != 1:
+            raise AuditIntegrityError("guided correction changed state outside selected edge authority")
+        if target.edge_routing is not None and target.edge_preserved_fingerprint is not None:
+            successor_preserved = _edge_preserved_state_fingerprint(
+                successor,
+                owner_kind=target.owner_kind,
+                owner_key=target.owner_key,
+                routing=target.edge_routing,
+            )
+            if successor_preserved != target.edge_preserved_fingerprint:
+                raise AuditIntegrityError("guided correction changed state outside selected edge authority")
         return
 
     if target.requested.kind == "source":
@@ -864,6 +1138,63 @@ def _closed_canonical_metadata(schema: object) -> Mapping[str, Any]:
     return projected
 
 
+def _public_target_plugin_id(public_target: Mapping[str, Any]) -> str | None:
+    plugin = public_target.get("plugin")
+    if type(plugin) is str:
+        return plugin
+    if isinstance(plugin, Mapping) and plugin.get("kind") == "transform" and type(plugin.get("id")) is str:
+        return cast(str, plugin["id"])
+    return None
+
+
+def _guided_node_patch_schema(
+    canonical_node_properties: Mapping[str, Any],
+    correction_target: GuidedCorrectionTarget,
+) -> Mapping[str, Any]:
+    """Project one selected node's public writable fields from canonical leaves."""
+
+    public = correction_target.public_target
+    behavior = public.get("behavior")
+    behavior_kind = behavior.get("kind") if type(behavior) is dict else public.get("node_type")
+    properties: dict[str, Any] = {
+        "stable_id": {
+            **deep_thaw(canonical_node_properties["id"]),
+            "const": correction_target.requested.stable_id,
+        }
+    }
+    public_fields_by_kind: dict[object, tuple[str, ...]] = {
+        "transform": ("input", "on_success", "on_error"),
+        "queue": ("input",),
+        "gate": ("input", "on_error", "condition"),
+        "aggregation": (
+            "input",
+            "on_success",
+            "on_error",
+            "trigger",
+            "output_mode",
+            "expected_output_count",
+        ),
+        "coalesce": ("input", "on_success", "policy", "merge", "timeout_seconds"),
+        "row_union": ("input", "on_success", "timeout_seconds"),
+    }
+    fields = public_fields_by_kind.get(behavior_kind, ("input", "on_success", "on_error"))
+    for field in fields:
+        properties[field] = deep_thaw(canonical_node_properties[field])
+    plugin_id = _public_target_plugin_id(public)
+    option_keys = public_node_option_keys(plugin_id)
+    if option_keys:
+        options_schema = cast(dict[str, Any], deep_thaw(canonical_node_properties["options"]))
+        options_schema["properties"] = {key: {} for key in option_keys}
+        options_schema["additionalProperties"] = False
+        properties["options"] = options_schema
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": ["stable_id"],
+        "additionalProperties": False,
+    }
+
+
 def guided_authorized_pipeline_schema(
     guided: GuidedSession,
     *,
@@ -939,6 +1270,24 @@ def guided_authorized_pipeline_schema(
             "metadata": _closed_canonical_metadata(canonical["metadata"]),
         }
         required = ["source_routes", "nodes", "edges", "output_targets"]
+    elif correction_target.requested.kind == "edge":
+        edge_item = cast(dict[str, Any], edges_schema["items"])
+        edge_properties = cast(dict[str, Any], edge_item["properties"])
+        properties = {
+            "edge_patch": {
+                "type": "object",
+                "properties": {
+                    "stable_id": {
+                        **deep_thaw(edge_properties["id"]),
+                        "const": correction_target.requested.stable_id,
+                    },
+                    "to_node": deep_thaw(edge_properties["to_node"]),
+                },
+                "required": ["stable_id", "to_node"],
+                "additionalProperties": False,
+            }
+        }
+        required = ["edge_patch"]
     elif correction_target.owner_kind == "source":
         stable_ids = tuple(
             stable_id for stable_id in guided.source_order if guided.reviewed_sources[stable_id].name == correction_target.owner_key
@@ -956,27 +1305,11 @@ def guided_authorized_pipeline_schema(
     elif correction_target.owner_kind == "node":
         node_item = cast(dict[str, Any], nodes_schema["items"])
         node_properties = cast(dict[str, Any], node_item["properties"])
-        predecessor_id = correction_target.owner_key
-        node_contract = cast(dict[str, Any], deep_thaw(nodes_schema))
-        node_contract["minItems"] = 1
-        node_contract["maxItems"] = 1
-        selected_item = cast(dict[str, Any], node_contract["items"])
-        selected_properties = cast(dict[str, Any], selected_item["properties"])
-        selected_properties["id"] = {**deep_thaw(node_properties["id"]), "const": predecessor_id}
-        public_node_type = correction_target.public_target.get("node_type")
-        public_plugin = correction_target.public_target.get("plugin")
-        if type(public_node_type) is str:
-            selected_properties["node_type"] = {
-                **deep_thaw(node_properties["node_type"]),
-                "const": public_node_type,
-            }
-        if type(public_plugin) is str:
-            selected_properties["plugin"] = {
-                **deep_thaw(node_properties["plugin"]),
-                "const": public_plugin,
-            }
-        properties = {"nodes": node_contract, "edges": edges_schema}
-        required = ["nodes", "edges"]
+        properties = {
+            "node_patch": _guided_node_patch_schema(node_properties, correction_target),
+            "edges": edges_schema,
+        }
+        required = ["node_patch", "edges"]
     else:
         stable_ids = tuple(
             stable_id for stable_id in guided.output_order if guided.reviewed_outputs[stable_id].name == correction_target.owner_key
@@ -1085,6 +1418,105 @@ def _replace_incident_edges(
     pipeline["edges"] = [*retained, *replacements]
 
 
+def _merge_incident_edge_patches(
+    pipeline: MutableMapping[str, Any],
+    *,
+    owners: frozenset[str],
+    patches: Sequence[Mapping[str, Any]],
+) -> None:
+    """Overlay explicit incident edge IDs while preserving every omitted edge byte."""
+
+    raw_edges = pipeline.get("edges")
+    if type(raw_edges) is not list:
+        raise AuditIntegrityError("guided correction predecessor edges are malformed")
+    positions: dict[str, int] = {}
+    for index, raw in enumerate(raw_edges):
+        if type(raw) is not dict or type(raw.get("id")) is not str:
+            raise AuditIntegrityError("guided correction predecessor edge is malformed")
+        edge_id = cast(str, raw["id"])
+        if edge_id in positions:
+            raise AuditIntegrityError("guided correction predecessor duplicated an edge identity")
+        positions[edge_id] = index
+    for patch in patches:
+        edge_id = cast(str, patch["id"])
+        if edge_id not in positions:
+            raw_edges.append(deep_thaw(patch))
+            positions[edge_id] = len(raw_edges) - 1
+            continue
+        previous = raw_edges[positions[edge_id]]
+        assert type(previous) is dict
+        if previous.get("from_node") not in owners and previous.get("to_node") not in owners:
+            raise _guided_delta_rejection(
+                "guided_delta_nonincident_route",
+                facts={"edge_id": edge_id},
+            )
+        raw_edges[positions[edge_id]] = deep_thaw(patch)
+
+
+def _pipeline_edge_owner(
+    pipeline: MutableMapping[str, Any],
+    *,
+    owner_kind: Literal["source", "node", "output"],
+    owner_key: str,
+) -> MutableMapping[str, Any]:
+    if owner_kind == "source":
+        sources = pipeline.get("sources")
+        if type(sources) is not dict or type(sources.get(owner_key)) is not dict:
+            raise AuditIntegrityError("guided edge correction predecessor source is malformed")
+        return cast(dict[str, Any], sources[owner_key])
+    if owner_kind == "output":
+        outputs = pipeline.get("outputs")
+        if type(outputs) is not list:
+            raise AuditIntegrityError("guided edge correction predecessor outputs are malformed")
+        matches = [item for item in outputs if type(item) is dict and item.get("name") == owner_key]
+        if len(matches) != 1:
+            raise AuditIntegrityError("guided edge correction predecessor output does not resolve exactly once")
+        return cast(dict[str, Any], matches[0])
+    nodes = pipeline.get("nodes")
+    if type(nodes) is not list:
+        raise AuditIntegrityError("guided edge correction predecessor nodes are malformed")
+    matches = [item for item in nodes if type(item) is dict and item.get("id") == owner_key]
+    if len(matches) != 1:
+        raise AuditIntegrityError("guided edge correction predecessor node does not resolve exactly once")
+    return cast(dict[str, Any], matches[0])
+
+
+def _apply_selected_edge_route_patch(
+    pipeline: MutableMapping[str, Any],
+    *,
+    authority: GuidedCorrectionTarget,
+    destination: str,
+) -> None:
+    routing = authority.edge_routing
+    if routing is None:
+        raise _guided_delta_rejection("guided_delta_authority_violation")
+    owner = _pipeline_edge_owner(
+        pipeline,
+        owner_kind=authority.owner_kind,
+        owner_key=authority.owner_key,
+    )
+    if routing.field == "routes":
+        routes = owner.get("routes")
+        if type(routes) is not dict or routing.route_key is None or routes.get(routing.route_key) != routing.before_destination:
+            raise AuditIntegrityError("guided edge correction route authority is stale")
+        routes[routing.route_key] = destination
+        return
+    if routing.field == "fork_to":
+        branches = owner.get("fork_to")
+        if (
+            type(branches) is not list
+            or routing.fork_index is None
+            or routing.fork_index >= len(branches)
+            or branches[routing.fork_index] != routing.before_destination
+        ):
+            raise AuditIntegrityError("guided edge correction fork authority is stale")
+        branches[routing.fork_index] = destination
+        return
+    if owner.get(routing.field) != routing.before_destination:
+        raise AuditIntegrityError("guided edge correction scalar authority is stale")
+    owner[routing.field] = destination
+
+
 def materialize_guided_authorized_candidate(
     delta: Mapping[str, Any],
     authority: GuidedCorrectionTarget | None,
@@ -1153,7 +1585,26 @@ def materialize_guided_authorized_candidate(
 
     predecessor = cast(dict[str, Any], deep_thaw(current_state.to_dict()))
     predecessor.pop("version", None)
-    if authority.owner_kind == "source":
+    if authority.requested.kind == "edge":
+        admitted = _exact_delta_members(delta, allowed={"edge_patch"})
+        if set(admitted) != {"edge_patch"}:
+            raise _guided_delta_rejection("guided_delta_authority_violation")
+        edge_patch = _exact_delta_members(admitted["edge_patch"], allowed={"stable_id", "to_node"})
+        stable_id = edge_patch.get("stable_id")
+        destination = edge_patch.get("to_node")
+        if stable_id != authority.requested.stable_id:
+            raise _guided_delta_rejection(
+                "guided_delta_unknown_stable_id",
+                facts={"stable_id": cast(JsonValue, stable_id if type(stable_id) is str else "invalid")},
+            )
+        if type(destination) is not str:
+            raise _guided_delta_rejection("guided_delta_authority_violation")
+        _apply_selected_edge_route_patch(
+            predecessor,
+            authority=authority,
+            destination=destination,
+        )
+    elif authority.owner_kind == "source":
         admitted = _exact_delta_members(delta, allowed={"source_routes", "nodes", "edges"})
         if set(admitted) != {"source_routes", "nodes", "edges"}:
             raise _guided_delta_rejection("guided_delta_authority_violation")
@@ -1209,32 +1660,16 @@ def materialize_guided_authorized_candidate(
         edges = _incident_edges(admitted["edges"], owners=owners)
         _replace_incident_edges(predecessor, owners=owners, replacements=edges)
     elif authority.owner_kind == "node":
-        admitted = _exact_delta_members(delta, allowed={"nodes", "edges"})
-        if set(admitted) != {"nodes", "edges"} or type(admitted["nodes"]) is not list or len(admitted["nodes"]) != 1:
+        admitted = _exact_delta_members(delta, allowed={"node_patch", "edges"})
+        if set(admitted) != {"node_patch", "edges"}:
             raise _guided_delta_rejection("guided_delta_authority_violation")
-        node = _exact_delta_members(
-            admitted["nodes"][0],
-            allowed={
-                "id",
-                "node_type",
-                "plugin",
-                "input",
-                "on_success",
-                "on_error",
-                "options",
-                "condition",
-                "routes",
-                "fork_to",
-                "branches",
-                "policy",
-                "merge",
-                "trigger",
-                "output_mode",
-                "expected_output_count",
-                "timeout_seconds",
-            },
-        )
-        if node.get("id") != authority.owner_key:
+        canonical_nodes = cast(dict[str, Any], _canonical_schema_properties()["nodes"])
+        canonical_node_item = cast(dict[str, Any], canonical_nodes["items"])
+        canonical_node_properties = cast(dict[str, Any], canonical_node_item["properties"])
+        patch_contract = _guided_node_patch_schema(canonical_node_properties, authority)
+        patch_properties = cast(dict[str, Any], patch_contract["properties"])
+        node_patch = _exact_delta_members(admitted["node_patch"], allowed=set(patch_properties))
+        if node_patch.get("stable_id") != authority.requested.stable_id:
             raise _guided_delta_rejection("guided_delta_unknown_stable_id")
         raw_nodes = predecessor.get("nodes")
         if type(raw_nodes) is not list:
@@ -1243,12 +1678,23 @@ def materialize_guided_authorized_candidate(
         if len(positions) != 1:
             raise _guided_delta_rejection("guided_delta_unknown_stable_id")
         private_node = cast(dict[str, Any], raw_nodes[positions[0]])
-        if node.get("node_type") != private_node.get("node_type") or node.get("plugin") != private_node.get("plugin"):
-            raise _guided_delta_rejection("guided_delta_authority_violation")
-        raw_nodes[positions[0]] = node
+        for key, value in node_patch.items():
+            if key == "stable_id":
+                continue
+            if key != "options":
+                private_node[key] = deep_thaw(value)
+                continue
+            if type(value) is not dict or type(private_node.get("options")) is not dict:
+                raise _guided_delta_rejection("guided_delta_authority_violation")
+            allowed_option_keys = frozenset(public_node_option_keys(_public_target_plugin_id(authority.public_target)))
+            if set(value) - allowed_option_keys:
+                raise _guided_delta_rejection("guided_delta_authority_violation")
+            private_options = cast(dict[str, Any], private_node["options"])
+            for option_key, option_value in value.items():
+                private_options[option_key] = deep_thaw(option_value)
         owners = frozenset({authority.owner_key})
         edges = _incident_edges(admitted["edges"], owners=owners)
-        _replace_incident_edges(predecessor, owners=owners, replacements=edges)
+        _merge_incident_edge_patches(predecessor, owners=owners, patches=edges)
     else:
         admitted = _exact_delta_members(delta, allowed={"output_targets", "edges"})
         if set(admitted) != {"output_targets", "edges"}:
@@ -1286,13 +1732,6 @@ def materialize_guided_authorized_candidate(
                 )
             cast(dict[str, Any], raw_nodes[positions[0]])[edge_type] = authority.owner_key
         _replace_incident_edges(predecessor, owners=frozenset({authority.owner_key}), replacements=edges)
-    if authority.owner_kind == "node":
-        return bind_guided_reviewed_components(
-            predecessor,
-            guided,
-            predecessor=current_state,
-            correction_target=authority,
-        )
     # Source-route and output-reconnection candidates above were constructed
     # from the private predecessor by this materializer, not reconstructed by
     # the provider.  The ordinary binder restores reviewed source/sink
@@ -1602,7 +2041,11 @@ def bind_guided_reviewed_components(
                 # AuditIntegrityErrors by that prefix, and a model emitting
                 # the selected node without an options dict is an authoring
                 # slip, not an integrity breach (elspeth-d923304d18).
-                raise AuditIntegrityError("guided planner candidate selected node options are malformed")
+                raise GuidedCandidateBindingRejected(
+                    "guided planner candidate selected node options are malformed",
+                    error_code="guided_delta_authority_violation",
+                    connectivity={},
+                )
             if candidate_node.get("node_type") != private_node.get("node_type") or candidate_node.get("plugin") != private_node.get(
                 "plugin"
             ):

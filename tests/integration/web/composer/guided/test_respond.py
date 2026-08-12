@@ -130,6 +130,38 @@ def _planner_terminal_response() -> _PlannerResponse:
     )
 
 
+def _source_validation_failure_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict
+        and type(connection.get("flow")) is dict
+        and connection["flow"].get("kind") == "source_validation_failure"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
+def _node_error_edit_target(payload: Mapping[str, Any]) -> dict[str, str]:
+    graph = payload.get("graph")
+    connections = graph.get("edges") if type(graph) is dict else payload.get("connections")
+    assert type(connections) is list
+    matches = [
+        connection
+        for connection in connections
+        if type(connection) is dict and type(connection.get("flow")) is dict and connection["flow"].get("kind") == "node_error"
+    ]
+    assert len(matches) == 1
+    stable_id = matches[0].get("stable_id")
+    assert type(stable_id) is str
+    return {"kind": "edge", "stable_id": stable_id}
+
+
 def _create_session(client: TestClient) -> str:
     """Create a session and return its string id."""
     resp = client.post("/api/sessions", json={"title": "respond-test"})
@@ -2112,7 +2144,7 @@ class TestStep2IntraStep:
         staged = self._stage_proposal(composer_test_client, session_id, filename="edge-custody.jsonl")
         turn = staged["next_turn"]
         payload = turn["payload"]
-        edge_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "edge")
+        edge_target = _source_validation_failure_edit_target(payload)
         reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
         assert staged["composition_state"]["sources"] == {}
 
@@ -2991,10 +3023,7 @@ class TestStep2IntraStep:
             "turn_token": wire_turn["turn_token"],
             "proposal_id": wire_payload["proposal_id"],
             "draft_hash": wire_payload["draft_hash"],
-            "edit_target": {
-                "kind": "edge",
-                "stable_id": wire_payload["connections"][0]["stable_id"],
-            },
+            "edit_target": _source_validation_failure_edit_target(wire_payload),
             "correction_feedback": feedback,
         }
 
@@ -4393,10 +4422,7 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": proposal_payload["proposal_id"],
                 "draft_hash": proposal_payload["draft_hash"],
-                "edit_target": {
-                    "kind": "edge",
-                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
-                },
+                "edit_target": _source_validation_failure_edit_target(turn["payload"]),
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         }
@@ -6270,54 +6296,29 @@ class TestStep2IntraStep:
             del recorder
             source = guided.reviewed_sources[guided.source_order[0]]
             output = guided.reviewed_outputs[guided.output_order[0]]
-            corrected = correction_target is not None and correction_target.owner_kind == "source"
-            source_success = f"{correction_target.owner_key}_corrected_rows" if corrected else "llm_rows"
-            correction_nodes = (
-                [
-                    {
-                        "id": f"{correction_target.owner_key}_correction",
-                        "node_type": "transform",
-                        "plugin": "passthrough",
-                        "input": source_success,
-                        "on_success": "llm_rows",
-                        "on_error": "discard",
-                        "options": {"schema": {"mode": "observed"}},
-                    }
-                ]
-                if corrected
-                else []
-            )
-            correction_edges = (
-                [
-                    {
-                        "id": f"{correction_target.owner_key}_to_correction",
-                        "from_node": correction_target.owner_key,
-                        "to_node": f"{correction_target.owner_key}_correction",
-                        "edge_type": "on_success",
-                        "label": None,
-                    }
-                ]
-                if corrected
-                else []
+            corrected_error_edge = (
+                correction_target is not None
+                and correction_target.requested.kind == "edge"
+                and correction_target.edge_routing is not None
+                and correction_target.edge_routing.field == "on_error"
             )
             pipeline = {
                 "sources": {
                     source.name: {
                         "plugin": source.plugin,
                         "options": deep_thaw(source.options),
-                        "on_success": source_success,
+                        "on_success": "llm_rows",
                         "on_validation_failure": source.on_validation_failure,
                     }
                 },
                 "nodes": [
-                    *correction_nodes,
                     {
                         "id": "summarize_rows",
                         "node_type": "transform",
                         "plugin": "llm",
                         "input": "llm_rows",
                         "on_success": output.name,
-                        "on_error": "discard",
+                        "on_error": output.name if corrected_error_edge else "discard",
                         "options": {
                             "schema": {"mode": "observed"},
                             "profile": "task-role",
@@ -6326,7 +6327,7 @@ class TestStep2IntraStep:
                         },
                     },
                 ],
-                "edges": correction_edges,
+                "edges": [],
                 "outputs": [
                     {
                         "sink_name": output.name,
@@ -6384,10 +6385,7 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": turn["payload"]["proposal_id"],
                 "draft_hash": turn["payload"]["draft_hash"],
-                "edit_target": {
-                    "kind": "edge",
-                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
-                },
+                "edit_target": _node_error_edit_target(turn["payload"]),
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         )
