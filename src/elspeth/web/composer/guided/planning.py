@@ -1883,6 +1883,20 @@ def _exact_field_mapper_retained_fields(node: NodeSpec) -> tuple[str, ...] | Non
     return target_fields
 
 
+def _success_projection_node(node: NodeSpec) -> NodeSpec:
+    """Keep only the node-kind routing fields that can carry successful rows."""
+
+    if node.node_type == "gate":
+        # Gates publish successful rows only through routes/fork_to. A generic
+        # planner node can still carry a malformed on_success value; ordinary
+        # candidate validation owns that shape rather than projection analysis.
+        return replace(node, on_success=None, on_error=None)
+    # Every other runtime node publishes success through on_success (or the
+    # coalesce/queue implicit id). The generic planner schema also admits gate
+    # fields on them, but those fields cannot prove a successful sink path.
+    return replace(node, on_error=None, routes=None, fork_to=None)
+
+
 def _reviewed_output_projection_conflict_for_bound_candidate(
     bound: Mapping[str, Any],
     guided: GuidedSession,
@@ -1932,7 +1946,7 @@ def _reviewed_output_projection_conflict_for_bound_candidate(
     # ProducerResolver serves validators that need both success and error
     # topology. This check is narrower: only rows reaching a reviewed sink on
     # a success route prove what the successful output projection retains.
-    success_nodes = tuple(replace(node, on_error=None) for node in projection_state.nodes)
+    success_nodes = tuple(_success_projection_node(node) for node in projection_state.nodes)
     resolver = ProducerResolver.build(
         source=None,
         sources=projection_state.sources,

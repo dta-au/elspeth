@@ -1202,6 +1202,66 @@ def test_projection_check_ignores_a_field_mapper_error_route_to_the_reviewed_sin
     assert bound["nodes"][0]["on_error"] == "output"
 
 
+@pytest.mark.parametrize(
+    ("routing_field", "routing_value"),
+    [
+        ("routes", {"unexpected": "output"}),
+        ("fork_to", ["output"]),
+    ],
+)
+def test_projection_check_ignores_gate_only_routing_fields_on_a_transform(
+    routing_field: str,
+    routing_value: object,
+) -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(mapping={"generated": "abstract"})
+    mapper = pipeline["nodes"][0]
+    mapper["on_success"] = "discard"
+    mapper[routing_field] = routing_value
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    # The binder must neither diagnose nor repair a malformed node shape.
+    # Preserve it verbatim for ordinary candidate/runtime validation.
+    assert bound["nodes"][0][routing_field] == routing_value
+
+
+def test_projection_check_leaves_a_transform_route_error_to_ordinary_validation() -> None:
+    from elspeth.web.composer.guided.planning import _canonical_state_from_private_pipeline
+
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(mapping={"generated": "abstract"})
+    mapper = pipeline["nodes"][0]
+    mapper["on_success"] = "discard"
+    mapper["routes"] = {"unexpected": "output"}
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+    validation = _canonical_state_from_private_pipeline(dict(bound)).validate()
+
+    assert "transform_unexpected_routes" in [error.error_code for error in validation.errors]
+
+
+def test_projection_check_ignores_a_gate_on_success_field() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _gate_after_exact_mapper_pipeline(mapping={"generated": "abstract"})
+    gate = pipeline["nodes"][1]
+    gate["routes"] = {"true": "discard", "false": "discard"}
+    gate["on_success"] = "output"
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    assert bound["nodes"][1]["on_success"] == "output"
+
+
 def _two_mapper_fanin_pipeline() -> dict[str, object]:
     return {
         "sources": {
