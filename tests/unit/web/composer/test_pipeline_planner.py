@@ -1566,6 +1566,65 @@ async def test_initial_request_declares_supplied_information_and_omits_redundant
     assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= 96 * 1024
 
 
+@pytest.mark.asyncio
+async def test_digest_omission_advertises_only_its_kind_inventory_until_details_close(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    original = planner_module.build_planner_authoring_aids
+
+    def aids_with_source_omission(catalog: PolicyCatalogView) -> dict[str, Any]:
+        aids = original(catalog)
+        source = aids["discovery_digest"]["plugins"]["sources"][0]
+        source.pop("purpose")
+        source["purpose_omitted"] = {
+            "sha256": "0" * 64,
+            "details_via": "list_sources",
+        }
+        aids["discovery_digest"]["plugins"]["budget"]["omitted_public_text_count"] += 1
+        return aids
+
+    monkeypatch.setattr(planner_module, "build_planner_authoring_aids", aids_with_source_omission)
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        information_aware=True,
+    )
+
+    initial = completion.requests[0]
+    payload = json.loads(initial["messages"][-1]["content"])
+    initial_names = [tool["function"]["name"] for tool in initial["tools"]]
+    omissions = [
+        omitted
+        for section in ("sources", "transforms", "sinks")
+        for entry in payload["authoring_aids"]["discovery_digest"]["plugins"][section]
+        for omitted in (entry.get("purpose_omitted"), entry.get("not_for_omitted"))
+        if omitted is not None
+    ]
+    assert {omission["details_via"] for omission in omissions} <= set(initial_names)
+    assert "list_sources" in initial_names
+    assert "catalog.details.source" in payload["information_manifest"]["unresolved_classes"]
+    assert not {"list_transforms", "list_sinks"} & set(initial_names)
+
+    second_names = [tool["function"]["name"] for tool in completion.requests[1]["tools"]]
+    assert "list_sources" not in second_names
+    tool_result = next(json.loads(message["content"]) for message in completion.requests[1]["messages"] if message["role"] == "tool")
+    assert tool_result["success"] is True
+    assert tool_result.get("error_code") != "DISCOVERY_NO_GAIN"
+    assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
+
+
 def test_pipeline_information_semantic_dominance_is_directional() -> None:
     import elspeth.web.composer.pipeline_planner as planner_module
 

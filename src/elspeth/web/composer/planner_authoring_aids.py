@@ -1459,6 +1459,26 @@ def discovery_digest(
     return digest
 
 
+def discovery_digest_detail_tools(authoring_aids: _PlannerAuthoringAids) -> tuple[str, ...]:
+    """Return the exact inventory tools needed to rehydrate omitted prose."""
+    digest = authoring_aids["discovery_digest"]["plugins"]
+    section_tools = (
+        (digest["sources"], "list_sources"),
+        (digest["transforms"], "list_transforms"),
+        (digest["sinks"], "list_sinks"),
+    )
+    required: set[str] = set()
+    for entries, expected_tool in section_tools:
+        for entry in entries:
+            for omission in (entry.get("purpose_omitted"), entry.get("not_for_omitted")):
+                if omission is None:
+                    continue
+                if omission["details_via"] != expected_tool:
+                    raise RuntimeError("discovery_digest_details_tool_invariant")
+                required.add(expected_tool)
+    return tuple(tool for tool in ("list_sinks", "list_sources", "list_transforms") if tool in required)
+
+
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "This digest is rendered from the live policy-visible catalog at prompt "
     "build and is current for this deployment. For plugin selection, plan directly from it; "
@@ -2161,6 +2181,7 @@ __all__ = [
     "build_planner_authoring_aids",
     "build_schema_contract_evidence",
     "discovery_digest",
+    "discovery_digest_detail_tools",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",
     "planner_plugin_contract",

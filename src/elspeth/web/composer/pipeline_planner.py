@@ -72,6 +72,7 @@ from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurf
 from elspeth.web.composer.planner_authoring_aids import (
     SchemaContractProjectionUnsupported,
     build_planner_authoring_aids,
+    discovery_digest_detail_tools,
     planner_plugin_contract,
 )
 from elspeth.web.composer.progress import (
@@ -110,6 +111,11 @@ _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
 
 _PIPELINE_CURRENT_INFORMATION: Final[str] = "pipeline.current"
 _CATALOG_SELECTION_INFORMATION: Final[str] = "catalog.selection"
+_CATALOG_DETAIL_INFORMATION_BY_TOOL: Final[Mapping[str, str]] = {
+    "list_sources": "catalog.details.source",
+    "list_transforms": "catalog.details.transform",
+    "list_sinks": "catalog.details.sink",
+}
 _RECIPE_INDEX_INFORMATION: Final[str] = "recipe.index"
 _FULL_STATE_ALIASES: Final[frozenset[str]] = frozenset({"", "all", "full", "pipeline"})
 _ALL_INFORMATION_GAPS_CLOSED_NOTICE: Final[str] = "All declared information gaps are closed; emit the terminal proposal now."
@@ -119,6 +125,7 @@ def _valid_information_key(key: str) -> bool:
     return key in {
         _PIPELINE_CURRENT_INFORMATION,
         _CATALOG_SELECTION_INFORMATION,
+        *_CATALOG_DETAIL_INFORMATION_BY_TOOL.values(),
         _RECIPE_INDEX_INFORMATION,
         "pipeline.full",
         "pipeline.source",
@@ -148,21 +155,32 @@ class PlannerInformationManifest:
 
     supplied: frozenset[str]
     unavailable: frozenset[str] = frozenset()
+    unresolved: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
-        if any(type(key) is not str or not _valid_information_key(key) for key in (*self.supplied, *self.unavailable)):
+        if any(type(key) is not str or not _valid_information_key(key) for key in (*self.supplied, *self.unavailable, *self.unresolved)):
             raise ValueError("planner information manifest contains an unknown key")
+        if self.unresolved & (self.supplied | self.unavailable):
+            raise ValueError("planner information manifest cannot resolve and supply the same key")
 
     def covers(self, key: str) -> bool:
+        if key in self.unresolved:
+            return False
         if key in self.supplied or key in self.unavailable:
             return True
+        if key in _CATALOG_DETAIL_INFORMATION_BY_TOOL.values():
+            return _CATALOG_SELECTION_INFORMATION in self.supplied
         is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
         return is_state_projection and (_PIPELINE_CURRENT_INFORMATION in self.supplied or "pipeline.full" in self.supplied)
 
     def supplies(self, key: str) -> bool:
         """Return whether usable information, rather than an omission, closes key."""
+        if key in self.unresolved:
+            return False
         if key in self.supplied:
             return True
+        if key in _CATALOG_DETAIL_INFORMATION_BY_TOOL.values():
+            return _CATALOG_SELECTION_INFORMATION in self.supplied
         is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
         return is_state_projection and (_PIPELINE_CURRENT_INFORMATION in self.supplied or "pipeline.full" in self.supplied)
 
@@ -170,8 +188,16 @@ class PlannerInformationManifest:
         target = self.supplied if available else self.unavailable
         updated = target | frozenset(keys)
         if available:
-            return PlannerInformationManifest(supplied=updated, unavailable=self.unavailable - frozenset(keys))
-        return PlannerInformationManifest(supplied=self.supplied, unavailable=updated - self.supplied)
+            return PlannerInformationManifest(
+                supplied=updated,
+                unavailable=self.unavailable - frozenset(keys),
+                unresolved=self.unresolved - frozenset(keys),
+            )
+        return PlannerInformationManifest(
+            supplied=self.supplied,
+            unavailable=updated - self.supplied,
+            unresolved=self.unresolved - frozenset(keys),
+        )
 
     def provider_payload(self, *, unresolved_classes: tuple[str, ...]) -> dict[str, object]:
         return {
@@ -192,15 +218,25 @@ class PlannerDiscoveryPolicy:
     unresolved_classes: tuple[str, ...]
 
     @classmethod
-    def initial(cls, surface: PlannerSurface) -> PlannerDiscoveryPolicy:
+    def initial(
+        cls,
+        surface: PlannerSurface,
+        *,
+        required_catalog_detail_tools: tuple[str, ...] = (),
+    ) -> PlannerDiscoveryPolicy:
+        unknown_detail_tools = set(required_catalog_detail_tools) - set(_CATALOG_DETAIL_INFORMATION_BY_TOOL)
+        if unknown_detail_tools:
+            raise ValueError("planner discovery policy contains an unknown catalog detail tool")
         unavailable = (
             frozenset({"pipeline.preview"}) if surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE} else frozenset()
         )
+        detail_gaps = frozenset(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools)
         manifest = PlannerInformationManifest(
             supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}),
             unavailable=unavailable,
+            unresolved=detail_gaps,
         )
-        omitted = {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"}
+        omitted = {"get_pipeline_state", *set(_CATALOG_DETAIL_INFORMATION_BY_TOOL) - set(required_catalog_detail_tools)}
         if unavailable:
             omitted.add("preview_pipeline")
         names = tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name not in omitted)
@@ -215,6 +251,7 @@ class PlannerDiscoveryPolicy:
                 "blob.metadata",
                 "validation.code",
                 "secret.reference",
+                *tuple(_CATALOG_DETAIL_INFORMATION_BY_TOOL[tool] for tool in required_catalog_detail_tools),
             ),
         )
 
@@ -238,8 +275,8 @@ def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str
         if normalized == "source":
             return ("pipeline.source",)
         return (f"pipeline.component:{component}",)
-    if name in {"list_sources", "list_transforms", "list_sinks"}:
-        return (_CATALOG_SELECTION_INFORMATION,)
+    if name in _CATALOG_DETAIL_INFORMATION_BY_TOOL:
+        return (_CATALOG_SELECTION_INFORMATION, _CATALOG_DETAIL_INFORMATION_BY_TOOL[name])
     if name == "list_recipes":
         return (_RECIPE_INDEX_INFORMATION,)
     if name == "get_plugin_schema":
@@ -2781,7 +2818,10 @@ async def _plan_pipeline_inner(
             expected_reviewed_anchor_hash=reviewed_anchor_hash(reviewed_facts),
         ),
     )
-    discovery_policy = PlannerDiscoveryPolicy.initial(surface)
+    discovery_policy = PlannerDiscoveryPolicy.initial(
+        surface,
+        required_catalog_detail_tools=discovery_digest_detail_tools(authoring_aids),
+    )
     information_manifest = discovery_policy.manifest
     tools = planner_tool_definitions(discovery_policy)
     provider_request: dict[str, Any] = {
