@@ -63,7 +63,10 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerChatTurnRecorder,
     ComposerLLMCall,
     ComposerLLMCallRecorder,
+    ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt, ComposerPlannerAttemptRecorder
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json, composer_authority_hash
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -82,8 +85,11 @@ __all__ = [
     "finish_cancelled",
     "finish_plugin_crash",
     "finish_success",
+    "interleave_planner_audit_records",
     "llm_call_audit_envelope",
     "llm_call_audit_summary",
+    "planner_attempt_audit_envelope",
+    "planner_attempt_audit_summary",
     "rebind_dispatch_arguments",
 ]
 
@@ -196,7 +202,12 @@ def build_canonicalization_sentinel(
     return sentinel
 
 
-class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerChatTurnRecorder):
+class BufferingRecorder(
+    ComposerToolRecorder,
+    ComposerLLMCallRecorder,
+    ComposerChatTurnRecorder,
+    ComposerPlannerAttemptRecorder,
+):
     """Append-only in-memory buffer for composer audit records.
 
     Used inside :meth:`ComposerServiceImpl._compose_loop`. After Phase 3,
@@ -216,6 +227,7 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         self._invocations: list[ComposerToolInvocation] = []
         self._llm_calls: list[ComposerLLMCall] = []
         self._chat_turns: list[ComposerChatTurn] = []
+        self._planner_attempts: list[ComposerPlannerAttempt] = []
         self._lock = threading.Lock()
 
     def record(self, invocation: ComposerToolInvocation) -> None:
@@ -236,6 +248,11 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         with self._lock:
             self._chat_turns.append(turn)
 
+    def record_planner_attempt(self, attempt: ComposerPlannerAttempt) -> None:
+        """Append one semantic planner response disposition."""
+        with self._lock:
+            self._planner_attempts.append(attempt)
+
     @property
     def invocations(self) -> tuple[ComposerToolInvocation, ...]:
         """Snapshot the current buffer as an immutable tuple."""
@@ -253,6 +270,12 @@ class BufferingRecorder(ComposerToolRecorder, ComposerLLMCallRecorder, ComposerC
         """Snapshot the current chat-turn buffer as an immutable tuple."""
         with self._lock:
             return tuple(self._chat_turns)
+
+    @property
+    def planner_attempts(self) -> tuple[ComposerPlannerAttempt, ...]:
+        """Snapshot semantic planner attempts as an immutable tuple."""
+        with self._lock:
+            return tuple(self._planner_attempts)
 
     def resolve_session(self, session_id: str) -> None:
         """Protocol no-op — the in-memory buffer has nothing to flush.
@@ -334,6 +357,74 @@ def llm_call_audit_envelope(call: ComposerLLMCall) -> dict[str, object]:
     """
 
     return {"_kind": "llm_call_audit", "call": _public_llm_call_audit_payload(call)}
+
+
+def planner_attempt_audit_envelope(attempt: ComposerPlannerAttempt) -> dict[str, object]:
+    """Wrap one value-free semantic planner attempt for durable storage."""
+    return {"_kind": "planner_attempt_audit", "attempt": attempt.to_dict()}
+
+
+def planner_attempt_audit_summary(attempt: ComposerPlannerAttempt) -> str:
+    """Render the bounded operator-facing projection of a planner attempt."""
+    return json.dumps(
+        {
+            "_kind": "planner_attempt_audit",
+            "ordinal": attempt.ordinal,
+            "planner_call_ordinal": attempt.planner_call_ordinal,
+            "phase": attempt.phase.value,
+            "outcome": attempt.outcome.value,
+            "planner_code": attempt.planner_code.value if attempt.planner_code is not None else None,
+            "led_to": attempt.led_to.value,
+        }
+    )
+
+
+def interleave_planner_audit_records(
+    llm_calls: tuple[ComposerLLMCall, ...],
+    planner_attempts: tuple[ComposerPlannerAttempt, ...],
+) -> tuple[ComposerLLMCall | ComposerPlannerAttempt, ...]:
+    """Validate and interleave one physical/logical planner evidence cohort.
+
+    Physical provider failures have no semantic attempt. Every provider
+    response, including a malformed response, has exactly one attempt placed
+    immediately after its matching LLM-call row. Physical ordinal gaps are
+    therefore expected while logical attempt ordinals remain contiguous.
+    """
+    if type(llm_calls) is not tuple or any(type(call) is not ComposerLLMCall for call in llm_calls):
+        raise AuditIntegrityError("planner LLM evidence must be an exact ComposerLLMCall tuple")
+    if type(planner_attempts) is not tuple or any(type(attempt) is not ComposerPlannerAttempt for attempt in planner_attempts):
+        raise AuditIntegrityError("planner attempt evidence must be an exact ComposerPlannerAttempt tuple")
+    if tuple(attempt.ordinal for attempt in planner_attempts) != tuple(range(1, len(planner_attempts) + 1)):
+        raise AuditIntegrityError("planner semantic attempt ordinals must be contiguous")
+    attempts_by_physical: dict[int, ComposerPlannerAttempt] = {}
+    for attempt in planner_attempts:
+        if attempt.planner_call_ordinal in attempts_by_physical:
+            raise AuditIntegrityError("planner physical call ordinal has multiple semantic attempts")
+        attempts_by_physical[attempt.planner_call_ordinal] = attempt
+    records: list[ComposerLLMCall | ComposerPlannerAttempt] = []
+    observed_physical: set[int] = set()
+    for call in llm_calls:
+        planner_call_ordinal = call.planner_call_ordinal
+        if planner_call_ordinal is None:
+            raise AuditIntegrityError("planner LLM call is missing its physical ordinal")
+        if planner_call_ordinal in observed_physical:
+            raise AuditIntegrityError("planner LLM physical ordinals must be unique")
+        observed_physical.add(planner_call_ordinal)
+        records.append(call)
+        matching_attempt = attempts_by_physical.get(planner_call_ordinal)
+        response_received = call.status in {
+            ComposerLLMCallStatus.SUCCESS,
+            ComposerLLMCallStatus.MALFORMED_RESPONSE,
+        }
+        if response_received and matching_attempt is None:
+            raise AuditIntegrityError("planner semantic response has no planner attempt")
+        if not response_received and matching_attempt is not None:
+            raise AuditIntegrityError("provider transport failure cannot own a semantic planner attempt")
+        if matching_attempt is not None:
+            records.append(matching_attempt)
+    if set(attempts_by_physical) - observed_physical:
+        raise AuditIntegrityError("planner attempt references an absent physical call")
+    return tuple(records)
 
 
 # Terminal states that are simply "the turn ended normally". ``stop`` is a

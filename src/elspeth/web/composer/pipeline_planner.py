@@ -36,6 +36,14 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+    ComposerPlannerCode,
+    ComposerPlannerInformationClass,
+)
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -89,6 +97,7 @@ from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
+    COMPOSER_NODE_TYPES,
     CompositionState,
     RouteDestinationFactDict,
     ValidationEntry,
@@ -102,7 +111,11 @@ from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
     get_tool_definitions,
 )
-from elspeth.web.composer.tools.generation import explain_validation_code, explain_withheld_validation_code
+from elspeth.web.composer.tools.generation import (
+    _CLOSED_VALIDATION_ERROR_CODES,
+    explain_validation_code,
+    explain_withheld_validation_code,
+)
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -908,6 +921,122 @@ PipelineCustodyResult = Literal["not_required", "ready"]
 slog = structlog.get_logger()
 
 
+_PLANNER_INFORMATION_EXACT: Final[Mapping[str, ComposerPlannerInformationClass]] = {
+    information.value: information
+    for information in ComposerPlannerInformationClass
+    if information
+    not in {
+        ComposerPlannerInformationClass.PIPELINE_COMPONENT,
+        ComposerPlannerInformationClass.PLUGIN_SCHEMA,
+        ComposerPlannerInformationClass.PLUGIN_ASSISTANCE,
+        ComposerPlannerInformationClass.BLOB_METADATA,
+        ComposerPlannerInformationClass.BLOB_INSPECTION,
+        ComposerPlannerInformationClass.BLOB_CONTENT,
+        ComposerPlannerInformationClass.SECRET_REFERENCE,
+        ComposerPlannerInformationClass.VALIDATION_CODE,
+    }
+}
+_PLANNER_INFORMATION_PREFIXES: Final[tuple[tuple[str, ComposerPlannerInformationClass], ...]] = (
+    ("pipeline.component:", ComposerPlannerInformationClass.PIPELINE_COMPONENT),
+    ("plugin.schema:", ComposerPlannerInformationClass.PLUGIN_SCHEMA),
+    ("plugin.assistance:", ComposerPlannerInformationClass.PLUGIN_ASSISTANCE),
+    ("blob.metadata:", ComposerPlannerInformationClass.BLOB_METADATA),
+    ("blob.inspection:", ComposerPlannerInformationClass.BLOB_INSPECTION),
+    ("blob.content:", ComposerPlannerInformationClass.BLOB_CONTENT),
+    ("secret.reference:", ComposerPlannerInformationClass.SECRET_REFERENCE),
+    ("validation.code:", ComposerPlannerInformationClass.VALIDATION_CODE),
+)
+_PLANNER_SERVER_REJECTION_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "argument_error",
+        "canonical_schema",
+        "deferred_intent_claim",
+        "validation_error",
+    }
+)
+_PLANNER_DECLARED_TOOL_NAMES: Final[frozenset[str]] = frozenset({*PLANNER_DISCOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME})
+
+
+def _planner_information_class(key: str) -> ComposerPlannerInformationClass:
+    exact = _PLANNER_INFORMATION_EXACT.get(key)
+    if exact is not None:
+        return exact
+    for prefix, information_class in _PLANNER_INFORMATION_PREFIXES:
+        if key.startswith(prefix):
+            return information_class
+    raise AuditIntegrityError("planner attempt referenced an unknown information class")
+
+
+def _planner_information_classes(keys: tuple[str, ...]) -> tuple[ComposerPlannerInformationClass, ...]:
+    return tuple(_planner_information_class(key) for key in keys)
+
+
+def _planner_tool_name(name: str) -> str:
+    return name if name in _PLANNER_DECLARED_TOOL_NAMES else "undeclared_tool"
+
+
+def _closed_planner_rejection_codes(codes: tuple[str, ...]) -> tuple[str, ...]:
+    closed = tuple(
+        code if code in _PLANNER_SERVER_REJECTION_CODES or code in _CLOSED_VALIDATION_ERROR_CODES else "validation_error" for code in codes
+    )
+    return tuple(sorted(set(closed)))
+
+
+def _value_free_shape(value: object) -> object:
+    """Project a value to container/scalar shape without retaining any value."""
+    if type(value) is dict:
+        child_shapes = [_value_free_shape(child) for child in value.values()]
+        return {
+            "kind": "object",
+            "size": len(value),
+            "children": sorted(child_shapes, key=canonical_json),
+        }
+    if type(value) is list:
+        return {
+            "kind": "array",
+            "size": len(value),
+            "children": [_value_free_shape(child) for child in value],
+        }
+    if value is None:
+        return "null"
+    if type(value) is bool:
+        return "boolean"
+    if type(value) is int:
+        return "integer"
+    if type(value) is float:
+        return "number"
+    if type(value) is str:
+        return "string"
+    return "unknown"
+
+
+def _candidate_shape_hash(candidate: Mapping[str, Any]) -> str:
+    """Hash only the structural shape of a model-authored candidate."""
+    raw_nodes = candidate.get("nodes")
+    node_types: list[str] = []
+    if type(raw_nodes) is list:
+        for raw_node in raw_nodes:
+            node_type = raw_node.get("node_type") if type(raw_node) is dict else None
+            node_types.append(node_type if type(node_type) is str and node_type in COMPOSER_NODE_TYPES else "unknown")
+    return stable_hash(
+        {
+            "domain": "composer.planner.candidate-shape.v1",
+            "node_types": node_types,
+            "shape": _value_free_shape(deep_thaw(candidate)),
+        }
+    )
+
+
+@dataclass(slots=True)
+class _ActivePlannerAttempt:
+    ordinal: int
+    planner_call_ordinal: int
+    phase_hint: ComposerPlannerAttemptPhase
+    selected_tools: tuple[str, ...]
+    requested_information: tuple[ComposerPlannerInformationClass, ...]
+    candidate_shape_hash: str | None
+
+
 class _PlannerAttemptTrail:
     """Per-attempt planner observability: every round names its outcome.
 
@@ -935,49 +1064,146 @@ class _PlannerAttemptTrail:
       the raised error still carries code REPAIR_EXHAUSTED)
     """
 
-    def __init__(self, *, session_id: str, operation_id: str | None, surface: str) -> None:
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        operation_id: str | None,
+        surface: str,
+        recorder: BufferingRecorder,
+    ) -> None:
         self.session_id = session_id
         self.operation_id = operation_id
         self.surface = surface
         self.attempts = 0
         self.phase_counts: dict[str, int] = {}
         self.rejection_history: list[dict[str, Any]] = []
+        self._recorder = recorder
+        self._active: _ActivePlannerAttempt | None = None
 
-    def begin_attempt(self) -> None:
-        self.attempts += 1
-
-    def log_attempt(
+    def begin_attempt(
         self,
-        phase: str,
-        outcome: str,
         *,
-        led_to: str,
+        planner_call_ordinal: int,
+        phase_hint: ComposerPlannerAttemptPhase,
+        selected_tools: tuple[str, ...] = (),
+        requested_information: tuple[ComposerPlannerInformationClass, ...] = (),
+        candidate_shape_hash: str | None = None,
+    ) -> None:
+        if self._active is not None:
+            raise AuditIntegrityError("planner semantic attempt began before the prior attempt settled")
+        self.attempts += 1
+        self._active = _ActivePlannerAttempt(
+            ordinal=self.attempts,
+            planner_call_ordinal=planner_call_ordinal,
+            phase_hint=phase_hint,
+            selected_tools=selected_tools,
+            requested_information=requested_information,
+            candidate_shape_hash=candidate_shape_hash,
+        )
+
+    def set_active_phase(self, phase: ComposerPlannerAttemptPhase) -> None:
+        if self._active is None:
+            raise AuditIntegrityError("planner semantic attempt phase changed without an active attempt")
+        self._active.phase_hint = phase
+
+    def finish_attempt(
+        self,
+        phase: str | ComposerPlannerAttemptPhase,
+        outcome: str | ComposerPlannerAttemptOutcome,
+        *,
+        led_to: str | ComposerPlannerAttemptLedTo,
         codes: tuple[str, ...] = (),
         planner_code: str | None = None,
         tool_calls: int = 0,
         repeated_fingerprint: bool = False,
+        new_information: tuple[ComposerPlannerInformationClass, ...] = (),
     ) -> None:
-        if phase not in self.phase_counts:
-            self.phase_counts[phase] = 0
-        self.phase_counts[phase] += 1
-        rejection_codes = sorted(set(codes))
+        del tool_calls
+        active = self._active
+        if active is None:
+            raise AuditIntegrityError("planner semantic attempt settled without an active attempt")
+        phase_value = ComposerPlannerAttemptPhase(phase)
+        outcome_value = ComposerPlannerAttemptOutcome(outcome)
+        led_to_value = ComposerPlannerAttemptLedTo(led_to)
+        planner_code_value = ComposerPlannerCode(planner_code) if planner_code is not None else None
+        rejection_codes = _closed_planner_rejection_codes(codes)
+        attempt = ComposerPlannerAttempt(
+            ordinal=active.ordinal,
+            planner_call_ordinal=active.planner_call_ordinal,
+            phase=phase_value,
+            outcome=outcome_value,
+            planner_code=planner_code_value,
+            selected_tools=active.selected_tools,
+            requested_information=active.requested_information,
+            new_information=new_information,
+            rejection_codes=rejection_codes,
+            candidate_shape_hash=active.candidate_shape_hash,
+            repeated_fingerprint=repeated_fingerprint,
+            led_to=led_to_value,
+        )
+        self._recorder.record_planner_attempt(attempt)
+        self._active = None
+        phase_name = phase_value.value
+        if phase_name not in self.phase_counts:
+            self.phase_counts[phase_name] = 0
+        self.phase_counts[phase_name] += 1
         if rejection_codes:
-            self.rejection_history.append({"attempt": self.attempts, "outcome": outcome, "codes": rejection_codes})
+            self.rejection_history.append({"attempt": attempt.ordinal, "outcome": outcome_value.value, "codes": list(rejection_codes)})
         slog.info(
             "composer.planner_attempt",
             session_id=self.session_id,
             operation_id=self.operation_id,
             surface=self.surface,
-            attempt=self.attempts,
-            phase=phase,
-            outcome=outcome,
-            led_to=led_to,
-            rejection_codes=rejection_codes,
-            planner_code=planner_code,
-            tool_calls=tool_calls,
+            attempt=attempt.ordinal,
+            phase=phase_name,
+            outcome=outcome_value.value,
+            led_to=led_to_value.value,
+            rejection_codes=list(rejection_codes),
+            planner_code=planner_code_value.value if planner_code_value is not None else None,
+            tool_calls=len(active.selected_tools),
             # True when this rejection's (component, code) fingerprint already
             # appeared in this request — the doctrine's "our bug" signal.
             repeated_fingerprint=repeated_fingerprint,
+        )
+
+    def finalize_active_exception(self, exc: BaseException) -> None:
+        active = self._active
+        if active is None:
+            return
+        if isinstance(exc, asyncio.CancelledError):
+            outcome = ComposerPlannerAttemptOutcome.CANCELLED
+            planner_code = None
+        elif isinstance(exc, PipelinePlannerError):
+            planner_code = exc.code
+            if exc.code == ComposerPlannerCode.MALFORMED_RESPONSE.value:
+                outcome = ComposerPlannerAttemptOutcome.MALFORMED_RESPONSE
+            elif exc.code == ComposerPlannerCode.RESPONSE_TRUNCATED.value:
+                outcome = ComposerPlannerAttemptOutcome.TRUNCATED
+            elif exc.code in {
+                ComposerPlannerCode.COMPLETION_TOKENS_EXCEEDED.value,
+                ComposerPlannerCode.COMPOSITION_EXHAUSTED.value,
+                ComposerPlannerCode.COST_CAP_EXCEEDED.value,
+                ComposerPlannerCode.COST_UNAVAILABLE.value,
+                ComposerPlannerCode.DISCOVERY_EXHAUSTED.value,
+                ComposerPlannerCode.PROVIDER_CALLS_EXHAUSTED.value,
+                ComposerPlannerCode.REPAIR_EXHAUSTED.value,
+                ComposerPlannerCode.REQUEST_BYTES_EXHAUSTED.value,
+                ComposerPlannerCode.TOOL_CALLS_EXHAUSTED.value,
+            }:
+                outcome = ComposerPlannerAttemptOutcome.BUDGET_EXHAUSTED
+            elif exc.code == ComposerPlannerCode.DECLINED.value:
+                outcome = ComposerPlannerAttemptOutcome.DECLINED
+            else:
+                outcome = ComposerPlannerAttemptOutcome.GUARD_FIRED
+        else:
+            outcome = ComposerPlannerAttemptOutcome.INTERNAL_ERROR
+            planner_code = None
+        self.finish_attempt(
+            active.phase_hint,
+            outcome,
+            planner_code=planner_code,
+            led_to=ComposerPlannerAttemptLedTo.TERMINAL,
         )
 
     def log_summary(self, final_outcome: str) -> None:
@@ -2809,6 +3035,7 @@ async def plan_pipeline(
         raise ValueError("freeform and guided-full surfaces cannot provide claim_evaluator")
 
     llm_call_start = len(recorder.llm_calls)
+    planner_attempt_start = len(recorder.planner_attempts)
     outcome: PlannerSettlement = "failed"
     primary_error: BaseException | None = None
     # The guided write fence carries the operation identity; freeform has
@@ -2818,6 +3045,7 @@ async def plan_pipeline(
         session_id=originating_message.session_id,
         operation_id=(custody_config.write_fence.operation_id if custody_config.write_fence is not None else None),
         surface=surface.value,
+        recorder=recorder,
     )
     try:
         await lifecycle.before_start()
@@ -2856,7 +3084,10 @@ async def plan_pipeline(
         return proposal
     except BaseException as exc:
         primary_error = exc
+        trail.finalize_active_exception(exc)
         attach_llm_calls(exc, recorder, start_index=llm_call_start)
+        exc_with_attempts = cast(Any, exc)
+        exc_with_attempts.planner_attempts = recorder.planner_attempts[planner_attempt_start:]
         if isinstance(exc, asyncio.CancelledError):
             outcome = "cancelled"
             trail.log_summary("cancelled")
@@ -3016,6 +3247,7 @@ async def _plan_pipeline_inner(
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
         reasoning_effort: str | None = None,
+        attempt_phase_hint: ComposerPlannerAttemptPhase = ComposerPlannerAttemptPhase.RESPONSE,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         nonlocal total_calls, total_cost
         effective_model = model_override or model_config.model_identifier
@@ -3077,6 +3309,38 @@ async def _plan_pipeline_inner(
             )
             _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
             recorder.record_llm_call(failed_call)
+
+        def begin_response_attempt(
+            call_to_bind: ComposerLLMCall,
+            parsed_calls: tuple[_ParsedToolCall, ...] = (),
+        ) -> None:
+            planner_call_ordinal = call_to_bind.planner_call_ordinal
+            if planner_call_ordinal is None:
+                raise AuditIntegrityError("planner semantic attempt requires a physical call ordinal")
+            selected_tools = tuple(_planner_tool_name(parsed_call.name) for parsed_call in parsed_calls)
+            requested_information = tuple(
+                information_class
+                for parsed_call in parsed_calls
+                for information_class in _planner_information_classes(planner_discovery_information_keys(parsed_call))
+            )
+            candidate_shape_hash: str | None = None
+            for parsed_call in parsed_calls:
+                if parsed_call.name != _TERMINAL_TOOL_NAME:
+                    continue
+                arguments = deep_thaw(parsed_call.arguments)
+                if type(arguments) is not dict:
+                    continue
+                candidate = arguments.get("pipeline")
+                if type(candidate) is dict:
+                    candidate_shape_hash = _candidate_shape_hash(candidate)
+                break
+            trail.begin_attempt(
+                planner_call_ordinal=planner_call_ordinal,
+                phase_hint=attempt_phase_hint,
+                selected_tools=selected_tools,
+                requested_information=requested_information,
+                candidate_shape_hash=candidate_shape_hash,
+            )
 
         for attempt in range(1, model_config.max_api_attempts + 1):
             if total_calls >= budget_policy.max_total_provider_calls:
@@ -3217,11 +3481,16 @@ async def _plan_pipeline_inner(
                 planner_policy_hash=budget_policy.audit_hash,
                 planner_call_ordinal=ordinal,
             )
-            _assert_planner_call_matches_manifest(call, manifest, recorder)
+            try:
+                _assert_planner_call_matches_manifest(call, manifest, recorder)
+            except AuditIntegrityError:
+                begin_response_attempt(call)
+                raise
             # Cost enforcement is intentionally post-call and pre-parse.  Do
             # not inspect provider content or dispatch tools before it passes.
             if call.provider_cost is None:
                 recorder.record_llm_call(call)
+                begin_response_attempt(call)
                 raise PipelinePlannerError("planner provider cost metadata is missing or malformed", code="COST_UNAVAILABLE")
             if call.completion_tokens is None:
                 malformed_usage = PipelinePlannerError(
@@ -3236,9 +3505,11 @@ async def _plan_pipeline_inner(
                         error_message=malformed_usage.code,
                     )
                 )
+                begin_response_attempt(call)
                 raise malformed_usage
             if call.completion_tokens > budget_policy.max_completion_tokens:
                 recorder.record_llm_call(call)
+                begin_response_attempt(call)
                 raise PipelinePlannerError(
                     "planner provider reported a completion token limit overage",
                     code="COMPLETION_TOKENS_EXCEEDED",
@@ -3246,6 +3517,7 @@ async def _plan_pipeline_inner(
             total_cost += Decimal(str(call.provider_cost))
             if total_cost > budget_policy.max_cumulative_provider_cost:
                 recorder.record_llm_call(call)
+                begin_response_attempt(call)
                 raise PipelinePlannerError("planner provider cost continuation cap exceeded", code="COST_CAP_EXCEEDED")
             try:
                 parsed_response = _parse_response_tool_calls(
@@ -3269,6 +3541,7 @@ async def _plan_pipeline_inner(
                         error_message="RESPONSE_TRUNCATED" if truncated else exc.code,
                     )
                 )
+                begin_response_attempt(call)
                 if truncated:
                     raise PipelinePlannerError(
                         "planner response was truncated at the completion token limit",
@@ -3277,6 +3550,7 @@ async def _plan_pipeline_inner(
                 raise
             recorder.record_llm_call(call)
             message, calls = parsed_response
+            begin_response_attempt(call, calls)
             return message, calls, call
         raise AssertionError("provider attempt loop exited without return or exception")
 
@@ -3349,6 +3623,7 @@ async def _plan_pipeline_inner(
                     tools_override=[planner_terminal_tool_definition(terminal_contract)],
                     allow_text_reply=True,
                     reasoning_effort=model_config.candidate_reasoning_effort,
+                    attempt_phase_hint=ComposerPlannerAttemptPhase.HATCH,
                 )
             else:
                 message, calls, audited_call = await call_model(
@@ -3376,64 +3651,73 @@ async def _plan_pipeline_inner(
                 # separate from the repair budget, which answers candidate
                 # rejections. Past the budget, the original terminal
                 # MALFORMED_RESPONSE disposition stands unchanged.
-                trail.begin_attempt()
                 if is_hatch_turn:
                     # The advisor's one shot produced nothing usable: the
                     # hatch is spent, the original exhaustion stands.
-                    trail.log_attempt("hatch", "prose_reply", led_to="terminal")
+                    trail.finish_attempt("hatch", "prose_reply", led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
                 prose_nudges += 1
                 if prose_nudges > _PROSE_NUDGE_BUDGET:
-                    trail.log_attempt("prose", "prose_reply", planner_code="MALFORMED_RESPONSE", led_to="terminal")
+                    trail.finish_attempt("prose", "prose_reply", planner_code="MALFORMED_RESPONSE", led_to="terminal")
                     raise PipelinePlannerError(
                         "planner response must call a declared tool",
                         code="MALFORMED_RESPONSE",
                     ) from exc
-                trail.log_attempt("prose", "prose_nudged", led_to="continue")
+                trail.finish_attempt("prose", "prose_nudged", led_to="continue")
                 messages.append({"role": "user", "content": _prose_reply_notice()})
                 continue
             if exc.code != "RESPONSE_TRUNCATED":
                 if is_hatch_turn:
+                    trail.finalize_active_exception(exc)
                     assert hatch_error is not None
                     raise hatch_error from None
                 raise
-            trail.begin_attempt()
             if is_hatch_turn:
                 # The advisor's one shot overflowed: the hatch is spent, the
                 # original exhaustion stands.
-                trail.log_attempt("hatch", "truncated", led_to="terminal")
+                trail.finish_attempt("hatch", "truncated", led_to="terminal")
                 assert hatch_error is not None
                 raise hatch_error from None
             repair_count += 1
             if repair_count > repair_budget:
                 if _hatch_available():
-                    trail.log_attempt("repair", "truncated", planner_code="REPAIR_EXHAUSTED", led_to="hatch")
+                    trail.finish_attempt("repair", "truncated", planner_code="REPAIR_EXHAUSTED", led_to="hatch")
                     _engage_escape_hatch(PipelinePlannerError("planner repair budget exhausted", code="REPAIR_EXHAUSTED"))
                     continue
-                trail.log_attempt("repair", "truncated", planner_code="REPAIR_EXHAUSTED", led_to="terminal")
+                trail.finish_attempt("repair", "truncated", planner_code="REPAIR_EXHAUSTED", led_to="terminal")
                 raise PipelinePlannerError("planner repair budget exhausted", code="REPAIR_EXHAUSTED") from None
-            trail.log_attempt("repair", "truncated", led_to="repair")
+            trail.finish_attempt("repair", "truncated", led_to="repair")
             messages.append({"role": "user", "content": _truncated_response_notice()})
             continue
-        except Exception:
+        except Exception as exc:
             if is_hatch_turn:
+                trail.finalize_active_exception(exc)
                 assert hatch_error is not None
                 raise hatch_error from None
             raise
-        trail.begin_attempt()
+        terminal_calls = tuple(call for call in calls if call.name == _TERMINAL_TOOL_NAME)
         # Phase of a terminal-tool turn: the first candidate is "candidate",
         # every post-rejection retry is "repair"; the advisor turn is "hatch".
-        attempt_phase = "hatch" if is_hatch_turn else ("candidate" if repair_count == 0 else "repair")
+        attempt_phase = (
+            ComposerPlannerAttemptPhase.HATCH
+            if is_hatch_turn
+            else ComposerPlannerAttemptPhase.CANDIDATE
+            if terminal_calls and repair_count == 0
+            else ComposerPlannerAttemptPhase.REPAIR
+            if terminal_calls
+            else ComposerPlannerAttemptPhase.DISCOVERY
+        )
+        trail.set_active_phase(attempt_phase)
         if is_hatch_turn and not calls:
             decline_content = _provider_field(message, "content")
-            trail.log_attempt("hatch", "declined", led_to="terminal")
+            trail.finish_attempt("hatch", "declined", planner_code="DECLINED", led_to="terminal")
             raise PlannerDeclined(
                 "planner escape-hatch advisor declined the request",
                 decline_text=decline_content if type(decline_content) is str else "",
             )
         if len(calls) > model_config.max_tool_calls_per_turn:
-            trail.log_attempt(
+            trail.finish_attempt(
                 attempt_phase, "budget_exhausted", planner_code="TOOL_CALLS_EXHAUSTED", led_to="terminal", tool_calls=len(calls)
             )
             if is_hatch_turn:
@@ -3441,18 +3725,17 @@ async def _plan_pipeline_inner(
                 raise hatch_error from None
             raise PipelinePlannerError("planner per-turn tool call budget exhausted", code="TOOL_CALLS_EXHAUSTED")
 
-        terminal_calls = tuple(call for call in calls if call.name == _TERMINAL_TOOL_NAME)
         if terminal_calls:
             if not is_hatch_turn:
                 composition_turns += 1
                 if composition_turns > model_config.max_composition_turns:
                     if _hatch_available():
-                        trail.log_attempt(attempt_phase, "budget_exhausted", planner_code="COMPOSITION_EXHAUSTED", led_to="hatch")
+                        trail.finish_attempt(attempt_phase, "budget_exhausted", planner_code="COMPOSITION_EXHAUSTED", led_to="hatch")
                         _engage_escape_hatch(
                             PipelinePlannerError("planner composition turn budget exhausted", code="COMPOSITION_EXHAUSTED")
                         )
                         continue
-                    trail.log_attempt(attempt_phase, "budget_exhausted", planner_code="COMPOSITION_EXHAUSTED", led_to="terminal")
+                    trail.finish_attempt(attempt_phase, "budget_exhausted", planner_code="COMPOSITION_EXHAUSTED", led_to="terminal")
                     raise PipelinePlannerError("planner composition turn budget exhausted", code="COMPOSITION_EXHAUSTED")
             call = terminal_calls[0]
             terminal_feedback: Mapping[str, Any] | None = None
@@ -3568,7 +3851,7 @@ async def _plan_pipeline_inner(
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         "hatch",
                         "candidate_rejected",
                         codes=last_rejection_codes,
@@ -3580,7 +3863,7 @@ async def _plan_pipeline_inner(
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
-                        trail.log_attempt(
+                        trail.finish_attempt(
                             attempt_phase,
                             "candidate_rejected",
                             codes=last_rejection_codes,
@@ -3596,7 +3879,7 @@ async def _plan_pipeline_inner(
                         )
                         _engage_escape_hatch(_rejection_exhausted())
                         continue
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         attempt_phase,
                         "candidate_rejected",
                         codes=last_rejection_codes,
@@ -3605,7 +3888,7 @@ async def _plan_pipeline_inner(
                         repeated_fingerprint=repeated_terminal_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(
+                trail.finish_attempt(
                     attempt_phase,
                     "candidate_rejected",
                     codes=last_rejection_codes,
@@ -3736,13 +4019,13 @@ async def _plan_pipeline_inner(
             except DeferredIntentClaimError:
                 last_rejection_codes = ("deferred_intent_claim",)
                 if is_hatch_turn:
-                    trail.log_attempt("hatch", "deferred_claim", codes=last_rejection_codes, led_to="terminal")
+                    trail.finish_attempt("hatch", "deferred_claim", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
-                        trail.log_attempt(
+                        trail.finish_attempt(
                             attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
                         deferred_feedback = _deferred_intent_claim_feedback()
@@ -3754,11 +4037,11 @@ async def _plan_pipeline_inner(
                         )
                         _engage_escape_hatch(_rejection_exhausted())
                         continue
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "deferred_claim", codes=last_rejection_codes, led_to="repair")
+                trail.finish_attempt(attempt_phase, "deferred_claim", codes=last_rejection_codes, led_to="repair")
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {
@@ -3771,13 +4054,13 @@ async def _plan_pipeline_inner(
             except ToolArgumentError as exc:
                 last_rejection_codes = (exc.code or "argument_error",)
                 if is_hatch_turn:
-                    trail.log_attempt("hatch", "arg_error", codes=last_rejection_codes, led_to="terminal")
+                    trail.finish_attempt("hatch", "arg_error", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
-                        trail.log_attempt(
+                        trail.finish_attempt(
                             attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
                         argument_feedback = _allowlisted_argument_feedback(exc)
@@ -3789,11 +4072,11 @@ async def _plan_pipeline_inner(
                         )
                         _engage_escape_hatch(_rejection_exhausted())
                         continue
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "arg_error", codes=last_rejection_codes, led_to="repair")
+                trail.finish_attempt(attempt_phase, "arg_error", codes=last_rejection_codes, led_to="repair")
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {
@@ -3836,7 +4119,7 @@ async def _plan_pipeline_inner(
                         ],
                     )
                 if is_hatch_turn:
-                    trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
+                    trail.finish_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
                 if repeated_fingerprint and candidate_facts_withheld:
@@ -3850,7 +4133,7 @@ async def _plan_pipeline_inner(
                     # the budget-exhaustion path does). Budget semantics are
                     # unchanged whenever every entry carries its facts.
                     if _hatch_available():
-                        trail.log_attempt(
+                        trail.finish_attempt(
                             attempt_phase,
                             "candidate_rejected",
                             codes=last_rejection_codes,
@@ -3870,7 +4153,7 @@ async def _plan_pipeline_inner(
                             )
                         )
                         continue
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         attempt_phase,
                         "candidate_rejected",
                         codes=last_rejection_codes,
@@ -3884,7 +4167,7 @@ async def _plan_pipeline_inner(
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
-                        trail.log_attempt(
+                        trail.finish_attempt(
                             attempt_phase,
                             "candidate_rejected",
                             codes=last_rejection_codes,
@@ -3900,7 +4183,7 @@ async def _plan_pipeline_inner(
                         )
                         _engage_escape_hatch(_rejection_exhausted())
                         continue
-                    trail.log_attempt(
+                    trail.finish_attempt(
                         attempt_phase,
                         "candidate_rejected",
                         codes=last_rejection_codes,
@@ -3909,7 +4192,7 @@ async def _plan_pipeline_inner(
                         repeated_fingerprint=repeated_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(
+                trail.finish_attempt(
                     attempt_phase,
                     "candidate_rejected",
                     codes=last_rejection_codes,
@@ -3930,7 +4213,7 @@ async def _plan_pipeline_inner(
                     assert hatch_error is not None
                     raise hatch_error from None
                 raise
-            trail.log_attempt(attempt_phase, "accepted", led_to="done", tool_calls=len(calls))
+            trail.finish_attempt(attempt_phase, "accepted", led_to="done", tool_calls=len(calls))
             return accepted_plan
 
         if is_hatch_turn:
@@ -3940,7 +4223,7 @@ async def _plan_pipeline_inner(
             assert hatch_error is not None
             raise hatch_error
         if any(call.name not in _PLANNER_DISCOVERY_TOOL_NAME_SET for call in calls):
-            trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_ONLY", led_to="terminal", tool_calls=len(calls))
+            trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_ONLY", led_to="terminal", tool_calls=len(calls))
             raise PipelinePlannerError(
                 "planner may execute read-only discovery tools only before its terminal proposal",
                 code="DISCOVERY_ONLY",
@@ -3948,12 +4231,14 @@ async def _plan_pipeline_inner(
         discovery_turns += 1
         if discovery_turns > model_config.max_discovery_turns:
             if _hatch_available():
-                trail.log_attempt(
+                trail.finish_attempt(
                     "discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="hatch", tool_calls=len(calls)
                 )
                 _engage_escape_hatch(PipelinePlannerError("planner discovery turn budget exhausted", code="DISCOVERY_EXHAUSTED"))
                 continue
-            trail.log_attempt("discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="terminal", tool_calls=len(calls))
+            trail.finish_attempt(
+                "discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="terminal", tool_calls=len(calls)
+            )
             raise PipelinePlannerError("planner discovery turn budget exhausted", code="DISCOVERY_EXHAUSTED")
         if repair_count != seen_discovery_round:
             # Exact-call repetition stays round-scoped, but semantic
@@ -3978,10 +4263,10 @@ async def _plan_pipeline_inner(
             # A cycling planner is stuck by definition — hand the puzzle to
             # the advisor rather than failing the request.
             if _hatch_available():
-                trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="hatch", tool_calls=len(calls))
+                trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="hatch", tool_calls=len(calls))
                 _engage_escape_hatch(PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE"))
                 continue
-            trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="terminal", tool_calls=len(calls))
+            trail.finish_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="terminal", tool_calls=len(calls))
             raise PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE")
         seen_discovery.update(keys)
         await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
@@ -3990,7 +4275,7 @@ async def _plan_pipeline_inner(
             await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
 
         if not useful_calls:
-            trail.log_attempt(
+            trail.finish_attempt(
                 "discovery",
                 "guard_fired",
                 planner_code="DISCOVERY_NO_GAIN",
@@ -4113,6 +4398,7 @@ async def _plan_pipeline_inner(
         if pending:
             await asyncio.gather(*pending)
         discovery_results = iter(task.result() for task in discovery_tasks)
+        new_information: list[ComposerPlannerInformationClass] = []
         for call in calls:
             if call in no_gain_calls:
                 messages.append(
@@ -4150,6 +4436,7 @@ async def _plan_pipeline_inner(
                 }
             )
             information_available = result.success
+            newly_covered_keys = tuple(key for key in information_keys[call.call_id] if not information_manifest.covers(key))
             if call.name == "get_plugin_schema" and result.success:
                 try:
                     if type(result.data) is not PluginSchemaInfo:
@@ -4169,6 +4456,7 @@ async def _plan_pipeline_inner(
                     information_keys[call.call_id],
                     available=information_available,
                 )
+                new_information.extend(_planner_information_classes(newly_covered_keys))
             else:
                 pending_information.difference_update(set(information_keys[call.call_id]) - declared_pending_information)
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
@@ -4176,12 +4464,13 @@ async def _plan_pipeline_inner(
             raise AuditIntegrityError("planner discovery produced an unowned result")
         discovery_policy = discovery_policy.with_manifest(information_manifest)
         tools = planner_tool_definitions(discovery_policy, terminal_contract=terminal_contract)
-        trail.log_attempt(
+        trail.finish_attempt(
             "discovery",
             "discovery_executed",
             planner_code="DISCOVERY_NO_GAIN" if escalate_no_gain else None,
             led_to="hatch" if escalate_no_gain and _hatch_available() else "terminal" if escalate_no_gain else "continue",
             tool_calls=len(calls),
+            new_information=tuple(new_information),
         )
         if escalate_no_gain:
             if _hatch_available():

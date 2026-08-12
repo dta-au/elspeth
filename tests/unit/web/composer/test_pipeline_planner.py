@@ -28,13 +28,19 @@ from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+    ComposerPlannerInformationClass,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo
-from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.audit import BufferingRecorder, planner_attempt_audit_envelope
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError
 from elspeth.web.composer.guided.planning import GuidedCandidateBindingRejected, guided_redacted_current_state_context
@@ -58,6 +64,7 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerTerminalContract,
     PlannerTerminalMaterialization,
     _allowlisted_candidate_feedback,
+    _candidate_shape_hash,
     _derive_finalizer_owned_refs,
     _feedback_error_codes,
     _FinalizerOwnedRefs,
@@ -1086,6 +1093,61 @@ async def test_happy_path_returns_proposal_and_audits_exact_marked_wire_payload(
     assert audit.max_completion_tokens_requested == policy.max_completion_tokens
     assert audit.planner_policy_hash == policy.audit_hash
     assert audit.planner_call_ordinal == 1
+    (attempt,) = recorder.planner_attempts
+    assert attempt.ordinal == 1
+    assert attempt.planner_call_ordinal == 1
+    assert attempt.phase is ComposerPlannerAttemptPhase.CANDIDATE
+    assert attempt.outcome is ComposerPlannerAttemptOutcome.ACCEPTED
+    assert attempt.selected_tools == ("emit_pipeline_proposal",)
+    assert attempt.requested_information == ()
+    assert attempt.new_information == ()
+    assert attempt.candidate_shape_hash is not None
+    assert attempt.led_to is ComposerPlannerAttemptLedTo.DONE
+
+
+@pytest.mark.asyncio
+async def test_candidate_shape_hash_ignores_authored_scalar_values(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    first = _pipeline(tmp_path)
+    second = deepcopy(first)
+    value_canary = "PRIVATE-CANDIDATE-VALUE-CANARY"
+    second["outputs"][0]["options"]["path"] = f"outputs/{value_canary}.jsonl"
+    first_recorder = BufferingRecorder()
+    second_recorder = BufferingRecorder()
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=_ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": first}))),
+        recorder=first_recorder,
+    )
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=_ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": second}))),
+        recorder=second_recorder,
+    )
+
+    assert first_recorder.planner_attempts[0].candidate_shape_hash == second_recorder.planner_attempts[0].candidate_shape_hash
+    second_attempt = second_recorder.planner_attempts[0]
+    serialized_evidence = canonical_json(
+        {
+            "attempt": second_attempt.to_dict(),
+            "envelope": planner_attempt_audit_envelope(second_attempt),
+        }
+    )
+    assert value_canary not in serialized_evidence
+
+
+def test_candidate_shape_hash_retains_closed_node_type_sequence(tmp_path: Path) -> None:
+    transform_candidate = _pipeline(tmp_path)
+    transform_candidate["nodes"] = [{"node_type": "transform"}]
+    gate_candidate = deepcopy(transform_candidate)
+    gate_candidate["nodes"][0]["node_type"] = "gate"
+
+    assert _candidate_shape_hash(transform_candidate) != _candidate_shape_hash(gate_candidate)
 
 
 @pytest.mark.asyncio
@@ -5279,6 +5341,8 @@ async def test_each_transient_api_retry_consumes_and_audits_a_wire_attempt(
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
     assert [call.status.value for call in recorder.llm_calls] == ["api_error", "success"]
     assert raw_canary not in canonical_json([call.to_dict() for call in recorder.llm_calls])
+    assert [attempt.ordinal for attempt in recorder.planner_attempts] == [1]
+    assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == [2]
 
 
 @pytest.mark.asyncio
@@ -5323,6 +5387,17 @@ async def test_repeated_discovery_call_hits_explicit_cycle_guard_before_redispat
     assert excinfo.value.code == "DISCOVERY_NO_GAIN"
     assert len(recorder.llm_calls) == 3
     assert len(recorder.invocations) == 1
+    assert [attempt.outcome.value for attempt in recorder.planner_attempts] == [
+        "discovery_executed",
+        "guard_fired",
+        "guard_fired",
+    ]
+    for no_gain_attempt in recorder.planner_attempts[1:]:
+        assert no_gain_attempt.requested_information == (
+            ComposerPlannerInformationClass.CATALOG_SELECTION,
+            ComposerPlannerInformationClass.CATALOG_DETAILS_SOURCE,
+        )
+        assert no_gain_attempt.new_information == ()
 
 
 async def _session_context(*, content: str = "Use this CSV: name,score\nada,42\n") -> tuple[Any, PlannerOriginatingMessage]:
@@ -5720,6 +5795,7 @@ async def test_disconnect_cancellation_during_provider_call_audits_and_settles(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert recorder.llm_calls[0].status.value == "cancelled"
+    assert recorder.planner_attempts == ()
     assert events[-1] == "settled:cancelled"
 
 
@@ -7300,11 +7376,43 @@ async def test_malformed_tool_call_arguments_stay_fatal(
         )
     )
 
+    recorder = BufferingRecorder()
     with pytest.raises(PipelinePlannerError) as excinfo:
-        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+        await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
     assert excinfo.value.code == "MALFORMED_RESPONSE"
     assert len(completion.requests) == 1
+    (attempt,) = recorder.planner_attempts
+    assert attempt.phase is ComposerPlannerAttemptPhase.RESPONSE
+    assert attempt.outcome is ComposerPlannerAttemptOutcome.MALFORMED_RESPONSE
+    assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+    assert excinfo.value.planner_attempts == (attempt,)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_response_closes_the_active_semantic_attempt(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    recorder = BufferingRecorder()
+
+    def cancel_after_response(_candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=_ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}))),
+            recorder=recorder,
+            candidate_finalizer=cancel_after_response,
+        )
+
+    (attempt,) = recorder.planner_attempts
+    assert attempt.phase is ComposerPlannerAttemptPhase.CANDIDATE
+    assert attempt.outcome is ComposerPlannerAttemptOutcome.CANCELLED
+    assert attempt.led_to is ComposerPlannerAttemptLedTo.TERMINAL
+    assert caught.value.planner_attempts == (attempt,)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -7453,6 +7561,7 @@ async def test_planner_attempt_trail_names_reject_repair_accept(
         _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
     )
     origin = _origin()
+    recorder = BufferingRecorder()
 
     with capture_logs() as logs:
         proposal = await _plan(
@@ -7460,6 +7569,7 @@ async def test_planner_attempt_trail_names_reject_repair_accept(
             tool_context=tool_context,
             completion=completion,
             originating_message=origin,
+            recorder=recorder,
         )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
@@ -7487,6 +7597,69 @@ async def test_planner_attempt_trail_names_reject_repair_accept(
         {"attempt": 2, "outcome": "candidate_rejected", "codes": rejected["rejection_codes"]},
     ]
     assert summary["session_id"] == origin.session_id
+    assert [attempt.ordinal for attempt in recorder.planner_attempts] == [1, 2, 3]
+    assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == [1, 2, 3]
+    discovery_attempt, rejected_attempt, accepted_attempt = recorder.planner_attempts
+    assert discovery_attempt.requested_information == (
+        ComposerPlannerInformationClass.CATALOG_SELECTION,
+        ComposerPlannerInformationClass.CATALOG_DETAILS_SOURCE,
+    )
+    assert discovery_attempt.new_information == discovery_attempt.requested_information
+    assert rejected_attempt.outcome is ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED
+    assert rejected_attempt.rejection_codes
+    assert accepted_attempt.outcome is ComposerPlannerAttemptOutcome.ACCEPTED
+
+
+@pytest.mark.asyncio
+async def test_durable_attempt_trail_preserves_seven_step_planner_history(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_recipes", {})),
+        _response(("list_models", {})),
+        _response(("get_expression_grammar", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        repair_budget=2,
+        budget=_budget(max_total_provider_calls=7),
+        model_overrides={"max_discovery_turns": 4, "escape_hatch_model": None},
+    )
+
+    assert deep_thaw(result.proposal.pipeline) == _pipeline(tmp_path)
+    assert [attempt.ordinal for attempt in recorder.planner_attempts] == list(range(1, 8))
+    assert [attempt.planner_call_ordinal for attempt in recorder.planner_attempts] == list(range(1, 8))
+    assert [attempt.outcome for attempt in recorder.planner_attempts] == [
+        ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED,
+        ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED,
+        ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED,
+        ComposerPlannerAttemptOutcome.DISCOVERY_EXECUTED,
+        ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED,
+        ComposerPlannerAttemptOutcome.CANDIDATE_REJECTED,
+        ComposerPlannerAttemptOutcome.ACCEPTED,
+    ]
+    assert [attempt.phase for attempt in recorder.planner_attempts] == [
+        ComposerPlannerAttemptPhase.DISCOVERY,
+        ComposerPlannerAttemptPhase.DISCOVERY,
+        ComposerPlannerAttemptPhase.DISCOVERY,
+        ComposerPlannerAttemptPhase.DISCOVERY,
+        ComposerPlannerAttemptPhase.CANDIDATE,
+        ComposerPlannerAttemptPhase.REPAIR,
+        ComposerPlannerAttemptPhase.REPAIR,
+    ]
+    assert recorder.planner_attempts[4].led_to is ComposerPlannerAttemptLedTo.REPAIR
+    assert recorder.planner_attempts[5].led_to is ComposerPlannerAttemptLedTo.REPAIR
+    assert recorder.planner_attempts[6].led_to is ComposerPlannerAttemptLedTo.DONE
 
 
 @pytest.mark.asyncio
