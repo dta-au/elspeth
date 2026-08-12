@@ -67,7 +67,14 @@
   gap: 0.5rem;
   align-items: center;
   justify-content: space-between;
-  padding: var(--space-sm);
+  /* Shared band-height contract: this toolbar, .chat-panel-header, and the
+     guided stepper band meet across the pane seam and must end on one line,
+     so every band derives its height from --size-workspace-band and centers
+     its content (no vertical padding — asymmetric or per-band padding is how
+     the bands drifted apart; see tokens.css). The short-screen density
+     regime below shrinks the token, and with it every band at once. */
+  min-height: var(--size-workspace-band);
+  padding: 0 var(--space-sm);
   border-bottom: 1px solid var(--color-border, currentcolor);
 }
 
@@ -422,7 +429,21 @@
 }
 
 @media (min-width: 961px) and (max-height: 800px) {
-  .artifact-workspace-toolbar,
+  /* Short-screen density: drop the shared band token so ALL header bands
+     (toolbar, chat-panel header, guided stepper) compress together and the
+     cross-pane seam stays on one line. 45px = the regime's historic toolbar
+     height (4px + 36px compact control + 4px + 1px seam). Before the token,
+     only the toolbar compressed here — leaving it 8px shorter than the
+     freeform header on every ≤800px-tall viewport. */
+  .composer-workspace {
+    --size-workspace-band: 45px;
+  }
+
+  .artifact-workspace-toolbar {
+    gap: 0.25rem;
+    padding-inline: 0.5rem;
+  }
+
   .workspace-action-bar {
     gap: 0.25rem;
     padding: 0.25rem 0.5rem;

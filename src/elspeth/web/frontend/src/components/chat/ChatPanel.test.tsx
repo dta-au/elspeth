@@ -3342,7 +3342,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(current).toHaveTextContent("Ready");
   });
 
-  it("guided authoring CSS keeps one bounded scroller, an inset focus ring, and compact short-height progress", () => {
+  it("guided authoring CSS keeps one bounded scroller, an inset focus ring, and the shared header-band height", () => {
     // jsdom runs with css:false — media queries and computed styles are
     // invisible, so the responsive contract is pinned as CSS text (same idiom
     // as the stepper-grid test above).
@@ -3361,9 +3361,51 @@ describe("ChatPanel mode discriminator", () => {
     );
     expect(css).not.toContain(".guided-workspace-rail");
     expect(css).not.toContain(".guided-workspace {");
-    const shortHeight = css.match(/@media \(max-height: 760px\)[\s\S]*?\n\}/);
-    expect(shortHeight).not.toBeNull();
-    expect(shortHeight![0]).toContain("padding-top: 2px;");
+    // Cross-pane band-height contract: the stepper band (both terminal
+    // states in ONE rule so they cannot drift apart), the freeform/guided
+    // chat-panel header, and the artifact toolbar all read
+    // --size-workspace-band, and the stepper centers its font-metric-
+    // dependent content instead of deriving height from asymmetric padding.
+    // Before this contract the completed band ran 8px taller than the
+    // toolbar (inherited --space-md top pad) and the active band ~1px short.
+    const bandRule = css.match(
+      /\.chat-panel--guided\s*>\s*\.guided-workflow,\s*\n\.chat-panel--completed\s*>\s*\.guided-workflow\s*\{(?<body>[^}]*)\}/,
+    );
+    expect(bandRule).not.toBeNull();
+    expect(bandRule!.groups!.body).toContain(
+      "min-height: var(--size-workspace-band)",
+    );
+    expect(bandRule!.groups!.body).toContain("align-content: center");
+    expect(bandRule!.groups!.body).toContain("padding-block: 0");
+    // The old short-height padding tweak is obsolete under min-height +
+    // centering (a padding-top nudge no longer buys vertical space) and
+    // would silently re-break seam alignment if reintroduced.
+    expect(css).not.toContain("@media (max-height: 760px)");
+    for (const [file, selector] of [
+      ["src/components/workspace/workspace.css", ".artifact-workspace-toolbar"],
+      ["src/components/chat/chat.css", ".chat-panel-header"],
+    ] as const) {
+      const sibling = readFileSync(join(process.cwd(), file), "utf8");
+      const rule = sibling.match(
+        new RegExp(`${selector.replace(/\./g, "\\.")}\\s*\\{(?<body>[^}]*)\\}`),
+      );
+      expect(rule).not.toBeNull();
+      expect(rule!.groups!.body).toContain(
+        "min-height: var(--size-workspace-band)",
+      );
+    }
+    // The short-screen density regime must compress every band through the
+    // shared token — a per-band padding override there is how the toolbar
+    // ended up 8px shorter than the header on ≤800px-tall viewports.
+    const workspaceCss = readFileSync(
+      join(process.cwd(), "src/components/workspace/workspace.css"),
+      "utf8",
+    );
+    const compactRegime = workspaceCss.match(
+      /@media \(min-width: 961px\) and \(max-height: 800px\)[\s\S]*?\n\}/,
+    );
+    expect(compactRegime).not.toBeNull();
+    expect(compactRegime![0]).toContain("--size-workspace-band: 45px");
   });
 
   it("delegates guided ChatInput sends to the retry-safe store action", async () => {

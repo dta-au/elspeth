@@ -21,9 +21,10 @@
        the pressed visual state.
    --------------------------------------------------------------------------- */
 
-.guided-workflow {
-  padding: var(--space-md) var(--space-md) 0;
-}
+/* (.guided-workflow itself carries no base padding: both render contexts —
+   .chat-panel--guided and .chat-panel--completed — are covered by the shared
+   band rule below, and a base top padding here is how the completed band
+   silently ended up 8px taller than the artifact toolbar.) */
 
 /* Stepper visual language (elspeth-8fa71e6d15): a path with positions on it.
    The old bordered-rectangle cells were this design system's INPUT idiom —
@@ -174,26 +175,33 @@
 
 /* Stepper: full-bleed band above the workspace (the tutorial's arrangement,
    promoted with the workspace — a centred 64rem stepper over a full-bleed
-   two-column workspace read as misaligned). Overrides the base
-   .guided-workflow padding: --space-xs top is the header-band tightening
-   (D9); --space-lg inline aligns with the workspace gutters. The faint
-   border-bottom is the band's only remaining edge now that the step cells
-   lost their container boxes — without it the strip floats into the
-   decision area below. Same quiet seam token as .chat-panel-header. */
-.chat-panel--guided > .guided-workflow {
+   two-column workspace read as misaligned). --space-lg inline aligns with the
+   workspace gutters; Run Results and the Pipeline Ready card in the completed
+   stack share that same edge below. The faint border-bottom is the band's
+   only remaining edge now that the step cells lost their container boxes —
+   without it the strip floats into the decision area below. Same quiet seam
+   token as .chat-panel-header.
+
+   Height is the shared band contract (tokens.css --size-workspace-band): in
+   the tutorial the header row is suppressed, so this band sits DIRECTLY
+   beside .artifact-workspace-toolbar across the pane seam and their bottom
+   edges must land on one line. The icon+label stack is font-metric dependent
+   (~38px), so the band centers it inside the token height instead of deriving
+   height from asymmetric padding — the previous construction left the active
+   band ~1px short of the toolbar and the completed band (which inherited a
+   --space-md top pad from a since-deleted base rule) 8px tall. One rule for
+   both terminal states so the pairing cannot drift apart again. */
+.chat-panel--guided > .guided-workflow,
+.chat-panel--completed > .guided-workflow {
+  display: grid;
+  align-content: center;
+  min-height: var(--size-workspace-band);
   max-width: none;
   margin-inline: 0;
-  padding: var(--space-xs) var(--space-lg) var(--space-sm);
-  border-bottom: 1px solid var(--color-border);
-}
-
-/* Keep the completed evidence stack on one shared horizontal grid. Run Results
-   already uses --space-lg as its inline gutter; the stepper's content and the
-   Pipeline Ready card align to that same edge below. Same closing seam as
-   the active-guided band above. */
-.chat-panel--completed > .guided-workflow {
+  /* Longhand on purpose: the ≤760px completed-surface rule overrides
+     padding-inline alone, and completionSurface.test.ts pins this pair. */
+  padding-block: 0;
   padding-inline: var(--space-lg);
-  padding-bottom: var(--space-sm);
   border-bottom: 1px solid var(--color-border);
 }
 
@@ -267,11 +275,10 @@
   font-size: var(--font-size-xs);
 }
 
-@media (max-height: 760px) {
-  .chat-panel--guided > .guided-workflow {
-    padding-top: 2px;
-  }
-}
+/* (No short-viewport padding tweak here any more: the band is min-height +
+   centered, so a padding-top nudge no longer buys vertical space, and the
+   band cannot drop below the shared token without breaking seam alignment
+   with the artifact toolbar.) */
 
 .guided-current-decision-copy {
   margin-bottom: var(--space-md);

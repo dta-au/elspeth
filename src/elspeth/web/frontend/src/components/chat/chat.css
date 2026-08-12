@@ -711,7 +711,14 @@
 }
 
 .chat-panel-header {
-  padding: var(--space-sm) var(--space-lg);
+  /* Shared band-height contract with .artifact-workspace-toolbar across the
+     pane seam (see tokens.css): height comes from the token, content centers
+     via the flex row below — no vertical padding, so the short-screen
+     density regime (workspace.css) can compress this band through the token.
+     Before the contract this row stayed 53px inside the ≤800px-tall compact
+     regime while the toolbar dropped to 45px. */
+  min-height: var(--size-workspace-band);
+  padding: 0 var(--space-lg);
   border-bottom: 1px solid var(--color-border);
   font-size: var(--font-size-sm);
   font-weight: 600;

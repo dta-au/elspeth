@@ -254,6 +254,19 @@
   /* Fixed app-header row height (desktop); the <=960px wrap rule reuses it as
      a min-height so a wrapped header never renders shorter than the fixed row. */
   --size-header-height:   40px;
+  /* Workspace header-band height (border-box, includes the 1px bottom seam).
+     The bands that sit side by side across the authoring/artifact pane
+     boundary — .chat-panel-header, the guided stepper band, and
+     .artifact-workspace-toolbar — all read this token as min-height and
+     center their content with NO vertical padding, so their bottom seams
+     stay on one line. Derived from the toolbar's historic construction:
+     --space-sm + --size-control-compact + --space-sm + 1px border. The
+     short-screen density regime (workspace.css, ≥961px wide and ≤800px
+     tall) overrides it to 45px on .composer-workspace so every band
+     compresses together. The stepper's icon+label stack is content-derived
+     (~38px, font-metric dependent) and centers inside the band instead of
+     defining it. */
+  --size-workspace-band:  53px;
 
   /* ── Transitions ─────────────────────────────────────────────────────────── */
   --transition-fast:   100ms ease;
