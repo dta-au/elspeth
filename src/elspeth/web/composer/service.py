@@ -3781,7 +3781,7 @@ class ComposerServiceImpl:
                         dict.fromkeys(
                             (
                                 *reviewed.observed_columns,
-                                *reviewed_schema_declared_field_names(reviewed.options.get("schema")),
+                                *(reviewed_schema_declared_field_names(reviewed.options["schema"]) if "schema" in reviewed.options else ()),
                             )
                         )
                     ),
@@ -3820,7 +3820,7 @@ class ComposerServiceImpl:
                 )
                 for stable_id in guided.output_order
                 for reviewed in (guided.reviewed_outputs[stable_id],)
-                for path in (reviewed.options.get("path"),)
+                for path in ((reviewed.options["path"],) if "path" in reviewed.options else ())
                 if type(path) is str
                 for output_format in (_effective_reviewed_output_format(plugin=reviewed.plugin, path=path, options=reviewed.options),)
                 if output_format is not None
