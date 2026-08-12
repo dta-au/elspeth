@@ -11,10 +11,15 @@ validation with "unknown node" and the repair loop burns to REPAIR_EXHAUSTED
 
 from __future__ import annotations
 
+from copy import deepcopy
+from dataclasses import replace
+
 import pytest
 from jsonschema import Draft202012Validator
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided import planning as guided_planning
 from elspeth.web.composer.guided.planning import (
     GuidedCandidateBindingRejected,
@@ -29,6 +34,9 @@ from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResol
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession
 from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
@@ -2083,3 +2091,333 @@ def test_correction_delta_rejects_unselected_identity_and_nonincident_routing() 
             current_state=predecessor,
         )
     assert nonincident.value.error_code == "guided_delta_nonincident_route"
+
+
+def _candidate_context() -> ToolContext:
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    return ToolContext(
+        catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
+        plugin_snapshot=snapshot,
+    )
+
+
+def _boundary_valid_guided(*, multiple_outputs: bool = False) -> GuidedSession:
+    guided = _guided_two_outputs() if multiple_outputs else _guided()
+    sources = {
+        stable_id: replace(
+            guided.reviewed_sources[stable_id],
+            options={"path": f"{guided.reviewed_sources[stable_id].name}.csv", "schema": {"mode": "observed"}},
+        )
+        for stable_id in guided.source_order
+    }
+    outputs = {
+        stable_id: replace(
+            guided.reviewed_outputs[stable_id],
+            options={
+                "path": f"outputs/{guided.reviewed_outputs[stable_id].name}.jsonl",
+                "schema": {"mode": "observed"},
+            },
+        )
+        for stable_id in guided.output_order
+    }
+    return replace(guided, reviewed_sources=sources, reviewed_outputs=outputs)
+
+
+def _boundary_valid_correction_guided() -> GuidedSession:
+    guided = _boundary_valid_guided()
+    source = guided.reviewed_sources[SOURCE_ID]
+    return replace(
+        guided,
+        reviewed_sources={
+            SOURCE_ID: replace(
+                source,
+                options={"path": "source.csv", "schema": {"mode": "fixed", "fields": ["amount: int"]}},
+            )
+        },
+    )
+
+
+def _empty_candidate_state() -> CompositionState:
+    return CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _authorized_initial_full_candidate(
+    topology: dict[str, object],
+    guided: GuidedSession,
+) -> dict[str, object]:
+    topology_sources = topology["sources"]
+    assert type(topology_sources) is dict
+    return {
+        "sources": {
+            reviewed.name: {
+                "plugin": reviewed.plugin,
+                "options": deep_thaw(reviewed.options),
+                "on_success": topology_sources[reviewed.name]["on_success"],
+                "on_validation_failure": reviewed.on_validation_failure,
+            }
+            for stable_id in guided.source_order
+            for reviewed in (guided.reviewed_sources[stable_id],)
+        },
+        "nodes": deepcopy(topology["nodes"]),
+        "edges": deepcopy(topology["edges"]),
+        "outputs": [
+            {
+                "sink_name": reviewed.name,
+                "plugin": reviewed.plugin,
+                "options": deep_thaw(reviewed.options),
+                "on_write_failure": reviewed.on_write_failure,
+            }
+            for stable_id in guided.output_order
+            for reviewed in (guided.reviewed_outputs[stable_id],)
+        ],
+    }
+
+
+def _set_pipeline_document(state: CompositionState) -> dict[str, object]:
+    document = state.to_dict()
+    document.pop("version")
+    outputs = document["outputs"]
+    assert type(outputs) is list
+    document["outputs"] = [
+        {"sink_name": output["name"], **{key: value for key, value in output.items() if key != "name"}} for output in outputs
+    ]
+    return document
+
+
+def _boundary_valid_correction_predecessor() -> CompositionState:
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="amount_gate",
+                options={"path": "source.csv", "schema": {"mode": "fixed", "fields": ["amount: int"]}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="amount_gate",
+                node_type="gate",
+                plugin=None,
+                input="amount_gate",
+                on_success=None,
+                on_error=None,
+                options={"schema": {"mode": "fixed", "fields": ["amount: int"]}},
+                condition="row['amount'] > 500",
+                routes={"true": "high_value", "false": "high_value"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="summarize_standard",
+                node_type="transform",
+                plugin="passthrough",
+                input="high_value",
+                on_success="format_high_value_input",
+                on_error="discard",
+                options={"schema": {"mode": "fixed", "fields": ["amount: int"]}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="format_high_value",
+                node_type="transform",
+                plugin="field_mapper",
+                input="format_high_value_input",
+                on_success="output",
+                on_error="discard",
+                options={
+                    "mapping": {"amount": "amount", "tier": "'high'"},
+                    "select_only": False,
+                    "schema": {"mode": "observed", "required_fields": ["amount"]},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="output",
+                plugin="json",
+                options={"path": "outputs/output.jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _assert_materialized_and_full_candidates_build_the_same_state(
+    *,
+    delta: dict[str, object],
+    authorized_full_candidate: dict[str, object],
+    guided: GuidedSession,
+    current_state: CompositionState,
+    authority: GuidedCorrectionTarget | None = None,
+) -> None:
+    materialized = materialize_guided_authorized_candidate(
+        delta,
+        authority=authority,
+        guided=guided,
+        current_state=current_state,
+    )
+    context = _candidate_context()
+    delta_candidate = build_set_pipeline_candidate(materialized, current_state, context)
+    full_candidate = build_set_pipeline_candidate(authorized_full_candidate, current_state, context)
+    assert delta_candidate.acceptable, [entry.message for entry in delta_candidate.result.validation.errors]
+    assert full_candidate.acceptable, [entry.message for entry in full_candidate.result.validation.errors]
+    assert delta_candidate.result.updated_state == full_candidate.result.updated_state
+
+
+def test_initial_linear_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_guided()
+    topology = _linear_pipeline()
+    delta = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": "output"}],
+        "nodes": [],
+        "edges": [],
+        "output_targets": [{"stable_id": OUTPUT_ID}],
+    }
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=_authorized_initial_full_candidate(topology, guided),
+        guided=guided,
+        current_state=_empty_candidate_state(),
+    )
+
+
+def test_initial_fork_coalesce_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_guided()
+    topology = _fork_coalesce_pipeline()
+    topology_sources = topology["sources"]
+    assert type(topology_sources) is dict
+    delta = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": topology_sources["source"]["on_success"]}],
+        "nodes": deepcopy(topology["nodes"]),
+        "edges": deepcopy(topology["edges"]),
+        "output_targets": [{"stable_id": OUTPUT_ID}],
+    }
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=_authorized_initial_full_candidate(topology, guided),
+        guided=guided,
+        current_state=_empty_candidate_state(),
+    )
+
+
+def test_initial_multi_output_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_guided(multiple_outputs=True)
+    topology = _two_output_candidate("output", "quarantine")
+    delta = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": "triage"}],
+        "nodes": deepcopy(topology["nodes"]),
+        "edges": deepcopy(topology["edges"]),
+        "output_targets": [{"stable_id": OUTPUT_ID}, {"stable_id": OUTPUT_B_ID}],
+    }
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=_authorized_initial_full_candidate(topology, guided),
+        guided=guided,
+        current_state=_empty_candidate_state(),
+    )
+
+
+def test_selected_source_correction_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_correction_guided()
+    predecessor = _boundary_valid_correction_predecessor()
+    added_node = {
+        "id": "screen_rows",
+        "node_type": "transform",
+        "plugin": "passthrough",
+        "input": "screen_input",
+        "on_success": "amount_gate",
+        "on_error": "discard",
+        "options": {"schema": {"mode": "observed"}},
+    }
+    added_edge = {
+        "id": "source_to_screen",
+        "from_node": "source",
+        "to_node": "screen_rows",
+        "edge_type": "on_success",
+    }
+    delta = {
+        "source_routes": [{"stable_id": SOURCE_ID, "on_success": "screen_input"}],
+        "nodes": [added_node],
+        "edges": [added_edge],
+    }
+    full = _set_pipeline_document(predecessor)
+    full["sources"]["source"]["on_success"] = "screen_input"
+    full["nodes"].append(deepcopy(added_node))
+    full["edges"] = [deepcopy(added_edge)]
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=full,
+        guided=guided,
+        current_state=predecessor,
+        authority=_source_correction_target(),
+    )
+
+
+def test_selected_node_correction_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_correction_guided()
+    predecessor = _boundary_valid_correction_predecessor()
+    selected = deepcopy(_planner_correction_candidate()["nodes"][2])
+    delta = {"nodes": [selected], "edges": []}
+    full = _set_pipeline_document(predecessor)
+    full["nodes"][2]["options"] = {
+        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "select_only": True,
+        "schema": {"mode": "observed", "required_fields": ["amount"]},
+    }
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=full,
+        guided=guided,
+        current_state=predecessor,
+        authority=_format_node_correction_target(),
+    )
+
+
+def test_output_upstream_reconnection_delta_matches_equivalent_full_candidate_state() -> None:
+    guided = _boundary_valid_correction_guided()
+    predecessor = _boundary_valid_correction_predecessor()
+    edge = {
+        "id": "summarize_error_to_output",
+        "from_node": "summarize_standard",
+        "to_node": "output",
+        "edge_type": "on_error",
+    }
+    delta = {
+        "output_targets": [{"stable_id": OUTPUT_ID}],
+        "edges": [edge],
+    }
+    full = _set_pipeline_document(predecessor)
+    full["nodes"][1]["on_error"] = "output"
+    full["edges"] = [deepcopy(edge)]
+    _assert_materialized_and_full_candidates_build_the_same_state(
+        delta=delta,
+        authorized_full_candidate=full,
+        guided=guided,
+        current_state=predecessor,
+        authority=_output_correction_target(),
+    )
