@@ -20,6 +20,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver
 from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
 from elspeth.web.composer.guided.protocol import (
@@ -51,6 +52,7 @@ from elspeth.web.composer.guided_blob_refs import (
     reviewed_source_is_blob_bound,
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
+from elspeth.web.composer.recipes import ReviewedOutputProjectionConflict, reviewed_output_projection_conflict
 from elspeth.web.composer.state import CompositionState, NodeSpec
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 
@@ -1827,6 +1829,119 @@ def _predecessor_reference_names(predecessor: CompositionState) -> set[str]:
     return names
 
 
+def _effective_sink_success_producers(
+    resolver: ProducerResolver,
+    sink_name: str,
+) -> tuple[ProducerEntry, ...] | None:
+    """Resolve every direct sink producer through structural gates, or abstain."""
+
+    direct = resolver.sink_producers(sink_name)
+    if not direct:
+        walked = resolver.walk_to_real_producer(sink_name)
+        return () if walked is None else (walked,)
+    resolved: list[ProducerEntry] = []
+    seen: set[str] = set()
+    for producer in direct:
+        actual = resolver.walk_entry_to_real_producer(producer)
+        if actual is None:
+            return None
+        if actual.producer_id in seen:
+            continue
+        seen.add(actual.producer_id)
+        resolved.append(actual)
+    return tuple(resolved)
+
+
+def _reviewed_output_projection_conflict_for_bound_candidate(
+    bound: Mapping[str, Any],
+    guided: GuidedSession,
+) -> ReviewedOutputProjectionConflict | None:
+    """Return missing reviewed fields proven by terminal exact mappers.
+
+    The check deliberately abstains unless a terminal success producer,
+    after walking structural gates, is exactly a transform/field_mapper with
+    a well-formed unique string mapping and ``select_only is True``. A
+    downstream pass-through or any non-exact/malformed mapper remains owned by
+    ordinary field-contract propagation.
+    """
+
+    raw_nodes = bound.get("nodes")
+    raw_sources = bound.get("sources")
+    if type(raw_nodes) is not list or type(raw_sources) is not dict:
+        return None
+    if any(type(node) is not dict for node in raw_nodes):
+        return None
+    source_keys = {"plugin", "options", "on_success", "on_validation_failure"}
+    if any(type(name) is not str or type(source) is not dict or set(source) != source_keys for name, source in raw_sources.items()):
+        return None
+    raw_outputs = bound.get("outputs")
+    if type(raw_outputs) is not list or any(type(output) is not dict for output in raw_outputs):
+        return None
+    try:
+        projection_state = CompositionState.from_dict(
+            {
+                "version": 1,
+                "metadata": {"name": "Projection check", "description": ""},
+                "sources": deep_thaw(raw_sources),
+                "nodes": deep_thaw(raw_nodes),
+                "edges": [],
+                "outputs": [
+                    {
+                        "name": output["sink_name"],
+                        "plugin": output["plugin"],
+                        "options": deep_thaw(output["options"]),
+                        "on_write_failure": output["on_write_failure"],
+                    }
+                    for output in raw_outputs
+                ],
+            }
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    resolver = ProducerResolver.build(
+        source=None,
+        sources=projection_state.sources,
+        nodes=projection_state.nodes,
+        sink_names=frozenset(output.name for output in projection_state.outputs),
+    )
+    missing_fields: list[str] = []
+    for stable_id in guided.output_order:
+        reviewed_output = guided.reviewed_outputs[stable_id]
+        producers = _effective_sink_success_producers(resolver, reviewed_output.name)
+        if producers is None:
+            continue
+        exact_projections: list[tuple[str, ...]] = []
+        for producer in producers:
+            node = resolver.get_node(producer.producer_id)
+            if type(node) is not NodeSpec or node.node_type != "transform" or node.plugin != "field_mapper":
+                break
+            options = node.options
+            if not isinstance(options, Mapping) or options.get("select_only") is not True:
+                break
+            mapping = options.get("mapping")
+            if not isinstance(mapping, Mapping):
+                break
+            entries = tuple(mapping.items())
+            if any(type(source_field) is not str or type(target_field) is not str for source_field, target_field in entries):
+                break
+            source_fields = tuple(source_field for source_field, _target_field in entries)
+            target_fields = tuple(target_field for _source_field, target_field in entries)
+            if len(set(source_fields)) != len(source_fields) or len(set(target_fields)) != len(target_fields):
+                break
+            exact_projections.append(target_fields)
+        else:
+            for target_fields in exact_projections:
+                conflict = reviewed_output_projection_conflict(
+                    retained_fields=target_fields,
+                    required_fields=tuple(reviewed_output.required_fields),
+                )
+                if conflict is not None:
+                    missing_fields.extend(field for field in conflict.missing_fields if field not in missing_fields)
+    if not missing_fields:
+        return None
+    return ReviewedOutputProjectionConflict(tuple(missing_fields))
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -2058,6 +2173,13 @@ def bind_guided_reviewed_components(
                 else:
                     private_options.pop(key, None)
             candidate_node["options"] = private_options
+    projection_conflict = _reviewed_output_projection_conflict_for_bound_candidate(bound, guided)
+    if projection_conflict is not None:
+        raise GuidedCandidateBindingRejected(
+            "guided planner candidate exact projection omits reviewed output fields",
+            error_code=projection_conflict.error_code,
+            connectivity={"missing_fields": cast(JsonValue, list(projection_conflict.missing_fields))},
+        )
     # Residual dangling sink references. Observed planner slip: the outputs
     # and edges use the reviewed name correctly, but one stale invented name
     # survives in a routing field — the rename map is then empty and the

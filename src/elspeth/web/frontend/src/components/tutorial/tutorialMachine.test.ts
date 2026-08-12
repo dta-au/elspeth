@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CANONICAL_TUTORIAL_PROMPT,
+  TUTORIAL_TRANSFORMS_PROMPT,
   initialTutorialState,
   isAbandonOnPageHide,
   progressForTutorialState,
@@ -15,6 +16,15 @@ describe("tutorialMachine", () => {
       "Scrape these three synthetic project-brief pages and, for each page, " +
         "have an LLM write a short summary of the page. Remove the raw HTML and " +
         "write the rows to a json file.",
+    );
+  });
+
+  it("pins the transform-stage projection and scraping authority", () => {
+    expect(TUTORIAL_TRANSFORMS_PROMPT).toBe(
+      "For each row, fetch the page at its `url`, then have an LLM write a short " +
+        "`summary`. Finally drop the raw HTML and fingerprint columns and retain " +
+        "exactly `url` and `summary`. Use noreply@dta.gov.au as the " +
+        "scraping abuse contact. Scraping reason: 'ELSPETH tutorial demonstration'.",
     );
   });
 });

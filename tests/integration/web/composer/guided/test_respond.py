@@ -4104,6 +4104,82 @@ class TestStep2IntraStep:
         assert last_operation["failure_code"] is None
         assert last_operation["result_kind"] == "composition_state"
 
+    def test_reviewed_projection_conflict_completes_without_proposal_or_failure_and_replays(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "projection-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+        before = _get_guided(composer_test_client, session_id)
+        preserved_turn = before["next_turn"]
+        preserved_graph = {key: before["composition_state"][key] for key in ("sources", "nodes", "edges", "outputs")}
+
+        async def conflict_planner(**_kwargs: object) -> object:
+            return GuidedPlannerConflict(missing_fields=("document_uri",))
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            conflict_planner,
+        )
+        operation_id = str(uuid4())
+        request_body = {
+            "operation_id": operation_id,
+            "turn_token": preserved_turn["turn_token"],
+            "component_action": {"action": "finish", "component_kind": "output"},
+        }
+
+        conflicted = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_body,
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        body = conflicted.json()
+        assert body["next_turn"] == preserved_turn
+        assert body["guided_session"]["step"] == "step_2_sink"
+        assert _full_guided_session(body)["active_proposal"] is None
+        assert {key: body["composition_state"][key] for key in ("sources", "nodes", "edges", "outputs")} == preserved_graph
+        assistant_turn = _full_guided_session(body)["chat_history"][-1]
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == (
+            "The exact retained-field projection omits reviewed output field `document_uri`. "
+            "Update the projection or the reviewed output contract before planning again."
+        )
+
+        replayed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_body,
+        )
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == body
+
+        with composer_test_client.app.state.session_engine.connect() as conn:
+            operation = (
+                conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+            )
+        assert operation["status"] == "completed"
+        assert operation["failure_code"] is None
+        assert operation["result_kind"] == "composition_state"
+
     def test_escape_hatch_decline_materializes_a_prospective_current_turn(
         self,
         composer_test_client: TestClient,

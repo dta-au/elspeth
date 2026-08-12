@@ -114,6 +114,7 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.pipeline_planner import (
     DELTA_PLANNER_TERMINAL_INSTRUCTION,
+    GuidedPlannerConflict,
     GuidedPlannerDecline,
     PipelineCandidatePolicyRejection,
     PipelinePlannerError,
@@ -173,6 +174,7 @@ from elspeth.web.composer.recipes import (
     RecipeReviewedOutputSummary,
     RecipeReviewedSourceSummary,
     RecipeSourceBinding,
+    ReviewedOutputProjectionConflict,
     apply_recipe,
     get_recipe,
     match_registered_recipe_intent,
@@ -3655,7 +3657,7 @@ class ComposerServiceImpl:
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline | GuidedPlannerConflict:
         """Run one shared planner call for the current guided checkpoint."""
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
@@ -3819,32 +3821,35 @@ class ComposerServiceImpl:
                 for output_format in (_effective_reviewed_output_format(plugin=reviewed.plugin, path=path, options=reviewed.options),)
                 if output_format is not None
             )
-            recipe_plan = await try_prepare_registered_recipe_plan(
-                intent_context=RecipeIntentContext(
-                    user_text=intent,
-                    reviewed_sources=source_summaries,
-                    reviewed_outputs=output_summaries,
-                    policy_snapshot=plugin_snapshot,
-                    source_bindings=source_bindings,
-                    output_bindings=output_bindings,
-                ),
-                current_state=current_state,
-                reviewed_facts=reviewed_facts,
-                reviewed_planner_context=reviewed_context,
-                supersedes_draft_hash=None,
-                surface=planner_surface,
-                policy_catalog=policy_catalog,
-                plugin_snapshot=plugin_snapshot,
-                originating_message=originating_message,
-                base=base,
-                custody_config=custody_config,
-                timeout_seconds=self._timeout_seconds,
-                candidate_finalizer=_required_controls_candidate_finalizer(
+            try:
+                recipe_plan = await try_prepare_registered_recipe_plan(
+                    intent_context=RecipeIntentContext(
+                        user_text=intent,
+                        reviewed_sources=source_summaries,
+                        reviewed_outputs=output_summaries,
+                        policy_snapshot=plugin_snapshot,
+                        source_bindings=source_bindings,
+                        output_bindings=output_bindings,
+                    ),
+                    current_state=current_state,
+                    reviewed_facts=reviewed_facts,
+                    reviewed_planner_context=reviewed_context,
+                    supersedes_draft_hash=None,
+                    surface=planner_surface,
                     policy_catalog=policy_catalog,
                     plugin_snapshot=plugin_snapshot,
-                    inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
-                ),
-            )
+                    originating_message=originating_message,
+                    base=base,
+                    custody_config=custody_config,
+                    timeout_seconds=self._timeout_seconds,
+                    candidate_finalizer=_required_controls_candidate_finalizer(
+                        policy_catalog=policy_catalog,
+                        plugin_snapshot=plugin_snapshot,
+                        inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+                    ),
+                )
+            except ReviewedOutputProjectionConflict as conflict:
+                return GuidedPlannerConflict(missing_fields=conflict.missing_fields)
             if recipe_plan is not None:
                 return recipe_plan, catalog_ids
 

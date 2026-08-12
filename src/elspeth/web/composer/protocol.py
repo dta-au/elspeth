@@ -21,7 +21,12 @@ if TYPE_CHECKING:
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
-    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlanResult, PlannerOriginatingMessage
+    from elspeth.web.composer.pipeline_planner import (
+        GuidedPlannerConflict,
+        GuidedPlannerDecline,
+        PipelinePlanResult,
+        PlannerOriginatingMessage,
+    )
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -93,8 +98,7 @@ PIPELINE_STAGED_REVIEW_PREFLIGHT_NOT_RUN_MESSAGE: Final[str] = (
 # It still blocks auto-commit — an unresolved review must not become canonical
 # state unreviewed.
 PIPELINE_STAGED_REVIEW_PENDING_INTERPRETATION_MESSAGE: Final[str] = (
-    "I prepared the requested pipeline and staged it for your review. "
-    "It has interpretation review cards to resolve before it can run."
+    "I prepared the requested pipeline and staged it for your review. It has interpretation review cards to resolve before it can run."
 )
 
 
@@ -1295,7 +1299,7 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
         revision_authority: GuidedRevisionAuthority | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline | GuidedPlannerConflict:
         """Run the shared planner once with split private/provider-safe facts."""
         ...
 

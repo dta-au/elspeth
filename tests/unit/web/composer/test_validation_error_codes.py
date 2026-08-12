@@ -450,6 +450,21 @@ class TestClosedCodeCatalogueInvariants:
         assert "private" not in explanation.lower()
         assert "private" not in fix.lower()
 
+    def test_reviewed_output_projection_conflict_is_closed_and_actionable(self) -> None:
+        code = "reviewed_output_projection_conflict"
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "select-only field_mapper" in explanation
+        assert "VALUES" in explanation
+        assert "missing_fields" in explanation
+        assert "options.mapping value" in fix
+        assert "reviewed output form" in fix
+        assert "tutorial" not in (explanation + fix).lower()
+        assert "private" not in (explanation + fix).lower()
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 

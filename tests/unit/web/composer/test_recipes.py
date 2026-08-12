@@ -157,6 +157,44 @@ class TestRecipeRegistry:
         assert spec.alternative_plugin_groups == (frozenset({PluginId("source", "csv"), PluginId("source", "json")}),)
 
 
+class TestReviewedOutputProjectionCompatibility:
+    def test_required_subset_is_compatible_regardless_of_projection_order(self) -> None:
+        conflict = recipes_module.reviewed_output_projection_conflict(
+            retained_fields=("abstract", "document_uri"),
+            required_fields=("document_uri",),
+        )
+
+        assert conflict is None
+
+    def test_projection_superset_is_compatible_without_widening_or_narrowing(self) -> None:
+        retained = ("document_uri", "abstract", "published_at")
+
+        conflict = recipes_module.reviewed_output_projection_conflict(
+            retained_fields=retained,
+            required_fields=("document_uri", "abstract"),
+        )
+
+        assert conflict is None
+        assert retained == ("document_uri", "abstract", "published_at")
+
+    def test_conflict_orders_and_deduplicates_missing_reviewed_fields_across_outputs(self) -> None:
+        first = recipes_module.reviewed_output_projection_conflict(
+            retained_fields=("abstract",),
+            required_fields=("document_uri", "abstract", "published_at"),
+        )
+        second = recipes_module.reviewed_output_projection_conflict(
+            retained_fields=("digest",),
+            required_fields=("published_at", "source_id", "document_uri"),
+        )
+
+        missing = tuple(dict.fromkeys((*first.missing_fields, *second.missing_fields)))
+
+        assert type(first) is recipes_module.ReviewedOutputProjectionConflict
+        assert type(second) is recipes_module.ReviewedOutputProjectionConflict
+        assert first.error_code == "reviewed_output_projection_conflict"
+        assert missing == ("document_uri", "published_at", "source_id")
+
+
 class TestRegisteredRecipeIntentMatching:
     def _context(
         self,
@@ -400,10 +438,22 @@ class TestRegisteredRecipeIntentMatching:
 
         assert match_registered_recipe_intent(context) is None
 
-    def test_conflicting_reviewed_projection_falls_back(self) -> None:
+    def test_complete_conflicting_reviewed_projection_raises_closed_conflict(self) -> None:
         context = self._context(
             "Fetch every `document_uri`, have an LLM write an `abstract`, and retain only `abstract`. "
             "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        with pytest.raises(Exception) as raised:
+            match_registered_recipe_intent(context)
+
+        assert type(raised.value) is recipes_module.ReviewedOutputProjectionConflict
+        assert raised.value.error_code == "reviewed_output_projection_conflict"
+        assert raised.value.missing_fields == ("document_uri",)
+
+    def test_incomplete_near_match_with_projection_conflict_still_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`, have an LLM write an `abstract`, and retain only `abstract`. Scraping reason: 'Public analysis'."
         )
 
         assert match_registered_recipe_intent(context) is None

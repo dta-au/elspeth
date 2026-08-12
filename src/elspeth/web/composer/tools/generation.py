@@ -794,6 +794,14 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "shadowed name for a node, connection, or branch value. Change nothing else.",
     ),
     (
+        r"reviewed_output_projection_conflict",
+        "An exact select-only field_mapper projection would remove one or more fields required by a reviewed output contract. "
+        "For field_mapper, retained output names are the VALUES in options.mapping; the rejection's missing_fields facts list "
+        "the reviewed names absent from those values.",
+        "Add every name in missing_fields as an options.mapping value while preserving the intended projection, or return to "
+        "the reviewed output form and change its required-field contract. Do not silently drop a reviewed field.",
+    ),
+    (
         r"gate_on_error_unknown_sink",
         "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
         "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
@@ -1148,6 +1156,8 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "guided_delta_nonincident_route",
     "guided_delta_unknown_reference",
     "guided_delta_reviewed_failure_route_required",
+    # ── Reviewed output versus exact field projection ──────────────────────
+    "reviewed_output_projection_conflict",
     # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
     # Planner-loop only: pairs the reviewed guided facts (what the sources
     # carry vs what the outputs declare) with the candidate's node count.

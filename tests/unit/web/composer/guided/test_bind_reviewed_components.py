@@ -1064,6 +1064,290 @@ def _linear_pipeline() -> dict[str, object]:
     }
 
 
+def _exact_field_mapper_pipeline(*, mapping: dict[str, object], select_only: object = True) -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "project_fields",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "rows",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": mapping,
+                    "select_only": select_only,
+                },
+            }
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+
+def test_initial_materializer_rejects_exact_projection_missing_a_reviewed_field() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(mapping={"abstract": "abstract"})
+    source = pipeline["sources"]["source"]
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "source_routes": [{"stable_id": SOURCE_ID, "on_success": source["on_success"]}],
+                "nodes": pipeline["nodes"],
+                "edges": pipeline["edges"],
+                "output_targets": [{"stable_id": OUTPUT_ID}],
+            },
+            None,
+            guided,
+            CompositionState(
+                sources={},
+                nodes=(),
+                edges=(),
+                outputs=(),
+                metadata=PipelineMetadata(),
+                version=1,
+                guided_session=guided,
+            ),
+        )
+
+    assert raised.value.error_code == "reviewed_output_projection_conflict"
+    assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
+
+
+def test_exact_projection_uses_mapping_values_and_allows_renames_supersets_and_order_changes() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(
+        mapping={
+            "generated_text": "abstract",
+            "raw_uri": "document_uri",
+            "published": "published_at",
+        }
+    )
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    assert bound["nodes"][0]["options"]["mapping"] == {
+        "generated_text": "abstract",
+        "raw_uri": "document_uri",
+        "published": "published_at",
+    }
+
+
+def _gate_after_exact_mapper_pipeline(*, mapping: dict[str, object]) -> dict[str, object]:
+    pipeline = _exact_field_mapper_pipeline(mapping=mapping)
+    mapper = pipeline["nodes"][0]
+    mapper["on_success"] = "projected"
+    pipeline["nodes"].append(
+        {
+            "id": "route_projected",
+            "node_type": "gate",
+            "plugin": None,
+            "input": "projected",
+            "on_success": None,
+            "on_error": None,
+            "condition": "True",
+            "routes": {"true": "output", "false": "output"},
+            "options": {},
+        }
+    )
+    return pipeline
+
+
+def test_exact_projection_is_checked_through_a_terminal_structural_gate() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(
+            _gate_after_exact_mapper_pipeline(mapping={"generated": "abstract"}),
+            guided,
+        )
+
+    assert raised.value.error_code == "reviewed_output_projection_conflict"
+    assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
+
+
+def _two_mapper_fanin_pipeline() -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "rows",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [
+            {
+                "id": "fan_out",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "on_success": None,
+                "on_error": None,
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": ["branch_a", "branch_b"],
+                "options": {},
+            },
+            {
+                "id": "project_a",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "branch_a",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"raw_uri": "document_uri", "generated": "abstract"},
+                    "select_only": True,
+                },
+            },
+            {
+                "id": "project_b",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "branch_b",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"generated": "abstract"},
+                    "select_only": True,
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+
+def test_every_exact_mapper_in_a_sink_fanin_is_checked() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(_two_mapper_fanin_pipeline(), guided)
+
+    assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
+
+
+def test_mixed_exact_and_passthrough_sink_fanin_abstains() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _two_mapper_fanin_pipeline()
+    second_branch = pipeline["nodes"][2]
+    second_branch["plugin"] = "passthrough"
+    second_branch["options"] = {"schema": {"mode": "observed"}}
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    assert bound["nodes"][2]["plugin"] == "passthrough"
+
+
+def _guided_with_two_projection_outputs() -> GuidedSession:
+    guided = _guided_two_outputs()
+    outputs = dict(guided.reviewed_outputs)
+    outputs[OUTPUT_ID] = replace(outputs[OUTPUT_ID], required_fields=("document_uri",))
+    outputs[OUTPUT_B_ID] = replace(outputs[OUTPUT_B_ID], required_fields=("error_code",))
+    return replace(guided, reviewed_outputs=outputs)
+
+
+def _two_output_projection_pipeline() -> dict[str, object]:
+    pipeline = _two_mapper_fanin_pipeline()
+    nodes = pipeline["nodes"]
+    nodes[1]["on_success"] = "main_out"
+    nodes[1]["options"]["mapping"] = {"raw_uri": "document_uri"}
+    nodes[2]["on_success"] = "errors_out"
+    nodes[2]["options"]["mapping"] = {"raw_error": "error_code"}
+    pipeline["outputs"] = [
+        {"sink_name": "main_out", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        {"sink_name": "errors_out", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+    ]
+    return pipeline
+
+
+def test_multi_output_projection_checks_preserve_sink_to_mapper_association() -> None:
+    bound = bind_guided_reviewed_components(
+        _two_output_projection_pipeline(),
+        _guided_with_two_projection_outputs(),
+    )
+
+    assert [output["sink_name"] for output in bound["outputs"]] == ["output", "quarantine"]
+
+
+@pytest.mark.parametrize(
+    ("mapping", "select_only"),
+    [
+        ({"generated": "abstract"}, False),
+        ({"generated": "abstract", "other": "abstract"}, True),
+        ({"generated": 7}, True),
+    ],
+)
+def test_nonexact_or_malformed_mapper_projection_abstains(mapping: dict[str, object], select_only: object) -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+
+    bound = bind_guided_reviewed_components(
+        _exact_field_mapper_pipeline(mapping=mapping, select_only=select_only),
+        guided,
+    )
+
+    assert bound["nodes"][0]["plugin"] == "field_mapper"
+
+
+def test_mapper_with_a_downstream_passthrough_abstains() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(mapping={"generated": "abstract"})
+    pipeline["nodes"][0]["on_success"] = "projected"
+    pipeline["nodes"].append(
+        {
+            "id": "forward_projected",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "projected",
+            "on_success": "output",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+    )
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    assert bound["nodes"][-1]["plugin"] == "passthrough"
+
+
 def _correction_predecessor() -> CompositionState:
     return CompositionState(
         sources={
@@ -2132,6 +2416,33 @@ def test_node_correction_materializer_preserves_every_unselected_node_byte() -> 
         "schema": {"mode": "observed", "required_fields": ["amount"]},
     }
     assert bound["outputs"][0]["options"] == {"path": "outputs/colours.json"}
+
+
+def test_node_correction_materializer_rejects_exact_projection_missing_a_reviewed_field() -> None:
+    guided = _guided_with_output(
+        required_fields=("amount", "tier"),
+        output_options={"path": "outputs/colours.json"},
+    )
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        materialize_guided_authorized_candidate(
+            {
+                "node_patch": {
+                    "stable_id": _format_node_correction_target().requested.stable_id,
+                    "options": {
+                        "mapping": {"tier": "tier"},
+                        "select_only": True,
+                    },
+                },
+                "edges": [],
+            },
+            authority=_format_node_correction_target(),
+            guided=guided,
+            current_state=_correction_predecessor(),
+        )
+
+    assert raised.value.error_code == "reviewed_output_projection_conflict"
+    assert raised.value.connectivity == {"missing_fields": ["amount"]}
 
 
 def _public_node_correction_target(
