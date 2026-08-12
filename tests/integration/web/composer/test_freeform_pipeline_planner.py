@@ -1094,4 +1094,3 @@ async def test_incomplete_recipe_request_falls_back_before_custody_without_side_
     prepare.assert_not_awaited()
     fallback.assert_awaited_once()
     _assert_no_pipeline_side_effects(engine)
-
