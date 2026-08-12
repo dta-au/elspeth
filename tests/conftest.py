@@ -108,7 +108,6 @@ def _is_declared_remote_service_node(item: pytest.Item) -> bool:
     return (
         item.get_closest_marker("live_aws") is not None
         or ("/tests/integration/plugins/" in path and path.endswith("_live.py"))
-        or path.endswith("/tests/integration/plugins/test_state_engine_plugin_lifecycle_matrix.py")
         or path.endswith("/tests/integration/web/composer/test_bedrock_live_smoke.py")
         or path.endswith("/tests/e2e/recovery/test_run_lifecycle_aws_live.py")
     )
