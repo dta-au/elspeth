@@ -831,3 +831,111 @@ describe("ChatInput — compose timeout readiness gate (bootstrap race)", () => 
     expect(screen.getByLabelText(/send message/i)).toBeDisabled();
   });
 });
+
+describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
+  // The file-manager toggle and secrets entry fold behind one "More"
+  // trigger so the textarea keeps a usable width in the 360px authoring
+  // column. Upload stays persistent — it is the core "give the composer
+  // your data" action.
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput(overrides?: {
+    onToggleBlobManager?: () => void;
+    onOpenSecrets?: () => void;
+    readOnly?: boolean;
+  }) {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        onToggleBlobManager={overrides?.onToggleBlobManager}
+        onOpenSecrets={overrides?.onOpenSecrets}
+        readOnly={overrides?.readOnly}
+      />,
+    );
+  }
+
+  it("keeps only Upload persistent — folder and key live behind More", () => {
+    renderInput({
+      onToggleBlobManager: vi.fn(),
+      onOpenSecrets: vi.fn(),
+    });
+    expect(screen.getByLabelText(/upload file/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/more actions/i)).toBeInTheDocument();
+    // Closed menu: neither rare action renders as a top-level row button.
+    expect(
+      screen.queryByLabelText(/show file manager|hide file manager/i),
+    ).toBeNull();
+    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+  });
+
+  it("opens the menu, dispatches each action, and closes on selection", async () => {
+    const onToggleBlobManager = vi.fn();
+    const onOpenSecrets = vi.fn();
+    renderInput({ onToggleBlobManager, onOpenSecrets });
+
+    const trigger = screen.getByLabelText(/more actions/i);
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    await userEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    await userEvent.click(screen.getByLabelText(/show file manager/i));
+    expect(onToggleBlobManager).toHaveBeenCalledTimes(1);
+    // Selection closes the menu.
+    expect(screen.queryByLabelText(/show file manager/i)).toBeNull();
+
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByLabelText(/open secrets settings/i));
+    expect(onOpenSecrets).toHaveBeenCalledTimes(1);
+    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+  });
+
+  it("closes on Escape without dispatching", async () => {
+    const onToggleBlobManager = vi.fn();
+    renderInput({ onToggleBlobManager, onOpenSecrets: vi.fn() });
+
+    await userEvent.click(screen.getByLabelText(/more actions/i));
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByLabelText(/show file manager/i)).toBeNull();
+    expect(onToggleBlobManager).not.toHaveBeenCalled();
+  });
+
+  it("renders no More trigger when both rare actions are absent or locked", () => {
+    renderInput();
+    expect(screen.queryByLabelText(/more actions/i)).toBeNull();
+
+    renderInput({
+      onToggleBlobManager: vi.fn(),
+      onOpenSecrets: vi.fn(),
+      readOnly: true,
+    });
+    expect(screen.queryByLabelText(/more actions/i)).toBeNull();
+  });
+
+  it("pins the narrow-pane wrap mechanics in chat.css (container query, break, floor)", () => {
+    // The wrap rule keys off the PANE's width (container query), not the
+    // viewport — 360px is the shipped default pane width at 1280-1535px
+    // viewports, which no viewport media query can see. The min-width floor
+    // is the backstop that makes a wrap-rule regression visible.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    expect(css).toMatch(/\.chat-input\s*\{[^}]*container-type:\s*inline-size/s);
+    const textareaRule = css.match(/\.chat-input-textarea\s*\{([^}]*)\}/s)?.[1];
+    expect(textareaRule).toMatch(/min-width:\s*160px/);
+    const containerBlock = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(containerBlock).toBeDefined();
+    expect(containerBlock).toMatch(
+      /\.chat-input-row-break\s*\{[^}]*flex-basis:\s*100%/s,
+    );
+    expect(containerBlock).toMatch(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*order:\s*2/s,
+    );
+  });
+});

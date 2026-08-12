@@ -74,7 +74,7 @@ interface ChatInputProps {
   readOnly?: boolean;
 }
 
-type ChatInputIconName = "folder" | "upload" | "key";
+type ChatInputIconName = "folder" | "upload" | "key" | "more";
 
 function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
   const path =
@@ -82,7 +82,9 @@ function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
       ? "M3 6.5h6l1.5 2H21v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Zm0 3h18"
       : name === "upload"
         ? "M12 16V4m0 0 4 4m-4-4-4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"
-        : "M14.5 9.5a4 4 0 1 0-3.2 3.9L9 15.7V18H6.7L5 19.7 3.3 18l6.3-6.3a4 4 0 0 0 4.9-2.2Zm.5-2h.01";
+        : name === "key"
+          ? "M14.5 9.5a4 4 0 1 0-3.2 3.9L9 15.7V18H6.7L5 19.7 3.3 18l6.3-6.3a4 4 0 0 0 4.9-2.2Zm.5-2h.01"
+          : "M5 12h.01M12 12h.01M19 12h.01";
   return (
     <svg
       aria-hidden="true"
@@ -129,6 +131,26 @@ export function ChatInput({
     : setInternalText;
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Rare-action overflow ("More"): the file-manager toggle and secrets entry
+  // fold behind one trigger so the textarea keeps a usable width in the
+  // 360px authoring column (elspeth-8fa71e6d15, IA spec Stage 4 #12/#14 —
+  // the same overflow idiom as WorkspaceActionBar's "More actions").
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!moreOpen) return;
+    function handlePointerDown(event: PointerEvent) {
+      if (
+        event.target instanceof Node &&
+        !moreRef.current?.contains(event.target)
+      ) {
+        setMoreOpen(false);
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [moreOpen]);
   // Track current text in a ref to avoid stale closures during async operations
   const textRef = useRef(text);
   textRef.current = text;
@@ -387,18 +409,11 @@ export function ChatInput({
           className="chat-input-textarea"
         />
 
-        {/* File manager toggle */}
-          {!readOnly && onToggleBlobManager && (
-            <button
-              type="button"
-              onClick={onToggleBlobManager}
-              title={showBlobManager ? "Hide file manager" : "Show file manager"}
-              aria-label={showBlobManager ? "Hide file manager" : "Show file manager"}
-              className={`chat-input-icon-btn${showBlobManager ? " chat-input-icon-btn--active" : ""}`}
-            >
-              <ChatInputIcon name="folder" />
-            </button>
-          )}
+        {/* Forced wrap point for narrow authoring panes: the container query
+            in chat.css turns this on so Upload/More drop below the
+            textarea/Stop/Send row instead of squeezing the textarea under
+            its floor. display:none at ordinary pane widths. */}
+        <span className="chat-input-row-break" aria-hidden="true" />
 
         {/* File upload button — using a visible button that clicks a hidden input */}
         {!readOnly && (
@@ -407,7 +422,7 @@ export function ChatInput({
               type="button"
               onClick={() => fileInputRef.current?.click()}
               disabled={!activeSessionId || uploadDisabled}
-              className="chat-input-icon-btn"
+              className="chat-input-icon-btn chat-input-upload-btn"
               title="Upload file"
               aria-label="Upload file"
             >
@@ -431,17 +446,71 @@ export function ChatInput({
           </>
         )}
 
-        {/* Secrets button — key icon, co-located with file actions (A5) */}
-        {!readOnly && onOpenSecrets && (
-          <button
-            type="button"
-            onClick={onOpenSecrets}
-            className="chat-input-icon-btn"
-            title="API Keys & Secrets"
-            aria-label="Open secrets settings"
+        {/* Rare-action overflow: file manager + secrets fold behind one
+            trigger (IA spec Stage 4 #12/#14 — Upload stays persistent, it is
+            the core "give the composer your data" action). */}
+        {!readOnly && (onToggleBlobManager || onOpenSecrets) && (
+          <div
+            ref={moreRef}
+            className="chat-input-more"
+            onKeyDown={(event) => {
+              if (event.key === "Escape" && moreOpen) {
+                event.stopPropagation();
+                setMoreOpen(false);
+              }
+            }}
           >
-            <ChatInputIcon name="key" />
-          </button>
+            <button
+              type="button"
+              className="chat-input-icon-btn"
+              title="More actions"
+              aria-label="More actions"
+              aria-controls="chat-input-more-panel"
+              aria-expanded={moreOpen}
+              onClick={() => setMoreOpen((open) => !open)}
+            >
+              <ChatInputIcon name="more" />
+            </button>
+            {moreOpen && (
+              <div
+                id="chat-input-more-panel"
+                className="chat-input-more-menu"
+                role="group"
+                aria-label="More actions"
+              >
+                {onToggleBlobManager && (
+                  <button
+                    type="button"
+                    className="btn-compact chat-input-more-item"
+                    aria-label={
+                      showBlobManager ? "Hide file manager" : "Show file manager"
+                    }
+                    onClick={() => {
+                      setMoreOpen(false);
+                      onToggleBlobManager();
+                    }}
+                  >
+                    <ChatInputIcon name="folder" />
+                    {showBlobManager ? "Hide file manager" : "Show file manager"}
+                  </button>
+                )}
+                {onOpenSecrets && (
+                  <button
+                    type="button"
+                    className="btn-compact chat-input-more-item"
+                    aria-label="Open secrets settings"
+                    onClick={() => {
+                      setMoreOpen(false);
+                      onOpenSecrets();
+                    }}
+                  >
+                    <ChatInputIcon name="key" />
+                    API keys & secrets
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         {disabled && onCancel && (
