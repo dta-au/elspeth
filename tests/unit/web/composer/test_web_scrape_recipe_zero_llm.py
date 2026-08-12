@@ -4,17 +4,10 @@ Building the canonical recipe is a pure, deterministic function: it must make
 ZERO LLM provider calls. Pins the §4.1 claim that the canonical pipeline
 composes with no frontier round-trip at recipe-build time.
 
-P4 owns the recipe build, not the dispatch wiring (P2). This test proves the
-recipe-build path itself is provider-free: building the set_pipeline args and
-validating the slots calls the LLM zero times. The llm node IS present in the
-COMPOSED pipeline (it runs at RUN time, never at compose time).
-
-_SLOTS carries profile + rating_template + allowed_hosts explicitly because
-``_build_web_scrape_recipe`` reads ``slots["profile"]`` /
-``slots["rating_template"]`` / ``slots["allowed_hosts"]`` directly; those keys
-are only injected by ``validate_slots`` when the build is reached through
-``apply_recipe``. Passing them explicitly keeps the direct-build test honest
-while remaining valid input to ``apply_recipe`` (all are declared slots).
+P4 owns the recipe build, not the dispatch wiring (P2). These tests prove both
+the generic builder and the public legacy-recipe adapter are provider-free:
+building the set_pipeline args calls the LLM zero times. The llm node IS
+present in the COMPOSED pipeline (it runs at RUN time, never at compose time).
 """
 
 from __future__ import annotations
@@ -22,7 +15,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 from uuid import uuid4
 
-from elspeth.web.composer.recipes import _build_web_scrape_recipe, apply_recipe
+from elspeth.web.composer.recipes import _build_web_scrape_project_recipe, apply_recipe
 
 _SLOTS = {
     "source_blob_id": str(uuid4()),
@@ -37,13 +30,28 @@ _SLOTS = {
     "allowed_hosts": (),
 }
 
+_GENERIC_SLOTS = {
+    "source_blob_id": _SLOTS["source_blob_id"],
+    "source_plugin": _SLOTS["source_plugin"],
+    "locator_field": "url",
+    "profile": _SLOTS["profile"],
+    "prompt_template": _SLOTS["rating_template"],
+    "response_field": "rating",
+    "required_input_fields": ("content",),
+    "retained_fields": ("url", "rating"),
+    "abuse_contact": _SLOTS["abuse_contact"],
+    "scraping_reason": _SLOTS["scraping_reason"],
+    "output_path": _SLOTS["output_path"],
+    "allowed_hosts": _SLOTS["allowed_hosts"],
+}
 
-def test_build_web_scrape_recipe_makes_zero_llm_calls() -> None:
+
+def test_build_generic_web_scrape_recipe_makes_zero_llm_calls() -> None:
     with patch(
         "elspeth.web.composer.service._litellm_acompletion",
         new_callable=AsyncMock,
     ) as mock_acomp:
-        args = _build_web_scrape_recipe(_SLOTS)
+        args = _build_web_scrape_project_recipe(_GENERIC_SLOTS)
         # llm node IS present in the COMPOSED pipeline (it runs at RUN time,
         # not compose time) — but the build itself called no provider.
         assert any(n["plugin"] == "llm" for n in args["nodes"])
@@ -56,5 +64,5 @@ def test_apply_web_scrape_recipe_makes_zero_llm_calls() -> None:
         new_callable=AsyncMock,
     ) as mock_acomp:
         args = apply_recipe("web-scrape-llm-rate-jsonl", _SLOTS)
-        assert args["metadata"]["name"] == "web-scrape-llm-rate-jsonl"
+        assert any(node["plugin"] == "llm" for node in args["nodes"])
     assert mock_acomp.call_count == 0

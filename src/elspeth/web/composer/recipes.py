@@ -534,7 +534,12 @@ def _build_threshold_recipe(slots: Mapping[str, Any]) -> dict[str, Any]:
 
 
 _INLINE_SOURCE_BLOB_SENTINEL: Final[str] = str(UUID(int=0))
-_FORK_CSV_MARKER_RE = re.compile(r"(?:customer\s+rows\s*)?\(csv\):\s*\n(?P<csv>.+)\Z", re.IGNORECASE | re.DOTALL)
+_FORK_CSV_MARKER_RE = re.compile(
+    r"(?:customer\s+rows\s*)?\(csv\):\s*\n(?P<csv>.*?)"
+    r"(?=(?:customer\s+rows\s*)?\(csv\):\s*\n|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+_FORK_CSV_LABEL_RE = re.compile(r"(?:customer\s+rows\s*)?\(csv\):", re.IGNORECASE)
 _FORK_OUTPUT_PATH_RE = re.compile(r"\bat\s+(?P<path>[^\s:]+\.jsonl)\b", re.IGNORECASE)
 _FORK_TRUNCATE_RE = re.compile(
     r"\btruncates?\s+the\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+field\s+to\s+(?P<max_chars>\d+)\s+characters?",
@@ -553,28 +558,59 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     lower = context.user_text.lower()
     if not all(needle in lower for needle in ("two ways in parallel", "single merged output row", "truncat")):
         return None
-    csv_match = _FORK_CSV_MARKER_RE.search(context.user_text)
-    truncate_match = _FORK_TRUNCATE_RE.search(context.user_text)
-    if csv_match is None or truncate_match is None:
+    for phrase in ("two ways in parallel", "single merged output row"):
+        for phrase_match in re.finditer(re.escape(phrase), context.user_text, re.IGNORECASE):
+            if _match_is_negated(context.user_text, phrase_match, _AUTHORITY_NEGATION_RE):
+                return None
+    csv_matches = tuple(_FORK_CSV_MARKER_RE.finditer(context.user_text))
+    if len(csv_matches) != len(tuple(_FORK_CSV_LABEL_RE.finditer(context.user_text))) or not csv_matches:
         return None
-    csv_content = csv_match.group("csv").strip()
+    truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(context.user_text))
+    if not truncate_matches:
+        return None
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in csv_matches):
+        return None
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in truncate_matches):
+        return None
+    truncate_values = tuple((match.group("field"), int(match.group("max_chars"))) for match in truncate_matches)
+    truncate_value = truncate_values[0]
+    if any(candidate != truncate_value for candidate in truncate_values[1:]):
+        return None
+    csv_values = tuple(match.group("csv").strip() for match in csv_matches)
+    csv_content = csv_values[0]
+    if any(candidate != csv_content for candidate in csv_values[1:]):
+        return None
     if "\n" not in csv_content:
         return None
 
     slots: dict[str, object] = {
-        "truncate_field": truncate_match.group("field"),
-        "max_chars": int(truncate_match.group("max_chars")),
+        "truncate_field": truncate_value[0],
+        "max_chars": truncate_value[1],
     }
-    output_match = _FORK_OUTPUT_PATH_RE.search(context.user_text)
-    if output_match is not None:
-        slots["output_path"] = output_match.group("path")
-    suffix_match = _FORK_SUFFIX_RE.search(context.user_text)
-    if suffix_match is not None:
-        slots["truncation_suffix"] = suffix_match.group("suffix")
-    keys_match = _FORK_KEYS_RE.search(context.user_text)
-    if keys_match is not None:
-        slots["key_a"] = keys_match.group("key_a")
-        slots["key_b"] = keys_match.group("key_b")
+    output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(context.user_text))
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in output_matches):
+        return None
+    output_paths = tuple(match.group("path") for match in output_matches)
+    if output_paths and any(candidate != output_paths[0] for candidate in output_paths[1:]):
+        return None
+    if output_paths:
+        slots["output_path"] = output_paths[0]
+    suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(context.user_text))
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in suffix_matches):
+        return None
+    suffixes = tuple(match.group("suffix") for match in suffix_matches)
+    if suffixes and any(candidate != suffixes[0] for candidate in suffixes[1:]):
+        return None
+    if suffixes:
+        slots["truncation_suffix"] = suffixes[0]
+    keys_matches = tuple(_FORK_KEYS_RE.finditer(context.user_text))
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in keys_matches):
+        return None
+    keys = tuple((match.group("key_a"), match.group("key_b")) for match in keys_matches)
+    if keys and any(candidate != keys[0] for candidate in keys[1:]):
+        return None
+    if keys:
+        slots["key_a"], slots["key_b"] = keys[0]
     return RecipeIntentCandidate(
         slots=slots,
         inline_blob=InlineRecipeBlob(
@@ -780,6 +816,9 @@ def _build_fork_coalesce_truncate_recipe(slots: Mapping[str, Any]) -> dict[str, 
 _GENERIC_WEB_PROMPT_TEMPLATE: Final[str] = "Analyze the following public page and return the requested response:\n\n{{ row['content'] }}"
 _LEGACY_RATING_TEMPLATE: Final[str] = "Rate the appeal of this government web page from 1-10 and explain briefly:\n\n{{ row['content'] }}"
 _RAW_SCRAPE_FIELDS: Final[frozenset[str]] = frozenset({"content", "content_fingerprint"})
+_WEB_SCRAPE_GENERATED_FIELDS: Final[frozenset[str]] = frozenset(
+    {"content", "content_fingerprint", "fetch_status", "fetch_url_final", "fetch_url_final_ip"}
+)
 _FIELD_TOKEN_RE = re.compile(r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`")
 _RESPONSE_FIELD_RE = re.compile(
     r"\b(?:write|produce|generate|create|return|store)(?:\s+(?:a|an))?(?:\s+(?:short|concise|brief))?\s+"
@@ -804,6 +843,49 @@ _SCRAPING_REASON_LABEL_RE = re.compile(
 )
 _AUTHORITY_NEGATION_RE = re.compile(r"\b(?:do\s+not|don't|never|no|not)\b", re.IGNORECASE)
 _CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
+_LLM_TOKEN_RE = re.compile(r"\b(?:an?\s+)?llm\b", re.IGNORECASE)
+_RESPONSE_NEGATION_RE = re.compile(
+    r"\b(?:do\s+not|don't|never)\s+(?:(?:have|let|ask|use)\s+)?(?:an?\s+)?llm\b[^.;\n]*"
+    r"\b(?:write|produce|generate|create|return|store)\b"
+    r"|\bllm\b[^.;\n,]{0,80}\bnot\s+(?:write|produce|generate|create|return|store)\b"
+    r"|\b(?:do\s+not|don't|never)\s+(?:write|produce|generate|create|return|store)\b",
+    re.IGNORECASE,
+)
+_PROJECTION_NEGATION_RE = re.compile(
+    r"\b(?:(?:do\s+not|don't|never)\s+|must\s+not\s+)(?:keep|retain|project)\b",
+    re.IGNORECASE,
+)
+_AUTHORITY_ALTERNATIVE_RE = re.compile(r"\b(?:or|alternatively|otherwise)\b|/", re.IGNORECASE)
+_PROFILE_PREFIX_RE = re.compile(
+    r"\bllm\s+profile\s*(?:is\s+|[:=]\s*)?(?:the\s+)?"
+    r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))",
+    re.IGNORECASE,
+)
+_PROFILE_SUFFIX_RE = re.compile(
+    r"\b(?:use|select|choose)\s+(?:the\s+)?"
+    r"(?:`(?P<quoted>[A-Za-z0-9][A-Za-z0-9_-]*)`|(?P<plain>[A-Za-z0-9][A-Za-z0-9_-]*))\s+"
+    r"(?:llm\s+)?profile\b",
+    re.IGNORECASE,
+)
+_PROFILE_LABEL_RE = re.compile(r"\bllm\s+profile\b|\bprofile\s*(?:is\b|[:=])", re.IGNORECASE)
+_FETCH_NEGATION_RE = re.compile(
+    r"\b(?:(?:do\s+not|don't|never)\s+|must\s+not\s+)(?:fetch|scrape)\b",
+    re.IGNORECASE,
+)
+_SOURCE_FORMAT_RE = re.compile(r"\b(?P<format>csv|jsonl?|text)\s+source\b", re.IGNORECASE)
+_OUTPUT_FORMAT_BEFORE_RE = re.compile(r"\b(?P<format>jsonl|json|csv)\s+output\b", re.IGNORECASE)
+_OUTPUT_FORMAT_AFTER_RE = re.compile(
+    r"\boutput\s+(?:must\s+)?(?:be\s+)?(?P<format>jsonl|json|csv)\b",
+    re.IGNORECASE,
+)
+_REVIEWED_SOURCE_NAME_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:csv|jsonl?|text)?\s*source\s+`(?P<name>[A-Za-z_][A-Za-z0-9_-]*)`",
+    re.IGNORECASE,
+)
+_REVIEWED_OUTPUT_NAME_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:jsonl|json|csv)?\s*output\s+`(?P<name>[A-Za-z_][A-Za-z0-9_-]*)`",
+    re.IGNORECASE,
+)
 _RETENTION_CLAUSE_RE = re.compile(
     r"\b(?:keep|retain|project)\s+(?:only|exactly)\s+(?P<fields>.*?)"
     r"(?=(?:[.;]|$|,?\s+(?:and|then)\s+(?:(?:write|save|send|output)\b|(?:keep|retain|project)\s+(?:only|exactly)\b)"
@@ -814,6 +896,64 @@ _PROJECTION_FIELD_LIST_RE = re.compile(
     r"`[A-Za-z_][A-Za-z0-9_]*`"
     r"(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+)`[A-Za-z_][A-Za-z0-9_]*`)*",
 )
+
+
+def _clause_bounds(user_text: str, position: int) -> tuple[int, int]:
+    """Return the delimiter-bounded clause containing ``position``."""
+
+    start = 0
+    for delimiter in _CLAUSE_DELIMITER_RE.finditer(user_text):
+        if delimiter.end() <= position:
+            start = delimiter.end()
+            continue
+        if delimiter.start() >= position:
+            return start, delimiter.start()
+    return start, len(user_text)
+
+
+def _match_is_negated(user_text: str, match: re.Match[str], negation: re.Pattern[str]) -> bool:
+    start, end = _clause_bounds(user_text, match.start())
+    return negation.search(user_text[start:end]) is not None
+
+
+def _authority_has_alternative_residue(
+    user_text: str,
+    matches: tuple[re.Match[str], ...],
+) -> bool:
+    """Return whether an authority clause contains an unparsed alternative."""
+
+    for match in matches:
+        clause_start, clause_end = _clause_bounds(user_text, match.start())
+        clause_matches = tuple(candidate for candidate in matches if clause_start <= candidate.start() < clause_end)
+        cursor = clause_start
+        residue: list[str] = []
+        for candidate in clause_matches:
+            residue.append(user_text[cursor : candidate.start()])
+            cursor = candidate.end()
+        residue.append(user_text[cursor:clause_end])
+        if _AUTHORITY_ALTERNATIVE_RE.search(" ".join(residue)) is not None:
+            return True
+    return False
+
+
+def _llm_generated_fields(response_field: str) -> frozenset[str]:
+    return frozenset({response_field, f"{response_field}_usage", f"{response_field}_model"})
+
+
+def _web_projection_namespace_collisions(
+    *,
+    locator_field: str,
+    response_field: str,
+    upstream_fields: tuple[str, ...],
+) -> frozenset[str]:
+    """Return cross-stage generated-field collisions for the generic graph."""
+
+    upstream = {*upstream_fields, locator_field}
+    llm_generated = _llm_generated_fields(response_field)
+    return frozenset(
+        (upstream & _WEB_SCRAPE_GENERATED_FIELDS) | (upstream & llm_generated) | (_WEB_SCRAPE_GENERATED_FIELDS & llm_generated)
+    )
+
 
 _RECIPE_WEB_PROJECT_SLOTS: Final[dict[str, SlotSpec]] = {
     "source_blob_id": SlotSpec(
@@ -925,11 +1065,17 @@ def _build_web_scrape_project_recipe(slots: Mapping[str, Any]) -> dict[str, Any]
         raise RecipeValidationError("web projection recipe locator_field must be non-empty")
     if type(response_field) is not str or not response_field:
         raise RecipeValidationError("web projection recipe response_field must be non-empty")
+    namespace_collisions = _web_projection_namespace_collisions(
+        locator_field=locator_field,
+        response_field=response_field,
+        upstream_fields=tuple(field for field in retained_fields if field != response_field),
+    )
+    if namespace_collisions:
+        raise RecipeValidationError(
+            f"web projection recipe generated field namespace collides with raw scrape or LLM outputs: {sorted(namespace_collisions)}"
+        )
     if not retained_fields or len(set(retained_fields)) != len(retained_fields):
         raise RecipeValidationError("web projection recipe retained_fields must be a non-empty unique list")
-    raw_retained = _RAW_SCRAPE_FIELDS.intersection(retained_fields)
-    if raw_retained:
-        raise RecipeValidationError(f"web projection recipe cannot retain raw scrape field(s): {sorted(raw_retained)}")
     if response_field not in retained_fields:
         raise RecipeValidationError("web projection recipe retained_fields must include response_field")
 
@@ -1094,19 +1240,30 @@ def _unique_in_order(values: list[str]) -> tuple[str, ...]:
 def _web_response_contract(user_text: str) -> tuple[str, str] | None:
     """Return one exact response field and semantic instruction, else abstain."""
 
-    response_matches = tuple(_RESPONSE_FIELD_RE.finditer(user_text))
-    if not response_matches:
-        return None
     nonsemantic_starts = tuple(
         match.start() for pattern in (_RETENTION_CLAUSE_RE, _ABUSE_CONTACT_RE, _SCRAPING_REASON_RE) for match in pattern.finditer(user_text)
     )
+    llm_mentions = tuple(_LLM_TOKEN_RE.finditer(user_text))
+    if not llm_mentions:
+        return None
+    semantic_start = llm_mentions[0].start()
+    semantic_end = min((start for start in nonsemantic_starts if start > semantic_start), default=len(user_text))
+    response_matches = tuple(match for match in _RESPONSE_FIELD_RE.finditer(user_text) if semantic_start <= match.start() < semantic_end)
+    if not response_matches:
+        return None
     contracts: list[tuple[str, str]] = []
     for index, response_match in enumerate(response_matches):
+        if _match_is_negated(user_text, response_match, _RESPONSE_NEGATION_RE):
+            return None
         boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
         if index + 1 < len(response_matches):
             boundary_starts.append(response_matches[index + 1].start())
         end = min(boundary_starts, default=len(user_text))
-        instruction = user_text[response_match.start() : end].strip(" ,.;")
+        clause_start, _clause_end = _clause_bounds(user_text, response_match.start())
+        llm_mentions = tuple(_LLM_TOKEN_RE.finditer(user_text, clause_start, response_match.start()))
+        instruction_start = llm_mentions[-1].end() if llm_mentions else response_match.start()
+        instruction = user_text[instruction_start:end].strip(" ,.;")
+        instruction = re.sub(r"^to\s+", "", instruction, count=1, flags=re.IGNORECASE)
         instruction = re.sub(r"(?:[,;]\s*)?(?:and|then)\s*$", "", instruction, flags=re.IGNORECASE).strip(" ,.;")
         field = response_match.group("quoted") or response_match.group("plain")
         if not instruction or field is None:
@@ -1127,6 +1284,8 @@ def _web_retained_fields(user_text: str) -> tuple[str, ...] | None:
         return None
     projections: list[tuple[str, ...]] = []
     for clause in clauses:
+        if _match_is_negated(user_text, clause, _PROJECTION_NEGATION_RE):
+            return None
         raw_fields = clause.group("fields").strip()
         if _PROJECTION_FIELD_LIST_RE.fullmatch(raw_fields) is None:
             return None
@@ -1155,6 +1314,8 @@ def _web_abuse_contact(user_text: str) -> str | None:
     matches = tuple(_ABUSE_CONTACT_RE.finditer(user_text))
     if not matches:
         return None
+    if _authority_has_alternative_residue(user_text, matches):
+        return None
     contacts = tuple(match.group("after") or match.group("before") for match in matches)
     contact = contacts[0]
     if contact is None or any(candidate != contact for candidate in contacts[1:]):
@@ -1170,6 +1331,8 @@ def _web_scraping_reason(user_text: str) -> str | None:
     matches = tuple(_SCRAPING_REASON_RE.finditer(user_text))
     if not matches:
         return None
+    if _authority_has_alternative_residue(user_text, matches):
+        return None
     reasons = tuple(match.group("reason").strip() for match in matches)
     reason = reasons[0]
     if not reason or not reason.isascii() or any(candidate != reason for candidate in reasons[1:]):
@@ -1182,12 +1345,89 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     if snapshot is None:
         return None
     aliases = dict(snapshot.usable_profile_aliases).get(PluginId("transform", "llm"), ())
-    named = tuple(alias for alias in aliases if re.search(rf"(?<![A-Za-z0-9_-]){re.escape(alias)}(?![A-Za-z0-9_-])", context.user_text))
-    if len(named) == 1:
-        return named[0]
-    if named:
+    for alias in aliases:
+        negated_alias = re.compile(
+            rf"\b(?:do\s+not|don't|never)\s+use\s+(?:the\s+)?`?{re.escape(alias)}`?(?![A-Za-z0-9_-])",
+            re.IGNORECASE,
+        )
+        if negated_alias.search(context.user_text) is not None:
+            return None
+    authority_matches = tuple(
+        sorted(
+            (*_PROFILE_PREFIX_RE.finditer(context.user_text), *_PROFILE_SUFFIX_RE.finditer(context.user_text)),
+            key=lambda match: match.start(),
+        )
+    )
+    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in authority_matches):
+        return None
+    if authority_matches:
+        selected = tuple((match.group("quoted") or match.group("plain")) for match in authority_matches)
+        profile = selected[0]
+        if any(candidate != profile for candidate in selected[1:]) or profile not in aliases:
+            return None
+        return profile
+    if _PROFILE_LABEL_RE.search(context.user_text) is not None:
         return None
     return aliases[0] if len(aliases) == 1 else None
+
+
+def _reviewed_web_authority_is_compatible(
+    context: RecipeIntentContext,
+    *,
+    source: RecipeReviewedSourceSummary,
+    output: RecipeReviewedOutputSummary,
+    output_binding: RecipeOutputBinding,
+) -> bool:
+    """Return whether explicit source/output prose agrees with reviewed authority."""
+
+    if _FETCH_NEGATION_RE.search(context.user_text) is not None:
+        return False
+    for source_format in _SOURCE_FORMAT_RE.finditer(context.user_text):
+        if source_format.group("format").casefold() != source.plugin.casefold():
+            return False
+        if _match_is_negated(context.user_text, source_format, _AUTHORITY_NEGATION_RE):
+            return False
+    for source_name in _REVIEWED_SOURCE_NAME_RE.finditer(context.user_text):
+        if source_name.group("name") != source.name:
+            return False
+        if _match_is_negated(context.user_text, source_name, _AUTHORITY_NEGATION_RE):
+            return False
+    for field in source.field_names:
+        for field_match in re.finditer(
+            rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])",
+            context.user_text,
+            re.IGNORECASE,
+        ):
+            clause_start, clause_end = _clause_bounds(context.user_text, field_match.start())
+            clause = context.user_text[clause_start:clause_end]
+            if "source" in clause.casefold() and _AUTHORITY_NEGATION_RE.search(clause) is not None:
+                return False
+
+    output_matches = tuple(
+        sorted(
+            (*_OUTPUT_FORMAT_BEFORE_RE.finditer(context.user_text), *_OUTPUT_FORMAT_AFTER_RE.finditer(context.user_text)),
+            key=lambda match: match.start(),
+        )
+    )
+    for output_format in output_matches:
+        if output_format.group("format").casefold() != output_binding.format.casefold():
+            return False
+        if _match_is_negated(context.user_text, output_format, _AUTHORITY_NEGATION_RE):
+            return False
+    for output_name in _REVIEWED_OUTPUT_NAME_RE.finditer(context.user_text):
+        if output_name.group("name") != output.name:
+            return False
+        if _match_is_negated(context.user_text, output_name, _AUTHORITY_NEGATION_RE):
+            return False
+    for clause in _CLAUSE_DELIMITER_RE.split(context.user_text):
+        lowered = clause.casefold()
+        if "output" not in lowered:
+            continue
+        names_reviewed_output = output.name.casefold() in lowered or "reviewed output" in lowered
+        constrains_output_format = any(token in lowered for token in ("jsonl", "json", "csv"))
+        if (names_reviewed_output or constrains_output_format) and _AUTHORITY_NEGATION_RE.search(clause) is not None:
+            return False
+    return True
 
 
 def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeIntentCandidate | None:
@@ -1218,6 +1458,13 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
         return None
     if not output_binding.path:
         return None
+    if not _reviewed_web_authority_is_compatible(
+        context,
+        source=source,
+        output=output,
+        output_binding=output_binding,
+    ):
+        return None
 
     response_contract = _web_response_contract(context.user_text)
     if response_contract is None:
@@ -1231,6 +1478,12 @@ def _match_web_scrape_project_intent(context: RecipeIntentContext) -> RecipeInte
     if len(mentioned_source_fields) != 1:
         return None
     locator_field = mentioned_source_fields[0]
+    if _web_projection_namespace_collisions(
+        locator_field=locator_field,
+        response_field=response_field,
+        upstream_fields=tuple(source.field_names),
+    ):
+        return None
     explicit_retained_fields = _web_retained_fields(context.user_text)
     if explicit_retained_fields is None:
         return None
