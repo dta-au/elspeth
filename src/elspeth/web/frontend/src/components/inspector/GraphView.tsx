@@ -28,6 +28,7 @@ import {
   type NodeTypes,
   type NodeMouseHandler,
   type OnInit,
+  type FitViewOptions,
   Background,
   Controls,
   MiniMap,
@@ -53,6 +54,15 @@ const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
 // promote this to a viewport-overflow heuristic or an explicit user toggle.
 const MINIMAP_NODE_COUNT_THRESHOLD = 8;
+// One options object for BOTH fit-view surfaces: the imperative first-render
+// fit in handleInit and the ReactFlow fitViewOptions prop (Controls button).
+// The imperative call does not read the prop, so sharing the constant is what
+// keeps the two fits from drifting apart.
+const GRAPH_FIT_VIEW_OPTIONS: FitViewOptions = {
+  padding: 0.15,
+  maxZoom: 1.5,
+  minZoom: 0.3,
+};
 const PIPELINE_NODE_TYPE = "pipeline-component";
 const PARALLEL_EDGE_TYPE = "parallel-lane";
 const PARALLEL_EDGE_LANE_GAP = 22;
@@ -713,9 +723,11 @@ export function GraphView() {
   // Fit-to-view ONCE on first render. Using `fitView` as a static prop
   // re-triggers viewport reset whenever `nodesInitialized` flips (i.e. every
   // chat-driven topology change), which destroys the operator's pan/zoom.
-  // The Controls fit-view button continues to honour `fitViewOptions` below.
+  // The imperative call does not inherit the `fitViewOptions` prop, so pass
+  // the same options explicitly or the initial fit uses the library default
+  // maxZoom of 1 and small pipelines render tiny in a large canvas.
   const handleInit: OnInit = useCallback((instance) => {
-    instance.fitView();
+    void instance.fitView(GRAPH_FIT_VIEW_OPTIONS);
   }, []);
 
   // Build a map of component_id → validation severity for border coloring
@@ -1651,7 +1663,7 @@ export function GraphView() {
               onPaneClick={onPaneClick}
               colorMode={resolvedTheme}
               onInit={handleInit}
-              fitViewOptions={{ padding: 0.15, maxZoom: 1.5, minZoom: 0.3 }}
+              fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
               proOptions={{ hideAttribution: true }}
             >
               <Background gap={16} size={1} color="var(--color-canvas-grid)" />
