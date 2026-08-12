@@ -24,18 +24,25 @@ import { classifyOutcome, type StepSignal } from "./harness/classify";
 import { ACKNOWLEDGEMENT_PRIMARY_ACTION_NAMES } from "./harness/guided-driver";
 import type { RunRecord } from "./harness/types";
 import {
+  classifyPlannerEfficiency,
   fetchComposition,
   fetchDiagnostics,
   fetchInterpretationEvents,
+  fetchPlannerAuditEvidence,
   harnessCtx,
+  plannerEfficiencyAssertionFailure,
   reachableSourceCount,
   resetToFirstRun,
   cleanSessions,
   scrapeNodeId,
+  unavailablePlannerEfficiency,
+  type PlannerEfficiency,
 } from "./helpers/tutorial-harness";
 
 const BATCH_ID = process.env.HARNESS_BATCH_ID ?? "skeleton";
 const BATCH_SIZE = Number(process.env.HARNESS_BATCH_SIZE ?? "1");
+
+type EfficiencyRunRecord = RunRecord & { efficiency: PlannerEfficiency };
 
 // Acknowledge every pending guided interpretation card currently rendered, then
 // return how many were acknowledged this pass.
@@ -207,10 +214,9 @@ async function driveGuidedWalk(page: Page): Promise<void> {
   // summary (.guided-schema-summary), not an editable form. The first time a
   // summary is visible, assert no editable schema input is shown alongside it.
   let assertedSummary = false;
-  // The walk crosses TWO inherent sequential planner runs (the step-2→3
-  // auto-proposal plus the frozen-prompt replan), measured at 222s + 233s on
-  // 2026-07-22 — a 600s ceiling was the binding constraint that failed an
-  // otherwise-converging walk. Budget both plus discovery-turn variance.
+  // Keep generous infrastructure headroom. Planner efficiency is gated below
+  // from durable attempt/call structure, not by treating provider wall-clock
+  // variance as a correctness signal or lowering this deadline.
   const deadline = Date.now() + 900_000;
   while (Date.now() < deadline) {
     // Done once the guided surface is replaced by the run turn.
@@ -547,6 +553,13 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
     // run (it repaired the composed pipeline) → dim (b) FAILS. No separate re-run is
     // issued (it would collide on the first run's output artifacts → FileExistsError).
     const dimBPassed = !normalized && graduated && outputRows.length > 0;
+    const efficiency = sessionId
+      ? await fetchPlannerAuditEvidence(ctx, sessionId)
+          .then((evidence) => classifyPlannerEfficiency(evidence, dimBPassed))
+          .catch((error: unknown) =>
+            unavailablePlannerEfficiency(error instanceof Error ? error.message : String(error)),
+          )
+      : unavailablePlannerEfficiency("session id was not captured");
 
     // Classify (spec §7) via the pure, unit-tested classifier (harness/classify.ts).
     // It keys on the BACKEND outcome of the blocking step (compose/run POST status,
@@ -575,7 +588,7 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
       hardError,
     });
 
-    const record: RunRecord = {
+    const record: EfficiencyRunRecord = {
       batch_id: BATCH_ID,
       run_index: runIndex,
       outcome,
@@ -621,6 +634,7 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
           ? { run_s: Math.round(step.run.elapsedMs / 100) / 10 }
           : {}),
       },
+      efficiency,
       // Backend step evidence (the de-conflation inputs) — kept in the record so
       // a future batch is diagnosable without re-running: did each POST fire,
       // respond, with what status, in how long.
@@ -650,6 +664,13 @@ async function runOnce(page: Page, runIndex: number): Promise<void> {
       JSON.stringify(record, null, 2),
     );
     await ctx.dispose();
+    const efficiencyFailure = plannerEfficiencyAssertionFailure(efficiency, hardError);
+    if (efficiencyFailure !== null) {
+      expect(
+        efficiencyFailure,
+        `planner efficiency failed: ${efficiencyFailure}`,
+      ).toBeNull();
+    }
   }
 }
 
