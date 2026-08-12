@@ -5167,7 +5167,7 @@ async def post_guided_respond(
                     raise
                 # Only planner terminal exceptions carry this evidence marker.
                 attached_calls = exc_dict["llm_calls"]
-                attached_attempts = exc_dict.get("planner_attempts", ())
+                attached_attempts = exc_dict["planner_attempts"]
                 carrier_error: AuditIntegrityError | None = None
                 if type(attached_calls) is not tuple or attached_calls != planner_recorder.llm_calls:
                     carrier_error = AuditIntegrityError("guided planner cancellation carried malformed or unrelated LLM audit evidence")

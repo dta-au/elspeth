@@ -230,7 +230,9 @@ def prepare_guided_audit_rows(
             )
         )
         if call.planner_call_ordinal is not None:
-            attempt = attempt_by_physical.get(call.planner_call_ordinal)
+            attempt: ComposerPlannerAttempt | None = None
+            if call.planner_call_ordinal in attempt_by_physical:
+                attempt = attempt_by_physical[call.planner_call_ordinal]
             if attempt is not None:
                 rows.append(
                     PreparedGuidedAuditRow(

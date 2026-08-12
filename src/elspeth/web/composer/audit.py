@@ -418,7 +418,9 @@ def interleave_planner_audit_records(
         observed_physical.add(planner_call_ordinal)
         previous_physical_ordinal = planner_call_ordinal
         records.append(call)
-        matching_attempt = attempts_by_physical.get(planner_call_ordinal)
+        matching_attempt: ComposerPlannerAttempt | None = None
+        if planner_call_ordinal in attempts_by_physical:
+            matching_attempt = attempts_by_physical[planner_call_ordinal]
         response_received = call.status in {
             ComposerLLMCallStatus.SUCCESS,
             ComposerLLMCallStatus.MALFORMED_RESPONSE,
