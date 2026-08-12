@@ -1864,7 +1864,10 @@ def _exact_field_mapper_retained_fields(node: NodeSpec) -> tuple[str, ...] | Non
     if not isinstance(mapping, Mapping):
         return None
     entries = tuple(mapping.items())
-    if any(type(source_field) is not str or type(target_field) is not str for source_field, target_field in entries):
+    if any(
+        type(source_field) is not str or not source_field or type(target_field) is not str or not target_field
+        for source_field, target_field in entries
+    ):
         return None
     source_fields = tuple(source_field for source_field, _target_field in entries)
     target_fields = tuple(target_field for _source_field, target_field in entries)

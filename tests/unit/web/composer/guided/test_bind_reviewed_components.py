@@ -1372,6 +1372,20 @@ def test_nonexact_or_malformed_mapper_projection_abstains(mapping: object, selec
     assert bound["nodes"][0]["plugin"] == "field_mapper"
 
 
+def test_exact_projection_abstains_on_an_empty_mapper_target() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+
+    bound = bind_guided_reviewed_components(
+        _exact_field_mapper_pipeline(mapping={"raw": ""}),
+        guided,
+    )
+
+    assert bound["nodes"][0]["options"]["mapping"] == {"raw": ""}
+
+
 def test_mapper_with_a_downstream_passthrough_abstains() -> None:
     guided = _guided_with_output(
         required_fields=("document_uri", "abstract"),
