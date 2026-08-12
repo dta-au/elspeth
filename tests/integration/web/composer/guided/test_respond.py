@@ -4180,6 +4180,167 @@ class TestStep2IntraStep:
         assert operation["failure_code"] is None
         assert operation["result_kind"] == "composition_state"
 
+    def test_reviewed_projection_conflict_with_oversized_field_name_settles_with_bounded_text(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer.guided.state_machine import GUIDED_MAX_CHAT_CONTENT_CHARS
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerConflict
+
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "oversized-projection-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(composer_test_client, session_id, chosen=["text"], custom_inputs=[])
+
+        async def conflict_planner(**_kwargs: object) -> object:
+            return GuidedPlannerConflict(missing_fields=("x" * GUIDED_MAX_CHAT_CONTENT_CHARS,))
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            conflict_planner,
+        )
+
+        operation_id = str(uuid4())
+        conflicted = _post_current_response(
+            composer_test_client,
+            session_id,
+            operation_id=operation_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        assistant_turn = _full_guided_session(conflicted.json())["chat_history"][-1]
+        assert assistant_turn["role"] == "assistant"
+        assert len(assistant_turn["content"]) <= GUIDED_MAX_CHAT_CONTENT_CHARS
+        assert "reviewed output" in assistant_turn["content"]
+        assert "Update the projection" in assistant_turn["content"]
+
+    def test_staged_http_registered_recipe_projection_conflict_never_calls_completion(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client)
+        started = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/start",
+            json={
+                "operation_id": str(uuid4()),
+                "intent": (
+                    "Fetch every `document_uri`, have an LLM write an `abstract`, and retain only `abstract`. "
+                    "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+                ),
+            },
+        )
+        assert started.status_code == 200, started.json()
+
+        _seed_blob(
+            composer_test_client,
+            session_id,
+            content="document_uri\nhttps://example.gov.au/brief\n",
+        )
+        _get_guided(composer_test_client, session_id)
+        selected = _respond(composer_test_client, session_id, chosen=["csv"])
+        inspected = _respond(
+            composer_test_client,
+            session_id,
+            edited_values={"plugin": "csv", "options": selected["next_turn"]["payload"]["prefilled"]},
+        )
+        assert inspected["next_turn"]["type"] == "inspect_and_confirm"
+        _respond(composer_test_client, session_id, edited_values={"columns": ["document_uri"]})
+        _finish_review(composer_test_client, session_id, "source")
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "registered-recipe-conflict.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        _respond(
+            composer_test_client,
+            session_id,
+            chosen=["document_uri"],
+            custom_inputs=["abstract"],
+        )
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+        completion_calls: list[dict[str, object]] = []
+
+        async def poisoned_completion(**kwargs: object) -> _PlannerResponse:
+            completion_calls.append(kwargs)
+            raise AssertionError("a complete deterministic projection conflict must not call completion")
+
+        monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", poisoned_completion)
+
+        operation_id = str(uuid4())
+        conflicted = _post_current_response(
+            composer_test_client,
+            session_id,
+            operation_id=operation_id,
+            component_action={"action": "finish", "component_kind": "output"},
+        )
+
+        assert conflicted.status_code == 200, conflicted.json()
+        body = conflicted.json()
+        assert body["guided_session"]["step"] == "step_2_sink"
+        assert _full_guided_session(body)["active_proposal"] is None
+        assert _full_guided_session(body)["chat_history"][-1]["content"] == (
+            "The exact retained-field projection omits reviewed output field `document_uri`. "
+            "Update the projection or the reviewed output contract before planning again."
+        )
+        assert completion_calls == []
+        with app.state.session_engine.connect() as conn:
+            proposals = conn.execute(
+                select(composition_proposals_table.c.id).where(composition_proposals_table.c.session_id == session_id)
+            ).all()
+            operation = (
+                conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+            )
+        assert proposals == []
+        assert operation["status"] == "completed"
+        assert operation["failure_code"] is None
+        assert operation["result_kind"] == "composition_state"
+
     def test_escape_hatch_decline_materializes_a_prospective_current_turn(
         self,
         composer_test_client: TestClient,

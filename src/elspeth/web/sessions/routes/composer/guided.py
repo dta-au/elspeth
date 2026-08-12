@@ -36,7 +36,11 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedCorrectionMessageRef
+from elspeth.web.composer.guided.state_machine import (
+    GUIDED_MAX_CHAT_CONTENT_CHARS,
+    ComponentTarget,
+    GuidedCorrectionMessageRef,
+)
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import (
@@ -2678,12 +2682,25 @@ async def post_guided_respond(
     _empty_decline_fallback = "I could not find a way to build this pipeline with the available components."
 
     def _projection_conflict_text(conflict: GuidedPlannerConflict) -> str:
-        rendered_fields = ", ".join(f"`{name}`" for name in conflict.missing_fields)
         noun = "field" if len(conflict.missing_fields) == 1 else "fields"
-        return (
-            f"The exact retained-field projection omits reviewed output {noun} {rendered_fields}. "
-            "Update the projection or the reviewed output contract before planning again."
+        prefix = f"The exact retained-field projection omits reviewed output {noun} "
+        suffix = ". Update the projection or the reviewed output contract before planning again."
+        overflow_text = (
+            "The exact retained-field projection omits reviewed output fields whose identifiers are too long "
+            "to display safely. Update the projection or the reviewed output contract before planning again."
         )
+        rendered_fields: list[str] = []
+        rendered_length = len(prefix) + len(suffix)
+        for name in conflict.missing_fields:
+            separator = ", " if rendered_fields else ""
+            rendered_name = f"`{name}`"
+            rendered_length += len(separator) + len(rendered_name)
+            if rendered_length > GUIDED_MAX_CHAT_CONTENT_CHARS:
+                return overflow_text
+            rendered_fields.append(f"{separator}{rendered_name}")
+        if not rendered_fields:
+            return overflow_text
+        return f"{prefix}{''.join(rendered_fields)}{suffix}"
 
     service: SessionServiceProtocol = request.app.state.session_service
     composer = request.app.state.composer_service

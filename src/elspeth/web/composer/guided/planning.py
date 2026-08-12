@@ -9,7 +9,7 @@ closed ``PROPOSE_PIPELINE`` wire contract.
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID, uuid4
 
@@ -1832,8 +1832,8 @@ def _predecessor_reference_names(predecessor: CompositionState) -> set[str]:
 def _effective_sink_success_producers(
     resolver: ProducerResolver,
     sink_name: str,
-) -> tuple[ProducerEntry, ...] | None:
-    """Resolve every direct sink producer through structural gates, or abstain."""
+) -> tuple[ProducerEntry, ...]:
+    """Resolve each direct sink producer through structural gates independently."""
 
     direct = resolver.sink_producers(sink_name)
     if not direct:
@@ -1844,12 +1844,40 @@ def _effective_sink_success_producers(
     for producer in direct:
         actual = resolver.walk_entry_to_real_producer(producer)
         if actual is None:
-            return None
+            continue
         if actual.producer_id in seen:
             continue
         seen.add(actual.producer_id)
         resolved.append(actual)
     return tuple(resolved)
+
+
+def _exact_field_mapper_retained_fields(node: NodeSpec) -> tuple[str, ...] | None:
+    """Return one valid exact mapper projection, otherwise abstain for this branch."""
+
+    if node.node_type != "transform" or node.plugin != "field_mapper":
+        return None
+    options = node.options
+    if not isinstance(options, Mapping) or options.get("select_only") is not True:
+        return None
+    mapping = options.get("mapping")
+    if not isinstance(mapping, Mapping):
+        return None
+    entries = tuple(mapping.items())
+    if any(type(source_field) is not str or type(target_field) is not str for source_field, target_field in entries):
+        return None
+    source_fields = tuple(source_field for source_field, _target_field in entries)
+    target_fields = tuple(target_field for _source_field, target_field in entries)
+    if len(set(source_fields)) != len(source_fields) or len(set(target_fields)) != len(target_fields):
+        return None
+    source_field_set = set(source_fields)
+    if any(source_field != target_field and target_field in source_field_set for source_field, target_field in entries):
+        # FieldMapperConfig rejects rename chains/cycles because in-place
+        # application would make their result order-dependent. Projection
+        # analysis must abstain on the same malformed shape rather than claim
+        # a reviewed-contract conflict for a mapper the runtime cannot build.
+        return None
+    return target_fields
 
 
 def _reviewed_output_projection_conflict_for_bound_candidate(
@@ -1898,45 +1926,33 @@ def _reviewed_output_projection_conflict_for_bound_candidate(
         )
     except (KeyError, TypeError, ValueError):
         return None
+    # ProducerResolver serves validators that need both success and error
+    # topology. This check is narrower: only rows reaching a reviewed sink on
+    # a success route prove what the successful output projection retains.
+    success_nodes = tuple(replace(node, on_error=None) for node in projection_state.nodes)
     resolver = ProducerResolver.build(
         source=None,
         sources=projection_state.sources,
-        nodes=projection_state.nodes,
+        nodes=success_nodes,
         sink_names=frozenset(output.name for output in projection_state.outputs),
     )
     missing_fields: list[str] = []
     for stable_id in guided.output_order:
         reviewed_output = guided.reviewed_outputs[stable_id]
         producers = _effective_sink_success_producers(resolver, reviewed_output.name)
-        if producers is None:
-            continue
-        exact_projections: list[tuple[str, ...]] = []
         for producer in producers:
             node = resolver.get_node(producer.producer_id)
-            if type(node) is not NodeSpec or node.node_type != "transform" or node.plugin != "field_mapper":
-                break
-            options = node.options
-            if not isinstance(options, Mapping) or options.get("select_only") is not True:
-                break
-            mapping = options.get("mapping")
-            if not isinstance(mapping, Mapping):
-                break
-            entries = tuple(mapping.items())
-            if any(type(source_field) is not str or type(target_field) is not str for source_field, target_field in entries):
-                break
-            source_fields = tuple(source_field for source_field, _target_field in entries)
-            target_fields = tuple(target_field for _source_field, target_field in entries)
-            if len(set(source_fields)) != len(source_fields) or len(set(target_fields)) != len(target_fields):
-                break
-            exact_projections.append(target_fields)
-        else:
-            for target_fields in exact_projections:
-                conflict = reviewed_output_projection_conflict(
-                    retained_fields=target_fields,
-                    required_fields=tuple(reviewed_output.required_fields),
-                )
-                if conflict is not None:
-                    missing_fields.extend(field for field in conflict.missing_fields if field not in missing_fields)
+            if type(node) is not NodeSpec:
+                continue
+            target_fields = _exact_field_mapper_retained_fields(node)
+            if target_fields is None:
+                continue
+            conflict = reviewed_output_projection_conflict(
+                retained_fields=target_fields,
+                required_fields=tuple(reviewed_output.required_fields),
+            )
+            if conflict is not None:
+                missing_fields.extend(field for field in conflict.missing_fields if field not in missing_fields)
     if not missing_fields:
         return None
     return ReviewedOutputProjectionConflict(tuple(missing_fields))

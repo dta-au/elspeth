@@ -1064,7 +1064,7 @@ def _linear_pipeline() -> dict[str, object]:
     }
 
 
-def _exact_field_mapper_pipeline(*, mapping: dict[str, object], select_only: object = True) -> dict[str, object]:
+def _exact_field_mapper_pipeline(*, mapping: object, select_only: object = True) -> dict[str, object]:
     return {
         "sources": {
             "source": {
@@ -1187,6 +1187,21 @@ def test_exact_projection_is_checked_through_a_terminal_structural_gate() -> Non
     assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
 
 
+def test_projection_check_ignores_a_field_mapper_error_route_to_the_reviewed_sink() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _exact_field_mapper_pipeline(mapping={"generated": "abstract"})
+    mapper = pipeline["nodes"][0]
+    mapper["on_success"] = "discard"
+    mapper["on_error"] = "output"
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+
+    assert bound["nodes"][0]["on_error"] == "output"
+
+
 def _two_mapper_fanin_pipeline() -> dict[str, object]:
     return {
         "sources": {
@@ -1256,19 +1271,50 @@ def test_every_exact_mapper_in_a_sink_fanin_is_checked() -> None:
     assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
 
 
-def test_mixed_exact_and_passthrough_sink_fanin_abstains() -> None:
+def test_mixed_exact_and_passthrough_sink_fanin_checks_the_exact_branch() -> None:
     guided = _guided_with_output(
         required_fields=("document_uri", "abstract"),
         output_options={"path": "outputs/colours.json"},
     )
     pipeline = _two_mapper_fanin_pipeline()
+    exact_branch = pipeline["nodes"][1]
+    exact_branch["options"]["mapping"] = {"generated": "abstract"}
     second_branch = pipeline["nodes"][2]
     second_branch["plugin"] = "passthrough"
     second_branch["options"] = {"schema": {"mode": "observed"}}
 
-    bound = bind_guided_reviewed_components(pipeline, guided)
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, guided)
 
-    assert bound["nodes"][2]["plugin"] == "passthrough"
+    assert raised.value.error_code == "reviewed_output_projection_conflict"
+    assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
+
+
+def test_unresolved_structural_fanin_branch_does_not_suppress_an_exact_sibling() -> None:
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _two_mapper_fanin_pipeline()
+    exact_branch = pipeline["nodes"][1]
+    exact_branch["options"]["mapping"] = {"generated": "abstract"}
+    pipeline["nodes"][2] = {
+        "id": "unresolved_gate",
+        "node_type": "gate",
+        "plugin": None,
+        "input": "unresolved_rows",
+        "on_success": None,
+        "on_error": None,
+        "condition": "True",
+        "routes": {"true": "output", "false": "discard"},
+        "options": {},
+    }
+
+    with pytest.raises(GuidedCandidateBindingRejected) as raised:
+        bind_guided_reviewed_components(pipeline, guided)
+
+    assert raised.value.error_code == "reviewed_output_projection_conflict"
+    assert raised.value.connectivity == {"missing_fields": ["document_uri"]}
 
 
 def _guided_with_two_projection_outputs() -> GuidedSession:
@@ -1308,9 +1354,11 @@ def test_multi_output_projection_checks_preserve_sink_to_mapper_association() ->
         ({"generated": "abstract"}, False),
         ({"generated": "abstract", "other": "abstract"}, True),
         ({"generated": 7}, True),
+        ({"raw": "abstract", "abstract": "digest"}, True),
+        (["generated", "abstract"], True),
     ],
 )
-def test_nonexact_or_malformed_mapper_projection_abstains(mapping: dict[str, object], select_only: object) -> None:
+def test_nonexact_or_malformed_mapper_projection_abstains(mapping: object, select_only: object) -> None:
     guided = _guided_with_output(
         required_fields=("document_uri", "abstract"),
         output_options={"path": "outputs/colours.json"},
