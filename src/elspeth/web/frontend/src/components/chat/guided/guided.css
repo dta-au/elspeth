@@ -176,18 +176,25 @@
    promoted with the workspace — a centred 64rem stepper over a full-bleed
    two-column workspace read as misaligned). Overrides the base
    .guided-workflow padding: --space-xs top is the header-band tightening
-   (D9); --space-lg inline aligns with the workspace gutters. */
+   (D9); --space-lg inline aligns with the workspace gutters. The faint
+   border-bottom is the band's only remaining edge now that the step cells
+   lost their container boxes — without it the strip floats into the
+   decision area below. Same quiet seam token as .chat-panel-header. */
 .chat-panel--guided > .guided-workflow {
   max-width: none;
   margin-inline: 0;
-  padding: var(--space-xs) var(--space-lg) 0;
+  padding: var(--space-xs) var(--space-lg) var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
 }
 
 /* Keep the completed evidence stack on one shared horizontal grid. Run Results
    already uses --space-lg as its inline gutter; the stepper's content and the
-   Pipeline Ready card align to that same edge below. */
+   Pipeline Ready card align to that same edge below. Same closing seam as
+   the active-guided band above. */
 .chat-panel--completed > .guided-workflow {
   padding-inline: var(--space-lg);
+  padding-bottom: var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
 }
 
 /* Active guided mode supplies only the common workspace's authoring pane.
