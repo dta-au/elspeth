@@ -529,6 +529,12 @@
   font-size: var(--font-size-xs);
 }
 
+.filter-chip-clear:hover {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
+  color: var(--color-text);
+}
+
 .catalog-status-message {
   padding: var(--space-lg);
   font-size: var(--font-size-xs);

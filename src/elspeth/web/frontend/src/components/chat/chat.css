@@ -554,6 +554,10 @@
   cursor: pointer;
 }
 
+.chat-input-send-btn:hover:not(:disabled) {
+  background-color: var(--color-btn-primary-bg-hover);
+}
+
 .chat-input-hint {
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
@@ -879,6 +883,7 @@
 .chat-panel-error-dismiss {
   background: none;
   border: none;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   font-size: var(--font-size-lg);
   color: var(--color-error);
@@ -887,6 +892,10 @@
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+.chat-panel-error-dismiss:hover {
+  background-color: var(--color-surface-hover);
 }
 
 .chat-panel-messages {
@@ -1073,6 +1082,10 @@
   font-size: var(--font-size-xs);
   padding: var(--space-xs) var(--space-sm);
   min-height: var(--size-control-compact);
+}
+
+.message-retry-btn:hover {
+  background-color: var(--color-surface-hover);
 }
 
 .message-pending {

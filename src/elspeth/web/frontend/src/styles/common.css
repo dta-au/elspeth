@@ -469,6 +469,11 @@
   cursor: pointer;
 }
 
+.graph-modal-close:hover {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
+}
+
 .graph-modal-body {
   flex: 1 1 auto;
   min-height: 0;
@@ -519,6 +524,11 @@
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   cursor: pointer;
+}
+
+.yaml-modal-close:hover {
+  background-color: var(--color-surface-hover);
+  border-color: var(--color-border-strong);
 }
 
 

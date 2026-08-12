@@ -35,6 +35,11 @@
   justify-content: center;
 }
 
+.secrets-panel-close:hover {
+  background: var(--color-surface-hover);
+  color: var(--color-text);
+}
+
 .secrets-panel-body {
   flex: 1;
   overflow-y: auto;

@@ -40,6 +40,10 @@
   flex-shrink: 0;
 }
 
+.alert-banner-action:hover {
+  background: var(--color-surface-hover);
+}
+
 .alert-banner--info {
   background-color: var(--color-info-bg);
   color: var(--color-info);
