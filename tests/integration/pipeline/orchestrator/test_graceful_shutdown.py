@@ -16,7 +16,8 @@ import pytest
 
 from elspeth.contracts import Determinism, PipelineRow, ResumePoint, RunStatus
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.errors import GracefulShutdownError, IncompleteSourceResumeError
+from elspeth.contracts.enums import TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError, GracefulShutdownError, IncompleteSourceResumeError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.runtime_val_manifest import build_runtime_val_manifest
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
@@ -766,9 +767,11 @@ class TestInterruptAndResume:
         # broken. The fabrication is removed; the engine itself supplies the
         # contract.
 
+        import json
+
         from sqlalchemy import select
 
-        from elspeth.core.landscape.schema import token_work_items_table
+        from elspeth.core.landscape.schema import token_outcomes_table, token_work_items_table
 
         with landscape_db.connection() as conn:
             pre_resume_work = (
@@ -792,8 +795,40 @@ class TestInterruptAndResume:
         assert {row["coalesce_name"] for row in coalesce_blocked_work} == {"merge_paths"}
         assert all(row["fork_group_id"] is not None for row in coalesce_blocked_work)
 
+        # ADR-038: the interrupted source makes this run structurally
+        # non-resumable, so run finalization durably declared every undecided
+        # token (NULL, ABANDONED) — non-terminal outcome rows recording that
+        # nothing will ever decide them — while the BLOCKED journal rows above
+        # remain as honest history.
+        with landscape_db.connection() as conn:
+            abandoned_rows = (
+                conn.execute(
+                    select(
+                        token_outcomes_table.c.outcome,
+                        token_outcomes_table.c.completed,
+                        token_outcomes_table.c.context_json,
+                    ).where(
+                        token_outcomes_table.c.run_id == run_id,
+                        token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        assert abandoned_rows
+        for abandoned_row in abandoned_rows:
+            assert abandoned_row["outcome"] is None
+            assert abandoned_row["completed"] == 0
+            abandoned_context = json.loads(abandoned_row["context_json"])
+            assert abandoned_context["abandoned_by"] == "run_finalization"
+            assert "incomplete_sources" in abandoned_context["non_resumable_arms"]
+
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        # ADR-038: the public work-set surface fails closed on an abandoned
+        # run — it must never classify ABANDONED tokens as pending replay
+        # work, and it refuses rather than reporting an empty work set.
+        with pytest.raises(AuditIntegrityError, match="ABANDONED is non-resumable"):
+            recovery.get_unprocessed_rows(run_id)
 
         # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
         # source, so get_resume_point returns None. Hand-build the resume
@@ -862,7 +897,11 @@ class TestInterruptAndResume:
         assert output_sink.results == []
 
         recovery = RecoveryManager(landscape_db, checkpoint_mgr)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        # ADR-038: run finalization abandoned the undecided tokens of this
+        # non-resumable interrupted run, so the public work-set surface fails
+        # closed instead of reporting an empty replay set.
+        with pytest.raises(AuditIntegrityError, match="ABANDONED is non-resumable"):
+            recovery.get_unprocessed_rows(run_id)
 
         # elspeth-1f5b83cd28: the advisory gate refuses the interrupted
         # source; hand-build the resume point to prove the enforcing guard
@@ -928,7 +967,10 @@ class TestInterruptAndResume:
         # Sorted compare: the two SELECTs carry no ORDER BY, so raw list
         # equality is a latent row-order flake.
         assert sorted(post_refusal_blocked) == sorted(blocked_coalesce_rows)
-        assert recovery.get_unprocessed_rows(run_id) == []
+        # The refused resume changed nothing: the ADR-038 fail-closed verdict
+        # on the abandoned work set is unchanged too.
+        with pytest.raises(AuditIntegrityError, match="ABANDONED is non-resumable"):
+            recovery.get_unprocessed_rows(run_id)
 
     def _setup_failed_run(
         self,

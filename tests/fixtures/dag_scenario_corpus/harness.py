@@ -4476,6 +4476,11 @@ def _parallel_sink_finalization_recovery_case(
             else:
                 raise AssertionError("parallel sink-finalization recovery did not inject the first-sink finalization fault")
         expected_seams = (
+            SinkEffectExecutionSeam.BEFORE_RESERVATION,
+            SinkEffectExecutionSeam.AFTER_RESERVATION,
+            SinkEffectExecutionSeam.AFTER_PREPARATION_CLAIM,
+            SinkEffectExecutionSeam.AFTER_INSPECTION,
+            SinkEffectExecutionSeam.AFTER_PLAN_CAS,
             SinkEffectExecutionSeam.BEFORE_EFFECT,
             SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN,
             SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE,
