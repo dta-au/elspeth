@@ -27,7 +27,8 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
 _ALTERNATIVE_COORDINATOR_PATTERN: Final[str] = r"(?:or|alternatively|otherwise|instead)"
-_ALTERNATIVE_PREFIX_PATTERN: Final[str] = rf"(?:\s*[,;.]?\s*{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s+|\s*/\s*)"
+_ALTERNATIVE_PREFIX_PATTERN: Final[str] = rf"(?:\s*[,;.]?\s*{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+|\s*/\s*)"
+_ADDITIVE_COORDINATOR_PATTERN: Final[str] = r"(?:and|as\s+well\s+as|plus)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,18 +564,20 @@ _FORK_NEGATED_TRUNCATE_RE = re.compile(
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_OUTPUT_RE = re.compile(
-    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\s+"
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
     r"(?:(?:write|save)(?:\s+it)?\s+(?:at|to)\s+)?(?P<path>[^\s,:;]+\.jsonl)\b",
     re.IGNORECASE,
 )
 _FORK_ALTERNATIVE_SUFFIX_RE = re.compile(
-    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\s+(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
+    rf"\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
+    r"(?:(?:use|select)\s+)?(?:the\s+)?(?:suffix\s+)?"
     r"(?P<quote>['\"])(?P<suffix>.*?)(?P=quote)",
     re.IGNORECASE,
 )
 _FORK_AMBIGUOUS_KEYS_RE = re.compile(
     r"\bkeys\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?\s+"
-    rf"{_ALTERNATIVE_COORDINATOR_PATTERN}\s+(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
+    rf"{_ALTERNATIVE_COORDINATOR_PATTERN}\b\s*[,;:]?\s+"
+    r"(?:(?:use|select)\s+(?:the\s+)?keys\s+)?"
     r"`?[A-Za-z_][A-Za-z0-9_]*`?\s+and\s+`?[A-Za-z_][A-Za-z0-9_]*`?",
     re.IGNORECASE,
 )
@@ -592,16 +595,16 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
         return None
     for phrase in ("two ways in parallel", "single merged output row"):
         for phrase_match in re.finditer(re.escape(phrase), authority_text, re.IGNORECASE):
-            if _match_is_negated(authority_text, phrase_match, _AUTHORITY_NEGATION_RE):
+            if _match_is_negated(authority_text, phrase_match):
                 return None
     truncate_matches = tuple(_FORK_TRUNCATE_RE.finditer(authority_text))
     if not truncate_matches:
         return None
     if _FORK_NEGATED_TRUNCATE_RE.search(authority_text) is not None:
         return None
-    if any(_match_is_negated(context.user_text, match, _AUTHORITY_NEGATION_RE) for match in csv_matches):
+    if any(_match_is_negated(context.user_text, match) for match in csv_matches):
         return None
-    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in truncate_matches):
+    if any(_match_is_negated(authority_text, match) for match in truncate_matches):
         return None
     truncate_values = tuple((match.group("field"), int(match.group("max_chars"))) for match in truncate_matches)
     truncate_value = truncate_values[0]
@@ -619,7 +622,7 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
         "max_chars": truncate_value[1],
     }
     output_matches = tuple(_FORK_OUTPUT_PATH_RE.finditer(authority_text))
-    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in output_matches):
+    if any(_match_is_negated(authority_text, match) for match in output_matches):
         return None
     output_paths = tuple(
         path_match.group("path")
@@ -634,7 +637,7 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     if output_paths:
         slots["output_path"] = output_paths[0]
     suffix_matches = tuple(_FORK_SUFFIX_RE.finditer(authority_text))
-    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in suffix_matches):
+    if any(_match_is_negated(authority_text, match) for match in suffix_matches):
         return None
     suffixes = tuple(
         quoted.group("value")
@@ -651,7 +654,7 @@ def _match_fork_coalesce_intent(context: RecipeIntentContext) -> RecipeIntentCan
     if _FORK_AMBIGUOUS_KEYS_RE.search(authority_text) is not None:
         return None
     keys_matches = tuple(_FORK_KEYS_RE.finditer(authority_text))
-    if any(_match_is_negated(authority_text, match, _AUTHORITY_NEGATION_RE) for match in keys_matches):
+    if any(_match_is_negated(authority_text, match) for match in keys_matches):
         return None
     keys = tuple((match.group("key_a"), match.group("key_b")) for match in keys_matches)
     if keys and any(candidate != keys[0] for candidate in keys[1:]):
@@ -894,16 +897,23 @@ _AUTHORITY_NEGATION_RE = re.compile(
     re.IGNORECASE,
 )
 _CLAUSE_DELIMITER_RE = re.compile(r";|\r?\n|\.(?=\s|$)")
-_LLM_TOKEN_RE = re.compile(r"\b(?:an?\s+)?llm\b", re.IGNORECASE)
-_RESPONSE_NEGATION_RE = re.compile(
-    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid|without)\s+"
-    r"(?:(?:have|having|let|ask|asking|use|using)\s+)?(?:an?\s+|the\s+)?llm\b(?:\s+to)?[^.;\n]*"
-    r"\b(?:write|produce|generate|create|return|store)\b"
-    r"|\bllm\b[^.;\n,]{0,80}\b(?:must\s+)?not\s+(?:write|produce|generate|create|return|store)\b"
-    r"|\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid)\s+"
-    r"(?:write|produce|generate|create|return|store)\b",
+_AUTHORITY_ACTION_RE = re.compile(
+    r"\b(?P<action>fetch(?:es|ed|ing)?|scrap(?:e|es|ed|ing)|writ(?:e|es|ing|ten)|produc(?:e|es|ed|ing)|"
+    r"generat(?:e|es|ed|ing)|creat(?:e|es|ed|ing)|return(?:s|ed|ing)?|stor(?:e|es|ed|ing)|"
+    r"keep(?:s|ing)?|kept|retain(?:s|ed|ing)?|project(?:s|ed|ing)?|us(?:e|es|ed|ing)|"
+    r"select(?:s|ed|ing)?|choos(?:e|es|ing)|chose|chosen|read(?:s|ing)?|sav(?:e|es|ed|ing)|"
+    r"process(?:es|ed|ing)?|truncat(?:e|es|ed|ing)|combin(?:e|es|ed|ing))\b",
     re.IGNORECASE,
 )
+_AUTHORITY_BOUNDARY_RE = re.compile(
+    rf"(?P<hard>;|\r?\n|\.(?=\s|$))|(?P<soft>[,:])|"
+    rf"(?P<alternative>\b{_ALTERNATIVE_COORDINATOR_PATTERN}\b)|"
+    rf"(?P<additive>\b(?:{_ADDITIVE_COORDINATOR_PATTERN}|then)\b)|"
+    r"(?P<contrast>\b(?:but|while|rather\s+than)\b)",
+    re.IGNORECASE,
+)
+_BACKTICK_PROSE_RE = re.compile(r"`[^`]*`")
+_LLM_TOKEN_RE = re.compile(r"\b(?:an?\s+)?llm\b", re.IGNORECASE)
 _PROFILE_ACTION_PATTERN: Final[str] = r"(?:use|using|select|selecting|choose|choosing)"
 _SOURCE_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|read|reading)"
 _OUTPUT_ACTION_PATTERN: Final[str] = rf"(?:{_PROFILE_ACTION_PATTERN}|write|writing|save|saving)"
@@ -927,11 +937,10 @@ _PROFILE_LABEL_RE = re.compile(
     r"\b(?:an?\s+)?llm\s+profile\b|\bprofile\s*(?:is\b|named\b|[:=])",
     re.IGNORECASE,
 )
-_FETCH_NEGATION_RE = re.compile(
-    r"\b(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid)\s+(?:fetch|scrape)\b",
-    re.IGNORECASE,
+_NEGATIVE_ACTION_PATTERN: Final[str] = (
+    r"(?:(?:do|does|did)\s+not|don't|doesn't|didn't|never|must\s+not|should\s+not|shouldn't|"
+    r"cannot|can't|avoid(?:s|ed|ing)?|without)"
 )
-_NEGATIVE_ACTION_PATTERN: Final[str] = r"(?:do\s+not|don't|never|must\s+not|should\s+not|shouldn't|avoid(?:s|ed|ing)?|without)"
 _SOURCE_AUTHORITY_RE = re.compile(
     rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_SOURCE_ACTION_PATTERN}\s+"
     r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?source\b"
@@ -939,11 +948,22 @@ _SOURCE_AUTHORITY_RE = re.compile(
     r"(?!(?:for|with|from|rows?|material)\b)(?P<name>[A-Za-z_][A-Za-z0-9_-]*)))?",
     re.IGNORECASE,
 )
+_SOURCE_SLOT_VALUE_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?source\b"
+    r"(?:\s+(?:named\s+)?(?:`[A-Za-z_][A-Za-z0-9_-]*`|[A-Za-z_][A-Za-z0-9_-]*))?",
+    re.IGNORECASE,
+)
 _OUTPUT_AUTHORITY_RE = re.compile(
     rf"\b(?P<negative>{_NEGATIVE_ACTION_PATTERN}\s+)?{_OUTPUT_ACTION_PATTERN}\s+"
     r"(?:an?\s+|the\s+)?(?P<reviewed>reviewed\s+)?(?:(?P<format>[A-Za-z][A-Za-z0-9_-]*)\s+)?output\b"
     r"(?:\s+(?:named\s+)?(?:`(?P<quoted>[A-Za-z_][A-Za-z0-9_-]*)`|(?P<name>(?!at\b)[A-Za-z_][A-Za-z0-9_-]*)))?"
     r"(?:\s+at\s+(?P<path>[A-Za-z0-9_./-]*[A-Za-z0-9_/-]))?",
+    re.IGNORECASE,
+)
+_OUTPUT_SLOT_VALUE_RE = re.compile(
+    r"\b(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?output\b"
+    r"(?:\s+(?:named\s+)?(?:`[A-Za-z_][A-Za-z0-9_-]*`|[A-Za-z_][A-Za-z0-9_-]*))?"
+    r"(?:\s+at\s+[A-Za-z0-9_./-]*[A-Za-z0-9_/-])?",
     re.IGNORECASE,
 )
 _OUTPUT_PATH_AUTHORITY_RE = re.compile(
@@ -961,8 +981,9 @@ _RESPONSE_DIRECT_ALTERNATIVE_RE = re.compile(
     r"(?:an?\s+)?(?:`[A-Za-z_][A-Za-z0-9_]*`|[A-Za-z_][A-Za-z0-9_]*)",
     re.IGNORECASE,
 )
-_RESPONSE_DIRECT_COORDINATOR_RE = re.compile(
-    rf"^\s*,?\s*(?:and|then|{_ALTERNATIVE_COORDINATOR_PATTERN})\s*$",
+_RESPONSE_SUBORDINATE_BRIDGE_RE = re.compile(
+    r"\b(?:explain(?:s|ed|ing)?|describ(?:e|es|ed|ing)|discuss(?:es|ed|ing)?|say(?:s|ing)?|"
+    r"about|how|why|recommend(?:s|ed|ing)?)\b",
     re.IGNORECASE,
 )
 _PIPELINE_CLEANUP_START_RE = re.compile(
@@ -975,17 +996,6 @@ _WEB_LOCATOR_RE = re.compile(
     r"(?:every|each)\s+(?:(?:reviewed\s+)?pages?\s+(?:(?:named\s+by|at(?:\s+its)?)\s+))?"
     r"|the\s+page\s+at(?:\s+its)?\s+)"
     r"`(?P<field>[A-Za-z_][A-Za-z0-9_]*)`",
-    re.IGNORECASE,
-)
-_SOURCE_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    rf"^{_ALTERNATIVE_PREFIX_PATTERN}(?:{_SOURCE_ACTION_PATTERN}\s+)?"
-    r"(?:an?\s+|the\s+)?(?:reviewed\s+)?"
-    r"(?:[A-Za-z][A-Za-z0-9_-]*\s+)?source\b",
-    re.IGNORECASE,
-)
-_OUTPUT_AUTHORITY_ALTERNATIVE_RE = re.compile(
-    rf"^{_ALTERNATIVE_PREFIX_PATTERN}(?:{_OUTPUT_ACTION_PATTERN}\s+)?"
-    r"(?:an?\s+|the\s+)?(?:reviewed\s+)?(?:[A-Za-z][A-Za-z0-9_-]*\s+)?output\b",
     re.IGNORECASE,
 )
 _RETENTION_CLAUSE_RE = re.compile(
@@ -1001,6 +1011,260 @@ _PROJECTION_FIELD_LIST_RE = re.compile(
 )
 
 
+_AuthorityJoin = Literal["none", "additive", "alternative"]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityAction:
+    """One recognized authority verb with segment-local polarity."""
+
+    name: str
+    start: int
+    end: int
+    negated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthoritySegment:
+    """One bounded lexical segment outside protected content spans."""
+
+    start: int
+    end: int
+    clause_id: int
+    join: _AuthorityJoin
+    actions: tuple[_AuthorityAction, ...]
+    negations: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AuthorityDocument:
+    """Bounded lexical authority view; intentionally not an NLP interpretation."""
+
+    user_text: str
+    segments: tuple[_AuthoritySegment, ...]
+
+    def segment_index_at(self, position: int) -> int | None:
+        for index, segment in enumerate(self.segments):
+            if segment.start <= position < segment.end:
+                return index
+        return None
+
+    def action_for_span(self, start: int, end: int) -> _AuthorityAction | None:
+        """Return the declaration action local to a parsed value or label span."""
+
+        segment_index = self.segment_index_at(start)
+        if segment_index is None:
+            return None
+        actions = self.segments[segment_index].actions
+        enclosed = tuple(action for action in actions if start <= action.start < end)
+        if enclosed:
+            return enclosed[0]
+        preceding = tuple(action for action in actions if action.end <= end)
+        return preceding[-1] if preceding else None
+
+    def match_is_negated(self, match: re.Match[str]) -> bool:
+        action = self.action_for_span(match.start(), match.end())
+        if action is not None:
+            return action.negated
+        segment_index = self.segment_index_at(match.start())
+        if segment_index is None:
+            return False
+        return any(end <= match.start() for _start, end in self.segments[segment_index].negations)
+
+    def has_negated_action(
+        self,
+        names: frozenset[str],
+        *,
+        start: int = 0,
+        end: int | None = None,
+        excluded_span: tuple[int, int] | None = None,
+    ) -> bool:
+        limit = len(self.user_text) if end is None else end
+        return any(
+            action.negated
+            and action.name in names
+            and start <= action.start < limit
+            and (excluded_span is None or not (excluded_span[0] <= action.start < excluded_span[1]))
+            for segment in self.segments
+            for action in segment.actions
+        )
+
+    def has_competing_value(
+        self,
+        declaration: re.Match[str],
+        value_pattern: re.Pattern[str],
+        *,
+        excluded_span: tuple[int, int] | None = None,
+        subordinate_bridge: re.Pattern[str] | None = None,
+    ) -> bool:
+        """Return whether another slot-shaped value competes with a declaration."""
+
+        segment_index = self.segment_index_at(declaration.start())
+        if segment_index is None:
+            return False
+        segment = self.segments[segment_index]
+        for candidate in value_pattern.finditer(self.user_text, declaration.end(), segment.end):
+            if excluded_span is not None and excluded_span[0] <= candidate.start() < excluded_span[1]:
+                continue
+            if _position_is_in_quoted_prose(self.user_text, candidate.start()):
+                continue
+            bridge = self.user_text[declaration.end() : candidate.start()]
+            if subordinate_bridge is not None and subordinate_bridge.search(bridge) is not None:
+                continue
+            if not self.match_is_negated(candidate):
+                return True
+        if segment_index + 1 >= len(self.segments):
+            return False
+        following = self.segments[segment_index + 1]
+        if following.join not in {"additive", "alternative"}:
+            return False
+        return any(
+            (excluded_span is None or not (excluded_span[0] <= candidate.start() < excluded_span[1]))
+            and not _position_is_in_quoted_prose(self.user_text, candidate.start())
+            and not self.match_is_negated(candidate)
+            for candidate in value_pattern.finditer(self.user_text, following.start, following.end)
+        )
+
+
+def _canonical_authority_action(token: str) -> str:
+    folded = token.casefold()
+    for prefix, canonical in (
+        ("fetch", "fetch"),
+        ("scrap", "scrape"),
+        ("writ", "write"),
+        ("produc", "produce"),
+        ("generat", "generate"),
+        ("creat", "create"),
+        ("return", "return"),
+        ("stor", "store"),
+        ("keep", "retain"),
+        ("kept", "retain"),
+        ("retain", "retain"),
+        ("project", "retain"),
+        ("us", "use"),
+        ("select", "use"),
+        ("choos", "use"),
+        ("chos", "use"),
+        ("read", "read"),
+        ("sav", "save"),
+        ("process", "process"),
+        ("truncat", "truncate"),
+        ("combin", "combine"),
+    ):
+        if folded.startswith(prefix):
+            return canonical
+    raise AssertionError(f"unrecognized authority action token: {token}")
+
+
+def _position_is_protected(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _authority_segment(
+    user_text: str,
+    *,
+    start: int,
+    end: int,
+    clause_id: int,
+    join: _AuthorityJoin,
+    protected_spans: tuple[tuple[int, int], ...],
+) -> _AuthoritySegment | None:
+    while start < end and user_text[start].isspace():
+        start += 1
+    while end > start and user_text[end - 1].isspace():
+        end -= 1
+    if start >= end:
+        return None
+    action_matches = tuple(
+        match
+        for match in _AUTHORITY_ACTION_RE.finditer(user_text, start, end)
+        if not _position_is_protected(match.start(), protected_spans)
+    )
+    negation_matches = tuple(
+        match
+        for match in _AUTHORITY_NEGATION_RE.finditer(user_text, start, end)
+        if not _position_is_protected(match.start(), protected_spans)
+    )
+    negated_action_starts = frozenset(
+        action.start()
+        for negation in negation_matches
+        for action in action_matches
+        if action.start() >= negation.end()
+        and not any(candidate.start() < action.start() for candidate in action_matches if candidate.start() >= negation.end())
+    )
+    actions = tuple(
+        _AuthorityAction(
+            name=_canonical_authority_action(action.group("action")),
+            start=action.start(),
+            end=action.end(),
+            negated=action.start() in negated_action_starts,
+        )
+        for action in action_matches
+    )
+    return _AuthoritySegment(
+        start=start,
+        end=end,
+        clause_id=clause_id,
+        join=join,
+        actions=actions,
+        negations=tuple(match.span() for match in negation_matches),
+    )
+
+
+def _authority_document(user_text: str) -> _AuthorityDocument:
+    """Parse bounded authority segments while masking content-only spans."""
+
+    protected_spans = tuple(
+        sorted(
+            (
+                *(match.span() for match in _QUOTED_PROSE_RE.finditer(user_text)),
+                *(match.span() for match in _BACKTICK_PROSE_RE.finditer(user_text)),
+                *(match.span("csv") for match in _FORK_CSV_MARKER_RE.finditer(user_text)),
+                *(match.span() for match in _ABUSE_CONTACT_LABEL_RE.finditer(user_text)),
+                *(match.span() for match in _SCRAPING_REASON_LABEL_RE.finditer(user_text)),
+            )
+        )
+    )
+    segments: list[_AuthoritySegment] = []
+    cursor = 0
+    clause_id = 0
+    pending_join: _AuthorityJoin = "none"
+    for boundary in _AUTHORITY_BOUNDARY_RE.finditer(user_text):
+        if _position_is_protected(boundary.start(), protected_spans):
+            continue
+        segment = _authority_segment(
+            user_text,
+            start=cursor,
+            end=boundary.start(),
+            clause_id=clause_id,
+            join=pending_join,
+            protected_spans=protected_spans,
+        )
+        if segment is not None:
+            segments.append(segment)
+        if boundary.group("hard") is not None:
+            clause_id += 1
+            pending_join = "none"
+        elif boundary.group("alternative") is not None:
+            pending_join = "alternative"
+        elif boundary.group("additive") is not None:
+            pending_join = "additive"
+        elif segment is not None:
+            pending_join = "none"
+        cursor = boundary.end()
+    final_segment = _authority_segment(
+        user_text,
+        start=cursor,
+        end=len(user_text),
+        clause_id=clause_id,
+        join=pending_join,
+        protected_spans=protected_spans,
+    )
+    if final_segment is not None:
+        segments.append(final_segment)
+    return _AuthorityDocument(user_text=user_text, segments=tuple(segments))
+
+
 def _clause_bounds(user_text: str, position: int) -> tuple[int, int]:
     """Return the delimiter-bounded clause containing ``position``."""
 
@@ -1014,19 +1278,14 @@ def _clause_bounds(user_text: str, position: int) -> tuple[int, int]:
     return start, len(user_text)
 
 
-def _match_is_negated(user_text: str, match: re.Match[str], negation: re.Pattern[str]) -> bool:
-    start, end = _clause_bounds(user_text, match.start())
-    return negation.search(user_text[start:end]) is not None
+def _match_is_negated(user_text: str, match: re.Match[str]) -> bool:
+    return _authority_document(user_text).match_is_negated(match)
 
 
 def _match_prefix_is_negated(user_text: str, match: re.Match[str]) -> bool:
-    """Return whether unquoted authority leading into ``match`` is negated."""
+    """Return whether the segment-local declaration for ``match`` is negated."""
 
-    clause_start, _clause_end = _clause_bounds(user_text, match.start())
-    return any(
-        not _position_is_in_quoted_prose(user_text, negation.start())
-        for negation in _AUTHORITY_NEGATION_RE.finditer(user_text, clause_start, match.end())
-    )
+    return _authority_document(user_text).match_is_negated(match)
 
 
 def _match_clause_residue(user_text: str, match: re.Match[str]) -> str:
@@ -1049,7 +1308,7 @@ def _residue_starts_with_alternative(residue: str) -> bool:
 def _residue_starts_with_quoted_value_addition(residue: str) -> bool:
     return (
         re.match(
-            r"^(?:\s*[,;.]?\s*(?:and|as\s+well\s+as)\s+|\s*,\s*)['\"]",
+            rf"^(?:\s*[,;.]?\s*{_ADDITIVE_COORDINATOR_PATTERN}\s+|\s*,\s*)['\"]",
             residue,
             re.IGNORECASE,
         )
@@ -1092,21 +1351,10 @@ def _profile_match_is_subordinate_response_prose(user_text: str, match: re.Match
     return semantic_span is not None and semantic_span[0] <= match.start() < semantic_span[1]
 
 
-def _residue_starts_with_profile_alternative(residue: str) -> bool:
-    return (
-        re.match(
-            rf"^(?:{_ALTERNATIVE_PREFIX_PATTERN}|\s*[,;.]?\s*and\s+)"
-            r"(?:`?[A-Za-z0-9][A-Za-z0-9_-]*`?)",
-            residue,
-            re.IGNORECASE,
-        )
-        is not None
-    )
-
-
 def _response_authority_matches(user_text: str, *, start: int, end: int) -> tuple[re.Match[str], ...]:
     """Return response declarations, excluding subordinate or quoted prose."""
 
+    authority = _authority_document(user_text)
     candidates = tuple(
         match for match in _RESPONSE_FIELD_RE.finditer(user_text, start, end) if not _position_is_in_quoted_prose(user_text, match.start())
     )
@@ -1114,29 +1362,19 @@ def _response_authority_matches(user_text: str, *, start: int, end: int) -> tupl
         return ()
     authorities = [candidates[0]]
     for candidate in candidates[1:]:
-        previous = authorities[-1]
-        previous_clause = _clause_bounds(user_text, previous.start())
-        candidate_clause = _clause_bounds(user_text, candidate.start())
-        if previous_clause == candidate_clause:
-            if _RESPONSE_DIRECT_COORDINATOR_RE.fullmatch(user_text[previous.end() : candidate.start()]) is not None:
-                authorities.append(candidate)
+        candidate_segment_index = authority.segment_index_at(candidate.start())
+        previous_segment_index = authority.segment_index_at(authorities[-1].start())
+        if candidate_segment_index is None or candidate_segment_index == previous_segment_index:
             continue
-        prefix = user_text[candidate_clause[0] : candidate.start()]
-        if (
-            re.fullmatch(
-                rf"\s*(?:(?:and|then|{_ALTERNATIVE_COORDINATOR_PATTERN})\s+)?",
-                prefix,
-                re.IGNORECASE,
-            )
-            is not None
-        ):
+        candidate_segment = authority.segments[candidate_segment_index]
+        action = authority.action_for_span(candidate.start(), candidate.end())
+        if action is not None and not user_text[candidate_segment.start : action.start].strip():
             authorities.append(candidate)
     return tuple(authorities)
 
 
 def _response_match_is_negated(user_text: str, match: re.Match[str]) -> bool:
-    clause_start, _clause_end = _clause_bounds(user_text, match.start())
-    return _RESPONSE_NEGATION_RE.search(user_text[clause_start : match.end()]) is not None
+    return _authority_document(user_text).match_is_negated(match)
 
 
 def _web_locator_field(user_text: str, source_fields: tuple[str, ...]) -> str | None:
@@ -1463,9 +1701,17 @@ def _web_response_contract(user_text: str) -> tuple[str, str] | None:
     response_matches = _response_authority_matches(user_text, start=semantic_start, end=semantic_end)
     if not response_matches:
         return None
+    authority = _authority_document(user_text)
     contracts: list[tuple[str, str]] = []
     for index, response_match in enumerate(response_matches):
         if _response_match_is_negated(user_text, response_match):
+            return None
+        if authority.has_competing_value(
+            response_match,
+            _RESPONSE_FIELD_RE,
+            excluded_span=(semantic_end, len(user_text)),
+            subordinate_bridge=_RESPONSE_SUBORDINATE_BRIDGE_RE,
+        ):
             return None
         boundary_starts = [start for start in nonsemantic_starts if start >= response_match.end()]
         if index + 1 < len(response_matches):
@@ -1606,7 +1852,19 @@ def _single_llm_profile(context: RecipeIntentContext) -> str | None:
     if any(_match_prefix_is_negated(context.user_text, match) for match in authority_matches):
         return None
     if authority_matches:
-        if any(_residue_starts_with_profile_alternative(_match_tail(context.user_text, match)) for match in authority_matches):
+        alias_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_@-])(?:{'|'.join(re.escape(alias) for alias in aliases)})(?![A-Za-z0-9_@-])",
+            re.IGNORECASE,
+        )
+        authority = _authority_document(context.user_text)
+        if any(
+            authority.has_competing_value(
+                match,
+                alias_pattern,
+                excluded_span=_web_response_semantic_span(context.user_text),
+            )
+            for match in authority_matches
+        ):
             return None
         selected = tuple((match.group("quoted") or match.group("plain")) for match in authority_matches)
         profile = selected[0]
@@ -1628,11 +1886,8 @@ def _reviewed_web_authority_is_compatible(
     """Return whether explicit source/output prose agrees with reviewed authority."""
 
     semantic_span = _web_response_semantic_span(context.user_text)
-    if any(
-        not _position_is_in_quoted_prose(context.user_text, fetch_negation.start())
-        and (semantic_span is None or not (semantic_span[0] <= fetch_negation.start() < semantic_span[1]))
-        for fetch_negation in _FETCH_NEGATION_RE.finditer(context.user_text)
-    ):
+    authority = _authority_document(context.user_text)
+    if authority.has_negated_action(frozenset({"fetch", "scrape"}), excluded_span=semantic_span):
         return False
     source_authorities = tuple(
         authority
@@ -1641,7 +1896,7 @@ def _reviewed_web_authority_is_compatible(
         and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
     )
     for source_authority in source_authorities:
-        if source_authority.group("negative") is not None:
+        if source_authority.group("negative") is not None or authority.match_is_negated(source_authority):
             return False
         source_format = source_authority.group("format")
         if source_format is not None and source_format.casefold() != source.plugin.casefold():
@@ -1651,7 +1906,7 @@ def _reviewed_web_authority_is_compatible(
             return False
         if source_authority.group("reviewed") is not None and source_format is None and source_name is None:
             return False
-        if _SOURCE_AUTHORITY_ALTERNATIVE_RE.match(_match_tail(context.user_text, source_authority)) is not None:
+        if authority.has_competing_value(source_authority, _SOURCE_SLOT_VALUE_RE, excluded_span=semantic_span):
             return False
 
     output_authorities = tuple(
@@ -1661,7 +1916,7 @@ def _reviewed_web_authority_is_compatible(
         and (semantic_span is None or not (semantic_span[0] <= authority.start() < semantic_span[1]))
     )
     for output_authority in output_authorities:
-        if output_authority.group("negative") is not None:
+        if output_authority.group("negative") is not None or authority.match_is_negated(output_authority):
             return False
         output_format = output_authority.group("format")
         if output_format is not None and output_format.casefold() != output_binding.format.casefold():
@@ -1674,7 +1929,7 @@ def _reviewed_web_authority_is_compatible(
             return False
         if output_authority.group("reviewed") is not None and output_format is None and output_name is None:
             return False
-        if _OUTPUT_AUTHORITY_ALTERNATIVE_RE.match(_match_tail(context.user_text, output_authority)) is not None:
+        if authority.has_competing_value(output_authority, _OUTPUT_SLOT_VALUE_RE, excluded_span=semantic_span):
             return False
     output_path_authorities = tuple(
         authority

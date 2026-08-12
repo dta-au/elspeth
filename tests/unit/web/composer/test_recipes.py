@@ -459,6 +459,11 @@ class TestRegisteredRecipeIntentMatching:
                 "scraping reason: 'Public analysis'."
             ),
             (
+                "Fetch every `document_uri`; cannot have an LLM write an `abstract`; "
+                "retain exactly `document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+                "scraping reason: 'Public analysis'."
+            ),
+            (
                 "Fetch every `document_uri`; have an LLM write an `abstract`; "
                 "shouldn't retain exactly `document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
                 "scraping reason: 'Public analysis'."
@@ -472,6 +477,15 @@ class TestRegisteredRecipeIntentMatching:
         context = self._context(
             "Fetch every `document_uri`, have an LLM write an `abstract` and produce a `digest`, "
             "then retain exactly `document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_unknown_connector_between_response_values_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract` coupled with produce a `digest`; "
+            "retain exactly `document_uri` and `abstract`. Abuse contact: ops@agency.gov.au; "
             "scraping reason: 'Public analysis'."
         )
 
@@ -499,6 +513,8 @@ class TestRegisteredRecipeIntentMatching:
             "Otherwise produce a `digest`",
             "Or produce a `digest`",
             "Instead produce a `digest`",
+            "Alternatively, produce a `digest`",
+            "Otherwise: produce a `digest`",
         ],
     )
     def test_new_clause_response_alternative_falls_back(self, alternative: str) -> None:
@@ -696,6 +712,14 @@ class TestRegisteredRecipeIntentMatching:
 
         assert match_registered_recipe_intent(context) is None
 
+    def test_plus_scraping_reason_alternative_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis' plus 'Private analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
     def test_negation_inside_quoted_scraping_reason_is_content(self) -> None:
         context = self._context(
             "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
@@ -874,6 +898,24 @@ class TestRegisteredRecipeIntentMatching:
 
         assert match_registered_recipe_intent(context) is None
 
+    def test_punctuated_profile_alternative_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Use profile-a; otherwise, profile-b. Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'.",
+            aliases=("profile-a", "profile-b"),
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_unknown_connector_between_profile_values_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Use profile-a coupled with profile-b. Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'.",
+            aliases=("profile-a", "profile-b"),
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
     def test_profile_like_prose_inside_quoted_reason_is_not_authority(self) -> None:
         context = self._context(
             "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
@@ -1014,6 +1056,8 @@ class TestRegisteredRecipeIntentMatching:
             "Shouldn't fetch the reviewed `document_uri` source rows.",
             "Shouldn't use the reviewed JSON source `briefs`.",
             "Should not write the reviewed JSONL output `projected`.",
+            "Cannot fetch the reviewed `document_uri` source rows.",
+            "Cannot use the reviewed JSON source `briefs`.",
         ],
     )
     def test_source_or_output_authority_contradiction_falls_back(self, authority_clause: str) -> None:
@@ -1106,10 +1150,46 @@ class TestRegisteredRecipeIntentMatching:
 
         assert match_registered_recipe_intent(context) is None
 
+    def test_punctuated_source_authority_alternative_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Use JSON source briefs; otherwise, CSV source backup. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_unknown_connector_between_source_values_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Use JSON source briefs coupled with CSV source backup. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
     def test_separator_bounded_output_authority_alternative_falls_back(self) -> None:
         context = self._context(
             "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
             "Write JSONL output projected; otherwise CSV output backup. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_punctuated_output_authority_alternative_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Write JSONL output projected; otherwise, CSV output backup. Abuse contact: ops@agency.gov.au; "
+            "scraping reason: 'Public analysis'."
+        )
+
+        assert match_registered_recipe_intent(context) is None
+
+    def test_unknown_connector_between_output_values_falls_back(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; retain exactly `document_uri` and `abstract`. "
+            "Write JSONL output projected coupled with CSV output backup. Abuse contact: ops@agency.gov.au; "
             "scraping reason: 'Public analysis'."
         )
 
@@ -1140,6 +1220,18 @@ class TestRegisteredRecipeIntentMatching:
         context = self._context(
             "Fetch every `document_uri`; have an LLM write an `abstract`; "
             "retain exactly `document_uri` and `abstract`, but do not retain raw content. "
+            "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
+        )
+
+        match = match_registered_recipe_intent(context)
+
+        assert match is not None
+        assert match.slots["retained_fields"] == ("document_uri", "abstract")
+
+    def test_prior_negative_cleanup_does_not_negate_exact_projection(self) -> None:
+        context = self._context(
+            "Fetch every `document_uri`; have an LLM write an `abstract`; "
+            "do not retain raw content, but retain exactly `document_uri` and `abstract`. "
             "Abuse contact: ops@agency.gov.au; scraping reason: 'Public analysis'."
         )
 
@@ -1422,6 +1514,20 @@ class TestForkIntentAdversarialMatrix:
     def test_negated_semantic_slots_fall_back(self, clauses: tuple[str, ...]) -> None:
         assert match_registered_recipe_intent(self._context(*clauses)) is None
 
+    def test_unrelated_prior_negation_does_not_negate_fork_authority(self) -> None:
+        context = RecipeIntentContext(
+            user_text=(
+                "Do not fake the split with a transform, process these rows two ways in parallel and produce "
+                "a single merged output row. Path B truncates the description field to 30 characters. "
+                "Customer rows (CSV):\nname,description\nalice,a long description"
+            )
+        )
+
+        match = match_registered_recipe_intent(context)
+
+        assert match is not None
+        assert match.slots == {"truncate_field": "description", "max_chars": 30}
+
     def test_identical_repeated_semantic_slots_remain_unambiguous(self) -> None:
         context = self._context(
             "Process these rows two ways in parallel and produce a single merged output row.",
@@ -1530,7 +1636,10 @@ class TestForkIntentAdversarialMatrix:
 
         assert match_registered_recipe_intent(context) is None
 
-    @pytest.mark.parametrize("alternative", ["Alternatively outputs/b.jsonl", "Or outputs/b.jsonl"])
+    @pytest.mark.parametrize(
+        "alternative",
+        ["Alternatively outputs/b.jsonl", "Or outputs/b.jsonl", "Otherwise, outputs/b.jsonl"],
+    )
     def test_separate_clause_output_path_alternative_falls_back(self, alternative: str) -> None:
         context = self._context(f"Path B truncates the description field to 30 characters. Write it at outputs/a.jsonl. {alternative}.")
 
