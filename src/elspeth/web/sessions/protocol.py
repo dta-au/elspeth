@@ -29,6 +29,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
 from elspeth.contracts.hashing import stable_hash
@@ -961,7 +962,7 @@ class GuidedForkSettlementCommand:
 
 
 GuidedJsonPayloadPurpose = Literal["turn", "turn_response"]
-GuidedPreparedAuditKind = Literal["tool", "llm", "chat"]
+GuidedPreparedAuditKind = Literal["tool", "llm", "planner", "chat"]
 GuidedResponseKind = Literal["guided_respond", "guided_chat", "guided_reenter"]
 
 
@@ -1038,7 +1039,7 @@ class PreparedGuidedAuditRow:
     envelope: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if self.kind not in {"tool", "llm", "chat"}:
+        if self.kind not in {"tool", "llm", "planner", "chat"}:
             raise AuditIntegrityError("PreparedGuidedAuditRow kind is outside the closed vocabulary")
         if type(self.content) is not str or not self.content:
             raise AuditIntegrityError("PreparedGuidedAuditRow content must be a non-empty exact string")
@@ -1047,6 +1048,7 @@ class PreparedGuidedAuditRow:
         expected_discriminator = {
             "tool": "audit",
             "llm": "llm_call_audit",
+            "planner": "planner_attempt_audit",
             "chat": "chat_turn_audit",
         }[self.kind]
         if self.envelope.get("_kind") != expected_discriminator:
@@ -1058,9 +1060,9 @@ GUIDED_FAILURE_AUDIT_LINEAGE_KEY = "_guided_failure_lineage"
 GUIDED_FAILURE_AUDIT_LINEAGE_SCHEMA = "guided_failure_audit_lineage.v1"
 GUIDED_FAILURE_AUDIT_COHORT_SCHEMA = "guided_failure_audit_cohort.v1"
 # One guided session is already bounded to 4,096 chat turns. Allow a
-# conservative four evidence rows per turn so the commitment stays finite
+# conservative five evidence rows per turn so the commitment stays finite
 # without narrowing any normal composer execution.
-GUIDED_FAILURE_AUDIT_COHORT_MAX_ROWS = 4 * GUIDED_MAX_CHAT_TURNS
+GUIDED_FAILURE_AUDIT_COHORT_MAX_ROWS = 5 * GUIDED_MAX_CHAT_TURNS
 
 
 @final
@@ -1299,6 +1301,7 @@ class GuidedAuditEvidence:
 
     invocations: tuple[ComposerToolInvocation, ...] = ()
     llm_calls: tuple[ComposerLLMCall, ...] = ()
+    planner_attempts: tuple[ComposerPlannerAttempt, ...] = ()
     chat_turns: tuple[ComposerChatTurn, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1306,6 +1309,8 @@ class GuidedAuditEvidence:
             raise AuditIntegrityError("GuidedAuditEvidence.invocations must be an exact typed tuple")
         if type(self.llm_calls) is not tuple or any(type(item) is not ComposerLLMCall for item in self.llm_calls):
             raise AuditIntegrityError("GuidedAuditEvidence.llm_calls must be an exact typed tuple")
+        if type(self.planner_attempts) is not tuple or any(type(item) is not ComposerPlannerAttempt for item in self.planner_attempts):
+            raise AuditIntegrityError("GuidedAuditEvidence.planner_attempts must be an exact typed tuple")
         if type(self.chat_turns) is not tuple or any(type(item) is not ComposerChatTurn for item in self.chat_turns):
             raise AuditIntegrityError("GuidedAuditEvidence.chat_turns must be an exact typed tuple")
 

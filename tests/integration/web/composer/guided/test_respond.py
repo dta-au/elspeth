@@ -1197,6 +1197,20 @@ class TestStep2IntraStep:
         assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
         gap = planner_contexts[0]["unproducible_output_fields"]
         assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
+        audit_messages = asyncio.run(app.state.session_service.get_messages(UUID(session_id), limit=None))
+        planner_evidence_kinds = [
+            envelope.get("_kind")
+            for message in audit_messages
+            for envelope in (message.tool_calls or ())
+            if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+            and (envelope.get("_kind") == "planner_attempt_audit" or envelope.get("call", {}).get("planner_call_ordinal") is not None)
+        ]
+        assert planner_evidence_kinds
+        assert len(planner_evidence_kinds) % 2 == 0
+        assert all(
+            planner_evidence_kinds[index : index + 2] == ["llm_call_audit", "planner_attempt_audit"]
+            for index in range(0, len(planner_evidence_kinds), 2)
+        )
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),

@@ -301,6 +301,28 @@ def _llm_call_audit_tool_calls(call: ComposerLLMCall | None = None) -> list[dict
     ]
 
 
+def _planner_attempt_audit_tool_calls() -> list[dict[str, Any]]:
+    return [
+        {
+            "_kind": "planner_attempt_audit",
+            "attempt": {
+                "ordinal": 1,
+                "planner_call_ordinal": 1,
+                "phase": "candidate",
+                "outcome": "accepted",
+                "planner_code": None,
+                "selected_tools": ["emit_pipeline_proposal"],
+                "requested_information": [],
+                "new_information": [],
+                "rejection_codes": [],
+                "candidate_shape_hash": "a" * 64,
+                "repeated_fingerprint": False,
+                "led_to": "done",
+            },
+        }
+    ]
+
+
 def _llm_call_audit_rows(messages: Sequence[ChatMessageRecord]) -> list[tuple[ChatMessageRecord, Mapping[str, Any]]]:
     """Rev-4: LLM-call audit sidecars are stored with ``role="audit"``."""
     rows: list[tuple[ChatMessageRecord, Mapping[str, Any]]] = []
@@ -4568,6 +4590,15 @@ class TestMessageRoutes:
                     writer_principal="compose_loop",
                 )
             )
+            loop.run_until_complete(
+                service.add_message(
+                    session_id,
+                    "audit",
+                    '{"_kind": "planner_attempt_audit", "ordinal": 1, "outcome": "accepted"}',
+                    tool_calls=_planner_attempt_audit_tool_calls(),
+                    writer_principal="compose_loop",
+                )
+            )
             loop.run_until_complete(service.add_message(session_id, "assistant", "Done.", writer_principal="compose_loop"))
         finally:
             loop.close()
@@ -4582,10 +4613,12 @@ class TestMessageRoutes:
         # Rev-4: the LLM-call audit sidecar surfaces as ``role="audit"``
         # in the response (it was previously surfaced as ``role="tool"``
         # because that's how it was persisted).
-        assert [message["role"] for message in messages] == ["user", "audit", "assistant"]
-        tool_calls = messages[1]["tool_calls"]
-        assert tool_calls[0]["_kind"] == "llm_call_audit"
-        assert tool_calls[0]["call"]["provider_cost"] == 0.0037
+        assert [message["role"] for message in messages] == ["user", "audit", "audit", "assistant"]
+        assert [message["tool_calls"][0]["_kind"] for message in messages[1:3]] == [
+            "llm_call_audit",
+            "planner_attempt_audit",
+        ]
+        assert messages[1]["tool_calls"][0]["call"]["provider_cost"] == 0.0037
         assert all("call-tool" not in str(message.get("tool_calls")) for message in messages)
 
     def test_get_messages_can_include_raw_content_for_intercepted_assistant_turns(self, tmp_path) -> None:

@@ -356,6 +356,7 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
             session_id=UUID(result_session_id),
             current_state_id=None,
             llm_calls=(),
+            planner_attempts=(),
             invocations=(invocation,),
         )
 

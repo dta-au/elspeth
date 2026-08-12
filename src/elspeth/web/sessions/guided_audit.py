@@ -9,10 +9,18 @@ from uuid import UUID
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope, llm_call_audit_summary
+from elspeth.web.composer.audit import (
+    chat_turn_audit_envelope,
+    interleave_planner_audit_records,
+    llm_call_audit_envelope,
+    llm_call_audit_summary,
+    planner_attempt_audit_envelope,
+    planner_attempt_audit_summary,
+)
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.state_machine import TerminalReason
@@ -137,8 +145,9 @@ def prepare_guided_audit_rows(
     invocations: tuple[ComposerToolInvocation, ...],
     llm_calls: tuple[ComposerLLMCall, ...],
     chat_turns: tuple[ComposerChatTurn, ...],
+    planner_attempts: tuple[ComposerPlannerAttempt, ...] = (),
 ) -> tuple[PreparedGuidedAuditRow, ...]:
-    """Apply existing redaction/public projections to all three audit channels."""
+    """Apply bounded public projections to all four guided audit channels."""
 
     if type(invocations) is not tuple or any(type(item) is not ComposerToolInvocation for item in invocations):
         raise TypeError("invocations must be an exact tuple[ComposerToolInvocation, ...]")
@@ -146,6 +155,8 @@ def prepare_guided_audit_rows(
         raise TypeError("llm_calls must be an exact tuple[ComposerLLMCall, ...]")
     if type(chat_turns) is not tuple or any(type(item) is not ComposerChatTurn for item in chat_turns):
         raise TypeError("chat_turns must be an exact tuple[ComposerChatTurn, ...]")
+    if type(planner_attempts) is not tuple or any(type(item) is not ComposerPlannerAttempt for item in planner_attempts):
+        raise TypeError("planner_attempts must be an exact tuple[ComposerPlannerAttempt, ...]")
 
     rows: list[PreparedGuidedAuditRow] = []
     for invocation in invocations:
@@ -198,6 +209,9 @@ def prepare_guided_audit_rows(
         elif invocation.tool_name not in MANIFEST and not authentic_guided_synthetic:
             content, envelope = _omitted_success_invocation(invocation)
         rows.append(PreparedGuidedAuditRow(kind="tool", content=content, envelope=envelope))
+    planner_calls = tuple(call for call in llm_calls if call.planner_call_ordinal is not None)
+    paired_records = interleave_planner_audit_records(planner_calls, planner_attempts)
+    attempt_by_physical = {record.planner_call_ordinal: record for record in paired_records if type(record) is ComposerPlannerAttempt}
     for call in llm_calls:
         content = llm_call_audit_summary(call)
         envelope = llm_call_audit_envelope(call)
@@ -215,6 +229,16 @@ def prepare_guided_audit_rows(
                 envelope=envelope,
             )
         )
+        if call.planner_call_ordinal is not None:
+            attempt = attempt_by_physical.get(call.planner_call_ordinal)
+            if attempt is not None:
+                rows.append(
+                    PreparedGuidedAuditRow(
+                        kind="planner",
+                        content=planner_attempt_audit_summary(attempt),
+                        envelope=planner_attempt_audit_envelope(attempt),
+                    )
+                )
     for turn in chat_turns:
         content = json.dumps(
             {

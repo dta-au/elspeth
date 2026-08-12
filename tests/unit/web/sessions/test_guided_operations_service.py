@@ -19,6 +19,13 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, func, insert, select, update
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+    ComposerPlannerCode,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
@@ -741,6 +748,94 @@ async def test_failure_without_evidence_writes_only_an_exact_terminal_event(file
             },
         ),
     ]
+
+
+@pytest.mark.asyncio
+async def test_failure_planner_pair_is_fenced_committed_and_replayable_with_one_lineage(file_engine) -> None:
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    claim = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="planner-pair-failure",
+        kind="guided_plan",
+        request_hash="e" * 64,
+        actor="claim-planner-pair",
+        lease_seconds=30,
+    )
+    assert isinstance(claim, GuidedOperationClaimed)
+    now = datetime.now(UTC)
+    call = ComposerLLMCall(
+        model_requested="test/planner",
+        model_returned="test/planner",
+        status=ComposerLLMCallStatus.MALFORMED_RESPONSE,
+        prompt_tokens=2,
+        completion_tokens=1,
+        total_tokens=3,
+        latency_ms=1,
+        provider_request_id="planner-malformed-response",
+        messages_hash="a" * 64,
+        tools_spec_hash="b" * 64,
+        declared_tool_names=("emit_pipeline_proposal",),
+        started_at=now,
+        finished_at=now,
+        error_class="PipelinePlannerError",
+        error_message="PRIVATE-MALFORMED-RESPONSE",
+        temperature=0.0,
+        seed=1,
+        max_completion_tokens_requested=8192,
+        planner_policy_hash="c" * 64,
+        planner_call_ordinal=1,
+    )
+    attempt = ComposerPlannerAttempt(
+        ordinal=1,
+        planner_call_ordinal=1,
+        phase=ComposerPlannerAttemptPhase.RESPONSE,
+        outcome=ComposerPlannerAttemptOutcome.MALFORMED_RESPONSE,
+        planner_code=ComposerPlannerCode.MALFORMED_RESPONSE,
+        selected_tools=(),
+        requested_information=(),
+        new_information=(),
+        rejection_codes=(),
+        candidate_shape_hash=None,
+        repeated_fingerprint=False,
+        led_to=ComposerPlannerAttemptLedTo.TERMINAL,
+    )
+
+    failed = await service.fail_guided_operation_with_audit(
+        GuidedOperationFailureCommand(
+            fence=claim.fence,
+            failure_code="invalid_provider_response",
+            actor="worker-planner-pair",
+            audit_evidence=GuidedAuditEvidence(llm_calls=(call,), planner_attempts=(attempt,)),
+        )
+    )
+    replay = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="planner-pair-failure",
+        kind="guided_plan",
+        request_hash="e" * 64,
+        actor="replay-worker",
+        lease_seconds=30,
+    )
+
+    assert replay == failed == GuidedOperationFailed(failure_code="invalid_provider_response")
+    messages = await service.get_messages(session_id, limit=None)
+    assert [message.tool_calls[0]["_kind"] for message in messages if message.tool_calls is not None] == [
+        "llm_call_audit",
+        "planner_attempt_audit",
+    ]
+    lineage = [message.tool_calls[0]["_guided_failure_lineage"] for message in messages if message.tool_calls is not None]
+    assert len(lineage) == 2
+    assert lineage[0] == lineage[1]
+    assert lineage[0]["operation_id"] == "planner-pair-failure"
+    assert "PRIVATE-MALFORMED-RESPONSE" not in repr(messages)
+    with file_engine.connect() as conn:
+        event = conn.execute(
+            select(guided_operation_events_table.c.failure_audit_cohort)
+            .where(guided_operation_events_table.c.operation_id == "planner-pair-failure")
+            .where(guided_operation_events_table.c.event_kind == "failed")
+        ).scalar_one()
+    assert event == _expected_failure_audit_cohort(messages)
 
 
 @pytest.mark.asyncio

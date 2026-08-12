@@ -24,7 +24,6 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerResult
-from elspeth.web.composer.recipe_intent_routing import FreeformRecipeIntentMatch, InlineRecipeBlob
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
@@ -284,7 +283,12 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
 
     with engine.connect() as conn:
         audit_rows = conn.execute(select(chat_messages_table.c.role, chat_messages_table.c.tool_calls)).all()
-    assert any(role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" for role, calls in audit_rows)
+    planner_audit_kinds = [
+        calls[0].get("_kind")
+        for role, calls in audit_rows
+        if role == "audit" and calls and calls[0].get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+    ]
+    assert planner_audit_kinds == ["llm_call_audit", "planner_attempt_audit"]
     assert len(requests) == 1
     assert requests[0]["max_tokens"] == settings.composer_planner_max_completion_tokens
 
@@ -1054,7 +1058,7 @@ def _assert_no_pipeline_side_effects(engine: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_server_recipe_falls_back_before_custody_without_side_effects(
+async def test_incomplete_recipe_request_falls_back_before_custody_without_side_effects(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1064,14 +1068,8 @@ async def test_invalid_server_recipe_falls_back_before_custody_without_side_effe
         monkeypatch,
         message=message,
     )
-    invalid_match = FreeformRecipeIntentMatch(
-        recipe_name="fork-coalesce-truncate-jsonl",
-        inline_blob=InlineRecipeBlob(filename="rows.csv", mime_type="text/csv", content="name,description\na,hello"),
-        slots={"output_path": "outputs/result.jsonl"},
-    )
     from elspeth.web.composer import service as composer_service
 
-    monkeypatch.setattr("elspeth.web.composer.service.match_freeform_recipe_intent", lambda _message: invalid_match)
     prepare = AsyncMock(
         spec=composer_service.prepare_pipeline_plan,
         side_effect=AssertionError("invalid recipe must not reach custody preparation"),
@@ -1103,27 +1101,21 @@ async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    message = "Build the requested pipeline."
+    message = (
+        "Please create a pipeline that processes the following customer rows. Each row should be processed two ways "
+        "in parallel and combined into a single merged output row at outputs/merged.jsonl: path A keeps the original "
+        "row unchanged, path B truncates the description field to 30 characters with suffix '...'. Combine both "
+        "branches under separate keys `path_a` and `path_b` in each merged output row -- one input row produces one "
+        "output row containing both branches side-by-side. Customer rows (CSV):\nname,description\n"
+        "alice,this is a moderately long description\nbob,short note"
+    )
     engine, _sessions, session, user_message, composer = await _recipe_composer_context(
         tmp_path,
         monkeypatch,
         message=message,
     )
-    valid_match = FreeformRecipeIntentMatch(
-        recipe_name="fork-coalesce-truncate-jsonl",
-        inline_blob=InlineRecipeBlob(filename="rows.csv", mime_type="text/csv", content="name,description\na,hello"),
-        slots={
-            "truncate_field": "description",
-            "max_chars": 30,
-            "truncation_suffix": "...",
-            "output_path": "outputs/result.jsonl",
-            "key_a": "path_a",
-            "key_b": "path_b",
-        },
-    )
     from elspeth.web.composer import pipeline_planner as pipeline_planner_module
 
-    monkeypatch.setattr("elspeth.web.composer.service.match_freeform_recipe_intent", lambda _message: valid_match)
     monkeypatch.setattr(
         "elspeth.web.composer.pipeline_planner.finalize_pipeline_custody",
         AsyncMock(
@@ -1143,3 +1135,44 @@ async def test_recipe_custody_failure_cannot_publish_reviewable_authority(
         )
 
     _assert_no_pipeline_side_effects(engine)
+
+
+@pytest.mark.asyncio
+async def test_matching_recipe_stages_without_provider_or_planner_attempt_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    message = (
+        "Please create a pipeline that processes the following customer rows. Each row should be processed two ways "
+        "in parallel and combined into a single merged output row at outputs/merged.jsonl: path A keeps the original "
+        "row unchanged, path B truncates the description field to 30 characters with suffix '...'. Combine both "
+        "branches under separate keys `path_a` and `path_b` in each merged output row -- one input row produces one "
+        "output row containing both branches side-by-side. Customer rows (CSV):\nname,description\n"
+        "alice,this is a moderately long description\nbob,short note"
+    )
+    _engine, sessions, session, user_message, composer = await _recipe_composer_context(
+        tmp_path,
+        monkeypatch,
+        message=message,
+    )
+    provider = AsyncMock(side_effect=AssertionError("a matching recipe must not call the provider"))
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", provider)
+
+    await composer.compose(
+        message,
+        [],
+        _empty_state(),
+        session_id=str(session.id),
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    provider.assert_not_awaited()
+    persisted = await sessions.get_messages(session.id, limit=None)
+    planner_kinds = [
+        envelope.get("_kind")
+        for row in persisted
+        for envelope in (row.tool_calls or ())
+        if envelope.get("_kind") in {"llm_call_audit", "planner_attempt_audit"}
+    ]
+    assert planner_kinds == []

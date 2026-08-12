@@ -25,6 +25,12 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import (
+    ComposerPlannerAttempt,
+    ComposerPlannerAttemptLedTo,
+    ComposerPlannerAttemptOutcome,
+    ComposerPlannerAttemptPhase,
+)
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
@@ -1091,6 +1097,64 @@ def test_audit_preparation_uses_real_typed_evidence_and_omits_hidden_provider_da
     assert "RAW-VALIDATION-CANARY" not in persisted
     assert "UNKNOWN-SUCCESS-CREDENTIAL" not in persisted
     assert "UNKNOWN-SUCCESS-DIAGNOSTIC" not in persisted
+
+
+def test_guided_audit_interleaves_planner_attempt_after_its_physical_response() -> None:
+    preparation = importlib.import_module("elspeth.web.sessions.guided_audit")
+    _invocation, llm_call, _chat_turn = _audit_evidence()
+    failed_call = replace(
+        llm_call,
+        model_returned=None,
+        status=ComposerLLMCallStatus.API_ERROR,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        error_class="ProviderFailure",
+        error_message="PRIVATE-PROVIDER-FAILURE",
+        max_completion_tokens_requested=8192,
+        planner_policy_hash="a" * 64,
+        planner_call_ordinal=1,
+    )
+    response_call = replace(
+        llm_call,
+        max_completion_tokens_requested=8192,
+        planner_policy_hash="a" * 64,
+        planner_call_ordinal=2,
+    )
+    attempt = ComposerPlannerAttempt(
+        ordinal=1,
+        planner_call_ordinal=2,
+        phase=ComposerPlannerAttemptPhase.CANDIDATE,
+        outcome=ComposerPlannerAttemptOutcome.ACCEPTED,
+        planner_code=None,
+        selected_tools=("emit_pipeline_proposal",),
+        requested_information=(),
+        new_information=(),
+        rejection_codes=(),
+        candidate_shape_hash="b" * 64,
+        repeated_fingerprint=False,
+        led_to=ComposerPlannerAttemptLedTo.DONE,
+    )
+
+    rows = preparation.prepare_guided_audit_rows(
+        invocations=(),
+        llm_calls=(failed_call, response_call),
+        chat_turns=(),
+        planner_attempts=(attempt,),
+    )
+
+    assert [row.kind for row in rows] == ["llm", "llm", "planner"]
+    assert [row.envelope["_kind"] for row in rows] == [
+        "llm_call_audit",
+        "llm_call_audit",
+        "planner_attempt_audit",
+    ]
+    assert "PRIVATE-PROVIDER-FAILURE" not in repr(rows)
+
+
+def test_guided_audit_evidence_rejects_non_tuple_planner_attempts() -> None:
+    with pytest.raises(AuditIntegrityError, match="planner_attempts"):
+        GuidedAuditEvidence(planner_attempts=[])  # type: ignore[arg-type]
 
 
 def test_intent_cancellation_is_allowlisted_only_for_the_exact_structural_schema() -> None:

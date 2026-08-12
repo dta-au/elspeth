@@ -442,6 +442,7 @@ async def post_guided_plan(
                             audit_evidence=GuidedAuditEvidence(
                                 invocations=recorder.invocations,
                                 llm_calls=recorder.llm_calls,
+                                planner_attempts=recorder.planner_attempts,
                                 chat_turns=recorder.chat_turns,
                             ),
                         )
@@ -488,6 +489,7 @@ async def post_guided_plan(
                         audit_evidence=GuidedAuditEvidence(
                             invocations=recorder.invocations,
                             llm_calls=recorder.llm_calls,
+                            planner_attempts=recorder.planner_attempts,
                             chat_turns=recorder.chat_turns,
                         ),
                         # Quota ceiling for the deferred inline-custody settle
@@ -605,6 +607,7 @@ async def post_guided_plan(
                         audit_evidence=GuidedAuditEvidence(
                             invocations=recorder.invocations,
                             llm_calls=recorder.llm_calls,
+                            planner_attempts=recorder.planner_attempts,
                             chat_turns=recorder.chat_turns,
                         ),
                     )
@@ -680,6 +683,7 @@ async def post_guided_plan(
                     audit_evidence=GuidedAuditEvidence(
                         invocations=recorder.invocations,
                         llm_calls=recorder.llm_calls,
+                        planner_attempts=recorder.planner_attempts,
                         chat_turns=recorder.chat_turns,
                     ),
                 )

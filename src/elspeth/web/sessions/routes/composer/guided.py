@@ -4,6 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
@@ -4050,6 +4051,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -4486,6 +4488,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -5042,6 +5045,7 @@ async def post_guided_respond(
                                         audit_evidence=GuidedAuditEvidence(
                                             invocations=(*planner_recorder.invocations, *recorder.invocations),
                                             llm_calls=planner_recorder.llm_calls,
+                                            planner_attempts=planner_recorder.planner_attempts,
                                         ),
                                     ),
                                     payload_store=payload_store,
@@ -5147,6 +5151,7 @@ async def post_guided_respond(
                                     audit_evidence=GuidedAuditEvidence(
                                         invocations=planner_recorder.invocations,
                                         llm_calls=planner_recorder.llm_calls,
+                                        planner_attempts=planner_recorder.planner_attempts,
                                         chat_turns=planner_recorder.chat_turns,
                                     ),
                                 ),
@@ -5161,10 +5166,20 @@ async def post_guided_respond(
                     raise
                 # Only planner terminal exceptions carry this evidence marker.
                 attached_calls = exc_dict["llm_calls"]
+                attached_attempts = exc_dict.get("planner_attempts", ())
                 carrier_error: AuditIntegrityError | None = None
                 if type(attached_calls) is not tuple or attached_calls != planner_recorder.llm_calls:
                     carrier_error = AuditIntegrityError("guided planner cancellation carried malformed or unrelated LLM audit evidence")
                     attached_calls = planner_recorder.llm_calls
+                if (
+                    type(attached_attempts) is not tuple
+                    or any(type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts)
+                    or attached_attempts != planner_recorder.planner_attempts
+                ):
+                    carrier_error = AuditIntegrityError(
+                        "guided planner cancellation carried malformed or unrelated semantic attempt evidence"
+                    )
+                    attached_attempts = planner_recorder.planner_attempts
                 try:
                     await _await_with_deferred_cancellation(
                         service.fail_guided_operation_with_audit(
@@ -5175,6 +5190,7 @@ async def post_guided_respond(
                                 audit_evidence=GuidedAuditEvidence(
                                     invocations=planner_recorder.invocations,
                                     llm_calls=attached_calls,
+                                    planner_attempts=attached_attempts,
                                     chat_turns=planner_recorder.chat_turns,
                                 ),
                             ),
@@ -5227,6 +5243,7 @@ async def post_guided_respond(
                             audit_evidence=GuidedAuditEvidence(
                                 invocations=planner_recorder.invocations,
                                 llm_calls=planner_recorder.llm_calls,
+                                planner_attempts=planner_recorder.planner_attempts,
                                 chat_turns=planner_recorder.chat_turns,
                             ),
                             unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),

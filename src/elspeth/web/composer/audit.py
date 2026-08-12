@@ -214,8 +214,10 @@ class BufferingRecorder(
     compose-loop tool rows are committed by
     ``SessionServiceProtocol.persist_compose_turn_async`` inside the loop;
     the route-layer ``tool_invocations`` drain is retained only for older
-    non-loop carriers. LLM call and guided chat-turn sidecars still use this
-    buffer as their route-persisted staging area.
+    non-loop carriers. LLM calls, their exact-once semantic planner attempts,
+    and guided chat-turn sidecars still use this buffer as their
+    route-persisted staging area. All four channels use the same locking
+    discipline, and each exposed tuple is an immutable point-in-time snapshot.
 
     Threading: ``record()`` is safe to call from any thread. The compose
     loop dispatches synchronously to a worker via ``run_sync_in_worker``

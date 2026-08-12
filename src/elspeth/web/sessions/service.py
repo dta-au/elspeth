@@ -9970,6 +9970,7 @@ class SessionServiceImpl:
             invocations=audit_evidence.invocations,
             llm_calls=audit_evidence.llm_calls,
             chat_turns=audit_evidence.chat_turns,
+            planner_attempts=audit_evidence.planner_attempts,
         )
         validate_guided_audit_payload_references(audit_rows, payloads)
         verify_guided_json_payloads(payload_store, payloads)

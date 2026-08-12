@@ -50,6 +50,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
+from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -87,8 +88,11 @@ from elspeth.web.composer.audit import (
     DispatchAudit,
     finish_arg_error,
     finish_success,
+    interleave_planner_audit_records,
     llm_call_audit_envelope,
     llm_call_audit_summary,
+    planner_attempt_audit_envelope,
+    planner_attempt_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
@@ -4176,30 +4180,44 @@ class ComposerServiceImpl:
         session_id: UUID,
         current_state_id: UUID | None,
         llm_calls: tuple[ComposerLLMCall, ...],
+        planner_attempts: tuple[ComposerPlannerAttempt, ...],
         invocations: tuple[ComposerToolInvocation, ...],
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority.
 
-        The whole evidence set — every LLM call and every discovery
-        invocation of one planning attempt — is one cohort and settles in
-        a single ``add_messages_atomic`` transaction (elspeth-90231248dc).
-        A mid-write failure or cancellation therefore leaves the evidence
-        either fully durable or cleanly absent, never a partial cohort
-        that reads as the complete planning record.
+        The whole evidence set — every physical LLM call, every value-free
+        semantic response disposition, and every discovery invocation of one
+        planning request — is one cohort and settles in a single
+        ``add_messages_atomic`` transaction (elspeth-90231248dc). Provider
+        failures can create physical ordinal gaps; every response row is
+        immediately followed by its logical attempt row. A mid-write failure
+        or cancellation therefore leaves the evidence either fully durable or
+        cleanly absent, never a partial cohort that reads as the complete
+        planning record.
         """
 
         from elspeth.web.sessions._persist_payload import AuditMessageDraft
 
         sessions = self._require_sessions_service()
         drafts: list[AuditMessageDraft] = []
-        for call in llm_calls:
-            drafts.append(
-                AuditMessageDraft(
-                    role="audit",
-                    content=llm_call_audit_summary(call),
-                    tool_calls=(llm_call_audit_envelope(call),),
+        for record in interleave_planner_audit_records(llm_calls, planner_attempts):
+            if type(record) is ComposerLLMCall:
+                drafts.append(
+                    AuditMessageDraft(
+                        role="audit",
+                        content=llm_call_audit_summary(record),
+                        tool_calls=(llm_call_audit_envelope(record),),
+                    )
                 )
-            )
+            else:
+                attempt = cast(ComposerPlannerAttempt, record)
+                drafts.append(
+                    AuditMessageDraft(
+                        role="audit",
+                        content=planner_attempt_audit_summary(attempt),
+                        tool_calls=(planner_attempt_audit_envelope(attempt),),
+                    )
+                )
         for invocation in invocations:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
             drafts.append(
@@ -4285,6 +4303,9 @@ class ComposerServiceImpl:
         user_id: str | None,
         preferences: ComposerSessionPreferencesRecord,
         recorder: BufferingRecorder,
+        planner_llm_calls: tuple[ComposerLLMCall, ...],
+        planner_attempts: tuple[ComposerPlannerAttempt, ...],
+        planner_invocations: tuple[ComposerToolInvocation, ...],
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
     ) -> ComposerResult:
         """Persist planner evidence, then create one reviewable proposal row.
@@ -4308,8 +4329,9 @@ class ComposerServiceImpl:
         await self._persist_pipeline_planner_audit(
             session_id=session_id,
             current_state_id=current_state_id,
-            llm_calls=recorder.llm_calls,
-            invocations=recorder.invocations,
+            llm_calls=planner_llm_calls,
+            planner_attempts=planner_attempts,
+            invocations=planner_invocations,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -4497,6 +4519,7 @@ class ComposerServiceImpl:
         )
         plan: PipelinePlanResult | None = None
         planner_llm_start = len(recorder.llm_calls)
+        planner_attempt_start = len(recorder.planner_attempts)
         planner_invocation_start = len(recorder.invocations)
         plan = await try_prepare_registered_recipe_plan(
             intent_context=RecipeIntentContext(user_text=message, policy_snapshot=plugin_snapshot),
@@ -4584,6 +4607,7 @@ class ComposerServiceImpl:
                     session_id=session_uuid,
                     current_state_id=state_uuid,
                     llm_calls=recorder.llm_calls[planner_llm_start:],
+                    planner_attempts=recorder.planner_attempts[planner_attempt_start:],
                     invocations=recorder.invocations[planner_invocation_start:],
                 )
                 decline_message = declined.decline_text.strip() or (
@@ -4597,11 +4621,19 @@ class ComposerServiceImpl:
                     raise AuditIntegrityError("pipeline planner exception carried malformed LLM audit evidence") from exc
                 if attached_calls != recorder.llm_calls[planner_llm_start:]:
                     raise AuditIntegrityError("pipeline planner exception carried unrelated LLM audit evidence") from exc
+                attached_attempts = exc_dict["planner_attempts"] if "planner_attempts" in exc_dict else ()
+                if type(attached_attempts) is not tuple or any(
+                    type(attempt) is not ComposerPlannerAttempt for attempt in attached_attempts
+                ):
+                    raise AuditIntegrityError("pipeline planner exception carried malformed semantic attempt evidence") from exc
+                if attached_attempts != recorder.planner_attempts[planner_attempt_start:]:
+                    raise AuditIntegrityError("pipeline planner exception carried unrelated semantic attempt evidence") from exc
                 _persisted, deferred = await _await_pipeline_staging_write_with_deferred_cancellation(
                     self._persist_pipeline_planner_audit(
                         session_id=session_uuid,
                         current_state_id=state_uuid,
                         llm_calls=attached_calls,
+                        planner_attempts=attached_attempts,
                         invocations=recorder.invocations[planner_invocation_start:],
                     ),
                     deferred=exc if type(exc) is asyncio.CancelledError else None,
@@ -4621,6 +4653,9 @@ class ComposerServiceImpl:
             user_id=user_id,
             preferences=preferences,
             recorder=recorder,
+            planner_llm_calls=recorder.llm_calls[planner_llm_start:],
+            planner_attempts=recorder.planner_attempts[planner_attempt_start:],
+            planner_invocations=recorder.invocations[planner_invocation_start:],
             plugin_snapshot=plugin_snapshot,
         )
 
