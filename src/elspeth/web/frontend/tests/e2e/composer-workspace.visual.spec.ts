@@ -124,6 +124,13 @@ test.describe("Composer workspace visual baselines", () => {
   });
 
   for (const viewport of [
+    // 1920x1080 (full-screen 1080p) and 1920x930 (1080p minus browser chrome
+    // and a taskbar) are the PRIMARY deployment targets. Neither was sampled
+    // before 2026-08-13, which is how both the original 1080p overflow and
+    // the recode's unskinned-chrome jank shipped through a green suite
+    // (elspeth-8fa71e6d15).
+    { width: 1920, height: 1080 },
+    { width: 1920, height: 930 },
     { width: 1920, height: 900 },
     { width: 1536, height: 760 },
     { width: 1280, height: 720 },
@@ -167,29 +174,40 @@ test.describe("Composer workspace visual baselines", () => {
     });
   }
 
-  test("guided decision at 1536x760", async ({ page }) => {
-    const { composer, sessionId } = await openStableVisualScenario(
+  // 1920x1080 joined the guided matrix with the 1080p remediation
+  // (elspeth-8fa71e6d15): the guided decision state is where the stepper and
+  // the sparse-content whitespace live, and neither defect family was visible
+  // at 1536x760 alone.
+  for (const viewport of [
+    { width: 1536, height: 760 },
+    { width: 1920, height: 1080 },
+  ] as const) {
+    test(`guided decision at ${viewport.width}x${viewport.height}`, async ({
       page,
-      "active-guided-decision",
-      { width: 1536, height: 760 },
-      2,
-    );
-    try {
-      await expect(
-        composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
-      ).toBeVisible();
-      await settleAuthoringScroll(
-        composer.authoringPane().locator(".guided-authoring-scroll"),
-        "top",
+    }) => {
+      const { composer, sessionId } = await openStableVisualScenario(
+        page,
+        "active-guided-decision",
+        viewport,
+        2,
       );
-      await expect(composer.workspace()).toHaveScreenshot(
-        "guided-decision-1536x760.png",
-        { animations: "disabled", caret: "hide" },
-      );
-    } finally {
-      await deleteWorkspaceScenario(page, sessionId);
-    }
-  });
+      try {
+        await expect(
+          composer.authoringPane().getByRole("log", { name: "Guided wizard step" }),
+        ).toBeVisible();
+        await settleAuthoringScroll(
+          composer.authoringPane().locator(".guided-authoring-scroll"),
+          "top",
+        );
+        await expect(composer.workspace()).toHaveScreenshot(
+          `guided-decision-${viewport.width}x${viewport.height}.png`,
+          { animations: "disabled", caret: "hide" },
+        );
+      } finally {
+        await deleteWorkspaceScenario(page, sessionId);
+      }
+    });
+  }
 
   test("inspector open at 1280x720", async ({ page }) => {
     const { composer, sessionId } = await openStableVisualScenario(
