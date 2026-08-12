@@ -198,6 +198,20 @@ count/names, registry, catalog, golden, contracts whitelist).
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-13 — aggregation members' live BUFFERED acceptances keep the
+  ORIGINAL batch_id across crash-retry**: `handle_incomplete_batches` retries a
+  dead EXECUTING/FAILED batch on a NEW batch linked through the durable
+  `batches.retry_of_batch_id` chain and copies `batch_members`, but the
+  acceptance-time BUFFERED `token_outcomes` rows are immutable history and
+  still name the original batch. Any consumer proving "this member is
+  buffered into this batch" — the `complete_aggregation_result` receipt
+  writer and the restore receipt validators — must bind against the whole
+  retry lineage (`core/landscape/batch_lineage.batch_retry_lineage_ids`),
+  never `token_outcomes.batch_id == batch_id` alone; the strict form bricks
+  every resumed EOF/flush-fault recovery. Do not "fix" this by writing a
+  second live BUFFERED row at restore: duplicate live acceptances are
+  refused as corruption by `_derive_restored_batch_id`.
+
 - **2026-08-12 — PostgreSQL token-lock classification needs a fresh statement
   after a lock wait**: do not combine `NOT EXISTS(token_outcomes)` and
   `SELECT ... FOR UPDATE` when deciding token fate under READ COMMITTED. The

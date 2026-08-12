@@ -63,6 +63,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapePostCommitError, LandscapeRecordError
 from elspeth.core.landscape.execution import (
@@ -807,6 +808,7 @@ class ExecutionRepository:
                         batches_table.c.status,
                         batches_table.c.aggregation_state_id,
                         batches_table.c.expansion_group_id,
+                        batches_table.c.retry_of_batch_id,
                         batches_table.c.trigger_type,
                         batches_table.c.trigger_reason,
                     )
@@ -834,16 +836,29 @@ class ExecutionRepository:
                         or batch.expansion_group_id is not None
                     ):
                         raise AuditIntegrityError("aggregation result receipt requires an OPEN state and unclaimed EXECUTING batch")
+                    # The members' live BUFFERED acceptances keep the ORIGINAL
+                    # batch_id across crash-retry (retry batches copy members
+                    # but never rewrite immutable acceptance history), so the
+                    # liveness proof binds against the durable retry lineage.
+                    lineage_batch_ids = batch_retry_lineage_ids(
+                        lambda query: conn.execute(query).one_or_none(),
+                        batch_id=batch_id,
+                        run_id=run_id,
+                        aggregation_node_id=aggregation_node_id,
+                        retry_of_batch_id=batch.retry_of_batch_id,
+                    )
                     live_rows = conn.execute(
                         select(token_outcomes_table.c.token_id)
                         .where(token_outcomes_table.c.run_id == run_id)
                         .where(token_outcomes_table.c.token_id.in_(member_token_ids))
                         .where(token_outcomes_table.c.completed == 0)
                         .where(token_outcomes_table.c.path == TerminalPath.BUFFERED.value)
-                        .where(token_outcomes_table.c.batch_id == batch_id)
+                        .where(token_outcomes_table.c.batch_id.in_(lineage_batch_ids))
                     ).all()
                     if tuple(sorted(str(row.token_id) for row in live_rows)) != tuple(sorted(member_token_ids)):
-                        raise AuditIntegrityError("aggregation result receipt requires one live BUFFERED outcome for every member")
+                        raise AuditIntegrityError(
+                            "aggregation result receipt requires one live BUFFERED outcome for every member within the batch retry lineage"
+                        )
                     terminal_rows = conn.execute(
                         select(token_outcomes_table.c.token_id)
                         .where(token_outcomes_table.c.run_id == run_id)

@@ -28,6 +28,7 @@ from elspeth.contracts.enums import BatchStatus, OutputMode, TerminalOutcome, Te
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
@@ -664,6 +665,7 @@ class BarrierRestoreReadModel:
                     batches_table.c.aggregation_state_id.label("batch_state_id"),
                     batches_table.c.expansion_group_id,
                     batches_table.c.status.label("batch_status"),
+                    batches_table.c.retry_of_batch_id,
                     node_states_table.c.status.label("node_status"),
                     node_states_table.c.output_hash.label("node_output_hash"),
                 )
@@ -793,10 +795,25 @@ class BarrierRestoreReadModel:
                 raise AuditIntegrityError(
                     f"Aggregation result receipt {batch_id!r} has members with terminal outcomes: {sorted(terminal_member_ids)!r}"
                 )
+            # A receipt committed by a resumed flush completes a RETRY batch;
+            # its members' live BUFFERED acceptances keep the original
+            # batch_id (immutable acceptance history), so the liveness proof
+            # binds against the durable retry lineage.
+            lineage_batch_ids = frozenset(
+                batch_retry_lineage_ids(
+                    self._ops.execute_fetchone,
+                    batch_id=batch_id,
+                    run_id=run_id,
+                    aggregation_node_id=aggregation_node_id,
+                    retry_of_batch_id=(str(header.retry_of_batch_id) if header.retry_of_batch_id is not None else None),
+                )
+            )
             for member_id in member_ids:
                 live = self.list_live_buffered_outcomes(TokenRef(token_id=member_id, run_id=run_id))
-                if len(live) != 1 or live[0].batch_id != batch_id:
-                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} lacks one live BUFFERED outcome per member")
+                if len(live) != 1 or live[0].batch_id not in lineage_batch_ids:
+                    raise AuditIntegrityError(
+                        f"Aggregation result receipt {batch_id!r} lacks one live BUFFERED outcome per member within the batch retry lineage"
+                    )
 
             output_rows = self._ops.execute_fetchall(
                 select(aggregation_result_outputs_table)
