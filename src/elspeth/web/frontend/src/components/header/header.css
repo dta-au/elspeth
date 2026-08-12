@@ -194,6 +194,39 @@
   background-color: var(--color-border);
 }
 
+/* ModelChip renders nothing until /api/system/status resolves (and stays
+   absent when no model is configured) — hide a separator left dangling as
+   the cluster's last child rather than special-casing the chip's mount. */
+.app-header-left .app-header-separator:last-child {
+  display: none;
+}
+
+/* Composer-model identity chip (elspeth-e9f7678de8), relocated here from the
+   chat-panel headers (elspeth-8fa71e6d15): identity chrome belongs in the
+   identity-chrome region, which has page width. Quiet reference chrome:
+   mono + muted so it reads as provenance metadata, not a control.
+   --color-text-muted passes 4.5:1 on both themes' page backgrounds (pinned
+   by colorContrast.test.ts). Truncates rather than overflows
+   (elspeth-0b70269ccc); the max-width fence keeps a long provider/model id
+   from crowding the session switcher at the 1280px minimum supported width
+   — the full value stays available via the chip's aria-label. */
+.chat-model-chip {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  color: var(--color-text-muted);
+  min-width: 0;
+  max-width: 36ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-model-chip-label {
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
 .header-session-switcher {
   position: relative;
 }

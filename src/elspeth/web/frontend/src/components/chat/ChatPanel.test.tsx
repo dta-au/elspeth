@@ -1812,16 +1812,10 @@ describe("ChatPanel mode discriminator", () => {
     expect(inlineRunResultsMountSpy).not.toHaveBeenCalled();
   });
 
-  it("shows the composer model chip in the GUIDED chat header too (elspeth-e9f7678de8)", async () => {
-    // Freeform's header already carries the chip; guided authoring must name
-    // its model the same way (same chip, same /api/system/status source).
-    vi.mocked(apiClient.fetchSystemStatus).mockResolvedValue({
-      composer_available: true,
-      composer_model: "anthropic/claude-sonnet-4.6",
-      composer_provider: "openrouter",
-      composer_reason: null,
-      composer_missing_keys: [],
-    });
+  it("keeps the GUIDED header to compose-state chrome — no model chip, no title (elspeth-8fa71e6d15)", () => {
+    // The model chip (elspeth-e9f7678de8) relocated to AppHeader: identity
+    // chrome belongs in the identity-chrome region, not a 360px column that
+    // truncated it to "Mo…". The guided header keeps only the mode switch.
     useSessionStore.setState({
       activeSessionId: "session-guided",
       sessions: [guidedSessionFixture],
@@ -1832,14 +1826,10 @@ describe("ChatPanel mode discriminator", () => {
 
     const { container } = render(<ChatPanel />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-      ).toBeInTheDocument();
-    });
-    // The chip lives in the guided header's actions chrome.
     const header = container.querySelector(".chat-panel-header");
-    expect(header?.querySelector(".chat-model-chip")).not.toBeNull();
+    expect(header).not.toBeNull();
+    expect(header?.querySelector(".chat-model-chip")).toBeNull();
+    expect(header?.querySelector(".chat-panel-header-title")).toBeNull();
   });
 
   it("non-tutorial guided: no 'always start in freeform mode' opt-out checkbox", () => {
@@ -7122,27 +7112,29 @@ describe("ChatPanel chat presentation (ux-review-2026-07-02)", () => {
     expect(status?.querySelector("button")).toBeNull();
   });
 
-  it("shows the composer model chip in the chat header (elspeth-e9f7678de8)", async () => {
-    vi.mocked(apiClient.fetchSystemStatus).mockResolvedValue({
-      composer_available: true,
-      composer_model: "anthropic/claude-sonnet-4.6",
-      composer_provider: "openrouter",
-      composer_reason: null,
-      composer_missing_keys: [],
+  it("keeps the freeform header to compose-state chrome — authority chip stays, model chip and title do not (elspeth-8fa71e6d15)", () => {
+    // The model chip (elspeth-e9f7678de8) relocated to AppHeader; the
+    // AuthorityChip is the fact that must stay visible at a glance in the
+    // authoring chrome and must NOT ride along in any such move. Load
+    // preferences so the chip has an authority to name (it renders nothing
+    // until trust_mode is known — absence of chrome, never a fabricated
+    // authority claim).
+    useSessionStore.setState({
+      composerPreferences: {
+        session_id: "session-1",
+        trust_mode: "auto_commit",
+        density_default: "high",
+        interpretation_review_disabled: false,
+        updated_at: "2026-08-06T00:00:00Z",
+      },
     });
-
     const { container } = render(<ChatPanel />);
 
-    await waitFor(() => {
-      expect(
-        screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
-      ).toBeInTheDocument();
-    });
-    // The chip lives in the header chrome, not in the message stream.
     const header = container.querySelector(".chat-panel-header");
-    expect(
-      header?.querySelector(".chat-model-chip"),
-    ).not.toBeNull();
+    expect(header).not.toBeNull();
+    expect(header?.querySelector(".chat-model-chip")).toBeNull();
+    expect(header?.querySelector(".chat-panel-header-title")).toBeNull();
+    expect(header?.querySelector(".chat-authority-chip")).not.toBeNull();
   });
 });
 

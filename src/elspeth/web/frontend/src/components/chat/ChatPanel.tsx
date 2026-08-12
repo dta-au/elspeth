@@ -26,7 +26,6 @@ import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
 import { ComposingIndicator } from "./ComposingIndicator";
 import { AuthorityChip } from "./AuthorityChip";
-import { ModelChip } from "./ModelChip";
 import { ChatInput, uploadedBlobPromptSentence } from "./ChatInput";
 import { FreeformIntroduction } from "./FreeformIntroduction";
 import { BlobManager } from "@/components/blobs/BlobManager";
@@ -640,7 +639,6 @@ export function ChatPanel({
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const blobs = useBlobStore((s) => s.blobs);
   const blobActivationEpoch = useBlobStore((s) => s.activationEpoch);
-  const sessions = useSessionStore((s) => s.sessions);
   const compositionState = useSessionStore((s) => s.compositionState);
   const compositionProposals = useSessionStore((s) => s.compositionProposals);
   const staleProposalIds = useSessionStore((s) => s.staleProposalIds);
@@ -914,7 +912,6 @@ export function ChatPanel({
     [guidedSession, activeSessionId, sendGuidedChat, startGuided],
   );
 
-  const activeSessionTitle = sessions.find((s) => s.id === activeSessionId)?.title;
   const {
     sendMessage,
     retryMessage,
@@ -2528,22 +2525,12 @@ export function ChatPanel({
         {/* Header — mirrors the freeform body header so the mode-switch control
             ("Exit to freeform") sits in the same top-right spot that freeform's
             "Switch to guided" occupies. The tutorial suppresses the exit
-            affordance, so it has no header. */}
+            affordance, so it has no header. Session title and model identity
+            are app-level facts and live in AppHeader (elspeth-8fa71e6d15) —
+            this column keeps only compose-state chrome. */}
         {!isTutorial && (
           <div className="chat-panel-header">
-            {activeSessionTitle ? (
-              <h2 className="chat-panel-header-title">{activeSessionTitle}</h2>
-            ) : (
-              <span aria-hidden="true" />
-            )}
-            <div
-              className="chat-panel-header-actions"
-              style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-            >
-              {/* Persistent composer-model identity (elspeth-e9f7678de8):
-                  guided authoring names its model in the chrome exactly as
-                  freeform does — same chip, same source. */}
-              <ModelChip />
+            <div className="chat-panel-header-actions">
               <ModeSwitchButton target="freeform" hasWork={currentChatHasWork} />
             </div>
           </div>
@@ -2701,19 +2688,17 @@ export function ChatPanel({
       // components/chat/chat.css [data-composing="true"] rules.
       data-composing={isComposing ? "true" : undefined}
     >
-      {/* Session title header. The "Switch to guided" affordance lives in the
+      {/* Compose-state header. The "Switch to guided" affordance lives in the
           header so it's always visible without competing with the chat input
           for vertical real-estate. Symmetric with the "Exit to freeform"
           control in the guided branch above — both are the same
           ModeSwitchButton, so they share the conditional-confirm behaviour.
-          The future-default is changed from the Account menu → Composer
-          preferences panel (no longer a header link). */}
+          Session title and model identity are app-level facts and live in
+          AppHeader (elspeth-8fa71e6d15): a second in-column copy competed
+          with these controls for a 360px rail and truncated at every width.
+          The AuthorityChip stays — it is the one fact this audit-first
+          product must keep visible at a glance (chat.css:693). */}
       <div className="chat-panel-header">
-        {activeSessionTitle ? (
-          <h2 className="chat-panel-header-title">{activeSessionTitle}</h2>
-        ) : (
-          <span aria-hidden="true" />
-        )}
         {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
             As an inline style this row was `inline-flex` with no wrap and no
             min-width, which no stylesheet rule and therefore no breakpoint
@@ -2722,12 +2707,8 @@ export function ChatPanel({
         <div className="chat-panel-header-actions">
           {/* Persistent composer authority (elspeth-f5e6723133): whether
               this session auto-applies mutations or gates them behind
-              proposals — named in the chrome, beside the model identity. */}
+              proposals — named in the chrome. */}
           <AuthorityChip />
-          {/* Persistent composer-model identity (elspeth-e9f7678de8): an
-              auditability product should name the model doing the composing
-              in the authoring chrome, not only in run records. */}
-          <ModelChip />
           <ModeSwitchButton
             target="guided"
             hasWork={currentChatHasWork}

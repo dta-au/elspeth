@@ -7,7 +7,7 @@
    .message-group-separator, .tool-call-*, .pending-proposals-banner*,
    .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
-   .freeform-introduction, .chat-model-chip*, .proposal-diff*.
+   .freeform-introduction, .proposal-diff*.
    Tenants (execution-named but chat-mounted — they render inside the chat
    panel via inline run results):
      .inline-run-results*, .run-outputs-panel*, .run-output-artifact*. */
@@ -651,29 +651,10 @@
   gap: var(--space-md);
 }
 
-/* Persistent composer-model identity chip in the chat header
-   (elspeth-e9f7678de8). Quiet reference chrome: mono + muted so it reads as
-   provenance metadata, not a control. --color-text-muted passes 4.5:1 on
-   both themes' page backgrounds (pinned by colorContrast.test.ts). */
-.chat-model-chip {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 400;
-  color: var(--color-text-muted);
-  /* Truncate rather than overflow (elspeth-0b70269ccc). A bare `nowrap` gives
-     this chip a min-content width equal to the whole model id
-     ("openrouter/anthropic/claude-sonnet-4-6"), which flexbox will not shrink
-     below — so at 390px it pushed the sibling ModeSwitchButton past the panel
-     edge and .chat-panel's overflow:hidden cut it to "Sw". The full value stays
-     available via the element's title/aria-label. The same nowrap-chip-clips-
-     its-sibling failure was fixed for .mode-switch-confirm below. */
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-/* Header action cluster: model chip + mode switch. Was an inline style prop on
+/* Header action cluster: authority chip + mode switch (the session title and
+   model chip moved to AppHeader, elspeth-8fa71e6d15 — this column keeps only
+   compose-state chrome). margin-left:auto right-aligns the cluster now that
+   no flex-1 title occupies the left side. Was an inline style prop on
    ChatPanel's header (elspeth-0b70269ccc), which outranked every stylesheet
    rule and made the row unresponsive at any breakpoint. */
 .chat-panel-header-actions {
@@ -682,16 +663,12 @@
   gap: var(--space-sm);
   min-width: 0;
   flex: 0 1 auto;
-}
-
-.chat-model-chip-label {
-  font-weight: 600;
-  color: var(--color-text-secondary);
+  margin-left: auto;
 }
 
 /* Composer-authority chip (elspeth-f5e6723133) — names whether this session
    auto-applies mutations or gates them behind proposals. Sibling of
-   .chat-model-chip in the header actions row; the left accent is the
+   the mode switch in the header actions row; the left accent is the
    recurring edge motif. Auto-apply carries the warning accent because it is
    the mode where the composer acts without asking — the one fact a user
    must be able to see at a glance. */
@@ -714,17 +691,6 @@
 
 .chat-authority-chip--explicit_approve {
   border-left-color: var(--color-success);
-}
-
-.chat-panel-header-title {
-  margin: 0;
-  font-size: inherit;
-  font-weight: inherit;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 /* ModeSwitchButton — the symmetric guided<->freeform toggle in BOTH body

@@ -1,8 +1,22 @@
 import { readFileSync } from "node:fs";
 
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
 import { AppHeader } from "./AppHeader";
+
+// The ModelChip fetches /api/system/status on mount; give it a stable answer
+// so the placement pin below is not racing an unmocked network call. All
+// other client exports stay real.
+vi.mock("@/api/client", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/api/client")>()),
+  fetchSystemStatus: vi.fn().mockResolvedValue({
+    composer_available: true,
+    composer_model: "anthropic/claude-sonnet-4.6",
+    composer_provider: "openrouter",
+    composer_reason: null,
+    composer_missing_keys: [],
+  }),
+}));
 
 describe("AppHeader", () => {
   it("sizes the application shell to the dynamic viewport with a legacy fallback", () => {
@@ -47,5 +61,20 @@ describe("AppHeader", () => {
   it("renders the user menu", () => {
     render(<AppHeader onOpenSettings={() => {}} onSignOut={() => {}} />);
     expect(screen.getByRole("button", { name: /account/i })).toBeInTheDocument();
+  });
+
+  it("carries the composer-model chip — relocated from the chat headers (elspeth-8fa71e6d15)", async () => {
+    // Identity chrome lives in the identity-chrome region: the chip's
+    // previous home was a 360px authoring column that truncated it to "Mo…".
+    // ChatPanel.test.tsx pins the corresponding absence in both chat headers.
+    const { container } = render(
+      <AppHeader onOpenSettings={() => {}} onSignOut={() => {}} />,
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByLabelText("Composer model: anthropic/claude-sonnet-4.6"),
+      ).toBeInTheDocument();
+    });
+    expect(container.querySelector(".app-header-left .chat-model-chip")).not.toBeNull();
   });
 });
