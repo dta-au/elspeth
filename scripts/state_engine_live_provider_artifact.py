@@ -35,8 +35,14 @@ CANARY_ENV_NAMES = (
 _NODE_ID = re.compile(r"tests/[A-Za-z0-9_./-]+\.py::[^\s\x00]+\Z")
 _RESOURCE_NAME = re.compile(r"[A-Z][A-Z0-9_]{1,127}\Z")
 _SENSITIVE_RESOURCE_NAME = re.compile(r".*(?:SECRET|TOKEN|KEY|PASSWORD|CREDENTIAL|CONNECTION_STRING|POSTGRES_URL).*")
+#: The one non-PB-09 dispatchable case: the AWS composition lane itself. It
+#: maps to the fixed "postgresql-16-aws" selector lane, not a derived
+#: per-case protected lane.
+COMPOSITION_CASE_ID = "composition:aws-single-leader"
+COMPOSITION_LANE_ID = "postgresql-16-aws"
 EXTERNAL_CASE_IDS_BY_JOB = {
     "live_aws": (
+        COMPOSITION_CASE_ID,
         "sink:aws_s3@default",
         "source:aws_s3@default",
         "transform:aws_bedrock_content_safety@default",
@@ -100,6 +106,8 @@ def lane_id_for_case(case_id: str) -> str:
     """Return the deterministic per-subject protected lane identity."""
     if case_id not in _EXTERNAL_CASE_IDS:
         _reject("case_id is not in the closed external-provider inventory")
+    if case_id == COMPOSITION_CASE_ID:
+        return COMPOSITION_LANE_ID
     return "protected-live-" + case_id.replace(":", "-").replace("@", "-")
 
 
@@ -142,7 +150,7 @@ def _sha256(path: Path) -> str:
 
 def _selector_lane(selector_path: Path, lane_id: str) -> tuple[str, dict[str, Any]]:
     document = _object(_read_json(selector_path, "selector manifest"), "selector manifest")
-    if document.get("schema_version") != 1:
+    if document.get("schema_version") != 2:
         _reject("selector manifest schema version is unsupported")
     catalog_id = _text(document.get("catalog_id"), "selector catalog_id")
     lanes = _array(document.get("lanes"), "selector lanes")

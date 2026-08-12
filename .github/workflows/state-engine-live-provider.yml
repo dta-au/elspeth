@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         case_id:
+          - composition:aws-single-leader
           - sink:aws_s3@default
           - source:aws_s3@default
           - transform:aws_bedrock_content_safety@default

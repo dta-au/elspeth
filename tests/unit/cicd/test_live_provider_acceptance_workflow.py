@@ -250,7 +250,12 @@ def test_artifact_sealer_contract_names_the_only_uploadable_files() -> None:
 
 
 def test_workflow_matrix_is_the_exact_collision_free_external_case_inventory() -> None:
-    from scripts.state_engine_live_provider_artifact import EXTERNAL_CASE_IDS_BY_JOB, lane_id_for_case
+    from scripts.state_engine_live_provider_artifact import (
+        COMPOSITION_CASE_ID,
+        COMPOSITION_LANE_ID,
+        EXTERNAL_CASE_IDS_BY_JOB,
+        lane_id_for_case,
+    )
 
     workflow = _workflow()
     observed_lane_ids: set[str] = set()
@@ -260,27 +265,41 @@ def test_workflow_matrix_is_the_exact_collision_free_external_case_inventory() -
         assert observed_case_ids == list(expected_case_ids)
         for case_id in observed_case_ids:
             lane_id = lane_id_for_case(case_id)
-            assert lane_id.startswith("protected-live-")
+            if case_id == COMPOSITION_CASE_ID:
+                assert job_id == "live_aws"
+                assert lane_id == COMPOSITION_LANE_ID
+            else:
+                assert lane_id.startswith("protected-live-")
             assert lane_id not in observed_lane_ids
             observed_lane_ids.add(lane_id)
-    assert len(observed_lane_ids) == 38
+    assert len(observed_lane_ids) == 39
 
 
 def _selector(path: Path) -> None:
     path.write_text(
         """{
-  "schema_version": 1,
+  "schema_version": 2,
   "catalog_id": "elspeth-state-engine-v3",
   "lanes": [
     {
       "lane_id": "protected-live-source-aws_s3-default",
-      "workflow_job": "live-aws / source:aws_s3@default",
+      "workflow_job": "live_aws",
       "profile_case": "postgresql-16-aws-single-leader-landscape",
       "marker_expression": "live_provider and live_aws",
       "node_ids": [
         "tests/integration/plugins/sources/test_aws_s3_source_live.py::test_real_s3_default_chain_round_trip[csv]"
       ],
-      "cells": [],
+      "cells": [
+        {
+          "leg_id": "PB-09",
+          "dimension_id": "boundary_composition",
+          "case_id": "source:aws_s3",
+          "profile_case": "postgresql-16-aws-single-leader-landscape",
+          "node_ids": [
+            "tests/integration/plugins/sources/test_aws_s3_source_live.py::test_real_s3_default_chain_round_trip[csv]"
+          ]
+        }
+      ],
       "resource_variables": ["AWS_REGION", "ELSPETH_TEST_S3_BUCKET"],
       "artifact_kinds": ["manifest", "junit_xml", "profile_report", "node_index", "scrub_report"]
     }
