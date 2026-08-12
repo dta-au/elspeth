@@ -11,13 +11,14 @@ import asyncio
 import json
 import threading
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
@@ -632,6 +633,7 @@ async def _plan(
     candidate_acceptance: Any = None,
     unproducible_output_fields: tuple[str, ...] = (),
     conversation_context: PlannerConversationContext | None = None,
+    information_aware: bool = False,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -641,35 +643,47 @@ async def _plan(
     full_catalog = create_catalog_service()
     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
     policy_catalog = PolicyCatalogView.for_trained_operator(full_catalog, plugin_snapshot)
-    return await plan_pipeline(
-        intent=intent,
-        current_state=current_state or _empty_state(),
-        provider_current_state=(
-            provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
-        ),
-        reviewed_facts={"request": "Build the requested pipeline."},
-        reviewed_planner_context={"request": "Build the requested pipeline."},
-        unproducible_output_fields=unproducible_output_fields,
-        eligible_deferred_intent_ids=eligible_deferred_intent_ids,
-        claim_evaluator=claim_evaluator,
-        supersedes_draft_hash=supersedes_draft_hash,
-        surface=surface,
-        profile=profile or ("tutorial" if surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"),
-        conversation_context=conversation_context,
-        policy_catalog=policy_catalog,
-        plugin_snapshot=plugin_snapshot,
-        originating_message=originating_message or _origin(),
-        base=AbsentBase(),
-        model_config=_model(completion, **dict(model_overrides or {})),
-        rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
-        repair_budget=repair_budget,
-        budget_policy=budget or _budget(),
-        custody_config=custody_config or _custody(tmp_path),
-        lifecycle=lifecycle or _lifecycle(),
-        recorder=recorder or BufferingRecorder(),
-        candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
-        candidate_acceptance=candidate_acceptance,
-    )
+    if information_aware:
+        policy_context = nullcontext()
+    else:
+        import elspeth.web.composer.pipeline_planner as planner_module
+
+        full_policy = planner_module.PlannerDiscoveryPolicy(
+            manifest=planner_module.PlannerInformationManifest(supplied=frozenset()),
+            discovery_tool_names=PLANNER_DISCOVERY_TOOL_NAMES,
+            unresolved_classes=(),
+        )
+        policy_context = patch.object(planner_module.PlannerDiscoveryPolicy, "initial", return_value=full_policy)
+    with policy_context:
+        return await plan_pipeline(
+            intent=intent,
+            current_state=current_state or _empty_state(),
+            provider_current_state=(
+                provider_current_state if provider_current_state is not None else (current_state or _empty_state()).to_dict()
+            ),
+            reviewed_facts={"request": "Build the requested pipeline."},
+            reviewed_planner_context={"request": "Build the requested pipeline."},
+            unproducible_output_fields=unproducible_output_fields,
+            eligible_deferred_intent_ids=eligible_deferred_intent_ids,
+            claim_evaluator=claim_evaluator,
+            supersedes_draft_hash=supersedes_draft_hash,
+            surface=surface,
+            profile=profile or ("tutorial" if surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"),
+            conversation_context=conversation_context,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=plugin_snapshot,
+            originating_message=originating_message or _origin(),
+            base=AbsentBase(),
+            model_config=_model(completion, **dict(model_overrides or {})),
+            rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
+            repair_budget=repair_budget,
+            budget_policy=budget or _budget(),
+            custody_config=custody_config or _custody(tmp_path),
+            lifecycle=lifecycle or _lifecycle(),
+            recorder=recorder or BufferingRecorder(),
+            candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
+            candidate_acceptance=candidate_acceptance,
+        )
 
 
 def test_planner_palette_is_pinned_read_only_and_terminal_schema_is_exact() -> None:
@@ -1516,13 +1530,245 @@ async def test_discovery_round_uses_real_read_only_tool_then_terminal(
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert len(completion.requests) == 2
-    # Tool results land before the budget-pressure notice that fires at two
-    # remaining discovery turns.
-    assert completion.requests[1]["messages"][-2]["role"] == "tool"
-    assert completion.requests[1]["messages"][-1]["role"] == "user"
+    # Tool results land before the budget-pressure and information-closure notices.
+    assert completion.requests[1]["messages"][-3]["role"] == "tool"
+    assert completion.requests[1]["messages"][-2]["role"] == "user"
+    assert completion.requests[1]["messages"][-1]["content"] == (
+        "All declared information gaps are closed; emit the terminal proposal now."
+    )
     assert len(recorder.invocations) == 1
     assert recorder.invocations[0].tool_name == "list_sources"
     assert [call.planner_call_ordinal for call in recorder.llm_calls] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_initial_request_declares_supplied_information_and_omits_redundant_discovery(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, information_aware=True)
+
+    request = completion.requests[0]
+    payload = json.loads(request["messages"][-1]["content"])
+    assert payload["information_manifest"]["supplied"] == {
+        "pipeline_state": "current_projection",
+        "plugin_selection": "policy_snapshot",
+    }
+    names = [tool["function"]["name"] for tool in request["tools"]]
+    assert not {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"} & set(names)
+    assert names[-1] == "emit_pipeline_proposal"
+    fixed_scaffolding = {
+        key: value for key, value in payload.items() if key not in {"intent", "conversation_context", "current_state", "reviewed_facts"}
+    }
+    assert len(canonical_json(fixed_scaffolding).encode("utf-8")) <= 96 * 1024
+
+
+def test_pipeline_information_semantic_dominance_is_directional() -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    empty = planner_module.PlannerInformationManifest(supplied=frozenset())
+    source_only = empty.with_result(("pipeline.source",), available=True)
+    assert source_only.covers("pipeline.source")
+    assert not source_only.covers("pipeline.full")
+
+    full = empty.with_result(("pipeline.full",), available=True)
+    assert full.covers("pipeline.source")
+    assert full.covers("pipeline.component:any-node")
+
+
+def test_restricted_policy_never_advertises_unavailable_preview_or_state_round_trip() -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    policy = planner_module.PlannerDiscoveryPolicy.initial(PlannerSurface.GUIDED_STAGED)
+    names = [tool["function"]["name"] for tool in planner_tool_definitions(policy)]
+
+    assert "preview_pipeline" not in names
+    assert "get_pipeline_state" not in names
+    assert "set_pipeline_arguments" not in names
+
+
+def _generic_document_abstract_pipeline(data_dir: Path) -> dict[str, Any]:
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "documents",
+            "options": {
+                "path": str(data_dir / "blobs" / _TEST_SESSION_ID / "documents.csv"),
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["document_uri: str"],
+                    "guaranteed_fields": ["document_uri"],
+                },
+            },
+            "on_validation_failure": "discard",
+        },
+        "nodes": [
+            {
+                "id": "fetch_document",
+                "node_type": "transform",
+                "plugin": "web_scrape",
+                "input": "documents",
+                "on_success": "fetched_documents",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "url_field": "document_uri",
+                    "content_field": "document_content",
+                    "fingerprint_field": "document_fingerprint",
+                    "http": {
+                        "abuse_contact": "data-steward@agency.gov.au",
+                        "scraping_reason": "Retrieve user-requested documents",
+                    },
+                },
+            },
+            {
+                "id": "write_abstract",
+                "node_type": "transform",
+                "plugin": "llm",
+                "input": "fetched_documents",
+                "on_success": "abstracted_documents",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
+                    "prompt_template": "Write an abstract of {{ row.document_content }}",
+                    "required_input_fields": ["document_content"],
+                    "response_field": "abstract",
+                },
+            },
+            {
+                "id": "retain_public_fields",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "abstracted_documents",
+                "on_success": "result",
+                "on_error": "discard",
+                "options": {
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["document_uri: str", "abstract: str"],
+                        "guaranteed_fields": ["document_uri", "abstract"],
+                    },
+                    "mapping": {"document_uri": "document_uri", "abstract": "abstract"},
+                    "select_only": True,
+                    INTERPRETATION_REQUIREMENTS_KEY: [
+                        {
+                            "kind": "pipeline_decision",
+                            "user_term": RAW_HTML_CLEANUP_USER_TERM,
+                            "draft": RAW_HTML_CLEANUP_REVIEW_DRAFT,
+                        }
+                    ],
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "result",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/document_abstracts.json",
+                    "schema": {"mode": "fixed", "fields": ["document_uri: str", "abstract: str"]},
+                    "format": "json",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {"name": "Document abstract pipeline"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_generic_linear_plan_reuses_initial_information_and_needs_one_discovery_turn(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "web_scrape"}),
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "llm"}),
+            ("get_plugin_schema", {"plugin_type": "transform", "name": "field_mapper"}),
+        ),
+        _response(("emit_pipeline_proposal", {"pipeline": _generic_document_abstract_pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        intent="Fetch each document, write an abstract, retain the document identifier and abstract, then write JSON.",
+        information_aware=True,
+    )
+
+    assert len(completion.requests) == 2
+    assert [invocation.tool_name for invocation in recorder.invocations] == [
+        "get_plugin_schema",
+        "get_plugin_schema",
+        "get_plugin_schema",
+    ]
+    assert result.proposal.repair_count == 0
+    pipeline = deep_thaw(result.proposal.pipeline)
+    assert [node["plugin"] for node in pipeline["nodes"]] == ["web_scrape", "llm", "field_mapper"]
+    assert pipeline["nodes"][0]["options"]["url_field"] == "document_uri"
+    assert pipeline["nodes"][1]["options"]["response_field"] == "abstract"
+    mapper = pipeline["nodes"][2]["options"]
+    assert mapper["select_only"] is True
+    assert mapper["mapping"] == {"document_uri": "document_uri", "abstract": "abstract"}
+    final_messages = completion.requests[1]["messages"]
+    assert sum(message["role"] == "tool" for message in final_messages) == 3
+    for message in final_messages:
+        if message["role"] != "tool":
+            continue
+        contract = json.loads(message["content"])["data"]
+        assert set(contract) == {"plugin_id", "schema_hash", "json_schema", "knob_schema", "composer_hints"}
+    assert final_messages[-1]["content"] == "All declared information gaps are closed; emit the terminal proposal now."
+
+
+@pytest.mark.asyncio
+async def test_schema_fact_survives_rejection_while_issue_specific_discovery_adds_information(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("get_plugin_schema", {"plugin_type": "source", "name": "csv"})),
+        _response(
+            ("get_plugin_assistance", {"plugin_type": "source", "plugin_name": "csv"}),
+            ("explain_validation_error", {"error_text": "source_on_success_dangling"}),
+        ),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+    recorder = BufferingRecorder()
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        recorder=recorder,
+        budget=_budget(max_total_provider_calls=6),
+        information_aware=True,
+    )
+
+    assert result.proposal.repair_count == 1
+    invocation_names = [invocation.tool_name for invocation in recorder.invocations]
+    assert invocation_names[0] == "get_plugin_schema"
+    assert set(invocation_names[1:]) == {"get_plugin_assistance", "explain_validation_error"}
+    no_gain = [
+        json.loads(message["content"])
+        for message in completion.requests[-1]["messages"]
+        if message["role"] == "tool" and json.loads(message["content"]).get("error_code") == "DISCOVERY_NO_GAIN"
+    ]
+    assert len(no_gain) == 1
+    assert no_gain[0]["information_keys"] == ["plugin.schema:source/csv"]
 
 
 @pytest.mark.asyncio
@@ -2031,6 +2277,10 @@ def test_every_restricted_discovery_success_uses_the_closed_provider_envelope(
     elif tool_name == "preview_pipeline":
         assert payload["success"] is False
         assert payload["data"]["error_code"] == "surface_projection_unavailable"
+    elif tool_name == "get_plugin_schema":
+        assert payload["success"] is False
+        assert payload["data"]["error_code"] == "schema_projection_unavailable"
+        assert payload["data"]["next_tool"] == "get_plugin_assistance"
     else:
         assert payload["success"] is True
         assert payload["data"] == authoritative_data
@@ -2166,7 +2416,9 @@ async def test_staged_guided_discovery_reread_after_rejection_stays_redacted(
     state_reads = [
         content for content in tool_messages if json.loads(content).get("data", {}).get("schema") == "guided.current-state-context.v1"
     ]
-    assert len(state_reads) == 2
+    assert len(state_reads) == 1
+    no_gain = [content for content in tool_messages if json.loads(content).get("error_code") == "DISCOVERY_NO_GAIN"]
+    assert len(no_gain) == 1
     assert all(all(canary not in content for canary in _DISCLOSURE_CANARIES) for content in state_reads)
 
 
@@ -2577,7 +2829,9 @@ async def test_anthropic_cache_markers_stay_stable_across_discovery_rounds(
     marked_tools = [request["tools"] for request in completion.requests]
     assert all(message["cache_control"] == {"type": "ephemeral"} for message in marked_system)
     assert marked_system[0] == marked_system[1] == marked_system[2]
-    assert marked_tools[0] == marked_tools[1] == marked_tools[2]
+    assert all(toolset[-1]["function"]["name"] == "emit_pipeline_proposal" for toolset in marked_tools)
+    assert len(marked_tools[1]) < len(marked_tools[0])
+    assert marked_tools[1] == marked_tools[2]
     assert all(tools[-1]["cache_control"] == {"type": "ephemeral"} for tools in marked_tools)
 
 
@@ -4422,13 +4676,18 @@ async def test_repeated_discovery_call_hits_explicit_cycle_guard_before_redispat
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
-    completion = _ScriptedCompletion(_response(("list_sources", {})), _response(("list_sources", {})))
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_sources", {})),
+        _response(("list_sources", {})),
+    )
     recorder = BufferingRecorder()
 
-    with pytest.raises(PipelinePlannerError, match="repetition/cycle guard"):
+    with pytest.raises(PipelinePlannerError, match="no new information") as excinfo:
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion, recorder=recorder)
 
-    assert len(recorder.llm_calls) == 2
+    assert excinfo.value.code == "DISCOVERY_NO_GAIN"
+    assert len(recorder.llm_calls) == 3
     assert len(recorder.invocations) == 1
 
 
@@ -6094,7 +6353,8 @@ async def test_escape_hatch_fires_on_discovery_cycle(
     """A cycling planner is stuck — the cycle guard engages the hatch, not a 502."""
     completion = _ScriptedCompletion(
         _response_with_call_id("discovery-a", "list_sources", {}),
-        _response_with_call_id("discovery-cycle", "list_sources", {}),
+        _response_with_call_id("discovery-no-gain-a", "list_sources", {}),
+        _response_with_call_id("discovery-no-gain-b", "list_sources", {}),
         _response_with_call_id("hatch-proposal", "emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)}),
     )
     recorder = BufferingRecorder()
@@ -6111,15 +6371,15 @@ async def test_escape_hatch_fires_on_discovery_cycle(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-    assert completion.requests[2]["model"] == "openrouter/advisor-under-test"
-    assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == ["emit_pipeline_proposal"]
+    assert completion.requests[3]["model"] == "openrouter/advisor-under-test"
+    assert [tool["function"]["name"] for tool in completion.requests[3]["tools"]] == ["emit_pipeline_proposal"]
     # The repeated discovery batch is never dispatched.
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
-    retained_call_ids = [call["id"] for message in completion.requests[2]["messages"] for call in message.get("tool_calls", ())]
-    assert retained_call_ids == ["discovery-a"]
+    retained_call_ids = [call["id"] for message in completion.requests[3]["messages"] for call in message.get("tool_calls", ())]
+    assert retained_call_ids == ["discovery-a", "discovery-no-gain-a", "discovery-no-gain-b"]
     notice = next(
         message["content"]
-        for message in completion.requests[2]["messages"]
+        for message in completion.requests[3]["messages"]
         if message["role"] == "user" and "escape hatch" in message["content"]
     )
     assert "discovery guards" in notice
@@ -6133,13 +6393,14 @@ async def test_discovery_cycle_without_hatch_still_raises(
     completion = _ScriptedCompletion(
         _response(("list_sources", {})),
         _response(("list_sources", {})),
+        _response(("list_sources", {})),
     )
 
     with pytest.raises(PipelinePlannerError) as excinfo:
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
-    assert excinfo.value.code == "DISCOVERY_CYCLE"
-    assert len(completion.requests) == 2
+    assert excinfo.value.code == "DISCOVERY_NO_GAIN"
+    assert len(completion.requests) == 3
 
 
 @pytest.mark.asyncio
@@ -6176,8 +6437,14 @@ async def test_discovery_reread_after_candidate_rejection_is_not_a_cycle(
     )
 
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
-    # Both reads dispatched — the post-rejection re-read was served, not guarded.
-    assert [inv.tool_name for inv in recorder.invocations if inv.tool_name == "list_sources"] == ["list_sources", "list_sources"]
+    # The catalog snapshot survives rejection; the re-read is no-gain and is
+    # not dispatched a second time.
+    assert [inv.tool_name for inv in recorder.invocations if inv.tool_name == "list_sources"] == ["list_sources"]
+    assert any(
+        json.loads(message["content"]).get("error_code") == "DISCOVERY_NO_GAIN"
+        for message in completion.requests[-1]["messages"]
+        if message["role"] == "tool"
+    )
 
 
 @pytest.mark.asyncio
@@ -6202,7 +6469,7 @@ async def test_discovery_repetition_within_one_repair_round_still_trips(
     with pytest.raises(PipelinePlannerError) as excinfo:
         await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
 
-    assert excinfo.value.code == "DISCOVERY_CYCLE"
+    assert excinfo.value.code == "DISCOVERY_NO_GAIN"
     assert len(completion.requests) == 4
 
 

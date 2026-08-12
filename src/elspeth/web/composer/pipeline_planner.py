@@ -43,6 +43,7 @@ from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
 from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
@@ -68,7 +69,11 @@ from elspeth.web.composer.pipeline_custody import (
     prepare_pipeline_custody,
 )
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, ProposalBase, reviewed_anchor_hash
-from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
+from elspeth.web.composer.planner_authoring_aids import (
+    SchemaContractProjectionUnsupported,
+    build_planner_authoring_aids,
+    planner_plugin_contract,
+)
 from elspeth.web.composer.progress import (
     emit_progress,
     model_call_progress_event,
@@ -102,6 +107,168 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 _PLANNER_DISCOVERY_TOOL_NAME_SET: Final[frozenset[str]] = frozenset(PLANNER_DISCOVERY_TOOL_NAMES)
 _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
+
+_PIPELINE_CURRENT_INFORMATION: Final[str] = "pipeline.current"
+_CATALOG_SELECTION_INFORMATION: Final[str] = "catalog.selection"
+_RECIPE_INDEX_INFORMATION: Final[str] = "recipe.index"
+_FULL_STATE_ALIASES: Final[frozenset[str]] = frozenset({"", "all", "full", "pipeline"})
+_ALL_INFORMATION_GAPS_CLOSED_NOTICE: Final[str] = "All declared information gaps are closed; emit the terminal proposal now."
+
+
+def _valid_information_key(key: str) -> bool:
+    return key in {
+        _PIPELINE_CURRENT_INFORMATION,
+        _CATALOG_SELECTION_INFORMATION,
+        _RECIPE_INDEX_INFORMATION,
+        "pipeline.full",
+        "pipeline.source",
+        "model.catalog",
+        "blob.index",
+        "secret.index",
+        "audit.info",
+        "expression.grammar",
+        "pipeline.preview",
+        "pipeline.diff",
+    } or key.startswith(
+        (
+            "pipeline.component:",
+            "plugin.schema:",
+            "plugin.assistance:",
+            "blob.metadata:",
+            "blob.content:",
+            "validation.code:",
+            "secret.reference:",
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerInformationManifest:
+    """Closed request-owned facts already supplied or proven unavailable."""
+
+    supplied: frozenset[str]
+    unavailable: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if any(type(key) is not str or not _valid_information_key(key) for key in (*self.supplied, *self.unavailable)):
+            raise ValueError("planner information manifest contains an unknown key")
+
+    def covers(self, key: str) -> bool:
+        if key in self.supplied or key in self.unavailable:
+            return True
+        is_state_projection = key in {"pipeline.full", "pipeline.source"} or key.startswith("pipeline.component:")
+        return is_state_projection and (_PIPELINE_CURRENT_INFORMATION in self.supplied or "pipeline.full" in self.supplied)
+
+    def with_result(self, keys: tuple[str, ...], *, available: bool) -> PlannerInformationManifest:
+        target = self.supplied if available else self.unavailable
+        updated = target | frozenset(keys)
+        if available:
+            return PlannerInformationManifest(supplied=updated, unavailable=self.unavailable - frozenset(keys))
+        return PlannerInformationManifest(supplied=self.supplied, unavailable=updated - self.supplied)
+
+    def provider_payload(self, *, unresolved_classes: tuple[str, ...]) -> dict[str, object]:
+        return {
+            "supplied": {
+                "pipeline_state": "current_projection",
+                "plugin_selection": "policy_snapshot",
+            },
+            "unresolved_classes": list(unresolved_classes),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerDiscoveryPolicy:
+    """Immutable palette derived from one request's exact information gaps."""
+
+    manifest: PlannerInformationManifest
+    discovery_tool_names: tuple[str, ...]
+    unresolved_classes: tuple[str, ...]
+
+    @classmethod
+    def initial(cls, surface: PlannerSurface) -> PlannerDiscoveryPolicy:
+        unavailable = (
+            frozenset({"pipeline.preview"}) if surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE} else frozenset()
+        )
+        manifest = PlannerInformationManifest(
+            supplied=frozenset({_PIPELINE_CURRENT_INFORMATION, _CATALOG_SELECTION_INFORMATION}),
+            unavailable=unavailable,
+        )
+        omitted = {"get_pipeline_state", "list_sources", "list_transforms", "list_sinks"}
+        if unavailable:
+            omitted.add("preview_pipeline")
+        names = tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name not in omitted)
+        return cls(
+            manifest=manifest,
+            discovery_tool_names=names,
+            unresolved_classes=(
+                "plugin.schema",
+                "plugin.assistance",
+                "model.catalog",
+                "recipe.index",
+                "blob.metadata",
+                "validation.code",
+                "secret.reference",
+            ),
+        )
+
+    def with_manifest(self, manifest: PlannerInformationManifest) -> PlannerDiscoveryPolicy:
+        retained = tuple(
+            name for name in self.discovery_tool_names if not all(manifest.covers(key) for key in _tool_information_keys(name, {}))
+        )
+        return PlannerDiscoveryPolicy(
+            manifest=manifest,
+            discovery_tool_names=retained,
+            unresolved_classes=self.unresolved_classes,
+        )
+
+
+def _tool_information_keys(name: str, arguments: Mapping[str, Any]) -> tuple[str, ...]:
+    if name == "get_pipeline_state":
+        component = arguments.get("component")
+        normalized = component.strip().lower() if type(component) is str else ""
+        if normalized in _FULL_STATE_ALIASES or component is None or normalized == "set_pipeline_arguments":
+            return ("pipeline.full",)
+        if normalized == "source":
+            return ("pipeline.source",)
+        return (f"pipeline.component:{component}",)
+    if name in {"list_sources", "list_transforms", "list_sinks"}:
+        return (_CATALOG_SELECTION_INFORMATION,)
+    if name == "list_recipes":
+        return (_RECIPE_INDEX_INFORMATION,)
+    if name == "get_plugin_schema":
+        return (f"plugin.schema:{arguments.get('plugin_type')}/{arguments.get('name')}",)
+    if name == "get_plugin_assistance":
+        issue = arguments.get("issue_code") or "general"
+        return (f"plugin.assistance:{arguments.get('plugin_type')}/{arguments.get('plugin_name')}:{issue}",)
+    if name == "explain_validation_error":
+        code = arguments.get("error_code") or arguments.get("error_text") or "unknown"
+        return (f"validation.code:{code}",)
+    if name == "list_models":
+        return ("model.catalog",)
+    if name in {"list_blobs", "list_composer_blobs"}:
+        return ("blob.index",)
+    if name in {"get_blob_metadata", "inspect_source"}:
+        return (f"blob.metadata:{arguments.get('blob_id')}",)
+    if name == "get_blob_content":
+        return (f"blob.content:{arguments.get('blob_id')}",)
+    if name == "list_secret_refs":
+        return ("secret.index",)
+    if name == "validate_secret_ref":
+        return (f"secret.reference:{arguments.get('name')}",)
+    if name == "get_audit_info":
+        return ("audit.info",)
+    if name == "get_expression_grammar":
+        return ("expression.grammar",)
+    if name == "preview_pipeline":
+        return ("pipeline.preview",)
+    if name == "diff_pipeline":
+        return ("pipeline.diff",)
+    return ()
+
+
+def planner_discovery_information_keys(call: _ParsedToolCall) -> tuple[str, ...]:
+    """Map one admitted discovery call to its closed information identities."""
+    return _tool_information_keys(call.name, call.arguments)
 
 
 class _Completion(Protocol):
@@ -831,12 +998,15 @@ def planner_terminal_tool_definition() -> dict[str, Any]:
     }
 
 
-def planner_tool_definitions() -> list[dict[str, Any]]:
-    """Return the pinned read-only palette followed by the sole terminal."""
+def planner_tool_definitions(policy: PlannerDiscoveryPolicy | None = None) -> list[dict[str, Any]]:
+    """Return an ordered request-owned read-only subset and sole terminal."""
     registered = {definition["name"]: definition for definition in get_tool_definitions()}
     missing = _PLANNER_DISCOVERY_TOOL_NAME_SET - registered.keys()
     if missing:
         raise RuntimeError(f"planner discovery declarations are missing: {sorted(missing)}")
+    names = PLANNER_DISCOVERY_TOOL_NAMES if policy is None else policy.discovery_tool_names
+    if tuple(name for name in PLANNER_DISCOVERY_TOOL_NAMES if name in names) != names:
+        raise RuntimeError("planner discovery policy is not an order-preserving registered subset")
     discovery = [
         {
             "type": "function",
@@ -846,7 +1016,7 @@ def planner_tool_definitions() -> list[dict[str, Any]]:
                 "parameters": registered[name]["parameters"],
             },
         }
-        for name in PLANNER_DISCOVERY_TOOL_NAMES
+        for name in names
     ]
     return [*discovery, planner_terminal_tool_definition()]
 
@@ -1977,7 +2147,27 @@ def _serialize_provider_discovery_result(
     component reads follow the authoritative result shape, so node/output
     identifiers that collide with full-state aliases keep dispatch precedence.
     """
-    if surface not in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}:
+    restricted = surface in {PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE}
+    if call.name == "get_plugin_schema" and result.success:
+        try:
+            if type(result.data) is not PluginSchemaInfo:
+                raise SchemaContractProjectionUnsupported
+            contract = planner_plugin_contract(result.data)
+        except SchemaContractProjectionUnsupported:
+            closed = _closed_provider_discovery_payload(result)
+            closed["success"] = False
+            closed["data"] = {
+                "error": "The selected plugin schema cannot be represented in the bounded planner projection. Use get_plugin_assistance.",
+                "error_code": "schema_projection_unavailable",
+                "next_tool": "get_plugin_assistance",
+            }
+            return _serialize_closed_provider_discovery_payload(closed)
+        if restricted:
+            closed = _closed_provider_discovery_payload(result)
+            closed["data"] = contract.to_dict()
+            return _serialize_closed_provider_discovery_payload(closed)
+        return serialize_tool_result(replace(result, data=contract.to_dict()))
+    if not restricted:
         return serialize_tool_result(result)
     payload = _closed_provider_discovery_payload(result)
 
@@ -2577,12 +2767,15 @@ async def _plan_pipeline_inner(
             expected_reviewed_anchor_hash=reviewed_anchor_hash(reviewed_facts),
         ),
     )
-    tools = planner_tool_definitions()
+    discovery_policy = PlannerDiscoveryPolicy.initial(surface)
+    information_manifest = discovery_policy.manifest
+    tools = planner_tool_definitions(discovery_policy)
     provider_request: dict[str, Any] = {
         "intent": intent,
         "current_state": provider_current_state,
         "reviewed_facts": reviewed_planner_context,
         "authoring_aids": authoring_aids,
+        "information_manifest": information_manifest.provider_payload(unresolved_classes=discovery_policy.unresolved_classes),
         "instruction": PLANNER_TERMINAL_INSTRUCTION,
     }
     if conversation_context is not None:
@@ -2608,6 +2801,7 @@ async def _plan_pipeline_inner(
     stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
+    no_gain_calls_in_round = 0
     # (component, code) fingerprints of every candidate rejection so far in
     # this request. A repeat means the intervening repair changed nothing that
     # mattered — the feedback then says so explicitly (repeat_notice) instead
@@ -3527,19 +3721,21 @@ async def _plan_pipeline_inner(
             trail.log_attempt("discovery", "budget_exhausted", planner_code="DISCOVERY_EXHAUSTED", led_to="terminal", tool_calls=len(calls))
             raise PipelinePlannerError("planner discovery turn budget exhausted", code="DISCOVERY_EXHAUSTED")
         if repair_count != seen_discovery_round:
-            # A candidate rejection opened a new repair round. The capability
-            # core's discovery-order step 3 blesses re-reading discovery —
-            # get_plugin_schema, get_pipeline_state, explain_validation_error —
-            # against a validation rejection, so the repetition window is
-            # scoped per round rather than spanning the whole request: a
-            # post-rejection re-read is repair, not cycling (guided sessions
-            # bad64533/b3acc846 died DISCOVERY_CYCLE mid-repair for exactly
-            # this). Repetition within a single round still trips the guard
-            # below, and discovery_turns / repair_budget / cost / deadline
-            # remain the round-spanning backstops.
+            # Exact-call repetition stays round-scoped, but semantic
+            # information facts remain request-scoped: a successfully read
+            # schema is not forgotten just because a candidate was rejected.
             seen_discovery.clear()
             seen_discovery_round = repair_count
-        keys = tuple((call.name, stable_hash(call.arguments)) for call in calls)
+            no_gain_calls_in_round = 0
+        information_keys = {call.call_id: planner_discovery_information_keys(call) for call in calls}
+        no_gain_calls = tuple(
+            call
+            for call in calls
+            if information_keys[call.call_id] and all(information_manifest.covers(key) for key in information_keys[call.call_id])
+        )
+        useful_calls = tuple(call for call in calls if call not in no_gain_calls)
+        no_gain_calls_in_round += len(no_gain_calls)
+        keys = tuple((call.name, stable_hash(call.arguments)) for call in useful_calls)
         if any(key in seen_discovery for key in keys) or len(set(keys)) != len(keys):
             # A cycling planner is stuck by definition — hand the puzzle to
             # the advisor rather than failing the request.
@@ -3550,11 +3746,58 @@ async def _plan_pipeline_inner(
             trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_CYCLE", led_to="terminal", tool_calls=len(calls))
             raise PipelinePlannerError("planner discovery repetition/cycle guard fired", code="DISCOVERY_CYCLE")
         seen_discovery.update(keys)
-        trail.log_attempt("discovery", "discovery_executed", led_to="continue", tool_calls=len(calls))
+        if no_gain_calls_in_round >= 2:
+            messages.append(_assistant_tool_calls_message(message, calls))
+            for call in no_gain_calls:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "content": canonical_json(
+                            {
+                                "success": False,
+                                "error_code": "DISCOVERY_NO_GAIN",
+                                "information_keys": list(information_keys[call.call_id]),
+                                "message": "The requested information is already supplied or unavailable.",
+                            }
+                        ),
+                    }
+                )
+            if _hatch_available():
+                trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_NO_GAIN", led_to="hatch")
+                _engage_escape_hatch(PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN"))
+                continue
+            trail.log_attempt("discovery", "guard_fired", planner_code="DISCOVERY_NO_GAIN", led_to="terminal")
+            raise PipelinePlannerError("planner discovery produced no new information", code="DISCOVERY_NO_GAIN")
+        trail.log_attempt(
+            "discovery",
+            "discovery_executed" if useful_calls else "guard_fired",
+            planner_code=None if useful_calls else "DISCOVERY_NO_GAIN",
+            led_to="continue",
+            tool_calls=len(calls),
+        )
         await emit_progress(lifecycle.progress, tool_batch_progress_event(tuple(call.name for call in calls)))
         messages.append(_assistant_tool_calls_message(message, calls))
-        for call in calls:
+        for call in useful_calls:
             await emit_progress(lifecycle.progress, tool_started_progress_event(call.name))
+
+        if not useful_calls:
+            call = no_gain_calls[0]
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.call_id,
+                    "content": canonical_json(
+                        {
+                            "success": False,
+                            "error_code": "DISCOVERY_NO_GAIN",
+                            "information_keys": list(information_keys[call.call_id]),
+                            "message": "The requested information is already supplied or unavailable.",
+                        }
+                    ),
+                }
+            )
+            continue
 
         async def execute_one_discovery(call: _ParsedToolCall) -> tuple[_ParsedToolCall, ToolResult]:
             dispatch = begin_dispatch(
@@ -3611,7 +3854,7 @@ async def _plan_pipeline_inner(
             result = cast(_AuditedDiscoveryResult, audited.result).result
             return call, result
 
-        discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in calls]
+        discovery_tasks = [asyncio.create_task(execute_one_discovery(call)) for call in useful_calls]
         try:
             done, pending = await asyncio.wait(discovery_tasks, return_when=asyncio.FIRST_EXCEPTION)
         except BaseException:
@@ -3646,7 +3889,25 @@ async def _plan_pipeline_inner(
         if pending:
             await asyncio.gather(*pending)
         discovery_results = [task.result() for task in discovery_tasks]
-        for call, result in discovery_results:
+        result_by_call_id = {call.call_id: result for call, result in discovery_results}
+        for call in calls:
+            result = result_by_call_id.get(call.call_id)
+            if result is None:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.call_id,
+                        "content": canonical_json(
+                            {
+                                "success": False,
+                                "error_code": "DISCOVERY_NO_GAIN",
+                                "information_keys": list(information_keys[call.call_id]),
+                                "message": "The requested information is already supplied or unavailable.",
+                            }
+                        ),
+                    }
+                )
+                continue
             messages.append(
                 {
                     "role": "tool",
@@ -3659,10 +3920,25 @@ async def _plan_pipeline_inner(
                     ),
                 }
             )
+            information_available = result.success
+            if call.name == "get_plugin_schema" and result.success:
+                try:
+                    if type(result.data) is not PluginSchemaInfo:
+                        raise SchemaContractProjectionUnsupported
+                    planner_plugin_contract(result.data)
+                except SchemaContractProjectionUnsupported:
+                    information_available = False
+            information_manifest = information_manifest.with_result(
+                information_keys[call.call_id],
+                available=information_available,
+            )
             await emit_progress(lifecycle.progress, tool_completed_progress_event(call.name, result.success))
+        discovery_policy = discovery_policy.with_manifest(information_manifest)
+        tools = planner_tool_definitions(discovery_policy)
         remaining_discovery = model_config.max_discovery_turns - discovery_turns
         if remaining_discovery == 2:
             messages.append({"role": "user", "content": _discovery_pressure_notice(remaining_discovery)})
+        messages.append({"role": "user", "content": _ALL_INFORMATION_GAPS_CLOSED_NOTICE})
 
 
 __all__ = [
@@ -3674,10 +3950,13 @@ __all__ = [
     "PlannerBudgetPolicy",
     "PlannerCustodyConfig",
     "PlannerDeclined",
+    "PlannerDiscoveryPolicy",
+    "PlannerInformationManifest",
     "PlannerModelConfig",
     "PlannerOriginatingMessage",
     "PlannerRequestLifecycle",
     "plan_pipeline",
+    "planner_discovery_information_keys",
     "planner_terminal_tool_definition",
     "planner_tool_definitions",
     "prepare_pipeline_plan",

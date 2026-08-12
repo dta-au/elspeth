@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import pytest
 
+from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.composer import planner_authoring_aids
 from elspeth.web.composer.planner_authoring_aids import (
     _contract_discriminator,
     _contract_json_schema,
@@ -50,3 +52,55 @@ def test_contract_knob_schema_rejects_missing_fields_key() -> None:
 
 def test_contract_knob_schema_accepts_empty_fields() -> None:
     assert _contract_knob_schema({"fields": []}) == {"fields": []}
+
+
+def test_planner_plugin_contract_is_a_bounded_owned_projection() -> None:
+    admitted = PluginSchemaInfo(
+        name="bounded_transform",
+        plugin_type="transform",
+        description="A representative admitted plugin.",
+        json_schema={
+            "type": "object",
+            "properties": {"enabled": {"type": "boolean", "description": "UI prose"}},
+            "required": ["enabled"],
+        },
+        knob_schema={
+            "fields": [
+                {
+                    "name": "enabled",
+                    "kind": "boolean",
+                    "required": True,
+                    "description": "UI prose",
+                }
+            ]
+        },
+        composer_hints=("Use this only after selecting it.",),
+    )
+
+    contract = planner_authoring_aids.planner_plugin_contract(admitted)
+    payload = contract.to_dict()
+
+    assert payload["plugin_id"] == "transform/bounded_transform"
+    assert payload["composer_hints"] == ["Use this only after selecting it."]
+    assert payload["json_schema"] == {
+        "type": "object",
+        "properties": {"enabled": {"type": "boolean"}},
+        "required": ["enabled"],
+    }
+    assert payload["knob_schema"] == {"fields": [{"name": "enabled", "kind": "boolean", "required": True}]}
+
+
+def test_planner_plugin_contract_rejects_recursive_projection_overflow() -> None:
+    nested: dict[str, object] = {"type": "string"}
+    for _ in range(80):
+        nested = {"items": nested}
+    admitted = PluginSchemaInfo(
+        name="recursive_transform",
+        plugin_type="transform",
+        description="A recursive projection fixture.",
+        json_schema=nested,
+        knob_schema={"fields": []},
+    )
+
+    with pytest.raises(planner_authoring_aids.SchemaContractProjectionUnsupported):
+        planner_authoring_aids.planner_plugin_contract(admitted)

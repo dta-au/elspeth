@@ -1108,7 +1108,7 @@ class TestDiscoveryDigest:
         assert {entry["name"] for entry in digest["transforms"]} == {plugin.name for plugin in view.list_transforms()}
         assert {entry["name"] for entry in digest["sinks"]} == {plugin.name for plugin in view.list_sinks()}
 
-    def test_digest_entries_carry_purpose_required_knobs_and_hints(self) -> None:
+    def test_digest_entries_carry_bounded_selection_facts_without_contract_hints(self) -> None:
         view, _snapshot = _trained_view()
 
         digest = discovery_digest(view)
@@ -1116,12 +1116,9 @@ class TestDiscoveryDigest:
         csv_source = next(entry for entry in digest["sources"] if entry["name"] == "csv")
         assert csv_source["purpose"] == next(plugin.description for plugin in view.list_sources() if plugin.name == "csv")
         assert {"schema", "path", "on_validation_failure"} <= set(csv_source["required_options"])
-        # composer_hints are the designated live channel for web-policy facts
-        # (e.g. the json sink's explicit collision_policy contract) — the
-        # digest must surface them verbatim, not summarize them away.
         json_sink = next(entry for entry in digest["sinks"] if entry["name"] == "json")
-        assert json_sink["composer_hints"] == list(next(plugin.composer_hints for plugin in view.list_sinks() if plugin.name == "json"))
-        assert any("collision_policy" in hint for hint in json_sink["composer_hints"])
+        assert "composer_hints" not in json_sink
+        assert json_sink["purpose"]
 
     def test_every_declared_prohibition_and_tag_set_reaches_the_digest_verbatim(self) -> None:
         """The always-present tier states what a plugin must NOT be used for.
@@ -1148,6 +1145,26 @@ class TestDiscoveryDigest:
                     # reads as a narrower rule than the one declared.
                     assert entry["not_for"] == plugin.usage_when_not_to_use
                 assert entry.get("capability_tags", []) == list(plugin.capability_tags)
+
+    def test_digest_fits_the_canonical_utf8_selection_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        view, _snapshot = _trained_view()
+
+        rendered = canonical_json(discovery_digest(view)).encode("utf-8")
+
+        assert len(rendered) <= 24 * 1024
+
+    def test_three_selected_plugin_contracts_fit_the_canonical_utf8_budget(self) -> None:
+        from elspeth.core.canonical import canonical_json
+
+        view, _snapshot = _trained_view()
+        contracts = [
+            planner_authoring_aids.planner_plugin_contract(view.get_schema("transform", name)).to_dict()
+            for name in ("web_scrape", "llm", "field_mapper")
+        ]
+
+        assert len(canonical_json(contracts).encode("utf-8")) <= 48 * 1024
 
     def test_text_sink_digest_entry_states_the_multiline_prohibition(self) -> None:
         """The exact g11 regression anchor, held on the stable token only.
@@ -1733,16 +1750,11 @@ class TestRun2PackEdits:
         assert RAW_HTML_CLEANUP_REVIEW_DRAFT in rendered
         assert "field_mapper" in rendered  # attachment point
 
-    def test_llm_digest_hint_scopes_the_shield_advisory_to_fetched_content(self) -> None:
-        # G3 DECIDED: the advisory covers llms consuming untrusted REMOTE
-        # (fetched) producer output — not "every unshielded llm". The old
-        # hint contradicted the skill and the aids' own prompt_shield rule.
+    def test_detailed_llm_hints_are_not_copied_into_the_selection_digest(self) -> None:
         view, _snapshot = _trained_view()
         aids = build_planner_authoring_aids(view)
         llm_entry = next(e for e in aids["discovery_digest"]["plugins"]["transforms"] if e["name"] == "llm")
-        hints = "\n".join(llm_entry["composer_hints"])
-        assert "EVERY LLM node" not in hints
-        assert "externally-fetched" in hints or "externally fetched" in hints
+        assert "composer_hints" not in llm_entry
 
     def test_skill_authoring_exemplar_carries_no_server_review_fields(self) -> None:
         # G5: an exemplar demonstrated the heavy server-side review row

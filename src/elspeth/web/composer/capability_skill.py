@@ -196,9 +196,9 @@ def build_planner_capability_manifest(
 ) -> PlannerCapabilityManifest:
     """Validate and hash the exact messages/tools used by one planner call.
 
-    ``tool_surface`` names the advertised palette: ``"full"`` for ordinary
-    planner turns, ``"terminal_only"`` for the escape-hatch overtime turn
-    where the advisor model may only emit the terminal proposal.
+    ``tool_surface`` names the advertised palette: ``"full"`` accepts the
+    request-owned, order-preserving discovery subset followed by the terminal;
+    ``"terminal_only"`` is the escape-hatch overtime turn.
     """
     if type(surface) is not PlannerSurface:
         raise TypeError("surface must be an exact PlannerSurface")
@@ -221,10 +221,19 @@ def build_planner_capability_manifest(
         tool_names = tuple(cast(str, tool["function"]["name"]) for tool in tools)
     except (KeyError, TypeError) as exc:
         raise AuditIntegrityError("planner advertised tool definitions are malformed") from exc
-    expected_names = (
-        (PLANNER_TERMINAL_TOOL_NAME,) if tool_surface == "terminal_only" else (*PLANNER_DISCOVERY_TOOL_NAMES, PLANNER_TERMINAL_TOOL_NAME)
-    )
-    if tool_names != expected_names:
+    if tool_surface == "terminal_only":
+        valid_names = tool_names == (PLANNER_TERMINAL_TOOL_NAME,)
+    else:
+        discovery_names = tool_names[:-1]
+        positions = tuple(PLANNER_DISCOVERY_TOOL_NAMES.index(name) for name in discovery_names if name in PLANNER_DISCOVERY_TOOL_NAMES)
+        valid_names = (
+            bool(tool_names)
+            and tool_names[-1] == PLANNER_TERMINAL_TOOL_NAME
+            and len(positions) == len(discovery_names)
+            and len(set(discovery_names)) == len(discovery_names)
+            and positions == tuple(sorted(positions))
+        )
+    if not valid_names:
         raise AuditIntegrityError("planner advertised tool identities or order drifted")
     terminal = _schema_mapping(tools[-1]["function"], path="$tools[-1].function")
     parameters = _schema_mapping(terminal["parameters"], path="$tools[-1].function.parameters")

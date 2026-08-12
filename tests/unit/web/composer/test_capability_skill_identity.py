@@ -281,6 +281,47 @@ def test_manifest_uses_exact_ordered_advertised_tool_definitions() -> None:
     assert manifest.canonical_schema_hash == stable_hash(canonical_set_pipeline_schema())
 
 
+def test_manifest_accepts_an_order_preserving_dynamic_discovery_subset() -> None:
+    tools = planner_tool_definitions()
+    retained = {"get_plugin_assistance", "get_plugin_schema", "list_models"}
+    subset = [tool for tool in tools if tool["function"]["name"] in retained or tool is tools[-1]]
+
+    manifest = build_planner_capability_manifest(
+        surface=PlannerSurface.FREEFORM,
+        profile="ordinary",
+        messages=_messages(build_system_prompt(None)),
+        tools=subset,
+        canonical_schema=canonical_set_pipeline_schema(),
+    )
+
+    assert [tool["function"]["name"] for tool in subset] == [
+        "get_plugin_assistance",
+        "get_plugin_schema",
+        "list_models",
+        "emit_pipeline_proposal",
+    ]
+    assert manifest.effective_tool_hash == stable_hash(subset)
+
+
+@pytest.mark.parametrize("mutation", ("reordered", "unknown"))
+def test_manifest_rejects_invalid_dynamic_discovery_subset(mutation: str) -> None:
+    tools = planner_tool_definitions()
+    subset = [tool for tool in tools if tool["function"]["name"] in {"get_plugin_assistance", "get_plugin_schema"} or tool is tools[-1]]
+    if mutation == "reordered":
+        subset[0], subset[1] = subset[1], subset[0]
+    else:
+        subset[0]["function"]["name"] = "unknown_discovery"
+
+    with pytest.raises(AuditIntegrityError, match="identities or order"):
+        build_planner_capability_manifest(
+            surface=PlannerSurface.FREEFORM,
+            profile="ordinary",
+            messages=_messages(build_system_prompt(None)),
+            tools=subset,
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
 @pytest.mark.parametrize(
     ("surface", "profile", "rendered_skill"),
     (
