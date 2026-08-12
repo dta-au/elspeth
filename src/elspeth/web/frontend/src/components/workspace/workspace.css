@@ -173,6 +173,14 @@
 .workspace-collapse-control {
   align-self: flex-end;
   flex: 0 0 auto;
+
+  /* Vertical registration with the action bar across the divider: that row
+     is 8px padding + 44px .btn buttons, so this control takes the same 8px
+     standoff and the full --size-control height (overriding .btn-compact's
+     36px floor — workspace.css imports after shared.css) so both rows share
+     one bottom edge and one optical center. */
+  margin: var(--space-sm);
+  min-height: var(--size-control);
 }
 
 .workspace-collapsed-affordance {
@@ -418,5 +426,11 @@
   .workspace-action-bar {
     gap: 0.25rem;
     padding: 0.25rem 0.5rem;
+  }
+
+  /* Track the action bar's tightened padding so the shared bottom edge
+     holds in the compact regime too. */
+  .workspace-collapse-control {
+    margin: 0.25rem 0.5rem;
   }
 }
