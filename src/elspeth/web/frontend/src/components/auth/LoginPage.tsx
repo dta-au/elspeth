@@ -1,4 +1,4 @@
-import { useState, useEffect, type CSSProperties, type FormEvent } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { useAuth } from "../../hooks/useAuth";
 import * as api from "../../api/client";
 import type { ApiError, AuthConfig } from "../../types/index";
@@ -218,19 +218,6 @@ const NO_REGISTER_TARGETS: RegisterErrorTargets = {
   email: false,
   password: false,
   confirm: false,
-};
-
-/** Inline copy of the app's link-button idiom (.tutorial-link-button) —
- *  LoginPage is inline-styled and has no dedicated stylesheet. */
-const linkButtonStyle: CSSProperties = {
-  border: 0,
-  background: "transparent",
-  color: "var(--color-link)",
-  cursor: "pointer",
-  font: "inherit",
-  padding: 0,
-  textDecoration: "underline",
-  textUnderlineOffset: 3,
 };
 
 export function LoginPage() {
@@ -682,7 +669,7 @@ export function LoginPage() {
               Already have an account?{" "}
               <button
                 type="button"
-                style={linkButtonStyle}
+                className="link-button"
                 onClick={() => switchView("signin")}
               >
                 Sign in
@@ -753,7 +740,7 @@ export function LoginPage() {
                   New to ELSPETH?{" "}
                   <button
                     type="button"
-                    style={linkButtonStyle}
+                    className="link-button"
                     onClick={() => switchView("register")}
                   >
                     Create an account

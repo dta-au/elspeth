@@ -298,7 +298,7 @@ export function RecoveryDiff({
               <h4>{group.label}</h4>
               {isLarge ? (
                 <button
-                  className="btn btn-secondary"
+                  className="btn"
                   type="button"
                   onClick={() =>
                     setExpandedGroups((previous) => {

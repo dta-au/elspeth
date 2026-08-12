@@ -265,6 +265,27 @@
   cursor: not-allowed;
 }
 
+/* Button that reads as a link, for actions inside prose (download the full
+   file, switch auth view). One definition for what previously existed as
+   three mechanisms (two inline-TSX style objects and .tutorial-link-button).
+   No --color-link-hover token exists, so the hover cue is underline weight,
+   not a color shift. The radius only shapes the global focus ring. */
+.link-button {
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-link);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  text-decoration-thickness: 2px;
+}
+
 .btn-primary {
   background-color: var(--color-btn-primary-bg);
   border-color: var(--color-btn-primary-bg);

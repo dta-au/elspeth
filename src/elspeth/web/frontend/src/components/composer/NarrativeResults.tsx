@@ -353,6 +353,7 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
         <p className="narrative-results-download">
           <button
             type="button"
+            className="link-button"
             data-testid="narrative-results-download-link"
             onClick={() => void handleDownload()}
           >

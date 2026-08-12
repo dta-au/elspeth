@@ -691,7 +691,7 @@ function App() {
                 </button>
                 <button
                   type="button"
-                  className="btn btn-secondary"
+                  className="btn"
                   onClick={() => setCatalogOpen(true)}
                 >
                   Browse the catalog

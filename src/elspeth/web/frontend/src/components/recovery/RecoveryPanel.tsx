@@ -133,7 +133,7 @@ export function RecoveryPanel({
             </p>
             <div className="recovery-panel-confirm-actions">
               <button
-                className="btn btn-secondary"
+                className="btn"
                 type="button"
                 onClick={() => setNeedsConfirmation(false)}
               >
@@ -157,7 +157,7 @@ export function RecoveryPanel({
           />
           <div className="recovery-panel-transcript-controls">
             <button
-              className="btn btn-secondary"
+              className="btn"
               type="button"
               onClick={() =>
                 setShowTranscriptControls((currentlyShown) => !currentlyShown)

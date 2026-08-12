@@ -518,19 +518,7 @@ function ArtifactPreviewView({
           Preview truncated
           {preview.row_count_preview != null && ` to ${preview.row_count_preview} rows`}
           {" — "}
-          <button
-            type="button"
-            onClick={onDownload}
-            style={{
-              background: "none",
-              border: "none",
-              padding: 0,
-              color: "var(--color-link)",
-              textDecoration: "underline",
-              cursor: "pointer",
-              font: "inherit",
-            }}
-          >
+          <button type="button" className="link-button" onClick={onDownload}>
             download for full file
           </button>
           {" "}({formatBytes(preview.total_size_bytes)} total).
