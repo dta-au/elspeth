@@ -1863,7 +1863,9 @@ describe("ChatPanel mode discriminator", () => {
 
     render(<ChatPanel />);
 
-    const workflow = screen.getByRole("list", { name: /guided workflow/i });
+    const workflow = within(
+      screen.getByRole("navigation", { name: /guided workflow progress/i }),
+    ).getByRole("list");
     for (const label of ["Source", "Output", "Transforms", "Wire", "Ready"]) {
       expect(workflow).toHaveTextContent(label);
     }
@@ -1907,11 +1909,64 @@ describe("ChatPanel mode discriminator", () => {
 
     render(<ChatPanel />);
 
-    const workflow = screen.getByRole("list", { name: /guided workflow/i });
+    const workflow = within(
+      screen.getByRole("navigation", { name: /guided workflow progress/i }),
+    ).getByRole("list");
     expect(workflow).toHaveTextContent("Wire");
     expect(screen.getByRole("listitem", { current: "step" })).toHaveTextContent(
       "Wire",
     );
+  });
+
+  it("stepper states carry a sequence signal at every width (elspeth-8fa71e6d15)", () => {
+    // The responsive recode once hid .guided-workflow-index at compact
+    // width, leaving three states distinguishable only by a 1px border
+    // shift — the strip read as a row of input boxes. Pin the mechanism:
+    // the indicator renders in EVERY state (check for complete, numeral
+    // otherwise), aria-hidden with visually-hidden state suffixes standing
+    // in for AT, and no compact rule may hide it again.
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_4_wire" },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    const { container } = render(<ChatPanel />);
+    const steps = container.querySelectorAll(".guided-workflow-step");
+    expect(steps).toHaveLength(5);
+    for (const step of steps) {
+      const indicator = step.querySelector(".guided-workflow-index");
+      expect(indicator).not.toBeNull();
+      expect(indicator).toHaveAttribute("aria-hidden", "true");
+    }
+    // Completed steps show the settled mark, not a numeral.
+    const completeSteps = container.querySelectorAll(
+      ".guided-workflow-step--complete",
+    );
+    expect(completeSteps.length).toBeGreaterThan(0);
+    for (const step of completeSteps) {
+      expect(step.querySelector(".guided-workflow-check")).not.toBeNull();
+      expect(step.textContent).toContain(", completed");
+    }
+    const upcoming = container.querySelectorAll(
+      ".guided-workflow-step--upcoming",
+    );
+    for (const step of upcoming) {
+      expect(step.querySelector(".guided-workflow-check")).toBeNull();
+      expect(step.textContent).toContain(", not started");
+    }
+    // The current step announces via aria-current alone — no suffix.
+    const current = container.querySelector(".guided-workflow-step--current");
+    expect(current?.textContent).not.toContain(", ");
+
+    // Regression pin on the stylesheet: no rule may hide the indicator again.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/guided/guided.css"),
+      "utf8",
+    );
+    expect(css).not.toMatch(/\.guided-workflow-index[^{]*\{[^}]*display:\s*none/s);
   });
 
   it("lays the guided workflow stepper out one column per step, with a mobile breakpoint", () => {
@@ -2894,7 +2949,9 @@ describe("ChatPanel mode discriminator", () => {
       />,
     );
 
-    const stepper = screen.getByRole("list", { name: /guided workflow/i });
+    const stepper = within(
+      screen.getByRole("navigation", { name: /guided workflow progress/i }),
+    ).getByRole("list");
     const scroller = container.querySelector(".guided-authoring-scroll");
     expect(scroller).not.toBeNull();
     expect(
@@ -3207,7 +3264,9 @@ describe("ChatPanel mode discriminator", () => {
     expect(chatMain?.classList.contains("chat-panel--completed")).toBe(true);
     // Stepper (all steps done → "Ready") + the completion outcome render.
     expect(
-      screen.getByRole("list", { name: /guided workflow/i }),
+      within(
+      screen.getByRole("navigation", { name: /guided workflow progress/i }),
+    ).getByRole("list"),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("heading", { name: "Pipeline updated" }),

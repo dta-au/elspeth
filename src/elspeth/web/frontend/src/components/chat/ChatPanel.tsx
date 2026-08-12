@@ -3072,7 +3072,11 @@ function GuidedWorkflowStepper({
   const activeIndex = GUIDED_WORKFLOW_STEPS.findIndex((step) => step.id === activeStep);
   return (
     <nav className="guided-workflow" aria-label="Guided workflow progress">
-      <ol className="guided-workflow-list" aria-label="Guided workflow">
+      {/* The ol carries no aria-label of its own — the nav already announces
+          "Guided workflow progress"; two nested near-identical labels are
+          screen-reader noise (stepper visual-language spec,
+          elspeth-8fa71e6d15). */}
+      <ol className="guided-workflow-list">
         {GUIDED_WORKFLOW_STEPS.map((step, index) => {
           const state =
             index < activeIndex
@@ -3086,10 +3090,34 @@ function GuidedWorkflowStepper({
               className={`guided-workflow-step guided-workflow-step--${state}`}
               aria-current={state === "current" ? "step" : undefined}
             >
-              <span className="guided-workflow-index">{index + 1}</span>
+              {/* Indicator is aria-hidden in every state: list order already
+                  conveys position, a bare numeral adds noise, and the check
+                  is purely visual. Complete/upcoming get a visually-hidden
+                  state suffix because with the indicator hidden from AT the
+                  distinction is otherwise visual-only; current needs none —
+                  aria-current announces it. */}
+              <span className="guided-workflow-index" aria-hidden="true">
+                {state === "complete" ? (
+                  <svg
+                    className="guided-workflow-check"
+                    viewBox="0 0 24 24"
+                    focusable="false"
+                    aria-hidden="true"
+                  >
+                    <path d="M5 13l4 4L19 7" />
+                  </svg>
+                ) : (
+                  index + 1
+                )}
+              </span>
               <span className="guided-workflow-label">
                 {step.id === "ready" ? readyStepLabel : step.label}
               </span>
+              {state !== "current" && (
+                <span className="visually-hidden">
+                  {state === "complete" ? ", completed" : ", not started"}
+                </span>
+              )}
             </li>
           );
         })}

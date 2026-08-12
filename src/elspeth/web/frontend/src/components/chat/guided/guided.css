@@ -25,7 +25,19 @@
   padding: var(--space-md) var(--space-md) 0;
 }
 
+/* Stepper visual language (elspeth-8fa71e6d15): a path with positions on it.
+   The old bordered-rectangle cells were this design system's INPUT idiom —
+   with the numerals hidden at compact width, the strip read as a row of
+   labelled boxes, not progress. State now lives entirely in the indicator
+   circle + label weight: solid accent disc + check (complete) → heavy open
+   ring + bold numeral (current) → hairline ring + muted numeral (upcoming),
+   threaded on a decorative rail. No container box in any state. All
+   state-bearing pairings verified ≥3:1 (SC 1.4.11) in both themes from the
+   shipped token hexes — see the spec's contrast table before retuning any
+   of these tokens. */
 .guided-workflow-list {
+  --guided-stepper-gap: var(--space-xs);
+
   list-style: none;
   margin: 0;
   padding: 0;
@@ -33,54 +45,106 @@
   /* One column per workflow step (GUIDED_WORKFLOW_STEPS = 5). The prior
      repeat(6,…) left an empty trailing column. */
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: var(--space-xs);
+  gap: var(--guided-stepper-gap);
 }
 
 /* Narrow viewports: 5 equal columns are too tight (~70px each at 390px), which
    shattered single-word labels one character per line. Drop to two columns so
-   labels stay whole; the stepper wraps to a few short rows. */
+   labels stay whole; the stepper wraps to a few short rows. The rail is
+   suppressed here — a segment drawn to the previous DOM sibling lies about
+   adjacency once the grid wraps. */
 @media (max-width: 640px) {
   .guided-workflow-list {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+
+  .guided-workflow-step::before {
+    display: none;
+  }
 }
 
+/* Indicator-above-label, centered: side-by-side at a 64px cell (360px pane)
+   left ~36px for "Transforms" — guaranteed ragged wrap. Stacked, the label
+   gets the full cell. Indicators top-align so a wrapped label in one cell
+   never bends the rail. */
 .guided-workflow-step {
+  position: relative;
   display: flex;
+  flex-direction: column;
   align-items: center;
   gap: var(--space-xs);
   min-width: 0;
-  padding: var(--space-xs) var(--space-sm);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
   color: var(--color-text-muted);
-  background-color: var(--color-surface);
   font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+/* Rail segment to the previous step: decorative (uniform, untinted — state
+   lives in the nodes; same doctrine as the canvas dot grid), so it is exempt
+   from 1.4.11 and deliberately quiet. Spans between adjacent indicator
+   circles with a small clear gap on each side. */
+.guided-workflow-step:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  top: calc(0.625rem - 0.5px);
+  right: calc(50% + 0.875rem);
+  left: calc(-50% - var(--guided-stepper-gap) + 0.875rem);
+  border-top: 1px solid var(--color-border-strong);
 }
 
 .guided-workflow-step--complete {
   color: var(--color-text-secondary);
-  border-color: var(--color-border-strong);
-  background-color: var(--color-surface-elevated);
 }
 
 .guided-workflow-step--current {
   color: var(--color-text);
-  border-color: var(--color-accent);
-  background-color: var(--color-surface-elevated);
 }
 
+/* Upcoming (base): hairline ring + muted numeral. --color-input-border is
+   the designated clears-3:1 boundary token on both themes' backdrops. */
 .guided-workflow-index {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.5rem;
-  height: 1.5rem;
+  width: 1.25rem;
+  height: 1.25rem;
   flex: 0 0 auto;
   border-radius: 50%;
-  border: 1px solid currentColor;
+  border: 1px solid var(--color-input-border);
+  color: var(--color-text-muted);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-regular);
+}
+
+/* Complete: committed = filled, reusing the chip ladder's semantics (solid
+   accent means settled/selected in this system). The 1px chip-border ring is
+   load-bearing in dark theme — the accent fill alone is 2.73:1 against the
+   backdrop; the ring is what clears SC 1.4.11. Do not drop it because the
+   fill "is visible anyway". */
+.guided-workflow-step--complete .guided-workflow-index {
+  border-color: var(--color-chip-border);
+  background-color: var(--color-accent);
+  color: var(--color-text-inverse);
+}
+
+/* Current: emphasized OPEN ring, not a fill — no shipped token pair carries
+   both a ≥3:1 boundary and ≥4.5:1 text when filled, and a filled node would
+   also collide with the chip ladder's committed semantics. Strength comes
+   from three redundant cues: 2px ring, bold numeral, semibold label. */
+.guided-workflow-step--current .guided-workflow-index {
+  border: 2px solid var(--color-chip-border);
+  color: var(--color-text);
+  font-weight: var(--font-weight-bold);
+}
+
+.guided-workflow-check {
+  width: 0.75rem;
+  height: 0.75rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .guided-workflow-label {
@@ -89,6 +153,10 @@
      in a narrow grid cell. */
   overflow-wrap: break-word;
   line-height: 1.2;
+}
+
+.guided-workflow-step--current .guided-workflow-label {
+  font-weight: var(--font-weight-semibold);
 }
 
 .guided-current-decision {
@@ -178,27 +246,23 @@
 }
 
 /* The authoring pane can be 360px wide at a wide viewport, so compact the
-   five-step band without relying on a viewport-width media query. */
+   five-step band without relying on a viewport-width media query. The gap
+   custom property keeps the rail-segment math in the base rules honest.
+   (The old compact treatment ALSO hid .guided-workflow-index here — that
+   deletion removed the strip's only sequence signal and is what made the
+   steps read as input boxes; the indicator now renders at every width,
+   elspeth-8fa71e6d15.) */
 .chat-panel--guided .guided-workflow-list {
-  gap: 2px;
+  --guided-stepper-gap: 2px;
 }
 
 .chat-panel--guided .guided-workflow-step {
-  padding: var(--space-xs);
   font-size: var(--font-size-xs);
-}
-
-.chat-panel--guided .guided-workflow-index {
-  display: none;
 }
 
 @media (max-height: 760px) {
   .chat-panel--guided > .guided-workflow {
     padding-top: 2px;
-  }
-
-  .chat-panel--guided .guided-workflow-step {
-    padding-block: 2px;
   }
 }
 

@@ -97,4 +97,26 @@
   .tutorial-progress-bar::after {
     background: Highlight;
   }
+
+  /* Guided stepper (elspeth-8fa71e6d15) — same treatment as the tutorial
+     dots above: without these the token-colored rings and accent fill are
+     stripped and all three states collapse into indistinguishable circles. */
+  .guided-workflow-index {
+    border: 1px solid CanvasText;
+    forced-color-adjust: none;
+    background-color: Canvas;
+    color: CanvasText;
+  }
+
+  .guided-workflow-step--complete .guided-workflow-index {
+    border-color: CanvasText;
+    background-color: Highlight;
+    color: HighlightText;
+  }
+
+  .guided-workflow-step--current .guided-workflow-index {
+    border: 2px solid Highlight;
+    background-color: Canvas;
+    color: CanvasText;
+  }
 }
