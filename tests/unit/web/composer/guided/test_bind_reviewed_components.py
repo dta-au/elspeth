@@ -1262,6 +1262,25 @@ def test_projection_check_ignores_a_gate_on_success_field() -> None:
     assert bound["nodes"][1]["on_success"] == "output"
 
 
+def test_projection_check_leaves_a_dead_gate_fork_to_ordinary_validation() -> None:
+    from elspeth.web.composer.guided.planning import _canonical_state_from_private_pipeline
+
+    guided = _guided_with_output(
+        required_fields=("document_uri", "abstract"),
+        output_options={"path": "outputs/colours.json"},
+    )
+    pipeline = _gate_after_exact_mapper_pipeline(mapping={"generated": "abstract"})
+    gate = pipeline["nodes"][1]
+    gate["routes"] = {"true": "discard", "false": "discard"}
+    gate["fork_to"] = ["output"]
+
+    bound = bind_guided_reviewed_components(pipeline, guided)
+    validation = _canonical_state_from_private_pipeline(dict(bound)).validate()
+
+    assert bound["nodes"][1]["fork_to"] == ["output"]
+    assert "gate_fork_to_without_fork_route" in [error.error_code for error in validation.errors]
+
+
 def _two_mapper_fanin_pipeline() -> dict[str, object]:
     return {
         "sources": {

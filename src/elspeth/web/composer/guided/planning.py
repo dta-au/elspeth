@@ -1890,7 +1890,15 @@ def _success_projection_node(node: NodeSpec) -> NodeSpec:
         # Gates publish successful rows only through routes/fork_to. A generic
         # planner node can still carry a malformed on_success value; ordinary
         # candidate validation owns that shape rather than projection analysis.
-        return replace(node, on_success=None, on_error=None)
+        # The same ownership applies to a fork_to list with no route selecting
+        # the reserved "fork" action: those destinations are dead at runtime.
+        has_fork_route = node.routes is not None and any(destination == "fork" for destination in node.routes.values())
+        return replace(
+            node,
+            on_success=None,
+            on_error=None,
+            fork_to=node.fork_to if has_fork_route else None,
+        )
     # Every other runtime node publishes success through on_success (or the
     # coalesce/queue implicit id). The generic planner schema also admits gate
     # fields on them, but those fields cannot prove a successful sink path.
