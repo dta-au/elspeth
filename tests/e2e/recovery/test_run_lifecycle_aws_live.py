@@ -54,13 +54,14 @@ def _assert_aws_ecs_rds_provenance(database_url: str) -> None:
 
 
 @pytest.mark.live_aws
+@pytest.mark.live_provider
 def test_live_aws_postgresql16_non_resumable_finalization(
     request: pytest.FixtureRequest,
 ) -> None:
     database_url = os.environ.get(_URL_ENV)
     provenance = os.environ.get(_PROVENANCE_ENV)
     if database_url is None or provenance is None:
-        pytest.skip(f"live AWS lifecycle proof requires {_URL_ENV} and {_PROVENANCE_ENV}")
+        pytest.fail(f"live AWS lifecycle proof requires {_URL_ENV} and {_PROVENANCE_ENV}", pytrace=False)
     assert provenance == _EXPECTED_PROVENANCE
     _assert_aws_ecs_rds_provenance(database_url)
 
