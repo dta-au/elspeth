@@ -457,6 +457,9 @@ markers = [
     "fingerprint_baseline: Plan A baseline capture/verify across all elspeth-lints rules",
     "live_aws: marks opt-in tests that call live AWS services with operator-approved fixtures",
     "live_provider: marks protected tests that cross a real remote-provider boundary",
+    "live_azure: marks protected tests that cross a real Azure service boundary",
+    "live_dataverse: marks protected tests that cross a real Dataverse boundary",
+    "live_chroma: marks protected tests that cross a real Chroma service boundary",
 ]
 # Load .env file for integration tests (API keys)
 env_files = [".env"]

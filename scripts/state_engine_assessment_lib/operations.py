@@ -44,6 +44,7 @@ from .package import (
     validate_evidence_artifacts,
     validate_package,
 )
+from .selectors import validate_selector_manifest
 
 _LIVE_ENVELOPE_FILES = {"manifest.json", "junit.xml", "profile.json", "nodes.txt", "scrub-report.json"}
 _LIVE_RESULT_KEYS = ["passed", "failed", "errors", "skipped", "xfailed", "xpassed", "warnings"]
@@ -780,6 +781,9 @@ def _parser() -> argparse.ArgumentParser:
     ingest_parser.add_argument("assessment", type=Path)
     ingest_parser.add_argument("artifact_directory", type=Path)
     ingest_parser.add_argument("--lane", required=True)
+    validate_selectors_parser = subparsers.add_parser("validate-selectors")
+    validate_selectors_parser.add_argument("manifest", type=Path)
+    validate_selectors_parser.add_argument("--catalog", required=True, type=Path)
     subparsers.add_parser("check-links")
     return parser
 
@@ -803,6 +807,10 @@ def main(argv: list[str] | None = None) -> int:
         elif arguments.command == "ingest-live-evidence":
             record = ingest_live_evidence(arguments.assessment, arguments.artifact_directory, arguments.lane)
             print(f"live evidence ingested: {record['id']} ({arguments.lane})")
+        elif arguments.command == "validate-selectors":
+            manifest_path = arguments.manifest.resolve()
+            validate_selector_manifest(manifest_path, arguments.catalog.resolve())
+            print(f"state-engine evidence selectors: valid ({manifest_path})")
         elif arguments.command == "check-links":
             count = check_links(_git_root(Path.cwd()))
             print(f"state-engine documentation links: valid ({count} links)")
