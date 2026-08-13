@@ -223,6 +223,41 @@ describe("ProgressView", () => {
     expect(region).toHaveTextContent(/Pipeline completed.*3 rows, 2 succeeded, 1 failed\./);
   });
 
+  // The cases above each mount with their terminal status ALREADY set, so they
+  // pin the announcement TEXT without ever performing the running -> terminal
+  // transition their titles name. That leaves the mechanism unguarded: this is
+  // the declared single terminal-announcement authority (M07), and a live
+  // region only announces reliably when it pre-exists its content and the text
+  // MUTATES inside it. Drive the real transition and hold the element across
+  // it, so a refactor that remounts the region — restoring the unreliable
+  // insert-with-content pattern — fails here rather than staying green.
+  it("MUTATES the same live region across the running -> completed transition", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "running" }),
+    });
+
+    const { rerender } = render(<ProgressView />);
+    const region = screen.getByRole("status");
+    expect(region).toHaveTextContent(/in progress|running/i);
+
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({
+        status: "completed",
+        source_rows_processed: 3,
+        tokens_succeeded: 3,
+        tokens_failed: 0,
+      }),
+    });
+    rerender(<ProgressView />);
+
+    expect(screen.getByRole("status")).toBe(region);
+    expect(region).toHaveTextContent(/Pipeline completed/);
+  });
+
   it("distinguishes completed-with-failures in the live announcement", () => {
     (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
       activeRunId: "run-1",
