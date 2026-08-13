@@ -8,7 +8,7 @@
 // ============================================================================
 
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { axe, toHaveNoViolations } from "jest-axe";
 import { AcknowledgementLiveRegion, AcknowledgementStack } from "./AcknowledgementStack";
@@ -215,6 +215,27 @@ describe("AcknowledgementLiveRegion — count announce", () => {
     const status = screen.getByRole("status");
     expect(status).toBeTruthy();
     expect((status.textContent ?? "").trim()).toBe("");
+  });
+
+  // The whole reason this region is mounted separately from the stack is that
+  // the announcement must be a content MUTATION inside a node that already
+  // existed — a region inserted carrying its own text is the form with the
+  // documented AT failures. Every assertion above re-resolves the region by
+  // role AFTER rendering, which cannot tell a mutation from a replacement, so
+  // none of them guards that reason. Hold the element across the 0->1
+  // transition instead (elspeth-b46cd07678).
+  it("MUTATES the same region node across the 0->1 transition", () => {
+    useInterpretationEventsStore.setState({ pendingBySession: { [SID]: {} } });
+    render(<AcknowledgementLiveRegion sessionId={SID} />);
+    const before = screen.getByRole("status");
+    expect((before.textContent ?? "").trim()).toBe("");
+
+    act(() => {
+      seedPending([makeEvent("e1")]);
+    });
+
+    expect(screen.getByRole("status")).toBe(before);
+    expect(before.textContent).toMatch(/1 decision to acknowledge/i);
   });
 });
 

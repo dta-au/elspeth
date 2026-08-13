@@ -154,7 +154,10 @@ export function RunOutcomeNotice(): JSX.Element {
     <>
       {/* aria-live/aria-atomic are redundant with role="status" but stated
           explicitly, matching ProgressView's region — the belt-and-braces
-          form this repo already uses for its announcement authority. */}
+          form this repo already uses for its announcement authority.
+          The "-status-" in the test id predates the collapse to one region
+          and names this region's ROLE; there is no sibling alert region to
+          infer from it (see the header comment for why there is not). */}
       <div
         role="status"
         aria-live="polite"
