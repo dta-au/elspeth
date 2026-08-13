@@ -83,6 +83,26 @@
   color: var(--color-text-muted);
 }
 
+/* Operation label ("Applied: upsert_edge", "Reverted to v2", …) — kept to
+   one line so long tool names cannot wrap the 260px dropdown rows. */
+.version-selector-item-op {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Bookkeeping snapshots (content identical to the previous version): de-
+   emphasized but fully interactive — they remain legitimate revert targets. */
+.version-selector-item--snapshot .version-selector-item-label {
+  font-weight: 400;
+  color: var(--color-text-muted);
+}
+
+.version-selector-item--snapshot .version-selector-item-op {
+  font-style: italic;
+}
+
 .version-selector-actions {
   display: flex;
   justify-content: flex-end;

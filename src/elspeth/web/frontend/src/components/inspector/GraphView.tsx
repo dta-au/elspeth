@@ -43,6 +43,7 @@ import {
   sortedSourceEntries,
   sourceComponentId,
 } from "@/utils/compositionState";
+import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
 import { TypeBadge } from "@/components/ui";
 import type { CompositionState } from "@/types/index";
@@ -1515,14 +1516,28 @@ export function GraphView() {
       typeLabel: string,
       plugin: string | null,
     ): { id: string; status?: ValidationStatus; label: string } => {
-      const status = nodeValidationMap[id];
+      // A passing validation attributes no per-node findings, so the map is
+      // empty; announce 'valid' only when is_valid is strictly true. A
+      // failing result with unattributed (component_id: null) errors must
+      // keep unblamed nodes at 'not yet validated', never claim validity.
+      // Deliberately announced-only (elspeth-b5b7c5a6ad): the visual canvas
+      // does not render the 'valid' marker/border (makeRfNode reads the bare
+      // map, so its 'valid' arms are unreachable) — activating them changes
+      // pinned screenshot baselines and is a separate, deliberate change.
+      const status =
+        nodeValidationMap[id] ??
+        (validationResult?.is_valid === true ? "valid" : undefined);
       const validity =
         status === "error"
           ? "has validation errors"
           : status === "warning"
             ? "has warnings"
             : status === "valid"
-              ? "valid"
+              ? // "passed validation", not "valid": a verb phrase parallel to
+                // its three siblings, and the same word the status chip uses
+                // ("Validation: Passed", workspaceStatus.ts) so an operator
+                // cross-checking chip against node hears one vocabulary.
+                "passed validation"
               : "not yet validated";
       const message = nodeMessageMap[id];
       return {
@@ -1542,7 +1557,7 @@ export function GraphView() {
       out.push(describe(output.name, "sink", output.plugin));
     }
     return out;
-  }, [compositionState, nodeValidationMap, nodeMessageMap]);
+  }, [compositionState, nodeValidationMap, nodeMessageMap, validationResult]);
 
   const accessibleEdges = useMemo(
     () =>
@@ -1574,10 +1589,10 @@ export function GraphView() {
       .length ?? 0;
   const rowUnionSummary =
     rowUnionCount > 0
-      ? `, including ${rowUnionCount} row union${rowUnionCount === 1 ? "" : "s"}`
+      ? `, including ${plural(rowUnionCount, "row union")}`
       : "";
   const ariaLabel =
-    `Pipeline graph with ${nodeCount} component${nodeCount !== 1 ? "s" : ""}`
+    `Pipeline graph with ${plural(nodeCount, "component")}`
     + `${rowUnionSummary} (sources, processing steps, sinks).`;
 
   return (
@@ -1654,10 +1669,13 @@ export function GraphView() {
               nodeTypes={NODE_TYPES}
               nodesDraggable={false}
               nodesConnectable={false}
-              // Visual nodes are display-only; keyboard node selection is
-              // provided by the .graph-a11y-list above, so the canvas nodes
-              // are not extra (invisible, role="img"-hidden) tab stops.
+              // Visual nodes and edges are display-only; keyboard node
+              // selection is provided by the .graph-a11y-list above and edge
+              // topology by the "Pipeline branch connections" list, so canvas
+              // nodes/edges are not extra (invisible, role="img"-hidden) tab
+              // stops.
               nodesFocusable={false}
+              edgesFocusable={false}
               elementsSelectable={true}
               onNodeClick={onNodeClick}
               onPaneClick={onPaneClick}

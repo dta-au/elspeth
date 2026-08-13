@@ -1,3 +1,4 @@
+import { CodeBlock } from "@/components/chat/CodeBlock";
 import { PipelineGloss } from "@/components/chat/guided/PipelineGloss";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionState } from "@/types/index";
@@ -64,14 +65,19 @@ function SpecSection({ name, rows }: SpecSectionProps): JSX.Element {
                     </div>
                   ))}
                 </dl>
-                <pre
+                <div
                   className="pipeline-spec-options"
                   role="region"
                   aria-label={`${singular} ${row.id} options`}
                   tabIndex={0}
                 >
-                  <code>{JSON.stringify(row.options, null, 2)}</code>
-                </pre>
+                  <CodeBlock
+                    code={JSON.stringify(row.options, null, 2)}
+                    language="json"
+                    prettyJson
+                    showCopy={false}
+                  />
+                </div>
               </article>
             );
           })}

@@ -8,13 +8,20 @@ import {
   type KeyboardEvent,
 } from "react";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import {
+  deriveVersionLabel,
+  describeVersionOperation,
+  isSnapshotOnly,
+} from "@/components/header/versionLabels";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { CompositionStateVersion } from "@/types/index";
+import { plural } from "@/utils/plural";
 import { relativeTime } from "@/utils/time";
 
 export function HeaderVersionSelector(): JSX.Element | null {
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const compositionState = useSessionStore((s) => s.compositionState);
+  const messages = useSessionStore((s) => s.messages);
   const stateVersions = useSessionStore((s) => s.stateVersions);
   const isLoadingVersions = useSessionStore((s) => s.isLoadingVersions);
   const loadStateVersions = useSessionStore((s) => s.loadStateVersions);
@@ -229,6 +236,25 @@ export function HeaderVersionSelector(): JSX.Element | null {
             {sortedVersions.map((version, index) => {
               const isCurrent = version.version === currentVersion;
               const isFocused = focusedIndex === index;
+              const nodeCount =
+                version.nodes?.length ?? version.node_count ?? 0;
+              // Adjacent predecessor by version number, from the fetched
+              // list: with >50 versions the window's oldest row has no
+              // predecessor and the discriminator honestly returns false.
+              const previousVersion = stateVersions.find(
+                (candidate) => candidate.version === version.version - 1,
+              );
+              const snapshotOnly = isSnapshotOnly(version, previousVersion);
+              // "no VISIBLE change", not "no pipeline change": isSnapshotOnly
+              // compares the redacted wire projection, so the strongest
+              // honest claim is about what this surface can see. Do not
+              // strengthen the wording without a backend content hash.
+              const operationLabel = snapshotOnly
+                ? "no visible change"
+                : deriveVersionLabel(version, stateVersions, messages);
+              const operationTitle = snapshotOnly
+                ? undefined
+                : (describeVersionOperation(version, messages) ?? undefined);
               return (
                 <li
                   key={version.version}
@@ -237,10 +263,12 @@ export function HeaderVersionSelector(): JSX.Element | null {
                   aria-selected={selectedIndex === index}
                   aria-label={`Version ${version.version}${
                     isCurrent ? " (current)" : ""
-                  }`}
+                  } — ${operationLabel}`}
                   className={`version-selector-item${
                     isFocused ? " version-selector-item--focused" : ""
-                  }${isCurrent ? " version-selector-item--current" : ""}`}
+                  }${isCurrent ? " version-selector-item--current" : ""}${
+                    snapshotOnly ? " version-selector-item--snapshot" : ""
+                  }`}
                   onClick={() => {
                     setFocusedIndex(index);
                     setSelectedIndex(index);
@@ -257,7 +285,13 @@ export function HeaderVersionSelector(): JSX.Element | null {
                       )}
                     </span>
                     <span className="version-selector-item-meta">
-                      {version.node_count} nodes
+                      {plural(nodeCount, "node")}
+                    </span>
+                    <span
+                      className="version-selector-item-meta version-selector-item-op"
+                      title={operationTitle}
+                    >
+                      {operationLabel}
                     </span>
                     <span className="version-selector-item-meta">
                       {relativeTime(version.created_at)}

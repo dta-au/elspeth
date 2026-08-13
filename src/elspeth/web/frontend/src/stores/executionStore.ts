@@ -29,6 +29,7 @@ import type {
   ExecutionFanoutGuard,
 } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { isTerminalRunStatus } from "@/types/index";
 import * as api from "@/api/client";
 import { connectToRun, type WebSocketConnection } from "@/api/websocket";
 import { useAuthStore } from "./authStore";
@@ -42,9 +43,41 @@ const STALE_FANOUT_READINESS_ERROR =
 
 export type RunHistoryLoadOutcome = "loaded" | "stale" | "unavailable";
 
+/**
+ * Terminal-outcome record for the most recent run this tab was attached to
+ * (elspeth-3a7b7c7b37). Every consumer that lives OUTSIDE the Run artifact
+ * panel (the always-mounted RunOutcomeNotice toast, the Run-tab badge) reads
+ * this instead of progress/runs, which only Run-panel components consume.
+ * `status` is the backend's verbatim terminal status — never re-derived.
+ */
+export interface RunOutcome {
+  runId: string;
+  status: RunStatus;
+  sessionId: string | null;
+}
+
 interface ExecutionState {
   runs: Run[];
   activeRunId: string | null;
+  /**
+   * Session the active run was LAUNCHED under (elspeth-3a7b7c7b37). Stamped
+   * alongside activeRunId by execute() and rehydrateActiveRun(), cleared by
+   * reset().
+   *
+   * Every outcome record copies THIS field rather than reading the session
+   * store's activeSessionId at terminal-event time, because the session is
+   * the outcome's ROUTING KEY, not a decoration: RunOutcomeNotice passes it
+   * to dispatchArtifactViewIntent, and ArtifactWorkspace ADMITS the intent
+   * only when it matches the committed controller's session. A routing key
+   * must therefore be fixed at launch and never re-derived from mutable
+   * store state — independently of whether any particular ordering of
+   * session-switch commit and reset() could produce a mismatch. (It is not
+   * the case that a WS terminal event landing before reset() would
+   * mis-attribute the outcome: activeRunId still identifies the launch
+   * session's run there, and reset() clears lastRunOutcome outright. The
+   * stamp is cheaper than depending on that reasoning staying true.)
+   */
+  activeRunSessionId: string | null;
   progress: RunProgress | null;
   diagnosticsByRunId: Record<string, RunDiagnostics>;
   diagnosticsLoadingByRunId: Record<string, boolean>;
@@ -61,6 +94,19 @@ interface ExecutionState {
   wsDisconnected: boolean;
   error: string | null;
   /**
+   * Unacknowledged terminal outcome of the active run (elspeth-3a7b7c7b37).
+   * Set inside applyRunEvent's terminal branch (WS, the primary source),
+   * cleared by acknowledgeRunOutcome(), by reset() (session switch), and by
+   * a new launch superseding it. The REST-poll fallback (InlineRunResults'
+   * 3s loadRuns loop) also records it when the poll observes the active run
+   * terminal while progress still says in-flight — the WS-drop degraded
+   * path must not silently reinstate the off-Run-tab silence this state
+   * exists to fix. Known gap: that poll only runs while the Run tab body is
+   * mounted, so a WS drop with the Run tab closed still surfaces the
+   * outcome only on the next Run-tab visit.
+   */
+  lastRunOutcome: RunOutcome | null;
+  /**
    * Sessions whose user ticked "don't ask again" on the pre-run egress
    * disclosure (elspeth-c18ad229cc). In-memory only (a page reload re-arms
    * the disclosure) and deliberately preserved across reset() so switching
@@ -76,6 +122,7 @@ interface ExecutionState {
   dismissFanoutGuard: () => void;
   acknowledgeRunDisclosure: (sessionId: string) => void;
   clearRunDisclosureAcks: () => void;
+  acknowledgeRunOutcome: () => void;
   cancel: (runId: string) => Promise<void>;
   loadRuns: (sessionId: string) => Promise<RunHistoryLoadOutcome>;
   rehydrateActiveRun: (sessionId: string) => Promise<void>;
@@ -317,9 +364,26 @@ function applyRunEvent(
     );
   }
 
+  // Terminal transition for the run this tab owns → record the outcome for
+  // the always-mounted surfaces (RunOutcomeNotice, Run-tab badge). The
+  // run_id guard pins the RUN (a stale event for a superseded run can never
+  // masquerade as the active run's outcome) but NOT the session — so the
+  // session is copied from activeRunSessionId, captured at launch, because
+  // the outcome's routing key must be fixed at launch rather than re-derived
+  // from mutable store state (see the activeRunSessionId doc comment).
+  const lastRunOutcome =
+    isTerminal && event.run_id === state.activeRunId
+      ? {
+          runId: event.run_id,
+          status: newProgress.status,
+          sessionId: state.activeRunSessionId,
+        }
+      : state.lastRunOutcome;
+
   return {
     progress: newProgress,
     runs: updatedRuns,
+    lastRunOutcome,
     wsDisconnected: false,
   };
 }
@@ -327,6 +391,7 @@ function applyRunEvent(
 const initialExecutionState = {
   runs: [] as Run[],
   activeRunId: null as string | null,
+  activeRunSessionId: null as string | null,
   progress: null as RunProgress | null,
   diagnosticsByRunId: {} as Record<string, RunDiagnostics>,
   diagnosticsLoadingByRunId: {} as Record<string, boolean>,
@@ -342,6 +407,7 @@ const initialExecutionState = {
   isExecuting: false,
   wsDisconnected: false,
   error: null as string | null,
+  lastRunOutcome: null as RunOutcome | null,
   runDisclosureAckBySession: {} as Record<string, boolean>,
 };
 
@@ -422,9 +488,16 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
       }
       set({
         activeRunId: run_id,
+        // The launch session travels with the run: it is the routing key
+        // every outcome record stamps (see the activeRunSessionId doc
+        // comment).
+        activeRunSessionId: sessionId,
         isExecuting: false,
         pendingFanoutGuard: null,
         pendingFanoutSessionId: null,
+        // A fresh launch supersedes any unacknowledged prior outcome: the
+        // Run-tab badge switches to the live pulse and the toast retires.
+        lastRunOutcome: null,
         progress: {
           source_rows_processed: 0,
           tokens_succeeded: 0,
@@ -533,6 +606,10 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     set({ runDisclosureAckBySession: {} });
   },
 
+  acknowledgeRunOutcome() {
+    set({ lastRunOutcome: null });
+  },
+
   connectWebSocket(runId: string) {
     // Close any existing WebSocket connection
     wsConnection?.close();
@@ -617,26 +694,50 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
   async cancel(runId: string) {
     try {
       const result = await api.cancelRun(runId);
-      set((state) => ({
-        runs: state.runs.map((run) =>
-          run.id === runId
-            ? {
-                ...run,
-                status: result.status,
-                cancel_requested: result.cancel_requested,
-              }
-            : run,
-        ),
-        progress:
-          state.activeRunId === runId && state.progress
-            ? {
-                ...state.progress,
-                status: result.status,
-                cancel_requested: result.cancel_requested,
-              }
-            : state.progress,
-        error: null,
-      }));
+      set((state) => {
+        // Cancelling a run that had not started yet takes the backend's
+        // non-Event branch: ExecutionService.cancel writes status="cancelled"
+        // straight to the DB with NO run-event broadcast, and the response
+        // carries that terminal status. Writing it into progress without
+        // also recording the outcome would strand the run twice over — the
+        // toast would wait on the WebSocket's 60s idle recheck, and the
+        // loadRuns degraded-path reconciliation (gated on progress NOT being
+        // terminal) would be disarmed by the very write that needs it. So
+        // cancel() records the outcome itself, symmetric with the WS
+        // terminal branch and the loadRuns fallback; the later WS delivery
+        // becomes a redundant confirmation of the same runId/status rather
+        // than the only source. Stamped with the LAUNCH session for the same
+        // routing-key reason as every other outcome write.
+        const ownsRun = state.activeRunId === runId;
+        return {
+          runs: state.runs.map((run) =>
+            run.id === runId
+              ? {
+                  ...run,
+                  status: result.status,
+                  cancel_requested: result.cancel_requested,
+                }
+              : run,
+          ),
+          progress:
+            ownsRun && state.progress
+              ? {
+                  ...state.progress,
+                  status: result.status,
+                  cancel_requested: result.cancel_requested,
+                }
+              : state.progress,
+          lastRunOutcome:
+            ownsRun && isTerminalRunStatus(result.status)
+              ? {
+                  runId,
+                  status: result.status,
+                  sessionId: state.activeRunSessionId,
+                }
+              : state.lastRunOutcome,
+          error: null,
+        };
+      });
     } catch (err) {
       const apiErr = err as ApiError;
       set({ error: apiErr.detail ?? "Failed to cancel run." });
@@ -647,7 +748,42 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     try {
       const runs = await api.fetchRuns(sessionId);
       if (!shouldApplyRunListResult(sessionId)) return "stale";
-      set({ runs });
+      set((state) => {
+        // Degraded-path reconciliation (WS drop): when the poll observes the
+        // active run terminal while progress still claims in-flight, the WS
+        // terminal event was lost — record the outcome (stamped with the
+        // LAUNCH session) and reconcile progress.status so the always-mounted
+        // surfaces (toast, badge) and ProgressView retire instead of showing
+        // a live run forever. Known gap: this poll only runs while the Run
+        // tab body is mounted (InlineRunResults' 3s loop), so a WS drop with
+        // the Run tab closed still surfaces only on the next Run-tab visit.
+        const activeRow =
+          state.activeRunId !== null
+            ? runs.find((run) => run.id === state.activeRunId)
+            : undefined;
+        if (
+          activeRow !== undefined &&
+          isTerminalRunStatus(activeRow.status) &&
+          state.progress !== null &&
+          !isTerminalRunStatus(state.progress.status)
+        ) {
+          return {
+            runs,
+            progress: {
+              ...state.progress,
+              status: activeRow.status,
+              cancel_requested: false,
+              accounting: activeRow.accounting ?? state.progress.accounting,
+            },
+            lastRunOutcome: {
+              runId: activeRow.id,
+              status: activeRow.status,
+              sessionId: state.activeRunSessionId,
+            },
+          };
+        }
+        return { runs };
+      });
       return "loaded";
     } catch {
       // Non-critical -- runs list can be stale temporarily
@@ -684,6 +820,7 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     if (get().activeRunId !== null) return;
     set({
       activeRunId: liveRun.id,
+      activeRunSessionId: sessionId,
       progress: {
         source_rows_processed: 0,
         tokens_succeeded: 0,

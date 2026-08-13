@@ -103,6 +103,54 @@ describe("workspace status projections", () => {
     });
   });
 
+  it("uses the plural noun for more than one validation error", () => {
+    expect(
+      projectValidationWorkspaceStatus(
+        makeValidationResult({
+          is_valid: false,
+          errors: [
+            {
+              component_id: "node-1",
+              component_type: "transform",
+              message: "Invalid",
+              suggestion: null,
+            },
+            {
+              component_id: "node-2",
+              component_type: "transform",
+              message: "Also invalid",
+              suggestion: null,
+            },
+          ],
+        }),
+      ),
+    ).toEqual({
+      text: "2 errors",
+      tone: "error",
+      accessibleLabel: "Validation: 2 errors",
+    });
+  });
+
+  it("uses the singular noun for exactly one validation warning", () => {
+    expect(
+      projectValidationWorkspaceStatus({
+        ...makeValidationResult(),
+        warnings: [
+          {
+            component_id: "node-1",
+            component_type: "transform",
+            message: "Review this transform",
+            suggestion: null,
+          },
+        ],
+      }),
+    ).toEqual({
+      text: "1 warning",
+      tone: "warning",
+      accessibleLabel: "Validation: 1 warning",
+    });
+  });
+
   it("fails closed when validation is invalid without structured errors", () => {
     expect(
       projectValidationWorkspaceStatus(
@@ -244,6 +292,29 @@ describe("workspace status projections", () => {
       text: "2 issues",
       tone: "error",
       accessibleLabel: "Audit: 2 issues",
+    });
+  });
+
+  it("uses the singular noun for exactly one audit issue", () => {
+    const withOneIssue = auditSnapshot({
+      rows: auditSnapshot().rows.map((row) =>
+        row.id === "provenance"
+          ? { ...row, status: "warning" as const, summary: "Review" }
+          : row,
+      ),
+    });
+
+    expect(
+      projectAuditWorkspaceStatus({
+        activeSessionId: SESSION_ID,
+        compositionVersion: 4,
+        snapshotsBySession: { [SESSION_ID]: withOneIssue },
+        errorBySession: {},
+      }),
+    ).toEqual({
+      text: "1 issue",
+      tone: "warning",
+      accessibleLabel: "Audit: 1 issue",
     });
   });
 });

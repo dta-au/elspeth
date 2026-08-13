@@ -1,7 +1,52 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { HeaderVersionSelector } from "./HeaderVersionSelector";
 import { useSessionStore } from "@/stores/sessionStore";
+import type { CompositionStateVersion, NodeSpec } from "@/types/index";
+
+// Wire-shaped version rows: GET /state/versions delivers full
+// CompositionStateResponse rows (nodes/edges/outputs/sources/metadata),
+// NOT a node_count — the selector derives the count from nodes.length.
+function makeNode(id: string, options: Record<string, unknown> = {}): NodeSpec {
+  return {
+    id,
+    node_type: "transform",
+    plugin: "field_mapper",
+    input: "source",
+    on_success: null,
+    on_error: null,
+    options,
+  };
+}
+
+function makeVersion(
+  overrides: Partial<CompositionStateVersion> & {
+    id: string;
+    version: number;
+  },
+): CompositionStateVersion {
+  return {
+    created_at: "2026-05-15T10:00:00Z",
+    sources: { main: { plugin: "csv_source", options: { path: "in.csv" } } },
+    nodes: [makeNode(`n${overrides.version}`)],
+    edges: [],
+    outputs: [],
+    metadata: { name: "pipeline", description: null },
+    ...overrides,
+  };
+}
+
+// Distinct nodes per version so no row is snapshot-only unless a test
+// deliberately makes adjacent content identical.
+const defaultVersions = [
+  makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] }),
+  makeVersion({ id: "st-2", version: 2, nodes: [makeNode("a"), makeNode("b")] }),
+  makeVersion({
+    id: "st-3",
+    version: 3,
+    nodes: [makeNode("a"), makeNode("b"), makeNode("c")],
+  }),
+];
 
 describe("HeaderVersionSelector", () => {
   beforeEach(() => {
@@ -14,6 +59,7 @@ describe("HeaderVersionSelector", () => {
         edges: [],
         outputs: [],
       } as never,
+      messages: [],
       stateVersions: [],
       isLoadingVersions: false,
       loadStateVersions: vi.fn(),
@@ -54,26 +100,7 @@ describe("HeaderVersionSelector", () => {
   it("confirms and calls revertToVersion when the user picks an older version", () => {
     const revertToVersion = vi.fn();
     useSessionStore.setState({
-      stateVersions: [
-        {
-          id: "st-1",
-          version: 1,
-          created_at: "2026-05-15T10:00:00Z",
-          node_count: 1,
-        } as never,
-        {
-          id: "st-2",
-          version: 2,
-          created_at: "2026-05-15T10:10:00Z",
-          node_count: 2,
-        } as never,
-        {
-          id: "st-3",
-          version: 3,
-          created_at: "2026-05-15T10:20:00Z",
-          node_count: 3,
-        } as never,
-      ],
+      stateVersions: defaultVersions,
       revertToVersion,
     } as never);
     render(<HeaderVersionSelector />);
@@ -81,10 +108,138 @@ describe("HeaderVersionSelector", () => {
     fireEvent.click(
       screen.getByRole("button", { name: /composition history/i }),
     );
-    fireEvent.click(screen.getByRole("option", { name: /^version 2$/i }));
+    fireEvent.click(
+      screen.getByRole("option", { name: /^version 2 — edited$/i }),
+    );
     fireEvent.click(screen.getByRole("button", { name: /revert to version 2/i }));
     fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
 
+    expect(revertToVersion).toHaveBeenCalledWith("st-2");
+  });
+
+  // Regression for the undefined node_count bug: fetched rows carry nodes,
+  // not node_count, and the count must come from nodes.length.
+  it("renders the real node count for fetched rows", () => {
+    useSessionStore.setState({ stateVersions: defaultVersions } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    const option = screen.getByRole("option", {
+      name: /^version 2 — edited$/i,
+    });
+    expect(within(option).getByText("2 nodes")).toBeInTheDocument();
+  });
+
+  // The plural case above has an oracle; this is the singular one it was
+  // missing. v1 of defaultVersions has exactly one node.
+  it("renders a single-node version as '1 node', not '1 nodes'", () => {
+    useSessionStore.setState({ stateVersions: defaultVersions } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    const option = screen.getByRole("option", {
+      name: /^version 1 — session created$/i,
+    });
+    expect(within(option).getByText("1 node")).toBeInTheDocument();
+    expect(within(option).queryByText("1 nodes")).not.toBeInTheDocument();
+  });
+
+  it("labels version 1 as the session seed", () => {
+    useSessionStore.setState({ stateVersions: defaultVersions } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    expect(
+      screen.getByRole("option", { name: /^version 1 — session created$/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("labels a version from its applied tool-call stamp and joins it into the option name", () => {
+    useSessionStore.setState({
+      stateVersions: defaultVersions,
+      messages: [
+        {
+          id: "msg-1",
+          session_id: "sess-1",
+          role: "assistant",
+          content: "",
+          tool_calls: [
+            {
+              id: "call-1",
+              type: "function",
+              function: { name: "upsert_edge", arguments: "{}" },
+              outcome: "applied",
+              applied_state_version: 2,
+            },
+          ],
+          created_at: "2026-05-15T10:10:00Z",
+        },
+      ],
+    } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    const option = screen.getByRole("option", {
+      name: /^version 2 — applied: upsert_edge$/i,
+    });
+    expect(within(option).getByText("Applied: upsert_edge")).toBeInTheDocument();
+  });
+
+  it("marks snapshot-only rows, keeps them revertable", () => {
+    const revertToVersion = vi.fn();
+    // v2 content-identical to v1 — a bookkeeping snapshot; v3 differs.
+    const v1 = makeVersion({ id: "st-1", version: 1, nodes: [makeNode("a")] });
+    const v2 = makeVersion({ id: "st-2", version: 2, nodes: [makeNode("a")] });
+    const v3 = makeVersion({
+      id: "st-3",
+      version: 3,
+      nodes: [makeNode("a"), makeNode("b")],
+    });
+    useSessionStore.setState({
+      stateVersions: [v1, v2, v3],
+      revertToVersion,
+    } as never);
+    render(<HeaderVersionSelector />);
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /composition history/i }),
+    );
+
+    const option = screen.getByRole("option", {
+      name: /^version 2 — no visible change$/i,
+    });
+    expect(option.className).toContain("version-selector-item--snapshot");
+    expect(
+      within(option).getByText("no visible change"),
+    ).toBeInTheDocument();
+    // The stronger claim is not made anywhere on the row: the predicate
+    // compares a redacted projection and cannot prove the pipeline itself
+    // was unchanged.
+    expect(option.textContent).not.toContain("no pipeline change");
+    expect(option.getAttribute("aria-label")).not.toContain(
+      "no pipeline change",
+    );
+    // Non-snapshot siblings must NOT carry the class.
+    const edited = screen.getByRole("option", {
+      name: /^version 3 \(current\) — edited$/i,
+    });
+    expect(edited.className).not.toContain("version-selector-item--snapshot");
+
+    fireEvent.click(option);
+    fireEvent.click(screen.getByRole("button", { name: /revert to version 2/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^revert$/i }));
     expect(revertToVersion).toHaveBeenCalledWith("st-2");
   });
 

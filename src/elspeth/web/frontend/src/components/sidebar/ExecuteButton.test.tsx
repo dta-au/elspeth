@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import {
   ExecuteButton,
   INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
@@ -21,7 +28,11 @@ import type {
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
-import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
+import {
+  REQUEST_ARTIFACT_VIEW_EVENT,
+  REQUEST_RUN_EVENT,
+  type RequestArtifactViewDetail,
+} from "@/lib/composer-events";
 
 const READY_READINESS = {
   authoring_valid: true,
@@ -582,6 +593,122 @@ describe("ExecuteButton", () => {
 
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  // ── Post-launch Run-artifact switch (elspeth-3a7b7c7b37) ──────────────────
+  //
+  // All run-lifecycle feedback mounts only inside the Run artifact panel, so
+  // a successful launch must switch the workspace there. The switch keys on
+  // execute()'s returned run_id being a real id: the null returns (428
+  // fanout guard, 409, interpretation block, stale-session drop) must not
+  // move the user off their current tab.
+
+  function collectArtifactRequests(): {
+    requests: RequestArtifactViewDetail[];
+    detach: () => void;
+  } {
+    const requests: RequestArtifactViewDetail[] = [];
+    const listener = (event: Event): void => {
+      requests.push((event as CustomEvent<RequestArtifactViewDetail>).detail);
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener);
+    return {
+      requests,
+      detach: () =>
+        window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, listener),
+    };
+  }
+
+  it("switches to the Run artifact after a confirmed launch returns a run id", async () => {
+    const execute = vi.fn().mockResolvedValue("run-123");
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+
+    expect(execute).toHaveBeenCalledWith("sess-1");
+    await waitFor(() =>
+      expect(requests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "sess-1" },
+      ]),
+    );
+    detach();
+  });
+
+  it("switches to the Run artifact on the acknowledged fast path", async () => {
+    const execute = vi.fn().mockResolvedValue("run-456");
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(requests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "sess-1" },
+      ]),
+    );
+    detach();
+  });
+
+  it("does not switch artifacts when execute resolves null (fanout guard / block)", async () => {
+    // executionStore.execute returns null for the 428 fanout guard, a 409
+    // conflict, and the interpretation block — none of which launched a run.
+    const execute = vi.fn().mockResolvedValue(null);
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    const { requests, detach } = collectArtifactRequests();
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    await act(async () => Promise.resolve());
+    expect(requests).toEqual([]);
+    detach();
   });
 
   // ── Phase 5b.18b.7 — interpretation-review run gating ──────────────────────

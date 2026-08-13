@@ -11,6 +11,11 @@ import { useAuthStore } from "./authStore";
 import type { ValidationResult } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { humaniseValidationMessage, makePhraseFor } from "@/lib/validationHumaniser";
+import {
+  characterisePendingControls,
+  pendingControlsInstruction,
+} from "@/components/chat/acknowledgementLabels";
+import { useInterpretationEventsStore } from "./interpretationEventsStore";
 
 let previousVersion: number | null = null;
 let previousSessionIds: Set<string> = new Set();
@@ -303,14 +308,53 @@ export function initStoreSubscriptions(): void {
       const count = result.readiness.blockers.filter(
         (blocker) => blocker.code === "interpretation_review_pending",
       ).length;
+      // Button names come from `characterisePendingControls` /
+      // `pendingControlsInstruction` (acknowledgementLabels.ts), the SAME
+      // rule ChatInput's placeholder uses, so this note cannot drift from
+      // the rendered controls or from the sibling surface
+      // (elspeth-0a9f77dd75). Any set that rule cannot characterise — a mix
+      // that includes a prompt card, or an empty/stale pending map (the
+      // events stream in on a separate fetch that can lag validation) —
+      // returns null and falls back to neutral wording that names no control
+      // at all. The invariant is one-way: never name a control the pending
+      // card(s) do not render.
+      //
+      // Not tutorial-aware, and does not need to be: the stack additionally
+      // suppresses amend in tutorial mode (AcknowledgementStack `showAmend={
+      // !isTutorial && …}`), but this note is injected into sessionStore
+      // `messages`, which only the FREEFORM ChatPanel branch renders — the
+      // tutorial/guided column renders `guidedSession.chat_history` instead.
+      const pendingMap =
+        useInterpretationEventsStore.getState().pendingBySession[
+          sessionStore.activeSessionId ?? ""
+        ];
+      const pendingKinds =
+        pendingMap === undefined
+          ? []
+          : Object.values(pendingMap).map((event) => event.kind);
+      const instruction = pendingControlsInstruction(
+        characterisePendingControls(pendingKinds),
+        (label) => `**${label}**`,
+      );
+      // One vocabulary for one action (ux-review 2026-08-13): the click
+      // records an attestation, so the prose says "sign-off"/"acknowledged"
+      // throughout rather than mixing "okay", "Acknowledge" and "approved".
+      // "approved" in particular was the lowercase form of a DIFFERENT
+      // control's name (Approve), which all-vague_term sets never render.
+      const pickSingular =
+        instruction ?? "use the buttons on the card to resolve it";
+      const pickPlural =
+        instruction === null
+          ? "use the buttons on each card to resolve them"
+          : `${instruction} for each`;
       const message =
         count === 1
-          ? "I made one choice while building this that I'd like you to okay. " +
-            "Check the card above and pick **Use** or **Change it** — then your " +
-            "pipeline's ready to run."
-          : `I made ${count} choices while building this that I'd like you to okay. ` +
-            "Check the cards above and pick **Use** or **Change it** for each — " +
-            "once they're all approved, your pipeline's ready to run.";
+          ? "I made one choice while building this that needs your sign-off. " +
+            `Check the card above and ${pickSingular} — then your pipeline's ` +
+            "ready to run."
+          : `I made ${count} choices while building this that need your sign-off. ` +
+            `Check the cards above and ${pickPlural} — once every card is ` +
+            "acknowledged, your pipeline's ready to run.";
       sessionStore.injectSystemMessage(message, VALIDATION_MSG_ID);
       return;
     }
@@ -337,15 +381,19 @@ export function initStoreSubscriptions(): void {
       sessionStore.injectSystemMessage(lines.join("\n"), VALIDATION_MSG_ID);
     } else if (result.is_valid && previousWasPendingReview) {
       // The user just resolved the last pending interpretation review and the
-      // pipeline is otherwise clean. Replace the now-stale "needs your okay"
-      // message (same VALIDATION_MSG_ID) with a clear next step — the Run
-      // button lives in the side rail, away from the chat where the user's
-      // attention is, so name it explicitly. Gated on previousWasPendingReview
-      // so ordinary mid-compose valid results stay quiet.
+      // pipeline is otherwise clean. Replace the now-stale "needs your
+      // sign-off" message (same VALIDATION_MSG_ID) with a clear next step —
+      // the Run control lives away from the chat where the user's attention
+      // is, so NAME THE CONTROL. Deliberately no locative (was "in the side
+      // panel"): a place word is a second thing that can contradict the
+      // layout, which is the elspeth-eba8820005 defect class, and the control
+      // name "Run pipeline" is unique and searchable on its own. Gated on
+      // previousWasPendingReview so ordinary mid-compose valid results stay
+      // quiet.
       previousWasPendingReview = false;
       sessionStore.injectSystemMessage(
-        "All approved — your pipeline's ready. Select **Run pipeline** in the " +
-          "side panel to start it.",
+        "Every card acknowledged — your pipeline's ready. Select " +
+          "**Run pipeline** to start it.",
         VALIDATION_MSG_ID,
       );
     }

@@ -19,7 +19,9 @@ import {
   isCurrentWorkspaceViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
+import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import type { RunStatus } from "@/types/index";
 import { useWorkspacePaneController } from "./WorkspacePaneContext";
 import { PipelineSpecView } from "./PipelineSpecView";
 import { ARTIFACT_TABS, type ArtifactTab } from "./workspaceTypes";
@@ -107,7 +109,7 @@ function admitArtifactRequest(event: Event): RequestArtifactViewDetail | null {
   }
 }
 
-function activeArtifact(tab: ArtifactTab): JSX.Element {
+function activeArtifact(tab: ArtifactTab, runAvailable: boolean): JSX.Element {
   switch (tab) {
     case "graph":
       return <GraphView />;
@@ -116,19 +118,48 @@ function activeArtifact(tab: ArtifactTab): JSX.Element {
     case "yaml":
       return <YamlView />;
     case "run":
-      return <InlineRunResults showEmptyState />;
+      return <InlineRunResults showEmptyState runAvailable={runAvailable} />;
   }
 }
 
-export function ArtifactWorkspace(): JSX.Element {
+/** Dot colour for the Run-tab outcome badge. Mirrors ProgressView's terminal
+ *  colour mapping; `empty` (and any non-terminal residue) stays neutral. */
+function badgeTone(status: RunStatus): "success" | "warning" | "error" | "neutral" {
+  switch (status) {
+    case "completed":
+      return "success";
+    case "completed_with_failures":
+    case "cancelled":
+      return "warning";
+    case "failed":
+      return "error";
+    default:
+      return "neutral";
+  }
+}
+
+export function ArtifactWorkspace({
+  runAvailable = false,
+}: {
+  /** True only when the REQUEST_RUN_EVENT owner (ExecuteButton) is mounted —
+   *  App passes capabilities.completion; the tutorial shell leaves it false. */
+  runAvailable?: boolean;
+} = {}): JSX.Element {
   const activeSessionId = useSessionStore((state) => state.activeSessionId);
-  return <ArtifactWorkspaceSurface activeSessionId={activeSessionId} />;
+  return (
+    <ArtifactWorkspaceSurface
+      activeSessionId={activeSessionId}
+      runAvailable={runAvailable}
+    />
+  );
 }
 
 export function ArtifactWorkspaceSurface({
   activeSessionId,
+  runAvailable = false,
 }: {
   activeSessionId: string | null;
+  runAvailable?: boolean;
 }): JSX.Element {
   const { state, actions } = useWorkspacePaneController();
   const { activeArtifactTab, availableArtifactTabs } = state;
@@ -151,6 +182,51 @@ export function ArtifactWorkspaceSurface({
     id: 0,
     message: "",
   });
+
+  // Run-tab badge inputs (elspeth-3a7b7c7b37): pure executionStore readers —
+  // primitives only, never new pollers (the 3s loadRuns loop stays owned by
+  // InlineRunResults while the Run tab is active; see the polling pin).
+  const runOutcomeStatus = useExecutionStore(
+    (s) => s.lastRunOutcome?.status ?? null,
+  );
+  const runAttached = useExecutionStore(
+    (s) =>
+      s.activeRunId !== null &&
+      (s.progress?.status === "running" || s.progress?.status === "pending"),
+  );
+  const wsDisconnected = useExecutionStore((s) => s.wsDisconnected);
+  // A dropped WebSocket means progress.status can no longer advance from this
+  // tab, so the "live" pulse would spin forever for a run that may already be
+  // finished server-side — degrade the badge to the static neutral dot.
+  const runLive = runAttached && !wsDisconnected;
+  const acknowledgeRunOutcome = useExecutionStore(
+    (s) => s.acknowledgeRunOutcome,
+  );
+
+  // While the Run tab is active AND the artifact pane is actually visible,
+  // ProgressView is the single terminal-status announcement authority (its
+  // M07 live region) — acknowledge the outcome before paint so the badge
+  // clears and the App-level RunOutcomeNotice renders empty instead of
+  // double-announcing. The pane-visibility guard matters on narrow
+  // viewports: ComposerWorkspace keeps this surface MOUNTED but hidden/inert
+  // in compose view (same mounted-but-hidden fact pendingTabFocusRef
+  // consults), where ProgressView can neither be seen nor announced —
+  // swallowing the outcome there would silently reinstate the very defect
+  // the notice exists to fix.
+  useLayoutEffect(() => {
+    if (
+      state.artifactVisible &&
+      activeArtifactTab === "run" &&
+      runOutcomeStatus !== null
+    ) {
+      acknowledgeRunOutcome();
+    }
+  }, [
+    acknowledgeRunOutcome,
+    activeArtifactTab,
+    runOutcomeStatus,
+    state.artifactVisible,
+  ]);
 
   useInsertionEffect(() => {
     committedControllerRef.current = {
@@ -333,6 +409,21 @@ export function ArtifactWorkspaceSurface({
                 onKeyDown={handleTabKeyDown}
               >
                 {TAB_LABELS[tab]}
+                {/* Outcome/live badge — aria-hidden so the accessible tab
+                    name stays exactly "Run" (named-tab relationship pin). */}
+                {tab === "run" && (runAttached || runOutcomeStatus !== null) && (
+                  <span
+                    className="artifact-tab-badge"
+                    aria-hidden="true"
+                    data-tone={
+                      runAttached
+                        ? runLive
+                          ? "live"
+                          : "neutral"
+                        : badgeTone(runOutcomeStatus as RunStatus)
+                    }
+                  />
+                )}
               </button>
             );
           })}
@@ -382,7 +473,7 @@ export function ArtifactWorkspaceSurface({
                 key={`${activeSessionId ?? "no-session"}:${tab}`}
                 label={`${activeLabel} artifact`}
               >
-                {activeArtifact(tab)}
+                {activeArtifact(tab, runAvailable)}
               </ErrorBoundary>
             )}
           </div>

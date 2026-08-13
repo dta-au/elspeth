@@ -23,7 +23,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "@/api/client";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import { makeComposition } from "@/test/composerFixtures";
+import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
 import { useHashRouter } from "@/hooks/useHashRouter";
 import { ExportYamlButton } from "@/components/sidebar/ExportYamlButton";
 import {
@@ -60,6 +60,7 @@ class PassiveResizeObserver implements ResizeObserver {
 
 interface RenderArtifactWorkspaceOptions {
   inspector?: ReactNode;
+  runAvailable?: boolean;
 }
 
 function renderArtifactWorkspace(
@@ -68,7 +69,7 @@ function renderArtifactWorkspace(
   return render(
     <ComposerWorkspace
       authoring={<button type="button">Author control</button>}
-      artifact={<ArtifactWorkspace />}
+      artifact={<ArtifactWorkspace runAvailable={options.runAvailable} />}
       inspector={
         options.inspector ?? <button type="button">Validation status</button>
       }
@@ -146,8 +147,12 @@ describe("ArtifactWorkspace", () => {
     });
     useExecutionStore.setState({
       activeRunId: null,
+      activeRunSessionId: null,
       progress: null,
       runs: [],
+      lastRunOutcome: null,
+      validationResult: null,
+      wsDisconnected: false,
       loadRuns: vi.fn().mockResolvedValue("loaded"),
     } as never);
     vi.spyOn(api, "fetchYaml").mockResolvedValue({
@@ -1055,6 +1060,269 @@ describe("ArtifactWorkspace", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     window.removeEventListener("error", preventExpectedWindowError);
     consoleError.mockRestore();
+  });
+
+  // ── Run-tab outcome badge (elspeth-3a7b7c7b37) ────────────────────────────
+
+  it("badges the Run tab for an unacknowledged outcome and clears it on selecting Run", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "failed", sessionId: "session-1" },
+    } as never);
+    renderArtifactWorkspace();
+
+    // Accessible name stays exactly "Run": the badge is aria-hidden markup.
+    const runTab = screen.getByRole("tab", { name: "Run" });
+    const badge = runTab.querySelector(".artifact-tab-badge");
+    expect(badge).not.toBeNull();
+    expect(badge).toHaveAttribute("aria-hidden", "true");
+    expect(badge).toHaveAttribute("data-tone", "error");
+
+    fireEvent.click(runTab);
+    await act(async () => Promise.resolve());
+
+    // Selecting Run acknowledges the outcome (ProgressView owns the
+    // announcement there) and retires the badge.
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+    expect(runTab.querySelector(".artifact-tab-badge")).toBeNull();
+  });
+
+  it("maps completed outcomes to the success tone", () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      lastRunOutcome: {
+        runId: "run-1",
+        status: "completed",
+        sessionId: "session-1",
+      },
+    } as never);
+    renderArtifactWorkspace();
+
+    expect(
+      screen
+        .getByRole("tab", { name: "Run" })
+        .querySelector(".artifact-tab-badge"),
+    ).toHaveAttribute("data-tone", "success");
+  });
+
+  // `empty` is a terminal outcome the notice gives its own info tone, but the
+  // badge deliberately keeps it NEUTRAL: an empty run is not a fault, and a
+  // fourth colour on a 7px dot would add a distinction the user cannot read
+  // (see the decorative contract in workspace.css). Pinned so the mapping is
+  // a decision rather than the untested residue of badgeTone's default arm —
+  // and so the tone cannot silently drift onto warning/error, which WOULD
+  // claim a fault occurred.
+  it("keeps an empty-run outcome on the neutral tone rather than claiming a fault", () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      lastRunOutcome: {
+        runId: "run-1",
+        status: "empty",
+        sessionId: "session-1",
+      },
+    } as never);
+    renderArtifactWorkspace();
+
+    const badge = screen
+      .getByRole("tab", { name: "Run" })
+      .querySelector(".artifact-tab-badge");
+    // Badged at all — an empty run is still an unacknowledged outcome the
+    // operator has not seen.
+    expect(badge).not.toBeNull();
+    expect(badge).toHaveAttribute("data-tone", "neutral");
+  });
+
+  it("acknowledges an outcome immediately while Run is already the active tab", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    renderArtifactWorkspace();
+    fireEvent.click(screen.getByRole("tab", { name: "Run" }));
+    await act(async () => Promise.resolve());
+
+    // Terminal outcome lands while the Run panel (ProgressView's single
+    // announcement region) is mounted → suppressed before paint so the
+    // App-level notice never double-announces.
+    act(() => {
+      useExecutionStore.setState({
+        lastRunOutcome: {
+          runId: "run-1",
+          status: "completed",
+          sessionId: "session-1",
+        },
+      } as never);
+    });
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+    expect(
+      screen.getByRole("tab", { name: "Run" }).querySelector(".artifact-tab-badge"),
+    ).toBeNull();
+  });
+
+  it("shows a live pulse badge for an attached in-flight run without starting Run polling", () => {
+    vi.useFakeTimers();
+    const loadRuns = vi.fn().mockResolvedValue("loaded");
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      activeRunId: "run-live",
+      progress: { status: "running" },
+      runs: [],
+      loadRuns,
+    } as never);
+    renderArtifactWorkspace();
+
+    const badge = screen
+      .getByRole("tab", { name: "Run" })
+      .querySelector(".artifact-tab-badge");
+    expect(badge).toHaveAttribute("data-tone", "live");
+    expect(badge).toHaveAttribute("aria-hidden", "true");
+
+    // Extends the polling pin below: the badge is a pure store reader — no
+    // loadRuns traffic while the Run tab stays inactive.
+    act(() => vi.advanceTimersByTime(6000));
+    expect(loadRuns).not.toHaveBeenCalled();
+  });
+
+  // A dropped WebSocket freezes progress.status at "running" for a run that
+  // may already be finished server-side, so the pulse would animate forever
+  // and read as live evidence the tab no longer has. It degrades to the
+  // static neutral dot instead.
+  //
+  // What this assertion is and is NOT. data-tone is a DECORATIVE proxy: the
+  // badge is aria-hidden, and "live" differs from "neutral" only by an
+  // animation that workspace.css disables under prefers-reduced-motion — so a
+  // reduced-motion user cannot perceive this flip at all. The pin is here
+  // because the tone attribute is the only observable handle on the
+  // degradation decision in jsdom, not because the tone is the user-facing
+  // contract. The observable contracts are elsewhere and tested elsewhere:
+  // ProgressView's .progress-ws-banner states the dropped connection in
+  // words, and the terminal outcome is carried by the RunOutcomeNotice toast.
+  // Do not promote this into a claim about what the user perceives; see the
+  // decorative contract in workspace.css.
+  it("degrades the attached-run badge from the live pulse when the WebSocket drops", () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      activeRunId: "run-live",
+      progress: { status: "running" },
+      runs: [],
+      wsDisconnected: true,
+    } as never);
+    renderArtifactWorkspace();
+
+    const badge = screen
+      .getByRole("tab", { name: "Run" })
+      .querySelector(".artifact-tab-badge");
+    // Still badged — the tab still owns a run — but not as live.
+    expect(badge).not.toBeNull();
+    expect(badge).toHaveAttribute("data-tone", "neutral");
+  });
+
+  // Acknowledgement is a claim that ProgressView's live region has taken over
+  // the announcement. That claim only holds where ProgressView can actually
+  // be seen: ComposerWorkspace keeps this surface MOUNTED but hidden/inert in
+  // compose view on narrow viewports, and swallowing the outcome there would
+  // reinstate the off-Run-tab silence the notice exists to fix.
+  describe("outcome acknowledgement requires a VISIBLE artifact pane", () => {
+    function renderRunTabSurface(artifactVisible: boolean) {
+      return render(
+        <WorkspacePaneProvider
+          artifactVisible={artifactVisible}
+          paneState={
+            {
+              authoringCollapsed: false,
+              availableArtifactTabs: ["graph", "spec", "yaml", "run"],
+              activeArtifactTab: "run",
+              activeInspectorTab: null,
+              inspectorOpen: false,
+              resizeTransient: vi.fn(),
+              commitResize: vi.fn(),
+              setAuthoringCollapsed: vi.fn(),
+              selectArtifactTab: vi.fn(),
+              openInspector: vi.fn(),
+              closeInspector: vi.fn(),
+            } as never
+          }
+        >
+          <ArtifactWorkspaceSurface activeSessionId="session-1" />
+        </WorkspacePaneProvider>,
+      );
+    }
+
+    const outcome = {
+      runId: "run-1",
+      status: "completed_with_failures" as const,
+      sessionId: "session-1",
+    };
+
+    it("keeps the outcome unacknowledged while the Run tab is mounted but hidden", () => {
+      useExecutionStore.setState({ lastRunOutcome: outcome } as never);
+
+      renderRunTabSurface(false);
+
+      // The outcome survives for the always-mounted RunOutcomeNotice, and the
+      // badge keeps carrying it on the tab the operator has not yet reached.
+      expect(useExecutionStore.getState().lastRunOutcome).toEqual(outcome);
+      expect(
+        screen
+          .getByRole("tab", { name: "Run" })
+          .querySelector(".artifact-tab-badge"),
+      ).toHaveAttribute("data-tone", "warning");
+    });
+
+    it("acknowledges the outcome once the Run tab is visible", () => {
+      useExecutionStore.setState({ lastRunOutcome: outcome } as never);
+
+      renderRunTabSurface(true);
+
+      expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+      expect(
+        screen
+          .getByRole("tab", { name: "Run" })
+          .querySelector(".artifact-tab-badge"),
+      ).toBeNull();
+    });
+  });
+
+  it("forwards runAvailable to the Run panel's empty-state affordance", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    // The affordance needs BOTH facts: runAvailable (the REQUEST_RUN_EVENT
+    // owner is mounted) threaded down from here, and execution readiness
+    // read by InlineRunResults itself.
+    useExecutionStore.setState({
+      validationResult: makeValidationResult(),
+    } as never);
+    const user = userEvent.setup();
+    renderArtifactWorkspace({ runAvailable: true });
+
+    await user.click(screen.getByRole("tab", { name: "Run" }));
+
+    const runPanel = screen.getByRole("tabpanel", { name: "Run" });
+    expect(
+      await within(runPanel).findByRole("button", { name: "Run pipeline" }),
+    ).toBeInTheDocument();
+    expect(runPanel).toHaveTextContent(
+      "No runs yet. Run the pipeline to see its results here.",
+    );
+  });
+
+  // The OMITTED-prop arm, pinned separately from the explicit-false arm.
+  // TutorialGuidedShell does not pass runAvailable at all, so the tutorial's
+  // freedom from a dead Run control rests entirely on this default — which
+  // means a future `runAvailable = true` default would silently enable it
+  // there while every tutorial test still passed.
+  it("defaults runAvailable to off, so an omitted prop offers no Run affordance", async () => {
+    useSessionStore.setState({ compositionState: makeComposition(1) });
+    useExecutionStore.setState({
+      validationResult: makeValidationResult(),
+    } as never);
+    const user = userEvent.setup();
+    renderArtifactWorkspace();
+
+    await user.click(screen.getByRole("tab", { name: "Run" }));
+
+    const runPanel = screen.getByRole("tabpanel", { name: "Run" });
+    await within(runPanel).findByText("No runs yet.");
+    expect(
+      within(runPanel).queryByRole("button", { name: "Run pipeline" }),
+    ).not.toBeInTheDocument();
   });
 
   it("owns one Run polling stream only while Run is active", async () => {

@@ -1072,6 +1072,18 @@ export function ChatPanel({
       ),
     [compositionProposals],
   );
+  // Mid-flight tool activity for the ComposingIndicator's live tool log
+  // (elspeth-3c2caf56a7). The atomic-reveal gate below hides the incomplete
+  // tail agent turn's bubble, but its aggregatedToolCalls already carry the
+  // per-call rows the inflight-messages poll delivers mid-turn — a read-only
+  // projection; turn completeness semantics stay untouched. Empty once the
+  // genuine reply lands or a new user row becomes the tail (fresh request).
+  const liveToolCalls = useMemo(() => {
+    const tail = chatTurns[chatTurns.length - 1];
+    return isComposing && tail !== undefined && tail.kind === "agent" && !tail.isComplete
+      ? tail.aggregatedToolCalls
+      : [];
+  }, [chatTurns, isComposing]);
 
   function scrollToBottom() {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -1940,13 +1952,51 @@ export function ChatPanel({
   // step-advance focus effect below: on a Send both fire, and the focus
   // effect's scrollIntoView must win so the just-built decision presents itself.
   const guidedChatHistoryLength = guidedSession?.chat_history.length ?? 0;
+  // Identity of the transcript the length above belongs to: the active
+  // session while a guided session is loaded, null otherwise. ChatPanel is
+  // mounted unkeyed and survives session switches, so without this a switch
+  // to a session with a LONGER history — or a freeform→guided flip
+  // (length 0→N) — read as chat growth and fired a spurious reveal-scroll
+  // that fought the pin-to-bottom on a freshly shown transcript. An identity
+  // change re-seeds the previous-length ref instead of comparing across
+  // transcripts; only genuine same-session appends reveal.
+  const guidedChatIdentity = guidedSession === null ? null : activeSessionId;
+  const prevGuidedChatLenRef = useRef(guidedChatHistoryLength);
+  const prevGuidedChatIdentityRef = useRef(guidedChatIdentity);
   useEffect(() => {
+    const previousLength = prevGuidedChatLenRef.current;
+    const identityChanged =
+      prevGuidedChatIdentityRef.current !== guidedChatIdentity;
+    prevGuidedChatLenRef.current = guidedChatHistoryLength;
+    prevGuidedChatIdentityRef.current = guidedChatIdentity;
     const container = guidedWorkspaceScrollRef.current;
     if (!container) return;
     if (!guidedWorkspaceAtBottomRef.current) return;
     container.scrollTop = container.scrollHeight;
+    // Guided geometry inverts freeform's: the transcript sits ABOVE the
+    // decision card, so on chat_history growth the pin above re-shows the
+    // card while the newly appended turn (e.g. an Explain reply, which
+    // changes neither step_index nor turn type and so never fires the
+    // step-advance effect below) lands above the fold. Reveal it — the
+    // stage-divider rows carry no data-seq, so the last [data-seq] row is
+    // always the newest conversational turn. On a turn-rebuilding Send the
+    // step-advance effect still runs after this one and its scrollIntoView
+    // wins (ordering doctrine above).
+    if (!identityChanged && guidedChatHistoryLength > previousLength) {
+      const rows = container.querySelectorAll(
+        ".guided-chat-bubbles [data-seq]",
+      );
+      rows[rows.length - 1]?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+    }
   }, [
     guidedChatHistoryLength,
+    // Identity must be a dep: a switch between sessions with EQUAL history
+    // lengths otherwise never re-runs the effect, leaving stale refs that
+    // suppress (or misread) the next genuine append in the new session.
+    guidedChatIdentity,
     guidedChatPending,
     guidedResponsePending,
   ]);
@@ -2772,155 +2822,174 @@ export function ChatPanel({
         </>
       )}
 
-      {/* Message list.
-          tabIndex=0 (elspeth-5e43a0c8b2, WCAG 2.1.1): the scroll container
-          must be keyboard-focusable so keyboard-only users can arrow-scroll
-          a long conversation instead of tabbing through every interactive
-          child. The focus ring is the app's :focus-visible idiom, drawn
-          inset in chat.css because .chat-panel clips overflow. role="log"
-          aria-live semantics are unchanged. */}
-      <div
-        ref={scrollContainerRef}
-        onScroll={handleScroll}
-        className="chat-panel-messages"
-        role="log"
-        aria-label="Conversation"
-        aria-live="polite"
-        aria-relevant="additions"
-        tabIndex={0}
-      >
-        {messages.length === 0 ? (
-          <FreeformIntroduction />
-        ) : (
-          // Render one bubble per *turn*, not one per audit row. The compose
-          // loop persists every LLM round-trip as its own assistant row
-          // (Tier-1 audit doctrine); grouping projects the audit stream onto
-          // user-visible turns so a single user prompt becomes one user
-          // bubble + one agent bubble that aggregates every tool call and the
-          // final answer. See ./turns.ts.
-          //
-          // Atomic-reveal gate: agent turns that are mid-flight (only
-          // tool-call rows landed, no LLM text reply yet) are hidden from the
-          // timeline. The ComposingIndicator (rendered further down while
-          // `isComposing` is true) is the visible affordance for "the agent
-          // is thinking" — leaking a half-assembled bubble on top of it
-          // creates a confusing race between tool calls and the eventual
-          // answer. User and system turns are always complete, so the gate
-          // is a no-op for them. See turns.ts → ChatTurn.isComplete.
-          //
-          // `|| !isComposing` is the terminal escape (elspeth-e074575b6e).
-          // A turn is only "mid-flight" while the composer is still running;
-          // once isComposing goes false nothing more is coming, so an
-          // incomplete turn is one that ENDED without a reply (convergence /
-          // timeout — the backend persists partial state and the tool audit,
-          // then raises 422, and never writes a reply row). A later turn also
-          // proves an incomplete agent turn is historical, even while a new
-          // composition is running. Those historical turns must still render
-          // so their tool calls stay visible; only the current tail turn stays
-          // behind the atomic-reveal gate.
-          chatTurns
-            .filter(
-              (turn: ChatTurn, index: number) =>
-                turn.isComplete || !isComposing || index < chatTurns.length - 1,
-            )
-            .map((turn: ChatTurn) => {
-              const repr = turnRepresentativeMessage(turn);
-              // Attach the inline-source summary to the most recent complete
-              // agent turn — that's the turn whose audit narrative includes
-              // the source-creation event. The store holds at most one
-              // summary per session today; passing it as a list keeps the
-              // bubble's contract ready for multi-source turns without a
-              // future refactor here. When no agent turn is present (e.g.
-              // session-restore loaded a composition before any chat), the
-              // summary falls through to the standalone widget rendered
-              // below the message stream.
-              const sourcesForThisTurn =
-                inlineSourceSummary && turn.id === inlineSourceTargetTurnId
-                  ? [inlineSourceSummary]
-                  : undefined;
-              return (
-                <MessageBubble
-                  key={turn.id}
-                  message={repr}
-                  isComposing={isComposing}
-                  onRetry={turn.kind === "user" ? retryMessage : undefined}
-                  onFork={turn.kind === "user" ? handleFork : undefined}
-                  proposalsByToolCallId={proposalsByToolCallId}
-                  compositionState={compositionState}
-                  staleProposalIds={staleProposalIds}
-                  proposalActionPendingIds={proposalActionPendingIds}
-                  onAcceptProposal={acceptProposal}
-                  onRejectProposal={rejectProposal}
-                  sourcesCreated={sourcesForThisTurn}
-                  onEditInlineSource={handleEditInlineSource}
-                />
-              );
-            })
-        )}
-        {/* Standalone fallback for the inline-source summary: only painted
-            when no complete agent turn exists to absorb it into the bubble
-            (e.g. session-restore where a composition was loaded before any
-            chat turn happened). The hybrid keeps the operator's stated UX —
-            sources-created appears inside the bubble like tool calls do —
-            while not silently dropping the summary in pre-chat states. */}
-        {inlineSourceSummary && inlineSourceTargetTurnId === null && (
-          <InlineSourceCreatedTurn
-            summary={inlineSourceSummary}
-            onEdit={handleEditInlineSource}
-          />
-        )}
-        {/*
-          Resolve-success confirmation bubbles (Phase 5b.18b.8).
+      {/* Messages region (elspeth-4ad68a3769): the positioning containing
+          block for the jump-to-latest pill. The pill lives INSIDE this
+          region (so its bottom edge tracks the messages area, clearing the
+          indicator/banners/ChatInput at every pane width) but OUTSIDE the
+          scrolling element (so it floats instead of scrolling away). */}
+      <div className="chat-panel-messages-region">
+        {/* Message list.
+            tabIndex=0 (elspeth-5e43a0c8b2, WCAG 2.1.1): the scroll container
+            must be keyboard-focusable so keyboard-only users can arrow-scroll
+            a long conversation instead of tabbing through every interactive
+            child. The focus ring is the app's :focus-visible idiom, drawn
+            inset in chat.css because .chat-panel clips overflow. role="log"
+            aria-live semantics are unchanged. */}
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="chat-panel-messages"
+          role="log"
+          aria-label="Conversation"
+          aria-live="polite"
+          aria-relevant="additions"
+          tabIndex={0}
+        >
+          {messages.length === 0 ? (
+            <FreeformIntroduction />
+          ) : (
+            // Render one bubble per *turn*, not one per audit row. The compose
+            // loop persists every LLM round-trip as its own assistant row
+            // (Tier-1 audit doctrine); grouping projects the audit stream onto
+            // user-visible turns so a single user prompt becomes one user
+            // bubble + one agent bubble that aggregates every tool call and the
+            // final answer. See ./turns.ts.
+            //
+            // Atomic-reveal gate: agent turns that are mid-flight (only
+            // tool-call rows landed, no LLM text reply yet) are hidden from the
+            // timeline. The ComposingIndicator (rendered further down while
+            // `isComposing` is true) is the visible affordance for "the agent
+            // is thinking" — leaking a half-assembled bubble on top of it
+            // creates a confusing race between tool calls and the eventual
+            // answer. User and system turns are always complete, so the gate
+            // is a no-op for them. See turns.ts → ChatTurn.isComplete.
+            //
+            // `|| !isComposing` is the terminal escape (elspeth-e074575b6e).
+            // A turn is only "mid-flight" while the composer is still running;
+            // once isComposing goes false nothing more is coming, so an
+            // incomplete turn is one that ENDED without a reply (convergence /
+            // timeout — the backend persists partial state and the tool audit,
+            // then raises 422, and never writes a reply row). A later turn also
+            // proves an incomplete agent turn is historical, even while a new
+            // composition is running. Those historical turns must still render
+            // so their tool calls stay visible; only the current tail turn stays
+            // behind the atomic-reveal gate.
+            chatTurns
+              .filter(
+                (turn: ChatTurn, index: number) =>
+                  turn.isComplete || !isComposing || index < chatTurns.length - 1,
+              )
+              .map((turn: ChatTurn) => {
+                const repr = turnRepresentativeMessage(turn);
+                // Attach the inline-source summary to the most recent complete
+                // agent turn — that's the turn whose audit narrative includes
+                // the source-creation event. The store holds at most one
+                // summary per session today; passing it as a list keeps the
+                // bubble's contract ready for multi-source turns without a
+                // future refactor here. When no agent turn is present (e.g.
+                // session-restore loaded a composition before any chat), the
+                // summary falls through to the standalone widget rendered
+                // below the message stream.
+                const sourcesForThisTurn =
+                  inlineSourceSummary && turn.id === inlineSourceTargetTurnId
+                    ? [inlineSourceSummary]
+                    : undefined;
+                return (
+                  <MessageBubble
+                    key={turn.id}
+                    message={repr}
+                    isComposing={isComposing}
+                    onRetry={turn.kind === "user" ? retryMessage : undefined}
+                    onFork={turn.kind === "user" ? handleFork : undefined}
+                    proposalsByToolCallId={proposalsByToolCallId}
+                    compositionState={compositionState}
+                    staleProposalIds={staleProposalIds}
+                    proposalActionPendingIds={proposalActionPendingIds}
+                    onAcceptProposal={acceptProposal}
+                    onRejectProposal={rejectProposal}
+                    sourcesCreated={sourcesForThisTurn}
+                    onEditInlineSource={handleEditInlineSource}
+                  />
+                );
+              })
+          )}
+          {/* Standalone fallback for the inline-source summary: only painted
+              when no complete agent turn exists to absorb it into the bubble
+              (e.g. session-restore where a composition was loaded before any
+              chat turn happened). The hybrid keeps the operator's stated UX —
+              sources-created appears inside the bubble like tool calls do —
+              while not silently dropping the summary in pre-chat states. */}
+          {inlineSourceSummary && inlineSourceTargetTurnId === null && (
+            <InlineSourceCreatedTurn
+              summary={inlineSourceSummary}
+              onEdit={handleEditInlineSource}
+            />
+          )}
+          {/*
+            Resolve-success confirmation bubbles (Phase 5b.18b.8).
 
-          One assistant-styled bubble per resolved interpretation. Rendered
-          inside the role="log" region so the new bubble is announced to
-          AT users on append (aria-live="polite" on the parent). The
-          bubbles use the same chat-message--assistant styling as ordinary
-          assistant turns so the confirmation visually flows with the
-          conversation. These are NOT persisted to sessionStore.messages
-          and do NOT round-trip to the server — see the
-          handleInterpretationResolved comment above for the rationale.
-        */}
-        {resolveConfirmations.map((conf) => (
-          <div
-            key={conf.id}
-            className="chat-message chat-message--assistant interpretation-review-confirmation"
-            data-testid="interpretation-review-confirmation"
-            role="status"
+            One assistant-styled bubble per resolved interpretation. Rendered
+            inside the role="log" region so the new bubble is announced to
+            AT users on append (aria-live="polite" on the parent). The
+            bubbles use the same chat-message--assistant styling as ordinary
+            assistant turns so the confirmation visually flows with the
+            conversation. These are NOT persisted to sessionStore.messages
+            and do NOT round-trip to the server — see the
+            handleInterpretationResolved comment above for the rationale.
+          */}
+          {resolveConfirmations.map((conf) => (
+            <div
+              key={conf.id}
+              className="chat-message chat-message--assistant interpretation-review-confirmation"
+              data-testid="interpretation-review-confirmation"
+              role="status"
+            >
+              Got it — using your interpretation of{" "}
+              <em className="interpretation-review-confirmation-user-term">
+                {conf.userTerm}
+              </em>
+              .
+            </div>
+          ))}
+          {/*
+            Inline-source disambiguation widgets (Phase 5a Task 4).
+
+            One widget per pending+non-stale ambiguous-inline proposal
+            that survives the F-10 / F-11 re-fire guards (see
+            `disambiguationCandidates` derivation above for the
+            predicate). Each widget claims its proposal id; the same id
+            is excluded from `bannerProposals` so the standard
+            PendingProposalsBanner does not duplicate the action
+            surface. Non-ambiguous proposals continue to route through
+            the banner unchanged.
+          */}
+          {disambiguationCandidates.map((candidate) => (
+            <InlineSourceDisambiguationTurn
+              key={candidate.proposal.id}
+              userInput={candidate.userInput}
+              proposedRows={candidate.proposedRows}
+              proposalId={candidate.proposal.id}
+              messageId={candidate.messageId}
+              onConfirmMultiRow={handleDisambiguationConfirmMultiRow}
+              onTreatAsOneRow={handleDisambiguationTreatAsOneRow}
+              onEditRows={handleDisambiguationEditRows}
+              onNotSourceData={handleDisambiguationNotSourceData}
+            />
+          ))}
+          <div ref={messagesEndRef} />
+        </div>
+
+        {/* Scroll-to-bottom button — sibling of the scrolling element, so it
+            floats over the messages instead of scrolling away with them. */}
+        {showScrollButton && (
+          <button
+            onClick={scrollToBottom}
+            aria-label="Scroll to bottom"
+            className="btn scroll-to-bottom-btn"
           >
-            Got it — using your interpretation of{" "}
-            <em className="interpretation-review-confirmation-user-term">
-              {conf.userTerm}
-            </em>
-            .
-          </div>
-        ))}
-        {/*
-          Inline-source disambiguation widgets (Phase 5a Task 4).
-
-          One widget per pending+non-stale ambiguous-inline proposal
-          that survives the F-10 / F-11 re-fire guards (see
-          `disambiguationCandidates` derivation above for the
-          predicate). Each widget claims its proposal id; the same id
-          is excluded from `bannerProposals` so the standard
-          PendingProposalsBanner does not duplicate the action
-          surface. Non-ambiguous proposals continue to route through
-          the banner unchanged.
-        */}
-        {disambiguationCandidates.map((candidate) => (
-          <InlineSourceDisambiguationTurn
-            key={candidate.proposal.id}
-            userInput={candidate.userInput}
-            proposedRows={candidate.proposedRows}
-            proposalId={candidate.proposal.id}
-            messageId={candidate.messageId}
-            onConfirmMultiRow={handleDisambiguationConfirmMultiRow}
-            onTreatAsOneRow={handleDisambiguationTreatAsOneRow}
-            onEditRows={handleDisambiguationEditRows}
-            onNotSourceData={handleDisambiguationNotSourceData}
-          />
-        ))}
-        <div ref={messagesEndRef} />
+            {"\u2193"} Jump to latest
+          </button>
+        )}
       </div>
 
       {/* Composing indicator — deliberately a SIBLING of the role="log"
@@ -2935,18 +3004,8 @@ export function ChatPanel({
           compositionState={compositionState}
           composerProgress={composerProgress}
           completionOutcome={freeformCompletionOutcome}
+          liveToolCalls={liveToolCalls}
         />
-      )}
-
-      {/* Scroll-to-bottom button */}
-      {showScrollButton && (
-        <button
-          onClick={scrollToBottom}
-          aria-label="Scroll to bottom"
-          className="btn scroll-to-bottom-btn"
-        >
-          {"\u2193"} Jump to latest
-        </button>
       )}
 
       {/* Blob manager drawer */}

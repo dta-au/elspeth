@@ -185,9 +185,57 @@ describe("PipelineSpecView", () => {
       name: "Source input options",
     });
     expect(options).toHaveAttribute("tabindex", "0");
-    expect(options.textContent).toBe(
+    // Prove the highlighted JSON path rendered, not the plain fallback.
+    const highlighted = options.querySelector("[data-codeblock-format='json']");
+    expect(highlighted).not.toBeNull();
+    expect(
+      options.querySelector("[data-codeblock-format='plain']"),
+    ).toBeNull();
+    // Byte-exact oracle, indentation included. The shared prism highlighter
+    // renders one <div> per line, so the container's textContent loses the
+    // newlines with no separator — reconstruct them from the per-line
+    // children rather than normalising whitespace away. Deleting the
+    // whitespace would leave 2-space pretty-printing unpinned, and
+    // pretty-printing is the whole reason the Spec tab routes through
+    // CodeBlock with prettyJson.
+    const renderedLines = Array.from(highlighted?.children ?? []).map(
+      (line) => line.textContent ?? "",
+    );
+    expect(renderedLines.join("\n")).toBe(
       JSON.stringify({ delimiter: ",", header: true }, null, 2),
     );
+  });
+
+  it("keeps each dt/dd pair wrapped in a div so the spec-card grid contract holds", () => {
+    // .pipeline-spec-card dl lays out via grid + display:contents on the
+    // direct <div> children — the markup shape IS the styling contract.
+    useSessionStore.setState({
+      compositionState: makeComposition(2, {
+        sources: {
+          input: {
+            plugin: "csv",
+            options: {},
+            on_success: "rows",
+          },
+        },
+        nodes: [],
+        outputs: [],
+      }),
+    });
+
+    render(<PipelineSpecView />);
+
+    const card = screen.getByRole("article", { name: "Source input" });
+    const definitionList = card.querySelector("dl");
+    expect(definitionList).not.toBeNull();
+    const rows = Array.from(definitionList?.children ?? []);
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.tagName).toBe("DIV");
+      expect(
+        Array.from(row.children).map((child) => child.tagName),
+      ).toEqual(["DT", "DD"]);
+    }
   });
 
   it("reports empty sections without inventing components", () => {

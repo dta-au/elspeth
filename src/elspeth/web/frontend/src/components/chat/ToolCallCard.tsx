@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
-import { describeToolCall } from "./toolCallDescriptions";
+import { describeToolCall, toolCallOutcomeLabel } from "./toolCallDescriptions";
 
 /**
  * A button-triggered tooltip explaining what a composer tool call does in
@@ -85,19 +85,13 @@ export function ToolCallCard({
     // Proposal-less calls carry a server-derived outcome stamped by
     // GET /messages from the Tier-1 tool rows (elspeth-f5e6723133). In
     // auto_commit mode mutations execute without proposal rows, so without
-    // the stamp every applied change rendered as a read. No stamp (live
-    // stream, unclassifiable history) keeps the conservative lookup label.
+    // the stamp every applied change rendered as a read. "Looked up" is
+    // reserved for names in the read-only description map; a "completed"
+    // stamp on any other name (durable blob/interpretation writes) renders
+    // "Completed", and an unstamped non-read-only row renders "Ran" — no
+    // stamp means no server evidence of success, so no success is claimed.
     const outcome = toolCall.outcome;
-    const label =
-      outcome === "applied"
-        ? `Applied: ${toolCall.function.name}`
-        : outcome === "rejected"
-          ? `Attempted: ${toolCall.function.name} (not applied)`
-          : outcome === "failed"
-            ? `Failed: ${toolCall.function.name}`
-            : outcome === "cancelled"
-              ? `Cancelled: ${toolCall.function.name}`
-              : `Looked up: ${toolCall.function.name}`;
+    const label = toolCallOutcomeLabel(toolCall.function.name, outcome);
     const appliedVersion =
       outcome === "applied" && typeof toolCall.applied_state_version === "number"
         ? toolCall.applied_state_version

@@ -17,6 +17,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ChatInput } from "./ChatInput";
+import {
+  ACKNOWLEDGEMENT_ACCEPT_LABEL,
+  ACKNOWLEDGEMENT_AMEND_LABEL,
+  ACKNOWLEDGEMENT_APPROVE_LABEL,
+  ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+} from "./acknowledgementLabels";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -654,7 +660,190 @@ describe("ChatInput pending-interpretation placeholder cue", () => {
     // different column in the guided workspace, so the cue names the card
     // rather than pointing "above".
     expect(textarea.placeholder).toBe(
-      'Reviewing your interpretation of "cool" — pick Use mine or Change it on the review card to continue.',
+      'Reviewing your interpretation of "cool" — pick Acknowledge or Change… on the review card to continue.',
+    );
+  });
+
+  it("names the card's exact button labels in the cue (anti-drift, elspeth-0a9f77dd75)", () => {
+    // Truth test via the shared constants: the cue must name the buttons the
+    // card actually renders, and the retired inline-review vocabulary must
+    // not resurface.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({ user_term: "cool" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toContain(ACKNOWLEDGEMENT_ACCEPT_LABEL);
+    expect(textarea.placeholder).toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+    expect(textarea.placeholder).not.toContain("Use mine");
+    expect(textarea.placeholder).not.toContain("Change it");
+  });
+
+  it("prompt-template cue names View prompt then Approve, never the vague-term buttons (kind-aware, ux-review 2026-08-13)", () => {
+    // Prompt-template cards render "View prompt" + "Approve" — neither
+    // "Acknowledge" nor "Change…" exists on them, so the cue must not name
+    // absent controls.  The machine-facing user_term
+    // ("llm_prompt_template:<node id>") is deliberately not echoed.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+      llm_draft: "Summarise {{ row.body }} for an auditor.",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing an LLM-drafted prompt — pick " +
+        `${ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}, then ` +
+        `${ACKNOWLEDGEMENT_APPROVE_LABEL} on the review card to continue.`,
+    );
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_ACCEPT_LABEL);
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+    expect(textarea.placeholder).not.toContain("llm_prompt_template:node-1");
+  });
+
+  it("drops the Change… half for kinds without the amend affordance (kind-aware, ux-review 2026-08-13)", () => {
+    // supportsAmendment gates "Change…" to vague_term / legacy-null cards;
+    // a model-choice card renders Acknowledge alone, so the cue must too.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({
+      kind: "llm_model_choice",
+      user_term: "a good model",
+      llm_draft: "anthropic/claude-sonnet-4.6",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    // The NOUN is kind-branched too (ux-review 2026-08-13): an
+    // llm_model_choice is the composer's pick, not "your interpretation".
+    expect(textarea.placeholder).toBe(
+      "Reviewing the model the composer picked — pick " +
+        `${ACKNOWLEDGEMENT_ACCEPT_LABEL} on the review card to continue.`,
+    );
+    expect(textarea.placeholder).not.toContain(ACKNOWLEDGEMENT_AMEND_LABEL);
+  });
+
+  // ── Per-kind subject noun (ux-review 2026-08-13) ─────────────────────────
+  //
+  // The fallback branch used to call EVERY kind "your interpretation of X".
+  // That is a category error, not a loose synonym: a pipeline_decision, an
+  // llm_model_choice and an invented_source are things the COMPOSER chose,
+  // and telling an operator they are their own interpretation reassigns
+  // authorship at the moment they are asked to attest.  Only vague_term /
+  // legacy-null echo the term, because only there is the term the user's.
+  it.each([
+    [
+      "pipeline_decision" as const,
+      "Reviewing a decision the composer made",
+    ],
+    [
+      "invented_source" as const,
+      "Reviewing source data the composer invented",
+    ],
+  ])("names %s as the composer's choice, not the user's interpretation", (
+    kind,
+    expectedSubject,
+  ) => {
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const event = makePendingEvent({ kind, user_term: "the fast path" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [ACTIVE_SESSION_ID]: { [event.id]: event } },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      `${expectedSubject} — pick ${ACKNOWLEDGEMENT_ACCEPT_LABEL} ` +
+        "on the review card to continue.",
+    );
+    // The authorship claim is the whole point of the fix.
+    expect(textarea.placeholder).not.toContain("your interpretation");
+  });
+
+  // ── Set-aware cue (ux-review 2026-08-13) ─────────────────────────────────
+  //
+  // The selector used to return on the FIRST pending event carrying a
+  // user_term and speak in the singular, so a mixed pending set named
+  // controls some visible cards do not render — the elspeth-0a9f77dd75
+  // defect surviving in this sibling surface.  subscriptions.ts already
+  // solved it; both callers now share characterisePendingControls.
+  it("names no control and pluralises when the pending set is mixed", () => {
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    // A prompt review plus a term review from the same turn — routine.
+    const promptEvent = makePendingEvent({
+      id: "evt-prompt",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+    });
+    const termEvent = makePendingEvent({ id: "evt-term", user_term: "cool" });
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        [ACTIVE_SESSION_ID]: {
+          [promptEvent.id]: promptEvent,
+          [termEvent.id]: termEvent,
+        },
+      },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing 2 composer choices — use the buttons on the review cards " +
+        "to continue.",
+    );
+    // No single control name is true of both cards, so name none of them.
+    for (const label of [
+      ACKNOWLEDGEMENT_ACCEPT_LABEL,
+      ACKNOWLEDGEMENT_AMEND_LABEL,
+      ACKNOWLEDGEMENT_APPROVE_LABEL,
+      ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+    ]) {
+      expect(textarea.placeholder).not.toContain(label);
+    }
+  });
+
+  it("keeps naming the shared controls when every pending card is the same kind", () => {
+    // The mixed-set fallback must not swallow the case it does NOT apply to:
+    // two prompt cards still render View prompt + Approve on each.
+    useSessionStore.setState({ activeSessionId: ACTIVE_SESSION_ID });
+    const first = makePendingEvent({
+      id: "evt-a",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-1",
+    });
+    const second = makePendingEvent({
+      id: "evt-b",
+      kind: "llm_prompt_template",
+      user_term: "llm_prompt_template:node-2",
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: {
+        [ACTIVE_SESSION_ID]: { [first.id]: first, [second.id]: second },
+      },
+    });
+
+    render(<StandaloneHarness />);
+
+    const textarea = screen.getByLabelText(/message input/i) as HTMLTextAreaElement;
+    expect(textarea.placeholder).toBe(
+      "Reviewing 2 LLM-drafted prompts — pick " +
+        `${ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL}, then ` +
+        `${ACKNOWLEDGEMENT_APPROVE_LABEL} on each review card to continue.`,
     );
   });
 

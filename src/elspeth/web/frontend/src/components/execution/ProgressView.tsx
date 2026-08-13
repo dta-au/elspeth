@@ -15,7 +15,8 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, StatusBadge } from "@/components/ui";
-import type { RunAccounting, RunProgress } from "@/types/index";
+import { terminalRunAnnouncement } from "./runTerminalPhrases";
+import { isTerminalRunStatus, type RunAccounting, type RunProgress } from "@/types/index";
 
 function formattedCount(value: number): string {
   return value.toLocaleString();
@@ -26,23 +27,22 @@ function formattedCount(value: number): string {
 // string is stable across counter ticks while running and only changes on a
 // terminal transition — the live region then announces the run once per phase
 // instead of on every update.
+//
+// The terminal phrasing is NOT owned here: it comes from runTerminalPhrases,
+// shared with the App-level RunOutcomeNotice so the two announcement surfaces
+// for one event cannot drift into separate vocabularies. Only the in-flight
+// phases (cancelling / pending / running), which that surface never speaks,
+// are local literals.
 function buildStatusAnnouncement(progress: RunProgress, cancelRequested: boolean): string {
   if (cancelRequested) return "Cancelling pipeline.";
   const totals =
     `${formattedCount(progress.source_rows_processed)} rows, ` +
     `${formattedCount(progress.tokens_succeeded)} succeeded, ` +
     `${formattedCount(progress.tokens_failed)} failed`;
+  if (isTerminalRunStatus(progress.status)) {
+    return terminalRunAnnouncement(progress.status, totals);
+  }
   switch (progress.status) {
-    case "completed":
-      return `Pipeline completed — ${totals}.`;
-    case "completed_with_failures":
-      return `Pipeline completed with failures — ${totals}.`;
-    case "failed":
-      return `Pipeline failed — ${totals}.`;
-    case "empty":
-      return "Pipeline completed — no rows processed.";
-    case "cancelled":
-      return "Pipeline execution was cancelled.";
     case "pending":
       // Distinct from "running" so the polite live region announces the
       // pending→running transition (a queued run has not started yet).

@@ -3,6 +3,7 @@ import type {
   AuditReadinessSnapshot,
   ValidationResult,
 } from "@/types/api";
+import { plural } from "@/utils/plural";
 
 export type WorkspaceStatusTone =
   | "neutral"
@@ -38,12 +39,12 @@ export function projectValidationWorkspaceStatus(
   }
   const errorCount = validationResult.errors.length;
   if (errorCount > 0) {
-    return validationStatus(`${errorCount} ${errorCount === 1 ? "error" : "errors"}`, "error");
+    return validationStatus(plural(errorCount, "error"), "error");
   }
   if (!validationResult.is_valid) return validationStatus("Failed", "error");
   const warningCount = validationResult.warnings?.length ?? 0;
   if (warningCount > 0) {
-    return validationStatus(`${warningCount} warnings`, "warning");
+    return validationStatus(plural(warningCount, "warning"), "warning");
   }
   return validationStatus("Passed", "success");
 }
@@ -109,5 +110,5 @@ export function projectAuditWorkspaceStatus({
   const tone = issueRows.some((row) => row.status === "error")
     ? "error"
     : "warning";
-  return auditStatus(`${issueRows.length} issues`, tone);
+  return auditStatus(plural(issueRows.length, "issue"), tone);
 }

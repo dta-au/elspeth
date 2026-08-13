@@ -1,10 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { InlineRunResults } from "./InlineRunResults";
+import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useAuthStore } from "@/stores/authStore";
+import {
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { _resetNarrativeModeCacheForTesting } from "@/hooks/useNarrativeMode";
 import * as apiClient from "@/api/client";
 
@@ -97,15 +102,108 @@ describe("InlineRunResults", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders the artifact empty state only when explicitly requested", () => {
+  it("renders the artifact empty state only when explicitly requested", async () => {
     useExecutionStore.setState({
       loadRuns: vi.fn().mockResolvedValue("loaded"),
     } as never);
     render(<InlineRunResults showEmptyState />);
 
-    return waitFor(() => {
+    await waitFor(() => {
       expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
     });
+    // Without runAvailable there is no run affordance — the tutorial shell
+    // mounts no REQUEST_RUN_EVENT owner, so a button here would dispatch
+    // into a zero-listener surface (elspeth-553a6fb81d).
+    expect(
+      screen.queryByRole("button", { name: "Run pipeline" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the inline Run affordance when runAvailable and routes it through REQUEST_RUN_EVENT", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      // runAvailable only proves the REQUEST_RUN_EVENT owner is MOUNTED; the
+      // owner still drops an inadmissible run, so the button additionally
+      // requires the readiness fact that owner gates on.
+      validationResult: makeValidationResult(),
+    } as never);
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    render(<InlineRunResults showEmptyState runAvailable />);
+
+    const runButton = await screen.findByRole("button", {
+      name: "Run pipeline",
+    });
+    expect(
+      screen.getByText("No runs yet. Run the pipeline to see its results here."),
+    ).toBeInTheDocument();
+
+    fireEvent.click(runButton);
+
+    // The dispatch is the whole affordance: gating, egress disclosure, and
+    // execute() all stay with the single REQUEST_RUN_EVENT owner
+    // (ExecuteButton — see 'routes an external run intent through the
+    // egress disclosure' in ExecuteButton.test.tsx).
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  // runAvailable gates the LISTENER, execution_ready gates ADMISSION. The
+  // affordance needs both: the REQUEST_RUN_EVENT owner (ExecuteButton)
+  // requires `readiness.execution_ready === true` inside canExecute and
+  // silently drops the event otherwise, so a button rendered on mount-alone
+  // would be a dead control that reports nothing back to the operator.
+  it.each([
+    ["no validation has run", null],
+    [
+      "validation ran but execution is blocked",
+      makeValidationResult({
+        is_valid: false,
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    ],
+  ])(
+    "offers directional copy instead of a dead Run button when %s",
+    async (_label, validationResult) => {
+      useExecutionStore.setState({
+        loadRuns: vi.fn().mockResolvedValue("loaded"),
+        validationResult,
+      } as never);
+      const onRequestRun = vi.fn();
+      window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+      render(<InlineRunResults showEmptyState runAvailable />);
+
+      await waitFor(() => {
+        expect(
+          screen.getByText(
+            "No runs yet. Once validation passes, use Run pipeline to start one.",
+          ),
+        ).toHaveClass("artifact-empty");
+      });
+      // The copy names the control, never a place: there is no "sidebar" in
+      // this layout (the run control is in the sticky bottom action bar of
+      // this same pane), and a location word re-opens the defect class.
+      expect(screen.queryByText(/sidebar|side panel|side rail/i)).toBeNull();
+      expect(
+        screen.queryByRole("button", { name: "Run pipeline" }),
+      ).not.toBeInTheDocument();
+      expect(onRequestRun).not.toHaveBeenCalled();
+      window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    },
+  );
+
+  it("keeps the plain empty state when runAvailable is explicitly false (tutorial shell)", async () => {
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    render(<InlineRunResults showEmptyState runAvailable={false} />);
+
+    await waitFor(() => {
+      expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+    });
+    expect(
+      screen.queryByRole("button", { name: "Run pipeline" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows neutral loading until the current session's empty history settles", async () => {

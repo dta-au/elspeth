@@ -1984,6 +1984,27 @@ describe("ChatPanel mode discriminator", () => {
     );
   });
 
+  it("container-queries the schema summary so a narrow pane stacks label over value", () => {
+    // elspeth-6db14f8519: the authoring pane (360-640px) is independent of
+    // the viewport, so the narrow layout must key off the summary's own
+    // container width — a media query cannot see a narrow pane on a wide
+    // screen. jsdom cannot compute container queries, so pin the mechanism
+    // in the stylesheet itself (the stepper pins above set the idiom).
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/guided/guided.css"),
+      "utf8",
+    );
+    // (a) the summary <dl> is a size container...
+    expect(css).toMatch(
+      /\.guided-schema-summary\s*\{[^}]*container-type:\s*inline-size/s,
+    );
+    // (b) ...and a narrow-container block collapses the label:value grid to
+    // a single column so JSON values get the full row width.
+    expect(css).toMatch(
+      /@container \(max-width: 24rem\)\s*\{\s*\.guided-schema-summary-row\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/s,
+    );
+  });
+
   it("renders the active turn in a current-decision panel with step purpose copy", () => {
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -3231,6 +3252,306 @@ describe("ChatPanel mode discriminator", () => {
     });
 
     expect(scrollTop).toBe(1050);
+  });
+
+  it("guided explain-scroll: an appended explanation reveals the newest transcript row when the reader is at the bottom", () => {
+    // elspeth-e3065670f6: guided geometry inverts freeform's — the transcript
+    // sits ABOVE the decision card, so the pin-to-bottom alone re-shows the
+    // card and leaves an Explain reply above the fold. The chat-growth effect
+    // must ALSO scrollIntoView the newest [data-seq] transcript row. Explain
+    // changes neither step_index nor turn type, so the step-advance effect
+    // never covers for it.
+    const calls: Array<{ receiver: Element; args: unknown[] }> = [];
+    Element.prototype.scrollIntoView = vi.fn(function (
+      this: Element,
+      ...args: unknown[]
+    ) {
+      calls.push({ receiver: this, args });
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        chat_history: [
+          {
+            role: "user",
+            content: "create the source",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    // Mount fires the step-advance focus effect once; only appends matter.
+    calls.length = 0;
+
+    // No scroll event — the at-bottom default holds. Append the Explain
+    // round-trip (canned user turn + assistant explanation).
+    act(() => {
+      const session = useSessionStore.getState().guidedSession!;
+      useSessionStore.setState({
+        guidedSession: {
+          ...session,
+          chat_history: [
+            ...session.chat_history,
+            {
+              role: "user",
+              content: GUIDED_EXPLAIN_MESSAGE,
+              seq: 2,
+              step: "step_1_source",
+              ts_iso: "2026-05-12T10:00:01Z",
+              assistant_message_kind: null,
+              synthetic_failure_reason: null,
+              turn_token: null,
+            },
+            {
+              role: "assistant",
+              content: "This step chooses where your data comes from.",
+              seq: 3,
+              step: "step_1_source",
+              ts_iso: "2026-05-12T10:00:02Z",
+              assistant_message_kind: "assistant",
+              synthetic_failure_reason: null,
+              turn_token: null,
+            },
+          ],
+        },
+      });
+    });
+
+    // The reveal targets exactly the newest transcript row (highest seq) —
+    // never an older row, never a stage divider (those carry no data-seq).
+    const transcriptReceivers = calls.filter(
+      ({ receiver }) =>
+        receiver instanceof HTMLElement && receiver.hasAttribute("data-seq"),
+    );
+    expect(transcriptReceivers).toHaveLength(1);
+    expect(
+      (transcriptReceivers[0].receiver as HTMLElement).getAttribute("data-seq"),
+    ).toBe("3");
+    expect(transcriptReceivers[0].args).toEqual([
+      { behavior: "smooth", block: "start" },
+    ]);
+    // Explain does not advance the step — the decision turn is untouched.
+    expect(useSessionStore.getState().guidedNextTurn).toEqual(singleSelectTurn());
+  });
+
+  it("guided explain-scroll: an appended explanation does NOT reveal the transcript when the reader has scrolled up", () => {
+    const calls: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+      calls.push(this);
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        chat_history: [
+          {
+            role: "user",
+            content: "create the source",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-05-12T10:00:00Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    const { container } = render(<ChatPanel />);
+    const scroll = container.querySelector<HTMLElement>(
+      ".guided-authoring-scroll",
+    );
+    expect(scroll).not.toBeNull();
+    let scrollTop = 100; // 1000 - 100 - 400 = 500px from the bottom (> 40px).
+    Object.defineProperty(scroll!, "scrollHeight", {
+      configurable: true,
+      get: () => 1000,
+    });
+    Object.defineProperty(scroll!, "clientHeight", {
+      configurable: true,
+      get: () => 400,
+    });
+    Object.defineProperty(scroll!, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    // The reader scrolls up into the transcript.
+    fireEvent.scroll(scroll!);
+    calls.length = 0;
+
+    act(() => {
+      const session = useSessionStore.getState().guidedSession!;
+      useSessionStore.setState({
+        guidedSession: {
+          ...session,
+          chat_history: [
+            ...session.chat_history,
+            {
+              role: "assistant",
+              content: "This step chooses where your data comes from.",
+              seq: 2,
+              step: "step_1_source",
+              ts_iso: "2026-05-12T10:00:02Z",
+              assistant_message_kind: "assistant",
+              synthetic_failure_reason: null,
+              turn_token: null,
+            },
+          ],
+        },
+      });
+    });
+
+    // A reader reviewing history is neither pinned nor scrolled to the row.
+    expect(scrollTop).toBe(100);
+    expect(
+      calls.some(
+        (el) => el instanceof HTMLElement && el.hasAttribute("data-seq"),
+      ),
+    ).toBe(false);
+  });
+
+  const guidedSessionFixtureB: Session = {
+    id: "session-guided-b",
+    title: "Second guided composer session",
+    created_at: "2026-05-12T11:00:00Z",
+    updated_at: "2026-05-12T11:00:00Z",
+  };
+
+  function guidedUserTurn(seq: number, content: string) {
+    return {
+      role: "user" as const,
+      content,
+      seq,
+      step: "step_1_source" as const,
+      ts_iso: `2026-05-12T10:00:0${seq}Z`,
+      assistant_message_kind: null,
+      synthetic_failure_reason: null,
+      turn_token: null,
+    };
+  }
+
+  it("guided reveal-scroll: switching to a session with a LONGER transcript is not chat growth — no reveal fires", () => {
+    // ChatPanel is mounted unkeyed and survives session switches, so the
+    // previous-length ref used to read a switch from session A (1 turn) to
+    // session B (3 turns) as growth and smooth-scroll B's newest row,
+    // fighting the pin-to-bottom on a freshly shown transcript. An identity
+    // change re-seeds the ref instead; only same-session appends reveal.
+    const calls: Element[] = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+      calls.push(this);
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture, guidedSessionFixtureB],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        chat_history: [guidedUserTurn(1, "create the source")],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+    calls.length = 0;
+
+    // Switch to session B, whose transcript is longer (1 -> 3).
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-guided-b",
+        guidedSession: {
+          ...activeGuidedSession(),
+          chat_history: [
+            guidedUserTurn(1, "start over"),
+            guidedUserTurn(2, "pick csv"),
+            guidedUserTurn(3, "explain that"),
+          ],
+        },
+      });
+    });
+
+    // No transcript row is revealed: the switch is a new transcript, not an
+    // append to the one on screen.
+    expect(
+      calls.some(
+        (el) => el instanceof HTMLElement && el.hasAttribute("data-seq"),
+      ),
+    ).toBe(false);
+  });
+
+  it("guided reveal-scroll: an EQUAL-LENGTH session switch re-seeds the guard, so the next same-session append still reveals", () => {
+    // The identity must be an effect dependency: a switch between sessions
+    // with equal history lengths otherwise never re-runs the effect, leaving
+    // a stale identity ref that misreads the next genuine append in the new
+    // session as a cross-session comparison and suppresses its reveal.
+    const calls: Array<{ receiver: Element }> = [];
+    Element.prototype.scrollIntoView = vi.fn(function (this: Element) {
+      calls.push({ receiver: this });
+    });
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture, guidedSessionFixtureB],
+      messages: [],
+      guidedSession: {
+        ...activeGuidedSession(),
+        chat_history: [guidedUserTurn(1, "create the source")],
+      },
+      guidedNextTurn: singleSelectTurn(),
+    });
+
+    render(<ChatPanel />);
+
+    // Switch to session B with the SAME transcript length (1 -> 1).
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-guided-b",
+        guidedSession: {
+          ...activeGuidedSession(),
+          chat_history: [guidedUserTurn(1, "start over")],
+        },
+      });
+    });
+    calls.length = 0;
+
+    // A genuine append in session B (1 -> 2) must reveal its newest row.
+    act(() => {
+      const session = useSessionStore.getState().guidedSession!;
+      useSessionStore.setState({
+        guidedSession: {
+          ...session,
+          chat_history: [
+            ...session.chat_history,
+            guidedUserTurn(2, "explain that"),
+          ],
+        },
+      });
+    });
+
+    const transcriptReceivers = calls.filter(
+      ({ receiver }) =>
+        receiver instanceof HTMLElement && receiver.hasAttribute("data-seq"),
+    );
+    expect(transcriptReceivers).toHaveLength(1);
+    expect(
+      (transcriptReceivers[0].receiver as HTMLElement).getAttribute("data-seq"),
+    ).toBe("2");
   });
 
   it("tutorial completed: the completion surface renders under the guided shell with the stepper and the --completed frame escape hook", () => {
@@ -7411,5 +7732,302 @@ describe("freeform upload session fence (elspeth-341a3e2fc4)", () => {
     // The rejection was NOT accepted by the fence: the mock records accepted
     // failures, so an empty list proves the foreign-session alert was fenced.
     expect(mockedChatInputUpload.acceptedFailureRequestIds).toEqual([]);
+  });
+});
+
+describe("ChatPanel live tool log (elspeth-3c2caf56a7)", () => {
+  const session: Session = {
+    id: "session-1",
+    title: "Composer session",
+    created_at: "2026-08-13T10:00:00Z",
+    updated_at: "2026-08-13T10:00:00Z",
+  };
+
+  function userRow(id: string, content: string): ChatMessage {
+    return {
+      id,
+      session_id: "session-1",
+      role: "user",
+      content,
+      tool_calls: null,
+      created_at: "2026-08-13T10:00:01Z",
+    };
+  }
+
+  function midLoopAssistantRow(): ChatMessage {
+    return {
+      id: "assistant-1",
+      session_id: "session-1",
+      role: "assistant",
+      content: "Checking the schema before submitting.",
+      tool_calls: [
+        {
+          id: "tc-1",
+          type: "function",
+          function: { name: "get_plugin_schema", arguments: "{}" },
+        },
+        {
+          id: "tc-2",
+          type: "function",
+          function: { name: "set_pipeline", arguments: "{}" },
+        },
+        {
+          id: "tc-3",
+          type: "function",
+          function: { name: "set_source", arguments: "{}" },
+          outcome: "applied",
+        },
+      ],
+      created_at: "2026-08-13T10:00:02Z",
+    };
+  }
+
+  function mockComposer(isComposing: boolean) {
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      isComposing,
+      compositionState: null,
+      error: null,
+    });
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    mockComposer(true);
+  });
+
+  it("surfaces the mid-flight tail turn's tool calls in the indicator while the bubble stays hidden", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [session],
+      messages: [userRow("user-1", "Build the pipeline"), midLoopAssistantRow()],
+    });
+
+    render(<ChatPanel />);
+
+    // Atomic-reveal gate: only the user bubble renders; the incomplete tail
+    // agent turn stays hidden behind the indicator.
+    expect(screen.getAllByTestId("message-bubble")).toHaveLength(1);
+    // The live log names each call with outcome-honest prefixes, visible
+    // WITHOUT opening the Show-details disclosure: no stamp keeps the
+    // conservative lookup label for discovery tools and the neutral Running
+    // label for mutating tools — never a fabricated "Applied".
+    expect(screen.getByText("Looked up: get_plugin_schema")).toBeInTheDocument();
+    expect(screen.getByText("Running: set_pipeline")).toBeInTheDocument();
+    expect(screen.queryByText("Applied: set_pipeline")).not.toBeInTheDocument();
+    // A server-stamped outcome renders its real verdict.
+    expect(screen.getByText("Applied: set_source")).toBeInTheDocument();
+  });
+
+  it("keeps the live log outside the aria-live message log and outside the role=status node", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [session],
+      messages: [userRow("user-1", "Build the pipeline"), midLoopAssistantRow()],
+    });
+
+    const { container } = render(<ChatPanel />);
+
+    const log = container.querySelector(".composing-tool-log");
+    expect(log).not.toBeNull();
+    // Not inside any live region: an append-per-poll list inside a polite
+    // region would announce every 1.5s tick (WCAG 4.1.3).
+    for (
+      let node = log!.parentElement;
+      node !== null;
+      node = node.parentElement
+    ) {
+      expect(node.getAttribute("aria-live")).toBeNull();
+      expect(node.getAttribute("role")).not.toBe("status");
+      expect(node.getAttribute("role")).not.toBe("log");
+    }
+  });
+
+  it("rolls the entries away once the genuine reply lands and composing ends", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [session],
+      messages: [userRow("user-1", "Build the pipeline"), midLoopAssistantRow()],
+    });
+
+    const { rerender } = render(<ChatPanel />);
+    expect(screen.getByText("Running: set_pipeline")).toBeInTheDocument();
+
+    mockComposer(false);
+    act(() => {
+      useSessionStore.setState({
+        messages: [
+          userRow("user-1", "Build the pipeline"),
+          midLoopAssistantRow(),
+          {
+            id: "assistant-2",
+            session_id: "session-1",
+            role: "assistant",
+            content: "Pipeline saved.",
+            tool_calls: null,
+            created_at: "2026-08-13T10:00:03Z",
+          },
+        ],
+      });
+    });
+    rerender(<ChatPanel />);
+
+    // Indicator (and its live log) is gone; the completed turn's bubble now
+    // renders, where the aggregated calls live in the Tool calls disclosure
+    // (MessageBubble's own pinned behaviour — mocked here).
+    expect(screen.queryByText("Running: set_pipeline")).not.toBeInTheDocument();
+    expect(screen.getAllByTestId("message-bubble")).toHaveLength(2);
+  });
+
+  it("clears the entries when a new request's optimistic user row becomes the tail", () => {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [session],
+      messages: [userRow("user-1", "Build the pipeline"), midLoopAssistantRow()],
+    });
+
+    render(<ChatPanel />);
+    expect(screen.getByText("Running: set_pipeline")).toBeInTheDocument();
+
+    act(() => {
+      useSessionStore.setState({
+        messages: [
+          userRow("user-1", "Build the pipeline"),
+          midLoopAssistantRow(),
+          { ...userRow("local-123", "Now add an output"), local_status: "pending" },
+        ],
+      });
+    });
+
+    // The tail turn is now the optimistic user row — the old request's calls
+    // no longer masquerade as live activity for the new one.
+    expect(screen.queryByText("Running: set_pipeline")).not.toBeInTheDocument();
+    expect(screen.queryByText("Looked up: get_plugin_schema")).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatPanel jump-to-latest pill (elspeth-4ad68a3769)", () => {
+  const session: Session = {
+    id: "session-1",
+    title: "Composer session",
+    created_at: "2026-08-13T10:00:00Z",
+    updated_at: "2026-08-13T10:00:00Z",
+  };
+
+  function message(id: string, role: "user" | "assistant", content: string): ChatMessage {
+    return {
+      id,
+      session_id: "session-1",
+      role,
+      content,
+      tool_calls: null,
+      created_at: "2026-08-13T10:00:01Z",
+    };
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    Element.prototype.scrollIntoView = vi.fn();
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
+  });
+
+  function renderScrolledUpPanel() {
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      sessions: [session],
+      messages: [
+        message("user-1", "user", "Build the pipeline"),
+        message("assistant-1", "assistant", "Done."),
+      ],
+    });
+
+    const { container } = render(<ChatPanel />);
+    const scroll = container.querySelector<HTMLElement>(".chat-panel-messages");
+    expect(scroll).not.toBeNull();
+    // jsdom has no layout: stub geometry 560px above the bottom (> 40px).
+    let scrollTop = 0;
+    Object.defineProperty(scroll!, "scrollHeight", {
+      configurable: true,
+      get: () => 1000,
+    });
+    Object.defineProperty(scroll!, "clientHeight", {
+      configurable: true,
+      get: () => 400,
+    });
+    Object.defineProperty(scroll!, "scrollTop", {
+      configurable: true,
+      get: () => scrollTop,
+      set: (v: number) => {
+        scrollTop = v;
+      },
+    });
+    fireEvent.scroll(scroll!);
+    return { container, scroll: scroll! };
+  }
+
+  it("anchors the pill inside the messages region, outside the scrolling element", () => {
+    const { container, scroll } = renderScrolledUpPanel();
+
+    const pill = screen.getByRole("button", { name: "Scroll to bottom" });
+    const region = container.querySelector(".chat-panel-messages-region");
+    expect(region).not.toBeNull();
+    // Direct child of the region — a SIBLING of the scrolling element, so it
+    // floats over the messages instead of scrolling away with them, and its
+    // bottom anchor is the messages area's edge, not the whole panel's.
+    expect(pill.parentElement).toBe(region);
+    expect(scroll.parentElement).toBe(region);
+    expect(scroll.contains(pill)).toBe(false);
+    // Not a sibling of the ChatInput form: the input lives outside the region.
+    expect(region!.contains(screen.getByTestId("chat-input"))).toBe(false);
+  });
+
+  it("pins the positioning contract the anchoring depends on", () => {
+    // The structural test above is only HALF the fix for elspeth-4ad68a3769.
+    // The other half is CSS, and jsdom computes no layout: the pill is
+    // position:absolute and is anchored by .chat-panel-messages-region being
+    // its nearest POSITIONED ancestor. Drop `position: relative` from the
+    // region and the pill re-anchors to whatever is positioned further up,
+    // landing var(--space-md) above the panel bottom — squarely on the
+    // ChatInput, i.e. the exact reported defect — and this change DELETED the
+    // old `.chat-panel:has(.inline-run-results)` bottom offsets, so there is
+    // no longer a fallback offset to soften it. Same stylesheet-reading idiom
+    // this file already uses to pin guided.css's container query, for the
+    // same reason: the mechanism is unobservable to the DOM test.
+    const css = readFileSync(
+      join(process.cwd(), "src/components/chat/chat.css"),
+      "utf8",
+    );
+    expect(css).toMatch(
+      /\.chat-panel-messages-region\s*\{[^}]*position:\s*relative/s,
+    );
+    expect(css).toMatch(
+      /\.scroll-to-bottom-btn\s*\{[^}]*position:\s*absolute/s,
+    );
+  });
+
+  it("keeps the pill's jump behaviour through the new structure", () => {
+    renderScrolledUpPanel();
+
+    const pill = screen.getByRole("button", { name: "Scroll to bottom" });
+    fireEvent.click(pill);
+
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({
+      behavior: "smooth",
+    });
+    expect(
+      screen.queryByRole("button", { name: "Scroll to bottom" }),
+    ).toBeNull();
   });
 });

@@ -214,6 +214,49 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-13 — the web frontend has TWO live-region conventions, and mixing
+  them breaks unrelated suites**: POLITE `role="status"` regions are
+  persistent-and-mutate (`AcknowledgementLiveRegion`, `RunOutcomeNotice`) —
+  a polite region inserted WITH its content already present is the documented
+  unreliable pattern, so the node must pre-exist and only its text may change.
+  ASSERTIVE `role="alert"` regions are CONDITIONALLY INSERTED (`AppNoticeCenter`,
+  `ErrorBoundary`, `DefaultModeChangedBanner`): `role="alert"` already carries
+  `aria-live="assertive"` + `aria-atomic="true"` and IS the announce-on-insertion
+  role, so a permanently-mounted empty alert buys nothing — and it makes every
+  singular `getByRole("alert")` in the tree ambiguous (this fired: it broke an
+  unrelated App recovery-panel test). Reserve assertive for what actually
+  interrupts; a background run finishing, even failing, is polite.
+
+- **2026-08-13 — prose that names a control must derive WHICH controls exist,
+  never assume**: review-card labels vary by interpretation kind
+  (`llm_prompt_template` renders "View prompt" + "Approve", never
+  "Acknowledge"; "Change…" only where `supportsAmendment`). Both prose
+  surfaces — the `ChatInput` placeholder and the `subscriptions.ts` system
+  note — go through `characterisePendingControls` in
+  `components/chat/acknowledgementLabels.ts`, whose invariant is ONE-WAY:
+  never name a control the pending card(s) do not render (a mixed set falls to
+  control-free wording). That module is a deliberate LEAF (no React, no store)
+  because `stores/subscriptions.ts` imports it and was otherwise the tree's
+  only store→components edge. Same one-owner shape:
+  `components/execution/runTerminalPhrases.ts` owns the terminal-run vocabulary
+  that both `ProgressView` and `RunOutcomeNotice` speak.
+
+- **2026-08-13 — a version row's wire projection is REDACTED, so "no change"
+  needs the guided blob axis**: `_state_response` runs
+  `redact_guided_snapshot_storage_paths`, which overwrites a guided committed
+  source's `path`/`file` carriers with a CONSTANT sentinel, so two versions
+  differing only in which input file the pipeline reads are byte-identical
+  across every content field. `versionLabels.isSnapshotOnly` therefore also
+  compares `composer_meta.guided_session.reviewed_sources` blob bindings —
+  BOTH the surviving `options.blob_ref` and any `blob:<uuid>` carrier (the
+  sentinel arm keeps no `blob_ref`). That is the ONLY thing under
+  `composer_meta` allowed to move the verdict; everything else there is
+  bookkeeping. `composer_meta` is untrusted wire data, so it is PARSED
+  (ADR-032) with an explicit unreadable arm that fails closed. The label says
+  "no visible change", not "no pipeline change" — the client can only claim
+  what the projection shows; a backend per-version content hash is what would
+  earn the stronger word.
+
 - **2026-08-13 — aggregation members' live BUFFERED acceptances keep the
   ORIGINAL batch_id across crash-retry**: `handle_incomplete_batches` retries a
   dead EXECUTING/FAILED batch on a NEW batch linked through the durable

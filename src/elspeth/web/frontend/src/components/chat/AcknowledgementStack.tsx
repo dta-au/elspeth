@@ -22,10 +22,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
-import {
-  AcknowledgementCard,
-  supportsAmendment,
-} from "./AcknowledgementCard";
+import { AcknowledgementCard } from "./AcknowledgementCard";
+import { supportsAmendment } from "./acknowledgementLabels";
 import { buildStepOrder, humaniseStepLabel } from "./interpretationStepLabel";
 import {
   describeError,
@@ -181,7 +179,18 @@ export function AcknowledgementStack({
     if (focusTargetId === null) return;
     const button = acceptRefs.current.get(focusTargetId);
     const section = sectionRefs.current.get(focusTargetId);
-    if (button != null && !button.disabled) {
+    // "Enabled" means BOTH gates are open. The card's view-gate is expressed
+    // as aria-disabled + a no-op click rather than native `disabled` (house
+    // idiom for a gated primary carrying a reason — ExecuteButton.tsx), so
+    // reading `.disabled` alone would land focus on an inert primary. The
+    // section fallback is the better target anyway: it announces the card
+    // title, and the first control after it is now the "View prompt"
+    // prerequisite that opens the gate.
+    const buttonInert =
+      button == null ||
+      button.disabled ||
+      button.getAttribute("aria-disabled") === "true";
+    if (!buttonInert) {
       button.focus();
     } else if (section != null) {
       section.focus();
@@ -237,6 +246,10 @@ export function AcknowledgementStack({
           event={event}
           sessionId={sessionId}
           stepLabel={humaniseStepLabel(compositionState, event.affected_node_id)}
+          // Live state for the card's resolved-prompt rendering
+          // (elspeth-990f5ea562): refreshed on every sibling resolve, so an
+          // open prompt card re-renders with fresh substitutions.
+          compositionState={compositionState}
           showAmend={!isTutorial && supportsAmendment(event.kind)}
           acceptButtonRef={(el) => {
             if (el != null) acceptRefs.current.set(event.id, el);

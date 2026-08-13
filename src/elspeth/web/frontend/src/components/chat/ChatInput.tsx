@@ -13,6 +13,11 @@ import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { PREFILL_CHAT_INPUT_EVENT } from "@/components/catalog/PluginCard";
 import {
+  characterisePendingControls,
+  pendingControlsInstruction,
+} from "@/components/chat/acknowledgementLabels";
+import type { InterpretationEvent } from "@/types/interpretation";
+import {
   COMPOSE_CONNECTING_MESSAGE,
   COMPOSE_UNAVAILABLE_MESSAGE,
 } from "@/config/composer";
@@ -26,6 +31,110 @@ import type { BlobMetadata } from "@/types/api";
  */
 export function uploadedBlobPromptSentence(filename: string): string {
   return `I've uploaded "${filename}"; please use it as the pipeline input.`;
+}
+
+/**
+ * The subject noun for a pending SET, in the vocabulary of what was actually
+ * decided (ux-review 2026-08-13).  The previous wording called every kind
+ * "your interpretation of X", which is a category error rather than a loose
+ * synonym: a pipeline_decision, an llm_model_choice and an invented_source
+ * are all things the COMPOSER chose, and telling an operator they are their
+ * own interpretation reassigns authorship at the exact moment they are being
+ * asked to attest to them.
+ *
+ * Prompt-template events carry a machine-facing `user_term`
+ * ("llm_prompt_template:<node id>"), so that branch deliberately does not
+ * echo the term.  Only vague_term / legacy-null events echo it — those are
+ * the ones where the term is genuinely the user's.
+ */
+function pendingSubjectNoun(
+  events: readonly InterpretationEvent[],
+  userTerm: string,
+): string {
+  const count = events.length;
+  const kinds = new Set(events.map((event) => event.kind));
+  if (kinds.size !== 1) return `${count} composer choices`;
+  switch (events[0].kind) {
+    case "llm_prompt_template":
+      return count === 1
+        ? "an LLM-drafted prompt"
+        : `${count} LLM-drafted prompts`;
+    case "pipeline_decision":
+      return count === 1
+        ? "a decision the composer made"
+        : `${count} decisions the composer made`;
+    case "llm_model_choice":
+      return count === 1
+        ? "the model the composer picked"
+        : `${count} models the composer picked`;
+    case "invented_source":
+      return "source data the composer invented";
+    case "vague_term":
+    case null:
+      return count === 1
+        ? `your interpretation of "${userTerm}"`
+        : `${count} interpretations of your words`;
+    default:
+      return unnamedKindNoun(events[0].kind, count);
+  }
+}
+
+/**
+ * Runtime floor for an InterpretationKind added to the union without copy in
+ * `pendingSubjectNoun` — without it the switch falls through and the
+ * placeholder reads "Reviewing undefined".
+ *
+ * The `never` parameter keeps the COMPILE-TIME exhaustiveness check that a
+ * plain `default` arm would have thrown away: a new kind is a type error at
+ * the call site, exactly as `assertNever` does for the card's own switch.
+ * The difference is the runtime behaviour, and it is deliberate — this string
+ * feeds a textarea placeholder, so throwing would take out the composer input
+ * over a missing noun. It degrades to the same neutral wording a mixed set
+ * gets, which names no control either.
+ */
+function unnamedKindNoun(kind: never, count: number): string {
+  void kind;
+  return count === 1 ? "a composer choice" : `${count} composer choices`;
+}
+
+/**
+ * Kind-aware, SET-aware pending-review placeholder cue (ux-review
+ * 2026-08-13, extends elspeth-0a9f77dd75).
+ *
+ * Two things this must not do.  It must never name a control the pending
+ * card(s) do not render — the card's controls vary by kind, so the control
+ * naming is delegated to `characterisePendingControls` /
+ * `pendingControlsInstruction`, the same shared rule the injected validation
+ * note uses, which returns null for any set it cannot characterise.  And it
+ * must characterise the WHOLE pending set rather than the first event: the
+ * previous implementation returned on the first event carrying a user_term
+ * and spoke in the singular, so a mixed set (a prompt review plus a term
+ * review from the same turn — routine) named controls the topmost card does
+ * not render, which is the elspeth-0a9f77dd75 defect surviving in the
+ * sibling surface.
+ *
+ * Returns null when no pending event carries a user_term: auto-baked rows
+ * (interpretation_source = auto_interpreted_opt_out / no_surfaces) have
+ * user_term=null and there is nothing to cue, so the placeholder falls
+ * through to the next layer.
+ */
+export function interpretationCueText(
+  events: readonly InterpretationEvent[],
+): string | null {
+  if (events.length === 0) return null;
+  const termed = events.find((event) => event.user_term !== null);
+  if (termed === undefined) return null;
+  const subject = pendingSubjectNoun(events, termed.user_term ?? "");
+  const instruction = pendingControlsInstruction(
+    characterisePendingControls(events.map((event) => event.kind)),
+    (label) => label,
+  );
+  const plural = events.length > 1;
+  const tail =
+    instruction === null
+      ? `use the buttons on the review card${plural ? "s" : ""} to continue.`
+      : `${instruction} on ${plural ? "each review card" : "the review card"} to continue.`;
+  return `Reviewing ${subject} — ${tail}`;
 }
 
 interface ChatInputProps {
@@ -194,16 +303,17 @@ export function ChatInput({
   // (interpretation_source = auto_interpreted_opt_out / no_surfaces) have
   // user_term=null per types/interpretation.ts:101-106 — there is no term
   // to echo, so the cue falls through to the next placeholder layer.
-  // Selector returns just the string|null so this component only re-renders
-  // when the *displayed term* changes, not on every pending-map mutation.
-  const pendingInterpretationUserTerm = useInterpretationEventsStore((s) => {
+  // Selector returns the finished cue string|null (strings compare by value
+  // under zustand's Object.is check) so this component only re-renders when
+  // the *displayed cue* changes, not on every pending-map mutation.  The
+  // WHOLE pending set is passed to interpretationCueText — it is set-aware,
+  // not first-event-wins, so it never names a control some visible card does
+  // not render (ux-review 2026-08-13).
+  const interpretationCuePlaceholder = useInterpretationEventsStore((s) => {
     if (!activeSessionId) return null;
     const pending = s.pendingBySession[activeSessionId];
     if (!pending) return null;
-    for (const event of Object.values(pending)) {
-      if (event.user_term !== null) return event.user_term;
-    }
-    return null;
+    return interpretationCueText(Object.values(pending));
   });
 
   // Listen for prefill events dispatched by InlineChatSourceEntry (catalog
@@ -350,11 +460,11 @@ export function ChatInput({
     : "Describe the pipeline you want to build...";
   // Directionally neutral (elspeth-eba8820005): the review card renders in a
   // different column in the guided workspace, so "above" contradicts the
-  // layout at some breakpoints — name the card, not a direction.
-  const interpretationCuePlaceholder =
-    pendingInterpretationUserTerm !== null
-      ? `Reviewing your interpretation of "${pendingInterpretationUserTerm}" — pick Use mine or Change it on the review card to continue.`
-      : null;
+  // layout at some breakpoints — name the card, not a direction.  The cue
+  // itself is built kind-aware in the store selector above
+  // (interpretationCueText) so its button names interpolate the card's
+  // exported label constants and match the controls the pending card
+  // actually renders (elspeth-0a9f77dd75 + ux-review 2026-08-13).
   const effectivePlaceholder =
     placeholder ?? interpretationCuePlaceholder ?? defaultPlaceholder;
 

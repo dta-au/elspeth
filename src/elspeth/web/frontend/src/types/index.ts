@@ -244,12 +244,27 @@ export interface CompositionState {
   plugin_policy_findings: PluginPolicyFinding[];
 }
 
-/** A version history entry for CompositionState. */
+/**
+ * A version history entry for CompositionState.
+ *
+ * The wire payload from GET /sessions/{id}/state/versions is a full
+ * CompositionStateResponse row, so fetched entries carry the content
+ * fields below. They are optional only because HeaderVersionSelector
+ * synthesizes a slim "current" entry when the live version is not in the
+ * fetched window; `node_count` exists solely for that synthesized entry
+ * and is never delivered by the backend.
+ */
 export interface CompositionStateVersion {
   id: string;
   version: number;
   created_at: string;
-  node_count: number;
+  node_count?: number;
+  sources?: Record<string, SourceSpec>;
+  nodes?: NodeSpec[];
+  edges?: EdgeSpec[];
+  outputs?: OutputSpec[];
+  metadata?: PipelineMetadata | null;
+  derived_from_state_id?: string | null;
 }
 
 // ── Composer Proposal Lifecycle ────────────────────────────────────────────

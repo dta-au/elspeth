@@ -262,7 +262,7 @@ describe("Phase 5b.18b.6 — Part C — Change… + amend", () => {
     render(<AcknowledgementStack sessionId={SESSION_ID} />);
 
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
     await user.clear(textarea);

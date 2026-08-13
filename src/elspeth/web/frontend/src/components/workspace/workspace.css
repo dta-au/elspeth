@@ -87,6 +87,74 @@
   min-height: var(--size-control-compact);
 }
 
+/* Run-tab outcome/live badge (elspeth-3a7b7c7b37). aria-hidden dot appended
+   inside the Run tab button; tones mirror ProgressView's terminal colour
+   mapping, "live" is the neutral in-flight pulse.
+
+   DECORATIVE CONTRACT — read this before "fixing" the colour-only encoding.
+   The dot is 0.5em (~7px) and the four terminal tones differ ONLY by
+   background-color, with no glyph or shape distinction. That is deliberate,
+   not an oversight, and it is not a WCAG 1.4.1 failure, because the badge is
+   never the carrier of the information:
+
+     - It is aria-hidden (ArtifactWorkspace), so the Run tab's accessible name
+       stays exactly "Run" and assistive tech loses nothing.
+     - The OUTCOME badge and the RunOutcomeNotice toast are the same fact read
+       from the same store field (lastRunOutcome), so they appear together and
+       retire together on acknowledgement. There is no window in which the dot
+       is the only surviving signal of success-vs-failure — the toast states
+       the outcome in words for exactly as long as the dot is on screen, and
+       the Run panel carries it in full afterwards.
+     - The LIVE tone is a pulse animation over the same neutral fill, and the
+       reduced-motion block below stops that animation — so for a
+       reduced-motion user "live" and the WS-dropped "neutral" are identical.
+       Also deliberate: the badge is a glance-level "something is happening on
+       this tab" marker, and the real degraded-connection signal is
+       ProgressView's .progress-ws-banner, which states it in words.
+
+   A glyph (the way ui/StatusBadge encodes warning/empty) was considered and
+   rejected here: a glyph cannot live inside a 7px border-radius:50% dot, so it
+   would mean re-sizing the marker into a text run and changing artifact
+   tab-strip geometry — a visible redesign of a decoration that carries no
+   information of its own. If a future change makes the badge OUTLIVE the
+   toast, this contract lapses and the glyph becomes mandatory. */
+.artifact-tab-badge {
+  display: inline-block;
+  width: 0.5em;
+  height: 0.5em;
+  margin-left: 0.35em;
+  vertical-align: middle;
+  border-radius: 50%;
+  background-color: var(--color-text-muted);
+}
+
+.artifact-tab-badge[data-tone="success"] {
+  background-color: var(--color-success);
+}
+
+.artifact-tab-badge[data-tone="warning"] {
+  background-color: var(--color-warning);
+}
+
+.artifact-tab-badge[data-tone="error"] {
+  background-color: var(--color-error);
+}
+
+.artifact-tab-badge[data-tone="live"] {
+  animation: artifact-tab-badge-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes artifact-tab-badge-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.35;
+  }
+}
+
 .artifact-workspace-panel {
   position: relative;
   flex: 1 1 auto;
@@ -426,6 +494,10 @@
   .workspace-collapsed-affordance {
     scroll-behavior: auto;
   }
+
+  .artifact-tab-badge[data-tone="live"] {
+    animation: none;
+  }
 }
 
 @media (min-width: 961px) and (max-height: 800px) {
@@ -454,4 +526,86 @@
   .workspace-collapse-control {
     margin: 0.25rem 0.5rem;
   }
+}
+
+/* Spec tab (PipelineSpecView): card chrome + aligned key-value grid.
+   The dl lays out via grid + display:contents, so each dt/dd pair MUST stay
+   wrapped in a direct <div> child — the markup shape is the styling contract
+   (pinned in PipelineSpecView.test.tsx). Appended at the end of the file:
+   the middle sections are owned by the collapse/action-bar workstreams. */
+.pipeline-spec-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-lg);
+  padding: var(--space-md);
+}
+
+.pipeline-spec-metadata h2 {
+  margin: 0 0 var(--space-xs);
+  color: var(--color-text);
+  font-size: var(--font-size-lg);
+  line-height: var(--line-height-tight);
+}
+
+.pipeline-spec-metadata p {
+  margin: 0 0 var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.pipeline-spec-section h3 {
+  margin: 0 0 var(--space-sm);
+  color: var(--color-text);
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-tight);
+}
+
+.pipeline-spec-cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.pipeline-spec-card {
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md);
+}
+
+.pipeline-spec-card h4 {
+  margin: 0 0 var(--space-sm);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
+  line-height: var(--line-height-tight);
+  text-transform: uppercase;
+}
+
+.pipeline-spec-card dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-xs) var(--space-md);
+  margin: 0;
+}
+
+.pipeline-spec-card dl > div {
+  display: contents;
+}
+
+.pipeline-spec-card dt {
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.pipeline-spec-card dd {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.pipeline-spec-options {
+  margin-top: var(--space-sm);
+  overflow-x: auto;
 }

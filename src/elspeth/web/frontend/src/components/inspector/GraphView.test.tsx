@@ -7,6 +7,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import type { CompositionProposal, CompositionState, NodeSpec, EdgeSpec } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { projectValidationWorkspaceStatus } from "@/components/workspace/workspaceStatus";
 
 // Mock @xyflow/react — jsdom cannot do DOM measurements required by React Flow.
 // Render ordinary elements directly and invoke custom node/edge renderers with
@@ -30,6 +31,8 @@ vi.mock("@xyflow/react", () => ({
     onInit,
     fitViewOptions,
     onNodeClick,
+    nodesFocusable,
+    edgesFocusable,
   }: any) => (
     <div
       data-testid="react-flow"
@@ -41,6 +44,11 @@ vi.mock("@xyflow/react", () => ({
       data-fit-view-prop={fitView === undefined ? "absent" : String(Boolean(fitView))}
       data-has-on-init={String(typeof onInit === "function")}
       data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
+      // Focusability assertions (elspeth-437caadef3): both must be explicitly
+      // false — React Flow defaults them to true, which puts invisible tab
+      // stops inside the role="img" (children-presentational) diagram scope.
+      data-nodes-focusable={nodesFocusable === undefined ? "absent" : String(Boolean(nodesFocusable))}
+      data-edges-focusable={edgesFocusable === undefined ? "absent" : String(Boolean(edgesFocusable))}
     >
       {nodes?.map((n: any) => {
         const NodeRenderer = nodeTypes?.[n.type];
@@ -1889,6 +1897,22 @@ describe("GraphView", () => {
     });
   });
 
+  // Canvas nodes AND edges live inside the role="img" children-presentational
+  // diagram wrapper: focusable, they would be invisible tab stops with no
+  // usable announcement. The a11y node list and the "Pipeline branch
+  // connections" list are the keyboard/AT equivalents (elspeth-437caadef3).
+  describe("canvas focusability (elspeth-437caadef3)", () => {
+    it("removes canvas nodes and edges from the tab order", () => {
+      useSessionStore.setState({
+        compositionState: makeState({ nodes: [makeNode({ id: "classify" })] }),
+      });
+      render(<GraphView />);
+      const flow = screen.getByTestId("react-flow");
+      expect(flow.dataset.nodesFocusable).toBe("false");
+      expect(flow.dataset.edgesFocusable).toBe("false");
+    });
+  });
+
   describe("accessible node list (C2/C3, elspeth-ef897110dd / elspeth-d37b7217c9)", () => {
     it("exposes every component as a keyboard-operable item with type + validity", () => {
       useSessionStore.setState({
@@ -1951,6 +1975,153 @@ describe("GraphView", () => {
         name: /classify configuration/i,
       });
       expect(panel).toHaveFocus();
+    });
+  });
+
+  // Truth tests (not declaration tests) for the per-node validity the a11y
+  // list announces. A passing validation attributes no per-node findings, so
+  // 'valid' is derived from is_valid === true — gated honestly: a failing
+  // result with only unattributed (component_id: null) errors must never
+  // claim per-node validity (elspeth-b5b7c5a6ad).
+  describe("per-node validity announcement (elspeth-b5b7c5a6ad)", () => {
+    const passingShapeState = () =>
+      makeState({
+        sources: { in: { plugin: "csv", on_success: "t1", options: {} } } as never,
+        nodes: [
+          makeNode({
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm_transform",
+            input: "t1",
+            on_success: "out",
+          }),
+        ],
+        outputs: [{ name: "out", plugin: "jsonl", options: {} }] as never,
+      });
+
+    const a11yButtonText = () => {
+      const list = screen.getByRole("list", {
+        name: /pipeline components in source-to-sink order/i,
+      });
+      return within(list)
+        .getAllByRole("button")
+        .map((b) => b.textContent ?? "");
+    };
+
+    it("announces every component as valid on a passing result", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      useExecutionStore.setState({
+        validationResult: { is_valid: true, checks: [], errors: [], warnings: [] },
+      } as never);
+      render(<GraphView />);
+      const text = a11yButtonText();
+      expect(text).toHaveLength(3);
+      expect(text.every((t) => /— passed validation\./.test(t))).toBe(true);
+      expect(text.some((t) => t.includes("not yet validated"))).toBe(false);
+    });
+
+    // The graph's own summary counts components; the singular case had no
+    // oracle, so "1 components" could ship unnoticed.
+    it("names a one-component graph in the singular", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: { in: { plugin: "csv", on_success: null, options: {} } } as never,
+        }),
+      });
+      render(<GraphView />);
+      expect(
+        screen.getByRole("img", { name: /^Pipeline graph with 1 component \(/ }),
+      ).toBeInTheDocument();
+    });
+
+    // Vocabulary parity, pinned as a relation rather than as two literals:
+    // the node's passing phrase must be built from the same word the
+    // validation status chip shows, so an operator cross-checking chip
+    // against node never meets two names for one fact. Reworded on either
+    // side without the other, this goes red.
+    it("announces the passing state with the status chip's own word", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      const passing = { is_valid: true, checks: [], errors: [], warnings: [] };
+      useExecutionStore.setState({ validationResult: passing } as never);
+      render(<GraphView />);
+      const chip = projectValidationWorkspaceStatus(passing as never);
+      expect(chip.text).toBe("Passed");
+      const phrase = `— ${chip.text.toLowerCase()} validation.`;
+      expect(a11yButtonText().every((t) => t.includes(phrase))).toBe(true);
+    });
+
+    // Verb-phrase parallelism across the four states: the passing arm must
+    // not drift back to a bare adjective while its siblings stay verbs.
+    it("keeps the passing phrase a verb phrase, not the bare adjective", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      useExecutionStore.setState({
+        validationResult: { is_valid: true, checks: [], errors: [], warnings: [] },
+      } as never);
+      render(<GraphView />);
+      const text = a11yButtonText();
+      expect(text).toHaveLength(3);
+      expect(text.some((t) => /— valid\./.test(t))).toBe(false);
+    });
+
+    it("announces the warned node as warning and the rest as valid on a warnings-only pass", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: true,
+          checks: [],
+          errors: [],
+          warnings: [
+            {
+              component_id: "classify",
+              component_type: "transform",
+              message: "Review optional mapping",
+              suggestion: null,
+            },
+          ],
+        },
+      } as never);
+      render(<GraphView />);
+      const text = a11yButtonText();
+      const warned = text.filter((t) => t.includes("classify"));
+      expect(warned).toHaveLength(1);
+      expect(warned[0]).toMatch(/has warnings/);
+      const others = text.filter((t) => !t.includes("classify"));
+      expect(others).toHaveLength(2);
+      expect(others.every((t) => /— passed validation\./.test(t))).toBe(true);
+    });
+
+    it("keeps every component 'not yet validated' when no validation has run", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      // beforeEach leaves validationResult: null — the honest-unknown arm.
+      render(<GraphView />);
+      const text = a11yButtonText();
+      expect(text).toHaveLength(3);
+      expect(text.every((t) => t.includes("not yet validated"))).toBe(true);
+      expect(text.some((t) => /— passed validation\./.test(t))).toBe(false);
+    });
+
+    it("never claims validity when a global (unattributed) error failed the pipeline", () => {
+      useSessionStore.setState({ compositionState: passingShapeState() });
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: false,
+          checks: [],
+          errors: [
+            {
+              component_id: null,
+              component_type: null,
+              message: "Pipeline is structurally incomplete",
+              suggestion: null,
+            },
+          ],
+          warnings: [],
+        },
+      } as never);
+      render(<GraphView />);
+      const text = a11yButtonText();
+      expect(text).toHaveLength(3);
+      expect(text.every((t) => t.includes("not yet validated"))).toBe(true);
+      expect(text.some((t) => /— passed validation\./.test(t))).toBe(false);
     });
   });
 

@@ -190,7 +190,15 @@ vi.mock("./components/common/ShortcutsHelp", () => ({
 }));
 
 vi.mock("./components/common/ConfirmDialog", () => ({
-  ConfirmDialog: () => <div data-testid="confirm-dialog-stub" />,
+  // Exposes onConfirm so the fanout-guard confirm path (the only App-level
+  // ConfirmDialog) can be exercised without the real dialog chrome.
+  ConfirmDialog: ({ onConfirm }: { onConfirm?: () => void }) => (
+    <div data-testid="confirm-dialog-stub">
+      <button type="button" onClick={() => onConfirm?.()}>
+        Stub confirm
+      </button>
+    </div>
+  ),
 }));
 
 // ── Auth stub ────────────────────────────────────────────────────────────────
@@ -356,6 +364,43 @@ describe("App banner roles", () => {
     const root = banner.closest(".alert-banner") as HTMLElement | null;
     expect(root).not.toBeNull();
     expect(root!.getAttribute("role")).toBe("status");
+  });
+
+  // The run-lifecycle fix rests entirely on RunOutcomeNotice being mounted at
+  // App level: it is the ONLY completion surface outside the Run panel, whose
+  // body unmounts whenever another artifact tab is active. Its own suite and
+  // the a11y audit both render the component directly, so they prove it works
+  // while proving nothing about it being wired in — deleting the <App/> mount
+  // left the whole suite green. This pins the wiring.
+  it("mounts the run-outcome notice's persistent polite region and surfaces a terminal outcome", async () => {
+    render(<App />);
+
+    // Present with NO outcome: the live region must pre-exist its content
+    // (a polite region inserted carrying its own text does not announce).
+    const region = await screen.findByTestId("run-outcome-status-region");
+    expect(region).toHaveAttribute("role", "status");
+    expect(region).toHaveTextContent("");
+    expect(document.querySelector(".run-outcome-notice")).toBeNull();
+
+    act(() => {
+      useExecutionStore.setState({
+        lastRunOutcome: {
+          runId: "run-app-1",
+          status: "failed",
+          sessionId: "session-1",
+        },
+      });
+    });
+
+    expect(region).toHaveTextContent("Pipeline failed.");
+    const banner = document.querySelector(".run-outcome-notice");
+    expect(banner).not.toBeNull();
+    expect(banner).toHaveTextContent("Pipeline failed.");
+    // App-level assertive-region hygiene: the notice announces every terminal
+    // outcome POLITELY and contributes no role="alert" node. A permanently
+    // mounted empty alert region made singular getByRole("alert") ambiguous
+    // for every other App surface (it broke the chat convergence-error test).
+    expect(screen.queryAllByRole("alert")).toHaveLength(0);
   });
 
   it("consolidates simultaneous notices into one priority-ordered banner row", async () => {
@@ -869,6 +914,86 @@ describe("App banner roles", () => {
     expect(onRequestRun).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  // Third run-launch path (elspeth-3a7b7c7b37): the fanout-guard
+  // ConfirmDialog's confirm re-enters execute() via confirmFanoutExecution,
+  // which ExecuteButton's own post-launch switch never observes — App must
+  // dispatch the Run-artifact intent itself, keyed on a real run_id.
+  it("switches to the Run artifact after a confirmed fanout execution", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    const confirmFanoutExecution = vi.fn().mockResolvedValue("run-99");
+    act(() => {
+      useExecutionStore.setState({
+        pendingFanoutGuard: {
+          ack_token: "ack-1",
+          risk_level: "high",
+          summary: "LLM fanout needs confirmation.",
+          risks: [],
+        },
+        pendingFanoutSessionId: "session-1",
+        confirmFanoutExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await waitFor(() =>
+      expect(artifactRequests).toEqual([
+        { tab: "run", focusMode: false, sessionId: "session-1" },
+      ]),
+    );
+    expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+  });
+
+  it("does not switch artifacts when the confirmed fanout dispatch fails", async () => {
+    const artifactRequests: RequestArtifactViewDetail[] = [];
+    const onArtifactRequest = (event: Event) => {
+      artifactRequests.push(
+        (event as CustomEvent<RequestArtifactViewDetail>).detail,
+      );
+    };
+    window.addEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    // Stale readiness / re-armed 428 both resolve null from the store.
+    const confirmFanoutExecution = vi.fn().mockResolvedValue(null);
+    act(() => {
+      useExecutionStore.setState({
+        pendingFanoutGuard: {
+          ack_token: "ack-1",
+          risk_level: "high",
+          summary: "LLM fanout needs confirmation.",
+          risks: [],
+        },
+        pendingFanoutSessionId: "session-1",
+        confirmFanoutExecution,
+      } as never);
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub confirm" }));
+
+    await act(async () => Promise.resolve());
+    expect(confirmFanoutExecution).toHaveBeenCalledTimes(1);
+    expect(artifactRequests).toEqual([]);
+    window.removeEventListener(REQUEST_ARTIFACT_VIEW_EVENT, onArtifactRequest);
   });
 
   it("does not dispatch retired inspector tab shortcuts on Alt+digit", async () => {

@@ -12,6 +12,11 @@ import type { ComponentProps } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AcknowledgementCard } from "./AcknowledgementCard";
+import {
+  ACKNOWLEDGEMENT_AMEND_LABEL,
+  ACKNOWLEDGEMENT_APPROVE_LABEL,
+  ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+} from "./acknowledgementLabels";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
@@ -116,6 +121,7 @@ function renderCard(
       event={event}
       sessionId="sess-1"
       stepLabel={props.stepLabel ?? "Summarise"}
+      compositionState={props.compositionState}
       showAmend={props.showAmend ?? event.kind === "vague_term"}
       onResolved={props.onResolved}
     />,
@@ -187,7 +193,7 @@ describe("AcknowledgementCard — per-kind copy", () => {
   it("hides the amend affordance when showAmend is false", () => {
     renderCard(makeEvent(), { showAmend: false });
     expect(
-      screen.queryByRole("button", { name: /edit the interpretation/i }),
+      screen.queryByRole("button", { name: /change the interpretation/i }),
     ).toBeNull();
   });
 });
@@ -301,7 +307,7 @@ describe("AcknowledgementCard — Acknowledge", () => {
       name: /acknowledge the llm's interpretation of cool/i,
     }) as HTMLButtonElement;
     const change = screen.getByRole("button", {
-      name: /edit the interpretation of cool/i,
+      name: /change the interpretation of cool/i,
     }) as HTMLButtonElement;
     expect(accept.disabled).toBe(true);
     expect(change.disabled).toBe(true);
@@ -322,7 +328,7 @@ describe("AcknowledgementCard — amend", () => {
     renderCard(makeEvent({ llm_draft: "interesting and engaging" }));
 
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
 
     const textarea = screen.getByRole("textbox") as HTMLTextAreaElement;
@@ -341,7 +347,7 @@ describe("AcknowledgementCard — amend", () => {
 
     renderCard(event);
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     const textarea = screen.getByRole("textbox");
     await user.clear(textarea);
@@ -361,7 +367,7 @@ describe("AcknowledgementCard — amend", () => {
     renderCard(makeEvent());
 
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     expect(screen.queryByRole("button", { name: "Submit" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Cancel" }));
@@ -379,7 +385,7 @@ describe("AcknowledgementCard — amend", () => {
     const user = userEvent.setup();
     renderCard(makeEvent({ llm_draft: "draft" }));
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     await user.clear(screen.getByRole("textbox"));
     expect(
@@ -392,7 +398,7 @@ describe("AcknowledgementCard — amend", () => {
     const user = userEvent.setup();
     renderCard(makeEvent({ llm_draft: "draft" }));
     await user.click(
-      screen.getByRole("button", { name: /edit the interpretation of cool/i }),
+      screen.getByRole("button", { name: /change the interpretation of cool/i }),
     );
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "a".repeat(8200) } });
@@ -463,7 +469,8 @@ describe("AcknowledgementCard — error mapping", () => {
       makeEvent({ kind: "llm_prompt_template", llm_draft: "Classify {{ x }}." }),
       { showAmend: false },
     );
-    // Two-stage primary: click 1 reveals the prompt, click 2 approves.
+    // Two-control design: the View prompt toggle unlocks the separate
+    // Approve button.
     await user.click(screen.getByRole("button", { name: "View prompt" }));
     await user.click(
       screen.getByRole("button", { name: /approve the llm prompt template/i }),
@@ -474,10 +481,91 @@ describe("AcknowledgementCard — error mapping", () => {
   });
 });
 
-// ── Prompt-template two-stage primary (View prompt → Approve) ────────────────
+// ── Prompt-template View/Approve controls (elspeth-3a4a65530f) ───────────────
+//
+// Deliberate rewrite of the retired "two-stage primary" oracles: the single
+// morphing button (View prompt → Approve, operator ask 2026-07-03) is
+// replaced by two single-meaning controls — a disclosure toggle and an
+// Approve button that stays disabled until the prompt has been viewed.
 
-describe("AcknowledgementCard — prompt-template two-stage primary", () => {
-  it("first click reveals the prompt, second click approves — one primary button", async () => {
+describe("AcknowledgementCard — prompt-template View/Approve controls", () => {
+  it("renders two distinct controls pre-view: an enabled View prompt toggle and a disabled Approve", () => {
+    renderCard(
+      makeEvent({
+        kind: "llm_prompt_template",
+        llm_draft: "Summarise {{ row.body }} for an auditor.",
+      }),
+      { showAmend: false },
+    );
+
+    const toggle = screen.getByRole("button", {
+      name: "View prompt",
+    }) as HTMLButtonElement;
+    expect(toggle.disabled).toBe(false);
+    expect(toggle.className).toContain("ack-card-view-toggle");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    // Truth test for the exported constant (elspeth-0a9f77dd75): the cue
+    // prose (ChatInput placeholder, subscriptions system note) interpolates
+    // ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL, so the rendered toggle must be
+    // byte-exact with it.
+    expect(toggle.textContent).toBe(ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL);
+
+    const approve = screen.getByRole("button", {
+      name: /approve the llm prompt template/i,
+    }) as HTMLButtonElement;
+    expect(approve).not.toBe(toggle);
+    expect(approve.className).toContain("ack-card-accept-btn");
+    // Same truth test for the prompt card's accept label: the card renders
+    // "Approve" (never "Acknowledge"), and the exported constant is the
+    // anti-drift anchor the pointing prose interpolates.
+    expect(approve.textContent).toBe(ACKNOWLEDGEMENT_APPROVE_LABEL);
+    expect(ACKNOWLEDGEMENT_APPROVE_LABEL).toBe("Approve");
+    // The VIEW GATE is aria-disabled, not native `disabled` (house idiom for
+    // a gated primary with an attached reason — ExecuteButton.tsx,
+    // elspeth-94c32de486): the button must stay FOCUSABLE so its
+    // aria-describedby gate note is reachable by SR navigation.  Inertness is
+    // pinned separately by the rapid-double-click test below, which is what
+    // keeps this an advisory attribute plus a real no-op rather than a
+    // downgrade.
+    expect(approve.getAttribute("aria-disabled")).toBe("true");
+    expect(approve.disabled).toBe(false);
+    expect(approve.tabIndex).toBe(0);
+
+    // DOM/tab order: the prerequisite disclosure precedes the gated primary
+    // (ux-review 2026-08-13).  In a 360px pane the toggle otherwise fell
+    // below the fold under a greyed-out Approve.
+    expect(
+      toggle.compareDocumentPosition(approve) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // The prompt is hidden pre-view, and exactly one control carries the
+    // name "View prompt" (no duplicate-name trap).
+    expect(
+      screen.queryByRole("region", { name: /prompt template review/i }),
+    ).toBeNull();
+    expect(screen.getAllByRole("button", { name: /view prompt/i })).toHaveLength(1);
+  });
+
+  it("never resolves from the disabled Approve, even under a rapid double click", () => {
+    const event = makeEvent({
+      kind: "llm_prompt_template",
+      llm_draft: "Summarise {{ row.body }}.",
+    });
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(
+      makeResolveResponse(event),
+    );
+    renderCard(event, { showAmend: false });
+
+    const approve = screen.getByRole("button", {
+      name: /approve the llm prompt template/i,
+    });
+    fireEvent.click(approve);
+    fireEvent.click(approve);
+    expect(api.resolveInterpretation).not.toHaveBeenCalled();
+  });
+
+  it("View prompt reveals the region and unlocks Approve; viewing alone resolves nothing", async () => {
     const user = userEvent.setup();
     const event = makeEvent({
       kind: "llm_prompt_template",
@@ -488,34 +576,16 @@ describe("AcknowledgementCard — prompt-template two-stage primary", () => {
     );
     renderCard(event, { showAmend: false });
 
-    // Stage 1: the PRIMARY button is the view affordance (disclosure
-    // semantics), the prompt is hidden, and nothing resolves yet. No
-    // separate small "View prompt" toggle exists pre-view — two buttons
-    // with the same name would be a duplicate-name trap.
-    const primary = screen.getByRole("button", {
-      name: "View prompt",
-    }) as HTMLButtonElement;
-    expect(primary.disabled).toBe(false);
-    expect(primary.className).toContain("ack-card-accept-btn");
-    expect(primary.getAttribute("aria-expanded")).toBe("false");
-    expect(
-      screen.queryByRole("region", { name: /prompt template review/i }),
-    ).toBeNull();
-    expect(screen.getAllByRole("button", { name: /view prompt/i })).toHaveLength(1);
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
 
-    await user.click(primary);
-
-    // Stage 2: prompt revealed; the SAME button now approves; the first
-    // click must NOT have resolved anything.
     expect(
       screen.getByRole("region", { name: /prompt template review/i }),
     ).toBeTruthy();
     expect(api.resolveInterpretation).not.toHaveBeenCalled();
     const approve = screen.getByRole("button", {
       name: /approve the llm prompt template/i,
-    });
-    expect(approve).toBe(primary);
-    expect(approve.textContent).toBe("Approve");
+    }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
 
     await user.click(approve);
     await waitFor(() =>
@@ -523,9 +593,26 @@ describe("AcknowledgementCard — prompt-template two-stage primary", () => {
     );
   });
 
-  // Successor of elspeth-3b35abf148 variant 2: the primary button's first
-  // stage says WHY as visible text wired via aria-describedby.
-  it("explains stage 1 in visible text wired to the button, cleared once viewed", async () => {
+  it("collapsing the prompt after viewing does NOT re-disable Approve", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: "Classify {{ x }}." }),
+      { showAmend: false },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
+    expect(
+      screen.queryByRole("region", { name: /prompt template review/i }),
+    ).toBeNull();
+    const approve = screen.getByRole("button", {
+      name: /approve the llm prompt template/i,
+    }) as HTMLButtonElement;
+    expect(approve.disabled).toBe(false);
+  });
+
+  // Successor of elspeth-3b35abf148 variant 2: the gate says WHY in visible
+  // text wired to the Approve button via aria-describedby.
+  it("explains the gate in visible text wired to Approve, cleared once viewed", async () => {
     const user = userEvent.setup();
     renderCard(
       makeEvent({
@@ -535,31 +622,18 @@ describe("AcknowledgementCard — prompt-template two-stage primary", () => {
       { showAmend: false },
     );
 
-    const note = screen.getByText(/shows the llm's instruction/i);
+    const note = screen.getByText(/approve unlocks once you have viewed it/i);
     expect(note.classList.contains("visually-hidden")).toBe(false);
-    const primary = screen.getByRole("button", { name: "View prompt" });
-    expect(primary.getAttribute("aria-describedby")).toBe(note.id);
+    const approve = screen.getByRole("button", {
+      name: /approve the llm prompt template/i,
+    });
+    expect(approve.getAttribute("aria-describedby")).toBe(note.id);
 
-    await user.click(primary);
-    expect(screen.queryByText(/shows the llm's instruction/i)).toBeNull();
-  });
-
-  it("collapsing the prompt after viewing does NOT demote Approve back to stage 1", async () => {
-    const user = userEvent.setup();
-    renderCard(
-      makeEvent({ kind: "llm_prompt_template", llm_draft: "Classify {{ x }}." }),
-      { showAmend: false },
-    );
     await user.click(screen.getByRole("button", { name: "View prompt" }));
-    // The small toggle appears only after viewing; it hides the prompt
-    // without resetting the viewed state.
-    await user.click(screen.getByRole("button", { name: "Hide prompt" }));
     expect(
-      screen.queryByRole("region", { name: /prompt template review/i }),
+      screen.queryByText(/approve unlocks once you have viewed it/i),
     ).toBeNull();
-    expect(
-      screen.getByRole("button", { name: /approve the llm prompt template/i }),
-    ).toBeTruthy();
+    expect(approve.getAttribute("aria-describedby")).toBeNull();
   });
 
   it("has a stable DOM id the wire-stage blocker links can target", () => {
@@ -568,6 +642,352 @@ describe("AcknowledgementCard — prompt-template two-stage primary", () => {
     const section = document.getElementById(`ack-card-${event.id}`);
     expect(section).not.toBeNull();
     expect(section?.getAttribute("data-testid")).toBe("acknowledgement-card");
+  });
+});
+
+// ── Resolved-prompt rendering (elspeth-990f5ea562) ───────────────────────────
+
+/** Composition state whose node-1 carries structured prompt parts. */
+function makePromptPartsState(
+  requirement: Record<string, unknown>,
+  version = 5,
+): CompositionState {
+  return {
+    ...makeCompositionState(version),
+    nodes: [
+      {
+        id: "node-1",
+        node_type: "transform",
+        plugin: "llm",
+        input: "rows",
+        on_success: null,
+        on_error: null,
+        options: {
+          prompt_template_parts: [
+            { kind: "text", text: "Summarise " },
+            { kind: "interpretation_ref", requirement_id: "req-1" },
+            { kind: "text", text: " for an auditor." },
+          ],
+          interpretation_requirements: [requirement],
+        },
+      },
+    ],
+  };
+}
+
+const RESOLVED_REQUIREMENT = {
+  id: "req-1",
+  kind: "vague_term",
+  user_term: "punchy",
+  status: "resolved",
+  draft: "short and direct",
+  event_id: "evt-vague-1",
+  accepted_value: "concise and neutral",
+  accepted_artifact_hash: null,
+  resolved_prompt_template_hash: null,
+};
+
+const PENDING_REQUIREMENT = {
+  ...RESOLVED_REQUIREMENT,
+  status: "pending",
+  accepted_value: null,
+};
+
+/** The staging-time frozen draft: slot masked as 'pending interpretation'. */
+const MASKED_DRAFT = "Summarise pending interpretation for an auditor.";
+
+describe("AcknowledgementCard — resolved-prompt rendering", () => {
+  it("shows the accepted sibling value (not the frozen 'pending interpretation' mask)", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+      {
+        showAmend: false,
+        compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
+      },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    const mark = region.querySelector("mark.ack-card-prompt-slot--resolved");
+    // The slot carries a visually-hidden "accepted value: " prefix so the
+    // resolved/pending distinction is not CSS-only (WCAG 1.3.1); textContent
+    // therefore includes it even though only the value is visible.
+    expect(mark?.textContent).toBe("accepted value: concise and neutral");
+    // The PRIMARY render carries the substitution; the frozen mask survives
+    // only inside the secondary 'View original template' disclosure.
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    expect(primaryPre?.textContent).toBe(
+      "Summarise accepted value: concise and neutral for an auditor.",
+    );
+    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+    // Fully resolved: no pending note, and the legend keys only the tint
+    // that is actually on screen.
+    expect(screen.queryByText(/pending values are drafts/i)).toBeNull();
+    expect(screen.getByText("Accepted value")).toBeTruthy();
+    expect(
+      screen.queryByText(/pending value — awaiting its own review/i),
+    ).toBeNull();
+  });
+
+  it("highlights a still-pending slot with its draft and the pending note", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+      {
+        showAmend: false,
+        compositionState: makePromptPartsState(PENDING_REQUIREMENT),
+      },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    const mark = region.querySelector("mark.ack-card-prompt-slot--pending");
+    // Visually-hidden "pending value: " prefix — see the resolved-slot test.
+    expect(mark?.textContent).toBe("pending value: short and direct");
+    expect(screen.getByText(/pending values are drafts/i)).toBeTruthy();
+    // All-pending: only the pending tint is keyed.
+    expect(
+      screen.getByText("Pending value — awaiting its own review"),
+    ).toBeTruthy();
+    expect(screen.queryByText("Accepted value")).toBeNull();
+  });
+
+  // ── Mixed prompt: the case the old caption got wrong ──────────────────────
+  //
+  // ux-review 2026-08-13 (UX-2): resolved AND pending slots both render as
+  // <mark>, differing only by CSS class, and the note said "Highlighted
+  // values await their own interpretation reviews" — false for every resolved
+  // slot.  On a mixed prompt (one accepted slot, one still pending: the
+  // normal state part-way through a review queue) an operator either
+  // discounted a value they had already attested or read a draft as settled.
+  // The visible legend now matches the sr-only per-slot prefixes, which had
+  // this right all along.
+  it("keys BOTH tints and scopes the note to pending on a mixed prompt", async () => {
+    const user = userEvent.setup();
+    const mixedState: CompositionState = {
+      ...makeCompositionState(5),
+      nodes: [
+        {
+          id: "node-1",
+          node_type: "transform",
+          plugin: "llm",
+          input: "rows",
+          on_success: null,
+          on_error: null,
+          options: {
+            prompt_template_parts: [
+              { kind: "text", text: "Summarise " },
+              { kind: "interpretation_ref", requirement_id: "req-1" },
+              { kind: "text", text: " complaints at " },
+              { kind: "interpretation_ref", requirement_id: "req-2" },
+              { kind: "text", text: " severity." },
+            ],
+            interpretation_requirements: [
+              RESOLVED_REQUIREMENT,
+              { ...PENDING_REQUIREMENT, id: "req-2", draft: "high" },
+            ],
+          },
+        },
+      ],
+    };
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+      { showAmend: false, compositionState: mixedState },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // Both tints are on screen…
+    expect(
+      region.querySelectorAll("mark.ack-card-prompt-slot--resolved"),
+    ).toHaveLength(1);
+    expect(
+      region.querySelectorAll("mark.ack-card-prompt-slot--pending"),
+    ).toHaveLength(1);
+    // …so BOTH legend items render, and the distinction is carried by TEXT
+    // (the swatches are aria-hidden decoration, stripped under forced-colors).
+    expect(screen.getByText("Accepted value")).toBeTruthy();
+    expect(
+      screen.getByText("Pending value — awaiting its own review"),
+    ).toBeTruthy();
+    // The note's subject is the PENDING tint alone — never "Highlighted
+    // values", which was true of the resolved slot too.
+    const note = screen.getByText(/drafts from their own reviews/i);
+    expect(note.textContent).toContain("Pending values");
+    expect(note.textContent).not.toContain("Highlighted values");
+  });
+
+  it("keys nothing when the prompt has no interpretation slots at all", async () => {
+    // A legend for tints that are not on screen would be noise, and the
+    // one-way invariant runs the same direction as the control naming:
+    // never key a distinction the render does not make.
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({
+        kind: "llm_prompt_template",
+        llm_draft: "Summarise the row for an auditor.",
+      }),
+      { showAmend: false, compositionState: null },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    expect(screen.queryByText("Accepted value")).toBeNull();
+    expect(
+      screen.queryByText("Pending value — awaiting its own review"),
+    ).toBeNull();
+    expect(screen.queryByText(/pending values are drafts/i)).toBeNull();
+  });
+
+  // ── Fallback visibility (code-review 2026-08-13) ──────────────────────────
+  //
+  // promptTemplateDisplay's `usedFallback` was computed on every return path
+  // and read by nothing.  On a card whose entire purpose is showing what
+  // actually runs, a degraded render that looks identical to the resolved one
+  // is the wrong silence — so the flag now drives a visible note.
+  it("says so when the structured parts could not be rendered", async () => {
+    const user = userEvent.setup();
+    const malformedState: CompositionState = {
+      ...makeCompositionState(5),
+      nodes: [
+        {
+          id: "node-1",
+          node_type: "transform",
+          plugin: "llm",
+          input: "rows",
+          on_success: null,
+          on_error: null,
+          options: {
+            // Malformed parts → the resolver falls back to prompt_template.
+            prompt_template_parts: "not-a-list",
+            interpretation_requirements: [],
+            prompt_template: "Summarise the row for an auditor.",
+          },
+        },
+      ],
+    };
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+      { showAmend: false, compositionState: malformedState },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    expect(
+      screen.getByText(/showing the stored prompt template as-is/i),
+    ).toBeTruthy();
+  });
+
+  it("shows no fallback note when the structured parts DID render", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+      {
+        showAmend: false,
+        compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
+      },
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    expect(
+      screen.queryByText(/showing the stored prompt template as-is/i),
+    ).toBeNull();
+  });
+
+  it("names each slot's review status in visually-hidden text (not CSS-only)", async () => {
+    // The resolved-vs-pending distinction is a status fact on an approval
+    // surface; background/border on <mark> alone is imperceivable to a
+    // screen-reader user, so each slot carries a .visually-hidden prefix
+    // ("accepted value: " / "pending value: ") inside the mark.
+    const user = userEvent.setup();
+    for (const [requirement, slotKind, prefix] of [
+      [RESOLVED_REQUIREMENT, "resolved", "accepted value: "],
+      [PENDING_REQUIREMENT, "pending", "pending value: "],
+    ] as const) {
+      const { unmount } = renderCard(
+        makeEvent({ kind: "llm_prompt_template", llm_draft: MASKED_DRAFT }),
+        {
+          showAmend: false,
+          compositionState: makePromptPartsState(requirement),
+        },
+      );
+      await user.click(screen.getByRole("button", { name: "View prompt" }));
+      const mark = document.querySelector(
+        `mark.ack-card-prompt-slot--${slotKind}`,
+      );
+      const hidden = mark?.querySelector("span.visually-hidden");
+      expect(hidden?.textContent).toBe(prefix);
+      unmount();
+    }
+  });
+
+  it("offers 'View original template' with the frozen draft only when it differs", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({
+      kind: "llm_prompt_template",
+      llm_draft: MASKED_DRAFT,
+    });
+    const { unmount } = renderCard(event, {
+      showAmend: false,
+      compositionState: makePromptPartsState(RESOLVED_REQUIREMENT),
+    });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+
+    const disclosure = screen.getByText("View original template");
+    expect(disclosure.closest("details")?.textContent).toContain(MASKED_DRAFT);
+    unmount();
+
+    // Fallback path (no composition state): the render IS the frozen draft,
+    // so no secondary disclosure appears.
+    renderCard(event, { showAmend: false });
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    expect(screen.getByText(MASKED_DRAFT)).toBeTruthy();
+    expect(screen.queryByText("View original template")).toBeNull();
+  });
+
+  it("re-renders with fresh substitutions when a sibling resolve updates the state prop", async () => {
+    const user = userEvent.setup();
+    const event = makeEvent({
+      kind: "llm_prompt_template",
+      llm_draft: MASKED_DRAFT,
+    });
+    const { rerender } = render(
+      <AcknowledgementCard
+        event={event}
+        sessionId="sess-1"
+        stepLabel="Summarise"
+        compositionState={makePromptPartsState(PENDING_REQUIREMENT, 5)}
+        showAmend={false}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    // Read the slot through its class + textContent, NOT getByText: the
+    // visually-hidden prefix is a child <span>, and testing-library's text
+    // matcher only joins an element's DIRECT text nodes, so no single element
+    // ever "has" the combined string.
+    function slotText(kind: "pending" | "resolved"): string | null {
+      const mark = document.querySelector(`mark.ack-card-prompt-slot--${kind}`);
+      return mark === null ? null : mark.textContent;
+    }
+    expect(slotText("pending")).toBe("pending value: short and direct");
+    expect(slotText("resolved")).toBeNull();
+
+    rerender(
+      <AcknowledgementCard
+        event={event}
+        sessionId="sess-1"
+        stepLabel="Summarise"
+        compositionState={makePromptPartsState(RESOLVED_REQUIREMENT, 6)}
+        showAmend={false}
+      />,
+    );
+    expect(slotText("resolved")).toBe("accepted value: concise and neutral");
+    expect(slotText("pending")).toBeNull();
   });
 });
 
@@ -589,5 +1009,18 @@ describe("AcknowledgementCard — a11y", () => {
       name: /acknowledge the llm's interpretation of cool/i,
     });
     expect(accept.tagName).toBe("BUTTON");
+  });
+
+  it("amend button's accessible name starts with its visible label verb (WCAG 2.5.3)", () => {
+    renderCard(makeEvent());
+    const amend = screen.getByRole("button", {
+      name: /change the interpretation of cool/i,
+    });
+    // Visible label is the shared constant ("Change…", U+2026); the
+    // accessible name must begin with the same verb so speech-input users
+    // can say what they see (elspeth-0a9f77dd75 label-in-name fix — the
+    // old aria-label said "Edit the interpretation of …").
+    expect(amend.textContent).toBe(ACKNOWLEDGEMENT_AMEND_LABEL);
+    expect(amend.getAttribute("aria-label")).toMatch(/^Change /);
   });
 });

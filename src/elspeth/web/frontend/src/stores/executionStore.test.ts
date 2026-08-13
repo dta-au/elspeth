@@ -8,7 +8,14 @@ import {
   makeValidationResult,
 } from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
-import type { Run, RunAccounting, RunDiagnostics, RunEvent, ValidationResult } from "@/types/index";
+import type {
+  Run,
+  RunAccounting,
+  RunDiagnostics,
+  RunEvent,
+  RunProgress,
+  ValidationResult,
+} from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 
 // Mock the API client
@@ -811,6 +818,75 @@ describe("executionStore.cancel", () => {
     const state = useExecutionStore.getState();
     expect(state.runs[0].cancel_requested).toBe(true);
     expect(state.progress?.cancel_requested).toBe(true);
+    // Nothing terminal happened, so no outcome may be recorded — otherwise
+    // the toast and badge would fire on a run that is still draining.
+    expect(state.lastRunOutcome).toBeNull();
+  });
+
+  // Cancelling a not-yet-started run takes the backend's non-Event branch:
+  // status flips to "cancelled" in the response with NO run-event broadcast.
+  // Writing that into progress without recording the outcome strands the run
+  // twice — the toast waits on the WS 60s idle recheck, AND the loadRuns
+  // degraded-path reconciliation is disarmed by the very write (it is gated
+  // on progress NOT already being terminal). Net effect before this guard:
+  // no Run-tab badge at all and a toast up to a minute late.
+  it("records the terminal outcome when the response cancels a not-yet-started run", async () => {
+    const { cancelRun } = await import("@/api/client");
+    (cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "cancelled",
+      cancel_requested: false,
+    });
+    useExecutionStore.setState({
+      runs: [makeRun({ status: "pending" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-launch",
+      progress: {
+        source_rows_processed: 0,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+        cancel_requested: false,
+        accounting: null,
+        recent_errors: [],
+        status: "pending",
+      },
+    });
+    // A session switch after launch must not re-route the outcome: the
+    // stamp, not the session store, is the routing key.
+    useSessionStore.setState({ activeSessionId: "session-other" } as never);
+
+    await useExecutionStore.getState().cancel("run-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.progress?.status).toBe("cancelled");
+    expect(state.lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "cancelled",
+      sessionId: "session-launch",
+    });
+  });
+
+  it("does not record an outcome for a cancelled run this tab does not own", async () => {
+    const { cancelRun } = await import("@/api/client");
+    (cancelRun as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: "cancelled",
+      cancel_requested: false,
+    });
+    useExecutionStore.setState({
+      runs: [makeRun({ id: "run-other", status: "pending" })],
+      activeRunId: "run-1",
+      activeRunSessionId: "session-launch",
+      progress: null,
+    });
+
+    await useExecutionStore.getState().cancel("run-other");
+
+    const state = useExecutionStore.getState();
+    expect(state.runs[0].status).toBe("cancelled");
+    // The always-mounted surfaces speak for the ACTIVE run only.
+    expect(state.lastRunOutcome).toBeNull();
   });
 });
 
@@ -982,6 +1058,62 @@ describe("executionStore.rehydrateActiveRun", () => {
     );
   });
 
+  // The launch-session stamp has TWO write sites and only execute()'s was
+  // covered. rehydrate is the page-reload-during-a-live-run path — precisely
+  // where a terminal WS event arrives later — so an unstamped rehydrate makes
+  // applyRunEvent copy sessionId: null into lastRunOutcome, RunOutcomeNotice
+  // dispatch {tab:"run", sessionId:null}, and ArtifactWorkspace DROP the
+  // intent as a session mismatch: "View run" silently no-ops while still
+  // acknowledging the toast away.
+  it("stamps the rehydrated session as the run's launch session", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-live", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+
+    await useExecutionStore.getState().rehydrateActiveRun("session-1");
+
+    expect(useExecutionStore.getState().activeRunSessionId).toBe("session-1");
+  });
+
+  it("routes a terminal event after rehydration to the rehydrated session, not null", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-live", status: "running" }),
+    ]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+
+    await useExecutionStore.getState().rehydrateActiveRun("session-1");
+
+    // rehydrateActiveRun opens the socket itself; take the handlers it
+    // registered rather than re-connecting, so this exercises the real
+    // reload path end to end.
+    const handlers = (connectToRun as ReturnType<typeof vi.fn>).mock
+      .calls[0][2] as Record<
+      string,
+      (event: RunEvent, data: RunEvent["data"]) => void
+    >;
+    const completedEvent: RunEvent = {
+      run_id: "run-live",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-live",
+      status: "completed",
+      sessionId: "session-1",
+    });
+  });
+
   it("also reattaches a queued (pending) run", async () => {
     const { fetchRuns } = await import("@/api/client");
     (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
@@ -1087,6 +1219,375 @@ describe("executionStore run-disclosure acknowledgements", () => {
     useExecutionStore.getState().acknowledgeRunDisclosure("sess-2");
     useExecutionStore.getState().clearRunDisclosureAcks();
     expect(useExecutionStore.getState().runDisclosureAckBySession).toEqual({});
+  });
+});
+
+// Terminal-outcome surfacing (elspeth-3a7b7c7b37): lastRunOutcome is the
+// only run-lifecycle fact readable by always-mounted surfaces (the
+// RunOutcomeNotice toast, the Run-tab badge). It must carry the backend's
+// VERBATIM terminal status, only for the run this tab owns.
+describe("executionStore lastRunOutcome", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+  });
+
+  type RunEventHandler = (event: RunEvent, data: RunEvent["data"]) => void;
+
+  // Seeds the post-launch state execute() itself writes: activeRunId AND the
+  // launch session stamp that travels with it. The stamp is the ONLY session
+  // an outcome may carry — the tests below never let the session store's
+  // activeSessionId stand in for it.
+  function seedActiveRun(
+    launchSessionId: string = "session-1",
+  ): Record<string, RunEventHandler> {
+    const close = vi.fn();
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close });
+    useExecutionStore.setState({
+      runs: [makeRun()],
+      activeRunId: "run-1",
+      activeRunSessionId: launchSessionId,
+      progress: {
+        source_rows_processed: 0,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+        cancel_requested: false,
+        accounting: null,
+        recent_errors: [],
+        status: "running",
+      },
+    });
+    useExecutionStore.getState().connectWebSocket("run-1");
+    return (connectToRun as ReturnType<typeof vi.fn>).mock
+      .calls[0][2] as Record<string, RunEventHandler>;
+  }
+
+  it("records the verbatim backend status for a completed_with_failures run", () => {
+    const handlers = seedActiveRun();
+    const completedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed_with_failures",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed_with_failures",
+      sessionId: "session-1",
+    });
+  });
+
+  it("records a FAILED terminal outcome for the active run", () => {
+    const handlers = seedActiveRun();
+    const failedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "failed",
+      data: {
+        status: "failed",
+        detail: "Pipeline execution failed (FrameworkBugError)",
+        node_id: null,
+      },
+    };
+
+    handlers.onFailed(failedEvent, failedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "failed",
+      sessionId: "session-1",
+    });
+  });
+
+  it("records a cancelled terminal outcome for the active run", () => {
+    const handlers = seedActiveRun();
+    const cancelledEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "cancelled",
+      data: {
+        status: "cancelled",
+        source_rows_processed: 1,
+        tokens_succeeded: 0,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+      },
+    };
+
+    handlers.onCancelled(cancelledEvent, cancelledEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "cancelled",
+      sessionId: "session-1",
+    });
+  });
+
+  it("does not record an outcome from a terminal event for a non-active run", () => {
+    const handlers = seedActiveRun();
+    const staleEvent: RunEvent = {
+      run_id: "run-other",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "failed",
+      data: { status: "failed", detail: "stale", node_id: null },
+    };
+
+    handlers.onFailed(staleEvent, staleEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("does not record an outcome from non-terminal progress events", () => {
+    const handlers = seedActiveRun();
+    const progressEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:00.000Z",
+      event_type: "progress",
+      data: {
+        source_rows_processed: 3,
+        tokens_succeeded: 2,
+        tokens_failed: 0,
+        tokens_quarantined: 0,
+        tokens_routed_success: 0,
+        tokens_routed_failure: 0,
+      },
+    };
+
+    handlers.onProgress(progressEvent, progressEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("acknowledgeRunOutcome clears the outcome", () => {
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "completed", sessionId: "session-1" },
+    });
+
+    useExecutionStore.getState().acknowledgeRunOutcome();
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("reset clears the outcome", () => {
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "failed", sessionId: "session-1" },
+    });
+
+    useExecutionStore.getState().reset();
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  it("a fresh launch supersedes an unacknowledged outcome", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockResolvedValue({
+      run_id: "run-2",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+    useExecutionStore.setState({
+      lastRunOutcome: { runId: "run-1", status: "failed", sessionId: "session-1" },
+    });
+
+    const runId = await useExecutionStore.getState().execute("session-1");
+
+    expect(runId).toBe("run-2");
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
+  });
+
+  // The session-switch window (elspeth-3a7b7c7b37): a session switch commits
+  // useSessionStore.activeSessionId BEFORE useSession's passive effect calls
+  // reset(), so a WS terminal event can land while activeSessionId already
+  // names the NEW session but the store still owns the OLD run. Reading the
+  // session store at event time mis-files the outcome under the session the
+  // user just moved to, where RunOutcomeNotice would surface a stranger's
+  // run. The launch stamp is the only attribution that survives that window.
+  it("stamps the LAUNCH session, not the session active when the terminal event lands", () => {
+    const handlers = seedActiveRun("session-A");
+    useSessionStore.setState({ activeSessionId: "session-B" } as never);
+    const completedEvent: RunEvent = {
+      run_id: "run-1",
+      timestamp: "2026-04-26T05:32:08.000Z",
+      event_type: "completed",
+      data: {
+        status: "completed",
+        accounting: makeAccounting(),
+        landscape_run_id: "landscape-run-1",
+      },
+    };
+
+    handlers.onComplete(completedEvent, completedEvent.data);
+
+    expect(useExecutionStore.getState().lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed",
+      sessionId: "session-A",
+    });
+  });
+
+  it("execute stamps the launching session onto activeRunSessionId", async () => {
+    const { executePipeline, fetchRuns } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockResolvedValue({
+      run_id: "run-2",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (connectToRun as ReturnType<typeof vi.fn>).mockReturnValue({ close: vi.fn() });
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: { id: "state-1", version: 1, sources: {}, nodes: [], edges: [], outputs: [] },
+    } as never);
+
+    await useExecutionStore.getState().execute("session-1");
+
+    expect(useExecutionStore.getState().activeRunSessionId).toBe("session-1");
+  });
+
+  it("reset clears the launch session stamp with the run", () => {
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+    });
+
+    useExecutionStore.getState().reset();
+
+    expect(useExecutionStore.getState().activeRunId).toBeNull();
+    expect(useExecutionStore.getState().activeRunSessionId).toBeNull();
+  });
+});
+
+// Degraded-path reconciliation (elspeth-3a7b7c7b37): when the WebSocket drops
+// its terminal event, the 3s loadRuns poll is the only remaining evidence the
+// run finished. loadRuns must convert that evidence into the same two facts
+// the WS branch writes — a recorded outcome and a reconciled progress.status —
+// and must do so ONLY for the run this tab owns.
+describe("executionStore loadRuns degraded-path reconciliation", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useExecutionStore.getState().reset();
+    resetInterpretationStore();
+    useSessionStore.setState({ activeSessionId: "session-1" } as never);
+  });
+
+  function inFlightProgress(): RunProgress {
+    return {
+      source_rows_processed: 2,
+      tokens_succeeded: 1,
+      tokens_failed: 0,
+      tokens_quarantined: 0,
+      tokens_routed_success: 0,
+      tokens_routed_failure: 0,
+      cancel_requested: true,
+      accounting: null,
+      recent_errors: [],
+      status: "running",
+    };
+  }
+
+  it("records the outcome and reconciles progress when the poll finds the active run terminal", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    const terminalRow = makeRun({
+      status: "completed_with_failures",
+      accounting: makeAccounting(),
+      finished_at: "2026-04-26T05:32:08.000Z",
+    });
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([terminalRow]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: inFlightProgress(),
+    });
+
+    const outcome = await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(outcome).toBe("loaded");
+    const state = useExecutionStore.getState();
+    // Verbatim backend status, stamped with the LAUNCH session — the same
+    // contract the WS terminal branch writes.
+    expect(state.lastRunOutcome).toEqual({
+      runId: "run-1",
+      status: "completed_with_failures",
+      sessionId: "session-1",
+    });
+    // ProgressView must stop claiming a live run, and a cancel request that
+    // can no longer be honoured must not survive the terminal transition.
+    expect(state.progress?.status).toBe("completed_with_failures");
+    expect(state.progress?.cancel_requested).toBe(false);
+    expect(state.progress?.accounting).toEqual(terminalRow.accounting);
+  });
+
+  it("stamps the launch session on the degraded outcome, not the currently active session", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ status: "failed", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    useSessionStore.setState({ activeSessionId: "session-B" } as never);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-A",
+      progress: inFlightProgress(),
+    });
+
+    await useExecutionStore.getState().loadRuns("session-B");
+
+    expect(useExecutionStore.getState().lastRunOutcome?.sessionId).toBe(
+      "session-A",
+    );
+  });
+
+  it("does not reconcile a terminal row for a run this tab is not attached to", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ id: "run-other", status: "failed" }),
+      makeRun({ id: "run-1", status: "running" }),
+    ]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: inFlightProgress(),
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    const state = useExecutionStore.getState();
+    expect(state.lastRunOutcome).toBeNull();
+    expect(state.progress?.status).toBe("running");
+    expect(state.runs).toHaveLength(2);
+  });
+
+  it("does not re-record an outcome once progress already reads terminal", async () => {
+    const { fetchRuns } = await import("@/api/client");
+    (fetchRuns as ReturnType<typeof vi.fn>).mockResolvedValue([
+      makeRun({ status: "completed", finished_at: "2026-04-26T05:32:08.000Z" }),
+    ]);
+    useExecutionStore.setState({
+      activeRunId: "run-1",
+      activeRunSessionId: "session-1",
+      progress: { ...inFlightProgress(), status: "completed", cancel_requested: false },
+      // The WS branch already recorded and the operator already acknowledged.
+      lastRunOutcome: null,
+    });
+
+    await useExecutionStore.getState().loadRuns("session-1");
+
+    expect(useExecutionStore.getState().lastRunOutcome).toBeNull();
   });
 });
 

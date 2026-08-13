@@ -203,7 +203,12 @@ describe("RunOutputsPanel", () => {
     expect(screen.queryByText(/no longer available on disk/i)).not.toBeInTheDocument();
   });
 
-  it("lazy-fetches preview when Preview is clicked and shows truncation footer", async () => {
+  // Auto-expansion (elspeth-3a7b7c7b37): the single-previewable-artifact
+  // common case expands and fetches its preview through the SAME
+  // togglePreview path a manual click uses — exactly once — while
+  // multi-artifact manifests keep the original opt-in behaviour.
+
+  it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
     );
@@ -213,13 +218,14 @@ describe("RunOutputsPanel", () => {
 
     render(<RunOutputsPanel runId={RUN_ID} />);
 
-    const previewBtn = await screen.findByRole("button", { name: /^Preview$/ });
-    expect(fetchRunOutputPreview).not.toHaveBeenCalled();
-    fireEvent.click(previewBtn);
-
+    // No click: the sole previewable artifact expands itself.
     await waitFor(() =>
       expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
     );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+    expect(
+      await screen.findByRole("button", { name: /Hide preview/ }),
+    ).toBeInTheDocument();
     // CSV renders as a table — assert on cell content.
     await waitFor(() => expect(screen.getByText("col1")).toBeInTheDocument());
     expect(screen.getByText("col2")).toBeInTheDocument();
@@ -235,6 +241,57 @@ describe("RunOutputsPanel", () => {
     expect(fullFileLink.hasAttribute("href")).toBe(false);
   });
 
+  it("keeps a multi-artifact manifest collapsed until Preview is clicked", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([
+        fileArtifact(),
+        fileArtifact({
+          artifact_id: "art-2",
+          path_or_uri: "file:///data/outputs/errors.csv",
+        }),
+      ]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const previewButtons = await screen.findAllByRole("button", {
+      name: /^Preview$/,
+    });
+    expect(previewButtons).toHaveLength(2);
+    expect(fetchRunOutputPreview).not.toHaveBeenCalled();
+
+    fireEvent.click(previewButtons[0]);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith(RUN_ID, "art-1"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not re-expand after a manual collapse, even across Refresh of the same run", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+
+    fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
+
+    // The refreshed manifest must not override the operator's collapse:
+    // auto-expansion is once per run.
+    await waitFor(() => expect(fetchRunOutputs).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+  });
+
   it("does not refetch preview when the row is collapsed and re-expanded", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
@@ -243,11 +300,10 @@ describe("RunOutputsPanel", () => {
 
     render(<RunOutputsPanel runId={RUN_ID} />);
 
-    const previewBtn = await screen.findByRole("button", { name: /^Preview$/ });
-    fireEvent.click(previewBtn);
+    // Auto-expansion performs the first (and only) fetch.
     await waitFor(() => expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1));
 
-    fireEvent.click(screen.getByRole("button", { name: /Hide preview/ }));
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
     fireEvent.click(screen.getByRole("button", { name: /^Preview$/ }));
 
     // Cached — no second fetch.
@@ -267,8 +323,8 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
+    // Sole previewable artifact — auto-expanded, no click needed.
     await waitFor(() =>
       expect(screen.getByText(/no inline preview available/i)).toBeInTheDocument(),
     );
@@ -290,7 +346,6 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     // The full JSON object is present in the rendered output rather than
     // any of its fragments. If the comma-split bug had survived,
@@ -321,7 +376,6 @@ describe("RunOutputsPanel", () => {
     );
 
     const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /Hide preview/ })).toBeInTheDocument(),
@@ -341,7 +395,6 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(csvPreview());
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     const headerCells = await screen.findAllByRole("columnheader");
     expect(headerCells.map((el) => el.textContent)).toEqual(["col1", "col2"]);
@@ -369,7 +422,6 @@ describe("RunOutputsPanel", () => {
     );
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     // Each header and data cell is its own queryable element. Before the
     // fix, "id\tname\tvalue" rendered as a single cell.
@@ -393,7 +445,6 @@ describe("RunOutputsPanel", () => {
     );
 
     const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() =>
       expect(container.querySelector('[data-codeblock-format="json"]')?.textContent).toContain(
@@ -523,8 +574,8 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
+    // The auto-expanded preview fetch hits the purge race directly.
     await waitFor(() =>
       expect(
         screen.getByText(
@@ -542,7 +593,6 @@ describe("RunOutputsPanel", () => {
     (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockRejectedValue(apiError);
 
     render(<RunOutputsPanel runId={RUN_ID} />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
 
     await waitFor(() => expect(screen.getByRole("alert")).toBeInTheDocument());
     expect(screen.getByText(/server boom/)).toBeInTheDocument();
@@ -569,7 +619,7 @@ describe("RunOutputsPanel", () => {
     );
 
     const { rerender } = render(<RunOutputsPanel runId="run-a" />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
+    // Sole previewable artifact — auto-expanded, no click needed.
     await waitFor(() =>
       expect(screen.getByText("old-run-preview")).toBeInTheDocument(),
     );
@@ -640,7 +690,7 @@ describe("RunOutputsPanel", () => {
     );
 
     const { rerender } = render(<RunOutputsPanel runId="run-a" />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Preview$/ }));
+    // Auto-expansion fires the run-a preview fetch.
     await waitFor(() =>
       expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-1"),
     );
@@ -658,6 +708,108 @@ describe("RunOutputsPanel", () => {
       expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
     );
     expect(screen.queryByText("stale-run-a-preview")).not.toBeInTheDocument();
+  });
+
+  // The auto-expand effect fires in the SAME commit as the runId prop change,
+  // while `manifest` state is still the previous run's. Acting on that pair
+  // would fetch run A's artifact ids against run B's /preview endpoint AND
+  // burn run B's once-per-run auto-expand budget, leaving B's real output
+  // collapsed. The manifest-ownership guard must make both impossible.
+  it("never auto-expands run B using run A's manifest", async () => {
+    const runBLoad = deferred<RunOutputsResponse>();
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        targetRunId === "run-a"
+          ? Promise.resolve(
+              manifest([
+                fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                }),
+              ]),
+            )
+          : runBLoad.promise,
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-a", "art-a"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputs).toHaveBeenCalledWith("run-b"),
+    );
+    // No cross-run preview fetch while run B's own manifest is still in
+    // flight — run A's artifact id does not exist under run B.
+    expect(fetchRunOutputPreview).not.toHaveBeenCalledWith("run-b", "art-a");
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(1);
+
+    runBLoad.resolve(
+      manifest([
+        fileArtifact({
+          artifact_id: "art-b",
+          path_or_uri: "file:///data/outputs/run-b.csv",
+        }),
+      ]),
+    );
+
+    // Run B's budget was never spent on run A's artifact, so B's own sole
+    // output still auto-expands.
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not re-expand a manually collapsed artifact when navigating run A → B → A", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockImplementation(
+      (targetRunId: string) =>
+        Promise.resolve(
+          manifest([
+            targetRunId === "run-a"
+              ? fileArtifact({
+                  artifact_id: "art-a",
+                  path_or_uri: "file:///data/outputs/run-a.csv",
+                })
+              : fileArtifact({
+                  artifact_id: "art-b",
+                  path_or_uri: "file:///data/outputs/run-b.csv",
+                }),
+          ]),
+        ),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview(),
+    );
+
+    const { rerender } = render(<RunOutputsPanel runId="run-a" />);
+    // Run A auto-expands, then the operator deliberately collapses it.
+    fireEvent.click(await screen.findByRole("button", { name: /Hide preview/ }));
+    expect(screen.getByRole("button", { name: /^Preview$/ })).toBeInTheDocument();
+
+    rerender(<RunOutputsPanel runId="run-b" />);
+    await waitFor(() =>
+      expect(fetchRunOutputPreview).toHaveBeenCalledWith("run-b", "art-b"),
+    );
+
+    rerender(<RunOutputsPanel runId="run-a" />);
+    await waitFor(() => expect(screen.getByText("run-a.csv")).toBeInTheDocument());
+
+    // Returning to run A must honour the collapse: auto-expansion is
+    // remembered per run in a SET, so run B's visit cannot re-arm run A.
+    expect(
+      await screen.findByRole("button", { name: /^Preview$/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Hide preview/ }),
+    ).not.toBeInTheDocument();
+    // Exactly the two intentional expansions: run A's original auto-expand
+    // and run B's. Returning to A adds no third fetch.
+    expect(fetchRunOutputPreview).toHaveBeenCalledTimes(2);
   });
 
   it("download button calls downloadRunOutputContent with auth (not a plain anchor)", async () => {

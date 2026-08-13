@@ -1493,6 +1493,11 @@
   display: grid;
   gap: var(--space-sm);
   margin: var(--space-sm) 0;
+  /* Container for the narrow-pane row stack below (chat.css .chat-input
+     precedent): the authoring pane's width (360-640px) is independent of
+     the viewport, so a media query cannot see a narrow pane on a wide
+     screen — only the summary's own inline size can. */
+  container-type: inline-size;
 }
 
 .guided-schema-summary-row {
@@ -1527,6 +1532,18 @@
 .guided-schema-summary-value .code-block code {
   background: none;
   padding: 0;
+}
+
+/* Narrow-pane layout (elspeth-6db14f8519): below ~24rem the two-column
+   label:value grid leaves the value cell ~150px in the 360px pane, so a
+   pretty-printed JSON knob value wraps mid-word. Stack the label above the
+   value instead, giving the value the full row width; wider panes keep the
+   two-column layout automatically. */
+@container (max-width: 24rem) {
+  .guided-schema-summary-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-2xs);
+  }
 }
 
 /* Validation-failure caveat, demoted to a small note beside its summary row

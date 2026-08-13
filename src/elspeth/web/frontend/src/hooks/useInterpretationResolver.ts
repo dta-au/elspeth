@@ -156,7 +156,7 @@ export function describeError(err: unknown): DisplayedError {
 /**
  * Sub-view modes for the widget.
  *
- *   "choose"   → two primary buttons (Use mine / Change it).
+ *   "choose"   → two primary buttons (Acknowledge / Change…).
  *   "amend"    → textarea + Submit / Cancel.
  */
 export type ReviewMode = "choose" | "amend";

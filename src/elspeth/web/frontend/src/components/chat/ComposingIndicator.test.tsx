@@ -1,7 +1,11 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ComposingIndicator, formatElapsed } from "./ComposingIndicator";
-import type { ComposerProgressSnapshot, CompositionState } from "@/types/api";
+import type {
+  ComposerProgressSnapshot,
+  CompositionState,
+  ToolCall,
+} from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
 function makeState(overrides: Partial<CompositionState> = {}): CompositionState {
@@ -339,6 +343,170 @@ describe("ComposingIndicator terminal badge honesty (elspeth-bf9c296ee5)", () =>
     expect(
       container.querySelector(".composing-terminal-mark")?.textContent,
     ).toBe("Stopped");
+  });
+});
+
+describe("ComposingIndicator live tool log (elspeth-3c2caf56a7)", () => {
+  function makeToolCall(
+    id: string,
+    name: string,
+    outcome?: ToolCall["outcome"],
+  ): ToolCall {
+    return {
+      id,
+      type: "function",
+      function: { name, arguments: "{}" },
+      ...(outcome !== undefined ? { outcome } : {}),
+    };
+  }
+
+  it("renders one always-visible entry per live call with outcome-honest prefixes", () => {
+    const { container } = render(
+      <ComposingIndicator
+        latestRequest="build a pipeline"
+        liveToolCalls={[
+          makeToolCall("tc-1", "get_plugin_schema"),
+          makeToolCall("tc-2", "set_pipeline"),
+          makeToolCall("tc-3", "set_source", "applied"),
+          makeToolCall("tc-4", "preview_pipeline", "failed"),
+        ]}
+      />,
+    );
+
+    // Visible WITHOUT opening the Show-details disclosure.
+    expect(screen.getByRole("button", { name: "Show details" })).toBeInTheDocument();
+    const log = container.querySelector(".composing-tool-log");
+    expect(log).not.toBeNull();
+    expect(log!.querySelectorAll("li")).toHaveLength(4);
+    // No stamp: conservative lookup label for discovery tools, neutral
+    // Running for mutating tools — never a fabricated "Applied".
+    expect(screen.getByText("Looked up: get_plugin_schema")).toBeInTheDocument();
+    expect(screen.getByText("Running: set_pipeline")).toBeInTheDocument();
+    expect(screen.queryByText("Applied: set_pipeline")).not.toBeInTheDocument();
+    // Server-stamped outcomes render their real verdicts.
+    expect(screen.getByText("Applied: set_source")).toBeInTheDocument();
+    expect(screen.getByText("Failed: preview_pipeline")).toBeInTheDocument();
+    // The human description is VISIBLE, not bound to a mouse-only `title`
+    // (ux-review 2026-08-13): during a multi-minute turn this log is the only
+    // progress affordance, and a `title` is unreachable by keyboard, by touch,
+    // and by most screen readers.
+    const lookupEntry = screen.getByText("Looked up: get_plugin_schema")
+      .parentElement!;
+    expect(lookupEntry.tagName).toBe("LI");
+    expect(lookupEntry).not.toHaveAttribute("title");
+    expect(lookupEntry.textContent).toContain(
+      "Reads a plugin's configuration schema to understand its options.",
+    );
+    // The description is the PRIMARY line and the machine identifier the
+    // secondary one.
+    expect(
+      lookupEntry.querySelector(".composing-tool-log-what")!.textContent,
+    ).toBe("Reads a plugin's configuration schema to understand its options.");
+    expect(
+      lookupEntry.querySelector(".composing-tool-log-call")!.textContent,
+    ).toBe("Looked up: get_plugin_schema");
+  });
+
+  it("never lets a visible description swallow a failure prefix", () => {
+    // The fabrication hazard of promoting the description: rendered alone,
+    // "Sets the pipeline's data source…" claims a mutation that FAILED or was
+    // rejected actually happened. The evidential prefix must survive on every
+    // outcome, alongside the description.
+    render(
+      <ComposingIndicator
+        latestRequest="build a pipeline"
+        liveToolCalls={[
+          makeToolCall("tc-1", "set_source", "failed"),
+          makeToolCall("tc-2", "upsert_node", "rejected"),
+          makeToolCall("tc-3", "remove_node", "cancelled"),
+        ]}
+      />,
+    );
+
+    for (const [label, description] of [
+      [
+        "Failed: set_source",
+        "Sets the pipeline's data source — what records the pipeline starts from.",
+      ],
+      [
+        "Attempted: upsert_node (not applied)",
+        "Adds a new transform or gate node, or replaces an existing one with the same id.",
+      ],
+      [
+        "Cancelled: remove_node",
+        "Removes a transform or gate node from the pipeline.",
+      ],
+    ] as const) {
+      const entry = screen.getByText(label).parentElement!;
+      expect(entry.textContent).toContain(description);
+      expect(entry.textContent).toContain(label);
+    }
+  });
+
+  it("keeps an unmapped tool name to its bare label — no empty description line", () => {
+    // describeToolCall's fallback is the generic "Composer tool call.", which
+    // says nothing; a line carrying it would be noise, so unmapped names keep
+    // exactly today's rendering.
+    const { container } = render(
+      <ComposingIndicator
+        latestRequest="build a pipeline"
+        liveToolCalls={[makeToolCall("tc-1", "some_future_tool")]}
+      />,
+    );
+
+    const entry = container.querySelector(".composing-tool-log li")!;
+    expect(entry.textContent).toBe("Running: some_future_tool");
+    expect(entry.querySelector(".composing-tool-log-what")).toBeNull();
+    expect(entry.textContent).not.toContain("Composer tool call.");
+  });
+
+  it("gives the log an accessible name so it is not an unlabelled sequence", () => {
+    // Nothing told the operator what "Running: set_source" was a list OF.
+    const { container } = render(
+      <ComposingIndicator
+        latestRequest="build a pipeline"
+        liveToolCalls={[makeToolCall("tc-1", "set_source")]}
+      />,
+    );
+
+    const log = container.querySelector(".composing-tool-log")!;
+    const captionId = log.getAttribute("aria-labelledby");
+    expect(captionId).not.toBeNull();
+    const caption = document.getElementById(captionId!);
+    expect(caption?.textContent).toBe("Composer actions in this turn");
+    // Visible, not sr-only: it doubles as the plain-language anchor for the
+    // Ran / Running / Looked up vocabulary.
+    expect(caption?.classList.contains("visually-hidden")).toBe(false);
+  });
+
+  it("keeps the log OUTSIDE the role=status live region so appends never announce", () => {
+    const { container } = render(
+      <ComposingIndicator
+        latestRequest="build a pipeline"
+        liveToolCalls={[makeToolCall("tc-1", "get_pipeline_state")]}
+      />,
+    );
+
+    const log = container.querySelector(".composing-tool-log");
+    expect(log).not.toBeNull();
+    expect(screen.getByRole("status").contains(log)).toBe(false);
+    // No aria-live ancestor at all — an append-per-poll list inside a polite
+    // region would announce every 1.5s tick (WCAG 4.1.3).
+    for (
+      let node = log!.parentElement;
+      node !== null;
+      node = node.parentElement
+    ) {
+      expect(node.getAttribute("aria-live")).toBeNull();
+      expect(node.getAttribute("role")).not.toBe("status");
+    }
+  });
+
+  it("renders no list at all when there are no live calls", () => {
+    const { container } = render(
+      <ComposingIndicator latestRequest="build a pipeline" />,
+    );
+    expect(container.querySelector(".composing-tool-log")).toBeNull();
   });
 });
 

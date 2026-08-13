@@ -25,6 +25,7 @@ import {
   type RunStatus,
 } from "@/types/index";
 import { plural } from "@/utils/plural";
+import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 import { RunsHistoryDrawer } from "./RunsHistoryDrawer";
 
 function statusLabel(status: RunStatus | null): string {
@@ -219,6 +220,15 @@ function DiscardSummaryWarning({ run }: { run: Run | null }): JSX.Element | null
 
 export interface InlineRunResultsProps {
   showEmptyState?: boolean;
+  /**
+   * True only when the REQUEST_RUN_EVENT policy owner (ExecuteButton inside
+   * CompletionBar) is mounted — App threads capabilities.completion through
+   * ArtifactWorkspace; the tutorial shell (completion: false) leaves it
+   * unset. Gates the empty-state Run affordance so it can never dispatch
+   * into a zero-listener surface (App.tsx single-emitter doctrine,
+   * elspeth-553a6fb81d).
+   */
+  runAvailable?: boolean;
 }
 
 interface InitialRunLoadState {
@@ -228,11 +238,19 @@ interface InitialRunLoadState {
 
 export function InlineRunResults({
   showEmptyState = false,
+  runAvailable = false,
 }: InlineRunResultsProps = {}): JSX.Element | null {
   const activeRunId = useExecutionStore((s) => s.activeRunId);
   const progress = useExecutionStore((s) => s.progress);
   const runs = useExecutionStore((s) => s.runs);
   const loadRuns = useExecutionStore((s) => s.loadRuns);
+  // Run admission fact for the empty-state affordance: REQUEST_RUN_EVENT's
+  // owner (ExecuteButton) drops the event when the run is inadmissible, so
+  // an enabled button here would silently no-op. Mirror the same readiness
+  // gate the owner enforces and fall back to directional copy instead.
+  const executionReady = useExecutionStore(
+    (s) => s.validationResult?.readiness?.execution_ready === true,
+  );
   const activeSessionId = useSessionStore((s) => s.activeSessionId);
   const [showHistory, setShowHistory] = useState(false);
   const [isCollapsed, setIsCollapsed] = useState(false);
@@ -346,9 +364,40 @@ export function InlineRunResults({
         </div>
       );
     }
-    return showEmptyState ? (
-      <p className="artifact-empty">No runs yet.</p>
-    ) : null;
+    if (!showEmptyState) return null;
+    if (!runAvailable) {
+      return <p className="artifact-empty">No runs yet.</p>;
+    }
+    // Inline run affordance (elspeth-553a6fb81d): route through the
+    // REQUEST_RUN_EVENT single policy owner (ExecuteButton's gating
+    // predicate + egress disclosure) — never a second ExecuteButton, never
+    // a direct execute() call. Rendered only when that owner is mounted AND
+    // the run is admissible (execution_ready): the owner's handler drops
+    // inadmissible events, so the button would otherwise be a silent
+    // dead control.
+    return executionReady ? (
+      <div className="artifact-empty">
+        <p>No runs yet. Run the pipeline to see its results here.</p>
+        <button
+          type="button"
+          className="btn-compact"
+          onClick={() => window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT))}
+        >
+          Run pipeline
+        </button>
+      </div>
+    ) : (
+      // Names the CONTROL, not a place. The run control lives in the sticky
+      // action bar at the bottom of this same pane at every width, so the
+      // earlier "run it from the sidebar" pointed at a surface that does not
+      // exist — the same defect class ("prose naming a control the user
+      // cannot find") the verb-vocabulary work exists to excise. Location
+      // words rot when the layout moves; "Run pipeline" is the one name that
+      // control carries on every surface.
+      <p className="artifact-empty">
+        No runs yet. Once validation passes, use Run pipeline to start one.
+      </p>
+    );
   }
 
   return (

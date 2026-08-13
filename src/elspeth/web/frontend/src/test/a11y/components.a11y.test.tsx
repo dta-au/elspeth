@@ -18,7 +18,7 @@
 // net.
 // ============================================================================
 
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef, type ReactNode } from "react";
@@ -87,6 +87,9 @@ const AUDITED_COMPONENTS = [
   // itself (landmark structure, live-region siblinghood, the named scroll
   // group) had zero axe coverage.
   "ChatPanelTutorialWorkspace",
+  // Run-lifecycle feedback (elspeth-3a7b7c7b37): the app-level terminal-run
+  // toast is the only completion surface mounted outside the Run panel.
+  "RunOutcomeNotice",
 ] as const;
 
 const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
@@ -121,6 +124,7 @@ const EXPECTED_AUDITED_COMPONENTS_SORTED: readonly string[] = [
   "ProposePipelineTurn",
   "ReadinessRowDetail",
   "RecoveryPanel",
+  "RunOutcomeNotice",
   "RunsHistoryDrawer",
   "SchemaFormTurn",
   "ShortcutsHelp",
@@ -296,6 +300,7 @@ import { CommandPalette } from "@/components/common/CommandPalette";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { WorkspaceSeparator } from "@/components/workspace/WorkspaceSeparator";
 import { ProgressView } from "@/components/execution/ProgressView";
+import { RunOutcomeNotice } from "@/components/execution/RunOutcomeNotice";
 import { RunsHistoryDrawer } from "@/components/execution/RunsHistoryDrawer";
 import { GraphView } from "@/components/inspector/GraphView";
 import { GraphModal } from "@/components/sidebar/GraphModal";
@@ -380,6 +385,12 @@ function resetAllStores() {
   } as never);
   useExecutionStore.setState({
     validationResult: null,
+    // Run-lifecycle fields (elspeth-3a7b7c7b37). RunOutcomeNotice reads
+    // lastRunOutcome, so a test that seeds it and throws before its inline
+    // cleanup would otherwise leak a mounted toast into every later test in
+    // this large shared file. Baselines belong here, not at a test's tail.
+    lastRunOutcome: null,
+    activeRunSessionId: null,
   } as never);
   useAuditReadinessStore.setState(getAuditInitialState());
   resetStore(useInterpretationEventsStore);
@@ -483,6 +494,27 @@ describe("UserMenu", () => {
     const { container } = render(
       <UserMenu onOpenSettings={() => {}} onSignOut={() => {}} />,
     );
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  // elspeth-312238838a: the open menu renders a non-focusable identity
+  // header (display name + username) when the auth store holds a user.
+  // Open the menu so the identity block is actually in the audited DOM.
+  it("has no axe violations with the signed-in identity header open", async () => {
+    useAuthStore.setState({
+      user: {
+        user_id: "user-a11y",
+        username: "jdoe",
+        display_name: "Jane Doe",
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+    });
+    const { container } = render(
+      <UserMenu onOpenSettings={() => {}} onSignOut={() => {}} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1443,7 +1475,7 @@ describe("AcknowledgementCard", () => {
     expect(await axe(container)).toHaveNoViolations();
   });
 
-  it("has no axe violations (llm_prompt_template with the two-stage View→Approve primary)", async () => {
+  it("has no axe violations (llm_prompt_template with the View/Approve controls, pre- and post-view)", async () => {
     const { container } = render(
       <AcknowledgementCard
         event={makeInterpretationEvent("evt-2", {
@@ -1454,6 +1486,71 @@ describe("AcknowledgementCard", () => {
         stepLabel="Summarise"
       />,
     );
+    // Pre-view: disabled Approve with the aria-describedby gate note.
+    expect(await axe(container)).toHaveNoViolations();
+    // Post-view: revealed prompt region + enabled Approve.
+    await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    expect(await axe(container)).toHaveNoViolations();
+  });
+
+  it("has no axe violations on the resolved prompt with marked substitution slots", async () => {
+    // Without a composition state the prompt renders as one flat text
+    // segment, so the <mark> slots — and the visually-hidden
+    // "accepted value: " / "pending value: " status prefixes inside them —
+    // escape the audit entirely.  Supply the structured parts so both slot
+    // kinds and the pending note are actually in the audited DOM.
+    const state = makeFullCompositionState();
+    const { container } = render(
+      <AcknowledgementCard
+        event={makeInterpretationEvent("evt-3", {
+          kind: "llm_prompt_template",
+          llm_draft: "Summarise pending interpretation for pending interpretation.",
+        })}
+        sessionId="sess-a11y"
+        stepLabel="Summarise"
+        compositionState={{
+          ...state,
+          nodes: [
+            {
+              ...state.nodes[0],
+              options: {
+                prompt_template_parts: [
+                  { kind: "text", text: "Summarise " },
+                  { kind: "interpretation_ref", requirement_id: "req-1" },
+                  { kind: "text", text: " for " },
+                  { kind: "interpretation_ref", requirement_id: "req-2" },
+                  { kind: "text", text: "." },
+                ],
+                interpretation_requirements: [
+                  {
+                    id: "req-1",
+                    status: "resolved",
+                    draft: "briefly",
+                    accepted_value: "concise and neutral",
+                  },
+                  {
+                    id: "req-2",
+                    status: "pending",
+                    draft: "an auditor",
+                    accepted_value: null,
+                  },
+                ],
+              },
+            },
+          ],
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View prompt" }));
+    // Guard against a vacuous pass: both slot kinds must be mounted, each
+    // carrying its visually-hidden status prefix.
+    const region = screen.getByRole("region", { name: /prompt template review/i });
+    expect(
+      region.querySelector("mark.ack-card-prompt-slot--resolved")?.textContent,
+    ).toBe("accepted value: concise and neutral");
+    expect(
+      region.querySelector("mark.ack-card-prompt-slot--pending")?.textContent,
+    ).toBe("pending value: an auditor");
     expect(await axe(container)).toHaveNoViolations();
   });
 });
@@ -1607,6 +1704,34 @@ describe("ProgressView", () => {
     } as never);
     const { container } = render(<ProgressView />);
     screen.getByText("Source Rows");
+    expect(await axe(container)).toHaveNoViolations();
+  });
+});
+
+describe("RunOutcomeNotice", () => {
+  // resetAllStores() clears lastRunOutcome for the whole file; this is the
+  // per-describe belt so an assertion failure above cannot leak a mounted
+  // toast into the next test even within this block.
+  afterEach(() => {
+    useExecutionStore.setState({ lastRunOutcome: null } as never);
+  });
+
+  it("has no axe violations for a failed-run outcome toast", async () => {
+    useExecutionStore.setState({
+      lastRunOutcome: {
+        runId: "run-a11y",
+        status: "failed",
+        sessionId: "sess-a11y",
+      },
+    } as never);
+    const { container } = render(<RunOutcomeNotice />);
+    // Guard against a vacuous pass on the empty (acknowledged) state: the
+    // toast and both actions must actually be mounted. The notice announces
+    // every terminal outcome POLITELY — role="status", never role="alert" —
+    // so the live region, not an alert, is what proves it spoke.
+    expect(screen.getByRole("status")).toHaveTextContent("Pipeline failed.");
+    screen.getByRole("button", { name: "View run" });
+    screen.getByRole("button", { name: "Dismiss run outcome notice" });
     expect(await axe(container)).toHaveNoViolations();
   });
 });

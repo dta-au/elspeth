@@ -28,6 +28,7 @@ import { DefaultModeChangedBanner } from "./components/common/DefaultModeChanged
 import { ChatPanel } from "./components/chat/ChatPanel";
 import { CatalogDrawer } from "./components/catalog/CatalogDrawer";
 import { RecoveryPanel } from "./components/recovery/RecoveryPanel";
+import { RunOutcomeNotice } from "./components/execution/RunOutcomeNotice";
 import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
 import { UserAdminDialog } from "./components/settings/UserAdminDialog";
@@ -267,7 +268,19 @@ function App() {
     [],
   );
   const confirmFanoutExecution = useCallback(async () => {
-    await useExecutionStore.getState().confirmFanoutExecution();
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+    // Third run-launch path (the fanout-guard ConfirmDialog below):
+    // ExecuteButton's own post-execute switch never sees this dispatch, so
+    // the Run-artifact switch is hooked here too (elspeth-3a7b7c7b37).
+    // Keyed on a real run_id — stale-readiness settles and re-armed 428
+    // guards return null and must not switch tabs.
+    if (typeof runId === "string") {
+      dispatchArtifactViewIntent({
+        tab: "run",
+        focusMode: false,
+        sessionId: useSessionStore.getState().activeSessionId,
+      });
+    }
   }, []);
   const dismissFanoutGuard = useCallback(() => {
     useExecutionStore.getState().dismissFanoutGuard();
@@ -668,6 +681,11 @@ function App() {
         <h1 className="sr-only">ELSPETH Pipeline Composer</h1>
 
         <AppNoticeCenter notices={appNotices} />
+        {/* Terminal-run toast (elspeth-3a7b7c7b37). Deliberately NOT a new
+            AppNoticeKind: the notice center's priority queue collapses to
+            one primary banner, and a run outcome must not displace (or be
+            displaced by) an outage banner. Pure executionStore reader. */}
+        <RunOutcomeNotice />
         <AppHeader
           onOpenSettings={openComposerSettings}
           onSignOut={logout}
@@ -730,7 +748,15 @@ function App() {
               authoring={<ChatPanel onOpenSecrets={openSecrets} />}
               authoringStatus={<DefaultModeChangedBanner />}
               collapsedStatus={<CollapsedAuthoringStatus />}
-              artifact={<ArtifactWorkspace />}
+              artifact={
+                // Same availability fact that mounts the REQUEST_RUN_EVENT
+                // owner (ExecuteButton via capabilities.completion), so the
+                // Run-tab empty-state affordance can never dispatch into a
+                // zero-listener surface (App.tsx REQUEST_RUN_EVENT doctrine).
+                <ArtifactWorkspace
+                  runAvailable={workspaceActionCapabilities.completion}
+                />
+              }
               inspector={<WorkspaceInspector />}
               actionBar={
                 <WorkspaceActionBar

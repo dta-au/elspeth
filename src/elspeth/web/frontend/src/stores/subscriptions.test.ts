@@ -1,11 +1,21 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { act, waitFor } from "@testing-library/react";
 import { initStoreSubscriptions, _resetSubscriptionsForTesting, requestValidate } from "./subscriptions";
 import { useSessionStore } from "./sessionStore";
 import { useExecutionStore } from "./executionStore";
 import { useAuditReadinessStore } from "./auditReadinessStore";
 import { useAuthStore } from "./authStore";
+import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import type { Session } from "../types/api";
+import type { InterpretationEvent, InterpretationKind } from "../types/interpretation";
+import {
+  ACKNOWLEDGEMENT_ACCEPT_LABEL,
+  ACKNOWLEDGEMENT_AMEND_LABEL,
+  ACKNOWLEDGEMENT_APPROVE_LABEL,
+  ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+} from "@/components/chat/acknowledgementLabels";
 
 const SESSION_A = "00000000-0000-0000-0000-000000000001";
 const SESSION_B = "00000000-0000-0000-0000-000000000002";
@@ -18,6 +28,58 @@ function compositionWithSource(version: number) {
     edges: [],
     outputs: [],
   };
+}
+
+/**
+ * A pending interpretation event as the events store holds it.  The
+ * review-cue tests vary only `kind` — that is what decides which controls
+ * the AcknowledgementCard renders — but the row is built in full so the
+ * fixture cannot drift from the wire shape.
+ */
+function makePendingEvent(
+  id: string,
+  kind: InterpretationKind | null,
+): InterpretationEvent {
+  return {
+    id,
+    session_id: "sess-1",
+    composition_state_id: "state-1",
+    affected_node_id: "node-1",
+    tool_call_id: "tool-1",
+    user_term: "cool",
+    kind,
+    llm_draft: "interesting and engaging",
+    accepted_value: null,
+    choice: "pending",
+    created_at: "2026-08-13T00:00:00Z",
+    resolved_at: null,
+    actor: "user:owner:u-1",
+    interpretation_source: "user_approved",
+    model_identifier: "anthropic/claude-opus-4-7",
+    model_version: "20260518",
+    provider: "anthropic",
+    composer_skill_hash: "deadbeef",
+    arguments_hash: null,
+    hash_domain_version: null,
+    runtime_model_identifier_at_resolve: null,
+    runtime_model_version_at_resolve: null,
+    resolved_prompt_template_hash: null,
+  };
+}
+
+/** Seed the pending map the review-note phrasing reads its kinds from. */
+function seedPendingKinds(
+  sessionId: string,
+  kinds: readonly (InterpretationKind | null)[],
+): void {
+  const pending: Record<string, InterpretationEvent> = {};
+  kinds.forEach((kind, index) => {
+    const id = `evt-${index}`;
+    pending[id] = makePendingEvent(id, kind);
+  });
+  useInterpretationEventsStore.setState({
+    pendingBySession: { [sessionId]: pending },
+  });
 }
 
 describe("subscriptions — auditReadiness clearSession on session removal", () => {
@@ -92,8 +154,64 @@ describe("subscriptions — auditReadiness clearSession on session removal", () 
 describe("subscriptions — validation result side effects", () => {
   beforeEach(() => {
     _resetSubscriptionsForTesting();
+    // The review-note phrasing reads the pending kinds from this store; clear
+    // it so no test inherits a previous test's pending map.
+    useInterpretationEventsStore.setState({ pendingBySession: {} });
     vi.clearAllMocks();
   });
+
+  /**
+   * Drive the pending-interpretation-review branch and return the injected
+   * note.  `kinds` seeds the pending events store (what the note's phrasing
+   * reads); `blockerCount` defaults to one blocker per pending event, and is
+   * decoupled only so the "events have not arrived yet" case can raise
+   * blockers with an EMPTY pending map — the real lag window, since the
+   * events arrive on a separate fetch.
+   */
+  function pendingReviewNote(
+    kinds: readonly (InterpretationKind | null)[],
+    blockerCount: number = Math.max(1, kinds.length),
+  ): string {
+    const injectSystemMessage = vi.fn();
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      injectSystemMessage,
+    } as never);
+    useExecutionStore.setState({ validationResult: null } as never);
+    seedPendingKinds("sess-1", kinds);
+    initStoreSubscriptions();
+
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        checks: [],
+        errors: [
+          {
+            component_type: "transform",
+            component_id: "rate_node",
+            message: "pending",
+            error_code: "interpretation_review_pending",
+          },
+        ],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: false,
+          completion_ready: true,
+          blockers: Array.from({ length: blockerCount }, (_, index) => ({
+            code: "interpretation_review_pending",
+            component_id: `node_${index}`,
+            component_type: "transform",
+            detail: `node_${index}:cool`,
+          })),
+        },
+      } as never,
+    } as never);
+
+    expect(injectSystemMessage).toHaveBeenCalled();
+    const [message] = injectSystemMessage.mock.calls[0] as [string, string];
+    return message;
+  }
 
   it("injects local validation status but does not send raw validation errors to the LLM", () => {
     const injectSystemMessage = vi.fn();
@@ -252,6 +370,9 @@ describe("subscriptions — validation result side effects", () => {
       sendMessage,
     } as never);
     useExecutionStore.setState({ validationResult: null } as never);
+    // One pending vague_term review — the card renders BOTH the accept and
+    // the amend control for this kind, so the note may name both.
+    seedPendingKinds("sess-1", ["vague_term"]);
     initStoreSubscriptions();
 
     useExecutionStore.setState({
@@ -298,10 +419,174 @@ describe("subscriptions — validation result side effects", () => {
     // Human-centric copy that points at the review cards, NOT a dump of the
     // raw validation blockers. The machine-facing component id / detail
     // ("rate_node", "rate_node:cool") must NOT leak into the chat message.
-    expect(message).toContain("okay");
+    // One vocabulary for one action (ux-review 2026-08-13): the click records
+    // an attestation, so the prose says sign-off / Acknowledge / acknowledged
+    // throughout.  "okay" understates what is recorded, and lowercase
+    // "approved" is the name of a DIFFERENT control that all-vague_term sets
+    // never render — both must stay out of every variant.
+    expect(message).toContain("needs your sign-off");
+    expect(message).not.toMatch(/\bokay\b/i);
+    expect(message).not.toMatch(/\bapproved\b/i);
     expect(message).toContain("ready to run");
     expect(message).not.toContain("rate_node");
+    // Anti-drift (elspeth-0a9f77dd75): the note names the review card's
+    // EXACT rendered button labels via the shared constants, and the retired
+    // inline-review vocabulary must not resurface.
+    expect(message).toContain(`**${ACKNOWLEDGEMENT_ACCEPT_LABEL}**`);
+    expect(message).toContain(`**${ACKNOWLEDGEMENT_AMEND_LABEL}**`);
+    expect(message).not.toContain("Use mine");
+    expect(message).not.toContain("pick **Use**");
     expect(stableId).toBe("system-validation-current");
+  });
+
+  it("names the card's button labels in the plural pending-review note too", () => {
+    const message = pendingReviewNote(["vague_term", "vague_term"]);
+    expect(message).toContain("2 choices");
+    expect(message).toContain(`**${ACKNOWLEDGEMENT_ACCEPT_LABEL}**`);
+    expect(message).toContain(`**${ACKNOWLEDGEMENT_AMEND_LABEL}**`);
+    expect(message).not.toContain("Use mine");
+    expect(message).not.toContain("pick **Use**");
+  });
+
+  // ── Kind-aware review-note phrasing (ux-review 2026-08-13) ────────────────
+  //
+  // The controls the AcknowledgementCard renders depend on the event kind, so
+  // the note's one non-negotiable invariant is: NEVER name a control the
+  // pending card(s) do not render.  Each case below therefore asserts BOTH
+  // halves — the labels that must appear, and the labels that must not.
+  //
+  // `ABSENT_CONTROL_LABELS` is the whole vocabulary, so a future phrasing
+  // change that reintroduces a wrong label fails here rather than passing on
+  // an assertion that only checked the labels the old copy happened to use.
+  const ABSENT_CONTROL_LABELS = [
+    ACKNOWLEDGEMENT_ACCEPT_LABEL,
+    ACKNOWLEDGEMENT_AMEND_LABEL,
+    ACKNOWLEDGEMENT_APPROVE_LABEL,
+    ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+  ] as const;
+
+  function expectNamesOnly(message: string, present: readonly string[]): void {
+    for (const label of ABSENT_CONTROL_LABELS) {
+      if (present.includes(label)) {
+        expect(message).toContain(`**${label}**`);
+      } else {
+        expect(message).not.toContain(label);
+      }
+    }
+  }
+
+  it("names View prompt then Approve — never Acknowledge/Change… — when every pending review is a prompt template", () => {
+    // Prompt-template cards render "View prompt" + "Approve"; neither
+    // "Acknowledge" nor "Change…" exists on them.
+    const message = pendingReviewNote(["llm_prompt_template"]);
+    expect(message).toContain("one choice");
+    expectNamesOnly(message, [
+      ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+      ACKNOWLEDGEMENT_APPROVE_LABEL,
+    ]);
+    // Copy framing the surrounding tests pin, preserved across all variants.
+    expect(message).toContain("needs your sign-off");
+    expect(message).not.toMatch(/\bokay\b/i);
+    expect(message).toContain("ready to run");
+  });
+
+  it("keeps the View prompt/Approve phrasing in the plural prompt-template note", () => {
+    const message = pendingReviewNote([
+      "llm_prompt_template",
+      "llm_prompt_template",
+    ]);
+    expect(message).toContain("2 choices");
+    expectNamesOnly(message, [
+      ACKNOWLEDGEMENT_VIEW_PROMPT_LABEL,
+      ACKNOWLEDGEMENT_APPROVE_LABEL,
+    ]);
+  });
+
+  it("drops the Change… half for kinds the card gives no amend affordance", () => {
+    // supportsAmendment() gates "Change…" to vague_term / legacy-null cards;
+    // a model-choice card renders the accept button alone.
+    const message = pendingReviewNote(["llm_model_choice"]);
+    expectNamesOnly(message, [ACKNOWLEDGEMENT_ACCEPT_LABEL]);
+  });
+
+  it("drops the Change… half as soon as ONE pending card lacks it", () => {
+    // Mixed amendable + non-amendable: every card still renders the accept
+    // button, so name that — but "Change…" is now absent from one card.
+    const message = pendingReviewNote(["vague_term", "pipeline_decision"]);
+    expectNamesOnly(message, [ACKNOWLEDGEMENT_ACCEPT_LABEL]);
+  });
+
+  it("names no control at all when a prompt-template review is mixed with another kind", () => {
+    // No single button vocabulary is true of both cards, so the note falls
+    // back to pointing at the cards' own buttons.
+    const message = pendingReviewNote(["llm_prompt_template", "vague_term"]);
+    expectNamesOnly(message, []);
+    expect(message).toContain("buttons on each card");
+    expect(message).toContain("need your sign-off");
+    expect(message).not.toMatch(/\bokay\b/i);
+    expect(message).toContain("ready to run");
+  });
+
+  it("names no control when the pending events have not arrived yet", () => {
+    // The events stream in on a separate fetch that can lag validation; with
+    // no kinds known the note must not guess a button vocabulary.
+    const message = pendingReviewNote([]);
+    expectNamesOnly(message, []);
+    expect(message).toContain("buttons on the card");
+  });
+
+  it("uses ONE attestation vocabulary across every pending-note variant", () => {
+    // ux-review 2026-08-13: the note previously carried three verbs for one
+    // action in a single sentence — "I'd like you to okay", "pick
+    // **Acknowledge**", "once they're all approved".  The click records an
+    // attestation the operator may later have to defend, so the whole family
+    // must speak sign-off / Acknowledge / acknowledged.  Iterating every
+    // phrasing family (not just the one the current copy happens to hit)
+    // is what makes this a vocabulary invariant rather than a spot check.
+    const variants: readonly (readonly InterpretationKind[])[] = [
+      ["vague_term"],
+      ["vague_term", "vague_term"],
+      ["llm_prompt_template"],
+      ["llm_prompt_template", "llm_prompt_template"],
+      ["llm_model_choice"],
+      ["vague_term", "pipeline_decision"],
+      ["llm_prompt_template", "vague_term"],
+      [],
+    ];
+    for (const kinds of variants) {
+      const message = pendingReviewNote(kinds);
+      expect(message).not.toMatch(/\bokay\b/i);
+      // Lowercase "approved" is the softened form of the Approve control's
+      // name; an all-vague_term set renders no Approve button at all.
+      expect(message).not.toMatch(/\bapproved\b/i);
+      expect(message).toMatch(/sign-off/);
+    }
+  });
+
+  it("keeps the store layer off the React component graph", () => {
+    // code-review 2026-08-13: subscriptions.ts was the only module under
+    // stores/ importing from components/ — it pulled AcknowledgementCard.tsx
+    // (and transitively CodeBlock + useInterpretationResolver) into the
+    // store-bootstrap module just to reach four string constants.  The
+    // constants now live in the React-free leaf acknowledgementLabels.ts.
+    // The anti-drift guarantee is unchanged; only the dependency direction
+    // moved, and this pin is what stops it moving back.
+    const source = readFileSync(
+      join(process.cwd(), "src/stores/subscriptions.ts"),
+      "utf8",
+    );
+    expect(source).not.toMatch(/from\s+"@\/components\/chat\/AcknowledgementCard"/);
+    expect(source).toMatch(
+      /from\s+"@\/components\/chat\/acknowledgementLabels"/,
+    );
+    const leaf = readFileSync(
+      join(process.cwd(), "src/components/chat/acknowledgementLabels.ts"),
+      "utf8",
+    );
+    // A leaf that imported React (or any component) would reinstate the edge
+    // through the back door.
+    expect(leaf).not.toMatch(/from\s+"react"/);
+    expect(leaf).not.toMatch(/\.tsx"/);
   });
 
   it("replaces the pending message with a ready-to-run nudge once reviews resolve", () => {
@@ -364,6 +649,14 @@ describe("subscriptions — validation result side effects", () => {
     const lastCall = calls[calls.length - 1] as [string, string];
     expect(lastCall[0]).toContain("ready");
     expect(lastCall[0]).toContain("Run pipeline");
+    // Names the CONTROL, never a place (ux-review 2026-08-13, the
+    // elspeth-eba8820005 defect class): a locative is a second thing that can
+    // contradict the layout, and this copy previously said "in the side
+    // panel" while a sibling surface said "sidebar" and the source comment
+    // said "side rail" — three names for one location.
+    expect(lastCall[0]).not.toMatch(/side ?(panel|bar|rail)/i);
+    // Attestation vocabulary, same as the pending note it replaces.
+    expect(lastCall[0]).toContain("Every card acknowledged");
     expect(lastCall[1]).toBe("system-validation-current");
   });
 

@@ -106,7 +106,20 @@ vi.mock("@/components/workspace/ComposerWorkspace", () => ({
 }));
 
 vi.mock("@/components/workspace/ArtifactWorkspace", () => ({
-  ArtifactWorkspace: () => <div>Artifact workspace</div>,
+  // Captures runAvailable: the tutorial shell mounts NO REQUEST_RUN_EVENT
+  // owner (capabilities.completion is false), so it must never enable the
+  // Run-tab empty-state affordance (elspeth-553a6fb81d).
+  //
+  // The RAW prop is rendered, deliberately un-defaulted: `?? false` would
+  // collapse "prop absent" and "prop explicitly false" into the same
+  // "false", so the assertion could not fail unless the shell affirmatively
+  // passed true — and deleting the prop pass-through entirely would go
+  // unnoticed. "undefined" is a distinguishable, and a failing, value.
+  ArtifactWorkspace: (props: { runAvailable?: boolean }) => (
+    <div data-run-available={String(props.runAvailable)}>
+      Artifact workspace
+    </div>
+  ),
 }));
 
 vi.mock("@/components/workspace/WorkspaceInspector", () => ({
@@ -254,6 +267,19 @@ describe("TutorialGuidedShell", () => {
       '{"completion":false,"importYaml":false,"catalog":false}',
     );
     expect(screen.queryByText("Run pipeline")).toBeNull();
+    // The Run-tab empty state must stay affordance-free in the tutorial:
+    // no run owner is mounted, so runAvailable must not be enabled
+    // (elspeth-553a6fb81d). The shell passes the prop NOWHERE — the raw
+    // "undefined" is the honest reading, and the guard that turns it into
+    // "off" is ArtifactWorkspace's own `runAvailable = false` default, pinned
+    // by ArtifactWorkspace.test.tsx's omitted-prop case. Asserting "false"
+    // here (via a `?? false` in the stub) hid that seam: it read the same
+    // whether the shell passed false or passed nothing at all, so deleting
+    // the prop wiring would not have failed anything.
+    expect(screen.getByText("Artifact workspace")).toHaveAttribute(
+      "data-run-available",
+      "undefined",
+    );
   });
 
   it("passes the same closed proposal and exact review binding to the passive tutorial surface", async () => {

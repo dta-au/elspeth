@@ -6,6 +6,8 @@ import {
   type FocusEvent,
 } from "react";
 import { useTheme } from "@/hooks/useTheme";
+import { useAuthStore } from "@/stores/authStore";
+import type { UserProfile } from "@/types/index";
 
 interface UserMenuProps {
   onOpenSettings: () => void;
@@ -22,6 +24,23 @@ interface UserMenuProps {
  * Exported so tests pin the single honest destination.
  */
 export const HELP_DOCS_URL = "https://github.com/johnm-dta/elspeth/tree/main/docs";
+
+/** The one line that names the signed-in account: display_name when it says
+ *  something, otherwise the username. Surrounding whitespace is not part of
+ *  a name, so it is trimmed — which also makes an all-whitespace (or empty)
+ *  display_name absence rather than a blank primary line naming nobody. */
+function identityName(user: UserProfile): string {
+  const displayName = user.display_name?.trim() ?? "";
+  return displayName === "" ? user.username : displayName;
+}
+
+/** True only when the username is information the primary line does not
+ *  already carry. Local auth sets username to the user_id and display_name
+ *  is frequently the same string, so equality — not just absence — must
+ *  suppress the second line. */
+function showsSecondaryUsername(user: UserProfile): boolean {
+  return identityName(user) !== user.username;
+}
 
 /**
  * Account dropdown in the app header. Click-outside, Escape-to-close
@@ -53,6 +72,11 @@ export function UserMenu({
   const wrapperRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const { resolvedTheme, toggleTheme } = useTheme();
+  // Store-reader pattern (same as useTheme above): identity is already
+  // client-side in the auth store — populated once at login/loadFromStorage
+  // via GET /api/auth/me — so no props flow through AppHeader and no new
+  // fetch consumer is added (elspeth-312238838a).
+  const user = useAuthStore((s) => s.user);
   const themeLabel =
     resolvedTheme === "dark" ? "Switch to light theme" : "Switch to dark theme";
 
@@ -147,6 +171,41 @@ export function UserMenu({
       </button>
       {open && (
         <ul className="user-menu-list">
+          {user !== null && (
+            /* Signed-in identity header: a plain non-focusable <li> — no
+               button/link — so the pinned Tab order across the action items
+               is unchanged and the disclosure role contract (no role=menu)
+               holds.
+
+               The visually-hidden "Signed in as" / "username: " prefixes
+               (the RecoveryPanel idiom) state the relationship the layout
+               only implies: without them a screen-reader user hears two
+               bare strings and nothing saying whose account this is or what
+               the second line means.
+
+               The secondary line is gated on carrying information the
+               primary does not. `display_name !== null` alone was not
+               enough: local auth builds UserIdentity with username ==
+               user_id and display_name is a separate registration field
+               that users and harnesses routinely set to the same string, so
+               the row rendered "jsmith" above a muted "jsmith". An empty
+               display_name likewise fell through to a blank primary line. */
+            <li className="user-menu-item user-menu-identity">
+              <span className="sr-only">Signed in as </span>
+              <span className="user-menu-identity-name">
+                {identityName(user)}
+              </span>
+              {showsSecondaryUsername(user) && (
+                <span className="user-menu-identity-username">
+                  {/* Leading space kept inside the hidden prefix: the two
+                      lines are separate blocks visually, but as flat text
+                      they abut, and "Jane Doeusername:" is not a sentence. */}
+                  <span className="sr-only">{" username: "}</span>
+                  {user.username}
+                </span>
+              )}
+            </li>
+          )}
           <li className="user-menu-item">
             <button
               type="button"

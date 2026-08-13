@@ -15,7 +15,10 @@ import { AcknowledgementLiveRegion, AcknowledgementStack } from "./Acknowledgeme
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
-import type { InterpretationEvent } from "@/types/interpretation";
+import type {
+  InterpretationEvent,
+  InterpretationResolveResponse,
+} from "@/types/interpretation";
 import type { CompositionState, NodeSpec } from "@/types/index";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
@@ -274,6 +277,101 @@ describe("AcknowledgementStack — foot-of-stack opt-out", () => {
 
     const alert = await screen.findByRole("alert");
     expect(alert.textContent).toMatch(/could not resolve interpretation/i);
+  });
+});
+
+describe("AcknowledgementStack — compositionState threading", () => {
+  // Truth test, not an existence test: the card can only render the accepted
+  // sibling value if the stack actually passes its subscribed
+  // compositionState down (elspeth-990f5ea562).
+  it("threads the live compositionState into each card so resolved slot values render", async () => {
+    const user = userEvent.setup();
+    const promptNode: NodeSpec = {
+      ...makeNode("llm", "llm"),
+      options: {
+        prompt_template_parts: [
+          { kind: "text", text: "Summarise " },
+          { kind: "interpretation_ref", requirement_id: "req-1" },
+          { kind: "text", text: " for an auditor." },
+        ],
+        interpretation_requirements: [
+          {
+            id: "req-1",
+            kind: "vague_term",
+            user_term: "punchy",
+            status: "resolved",
+            draft: "short and direct",
+            event_id: "evt-vague-1",
+            accepted_value: "concise and neutral",
+            accepted_artifact_hash: null,
+            resolved_prompt_template_hash: null,
+          },
+        ],
+      },
+    };
+    useSessionStore.setState({
+      compositionState: makeCompositionState([promptNode]),
+    });
+    seedPending([
+      makeEvent("e1", {
+        kind: "llm_prompt_template",
+        affected_node_id: "llm",
+        user_term: null,
+        llm_draft: "Summarise pending interpretation for an auditor.",
+      }),
+    ]);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(screen.getByRole("button", { name: "View prompt" }));
+    const region = screen.getByRole("region", {
+      name: /prompt template review/i,
+    });
+    // The PRIMARY render (first pre) carries the substitution; the frozen
+    // mask survives only inside the 'View original template' disclosure.
+    const primaryPre = region.querySelector("pre.ack-card-prompt-pre");
+    expect(primaryPre?.textContent).toContain("concise and neutral");
+    expect(primaryPre?.textContent).not.toContain("pending interpretation");
+  });
+});
+
+describe("AcknowledgementStack — focus restoration", () => {
+  // Pins the comment-documented fallback (stack effect: disabled button →
+  // section): after a sibling resolves, a still-gated prompt card's Approve
+  // is disabled, so focus lands on the card's labelled <section>.
+  it("falls back to a still-gated prompt card's section after a sibling resolves", async () => {
+    const user = userEvent.setup();
+    const first = makeEvent("e1", { created_at: "2026-06-20T00:00:00Z" });
+    const gated = makeEvent("e2", {
+      kind: "llm_prompt_template",
+      user_term: null,
+      llm_draft: "Classify {{ x }}.",
+      created_at: "2026-06-22T00:00:00Z",
+    });
+    seedPending([first, gated]);
+    const response: InterpretationResolveResponse = {
+      event: {
+        ...first,
+        choice: "accepted_as_drafted",
+        accepted_value: first.llm_draft,
+        resolved_at: "2026-06-22T01:00:00Z",
+      },
+      new_state: makeCompositionState([]),
+    };
+    vi.mocked(api.resolveInterpretation).mockResolvedValue(response);
+    render(<AcknowledgementStack sessionId={SID} />);
+
+    await user.click(
+      screen.getByRole("button", {
+        name: /acknowledge the llm's interpretation of cool/i,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId("acknowledgement-card")).toHaveLength(1);
+    });
+    expect(document.activeElement).toBe(
+      document.getElementById("ack-card-e2"),
+    );
   });
 });
 

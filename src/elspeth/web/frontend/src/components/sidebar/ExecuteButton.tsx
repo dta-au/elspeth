@@ -13,7 +13,10 @@ import type {
   SourceSpec,
 } from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
-import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
+import {
+  REQUEST_RUN_EVENT,
+  dispatchArtifactViewIntent,
+} from "@/lib/composer-events";
 
 /**
  * Run-button tooltip text used when a pending interpretation event blocks
@@ -514,15 +517,36 @@ export function ExecuteButton(): JSX.Element | null {
         (row.status === "warning" || row.status === "error"),
     ) ?? false;
 
+  // Launch, then switch the workspace to the Run artifact
+  // (elspeth-3a7b7c7b37): all run-lifecycle feedback (ProgressView's
+  // progress bar, Cancel, and its terminal live region) mounts only inside
+  // the Run panel, so a successful launch must bring it on screen. Keyed on
+  // execute()'s returned run_id being a real id — the null returns (428
+  // fanout guard, 409 conflict, interpretation block, stale-session drop)
+  // must not switch tabs. Same dispatch idiom as ExportYamlButton.
+  const launchRun = useCallback(
+    async (sessionId: string): Promise<void> => {
+      const runId = await execute(sessionId);
+      if (typeof runId === "string") {
+        dispatchArtifactViewIntent({
+          tab: "run",
+          focusMode: false,
+          sessionId,
+        });
+      }
+    },
+    [execute],
+  );
+
   const handleRunClick = useCallback((): void => {
     // Blocked-but-focusable case (aria-disabled): activation is a no-op.
     if (!canExecute || !activeSessionId) return;
     if (disclosureAcknowledged) {
-      void execute(activeSessionId);
+      void launchRun(activeSessionId);
       return;
     }
     setShowRunDisclosure(true);
-  }, [activeSessionId, canExecute, disclosureAcknowledged, execute]);
+  }, [activeSessionId, canExecute, disclosureAcknowledged, launchRun]);
 
   useEffect(() => {
     function handleRunRequest(): void {
@@ -541,7 +565,7 @@ export function ExecuteButton(): JSX.Element | null {
       acknowledgeRunDisclosure(activeSessionId);
     }
     setShowRunDisclosure(false);
-    void execute(activeSessionId);
+    void launchRun(activeSessionId);
   }
 
   if (!activeSessionId) return null;

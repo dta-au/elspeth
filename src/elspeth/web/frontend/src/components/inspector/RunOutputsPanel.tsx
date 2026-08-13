@@ -152,6 +152,19 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
   const activeRunIdRef = useRef(runId);
   const manifestRequestSeqRef = useRef(0);
   const previewRunGenerationRef = useRef(0);
+  // Which run OWNS the manifest currently in state. On a runId prop change
+  // A→B the auto-expand effect fires in the same commit with the NEW runId
+  // but the render-time manifest still run A's — acting on that pair would
+  // consume run B's auto-expand budget on run A's artifact ids (a cross-run
+  // /preview fetch that 404s). The effect therefore only acts when the
+  // manifest provably belongs to the current runId.
+  const manifestRunIdRef = useRef<string | null>(null);
+  // Runs that have already had their single previewable artifact
+  // auto-expanded (elspeth-3a7b7c7b37). Once-per-run so a manual collapse or
+  // a Refresh of the same run is never overridden — a SET, not a single id,
+  // so an A→B→A run flip can never re-arm run A's auto-expand over the
+  // operator's collapse.
+  const autoExpandedRunIdsRef = useRef<Set<string>>(new Set());
 
   const loadManifest = async (
     targetRunId: string,
@@ -161,6 +174,7 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     activeRunIdRef.current = targetRunId;
     if (options.clearRunScopedState) {
       previewRunGenerationRef.current += 1;
+      manifestRunIdRef.current = null;
       setManifest(null);
       setPreviewByArtifactId({});
       setExpandedArtifactIds(new Set());
@@ -175,6 +189,7 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
       ) {
         return;
       }
+      manifestRunIdRef.current = targetRunId;
       setManifest(response);
     } catch (err) {
       if (
@@ -212,6 +227,30 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     void loadManifest(runId, { clearRunScopedState: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+
+  // Auto-expand the single-previewable-artifact common case: previews were
+  // opt-in only, so the routine one-output run landed collapsed
+  // (elspeth-3a7b7c7b37). Routed through togglePreview so the lazy /preview
+  // fetch keeps its request-sequencing guards (manifestRequestSeqRef /
+  // previewRunGenerationRef) — never a parallel fetch path. Multi-artifact
+  // manifests stay collapsed.
+  useEffect(() => {
+    if (
+      manifest === null ||
+      manifestRunIdRef.current !== runId ||
+      autoExpandedRunIdsRef.current.has(runId)
+    ) {
+      return;
+    }
+    const previewable = manifest.artifacts.filter(
+      (artifact) =>
+        isFileArtifact(artifact) && artifact.exists_now && artifact.downloadable,
+    );
+    if (previewable.length !== 1) return;
+    autoExpandedRunIdsRef.current.add(runId);
+    void togglePreview(previewable[0]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manifest, runId]);
 
   const togglePreview = async (artifact: RunOutputArtifact) => {
     const next = new Set(expandedArtifactIds);

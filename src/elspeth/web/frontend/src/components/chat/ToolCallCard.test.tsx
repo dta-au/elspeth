@@ -157,7 +157,12 @@ describe("ToolCallCard", () => {
       expect(screen.getByText("Cancelled: upsert_node")).toBeInTheDocument();
     });
 
-    it("keeps the conservative Looked up default when no outcome was stamped", () => {
+    it("never claims completion — or a lookup — for a non-read-only call with no outcome stamp", () => {
+      // Deliberate oracle rewrite: this used to pin "Looked up: upsert_node"
+      // (mislabelled a mutation as a read), then briefly "Completed:
+      // upsert_node" (claimed success with no server evidence). An unstamped
+      // row carries no outcome stamp at all, so the ribbon claims dispatch
+      // only: "Ran".
       render(
         <ToolCallCard
           toolCall={call()}
@@ -166,7 +171,48 @@ describe("ToolCallCard", () => {
           onReject={vi.fn()}
         />,
       );
-      expect(screen.getByText("Looked up: upsert_node")).toBeInTheDocument();
+      expect(screen.getByText("Ran: upsert_node")).toBeInTheDocument();
+      expect(screen.queryByText(/Completed/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("labels a completed durable blob mutation as Completed, never Looked up", () => {
+      // create_blob succeeds without creating a composition-state version,
+      // so the server stamps it "completed" — it is still a durable write.
+      render(
+        <ToolCallCard
+          toolCall={{
+            id: "call-blob",
+            type: "function",
+            function: { name: "create_blob", arguments: "{}" },
+            outcome: "completed",
+          }}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(screen.getByText("Completed: create_blob")).toBeInTheDocument();
+      expect(screen.queryByText(/Looked up/)).not.toBeInTheDocument();
+    });
+
+    it("keeps Looked up for a completed read-only lookup", () => {
+      render(
+        <ToolCallCard
+          toolCall={{
+            id: "call-read",
+            type: "function",
+            function: { name: "get_pipeline_state", arguments: "{}" },
+            outcome: "completed",
+          }}
+          proposal={null}
+          onAccept={vi.fn()}
+          onReject={vi.fn()}
+        />,
+      );
+      expect(
+        screen.getByText("Looked up: get_pipeline_state"),
+      ).toBeInTheDocument();
     });
   });
 

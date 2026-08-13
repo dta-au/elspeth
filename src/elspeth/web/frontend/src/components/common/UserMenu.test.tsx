@@ -2,6 +2,28 @@ import { beforeEach, describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { UserMenu } from "./UserMenu";
+import { useAuthStore } from "@/stores/authStore";
+import type { UserProfile } from "@/types/index";
+
+/** Seedable /api/auth/me profile for the identity-header tests. */
+function makeUser(overrides: Partial<UserProfile> = {}): UserProfile {
+  return {
+    user_id: "user-1",
+    username: "jdoe",
+    display_name: "Jane Doe",
+    email: null,
+    groups: [],
+    dev_admin: false,
+    ...overrides,
+  };
+}
+
+/** The identity row's announced text, visually-hidden prefixes included —
+ *  the row carries no role or accessible name of its own, so its normalized
+ *  textContent IS what a screen reader reads out. */
+function identityText(element: Element | null): string {
+  return (element?.textContent ?? "").replace(/\s+/g, " ").trim();
+}
 
 // Role contract: this component is a disclosure/popover, NOT a WAI-ARIA
 // `menu` widget. Tests query items by their implicit `button` role rather
@@ -13,6 +35,8 @@ describe("UserMenu", () => {
     localStorage.clear();
     document.documentElement.removeAttribute("data-theme");
     document.documentElement.style.colorScheme = "";
+    // Signed-out by default; identity-header tests seed their own user.
+    useAuthStore.setState({ user: null });
   });
 
   it("is closed by default — action buttons not in the document", () => {
@@ -203,6 +227,8 @@ describe("UserMenu dev-admin entry", () => {
     localStorage.clear();
     document.documentElement.removeAttribute("data-theme");
     document.documentElement.style.colorScheme = "";
+    // Signed-out by default; identity-header tests seed their own user.
+    useAuthStore.setState({ user: null });
   });
 
   it("hides User management when onOpenUserManagement is absent", async () => {
@@ -246,5 +272,133 @@ describe("UserMenu dev-admin entry", () => {
       screen.getByRole("button", { name: /user management/i }),
     );
     expect(document.activeElement).toBe(trigger);
+  });
+});
+
+// elspeth-312238838a: the dropdown says who is signed in. The identity row is
+// a plain non-focusable <li> — never a button/link — so the pinned Tab order
+// across the action items is untouched.
+describe("UserMenu identity header", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    document.documentElement.removeAttribute("data-theme");
+    document.documentElement.style.colorScheme = "";
+    useAuthStore.setState({ user: null });
+  });
+
+  it("renders display name + username first in the list, not Tab-reachable", async () => {
+    useAuthStore.setState({ user: makeUser() });
+    render(<UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+    const identity = screen.getByText("Jane Doe").closest("li");
+    expect(identity).not.toBeNull();
+    expect(identity).toHaveClass("user-menu-identity");
+    // The ACCESSIBLE text, not just "the name renders": the visually-hidden
+    // prefixes are what state whose account this is and what the second
+    // line means, so they are part of the contract.
+    expect(identityText(identity)).toBe("Signed in as Jane Doe username: jdoe");
+    const list = screen.getByRole("list");
+    expect(list.firstElementChild).toBe(identity);
+    // Non-interactive: no button/link inside the identity row.
+    expect(identity?.querySelector("button, a")).toBeNull();
+    // Not reachable by Tab: the first Tab stop after the trigger is the
+    // theme action, and the full pinned four-action sequence still holds.
+    await userEvent.tab();
+    expect(
+      screen.getByRole("button", { name: /switch to light theme/i }),
+    ).toHaveFocus();
+    await userEvent.tab();
+    expect(
+      screen.getByRole("button", { name: /composer preferences/i }),
+    ).toHaveFocus();
+    await userEvent.tab();
+    expect(
+      screen.getByRole("link", { name: /help & documentation/i }),
+    ).toHaveFocus();
+    await userEvent.tab();
+    expect(screen.getByRole("button", { name: /sign out/i })).toHaveFocus();
+  });
+
+  it("renders the username as the primary line when display_name is null", async () => {
+    useAuthStore.setState({ user: makeUser({ display_name: null }) });
+    const { container } = render(
+      <UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+    const primary = container.querySelector(".user-menu-identity-name");
+    expect(primary).toHaveTextContent("jdoe");
+    // No secondary line — the username is not repeated.
+    expect(container.querySelector(".user-menu-identity-username")).toBeNull();
+    expect(identityText(container.querySelector(".user-menu-identity"))).toBe(
+      "Signed in as jdoe",
+    );
+  });
+
+  // Live for local auth: UserIdentity is built with username == user_id and
+  // display_name is a separate registration field that users and harnesses
+  // routinely set to the same string. The second line must appear only when
+  // it carries information the first does not.
+  it("does not repeat the identity when display_name equals the username", async () => {
+    useAuthStore.setState({
+      user: makeUser({ username: "jsmith", display_name: "jsmith" }),
+    });
+    const { container } = render(
+      <UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+    const identity = container.querySelector(".user-menu-identity");
+    expect(identityText(identity)).toBe("Signed in as jsmith");
+    expect(container.querySelector(".user-menu-identity-username")).toBeNull();
+    expect(screen.getAllByText("jsmith")).toHaveLength(1);
+  });
+
+  // Surrounding whitespace is not part of a name — and trimming is what
+  // makes the blank case below absence rather than a name made of spaces.
+  it("trims surrounding whitespace from the display name", async () => {
+    useAuthStore.setState({
+      user: makeUser({ username: "jdoe", display_name: "  Jane Doe  " }),
+    });
+    const { container } = render(
+      <UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+    expect(
+      container.querySelector(".user-menu-identity-name")?.textContent,
+    ).toBe("Jane Doe");
+  });
+
+  // An empty-string display_name is absence, not a name: rendering it left a
+  // blank primary line above a muted username.
+  it("falls back to the username when display_name is blank", async () => {
+    useAuthStore.setState({
+      user: makeUser({ username: "jdoe", display_name: "   " }),
+    });
+    const { container } = render(
+      <UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+    const primary = container.querySelector(".user-menu-identity-name");
+    expect(primary).toHaveTextContent("jdoe");
+    expect(identityText(container.querySelector(".user-menu-identity"))).toBe(
+      "Signed in as jdoe",
+    );
+    expect(container.querySelector(".user-menu-identity-username")).toBeNull();
+  });
+
+  it("renders no identity block when no user is signed in", async () => {
+    const { container } = render(
+      <UserMenu onOpenSettings={vi.fn()} onSignOut={vi.fn()} />,
+    );
+    await userEvent.click(screen.getByRole("button", { name: /account/i }));
+    expect(container.querySelector(".user-menu-identity")).toBeNull();
+    // Action items are unaffected.
+    expect(
+      screen.getByRole("button", { name: /sign out/i }),
+    ).toBeInTheDocument();
   });
 });

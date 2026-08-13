@@ -161,10 +161,13 @@
   }
 }
 
-/* Scroll-to-bottom floating button */
+/* Scroll-to-bottom floating button. Anchored to .chat-panel-messages-region
+   (elspeth-4ad68a3769) — the region ends at the messages area's bottom edge,
+   so the pill clears ChatInput, the ComposingIndicator, and the banners at
+   every pane width without a hard-coded input-height guess. */
 .scroll-to-bottom-btn {
   position: absolute;
-  bottom: 80px;
+  bottom: var(--space-md);
   left: 50%;
   transform: translateX(-50%);
   z-index: var(--z-panel-controls);
@@ -180,10 +183,6 @@
 }
 .scroll-to-bottom-btn:hover {
   background-color: var(--color-surface-hover);
-}
-
-.chat-panel:has(.inline-run-results) .scroll-to-bottom-btn {
-  bottom: calc(120px + min(260px, 32vh));
 }
 
 /* ---------------------------------------------------------------------------
@@ -390,10 +389,6 @@
 }
 
 @media (max-width: 760px) {
-  .chat-panel:has(.inline-run-results) .scroll-to-bottom-btn {
-    bottom: calc(128px + min(300px, 36vh));
-  }
-
   .inline-run-results {
     margin-inline: var(--space-sm);
     max-height: min(300px, 36vh);
@@ -940,6 +935,21 @@
 
 .chat-panel-error-dismiss:hover {
   background-color: var(--color-surface-hover);
+}
+
+/* Positioning containing block for the jump-to-latest pill: wraps ONLY the
+   messages scroll container (freeform branch), so an absolutely-positioned
+   pill anchored to its bottom edge sits just above whatever renders below
+   the messages (ComposingIndicator, banners, ChatInput) at every pane
+   width. min-height: 0 keeps the flex column shrinkable — without it the
+   region refuses to shrink below content height and the whole panel
+   overflows its height:100% / overflow:hidden chain. */
+.chat-panel-messages-region {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .chat-panel-messages {
@@ -1894,6 +1904,46 @@
   line-height: 1.45;
 }
 
+/* Live tool-call log (elspeth-3c2caf56a7): one line per mid-flight tool
+   call, always visible under the status summary. Kept OUTSIDE the
+   role="status" node in the TSX so per-poll appends never announce. */
+.composing-tool-log-caption {
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.composing-tool-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--space-2xs);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.composing-tool-log li {
+  display: grid;
+  gap: 0;
+}
+
+/* Plain-language line: what the composer is doing. Primary because the
+   audience waiting on this log is not reading tool identifiers. */
+.composing-tool-log-what {
+  color: var(--color-text);
+  line-height: 1.4;
+}
+
+/* Evidential label + machine tool name, demoted to the secondary line.
+   Never dropped: the prefix is what stops a failed mutation reading as a
+   completed one. */
+.composing-tool-log-call {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+
 
 /* ---------------------------------------------------------------------------
    Freeform introduction (dismissible account-level empty state)
@@ -2120,8 +2170,12 @@
   gap: var(--space-sm);
 }
 
+/* Full-width row inside .ack-card-main: the disclosure precedes the gated
+   primary in DOM/tab order (ux-review 2026-08-13), so it must not share the
+   wrap row with the card line and the action buttons. */
 .ack-card-value {
   display: flex;
+  flex: 1 1 100%;
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-xs);
@@ -2159,6 +2213,74 @@
   font-size: var(--font-size-sm);
   line-height: 1.5;
   color: var(--color-text);
+}
+
+/* Interpretation slots substituted into the displayed prompt
+   (elspeth-990f5ea562).  Resolved slots carry the accepted value; pending
+   slots carry the sibling review's draft.  <mark> keeps the UA's
+   forced-colors treatment for free — no forced-colors block here. */
+.ack-card-prompt-slot {
+  padding: 0 var(--space-2xs);
+  border-radius: var(--radius-sm);
+  color: var(--color-text);
+}
+
+.ack-card-prompt-slot--resolved {
+  background-color: var(--color-highlight);
+}
+
+.ack-card-prompt-slot--pending {
+  background-color: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+}
+
+/* Visible key for the two slot tints (ux-review 2026-08-13).  The swatches
+   reuse the slot modifier classes so a tint change can never desynchronise
+   the key from the thing it keys.  They are decoration only — under
+   forced-colors the backgrounds are stripped, so the DISTINCTION lives in
+   each item's text, which is why no forced-colors block belongs here. */
+.ack-card-prompt-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2xs) var(--space-sm);
+  margin: 0 0 var(--space-2xs);
+  padding: 0;
+  list-style: none;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.ack-card-prompt-legend li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
+.ack-card-prompt-legend-swatch {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: var(--radius-sm);
+}
+
+.ack-card-prompt-pending-note {
+  margin: var(--space-2xs) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+/* Secondary disclosure for the frozen staging-time template, shown only
+   when it differs from the resolved render. */
+.ack-card-original-template {
+  margin-top: var(--space-2xs);
+}
+
+.ack-card-original-template summary {
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }
 
 /* Visible scroll-gate explanation for the prompt-template card: says WHY

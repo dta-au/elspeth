@@ -3,7 +3,20 @@
    .progress-cancel-btn, .progress-bar-outer, .progress-counters-caption,
    .progress-counters*,
    .progress-routing-summary, .progress-accounting*, .progress-cancelled-msg,
-   .progress-failed-msg, .progress-errors-*, .progress-error-*. */
+   .progress-failed-msg, .progress-errors-*, .progress-error-*,
+   .run-outcome-notice*. */
+
+/* ---------------------------------------------------------------------------
+   RunOutcomeNotice — app-level terminal-run toast (elspeth-3a7b7c7b37).
+   Tone backgrounds/borders come from the shared .alert-banner classes
+   (header.css); this block owns only the action-row layout.
+   --------------------------------------------------------------------------- */
+.run-outcome-notice-actions {
+  display: inline-flex;
+  flex-shrink: 0;
+  gap: var(--space-xs);
+  align-items: center;
+}
 
 /* ---------------------------------------------------------------------------
    ProgressView
