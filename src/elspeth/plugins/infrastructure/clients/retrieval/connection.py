@@ -21,6 +21,9 @@ from elspeth.core.security.web import (
 )
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode_enabled
 
+ChromaConnectionMode = Literal["persistent", "client"]
+ChromaSearchMode = Literal["ephemeral", "persistent", "client"]
+
 _LOOPBACK_HOSTS = {"localhost"}
 _LOOPBACK_ALLOWED_RANGES = (
     ipaddress.ip_network("127.0.0.0/8"),
@@ -121,7 +124,7 @@ class ChromaConnectionConfig(BaseModel):
             )
         return v
 
-    mode: Literal["persistent", "client"] = Field(description="Connection mode: persistent (local disk) or client (remote HTTP)")
+    mode: ChromaConnectionMode = Field(description="Connection mode: persistent (local disk) or client (remote HTTP)")
     persist_directory: str | None = Field(
         default=None,
         description="Path to ChromaDB data directory (persistent mode only)",

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
 
-from elspeth.contracts import NodeStateStatus, NodeType
+from elspeth.contracts import NodeStateStatus, NodeType, RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.sink_effects import SinkEffectInputKind, SinkEffectMember, SinkEffectMemberCandidate, SinkEffectRole
 from elspeth.core.landscape.database import LandscapeDB
@@ -32,7 +32,7 @@ from elspeth.core.landscape.schema import (
     sink_effect_members_table,
     sink_effects_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, register_test_node
 
 
 @pytest.fixture
@@ -130,6 +130,26 @@ def test_pipeline_reservation_is_idempotent_under_reverse_arrival(db_factory: tu
         assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 1
         assert conn.scalar(select(func.count()).select_from(sink_effect_members_table)) == 3
         assert conn.scalar(select(func.count()).select_from(operations_table)) == 1
+
+
+def test_pipeline_reservation_refuses_terminal_run_before_effect_mutation(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    db, factory = db_factory
+    run_id, sink_id, members = _pipeline_members(factory, 1)
+    factory.run_lifecycle.finalize_run(
+        run_id,
+        RunStatus.FAILED,
+        token=leader_coordination_token(factory, run_id),
+    )
+
+    with pytest.raises(ValueError, match="terminal run status"):
+        factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members))
+
+    with db.read_only_connection() as conn:
+        assert conn.scalar(select(func.count()).select_from(sink_effects_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(sink_effect_members_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(operations_table)) == 0
 
 
 @pytest.mark.parametrize("terminal_status", (NodeStateStatus.COMPLETED, NodeStateStatus.FAILED))

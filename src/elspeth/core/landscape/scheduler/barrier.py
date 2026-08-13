@@ -20,6 +20,7 @@ from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.scheduler import (
     BarrierEmission,
+    BarrierTerminalOutcomeSpec,
     BatchMembershipSpec,
     BlockedPendingSinkHandoff,
     BranchLossSpec,
@@ -28,7 +29,7 @@ from elspeth.contracts.scheduler import (
     TokenWorkItem,
     TokenWorkStatus,
 )
-from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded
+from elspeth.core.landscape.data_flow.outcomes import record_buffered_outcome_guarded, record_terminal_outcome_guarded
 from elspeth.core.landscape.database import Tier1Engine, begin_write
 from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
@@ -47,7 +48,9 @@ from elspeth.core.landscape.scheduler.work_items import (
 )
 from elspeth.core.landscape.schema import (
     blocked_barrier_hold_clause,
+    token_outcomes_table,
     token_work_items_table,
+    tokens_table,
 )
 
 
@@ -90,6 +93,7 @@ class BarrierJournalRepository:
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
         branch_losses: Sequence[BranchLossSpec] = (),
+        terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
     ) -> int:
         """Complete a barrier atomically: consume BLOCKED inputs and emit outputs.
 
@@ -207,6 +211,17 @@ class BarrierJournalRepository:
                 f"Scheduler barrier completion received duplicate ready emissions for run_id={run_id!r} "
                 f"barrier_key={barrier_key!r}: {duplicates!r}"
             )
+        terminal_outcome_token_ids = tuple(spec.token_id for spec in terminal_outcomes)
+        if len(frozenset(terminal_outcome_token_ids)) != len(terminal_outcome_token_ids):
+            raise AuditIntegrityError(
+                f"Scheduler barrier completion received duplicate terminal outcomes for run_id={run_id!r} barrier_key={barrier_key!r}."
+            )
+        terminal_outcomes_outside_consumed = frozenset(terminal_outcome_token_ids) - consumed_set
+        if terminal_outcomes_outside_consumed:
+            raise AuditIntegrityError(
+                f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received "
+                f"terminal outcomes outside its consumed set: {sorted(terminal_outcomes_outside_consumed)!r}."
+            )
         pending_overlap = consumed_set & frozenset(pending_token_ids)
         if pending_overlap:
             raise AuditIntegrityError(
@@ -263,6 +278,32 @@ class BarrierJournalRepository:
             blocked_select = blocked_select.where(token_work_items_table.c.row_id == scope_row_id)
 
         with fenced_write(self._engine, coordination_token=coordination_token, now=now, verb="complete_barrier") as conn:
+            if terminal_outcome_token_ids:
+                locked_tokens = conn.execute(
+                    select(tokens_table.c.token_id, tokens_table.c.run_id)
+                    .where(tokens_table.c.token_id.in_(sorted(terminal_outcome_token_ids)))
+                    .order_by(tokens_table.c.token_id)
+                    .with_for_update(of=tokens_table)
+                ).all()
+                if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {
+                    (token_id, run_id) for token_id in terminal_outcome_token_ids
+                }:
+                    raise AuditIntegrityError(
+                        f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
+                        "received a terminal outcome for a missing or foreign token."
+                    )
+                existing_terminal_rows = conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.token_id.in_(terminal_outcome_token_ids))
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all()
+                if existing_terminal_rows:
+                    raise AuditIntegrityError(
+                        f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} "
+                        "would duplicate terminal outcomes for token_ids="
+                        f"{sorted(str(row.token_id) for row in existing_terminal_rows)!r}."
+                    )
             blocked_rows = (
                 conn.execute(
                     blocked_select.order_by(
@@ -387,6 +428,16 @@ class BarrierJournalRepository:
                 now=now,
                 release_context=release_context,
             )
+            for terminal_outcome in terminal_outcomes:
+                record_terminal_outcome_guarded(
+                    conn,
+                    run_id=run_id,
+                    token_id=terminal_outcome.token_id,
+                    outcome=terminal_outcome.outcome,
+                    path=terminal_outcome.path,
+                    recorded_at=now,
+                    error_hash=terminal_outcome.error_hash,
+                )
             self._transition_passthrough_pending_sink(
                 conn,
                 run_id=run_id,

@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://elspeth.dev/schemas/state-engine/assessment-v3.json",
+  "title": "ELSPETH state-engine assessment package v3",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "assessment_id", "mode", "parent_assessment",
+    "changed_tuples", "changed_gate_ids", "catalog", "baseline", "environment",
+    "structure_snapshot", "tracker_snapshot", "evidence", "legs", "hard_gates",
+    "derived", "limitations", "review_record"
+  ],
+  "properties": {
+    "schema_version": {"const": 3},
+    "assessment_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"},
+    "mode": {"enum": ["full", "delta"]},
+    "parent_assessment": {"type": ["object", "null"]},
+    "changed_tuples": {"type": "array", "items": {"$ref": "#/$defs/coverage_key"}},
+    "changed_gate_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "catalog": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "catalog_id", "schema_version", "sha256_at_evidence_capture"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "catalog_id": {"const": "elspeth-state-engine-v3"},
+        "schema_version": {"const": 2},
+        "sha256_at_evidence_capture": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "baseline": {"$ref": "#/$defs/baseline"},
+    "environment": {"type": "object"},
+    "structure_snapshot": {"type": "object"},
+    "tracker_snapshot": {"type": "object"},
+    "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}},
+    "legs": {"type": "array", "items": {"$ref": "#/$defs/leg"}},
+    "hard_gates": {"type": "array", "items": {"type": "object"}},
+    "derived": {"type": "object"},
+    "limitations": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+    "review_record": {"type": "string", "minLength": 1}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "git_object": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "publication_path": {
+      "type": "string",
+      "pattern": "^docs/(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*[*?\\[]).+[^/]$"
+    },
+    "baseline": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["mode", "commit", "tree"],
+          "properties": {
+            "mode": {"const": "historical"},
+            "commit": {"$ref": "#/$defs/git_object"},
+            "tree": {"$ref": "#/$defs/git_object"}
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["mode", "commit", "tree", "repository_root", "remote", "branch", "worktree_status_at_evidence_capture", "submodules", "worktrees_at_capture", "publication_paths"],
+          "properties": {
+            "mode": {"const": "current"},
+            "commit": {"$ref": "#/$defs/git_object"},
+            "tree": {"$ref": "#/$defs/git_object"},
+            "repository_root": {"type": "string", "minLength": 1},
+            "remote": {"type": "string", "minLength": 1},
+            "branch": {"type": "string", "minLength": 1},
+            "worktree_status_at_evidence_capture": {"type": "array", "items": {"type": "string"}},
+            "submodules": {"type": "array", "items": {"type": "string"}},
+            "worktrees_at_capture": {"type": "array", "items": {"type": "string"}},
+            "publication_paths": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/publication_path"}}
+          }
+        }
+      ]
+    },
+    "coverage_key": {
+      "type": "object", "additionalProperties": false,
+      "required": ["leg_id", "dimension_id", "case_id", "profile_case"],
+      "properties": {
+        "leg_id": {"type": "string"}, "dimension_id": {"type": "string"},
+        "case_id": {"type": "string"}, "profile_case": {"type": "string"}
+      }
+    },
+    "coverage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["leg_id", "dimension_id", "case_id", "profile_case", "node_ids"],
+      "properties": {
+        "leg_id": {"type": "string"}, "dimension_id": {"type": "string"},
+        "case_id": {"type": "string"}, "profile_case": {"type": "string"},
+        "node_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+      }
+    },
+    "local_provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["python_executable", "platform"],
+      "properties": {"python_executable": {"type": "string", "minLength": 1}, "platform": {"type": "string", "minLength": 1}}
+    },
+    "github_actions_provenance": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repository", "workflow_path", "workflow_sha256", "baseline_sha", "run_id", "run_attempt", "job_id", "runner_image", "selector_lane_id", "artifact_sha256", "scrub_report_sha256"],
+      "properties": {
+        "repository": {"type": "string", "minLength": 1}, "workflow_path": {"type": "string", "minLength": 1},
+        "workflow_sha256": {"$ref": "#/$defs/sha256"}, "baseline_sha": {"$ref": "#/$defs/git_object"},
+        "run_id": {"type": "integer", "minimum": 1}, "run_attempt": {"type": "integer", "minimum": 1},
+        "job_id": {"type": "integer", "minimum": 1}, "runner_image": {"type": "string", "minLength": 1},
+        "selector_lane_id": {"type": "string", "minLength": 1}, "artifact_sha256": {"$ref": "#/$defs/sha256"},
+        "scrub_report_sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "provenance": {
+      "oneOf": [
+        {"$ref": "#/$defs/local_provenance"},
+        {"$ref": "#/$defs/github_actions_provenance"}
+      ]
+    },
+    "result_counts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["passed", "failed", "errors", "skipped", "xfailed", "xpassed", "warnings"],
+      "properties": {
+        "passed": {"type": "integer", "minimum": 0}, "failed": {"type": "integer", "minimum": 0},
+        "errors": {"type": "integer", "minimum": 0}, "skipped": {"type": "integer", "minimum": 0},
+        "xfailed": {"type": "integer", "minimum": 0}, "xpassed": {"type": "integer", "minimum": 0},
+        "warnings": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {"enum": ["manifest", "junit_xml", "stdout", "stderr", "profile_report", "scrub_report", "node_index"]},
+        "path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["id", "kind", "runner", "provenance", "argv", "reproducibility_class", "cwd_relative", "timeout_seconds", "safe_environment", "resources", "started_at", "ended_at", "duration_seconds", "exit_code", "result_counts", "coverage", "retained_artifacts", "establishes", "does_not_establish"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string"}, "kind": {"enum": ["pytest", "documentation"]},
+        "runner": {"enum": ["local", "github_actions"]}, "provenance": {"$ref": "#/$defs/provenance"},
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "reproducibility_class": {"type": "string"},
+        "cwd_relative": {"type": "string"}, "timeout_seconds": {"type": "integer", "minimum": 1},
+        "safe_environment": {"type": "object", "additionalProperties": {"type": ["string", "null"]}}, "resources": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "started_at": {"type": "string"}, "ended_at": {"type": "string"}, "duration_seconds": {"type": "number", "minimum": 0},
+        "exit_code": {"type": "integer"}, "result_counts": {"oneOf": [{"$ref": "#/$defs/result_counts"}, {"type": "null"}]},
+        "coverage": {"type": "array", "items": {"$ref": "#/$defs/coverage"}},
+        "retained_artifacts": {"type": "array", "items": {"$ref": "#/$defs/artifact"}},
+        "collected_node_index": {"$ref": "#/$defs/artifact"}, "collected_nodes": {"type": "integer", "minimum": 1},
+        "establishes": {"type": "array", "items": {"type": "string"}}, "does_not_establish": {"type": "array", "items": {"type": "string"}}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "pytest"}}}, "then": {"required": ["collected_node_index", "collected_nodes"]}},
+        {"if": {"properties": {"runner": {"const": "local"}}, "required": ["runner"]}, "then": {"properties": {"provenance": {"$ref": "#/$defs/local_provenance"}}}},
+        {"if": {"properties": {"runner": {"const": "github_actions"}}, "required": ["runner"]}, "then": {"properties": {"provenance": {"$ref": "#/$defs/github_actions_provenance"}}}}
+      ]
+    },
+    "override": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dimension", "case", "profile_case", "status", "evidence"],
+      "properties": {
+        "dimension": {"type": "string"}, "case": {"type": "string"}, "profile_case": {"type": "string"},
+        "status": {"enum": ["pass", "partial", "fail", "unknown"]},
+        "evidence": {"type": "array", "uniqueItems": true, "items": {"type": "string"}},
+        "reason": {"type": "string", "minLength": 1}, "owner_issue": {"type": ["string", "null"]}, "exit_gate": {"type": "string", "minLength": 1}
+      }
+    },
+    "leg": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "derived_verdict", "default_status", "reason", "owner_issue", "exit_gate", "overrides"],
+      "properties": {
+        "id": {"type": "string"}, "derived_verdict": {"enum": ["confirmed", "gap", "unknown"]},
+        "default_status": {"const": "unknown"}, "reason": {"type": "string"},
+        "owner_issue": {"type": ["string", "null"]}, "exit_gate": {"type": "string"},
+        "overrides": {"type": "array", "items": {"$ref": "#/$defs/override"}}
+      }
+    }
+  }
+}

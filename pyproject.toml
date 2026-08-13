@@ -443,7 +443,7 @@ addopts = [
     "-ra",
     "--strict-markers",
     "--strict-config",
-    "-m", "not slow and not stress and not performance and not testcontainer",  # Skip slow/stress/performance/testcontainer tests by default
+    "-m", "not slow and not stress and not performance and not testcontainer and not live_provider",  # Remote-provider evidence is separately operator-gated
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -456,6 +456,10 @@ markers = [
     "testcontainer: marks tests requiring Docker via testcontainers-python (deselect with '-m \"not testcontainer\"')",
     "fingerprint_baseline: Plan A baseline capture/verify across all elspeth-lints rules",
     "live_aws: marks opt-in tests that call live AWS services with operator-approved fixtures",
+    "live_provider: marks protected tests that cross a real remote-provider boundary",
+    "live_azure: marks protected tests that cross a real Azure service boundary",
+    "live_dataverse: marks protected tests that cross a real Dataverse boundary",
+    "live_chroma: marks protected tests that cross a real Chroma service boundary",
 ]
 # Load .env file for integration tests (API keys)
 env_files = [".env"]

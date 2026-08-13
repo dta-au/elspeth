@@ -141,8 +141,21 @@ from elspeth.contracts.data import (
     validate_row,
 )
 from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
-from elspeth.contracts.engine import BufferEntry, CoalesceParentCompletion, PendingOutcome, RetryPolicy
+from elspeth.contracts.engine import (
+    AggregationParentDisposition,
+    AggregationResultMember,
+    AggregationResultReceipt,
+    BufferEntry,
+    CoalesceParentCompletion,
+    CommittedAggregationChild,
+    CommittedAggregationOutputReceipt,
+    CommittedAggregationResidual,
+    CommittedCoalesceResidual,
+    PendingOutcome,
+    RetryPolicy,
+)
 from elspeth.contracts.enums import (
+    AggregationMemberAction,
     AuditCharacteristic,
     BackpressureMode,
     BatchStatus,
@@ -154,6 +167,7 @@ from elspeth.contracts.enums import (
     ExportStatus,
     NodeStateStatus,
     NodeType,
+    OutputMode,
     ReproducibilityGrade,
     RoutingKind,
     RoutingMode,
@@ -469,6 +483,7 @@ __all__ = [  # Grouped by category for readability
     "ExportStatus",
     "NodeStateStatus",
     "NodeType",
+    "OutputMode",
     "ReproducibilityGrade",
     "RoutingKind",
     "RoutingMode",
@@ -546,8 +561,16 @@ __all__ = [  # Grouped by category for readability
     "check_compatibility",
     "validate_row",
     # engine
+    "AggregationParentDisposition",
+    "AggregationMemberAction",
+    "AggregationResultMember",
+    "AggregationResultReceipt",
     "BufferEntry",
     "CoalesceParentCompletion",
+    "CommittedAggregationChild",
+    "CommittedAggregationResidual",
+    "CommittedAggregationOutputReceipt",
+    "CommittedCoalesceResidual",
     "PendingOutcome",
     "RetryPolicy",
     # payload_store

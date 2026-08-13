@@ -16,17 +16,23 @@ tests pin the repository seam arm by arm.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import select, update
 
-from elspeth.contracts import RunStatus
+from elspeth.contracts import NodeType, RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.checkpoint import CheckpointDraft
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.sink_effects import SinkEffectMemberCandidate
 from elspeth.core.checkpoint import CheckpointManager
-from elspeth.core.landscape.schema import RunSourceLifecycleState, token_outcomes_table
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run
+from elspeth.core.landscape.execution.sink_effect_identity import resolve_sink_effect_members
+from elspeth.core.landscape.schema import RunSourceLifecycleState, operations_table, runs_table, token_outcomes_table
+from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 _TOPOLOGY_HASH = "a" * 64
 _LEADER_WORKER_ID = "worker:run-adr038:test"
@@ -84,6 +90,33 @@ def _abandoned_rows(setup: RecorderSetup) -> list:
             .where(token_outcomes_table.c.path == TerminalPath.ABANDONED.value)
             .order_by(token_outcomes_table.c.token_id)
         ).fetchall()
+
+
+def _reserve_effect_operation(setup: RecorderSetup, *, token_id: str, suffix: str) -> str:
+    """Reserve a real effect so its automatically-opened operation is authentic."""
+    sink_node_id = register_test_node(
+        setup.factory.data_flow,
+        setup.run_id,
+        f"sink-{suffix}",
+        node_type=NodeType.SINK,
+        plugin_name="sink",
+    )
+    setup.factory.execution.begin_node_state(
+        token_id=token_id,
+        node_id=sink_node_id,
+        run_id=setup.run_id,
+        step_index=0,
+        input_data={"effect": suffix},
+    )
+    members = resolve_sink_effect_members(
+        setup.factory,
+        (SinkEffectMemberCandidate(token_id=token_id, row={"effect": suffix}),),
+    )
+    effect = setup.factory.execution.sink_effects.reserve(_pipeline_request(setup.run_id, sink_node_id, members)).new_effect
+    assert effect is not None
+    operations = setup.factory.execution.get_operations_for_run(setup.run_id)
+    operation = next(item for item in operations if item.sink_effect_id == effect.effect_id)
+    return operation.operation_id
 
 
 class TestAbandonmentSweepFires:
@@ -175,6 +208,112 @@ class TestAbandonmentSweepFires:
 
         assert len(_abandoned_rows(setup)) == len(token_ids)
 
+    def test_non_resumable_finalize_fails_open_effect_operation_without_tokens_to_abandon(self) -> None:
+        """The operation sweep is independent of the token-outcome sweep."""
+        setup, token_ids = _setup_run_with_tokens(
+            lifecycle_state=RunSourceLifecycleState.LOADING,
+            with_checkpoint=True,
+            token_count=1,
+        )
+        setup.factory.data_flow.record_token_outcome(
+            ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.UNROUTED,
+            error_hash="e" * 64,
+        )
+        operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="open")
+
+        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+
+        assert _abandoned_rows(setup) == []
+        operation = setup.factory.execution.get_operation(operation_id)
+        assert operation is not None
+        assert operation.status == "failed"
+        assert operation.completed_at is not None
+        assert operation.duration_ms is not None and operation.duration_ms >= 0.0
+        assert operation.error_message == "run finalized as non-resumable before sink effect completed"
+
+    def test_operation_sweep_changes_only_open_effect_linked_operations(self) -> None:
+        setup, token_ids = _setup_run_with_tokens(
+            lifecycle_state=RunSourceLifecycleState.LOADING,
+            with_checkpoint=True,
+            token_count=4,
+        )
+        open_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="open")
+        completed_id = _reserve_effect_operation(setup, token_id=token_ids[1], suffix="completed")
+        failed_id = _reserve_effect_operation(setup, token_id=token_ids[2], suffix="failed")
+        pending_id = _reserve_effect_operation(setup, token_id=token_ids[3], suffix="pending")
+        effectless_id = setup.factory.execution.begin_operation(
+            setup.run_id,
+            setup.source_node_id,
+            "source_load",
+        ).operation_id
+        setup.factory.execution.complete_operation(completed_id, "completed", duration_ms=1.0)
+        setup.factory.execution.complete_operation(failed_id, "failed", duration_ms=2.0, error="bounded prior failure")
+        pending_at = datetime.now(UTC)
+        with setup.db.write_connection() as conn:
+            conn.execute(
+                update(operations_table)
+                .where(operations_table.c.operation_id == pending_id)
+                .values(status="pending", completed_at=pending_at, duration_ms=3.0)
+            )
+
+        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.INTERRUPTED, token=_leader_token(setup))
+
+        by_id = {item.operation_id: item for item in setup.factory.execution.get_operations_for_run(setup.run_id)}
+        assert by_id[open_id].status == "failed"
+        assert by_id[completed_id].status == "completed"
+        assert by_id[completed_id].error_message is None
+        assert by_id[failed_id].status == "failed"
+        assert by_id[failed_id].error_message == "bounded prior failure"
+        assert by_id[pending_id].status == "pending"
+        assert by_id[pending_id].completed_at is not None
+        assert by_id[effectless_id].status == "open"
+
+    def test_operation_sweep_failure_rolls_back_terminal_stamp_and_abandonment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        setup, token_ids = _setup_run_with_tokens(
+            lifecycle_state=RunSourceLifecycleState.LOADING,
+            with_checkpoint=True,
+            token_count=1,
+        )
+        operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="rollback")
+
+        def fail_sweep(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("injected operation sweep failure")
+
+        monkeypatch.setattr(setup.factory.run_lifecycle._operations_repo, "fail_open_effect_operations_for_run", fail_sweep)
+
+        with pytest.raises(RuntimeError, match="injected operation sweep failure"):
+            setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+
+        with setup.db.read_only_connection() as conn:
+            run_row = conn.execute(select(runs_table).where(runs_table.c.run_id == setup.run_id)).one()
+        assert run_row.status == RunStatus.RUNNING.value
+        assert run_row.completed_at is None
+        assert _abandoned_rows(setup) == []
+        operation = setup.factory.execution.get_operation(operation_id)
+        assert operation is not None and operation.status == "open"
+
+    def test_abandoned_token_refuses_a_late_terminal_decision(self) -> None:
+        setup, token_ids = _setup_run_with_tokens(
+            lifecycle_state=RunSourceLifecycleState.LOADING,
+            with_checkpoint=True,
+            token_count=1,
+        )
+        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+
+        with pytest.raises(AuditIntegrityError, match="decided-plus-abandoned history is forbidden"):
+            setup.factory.data_flow.record_token_outcome(
+                ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+                error_hash="e" * 64,
+            )
+
+        rows = _abandoned_rows(setup)
+        assert len(rows) == 1
+        assert rows[0].token_id == token_ids[0]
+
 
 class TestAbandonmentSweepStaysSilent:
     """Resumable or successful deaths must not write abandonment records."""
@@ -187,6 +326,19 @@ class TestAbandonmentSweepStaysSilent:
         setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
 
         assert _abandoned_rows(setup) == []
+
+    def test_resumable_run_keeps_effect_operation_open(self) -> None:
+        setup, token_ids = _setup_run_with_tokens(
+            lifecycle_state=RunSourceLifecycleState.EXHAUSTED,
+            with_checkpoint=True,
+            token_count=1,
+        )
+        operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="resumable")
+
+        setup.factory.run_lifecycle.finalize_run(setup.run_id, RunStatus.FAILED, token=_leader_token(setup))
+
+        operation = setup.factory.execution.get_operation(operation_id)
+        assert operation is not None and operation.status == "open"
 
     def test_loaded_lifecycle_also_counts_complete(self) -> None:
         setup, _token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADED, with_checkpoint=True)

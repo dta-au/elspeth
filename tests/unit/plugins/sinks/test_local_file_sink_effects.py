@@ -192,6 +192,83 @@ def test_json_effect_plan_persists_exact_diversion_attribution(
     assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
 
 
+def test_json_effect_diverts_a_row_that_cannot_be_encoded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "out.jsonl"
+    sink = inject_write_failure(JSONSink({"path": str(target), "format": "jsonl", "schema": _SCHEMA}))
+    real_dumps = json.dumps
+    encoding_error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "injected encoding failure")
+
+    class UnencodableJSON(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            del encoding, errors
+            raise encoding_error
+
+    def fail_encoding_for_selected_row(value, *args, **kwargs):
+        serialized = real_dumps(value, *args, **kwargs)
+        if isinstance(value, dict) and value.get("id") == 2:
+            return UnencodableJSON(serialized)
+        return serialized
+
+    monkeypatch.setattr(json, "dumps", fail_encoding_for_selected_row)
+    plan = _prepare(
+        sink,
+        effect_id="b0" * 32,
+        rows=[{"id": 1}, {"id": 2}],
+    )
+
+    assert plan.safe_evidence["accepted_ordinals"] == (0,)
+    assert plan.safe_evidence["diverted_ordinals"] == (1,)
+    assert _stage_path(plan).read_bytes() == b'{"id": 1}\n'
+    assert sink._get_diversions()[0].reason == f"JSON encoding (utf-8) failed: {encoding_error}"
+    assert plan.safe_evidence["diversion_attribution"] == _expected_diversion_attribution(sink)
+
+
+def test_json_effect_rejects_a_predecessor_row_that_cannot_be_encoded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "out.jsonl"
+    config = {"path": str(target), "format": "jsonl", "schema": _SCHEMA}
+    first_sink = JSONSink(config)
+    first_result = first_sink.commit_effect(
+        _prepare(first_sink, effect_id="b1" * 32, rows=[{"id": 1}]),
+        _CTX,
+    )
+    real_dumps = json.dumps
+    encoding_error = UnicodeEncodeError("utf-8", "\udcff", 0, 1, "injected encoding failure")
+
+    class UnencodableJSON(str):
+        def encode(self, encoding: str = "utf-8", errors: str = "strict") -> bytes:
+            del encoding, errors
+            raise encoding_error
+
+    def fail_encoding_for_predecessor_row(value, *args, **kwargs):
+        serialized = real_dumps(value, *args, **kwargs)
+        if isinstance(value, dict) and value.get("id") == 1:
+            return UnencodableJSON(serialized)
+        return serialized
+
+    monkeypatch.setattr(json, "dumps", fail_encoding_for_predecessor_row)
+    second_sink = JSONSink(config)
+    expected_message = f"Predecessor JSON snapshot is incompatible: JSON encoding (utf-8) failed: {encoding_error}"
+
+    with pytest.raises(ValueError) as exc_info:
+        _prepare(
+            second_sink,
+            effect_id="b2" * 32,
+            rows=[{"id": 2}],
+            predecessor=first_result.descriptor,
+            predecessor_rows=[{"id": 1}],
+        )
+
+    assert str(exc_info.value) == expected_message
+    assert isinstance(exc_info.value.__cause__, UnicodeEncodeError)
+    assert exc_info.value.__cause__ is encoding_error
+
+
 def test_csv_effect_thaws_nested_values_before_serialization(tmp_path: Path) -> None:
     sink = inject_write_failure(CSVSink({"path": str(tmp_path / "nested.csv"), "schema": _SCHEMA}))
     plan = _prepare(sink, effect_id="b1" * 32, rows=[{"id": 1, "metadata": {"tags": ["a", "b"]}}])

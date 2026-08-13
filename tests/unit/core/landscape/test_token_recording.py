@@ -7,7 +7,7 @@ from sqlalchemy import select, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
-from elspeth.contracts import NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
+from elspeth.contracts import AggregationParentDisposition, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
@@ -15,7 +15,7 @@ from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table, token_outcomes_table, token_parents_table, tokens_table
+from elspeth.core.landscape.schema import batches_table, node_states_table, token_outcomes_table, token_parents_table, tokens_table
 from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -651,7 +651,12 @@ class TestExpandToken:
             parent_batch_id=batch_id,
         )
 
-        with pytest.raises(AuditIntegrityError, match="already claimed an expansion"):
+        first_outcome = factory.data_flow.get_token_outcome(first_parent.token_id)
+        second_outcome = factory.data_flow.get_token_outcome(second_parent.token_id)
+        assert first_outcome is not None and first_outcome.path == TerminalPath.BATCH_CONSUMED
+        assert second_outcome is not None and second_outcome.path == TerminalPath.BATCH_CONSUMED
+
+        with pytest.raises(AuditIntegrityError, match="divergent expansion replay"):
             factory.data_flow.expand_token(
                 parent_ref=TokenRef(token_id=second_parent.token_id, run_id="run-1"),
                 row_id=second_row.row_id,
@@ -667,6 +672,54 @@ class TestExpandToken:
             ).all()
         assert len(children) == 2
         assert len(persisted_children) == 2
+
+    def test_batch_expansion_rolls_back_children_and_all_parent_dispositions_together(self, monkeypatch: pytest.MonkeyPatch):
+        """A failure on a later mixed disposition cannot strand a partial receipt."""
+        db, factory = _setup()
+        batch_id = _make_batch(factory, batch_id="batch-expand-rollback")
+        first_row, first_parent = _make_row(factory, row_index=0)
+        _second_row, second_parent = _make_row(factory, row_index=1)
+        factory.execution.add_batch_member(batch_id, first_parent.token_id, 0)
+        factory.execution.add_batch_member(batch_id, second_parent.token_id, 1)
+        dispositions = (
+            AggregationParentDisposition(
+                parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
+                outcome=TerminalOutcome.TRANSIENT,
+                path=TerminalPath.BATCH_CONSUMED,
+            ),
+            AggregationParentDisposition(
+                parent_ref=TokenRef(token_id=second_parent.token_id, run_id="run-1"),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.QUARANTINED_AT_SOURCE,
+                error_hash="quarantined-test-hash",
+            ),
+        )
+        original_record = factory.data_flow.outcomes.record_token_outcome
+        calls = 0
+
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise LandscapeRecordError("injected second disposition failure")
+            return original_record(*args, **kwargs)
+
+        monkeypatch.setattr(factory.data_flow.outcomes, "record_token_outcome", fail_second)
+        with pytest.raises(LandscapeRecordError, match="injected second disposition failure"):
+            factory.data_flow.expand_token(
+                parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
+                row_id=first_row.row_id,
+                child_payloads=[{"item": 1}],
+                output_contract=_MINIMAL_CONTRACT,
+                parent_path=TerminalPath.BATCH_CONSUMED,
+                parent_batch_id=batch_id,
+                aggregation_parent_dispositions=dispositions,
+            )
+
+        with db.connection() as conn:
+            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id.is_not(None))).all() == []
+            assert conn.execute(select(token_outcomes_table.c.outcome_id).where(token_outcomes_table.c.completed == 1)).all() == []
+            assert conn.execute(select(batches_table.c.expansion_group_id).where(batches_table.c.batch_id == batch_id)).scalar_one() is None
 
     def test_batch_expansion_rejects_parent_outside_batch(self):
         """BATCH_CONSUMED expansion must be claimed by an actual batch member."""

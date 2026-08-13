@@ -419,6 +419,59 @@ def test_missing_completed_terminal_outcome_marks_token_pending_and_open() -> No
         db.close()
 
 
+def test_abandoned_outcome_closes_missing_fate_without_counting_terminal_success() -> None:
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-abandoned")
+        _insert_tokens(db, run_id="run-abandoned", row_id="row-1", token_ids=["token-1"])
+        _insert_outcome(
+            db,
+            run_id="run-abandoned",
+            token_id="token-1",
+            outcome=None,
+            path=TerminalPath.ABANDONED,
+            completed=0,
+        )
+
+        accounting = load_run_accounting_from_db(db, landscape_run_id="run-abandoned")
+
+        assert accounting.tokens.emitted == 1
+        assert accounting.tokens.terminal == 0
+        assert accounting.tokens.pending == 0
+        assert accounting.tokens.abandoned == 1
+        assert accounting.integrity.missing_terminal_outcomes == 0
+        assert accounting.integrity.closure == "abandoned"
+    finally:
+        db.close()
+
+
+def test_decided_and_abandoned_same_token_is_an_audit_contradiction() -> None:
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-contradiction")
+        _insert_tokens(db, run_id="run-contradiction", row_id="row-1", token_ids=["token-1"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-contradiction",
+            token_ids=["token-1"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
+        _insert_outcome(
+            db,
+            run_id="run-contradiction",
+            token_id="token-1",
+            outcome=None,
+            path=TerminalPath.ABANDONED,
+            completed=0,
+        )
+
+        with pytest.raises(ValueError, match="both terminally decided and marked ABANDONED"):
+            load_run_accounting_from_db(db, landscape_run_id="run-contradiction")
+    finally:
+        db.close()
+
+
 def test_batch_loader_returns_accounting_for_requested_runs() -> None:
     db = LandscapeDB.in_memory()
     try:

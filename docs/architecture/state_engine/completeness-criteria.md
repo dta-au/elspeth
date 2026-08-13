@@ -4,7 +4,8 @@
 
 The durable state engine is **complete** only when every mandatory state,
 subtype, boundary, read decision, refusal, and recovery path has current,
-production-representative evidence for every applicable dimension in the v1
+production-representative evidence for every applicable dimension and
+state-store/deployment profile case in the v2
 proof catalog.
 
 Completeness is binary. A maturity score cannot override a failed or unknown
@@ -17,12 +18,17 @@ The claim includes:
 - durable token work from enqueue through terminal disposition;
 - transform and sink-redrive leasing, heartbeat, expiry, reclaim, and fencing;
 - aggregation and coalesce barrier adoption, completion, and continuation;
+- row-union release with all branches, branch loss before or after partial
+  arrival, timeout, late arrival, and restart on either side of release;
 - sink-effect reservation, preparation, lease, reconciliation, publication,
   finalization, and scheduler repair;
 - source, transform, gate, aggregation, coalesce, sink, follower, and lifecycle
   production boundaries;
 - scheduler events, coordination evidence, node states, token outcomes,
   branch-loss rows, effect attempts, and artifacts;
+- fenced failed/interrupted finalization in which every still-undecided row is
+  atomically recorded as `(NULL, ABANDONED)` and cannot re-enter processing,
+  resume derivation, or predicate accounting;
 - orchestration read models that decide drain, flush, resume, relinquishment,
   eviction, or completion;
 - the catalog's exact state-store, deployment, lifecycle, and first-party
@@ -79,6 +85,29 @@ Every catalog leg accounts for all ten dimensions:
 Applicability is catalog-owned. An assessor cannot mark a dimension N/A merely
 because it is inconvenient to execute.
 
+## Required execution-profile cases
+
+Every mandatory v2 cell is proved independently for these catalog-owned
+state-store/deployment pairs:
+
+1. `sqlite-wal-single-process-leader`;
+2. `sqlite-wal-same-host-leader-plus-claim-only-followers`;
+3. `sqlite-wal-web-hosted-leader-plus-same-host-cli-followers`;
+4. `postgresql-16-aws-single-leader-landscape`.
+
+This is an evidence cross-product, not an assertion that every lifecycle mode
+applies to every deployment. The catalog lists the modes supported by each
+profile case. In particular, follower lifecycle evidence applies only to the
+two SQLite follower profiles. The PostgreSQL 16 contract is the maintained AWS
+single-leader Landscape profile; it does not advertise PostgreSQL multi-leader,
+multi-replica, or multi-host scheduling.
+
+The PostgreSQL-only PB-11 cases separately require database-server time,
+row-lock order, transaction isolation, schema admission/migration, and
+ambiguous connection-loss reconciliation. SQLite evidence is catalog-N/A for
+PB-11; follower-only RC-05 and PB-08 cells are catalog-N/A outside the two
+SQLite follower profiles.
+
 ## Evidence hierarchy
 
 Behavioral `pass`, `partial`, or `fail` claims require executed evidence:
@@ -91,6 +120,19 @@ Behavioral `pass`, `partial`, or `fail` claims require executed evidence:
 Source inspection, architecture documents, decisions, plans, tracker state,
 and test names support mapping and interpretation. They cannot independently
 make a behavioral case pass.
+
+The v2 catalog makes that boundary executable: `pytest` is the only behavioral
+promotion kind and `documentation` is support-only. A promoting pytest record
+must bind every coverage tuple to retained node IDs, use one
+leg/case/profile proof subject per node, match one catalog execution profile,
+and report a positive all-passing result with no skip, xfail, or xpass.
+The checked-in reporter obtains backend facts from the live connection at the
+trusted test boundary, binds the deployment assertion to the probe node, and
+emits exact JUnit/profile node identities, one machine outcome per collected
+node, and warning provenance. Manifest counts must equal those derived facts;
+XFAIL, XPASS, and generic skip remain separate. PostgreSQL evidence reports a
+server-queried semantic 16.x version; SQLite evidence reports a
+connection-queried semantic 3.x version.
 
 Concurrency claims require independent connections and, where the contract is
 process-scoped, independent operating-system processes. In-process exception
@@ -117,15 +159,16 @@ The catalog defines these hard gates:
 - `HG-10-normative-contract-drift` — source, architecture, catalog, assessment,
   and tracker do not contradict one another.
 
-Any open or unknown hard gate prevents a `complete` verdict.
+Each gate declares the dimensions from which its status, affected legs, and
+evidence support are derived. Any open or unknown hard gate prevents a
+`complete` verdict.
 
 ## Derived verdicts
 
 Leg verdicts derive from their expanded cases and assessment gate mapping:
 
 - `confirmed`: every required case passes and every N/A is catalog-approved;
-- `gap`: at least one required case fails or an open hard gate's
-  `affected_leg_ids` names the leg;
+- `gap`: at least one required case fails;
 - `unknown`: no known failure exists, but required evidence is missing.
 
 Overall verdicts:
@@ -137,7 +180,10 @@ Overall verdicts:
 
 ## Production-supported claim
 
-`complete` proves the catalog contract at every versioned execution profile.
+`complete` proves every applicable required leg, case, and dimension at each
+versioned execution profile. Every non-applicable cell must be explicitly
+catalog-authorized as `not_applicable`; `complete` does not claim that an
+unsupported profile cell was executed.
 `production-supported` additionally requires:
 
 - every state-store, deployment, lifecycle, and first-party plugin named in

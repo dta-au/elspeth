@@ -418,6 +418,15 @@ class OutputMode(StrEnum):
     TRANSFORM = "transform"
 
 
+class AggregationMemberAction(StrEnum):
+    """Durable action a successful aggregation result applies to one member."""
+
+    CONSUME_BATCH = "consume_batch"
+    QUARANTINE = "quarantine"
+    DROP_FILTERED = "drop_filtered"
+    CONTINUE_PASSTHROUGH = "continue_passthrough"
+
+
 # ── Plugin catalog types (Phase 7A) ──────────────────────────────────────
 #
 # These types are referenced by base plugin classes (L3) and protocols (L0)

@@ -71,8 +71,10 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.diversion import SinkWriteResult
 from elspeth.contracts.enums import (
+    AggregationMemberAction,
     BatchStatus,
     NodeStateStatus,
+    OutputMode,
     RoutingKind,
     RoutingMode,
     TerminalOutcome,
@@ -617,6 +619,37 @@ class TestTransformExecutor:
 
         with pytest.raises(OrchestrationInvariantError, match="without node_id"):
             executor.execute_transform(transform, token, ctx)
+
+    def test_ownership_loss_after_plugin_return_leaves_attempt_open(self) -> None:
+        """A stale worker cannot terminalize node audit after its plugin returns."""
+        from elspeth.contracts.errors import SchedulerLeaseLostError
+
+        factory = _make_factory()
+        ownership_loss = SchedulerLeaseLostError(work_item_id="work-old", lease_owner="worker-old", run_id="run_1")
+
+        def heartbeat_seam() -> None:
+            """Spec target matching TransformExecutor's ``before_terminal_audit: Callable[[], None]``."""
+
+        before_terminal_audit = MagicMock(spec=heartbeat_seam, side_effect=ownership_loss)
+        executor = TransformExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            data_flow=factory.data_flow,
+            before_terminal_audit=before_terminal_audit,
+        )
+        transform = _make_transform(on_error="discard")
+        transform.process.return_value = TransformResult.success(
+            make_row({"value": "processed"}, contract=_make_contract()),
+            success_reason={"action": "test"},
+        )
+
+        with pytest.raises(SchedulerLeaseLostError):
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+
+        before_terminal_audit.assert_called_once_with()
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
 
     # --- Input validation (centralized) ---
 
@@ -2902,7 +2935,13 @@ class TestAggregationExecutor:
         pass
 
     def test_execute_flush_success_completes_batch_and_state(self) -> None:
-        """Successful flush transitions batch to COMPLETED and state to COMPLETED."""
+        """Successful flush commits node, batch, and result receipt in ONE atomic call.
+
+        Every successful aggregation completion owns a durable result receipt:
+        the node state, batch completion, ordered output payloads, and exact
+        member actions commit together via complete_aggregation_result — never
+        through the legacy complete_batch/complete_node_state pair.
+        """
         executor, factory, nid = self._make_agg_executor(count=2)
         contract = _make_contract()
 
@@ -2929,9 +2968,27 @@ class TestAggregationExecutor:
         assert len(tokens) == 2
         assert batch_id == "batch_001"
 
-        # Verify batch completed
-        complete_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.COMPLETED]
-        assert len(complete_calls) == 1
+        factory.execution.complete_aggregation_result.assert_called_once()
+        receipt_kwargs = factory.execution.complete_aggregation_result.call_args.kwargs
+        assert receipt_kwargs["batch_id"] == "batch_001"
+        assert receipt_kwargs["run_id"] == "test-run"
+        assert receipt_kwargs["aggregation_node_id"] == "agg_1"
+        assert receipt_kwargs["state_id"] == "state_001"
+        assert receipt_kwargs["trigger_type"] == TriggerType.COUNT
+        assert receipt_kwargs["output_mode"] is OutputMode.TRANSFORM
+        assert receipt_kwargs["output_shape"] == "single"
+        assert receipt_kwargs["output_rows"] == (result.row,)
+        assert_stable_hash(receipt_kwargs["output_hash"], result.row)
+        assert receipt_kwargs["expansion_parent_token_id"] == "t1"
+        assert receipt_kwargs["success_reason"] == {"action": "aggregated"}
+        assert [(member.member_ref.token_id, member.action, member.error_hash) for member in receipt_kwargs["members"]] == [
+            ("t1", AggregationMemberAction.CONSUME_BATCH, None),
+            ("t2", AggregationMemberAction.CONSUME_BATCH, None),
+        ]
+        # No separate legacy completion writes on success — replaying them
+        # would break the single-transaction receipt guarantee.
+        factory.execution.complete_batch.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
 
     def test_execute_flush_success_passes_aggregation_flush_context(self) -> None:
         """Successful flush passes AggregationFlushContext as context_after."""
@@ -2954,13 +3011,12 @@ class TestAggregationExecutor:
 
         executor.execute_flush(nid, transform, ctx, TriggerType.COUNT)
 
-        # Find the COMPLETED call to complete_node_state (success path)
-        completed_calls = [
-            c for c in factory.execution.complete_node_state.call_args_list if c[1].get("status") == NodeStateStatus.COMPLETED
-        ]
-        assert len(completed_calls) == 1
+        # The flush context rides the atomic result receipt; the success path
+        # never issues a separate complete_node_state write.
+        factory.execution.complete_aggregation_result.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
 
-        context_after = completed_calls[0][1]["context_after"]
+        context_after = factory.execution.complete_aggregation_result.call_args.kwargs["context_after"]
         assert isinstance(context_after, AggregationFlushContext)
         assert context_after.trigger_type == "count"
         assert context_after.buffer_size == 2
@@ -3875,6 +3931,47 @@ class TestNodeStateGuard:
         assert kwargs["error"].exception_type == "ValueError"
         assert kwargs["error"].phase == "executor_post_process"
         assert kwargs["duration_ms"] >= 0
+
+    def test_explicit_ownership_abandonment_preserves_open_state(self) -> None:
+        """Ownership loss leaves the stale attempt OPEN and propagates."""
+        from elspeth.contracts.errors import SchedulerLeaseLostError
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        guard = NodeStateGuard(
+            factory.execution,
+            token_id="tok_1",
+            node_id="node_1",
+            run_id="run_1",
+            step_index=1,
+            input_data={"v": 1},
+        )
+        with pytest.raises(SchedulerLeaseLostError), guard:
+            guard.abandon_open_state()
+            raise SchedulerLeaseLostError(work_item_id="work-old", lease_owner="worker-old", run_id="run_1")
+
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
+
+    def test_abandonment_rejects_non_ownership_exception(self) -> None:
+        """Only scheduler ownership loss may preserve an OPEN attempt."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        guard = NodeStateGuard(
+            factory.execution,
+            token_id="tok_1",
+            node_id="node_1",
+            run_id="run_1",
+            step_index=1,
+            input_data={"v": 1},
+        )
+        with pytest.raises(OrchestrationInvariantError, match="nominal ownership-loss exception"), guard:
+            guard.abandon_open_state()
+            raise ValueError("not an ownership verdict")
+
+        factory.execution.begin_node_state.assert_called_once()
+        factory.execution.complete_node_state.assert_not_called()
 
     def test_empty_exception_message_still_records_failed(self) -> None:
         """A bare `raise ValueError()` must not abort terminal persistence.
@@ -4871,9 +4968,15 @@ class TestAggregationExecutorTerminality:
         assert result.status == "success"
         assert len(tokens) == 1
 
-        # Verify batch completed (not failed)
-        completed_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.COMPLETED]
-        assert len(completed_calls) == 1
+        # Guard stands down after the atomic result receipt: exactly one
+        # completion write, and no legacy batch/node-state writes (a guard
+        # auto-FAIL after the receipt would show up here as complete_node_state).
+        factory.execution.complete_aggregation_result.assert_called_once()
+        receipt_kwargs = factory.execution.complete_aggregation_result.call_args.kwargs
+        assert receipt_kwargs["batch_id"] == "batch_001"
+        assert receipt_kwargs["state_id"] == "state_001"
+        factory.execution.complete_batch.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
 
 
 # =============================================================================

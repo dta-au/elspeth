@@ -547,7 +547,11 @@ class SchedulerDrainCoordinator:
                         if (
                             ready_count == 0
                             and failed_count == 0
-                            and self._scheduler.has_peer_owned_work(run_id=self._run_id, caller_owner=self._scheduler_lease_owner)
+                            and self._scheduler.has_peer_owned_work(
+                                run_id=self._run_id,
+                                caller_owner=self._scheduler_lease_owner,
+                                work_item_ids=pending_ids,
+                            )
                         ):
                             relinquished = {
                                 work_item_id: f"{item.token.token_id}@{item.current_node_id}"

@@ -1,0 +1,136 @@
+{
+  "schema": "warpline.reverify_worklist.v1",
+  "ok": true,
+  "query": {
+    "repo": "/home/john/elspeth/.claude/worktrees/state-engine-assessment-2026-08-12",
+    "tool": "warpline_reverify_worklist_get",
+    "arguments": {
+      "rev_range": "3c782ac3c7efb0550495be38f75800eddffa639a..af79b34040f5ce5fd989aa0d42a1b80ad8366829",
+      "changed_entity_key_ids": [],
+      "depth": 2
+    },
+    "filters": {},
+    "sort": {
+      "by": "priority",
+      "order": "asc"
+    },
+    "group_by": "none",
+    "include_federation": true,
+    "page": {
+      "limit": 100,
+      "cursor": null
+    }
+  },
+  "data": {
+    "completeness": "NO_SNAPSHOT",
+    "impact_completeness": {
+      "status": "unknown",
+      "as_of": "2026-08-11T17:22:20.606516+00:00",
+      "graph_fresh": false,
+      "graph_ref": null,
+      "depth_capped": false,
+      "unresolved_count": 0,
+      "reasons": [
+        "no_snapshot"
+      ]
+    },
+    "risk_verification": {
+      "risk": "unavailable",
+      "reason_code": "completeness_partial",
+      "reason": {
+        "reason_class": "partial",
+        "cause": "impact completeness is 'unknown', not 'complete' (reasons: ['no_snapshot']); the impact set is narrowed/partial and is not authoritative",
+        "fix": "resolve the partial-coverage reasons (recapture a fresh graph, raise traversal depth, resolve unmapped entities) and regenerate the worklist"
+      }
+    },
+    "staleness": {
+      "snapshot_commit": null,
+      "commits_behind": null
+    },
+    "verification_summary": {
+      "fresh": 0,
+      "stale": 0,
+      "unverified": 0,
+      "unavailable": 0,
+      "local_source_configured": false
+    },
+    "resolved": [],
+    "unresolved": [],
+    "items": [],
+    "grouped": null,
+    "next_actions": {
+      "filigree": []
+    },
+    "overflow": {
+      "total": 0,
+      "returned": 0,
+      "dumped_to": null,
+      "reason_class": "clean"
+    },
+    "page": {
+      "limit": 100,
+      "next_cursor": null,
+      "has_more": false,
+      "reason_class": "clean"
+    },
+    "federation": {
+      "members": {
+        "filigree": {
+          "weft_reason": {
+            "reason_class": "clean"
+          },
+          "entity_count": 0
+        },
+        "wardline": {
+          "weft_reason": {
+            "reason_class": "clean"
+          },
+          "entity_count": 0
+        },
+        "legis": {
+          "weft_reason": {
+            "reason_class": "clean"
+          },
+          "entity_count": 0
+        },
+        "plainweave": {
+          "weft_reason": {
+            "reason_class": "clean"
+          },
+          "entity_count": 0,
+          "unavailable_seen": false
+        }
+      },
+      "entities": []
+    }
+  },
+  "warnings": [
+    "NO_SNAPSHOT: downstream traversal unavailable; changed set only"
+  ],
+  "next_actions": {
+    "filigree": []
+  },
+  "enrichment": {
+    "sei": "absent",
+    "edges": "absent",
+    "work": "absent",
+    "risk": "absent",
+    "governance": "absent",
+    "requirements": "absent"
+  },
+  "enrichment_reasons": {
+    "requirements": {
+      "reason_class": "unresolved_input",
+      "cause": "plainweave knows the entity but no requirement is bound to it (a definitive none-here, not an unknown)",
+      "fix": "bind a requirement to this entity in plainweave (a satisfies/verifies trace), or accept it as honestly unbound; until then requirements is absent, not an earned-empty clean"
+    }
+  },
+  "meta": {
+    "producer": {
+      "tool": "warpline",
+      "version": "1.3.0"
+    },
+    "local_only": true,
+    "peer_side_effects": []
+  }
+}

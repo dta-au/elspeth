@@ -15,7 +15,7 @@ from sqlalchemy.engine import Connection
 
 from elspeth.contracts.audit import SinkEffect
 from elspeth.contracts.audit_export import C, H, final_manifest_identity_payload, hash_final_manifest_identity_payload
-from elspeth.contracts.enums import NodeStateStatus
+from elspeth.contracts.enums import NodeStateStatus, RunStatus
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
@@ -263,6 +263,23 @@ class SinkEffectReservation:
         request: SinkEffectReservationRequest,
         witness: _PipelineWitness,
     ) -> None:
+        # Run-first ordering matches fenced finalization (run row, then token
+        # rows). A shared row lock keeps independent reservations concurrent
+        # while conflicting with finalization's status UPDATE. If reservation
+        # wins, finalization subsequently observes and fails its open
+        # operation. If finalization wins, this fresh locked read sees the
+        # terminal status and refuses before any effect mutation.
+        # The audit-export reservation arm is intentionally separate: exports
+        # may be reserved for terminal source runs and have no pipeline token
+        # custody to close.
+        run_status = conn.execute(
+            select(runs_table.c.status).where(runs_table.c.run_id == request.run_id).with_for_update(read=True, of=runs_table)
+        ).scalar_one_or_none()
+        if run_status is None:
+            raise ValueError("sink effect run does not exist")
+        if run_status != RunStatus.RUNNING.value:
+            raise ValueError(f"cannot reserve a pipeline sink effect for terminal run status {run_status!r}")
+
         token_ids = tuple(sorted(member.token_id for member in request.members))
         locked_tokens: list[Row[Any]] = []
         for token_id in token_ids:

@@ -29,6 +29,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPlan,
     SinkEffectRole,
 )
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
@@ -40,6 +41,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import (
     artifacts_table,
     node_states_table,
+    operations_table,
     sink_effect_members_table,
     sink_effects_table,
     token_outcomes_table,
@@ -563,6 +565,7 @@ class _InFlightEffect:
     token_id: str
     sink_node_id: str
     effect_id: str
+    operation_id: str
     lease_owner: str
     generation: int
     request: SinkEffectFinalizeRequest
@@ -683,11 +686,17 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
         ),
         attempt_id=attempt.attempt_id,
     )
+    operations = factory.execution.get_operations_for_run(run.run_id)
+    assert len(operations) == 1
+    operation = operations[0]
+    assert operation.sink_effect_id == effect.effect_id
+    assert operation.status == "open"
     return _InFlightEffect(
         run_id=run.run_id,
         token_id=token.token_id,
         sink_node_id=sink,
         effect_id=effect.effect_id,
+        operation_id=operation.operation_id,
         lease_owner=lease.owner,
         generation=lease.generation,
         request=request,
@@ -761,9 +770,18 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
     assert backend_pids["takeover"] != backend_pids["finalizer"]
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
         assert effect_row.state == "in_flight"
         assert effect_row.lease_owner == "worker-b"
         assert int(effect_row.generation) == built.generation + 1
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "open"
+        assert operation_row.completed_at is None
+        assert operation_row.duration_ms is None
+        assert operation_row.output_data_hash is None
+        assert operation_row.error_message is None
         assert (
             conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 0
         )
@@ -773,6 +791,50 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
         )
         statuses = list(conn.execute(select(node_states_table.c.status).where(node_states_table.c.token_id == built.token_id)).scalars())
         assert statuses == [NodeStateStatus.OPEN.value]
+
+    winner_request = replace(
+        built.request,
+        lease_owner=new_lease.owner,
+        generation=new_lease.generation,
+    )
+    winner = takeover_factory.execution.sink_effects.finalize(winner_request)
+    assert winner.effect.effect_id == built.effect_id
+    assert winner.effect.generation == new_lease.generation
+    assert winner.artifact.path_or_uri == built.request.descriptor.path_or_uri
+    assert winner.artifact.content_hash == built.request.descriptor.content_hash
+    assert len(winner.state_ids) == 1
+    assert len(winner.outcome_ids) == 1
+    with db.read_only_connection() as conn:
+        effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
+        assert effect_row.state == "finalized"
+        assert effect_row.lease_owner is None
+        assert int(effect_row.generation) == new_lease.generation
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "completed"
+        assert operation_row.completed_at is not None
+        assert operation_row.duration_ms == winner_request.operation_duration_ms
+        assert operation_row.error_message is None
+        assert operation_row.output_data_hash == stable_hash(
+            {
+                "accepted_ordinals": list(winner_request.accepted_ordinals),
+                "artifact_id": winner.artifact.artifact_id,
+                "descriptor_hash": effect_row.result_descriptor_hash,
+                "diverted_ordinals": list(winner_request.diverted_ordinals),
+                "effect_id": built.effect_id,
+            }
+        )
+        assert (
+            conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 1
+        )
+        assert (
+            conn.scalar(select(func.count()).select_from(token_outcomes_table).where(token_outcomes_table.c.token_id == built.token_id))
+            == 1
+        )
+        statuses = list(conn.execute(select(node_states_table.c.status).where(node_states_table.c.token_id == built.token_id)).scalars())
+        assert statuses == [NodeStateStatus.COMPLETED.value]
 
 
 def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -826,12 +888,34 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
             takeover.result(timeout=10)
 
     assert winner.effect.state.value == "finalized"
+    assert winner.effect.effect_id == built.effect_id
+    assert winner.artifact.path_or_uri == built.request.descriptor.path_or_uri
+    assert winner.artifact.content_hash == built.request.descriptor.content_hash
+    assert len(winner.state_ids) == 1
+    assert len(winner.outcome_ids) == 1
     assert backend_pids["takeover"] != backend_pids["finalizer"]
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
+        operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
         assert effect_row.state == "finalized"
         assert effect_row.lease_owner is None
         assert int(effect_row.generation) == built.generation
+        assert len(operation_rows) == 1
+        operation_row = operation_rows[0]
+        assert operation_row.operation_id == built.operation_id
+        assert operation_row.status == "completed"
+        assert operation_row.completed_at is not None
+        assert operation_row.duration_ms == built.request.operation_duration_ms
+        assert operation_row.error_message is None
+        assert operation_row.output_data_hash == stable_hash(
+            {
+                "accepted_ordinals": list(built.request.accepted_ordinals),
+                "artifact_id": winner.artifact.artifact_id,
+                "descriptor_hash": effect_row.result_descriptor_hash,
+                "diverted_ordinals": list(built.request.diverted_ordinals),
+                "effect_id": built.effect_id,
+            }
+        )
         assert (
             conn.scalar(select(func.count()).select_from(artifacts_table).where(artifacts_table.c.sink_effect_id == built.effect_id)) == 1
         )

@@ -771,6 +771,44 @@ class RecoveryManager:
             incomplete non-delegation token continuations grouped by row_id,
             and the barrier-buffered token IDs used to derive both.
         """
+        # ADR-038: ABANDONED is an explicit declaration that no resume may
+        # ever decide the token.  The ordinary resume entry gates reject the
+        # finalized run before reaching this read, but this projection is also
+        # a public recovery surface and must not classify ABANDONED as pending
+        # work.  A completed outcome on the same token is the stronger audit
+        # contradiction: both images fail closed here before any replay set is
+        # returned.
+        abandoned = token_outcomes_table.alias("abandoned_outcomes")
+        decided = token_outcomes_table.alias("decided_outcomes")
+        with self._db.engine.connect() as conn:
+            abandoned_rows = conn.execute(
+                select(abandoned.c.token_id, func.count(decided.c.outcome_id).label("decided_count"))
+                .select_from(
+                    abandoned.outerjoin(
+                        decided,
+                        (decided.c.run_id == abandoned.c.run_id)
+                        & (decided.c.token_id == abandoned.c.token_id)
+                        & (decided.c.completed == 1),
+                    )
+                )
+                .where(abandoned.c.run_id == run_id)
+                .where(abandoned.c.path == TerminalPath.ABANDONED.value)
+                .group_by(abandoned.c.token_id)
+                .order_by(abandoned.c.token_id)
+            ).all()
+        if abandoned_rows:
+            contradictions = tuple(str(row.token_id) for row in abandoned_rows if int(row.decided_count) > 0)
+            if contradictions:
+                raise AuditIntegrityError(
+                    f"Resume work-set for run {run_id!r} found token(s) both terminally decided and marked "
+                    f"ABANDONED: {contradictions!r}; refusing an ADR-038 audit contradiction."
+                )
+            abandoned_ids = tuple(str(row.token_id) for row in abandoned_rows)
+            raise AuditIntegrityError(
+                f"Resume work-set for run {run_id!r} found ABANDONED token(s) {abandoned_ids!r}; "
+                "ABANDONED is non-resumable and cannot be returned as pending replay work."
+            )
+
         checkpoint = self._get_latest_checkpoint_for_resume_workset(run_id)
         if checkpoint is None:
             return ResumeWorkSet(row_ids=(), incomplete_by_row={}, buffered_token_ids=frozenset())

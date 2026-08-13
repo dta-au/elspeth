@@ -48,7 +48,12 @@ from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
 
 if TYPE_CHECKING:
-    from elspeth.contracts import Batch
+    from elspeth.contracts import (
+        Batch,
+        CommittedAggregationOutputReceipt,
+        CommittedAggregationResidual,
+        CommittedCoalesceResidual,
+    )
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.core.config import AggregationSettings
@@ -60,6 +65,7 @@ if TYPE_CHECKING:
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
     from elspeth.engine.dag_navigator import DAGNavigator
     from elspeth.engine.executors import AggregationExecutor
+    from elspeth.engine.processor import _PreparedAggregationRoute
     from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome, RowUnionRestoreEntry
 
 logger = logging.getLogger(__name__)
@@ -699,10 +705,14 @@ class BarrierIntakeCoordinator:
 
         Journal-first: the fenced cursor mark commits BEFORE the in-memory
         replay — a crash between mark and replay loses nothing because the
-        takeover restore derives lost_branches from the FULL loss table. At
-        N=1 the replay arm is structurally idle: the producer already
-        notified in-claim (record-then-notify), so ``has_recorded_branch_loss``
-        (or the executor's completed-keys check) dedups every row.
+        takeover restore derives lost_branches from the FULL loss table. For
+        ordinary N=1 claim dispositions the replay arm is structurally
+        idle: the producer already notified in-claim (record-then-notify), so
+        ``has_recorded_branch_loss`` (or the executor's completed-keys check)
+        dedups every row. Empty aggregation is the deliberate exception: it
+        stages without notifying, commits the loss with its own barrier, then
+        calls this intake seam so downstream consequences cannot precede the
+        durable loss.
         """
         dispositions: list[BarrierIntakeDisposition] = []
         if self._coalesce_executor is None and self._row_union_executor is None:
@@ -813,6 +823,10 @@ class BarrierIntakeCoordinator:
             )
         return dispositions
 
+    def replay_durable_branch_losses(self) -> tuple[BarrierIntakeDisposition, ...]:
+        """Replay committed loss-ledger entries after their producer commits."""
+        return tuple(self._replay_branch_losses())
+
 
 class BarrierRecoveryCoordinator:
     """F1 resume restore: rebuild barrier state from journal + audit tables."""
@@ -836,6 +850,12 @@ class BarrierRecoveryCoordinator:
         released_row_union_items: Callable[..., tuple[WorkItem, ...]] | None = None,
         complete_row_union_fire: Callable[..., None] | None = None,
         emit_token_completed: Callable[..., None] | None = None,
+        complete_committed_aggregation_residual: Callable[[CommittedAggregationResidual, Sequence[TokenWorkItem]], None] | None = None,
+        prepare_committed_aggregation_output: (
+            Callable[[CommittedAggregationOutputReceipt, Sequence[TokenWorkItem]], _PreparedAggregationRoute] | None
+        ) = None,
+        complete_committed_aggregation_output: Callable[[_PreparedAggregationRoute], None] | None = None,
+        complete_committed_coalesce_residual: Callable[[CommittedCoalesceResidual, Sequence[TokenWorkItem]], None] | None = None,
     ) -> None:
         self._run_id = run_id
         self._scheduler = scheduler
@@ -853,6 +873,10 @@ class BarrierRecoveryCoordinator:
         self._released_row_union_items = released_row_union_items
         self._complete_row_union_fire = complete_row_union_fire
         self._emit_token_completed = emit_token_completed
+        self._complete_committed_aggregation_residual = complete_committed_aggregation_residual
+        self._prepare_committed_aggregation_output = prepare_committed_aggregation_output
+        self._complete_committed_aggregation_output = complete_committed_aggregation_output
+        self._complete_committed_coalesce_residual = complete_committed_coalesce_residual
 
     def restore_from_journal(self, restore: BarrierJournalRestoreContext) -> None:
         """Rebuild aggregation buffers and coalesce pendings from journal BLOCKED rows.
@@ -984,6 +1008,9 @@ class BarrierRecoveryCoordinator:
 
         # Per-node batch metadata for every configured aggregation node.
         agg_plans: list[_AggregationRestorePlan] = []
+        committed_aggregation_plans: list[tuple[CommittedAggregationResidual, tuple[TokenWorkItem, ...]]] = []
+        committed_aggregation_output_plans: list[_PreparedAggregationRoute] = []
+        committed_coalesce_plans: list[tuple[CommittedCoalesceResidual, tuple[TokenWorkItem, ...]]] = []
         if self._aggregation_settings:
             members_by_batch: dict[str, list[str]] = {}
             for member in self._execution.get_all_batch_members_for_run(self._run_id):
@@ -1030,9 +1057,56 @@ class BarrierRecoveryCoordinator:
                 # counter-only branch below ("flushes all FAILED" — exactly the
                 # state that branch already anticipates).
                 #
-                # Scoped to (FAILURE, UNROUTED): the success-path BATCH_CONSUMED
-                # crash residual (elspeth-3977d8ab60) still owes a sink output
-                # and is NOT swept here — it keeps hitting the loud refusal.
+                # A successful transform-mode flush may have committed its
+                # batch result and expanded children before complete_barrier.
+                # Rebuild that continuation from the durable expansion receipt
+                # first; the processor callback publishes it with the exact
+                # BLOCKED membership through strict complete_barrier.
+                if node_items:
+                    committed_residuals = self._barrier_restore_reads.list_committed_aggregation_residuals(
+                        self._run_id,
+                        aggregation_node_id=str(node_id),
+                        blocked_token_ids=[item.token_id for item in node_items],
+                    )
+                    for aggregation_residual in committed_residuals:
+                        if self._complete_committed_aggregation_residual is None:
+                            raise OrchestrationInvariantError(
+                                "Committed aggregation residual recovery requires the processor continuation callback"
+                            )
+                        member_ids = frozenset(aggregation_residual.member_token_ids)
+                        residual_items = tuple(item for item in node_items if item.token_id in member_ids)
+                        if len(residual_items) != len(aggregation_residual.member_token_ids):
+                            raise AuditIntegrityError(
+                                f"Committed aggregation residual {aggregation_residual.batch_id!r} at node {node_id!r} "
+                                "does not match its exact BLOCKED journal snapshot"
+                            )
+                        committed_aggregation_plans.append((aggregation_residual, residual_items))
+                        node_items = [item for item in node_items if item.token_id not in member_ids]
+
+                if node_items:
+                    output_receipts = self._barrier_restore_reads.list_committed_aggregation_output_receipts(
+                        self._run_id,
+                        aggregation_node_id=str(node_id),
+                        blocked_token_ids=[item.token_id for item in node_items],
+                    )
+                    for output_receipt in output_receipts:
+                        if self._prepare_committed_aggregation_output is None or self._complete_committed_aggregation_output is None:
+                            raise OrchestrationInvariantError(
+                                "Committed aggregation output recovery requires prepare and completion callbacks"
+                            )
+                        member_ids = frozenset(output_receipt.member_token_ids)
+                        residual_items = tuple(item for item in node_items if item.token_id in member_ids)
+                        if len(residual_items) != len(output_receipt.member_token_ids):
+                            raise AuditIntegrityError(
+                                f"Committed aggregation output {output_receipt.batch_id!r} at node {node_id!r} "
+                                "does not match its exact BLOCKED journal snapshot"
+                            )
+                        prepared_route = self._prepare_committed_aggregation_output(output_receipt, residual_items)
+                        committed_aggregation_output_plans.append(prepared_route)
+                        node_items = [item for item in node_items if item.token_id not in member_ids]
+
+                # Scoped to (FAILURE, UNROUTED): this has no output receipt;
+                # the already-terminal failed inputs are simply released.
                 if node_items:
                     failed_terminal_ids = self._barrier_restore_reads.find_failed_unrouted_terminal_token_ids(
                         self._run_id, [item.token_id for item in node_items]
@@ -1304,6 +1378,36 @@ class BarrierRecoveryCoordinator:
         # state_ids check, which fired on both reachable crash states.
         coalesce_holdless_items: list[TokenWorkItem] = []
         if coalesce_items:
+            recovered_coalesce_member_ids: set[str] = set()
+            for coalesce_name, coalesce_node_id in self._coalesce_node_ids.items():
+                node_items = [item for item in coalesce_items if item.barrier_key == str(coalesce_name)]
+                row_ids = sorted({item.row_id for item in node_items})
+                for row_id in row_ids:
+                    group_items = tuple(item for item in node_items if item.row_id == row_id)
+                    coalesce_residual = self._barrier_restore_reads.get_committed_coalesce_residual(
+                        self._run_id,
+                        coalesce_node_id=str(coalesce_node_id),
+                        coalesce_name=str(coalesce_name),
+                        row_id=row_id,
+                        blocked_token_ids=tuple(item.token_id for item in group_items),
+                    )
+                    if coalesce_residual is None:
+                        continue
+                    if self._complete_committed_coalesce_residual is None:
+                        raise OrchestrationInvariantError(
+                            "Committed coalesce residual recovery requires the processor continuation callback"
+                        )
+                    member_ids = frozenset(coalesce_residual.member_token_ids)
+                    residual_items = tuple(item for item in group_items if item.token_id in member_ids)
+                    if len(residual_items) != len(member_ids):
+                        raise AuditIntegrityError(
+                            f"Committed coalesce residual {coalesce_residual.effect_id!r} does not match its BLOCKED journal snapshot"
+                        )
+                    committed_coalesce_plans.append((coalesce_residual, residual_items))
+                    recovered_coalesce_member_ids.update(member_ids)
+            if recovered_coalesce_member_ids:
+                coalesce_items = [item for item in coalesce_items if item.token_id not in recovered_coalesce_member_ids]
+
             holdless = [item for item in coalesce_items if item.token_id not in coalesce_state_ids]
             if holdless:
                 # Resolve the Landscape completed set once for all holdless rows.
@@ -1396,6 +1500,22 @@ class BarrierRecoveryCoordinator:
                 effective_coalesce_scalars[key] = CoalescePendingScalars(lost_branches=lost_branches)
 
         # ---- Mutate ---------------------------------------------------------
+        # Apply committed-result continuations only after every barrier's
+        # journal/audit derivation has succeeded. A corrupt later barrier must
+        # not allow an earlier valid residual to publish successor work.
+        for aggregation_residual, residual_items in committed_aggregation_plans:
+            if self._complete_committed_aggregation_residual is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Committed aggregation residual recovery requires the processor continuation callback")
+            self._complete_committed_aggregation_residual(aggregation_residual, residual_items)
+        for prepared_route in committed_aggregation_output_plans:
+            if self._complete_committed_aggregation_output is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Committed aggregation output recovery requires the completion callback")
+            self._complete_committed_aggregation_output(prepared_route)
+        for coalesce_residual, residual_items in committed_coalesce_plans:
+            if self._complete_committed_coalesce_residual is None:  # pragma: no cover - checked while planning
+                raise OrchestrationInvariantError("Committed coalesce residual recovery requires the processor continuation callback")
+            self._complete_committed_coalesce_residual(coalesce_residual, residual_items)
+
         # Coalesce first: ONE call for the whole executor (a second call would
         # discard this one — see CoalesceExecutor.restore_from_journal's caller
         # obligations). Called whenever a coalesce executor exists so completed

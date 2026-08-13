@@ -1,0 +1,1506 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "plugin_key": "sink:aws_s3",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.aws_s3_sink",
+      "qualname": "AWSS3Sink",
+      "source_path": "src/elspeth/plugins/sinks/aws_s3_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.aws_s3_sink:AWSS3Sink",
+        "flush": "elspeth.plugins.sinks.aws_s3_sink:AWSS3Sink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.aws_s3_sink:AWSS3Sink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "restaging",
+      "sink_effect_modes": [
+        "write"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "sink:azure_blob",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.azure_blob_sink",
+      "qualname": "AzureBlobSink",
+      "source_path": "src/elspeth/plugins/sinks/azure_blob_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.azure_blob_sink:AzureBlobSink",
+        "flush": "elspeth.plugins.sinks.azure_blob_sink:AzureBlobSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.azure_blob_sink:AzureBlobSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "restaging",
+      "sink_effect_modes": [
+        "write"
+      ],
+      "variants": [
+        "connection_string",
+        "sas_token",
+        "managed_identity",
+        "service_principal"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
+      "plugin_key": "sink:chroma_sink",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.chroma_sink",
+      "qualname": "ChromaSink",
+      "source_path": "src/elspeth/plugins/sinks/chroma_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
+        "write": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
+        "flush": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
+        "on_complete": "elspeth.plugins.sinks.chroma_sink:ChromaSink",
+        "close": "elspeth.plugins.sinks.chroma_sink:ChromaSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "member",
+      "sink_effect_modes": [
+        "overwrite"
+      ],
+      "variants": [
+        "persistent",
+        "client"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-chroma"
+    },
+    {
+      "plugin_key": "sink:csv",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.csv_sink",
+      "qualname": "CSVSink",
+      "source_path": "src/elspeth/plugins/sinks/csv_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.csv_sink:CSVSink",
+        "flush": "elspeth.plugins.sinks.csv_sink:CSVSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.csv_sink:CSVSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "contract",
+      "sink_effect_modes": [
+        "append",
+        "write"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "sink:database",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.database_sink",
+      "qualname": "DatabaseSink",
+      "source_path": "src/elspeth/plugins/sinks/database_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.database_sink:DatabaseSink",
+        "flush": "elspeth.plugins.sinks.database_sink:DatabaseSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.database_sink:DatabaseSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "contract",
+      "sink_effect_modes": [
+        "append"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "sink:dataverse",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.dataverse",
+      "qualname": "DataverseSink",
+      "source_path": "src/elspeth/plugins/sinks/dataverse.py",
+      "determinism": "external_call",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sinks.dataverse:DataverseSink",
+        "write": "elspeth.plugins.sinks.dataverse:DataverseSink",
+        "flush": "elspeth.plugins.sinks.dataverse:DataverseSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.dataverse:DataverseSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "member",
+      "sink_effect_modes": [
+        "upsert"
+      ],
+      "variants": [
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-dataverse"
+    },
+    {
+      "plugin_key": "sink:document",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.document_sink",
+      "qualname": "DocumentSink",
+      "source_path": "src/elspeth/plugins/sinks/document_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.document_sink:DocumentSink",
+        "flush": "elspeth.plugins.sinks.document_sink:DocumentSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.document_sink:DocumentSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "contract",
+      "sink_effect_modes": [
+        "write"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "sink:json",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.json_sink",
+      "qualname": "JSONSink",
+      "source_path": "src/elspeth/plugins/sinks/json_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.json_sink:JSONSink",
+        "flush": "elspeth.plugins.sinks.json_sink:JSONSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.json_sink:JSONSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "contract",
+      "sink_effect_modes": [
+        "append",
+        "write"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "sink:text",
+      "kind": "sink",
+      "module": "elspeth.plugins.sinks.text_sink",
+      "qualname": "TextSink",
+      "source_path": "src/elspeth/plugins/sinks/text_sink.py",
+      "determinism": "io_write",
+      "execution_model": "sink-batch",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSink",
+        "write": "elspeth.plugins.sinks.text_sink:TextSink",
+        "flush": "elspeth.plugins.sinks.text_sink:TextSink",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSink",
+        "close": "elspeth.plugins.sinks.text_sink:TextSink"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": "contract",
+      "sink_effect_modes": [
+        "append",
+        "write"
+      ],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-06",
+        "PB-07",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:aws_s3",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.aws_s3_source",
+      "qualname": "AWSS3Source",
+      "source_path": "src/elspeth/plugins/sources/aws_s3_source.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.aws_s3_source:AWSS3Source",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.aws_s3_source:AWSS3Source"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "source:azure_blob",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.azure_blob_source",
+      "qualname": "AzureBlobSource",
+      "source_path": "src/elspeth/plugins/sources/azure_blob_source.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.azure_blob_source:AzureBlobSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.azure_blob_source:AzureBlobSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "connection_string",
+        "sas_token",
+        "managed_identity",
+        "service_principal"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
+      "plugin_key": "source:blob_rows",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.blob_rows",
+      "qualname": "BlobRowsSource",
+      "source_path": "src/elspeth/plugins/sources/blob_rows.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sources.blob_rows:BlobRowsSource",
+        "load": "elspeth.plugins.sources.blob_rows:BlobRowsSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.blob_rows:BlobRowsSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:csv",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.csv_source",
+      "qualname": "CSVSource",
+      "source_path": "src/elspeth/plugins/sources/csv_source.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.csv_source:CSVSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.csv_source:CSVSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:dataverse",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.dataverse",
+      "qualname": "DataverseSource",
+      "source_path": "src/elspeth/plugins/sources/dataverse.py",
+      "determinism": "external_call",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sources.dataverse:DataverseSource",
+        "load": "elspeth.plugins.sources.dataverse:DataverseSource",
+        "on_complete": "elspeth.plugins.sources.dataverse:DataverseSource",
+        "close": "elspeth.plugins.sources.dataverse:DataverseSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "service_principal",
+        "managed_identity"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-dataverse"
+    },
+    {
+      "plugin_key": "source:json",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.json_source",
+      "qualname": "JSONSource",
+      "source_path": "src/elspeth/plugins/sources/json_source.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.json_source:JSONSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.json_source:JSONSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:llm",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.llm.source",
+      "qualname": "LLMSource",
+      "source_path": "src/elspeth/plugins/sources/llm/source.py",
+      "determinism": "non_deterministic",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.sources.llm.source:LLMSource",
+        "load": "elspeth.plugins.sources.llm.source:LLMSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.llm.source:LLMSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "azure",
+        "openrouter",
+        "bedrock",
+        "gateway"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-provider"
+    },
+    {
+      "plugin_key": "source:null",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.null_source",
+      "qualname": "NullSource",
+      "source_path": "src/elspeth/plugins/sources/null_source.py",
+      "determinism": "deterministic",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.null_source:NullSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.null_source:NullSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "source:text",
+      "kind": "source",
+      "module": "elspeth.plugins.sources.text_source",
+      "qualname": "TextSource",
+      "source_path": "src/elspeth/plugins/sources/text_source.py",
+      "determinism": "io_read",
+      "execution_model": "source-iterator",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseSource",
+        "load": "elspeth.plugins.sources.text_source:TextSource",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseSource",
+        "close": "elspeth.plugins.sources.text_source:TextSource"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-01",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:aws_bedrock_content_safety",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.aws.bedrock_content_safety",
+      "qualname": "AWSBedrockContentSafety",
+      "source_path": "src/elspeth/plugins/transforms/aws/bedrock_content_safety.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase",
+        "process": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "transform:aws_bedrock_prompt_shield",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.aws.bedrock_prompt_shield",
+      "qualname": "AWSBedrockPromptShield",
+      "source_path": "src/elspeth/plugins/transforms/aws/bedrock_prompt_shield.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase",
+        "process": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.aws._guardrail_transform:BedrockGuardrailTransformBase"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "transform:aws_textract_document_analysis",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.aws.textract_document_analysis",
+      "qualname": "AWSTextractDocumentAnalysis",
+      "source_path": "src/elspeth/plugins/transforms/aws/textract_document_analysis.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.aws.textract_document_analysis:AWSTextractDocumentAnalysis",
+        "process": "elspeth.plugins.transforms.aws.textract_document_analysis:AWSTextractDocumentAnalysis",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.aws.textract_document_analysis:AWSTextractDocumentAnalysis"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default_chain",
+        "secret_refs"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "transform:aws_textract_inline_analysis",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.aws.textract_inline_analysis",
+      "qualname": "AWSTextractInlineAnalysis",
+      "source_path": "src/elspeth/plugins/transforms/aws/textract_inline_analysis.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.aws.textract_inline_analysis:AWSTextractInlineAnalysis",
+        "process": "elspeth.plugins.transforms.aws.textract_inline_analysis:AWSTextractInlineAnalysis",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.aws.textract_inline_analysis:AWSTextractInlineAnalysis"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default_chain",
+        "secret_refs"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-aws"
+    },
+    {
+      "plugin_key": "transform:azure_content_safety",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.content_safety",
+      "qualname": "AzureContentSafety",
+      "source_path": "src/elspeth/plugins/transforms/azure/content_safety.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform",
+        "process": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
+      "plugin_key": "transform:azure_document_intelligence",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.document_intelligence",
+      "qualname": "AzureDocumentIntelligence",
+      "source_path": "src/elspeth/plugins/transforms/azure/document_intelligence.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence",
+        "process": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.azure.document_intelligence:AzureDocumentIntelligence"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
+      "plugin_key": "transform:azure_prompt_shield",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.azure.prompt_shield",
+      "qualname": "AzurePromptShield",
+      "source_path": "src/elspeth/plugins/transforms/azure/prompt_shield.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform",
+        "process": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.azure.base:BaseAzureSafetyTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-azure"
+    },
+    {
+      "plugin_key": "transform:batch_classifier_metrics",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_classifier_metrics",
+      "qualname": "BatchClassifierMetrics",
+      "source_path": "src/elspeth/plugins/transforms/batch_classifier_metrics.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_classifier_metrics:BatchClassifierMetrics",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_classifier_metrics:BatchClassifierMetrics"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_data_quality_report",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_data_quality_report",
+      "qualname": "BatchDataQualityReport",
+      "source_path": "src/elspeth/plugins/transforms/batch_data_quality_report.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_data_quality_report:BatchDataQualityReport",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_data_quality_report:BatchDataQualityReport"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_distribution_profile",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_distribution_profile",
+      "qualname": "BatchDistributionProfile",
+      "source_path": "src/elspeth/plugins/transforms/batch_distribution_profile.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_distribution_profile:BatchDistributionProfile",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_distribution_profile:BatchDistributionProfile"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_drift_compare",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_drift_compare",
+      "qualname": "BatchDriftCompare",
+      "source_path": "src/elspeth/plugins/transforms/batch_drift_compare.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_drift_compare:BatchDriftCompare",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_drift_compare:BatchDriftCompare"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_effect_size",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_effect_size",
+      "qualname": "BatchEffectSize",
+      "source_path": "src/elspeth/plugins/transforms/batch_effect_size.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_effect_size:BatchEffectSize",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_effect_size:BatchEffectSize"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_experiment_compare",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_experiment_compare",
+      "qualname": "BatchExperimentCompare",
+      "source_path": "src/elspeth/plugins/transforms/batch_experiment_compare.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_experiment_compare:BatchExperimentCompare",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_experiment_compare:BatchExperimentCompare"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_outlier_annotator",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_outlier_annotator",
+      "qualname": "BatchOutlierAnnotator",
+      "source_path": "src/elspeth/plugins/transforms/batch_outlier_annotator.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_outlier_annotator:BatchOutlierAnnotator",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_outlier_annotator:BatchOutlierAnnotator"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_paired_preference",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_paired_preference",
+      "qualname": "BatchPairedPreference",
+      "source_path": "src/elspeth/plugins/transforms/batch_paired_preference.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_paired_preference:BatchPairedPreference",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_paired_preference:BatchPairedPreference"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_replicate",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_replicate",
+      "qualname": "BatchReplicate",
+      "source_path": "src/elspeth/plugins/transforms/batch_replicate.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_replicate:BatchReplicate",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_replicate:BatchReplicate"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_stats",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_stats",
+      "qualname": "BatchStats",
+      "source_path": "src/elspeth/plugins/transforms/batch_stats.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_stats:BatchStats",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_stats:BatchStats"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_threshold_summary",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_threshold_summary",
+      "qualname": "BatchThresholdSummary",
+      "source_path": "src/elspeth/plugins/transforms/batch_threshold_summary.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_threshold_summary:BatchThresholdSummary",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_threshold_summary:BatchThresholdSummary"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:batch_top_k",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.batch_top_k",
+      "qualname": "BatchTopK",
+      "source_path": "src/elspeth/plugins/transforms/batch_top_k.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.batch_top_k:BatchTopK",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.batch_top_k:BatchTopK"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:blob_csv_expand",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.blob_csv_expand",
+      "qualname": "BlobCSVExpand",
+      "source_path": "src/elspeth/plugins/transforms/blob_csv_expand.py",
+      "determinism": "io_read",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.blob_csv_expand:BlobCSVExpand",
+        "process": "elspeth.plugins.transforms.blob_csv_expand:BlobCSVExpand",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.blob_csv_expand:BlobCSVExpand"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:blob_fetch",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.blob_fetch",
+      "qualname": "BlobFetch",
+      "source_path": "src/elspeth/plugins/transforms/blob_fetch.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.blob_fetch:BlobFetch",
+        "process": "elspeth.plugins.transforms.blob_fetch:BlobFetch",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.blob_fetch:BlobFetch"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:field_mapper",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.field_mapper",
+      "qualname": "FieldMapper",
+      "source_path": "src/elspeth/plugins/transforms/field_mapper.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.field_mapper:FieldMapper",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.field_mapper:FieldMapper"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:json_explode",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.json_explode",
+      "qualname": "JSONExplode",
+      "source_path": "src/elspeth/plugins/transforms/json_explode.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.json_explode:JSONExplode",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.json_explode:JSONExplode"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:keyword_filter",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.keyword_filter",
+      "qualname": "KeywordFilter",
+      "source_path": "src/elspeth/plugins/transforms/keyword_filter.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.keyword_filter:KeywordFilter",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.keyword_filter:KeywordFilter"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:line_explode",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.line_explode",
+      "qualname": "LineExplode",
+      "source_path": "src/elspeth/plugins/transforms/line_explode.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.line_explode:LineExplode",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.line_explode:LineExplode"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:llm",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.llm.transform",
+      "qualname": "LLMTransform",
+      "source_path": "src/elspeth/plugins/transforms/llm/transform.py",
+      "determinism": "non_deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.llm.transform:LLMTransform",
+        "process": "elspeth.plugins.transforms.llm.transform:LLMTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.llm.transform:LLMTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "azure",
+        "openrouter",
+        "bedrock",
+        "gateway"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-provider"
+    },
+    {
+      "plugin_key": "transform:passthrough",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.passthrough",
+      "qualname": "PassThrough",
+      "source_path": "src/elspeth/plugins/transforms/passthrough.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.passthrough:PassThrough",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.passthrough:PassThrough"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:rag_retrieval",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.rag.transform",
+      "qualname": "RAGRetrievalTransform",
+      "source_path": "src/elspeth/plugins/transforms/rag/transform.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
+        "process": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
+        "on_complete": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform",
+        "close": "elspeth.plugins.transforms.rag.transform:RAGRetrievalTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "azure-search-api-key",
+        "azure-search-managed-identity",
+        "chroma-ephemeral",
+        "chroma-persistent",
+        "chroma-client"
+      ],
+      "external_observation_required": true,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "provider-contract-fake",
+      "release_lane": "live-provider"
+    },
+    {
+      "plugin_key": "transform:report_assemble",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.report_assemble",
+      "qualname": "ReportAssemble",
+      "source_path": "src/elspeth/plugins/transforms/report_assemble.py",
+      "determinism": "deterministic",
+      "execution_model": "batch-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.report_assemble:ReportAssemble",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.report_assemble:ReportAssemble"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-04",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:truncate",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.truncate",
+      "qualname": "Truncate",
+      "source_path": "src/elspeth/plugins/transforms/truncate.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.truncate:Truncate",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.truncate:Truncate"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:type_coerce",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.type_coerce",
+      "qualname": "TypeCoerce",
+      "source_path": "src/elspeth/plugins/transforms/type_coerce.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.type_coerce:TypeCoerce",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.type_coerce:TypeCoerce"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:value_transform",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.value_transform",
+      "qualname": "ValueTransform",
+      "source_path": "src/elspeth/plugins/transforms/value_transform.py",
+      "determinism": "deterministic",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "process": "elspeth.plugins.transforms.value_transform:ValueTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.value_transform:ValueTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "hermetic",
+      "release_lane": "local"
+    },
+    {
+      "plugin_key": "transform:web_scrape",
+      "kind": "transform",
+      "module": "elspeth.plugins.transforms.web_scrape",
+      "qualname": "WebScrapeTransform",
+      "source_path": "src/elspeth/plugins/transforms/web_scrape.py",
+      "determinism": "external_call",
+      "execution_model": "row-transform",
+      "lifecycle_owners": {
+        "on_start": "elspeth.plugins.transforms.web_scrape:WebScrapeTransform",
+        "process": "elspeth.plugins.transforms.web_scrape:WebScrapeTransform",
+        "on_complete": "elspeth.plugins.infrastructure.base:BaseTransform",
+        "close": "elspeth.plugins.transforms.web_scrape:WebScrapeTransform"
+      },
+      "source_hash_present": true,
+      "sink_effect_capability": null,
+      "sink_effect_modes": [],
+      "variants": [
+        "default"
+      ],
+      "external_observation_required": false,
+      "applicable_pb_boundaries": [
+        "PB-02",
+        "PB-09"
+      ],
+      "local_fixture": "real-process-http",
+      "release_lane": "local"
+    }
+  ]
+}

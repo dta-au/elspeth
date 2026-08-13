@@ -151,6 +151,28 @@ def _compile_postgres_optional_lower_hex(element: _OptionalLowerHex64Check, _com
     return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{64}}$'"
 
 
+class _OptionalLowerHex16Check(ColumnElement[bool]):
+    """Dialect-exact optional 16-character audit error fingerprint."""
+
+    inherit_cache = True
+
+    def __init__(self, column_name: str) -> None:
+        super().__init__()
+        self.column_name = column_name
+
+
+@compiles(_OptionalLowerHex16Check, "sqlite")
+def _compile_sqlite_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR (length({name})=16 AND {name} NOT GLOB '*[^0-9a-f]*')"
+
+
+@compiles(_OptionalLowerHex16Check, "postgresql")
+def _compile_postgres_optional_lower_hex16(element: _OptionalLowerHex16Check, _compiler: SQLCompiler, **_kw: object) -> str:
+    name = element.column_name
+    return f"{name} IS NULL OR {name} ~ '^[0-9a-f]{{16}}$'"
+
+
 def _sql_string_literal(value: str) -> str:
     """Render one deterministic SQL string literal for generated CHECK clauses."""
     return "'" + value.replace("'", "''") + "'"
@@ -278,7 +300,15 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        recovered scheduler can reconcile fork-branch groups without in-memory
 #        state. This is a pre-1.0 delete-and-recreate boundary; a Landscape
 #        store written at epoch 29 lacks the column and is not migrated.
-SQLITE_SCHEMA_EPOCH = 30
+#   31 → token_work_items.status is mechanically closed over TokenWorkStatus.
+#        Removed states such as WAITING can no longer be reintroduced through
+#        direct SQL. This is a pre-1.0 delete-and-recreate boundary.
+#   32 → Every successful aggregation completion records an ordered,
+#        self-contained result receipt. A replacement process can materialize
+#        transform outputs, continue passthrough rows with their original
+#        token identities, or finish empty members without replaying the
+#        plugin after node/batch completion.
+SQLITE_SCHEMA_EPOCH = 32
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -702,6 +732,7 @@ token_work_items_table = Table(
         f"AND lease_owner IS NOT NULL AND length(lease_owner) > 0) OR status != {_sql_string_literal(TokenWorkStatus.LEASED.value)}",
         name="ck_token_work_items_lease_owner_required_when_leased",
     ),
+    CheckConstraint(_enum_in_check("status", TokenWorkStatus), name="ck_token_work_items_status"),
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
     ForeignKeyConstraint(["row_id", "run_id"], ["rows.row_id", "rows.run_id"]),
     ForeignKeyConstraint(["node_id", "run_id"], ["nodes.node_id", "nodes.run_id"]),
@@ -1996,6 +2027,74 @@ batch_members_table = Table(
     ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
 )
 
+aggregation_results_table = Table(
+    "aggregation_results",
+    metadata,
+    Column("batch_id", String(64), primary_key=True),
+    Column("run_id", String(64), ForeignKey("runs.run_id"), nullable=False),
+    Column("aggregation_state_id", String(64), nullable=False),
+    Column("output_mode", String(16), nullable=False),
+    Column("output_shape", String(16), nullable=False),
+    Column("output_hash", String(64), nullable=False),
+    Column("expansion_parent_token_id", String(64)),
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    UniqueConstraint("batch_id", "run_id"),
+    UniqueConstraint("aggregation_state_id", "run_id"),
+    CheckConstraint("output_mode IN ('transform', 'passthrough')", name="ck_aggregation_results_output_mode"),
+    CheckConstraint("output_shape IN ('empty', 'single', 'multi')", name="ck_aggregation_results_output_shape"),
+    CheckConstraint(
+        "(output_mode = 'transform' AND output_shape IN ('single', 'multi') AND expansion_parent_token_id IS NOT NULL) OR "
+        "(output_mode = 'transform' AND output_shape = 'empty' AND expansion_parent_token_id IS NULL) OR "
+        "(output_mode = 'passthrough' AND output_shape IN ('empty', 'multi') AND expansion_parent_token_id IS NULL)",
+        name="ck_aggregation_results_mode_shape_parent",
+    ),
+    CheckConstraint(_LowerHex64Check("output_hash"), name="ck_aggregation_results_output_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["batches.batch_id", "batches.run_id"]),
+    ForeignKeyConstraint(
+        ["aggregation_state_id", "run_id"],
+        ["node_states.state_id", "node_states.run_id"],
+    ),
+    ForeignKeyConstraint(
+        ["expansion_parent_token_id", "run_id"],
+        ["tokens.token_id", "tokens.run_id"],
+    ),
+)
+
+aggregation_result_outputs_table = Table(
+    "aggregation_result_outputs",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_data_ref", String(64), nullable=False),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_outputs_ordinal"),
+    CheckConstraint(_LowerHex64Check("token_data_ref"), name="ck_aggregation_result_outputs_ref_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+)
+
+aggregation_result_members_table = Table(
+    "aggregation_result_members",
+    metadata,
+    Column("batch_id", String(64), nullable=False),
+    Column("run_id", String(64), nullable=False),
+    Column("ordinal", Integer, nullable=False),
+    Column("token_id", String(64), nullable=False),
+    Column("action", String(32), nullable=False),
+    Column("error_hash", String(64)),
+    PrimaryKeyConstraint("batch_id", "ordinal"),
+    UniqueConstraint("batch_id", "token_id"),
+    CheckConstraint("ordinal >= 0", name="ck_aggregation_result_members_ordinal"),
+    CheckConstraint(
+        "(action IN ('consume_batch', 'drop_filtered', 'continue_passthrough') AND error_hash IS NULL) OR "
+        "(action = 'quarantine' AND error_hash IS NOT NULL)",
+        name="ck_aggregation_result_members_action",
+    ),
+    CheckConstraint(_OptionalLowerHex16Check("error_hash"), name="ck_aggregation_result_members_error_hash_hex"),
+    ForeignKeyConstraint(["batch_id", "run_id"], ["aggregation_results.batch_id", "aggregation_results.run_id"]),
+    ForeignKeyConstraint(["token_id", "run_id"], ["tokens.token_id", "tokens.run_id"]),
+)
+
 batch_outputs_table = Table(
     "batch_outputs",
     metadata,
@@ -2013,6 +2112,8 @@ Index("ix_routing_events_run_state", routing_events_table.c.run_id, routing_even
 Index("ix_routing_events_group", routing_events_table.c.routing_group_id)
 Index("ix_batches_run_status", batches_table.c.run_id, batches_table.c.status)
 Index("ix_batch_members_batch", batch_members_table.c.batch_id)
+Index("ix_aggregation_results_run", aggregation_results_table.c.run_id)
+Index("ix_aggregation_result_outputs_ref", aggregation_result_outputs_table.c.token_data_ref)
 Index("ix_batch_outputs_batch", batch_outputs_table.c.batch_id)
 
 # Indexes for existing Phase 1 tables

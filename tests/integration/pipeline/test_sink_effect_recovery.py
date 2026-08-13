@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from elspeth.contracts.errors import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
@@ -32,16 +34,29 @@ from elspeth.contracts.sink_effects import (
     SinkEffectRole,
     SinkEffectState,
 )
+from elspeth.contracts.types import NodeID, SinkName
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table, routing_events_table, sink_effect_members_table, sink_effects_table
+from elspeth.core.landscape.schema import (
+    node_states_table,
+    routing_events_table,
+    scheduler_events_table,
+    sink_effect_members_table,
+    sink_effects_table,
+    token_outcomes_table,
+    token_work_items_table,
+)
 from elspeth.engine.executors.sink import SinkExecutor
 from elspeth.engine.executors.sink_effects import SinkEffectExecutionSeam, SinkEffectInjectedFault
+from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
+from elspeth.engine.orchestrator.types import ExecutionCounters, PipelineConfig
+from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from tests.fixtures.base_classes import create_observed_contract
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
+from tests.fixtures.plugins import ListSource
 from tests.fixtures.sink_effects import (
     DuplicateObservableSink,
     DuplicateObservableTarget,
@@ -145,6 +160,246 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
         assert artifact is not None and artifact.sink_effect_id == target.effect_id
         assert counts.total == 0
         assert recovered_factory.data_flow.get_token_outcome(token.token_id) is not None
+    finally:
+        db.close()
+
+
+def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect(tmp_path: Path) -> None:
+    """A lost post-sink scheduler callback is repairable scheduler debt.
+
+    This is an in-process crash-window proof, not an OS-kill test: the injected
+    exception fires from the production batched scheduler callback only after
+    the sink effect, artifact, operation, node state, and token outcome are
+    durable. A fresh processor's public resume drain must consume the terminal
+    outcome witness and terminalize the PENDING_SINK row without rebuilding a
+    RowResult or invoking the external sink a second time.
+    """
+
+    class _LostSchedulerTerminalizer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, ...]] = []
+
+        def mark_sink_bound_scheduler_terminal_many(self, token_ids: tuple[str, ...]) -> None:
+            self.calls.append(token_ids)
+            raise RuntimeError("injected loss before scheduler terminalization")
+
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'ts14-callback-loss.db'}")
+    try:
+        factory, run_id, sink_id, tokens, ctx = _primary_setup(db, [{"value": 1}])
+        (token,) = tokens
+        leader = leader_coordination_token(factory, run_id)
+        now = datetime.now(UTC)
+        ready = factory.scheduler.enqueue_ready(
+            run_id=run_id,
+            token_id=token.token_id,
+            row_id=token.row_id,
+            node_id=sink_id,
+            step_index=1,
+            ingest_sequence=0,
+            row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+            available_at=now,
+        )
+        claimed = factory.scheduler.claim_ready(
+            run_id=run_id,
+            lease_owner=leader.worker_id,
+            lease_seconds=300,
+            now=now,
+        )
+        assert claimed is not None and claimed.work_item_id == ready.work_item_id
+        parked = factory.scheduler.mark_pending_sink(
+            work_item_id=claimed.work_item_id,
+            row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+            sink_name="output",
+            outcome=TerminalOutcome.SUCCESS.value,
+            path=TerminalPath.DEFAULT_FLOW.value,
+            error_hash=None,
+            error_message=None,
+            now=now,
+            expected_lease_owner=leader.worker_id,
+            worker_id=leader.worker_id,
+        )
+        assert parked.status is TokenWorkStatus.PENDING_SINK
+
+        target = DuplicateObservableTarget()
+        sink = DuplicateObservableSink(target)
+        sink.node_id = sink_id
+        pending_outcome = PendingOutcome(
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+            scheduler_pending_sink=True,
+        )
+        pending_tokens = {"output": [(token, pending_outcome)]}
+        lost_terminalizer = _LostSchedulerTerminalizer()
+        coordinator = SinkFlushCoordinator(span_factory=SpanFactory(), checkpoints=object())  # type: ignore[arg-type]
+        config = PipelineConfig(
+            sources={"source": ListSource([])},
+            transforms=(),
+            sinks={"output": sink},  # type: ignore[dict-item]
+            sink_effect_modes={"output": "write"},
+        )
+
+        with pytest.raises(RuntimeError, match="injected loss before scheduler terminalization"):
+            coordinator.write_pending_to_sinks(
+                factory=factory,
+                run_id=run_id,
+                config=config,
+                ctx=ctx,
+                counters=ExecutionCounters(),
+                pending_tokens=pending_tokens,
+                sink_id_map={SinkName("output"): NodeID(sink_id)},
+                edge_map={},
+                sink_step=1,
+                scheduler_terminalizer=lost_terminalizer,
+                worker_id=leader.worker_id,
+            )
+
+        assert lost_terminalizer.calls == [(token.token_id,)]
+        assert pending_tokens == {"output": [(token, pending_outcome)]}
+        assert target.publication_count == 1
+        outcome_before = factory.data_flow.get_token_outcome(token.token_id)
+        assert outcome_before is not None
+        assert (outcome_before.outcome, outcome_before.path, outcome_before.sink_name) == (
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            "output",
+        )
+
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run(run_id)
+        (artifact_before,) = factory.execution.get_artifacts(run_id)
+        (operation_before,) = factory.execution.get_operations_for_run(run_id)
+        assert effect_before.state is SinkEffectState.FINALIZED
+        assert artifact_before.sink_effect_id == effect_before.effect_id
+        assert operation_before.sink_effect_id == effect_before.effect_id
+        assert operation_before.status == "completed"
+        with db.connection() as conn:
+            callback_loss_image = conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.status,
+                    token_work_items_table.c.lease_owner,
+                    token_work_items_table.c.pending_sink_name,
+                    token_work_items_table.c.pending_outcome,
+                    token_work_items_table.c.pending_path,
+                ).where(token_work_items_table.c.token_id == token.token_id)
+            ).one()
+        assert tuple(callback_loss_image) == (
+            parked.work_item_id,
+            TokenWorkStatus.PENDING_SINK.value,
+            leader.worker_id,
+            "output",
+            TerminalOutcome.SUCCESS.value,
+            TerminalPath.DEFAULT_FLOW.value,
+        )
+
+        recovered_factory = make_factory(db)
+        source_node_id = NodeID("source")
+        traversal = DAGTraversalContext(
+            node_step_map={source_node_id: 0},
+            node_to_plugin={},
+            node_to_next={source_node_id: None},
+            coalesce_node_map={},
+            structural_node_ids=frozenset({source_node_id}),
+        )
+        resumed = RowProcessor(
+            execution=recovered_factory.execution,
+            data_flow=recovered_factory.data_flow,
+            span_factory=SpanFactory(),
+            run_id=run_id,
+            source_node_id=source_node_id,
+            source_on_success="output",
+            traversal=traversal,
+            scheduler=recovered_factory.scheduler,
+            scheduler_lease_owner=leader.worker_id,
+            coordination_token=leader,
+        )
+
+        assert resumed.drain_scheduled_work(ctx) == []
+        assert target.publication_count == 1
+
+        (effect_after,) = recovered_factory.execution.sink_effects.get_effects_for_run(run_id)
+        (artifact_after,) = recovered_factory.execution.get_artifacts(run_id)
+        (operation_after,) = recovered_factory.execution.get_operations_for_run(run_id)
+        assert effect_after.effect_id == effect_before.effect_id == target.effect_id
+        assert artifact_after.artifact_id == artifact_before.artifact_id
+        assert artifact_after.sink_effect_id == effect_before.effect_id
+        assert operation_after.operation_id == operation_before.operation_id
+        assert operation_after.sink_effect_id == effect_before.effect_id
+        assert recovered_factory.data_flow.get_token_outcome(token.token_id) == outcome_before
+
+        with db.connection() as conn:
+            work_after = conn.execute(
+                select(
+                    token_work_items_table.c.work_item_id,
+                    token_work_items_table.c.status,
+                    token_work_items_table.c.lease_owner,
+                    token_work_items_table.c.pending_sink_name,
+                    token_work_items_table.c.pending_outcome,
+                    token_work_items_table.c.pending_path,
+                ).where(token_work_items_table.c.token_id == token.token_id)
+            ).one()
+            outcome_rows = conn.execute(
+                select(
+                    token_outcomes_table.c.token_id,
+                    token_outcomes_table.c.outcome,
+                    token_outcomes_table.c.path,
+                    token_outcomes_table.c.completed,
+                    token_outcomes_table.c.sink_name,
+                ).where(token_outcomes_table.c.token_id == token.token_id)
+            ).all()
+            scheduler_events = conn.execute(
+                select(
+                    scheduler_events_table.c.event_type,
+                    scheduler_events_table.c.from_status,
+                    scheduler_events_table.c.to_status,
+                    scheduler_events_table.c.from_lease_owner,
+                    scheduler_events_table.c.to_lease_owner,
+                    scheduler_events_table.c.caller_owner,
+                ).where(scheduler_events_table.c.token_id == token.token_id)
+            ).all()
+
+        assert tuple(work_after) == (
+            parked.work_item_id,
+            TokenWorkStatus.TERMINAL.value,
+            None,
+            "output",
+            TerminalOutcome.SUCCESS.value,
+            TerminalPath.DEFAULT_FLOW.value,
+        )
+        assert [tuple(row) for row in outcome_rows] == [
+            (
+                token.token_id,
+                TerminalOutcome.SUCCESS.value,
+                TerminalPath.DEFAULT_FLOW.value,
+                True,
+                "output",
+            )
+        ]
+        event_image = {row.event_type: tuple(row)[1:] for row in scheduler_events}
+        assert len(event_image) == len(scheduler_events) == 4
+        assert event_image == {
+            SchedulerEventType.ENQUEUE.value: (None, TokenWorkStatus.READY.value, None, None, None),
+            SchedulerEventType.CLAIM_READY.value: (
+                TokenWorkStatus.READY.value,
+                TokenWorkStatus.LEASED.value,
+                None,
+                leader.worker_id,
+                leader.worker_id,
+            ),
+            SchedulerEventType.MARK_PENDING_SINK.value: (
+                TokenWorkStatus.LEASED.value,
+                TokenWorkStatus.PENDING_SINK.value,
+                leader.worker_id,
+                leader.worker_id,
+                leader.worker_id,
+            ),
+            SchedulerEventType.MARK_PENDING_SINK_TERMINAL.value: (
+                TokenWorkStatus.PENDING_SINK.value,
+                TokenWorkStatus.TERMINAL.value,
+                leader.worker_id,
+                None,
+                leader.worker_id,
+            ),
+        }
     finally:
         db.close()
 

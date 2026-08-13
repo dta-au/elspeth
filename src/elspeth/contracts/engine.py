@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import ClassVar, TypedDict
 
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import _LEGAL_TERMINAL_PAIRS, AggregationMemberAction, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import require_int
 from elspeth.contracts.node_state_context import NodeStateContext
 
@@ -18,6 +18,95 @@ class CoalesceParentCompletion:
     state_id: str
     duration_ms: float
     context_after: NodeStateContext | None
+
+
+@dataclass(frozen=True, slots=True)
+class AggregationParentDisposition:
+    """One batch member's terminal disposition committed with expansion."""
+
+    parent_ref: TokenRef
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AggregationResultMember:
+    """One ordered member action stored in an aggregation result receipt."""
+
+    member_ref: TokenRef
+    action: AggregationMemberAction
+    error_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AggregationResultReceipt:
+    """Durable successful aggregation output authority."""
+
+    batch_id: str
+    run_id: str
+    aggregation_state_id: str
+    output_mode: str
+    output_shape: str
+    output_hash: str
+    output_refs: tuple[str, ...]
+    members: tuple[AggregationResultMember, ...]
+    expansion_parent_token_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationChild:
+    """One ordered child from a committed transform-mode aggregation receipt."""
+
+    token_id: str
+    row_id: str
+    expand_group_id: str
+    token_data_ref: str
+    step_in_pipeline: int
+    parent_token_id: str
+    ordinal: int
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationResidual:
+    """Durable aggregation result whose scheduler barrier has not completed."""
+
+    batch_id: str
+    aggregation_node_id: str
+    output_hash: str
+    member_token_ids: tuple[str, ...]
+    children: tuple[CommittedAggregationChild, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedAggregationOutputReceipt:
+    """Completed aggregation output not yet materialized as an expansion."""
+
+    batch_id: str
+    aggregation_node_id: str
+    aggregation_state_id: str
+    output_mode: str
+    output_shape: str
+    output_hash: str
+    output_refs: tuple[str, ...]
+    member_token_ids: tuple[str, ...]
+    members: tuple[AggregationResultMember, ...]
+    expansion_parent_token_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedCoalesceResidual:
+    """Durable coalesce merge whose scheduler barrier has not completed."""
+
+    effect_id: str
+    coalesce_node_id: str
+    coalesce_name: str
+    row_id: str
+    result_token_id: str
+    result_join_group_id: str
+    token_data_ref: str
+    step_in_pipeline: int
+    member_token_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)

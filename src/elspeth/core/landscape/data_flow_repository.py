@@ -24,6 +24,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.engine import Row as SQLAlchemyRow
 
 from elspeth.contracts import (
+    AggregationParentDisposition,
     Determinism,
     Edge,
     Node,
@@ -346,6 +347,7 @@ class DataFlowRepository:
         step_in_pipeline: int | None = None,
         parent_path: TerminalPath = TerminalPath.EXPAND_PARENT,
         parent_batch_id: str | None = None,
+        aggregation_parent_dispositions: Sequence[AggregationParentDisposition] = (),
     ) -> tuple[list[Token], str]:
         """Expand a token into multiple child tokens (deaggregation)."""
         return self.tokens.expand_token(
@@ -356,6 +358,7 @@ class DataFlowRepository:
             step_in_pipeline=step_in_pipeline,
             parent_path=parent_path,
             parent_batch_id=parent_batch_id,
+            aggregation_parent_dispositions=aggregation_parent_dispositions,
         )
 
     # ── Token outcome recording (TokenOutcomeRepository) ───────────────────

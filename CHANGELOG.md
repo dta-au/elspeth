@@ -43,12 +43,19 @@ proposal-event type so an auto-commit blocked by the settlement-boundary
 trust-mode recheck leaves a durable audit record instead of silently falling
 back to the review path.
 Landscape
-`SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
-barrier attribution column to scheduler work items. ELSPETH does not migrate
+`SQLITE_SCHEMA_EPOCH` advances from 29 to 32. Epoch 30 adds the durable
+row_union barrier attribution column to scheduler work items, and epoch 31
+constrains scheduler work-item status to the public six-state vocabulary so
+removed states cannot be persisted through direct SQL. Epoch 32 atomically
+records every successful aggregation result and its ordered member actions
+with node and batch completion. A replacement process can materialize
+transform-mode outputs, continue passthrough outputs with their original token
+identities, or finish an empty result without replaying the plugin. Empty-result
+terminal outcomes commit atomically with scheduler barrier completion. ELSPETH does not migrate
 either predecessor database in place before 1.0. Archive or export required
 evidence, stop the old service, recreate stale session and Landscape stores,
 then install
-0.7.2. A Landscape database at epoch 29 is not current and must be recreated.
+0.7.2. A Landscape database below epoch 32 is not current and must be recreated.
 Do not roll older code back over the recreated databases; keep the service
 drained and repair this release forward.
 

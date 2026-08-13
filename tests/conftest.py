@@ -73,6 +73,10 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "slow: long-running tests (>10s)")
     config.addinivalue_line(
         "markers",
+        "live_provider: protected tests that cross a real remote-provider boundary",
+    )
+    config.addinivalue_line(
+        "markers",
         "composer_llm_eval: characterization/replay tests for the 2026-04-28 composer LLM evaluation scenarios",
     )
     config.addinivalue_line(
@@ -82,15 +86,42 @@ def pytest_configure(config: pytest.Config) -> None:
     )
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    """Register the operator-only live-provider execution gate."""
+    group = parser.getgroup("live-provider")
+    group.addoption(
+        "--run-live-provider",
+        action="store_true",
+        default=False,
+        help="Authorize execution of tests marked live_provider (credentials alone never authorize execution).",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auto-Marking by Directory
 # ---------------------------------------------------------------------------
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Auto-apply markers based on test file location."""
+def _is_declared_remote_service_node(item: pytest.Item) -> bool:
+    """Return whether repository placement or a legacy marker declares remote I/O."""
+    path = item.path.as_posix()
+    return (
+        item.get_closest_marker("live_aws") is not None
+        or item.get_closest_marker("live_azure") is not None
+        or item.get_closest_marker("live_dataverse") is not None
+        or item.get_closest_marker("live_chroma") is not None
+        or ("/tests/integration/plugins/" in path and path.endswith("_live.py"))
+        or path.endswith("/tests/integration/web/composer/test_bedrock_live_smoke.py")
+        or path.endswith("/tests/e2e/recovery/test_run_lifecycle_aws_live.py")
+    )
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Auto-mark test tiers and reject uncontained remote-service tests."""
+    uncontained_remote_nodes: list[str] = []
     for item in items:
-        path = str(item.fspath)
+        path = item.path.as_posix()
         if "/e2e/" in path:
             item.add_marker(pytest.mark.e2e)
         elif "/performance/" in path and "/stress/" in path:
@@ -99,6 +130,23 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         elif "/performance/" in path:
             item.add_marker(pytest.mark.performance)
         # integration/ tests get marker from their conftest
+        if _is_declared_remote_service_node(item) and item.get_closest_marker("live_provider") is None:
+            uncontained_remote_nodes.append(item.nodeid)
+    if uncontained_remote_nodes:
+        joined = "\n".join(f"- {node_id}" for node_id in sorted(uncontained_remote_nodes))
+        raise pytest.UsageError("remote-service test nodes must carry @pytest.mark.live_provider:\n" + joined)
+    selected_live_nodes = [item.nodeid for item in items if item.get_closest_marker("live_provider") is not None]
+    if selected_live_nodes and not config.getoption("run_live_provider") and not config.getoption("collectonly"):
+        # Collection-only inventory (the selector-manifest validator's exact
+        # node accounting) is authority-free; execution stays double-gated by
+        # this check and pytest_runtest_setup below.
+        raise pytest.UsageError("--run-live-provider is required to select @pytest.mark.live_provider nodes")
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Require explicit CLI authority independently of dotenv credentials."""
+    if item.get_closest_marker("live_provider") is not None and not item.config.getoption("run_live_provider"):
+        raise pytest.UsageError("--run-live-provider is required to execute @pytest.mark.live_provider nodes")
 
 
 # ---------------------------------------------------------------------------

@@ -49,7 +49,17 @@ from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceS
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import batch_members_table, batches_table, sink_effects_table, token_work_items_table
+from elspeth.core.landscape.schema import (
+    aggregation_result_members_table,
+    aggregation_result_outputs_table,
+    aggregation_results_table,
+    batch_members_table,
+    batches_table,
+    sink_effects_table,
+    token_outcomes_table,
+    token_work_items_table,
+    tokens_table,
+)
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -143,6 +153,64 @@ class _SumBatchTransform(BaseTransform):
         return TransformResult.success(row, success_reason={"action": "buffer"})
 
 
+class _EmptyBatchTransform(_SumBatchTransform):
+    """Batch transform whose committed success intentionally emits no rows."""
+
+    name = "empty_batch"
+    determinism = Determinism.DETERMINISTIC
+    passes_through_input = True
+    can_drop_rows = True
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list):
+            self.batch_calls += 1
+            return TransformResult.success_empty(success_reason={"action": "drop_batch"})
+        return TransformResult.success(row, success_reason={"action": "buffer"})
+
+
+class _MixedEmptyBatchTransform(_EmptyBatchTransform):
+    """Empty transform that explicitly quarantines its second member."""
+
+    name = "mixed_empty_batch"
+    determinism = Determinism.DETERMINISTIC
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list):
+            self.batch_calls += 1
+            return TransformResult.success_empty(success_reason={"action": "drop_batch", "metadata": {"quarantined_indices": [1]}})
+        return TransformResult.success(row, success_reason={"action": "buffer"})
+
+
+class _EnrichingPassthroughBatchTransform(_SumBatchTransform):
+    """Passthrough transform whose persisted rows differ from its inputs."""
+
+    name = "enriching_passthrough_batch"
+    determinism = Determinism.DETERMINISTIC
+
+    def process(self, row: PipelineRow | list[PipelineRow], ctx: Any) -> TransformResult:
+        if isinstance(row, list):
+            self.batch_calls += 1
+            contract = SchemaContract(
+                mode="OBSERVED",
+                fields=(
+                    FieldContract(normalized_name="value", original_name="value", python_type=int, required=False, source="inferred"),
+                    FieldContract(
+                        normalized_name="batch_enriched",
+                        original_name="batch_enriched",
+                        python_type=bool,
+                        required=False,
+                        source="inferred",
+                    ),
+                ),
+                locked=True,
+            )
+            return TransformResult.success_multi(
+                tuple(PipelineRow({**item.to_dict(), "batch_enriched": True}, contract) for item in row),
+                success_reason={"action": "enrich_batch"},
+            )
+        return TransformResult.success(row, success_reason={"action": "buffer"})
+
+
 class _FailOnceSink(CollectSink):
     """Sink whose first effect commit crashes in the post-flush window.
 
@@ -197,6 +265,8 @@ def _build_eof_aggregation_pipeline(
     transform: _SumBatchTransform,
     output_sink: CollectSink,
     downstream: _CountingPassTransform | None = None,
+    *,
+    output_mode: str = "transform",
 ) -> tuple[PipelineConfig, ExecutionGraph]:
     """Count-triggered transform-mode aggregation whose flush only fires at EOF."""
     aggregation_output = "aggregate_ready" if downstream is not None else "output"
@@ -208,7 +278,7 @@ def _build_eof_aggregation_pipeline(
         on_success=aggregation_output,
         on_error="discard",
         trigger=TriggerConfig(count=100, timeout_seconds=3600),
-        output_mode="transform",
+        output_mode=output_mode,
     )
     wired_transforms = (
         []
@@ -494,6 +564,344 @@ class TestFlushOutputJournalDurability:
             )
         assert work_statuses
         assert set(work_statuses) <= {"terminal"}
+
+    def test_committed_transform_result_before_barrier_completion_resumes_without_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A committed aggregate child closes its stranded BLOCKED inputs on resume.
+
+        This is the residual crash image between transform-mode output routing
+        and ``complete_barrier``: the batch/node result, expanded child token,
+        and BATCH_CONSUMED input outcomes are durable, while every scheduler
+        input remains BLOCKED and no READY/PENDING_SINK continuation exists.
+        Resume must continue from the persisted child payload without invoking
+        the aggregation transform again.
+        """
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.processor import RowProcessor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _SumBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+
+        real_complete_aggregation_flush = RowProcessor._complete_aggregation_flush
+
+        def crash_before_barrier_completion(
+            self: RowProcessor,
+            node_id: NodeID,
+            results: tuple[Any, ...],
+            buffered_tokens: list[Any],
+            child_items: list[Any],
+            *,
+            batch_id: str,
+            output_was_empty: bool,
+        ) -> tuple[tuple[Any, ...], frozenset[str]]:
+            del self, node_id, results, buffered_tokens, child_items, batch_id, output_was_empty
+            raise RuntimeError("injected crash before aggregation barrier completion")
+
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", crash_before_barrier_completion)
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=checkpoint_config,
+        )
+
+        with pytest.raises(RuntimeError, match="injected crash before aggregation barrier completion"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(RowProcessor, "_complete_aggregation_flush", real_complete_aggregation_flush)
+
+        assert transform.batch_calls == 1
+        assert output_sink.results == []
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            batch = conn.execute(select(batches_table.c.batch_id, batches_table.c.status).where(batches_table.c.run_id == run_id)).one()
+            consumed_ids = set(
+                conn.execute(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.path == "batch_consumed")
+                    .where(token_outcomes_table.c.completed == 1)
+                )
+                .scalars()
+                .all()
+            )
+            blocked_ids = set(
+                conn.execute(
+                    select(token_work_items_table.c.token_id)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.status == "blocked")
+                )
+                .scalars()
+                .all()
+            )
+            expanded_children = conn.execute(
+                select(tokens_table.c.token_id, tokens_table.c.token_data_ref)
+                .where(tokens_table.c.run_id == run_id)
+                .where(tokens_table.c.expand_group_id.isnot(None))
+            ).all()
+            continuations = conn.execute(
+                select(token_work_items_table.c.token_id)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status.in_(("ready", "pending_sink")))
+            ).all()
+
+        assert batch.status == "completed"
+        assert len(consumed_ids) == 3
+        assert blocked_ids == consumed_ids
+        assert len(expanded_children) == 1
+        assert expanded_children[0].token_data_ref is not None
+        assert continuations == []
+
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        resume_point = recovery.get_resume_point(run_id, graph)
+        assert resume_point is not None
+
+        result = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert result.status == RunStatus.COMPLETED
+        assert output_sink.results == [{"value": 60, "count": 3}]
+        assert transform.batch_calls == 1, "resume must use the committed aggregate child, not replay the transform"
+        assert source.load_invocations == 1
+
+        with db.connection() as conn:
+            remaining_statuses = conn.execute(
+                select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == run_id)
+            ).scalars()
+        assert set(remaining_statuses) <= {"terminal"}
+
+    def test_committed_result_before_expansion_resumes_without_plugin_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A durable result receipt closes death after node/batch completion.
+
+        The injected failure runs after ``execute_flush`` has completed the
+        aggregation node and batch but before transform-mode routing creates
+        any expanded child. Resume must materialize the persisted output and
+        complete the barrier without invoking either source or plugin again.
+        """
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        checkpoint_config = RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row"))
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}, {"value": 30}], on_success="batch_in")
+        transform = _SumBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink)
+        orchestrator = Orchestrator(db=db, checkpoint_manager=checkpoint_mgr, checkpoint_config=checkpoint_config)
+
+        real_execute_flush = AggregationExecutor.execute_flush
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before aggregation output routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        with pytest.raises(RuntimeError, match="injected crash before aggregation output routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            assert conn.execute(select(batches_table.c.status)).scalar_one() == "completed"
+            assert conn.execute(select(tokens_table.c.token_id).where(tokens_table.c.expand_group_id.isnot(None))).all() == []
+
+        recovery = RecoveryManager(db, checkpoint_mgr)
+        resume_point = recovery.get_resume_point(run_id, graph)
+        assert resume_point is not None
+        result = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert result.status == RunStatus.COMPLETED
+        assert output_sink.results == [{"value": 60, "count": 3}]
+        assert transform.batch_calls == 1
+        assert source.load_invocations == 1
+
+    @pytest.mark.parametrize(
+        ("output_mode", "mixed_quarantine"),
+        [("transform", False), ("transform", True), ("passthrough", False)],
+    )
+    def test_committed_empty_result_before_routing_resumes_without_plugin_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        output_mode: str,
+        mixed_quarantine: bool,
+    ) -> None:
+        """An intentional zero-row result is durable in both output modes."""
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}], on_success="batch_in")
+        transform = _MixedEmptyBatchTransform() if mixed_quarantine else _EmptyBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, output_mode=output_mode)
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+        )
+        real_execute_flush = AggregationExecutor.execute_flush
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before empty aggregation routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        with pytest.raises(RuntimeError, match="injected crash before empty aggregation routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            receipt = conn.execute(select(aggregation_results_table)).mappings().one()
+            member_actions = tuple(
+                conn.execute(
+                    select(aggregation_result_members_table.c.action).order_by(aggregation_result_members_table.c.ordinal)
+                ).scalars()
+            )
+            output_refs = tuple(conn.execute(select(aggregation_result_outputs_table.c.token_data_ref)).scalars())
+        assert receipt["output_mode"] == output_mode
+        assert receipt["output_shape"] == "empty"
+        assert receipt["expansion_parent_token_id"] is None
+        assert member_actions == (("drop_filtered", "quarantine") if mixed_quarantine else ("drop_filtered", "drop_filtered"))
+        assert output_refs == ()
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        resumed = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert resumed.status is (RunStatus.COMPLETED_WITH_FAILURES if mixed_quarantine else RunStatus.COMPLETED)
+        assert output_sink.results == []
+        assert transform.batch_calls == 1
+        assert source.load_invocations == 1
+        with db.connection() as conn:
+            terminal_pairs = set(
+                conn.execute(
+                    select(token_outcomes_table.c.outcome, token_outcomes_table.c.path)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.completed == 1)
+                ).all()
+            )
+        assert terminal_pairs == (
+            {("success", "filter_dropped"), ("failure", "quarantined_at_source")} if mixed_quarantine else {("success", "filter_dropped")}
+        )
+
+    def test_committed_passthrough_result_before_routing_resumes_without_plugin_replay(
+        self,
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Passthrough rows and same-token continuation survive pre-routing death."""
+        from elspeth.core.payload_store import FilesystemPayloadStore
+        from elspeth.engine.executors.aggregation import AggregationExecutor
+
+        db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
+        payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+        checkpoint_mgr = CheckpointManager(db)
+        source = _LoadCountingSource([{"value": 10}, {"value": 20}], on_success="batch_in")
+        transform = _EnrichingPassthroughBatchTransform()
+        output_sink = CollectSink("output")
+        config, graph = _build_eof_aggregation_pipeline(source, transform, output_sink, output_mode="passthrough")
+        orchestrator = Orchestrator(
+            db=db,
+            checkpoint_manager=checkpoint_mgr,
+            checkpoint_config=RuntimeCheckpointConfig.from_settings(CheckpointSettings(enabled=True, frequency="every_row")),
+        )
+        real_execute_flush = AggregationExecutor.execute_flush
+
+        def crash_before_output_routing(self: AggregationExecutor, *args: Any, **kwargs: Any) -> None:
+            real_execute_flush(self, *args, **kwargs)
+            raise RuntimeError("injected crash before passthrough aggregation routing")
+
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", crash_before_output_routing)
+        with pytest.raises(RuntimeError, match="injected crash before passthrough aggregation routing"):
+            orchestrator.run(config, graph=graph, payload_store=payload_store)
+        monkeypatch.setattr(AggregationExecutor, "execute_flush", real_execute_flush)
+
+        with db.connection() as conn:
+            run_id = str(conn.execute(select(batches_table.c.run_id)).scalars().one())
+            input_token_ids = tuple(
+                conn.execute(
+                    select(batch_members_table.c.token_id)
+                    .join(batches_table, batch_members_table.c.batch_id == batches_table.c.batch_id)
+                    .where(batches_table.c.run_id == run_id)
+                    .order_by(batch_members_table.c.ordinal)
+                ).scalars()
+            )
+            receipt = conn.execute(select(aggregation_results_table)).mappings().one()
+            member_actions = tuple(
+                conn.execute(
+                    select(aggregation_result_members_table.c.action).order_by(aggregation_result_members_table.c.ordinal)
+                ).scalars()
+            )
+            output_refs = tuple(
+                conn.execute(
+                    select(aggregation_result_outputs_table.c.token_data_ref).order_by(aggregation_result_outputs_table.c.ordinal)
+                ).scalars()
+            )
+        assert receipt["output_mode"] == "passthrough"
+        assert receipt["output_shape"] == "multi"
+        assert receipt["expansion_parent_token_id"] is None
+        assert member_actions == ("continue_passthrough", "continue_passthrough")
+        assert len(output_refs) == 2
+
+        resume_point = RecoveryManager(db, checkpoint_mgr).get_resume_point(run_id, graph)
+        assert resume_point is not None
+        resumed = orchestrator.resume(
+            resume_point=resume_point,
+            config=config,
+            graph=graph,
+            payload_store=payload_store,
+        )
+
+        assert resumed.status is RunStatus.COMPLETED
+        assert output_sink.results == [
+            {"value": 10, "batch_enriched": True},
+            {"value": 20, "batch_enriched": True},
+        ]
+        assert transform.batch_calls == 1
+        assert source.load_invocations == 1
+        with db.connection() as conn:
+            sink_token_ids = tuple(
+                conn.execute(
+                    select(token_work_items_table.c.token_id)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.pending_sink_name == "output")
+                    .order_by(token_work_items_table.c.token_id)
+                ).scalars()
+            )
+        assert sink_token_ids == tuple(sorted(input_token_ids))
 
 
 class _FailBatchTransform(BaseTransform):

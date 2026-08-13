@@ -8,15 +8,43 @@ writer so the persistence layer does not own restore policy.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from hashlib import sha256
+from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 
-from elspeth.contracts import NodeStateStatus, TokenOutcome
+from elspeth.contracts import (
+    AggregationMemberAction,
+    AggregationResultMember,
+    CommittedAggregationChild,
+    CommittedAggregationOutputReceipt,
+    CommittedAggregationResidual,
+    CommittedCoalesceResidual,
+    NodeStateStatus,
+    TokenOutcome,
+)
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts.enums import BatchStatus, OutputMode, TerminalOutcome, TerminalPath
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape._database_ops import DatabaseOps
+from elspeth.core.landscape.batch_lineage import batch_retry_lineage_ids
 from elspeth.core.landscape.model_loaders import TokenOutcomeLoader
-from elspeth.core.landscape.schema import coalesce_branch_losses_table, node_states_table, token_outcomes_table, tokens_table
+from elspeth.core.landscape.schema import (
+    aggregation_result_members_table,
+    aggregation_result_outputs_table,
+    aggregation_results_table,
+    batch_members_table,
+    batches_table,
+    coalesce_branch_losses_table,
+    coalesce_effect_members_table,
+    coalesce_effects_table,
+    node_states_table,
+    token_outcomes_table,
+    token_parents_table,
+    token_work_items_table,
+    tokens_table,
+)
 
 _TOKEN_ID_CHUNK_SIZE = 500
 
@@ -239,6 +267,588 @@ class BarrierRestoreReadModel:
             .where(token_outcomes_table.c.path == TerminalPath.UNROUTED.value)
         )
         return frozenset(row.token_id for row in self._ops.execute_fetchall(query))
+
+    def get_committed_coalesce_residual(
+        self,
+        run_id: str,
+        *,
+        coalesce_node_id: str,
+        coalesce_name: str,
+        row_id: str,
+        blocked_token_ids: Sequence[str],
+    ) -> CommittedCoalesceResidual | None:
+        """Return an exact completed coalesce effect still lacking continuation."""
+        if not blocked_token_ids:
+            return None
+        effect_rows = self._ops.execute_fetchall(
+            select(coalesce_effects_table)
+            .where(coalesce_effects_table.c.run_id == run_id)
+            .where(coalesce_effects_table.c.coalesce_node_id == coalesce_node_id)
+            .where(coalesce_effects_table.c.row_id == row_id)
+            .where(coalesce_effects_table.c.status == "completed")
+            .order_by(coalesce_effects_table.c.effect_id)
+        )
+        if not effect_rows:
+            return None
+        if len(effect_rows) != 1:
+            raise AuditIntegrityError(f"Coalesce residual {coalesce_name!r}/{row_id!r} has {len(effect_rows)} completed effect receipts")
+        effect = effect_rows[0]
+        members = self._ops.execute_fetchall(
+            select(
+                coalesce_effect_members_table.c.parent_token_id,
+                coalesce_effect_members_table.c.parent_state_id,
+                coalesce_effect_members_table.c.ordinal,
+            )
+            .where(coalesce_effect_members_table.c.run_id == run_id)
+            .where(coalesce_effect_members_table.c.effect_id == effect.effect_id)
+            .order_by(coalesce_effect_members_table.c.ordinal)
+        )
+        member_ids = tuple(str(row.parent_token_id) for row in members)
+        if (
+            not member_ids
+            or tuple(int(row.ordinal) for row in members) != tuple(range(len(members)))
+            or any(type(row.parent_state_id) is not str or not row.parent_state_id for row in members)
+        ):
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has incomplete ordered membership")
+        blocked_set = frozenset(blocked_token_ids)
+        member_set = frozenset(member_ids)
+        blocked_members = member_set & blocked_set
+        if not blocked_members:
+            return None
+        if blocked_members != member_set:
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has only a partial BLOCKED member set")
+
+        terminal_rows = []
+        for i in range(0, len(member_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = member_ids[i : i + _TOKEN_ID_CHUNK_SIZE]
+            terminal_rows.extend(
+                self._ops.execute_fetchall(
+                    select(
+                        token_outcomes_table.c.token_id,
+                        token_outcomes_table.c.outcome,
+                        token_outcomes_table.c.path,
+                        token_outcomes_table.c.join_group_id,
+                    )
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.token_id.in_(chunk))
+                    .where(token_outcomes_table.c.completed == 1)
+                )
+            )
+        if len(terminal_rows) != len(member_ids):
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} lacks exact terminal parent outcomes")
+        terminals = {str(row.token_id): row for row in terminal_rows}
+        if len(terminals) != len(member_ids):
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has duplicate terminal parent outcomes")
+        for member_id in member_ids:
+            outcome = terminals[member_id]
+            if not (
+                outcome.outcome == TerminalOutcome.SUCCESS.value
+                and outcome.path == TerminalPath.COALESCED.value
+                and outcome.join_group_id == effect.result_join_group_id
+            ):
+                raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has divergent parent outcomes")
+
+        token = self._ops.execute_fetchone(
+            select(
+                tokens_table.c.token_id,
+                tokens_table.c.row_id,
+                tokens_table.c.join_group_id,
+                tokens_table.c.token_data_ref,
+                tokens_table.c.step_in_pipeline,
+            )
+            .where(tokens_table.c.run_id == run_id)
+            .where(tokens_table.c.token_id == effect.result_token_id)
+        )
+        if (
+            token is None
+            or token.row_id != row_id
+            or token.join_group_id != effect.result_join_group_id
+            or token.token_data_ref != effect.expected_token_data_ref
+            or type(token.token_data_ref) is not str
+            or type(token.step_in_pipeline) is not int
+        ):
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has divergent result-token identity")
+        expected_parent_set_hash = stable_hash(tuple(sorted(member_ids)))
+        expected_effect_hash = stable_hash(
+            {
+                "ordered_parent_ids": member_ids,
+                "step_in_pipeline": token.step_in_pipeline,
+                "token_data_ref": token.token_data_ref,
+            }
+        )
+        if effect.parent_set_hash != expected_parent_set_hash or effect.effect_hash != expected_effect_hash:
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} has divergent identity hashes")
+        has_result_outcome = self._ops.execute_fetchone(
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == run_id)
+            .where(token_outcomes_table.c.token_id == token.token_id)
+            .limit(1)
+        )
+        has_result_work = self._ops.execute_fetchone(
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == run_id)
+            .where(token_work_items_table.c.token_id == token.token_id)
+            .limit(1)
+        )
+        if has_result_outcome is not None or has_result_work is not None:
+            raise AuditIntegrityError(f"Coalesce residual effect {effect.effect_id!r} result already has continuation evidence")
+        return CommittedCoalesceResidual(
+            effect_id=str(effect.effect_id),
+            coalesce_node_id=coalesce_node_id,
+            coalesce_name=coalesce_name,
+            row_id=row_id,
+            result_token_id=str(token.token_id),
+            result_join_group_id=str(token.join_group_id),
+            token_data_ref=token.token_data_ref,
+            step_in_pipeline=token.step_in_pipeline,
+            member_token_ids=member_ids,
+        )
+
+    def list_committed_aggregation_residuals(
+        self,
+        run_id: str,
+        *,
+        aggregation_node_id: str,
+        blocked_token_ids: Sequence[str],
+    ) -> tuple[CommittedAggregationResidual, ...]:
+        """Return exact committed aggregation receipts still stranded BLOCKED.
+
+        A receipt is admitted only when the completed batch/node result, exact
+        ordered membership, terminal BATCH_CONSUMED inputs, claimed expansion
+        group, ordered self-contained child tokens, and absence of any child
+        scheduler/outcome continuation agree. Partial or mixed images fail
+        closed instead of being mistaken for replayable buffered work.
+        """
+        if not blocked_token_ids:
+            return ()
+
+        consumed_rows = []
+        for i in range(0, len(blocked_token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = tuple(blocked_token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            consumed_rows.extend(
+                self._ops.execute_fetchall(
+                    select(token_outcomes_table.c.token_id, token_outcomes_table.c.batch_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.token_id.in_(chunk))
+                    .where(token_outcomes_table.c.completed == 1)
+                    .where(token_outcomes_table.c.outcome == TerminalOutcome.TRANSIENT.value)
+                    .where(token_outcomes_table.c.path == TerminalPath.BATCH_CONSUMED.value)
+                    .order_by(token_outcomes_table.c.batch_id, token_outcomes_table.c.token_id)
+                )
+            )
+        batch_ids = tuple(sorted({str(row.batch_id) for row in consumed_rows if row.batch_id is not None}))
+        residuals: list[CommittedAggregationResidual] = []
+        blocked_set = frozenset(blocked_token_ids)
+
+        for batch_id in batch_ids:
+            batch_row = self._ops.execute_fetchone(
+                select(
+                    batches_table.c.batch_id,
+                    batches_table.c.aggregation_node_id,
+                    batches_table.c.expansion_group_id,
+                    batches_table.c.status,
+                    node_states_table.c.status.label("node_state_status"),
+                    node_states_table.c.output_hash,
+                )
+                .select_from(
+                    batches_table.join(
+                        node_states_table,
+                        and_(
+                            batches_table.c.aggregation_state_id == node_states_table.c.state_id,
+                            batches_table.c.run_id == node_states_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(batches_table.c.batch_id == batch_id)
+                .where(batches_table.c.run_id == run_id)
+                .where(batches_table.c.aggregation_node_id == aggregation_node_id)
+            )
+            if batch_row is None:
+                batch_identity = self._ops.execute_fetchone(
+                    select(batches_table.c.aggregation_node_id, batches_table.c.status)
+                    .where(batches_table.c.batch_id == batch_id)
+                    .where(batches_table.c.run_id == run_id)
+                )
+                if (
+                    batch_identity is not None
+                    and batch_identity.aggregation_node_id == aggregation_node_id
+                    and batch_identity.status != BatchStatus.COMPLETED.value
+                ):
+                    continue
+                raise AuditIntegrityError(
+                    f"Committed aggregation residual batch {batch_id!r} is missing, foreign, or belongs to another node"
+                )
+            if (
+                batch_row.status != BatchStatus.COMPLETED.value
+                or batch_row.node_state_status != NodeStateStatus.COMPLETED.value
+                or type(batch_row.expansion_group_id) is not str
+                or not batch_row.expansion_group_id
+                or type(batch_row.output_hash) is not str
+                or not batch_row.output_hash
+            ):
+                raise AuditIntegrityError(
+                    f"Committed aggregation residual batch {batch_id!r} lacks a completed node/result expansion receipt"
+                )
+
+            member_rows = self._ops.execute_fetchall(
+                select(batch_members_table.c.token_id, batch_members_table.c.ordinal)
+                .where(batch_members_table.c.batch_id == batch_id)
+                .where(batch_members_table.c.run_id == run_id)
+                .order_by(batch_members_table.c.ordinal)
+            )
+            member_ids = tuple(str(row.token_id) for row in member_rows)
+            if not member_ids or tuple(int(row.ordinal) for row in member_rows) != tuple(range(len(member_rows))):
+                raise AuditIntegrityError(f"Committed aggregation residual batch {batch_id!r} has non-contiguous membership")
+            if not frozenset(member_ids).issubset(blocked_set):
+                raise AuditIntegrityError(
+                    f"Committed aggregation residual batch {batch_id!r} is not represented by its exact BLOCKED member set"
+                )
+
+            terminal_rows = []
+            for i in range(0, len(member_ids), _TOKEN_ID_CHUNK_SIZE):
+                chunk = member_ids[i : i + _TOKEN_ID_CHUNK_SIZE]
+                terminal_rows.extend(
+                    self._ops.execute_fetchall(
+                        select(
+                            token_outcomes_table.c.token_id,
+                            token_outcomes_table.c.outcome,
+                            token_outcomes_table.c.path,
+                            token_outcomes_table.c.batch_id,
+                        )
+                        .where(token_outcomes_table.c.run_id == run_id)
+                        .where(token_outcomes_table.c.token_id.in_(chunk))
+                        .where(token_outcomes_table.c.completed == 1)
+                        .order_by(token_outcomes_table.c.token_id, token_outcomes_table.c.recorded_at)
+                    )
+                )
+            terminals_by_token: dict[str, list[Any]] = {}
+            for row in terminal_rows:
+                terminals_by_token.setdefault(str(row.token_id), []).append(row)
+            for member_id in member_ids:
+                terminal = terminals_by_token[member_id] if member_id in terminals_by_token else []
+                if len(terminal) != 1:
+                    raise AuditIntegrityError(
+                        f"Committed aggregation residual batch {batch_id!r} member {member_id!r} does not have one terminal outcome"
+                    )
+                outcome = terminal[0]
+                batch_consumed = (
+                    outcome.outcome == TerminalOutcome.TRANSIENT.value
+                    and outcome.path == TerminalPath.BATCH_CONSUMED.value
+                    and outcome.batch_id == batch_id
+                )
+                quarantined = (
+                    outcome.outcome == TerminalOutcome.FAILURE.value
+                    and outcome.path == TerminalPath.QUARANTINED_AT_SOURCE.value
+                    and outcome.batch_id is None
+                )
+                if not (batch_consumed or quarantined):
+                    raise AuditIntegrityError(
+                        f"Committed aggregation residual batch {batch_id!r} member {member_id!r} has a divergent terminal outcome"
+                    )
+
+            child_rows = self._ops.execute_fetchall(
+                select(
+                    tokens_table.c.token_id,
+                    tokens_table.c.row_id,
+                    tokens_table.c.expand_group_id,
+                    tokens_table.c.token_data_ref,
+                    tokens_table.c.step_in_pipeline,
+                    token_parents_table.c.parent_token_id,
+                    token_parents_table.c.ordinal,
+                )
+                .select_from(
+                    tokens_table.join(
+                        token_parents_table,
+                        and_(
+                            tokens_table.c.token_id == token_parents_table.c.token_id,
+                            tokens_table.c.run_id == token_parents_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(tokens_table.c.run_id == run_id)
+                .where(tokens_table.c.expand_group_id == batch_row.expansion_group_id)
+                .order_by(token_parents_table.c.ordinal)
+            )
+            if not child_rows or tuple(int(row.ordinal) for row in child_rows) != tuple(range(len(child_rows))):
+                raise AuditIntegrityError(f"Committed aggregation residual batch {batch_id!r} has no exact ordered child set")
+            parent_ids = {str(row.parent_token_id) for row in child_rows}
+            if len(parent_ids) != 1 or not parent_ids.issubset(frozenset(member_ids)):
+                raise AuditIntegrityError(f"Committed aggregation residual batch {batch_id!r} has divergent child parentage")
+
+            children: list[CommittedAggregationChild] = []
+            for row in child_rows:
+                if (
+                    type(row.token_data_ref) is not str
+                    or not row.token_data_ref
+                    or type(row.step_in_pipeline) is not int
+                    or row.expand_group_id != batch_row.expansion_group_id
+                ):
+                    raise AuditIntegrityError(f"Committed aggregation residual batch {batch_id!r} has an incomplete child receipt")
+                child_has_outcome = self._ops.execute_fetchone(
+                    select(token_outcomes_table.c.outcome_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.token_id == row.token_id)
+                    .limit(1)
+                )
+                child_has_work = self._ops.execute_fetchone(
+                    select(token_work_items_table.c.work_item_id)
+                    .where(token_work_items_table.c.run_id == run_id)
+                    .where(token_work_items_table.c.token_id == row.token_id)
+                    .limit(1)
+                )
+                if child_has_outcome is not None or child_has_work is not None:
+                    raise AuditIntegrityError(
+                        f"Committed aggregation residual batch {batch_id!r} child {row.token_id!r} already has continuation evidence"
+                    )
+                children.append(
+                    CommittedAggregationChild(
+                        token_id=str(row.token_id),
+                        row_id=str(row.row_id),
+                        expand_group_id=str(row.expand_group_id),
+                        token_data_ref=row.token_data_ref,
+                        step_in_pipeline=row.step_in_pipeline,
+                        parent_token_id=str(row.parent_token_id),
+                        ordinal=row.ordinal,
+                    )
+                )
+
+            residuals.append(
+                CommittedAggregationResidual(
+                    batch_id=batch_id,
+                    aggregation_node_id=aggregation_node_id,
+                    output_hash=batch_row.output_hash,
+                    member_token_ids=member_ids,
+                    children=tuple(children),
+                )
+            )
+
+        return tuple(residuals)
+
+    def list_committed_aggregation_output_receipts(
+        self,
+        run_id: str,
+        *,
+        aggregation_node_id: str,
+        blocked_token_ids: Sequence[str],
+    ) -> tuple[CommittedAggregationOutputReceipt, ...]:
+        """Return completed aggregation outputs that have no routing claim."""
+        if not blocked_token_ids:
+            return ()
+        candidate_batch_ids: set[str] = set()
+        for i in range(0, len(blocked_token_ids), _TOKEN_ID_CHUNK_SIZE):
+            chunk = tuple(blocked_token_ids[i : i + _TOKEN_ID_CHUNK_SIZE])
+            rows = self._ops.execute_fetchall(
+                select(aggregation_results_table.c.batch_id)
+                .select_from(
+                    aggregation_results_table.join(
+                        batch_members_table,
+                        and_(
+                            aggregation_results_table.c.batch_id == batch_members_table.c.batch_id,
+                            aggregation_results_table.c.run_id == batch_members_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(aggregation_results_table.c.run_id == run_id)
+                .where(batch_members_table.c.token_id.in_(chunk))
+                .distinct()
+            )
+            candidate_batch_ids.update(str(row.batch_id) for row in rows)
+
+        blocked_set = frozenset(blocked_token_ids)
+        receipts: list[CommittedAggregationOutputReceipt] = []
+        claimed_member_ids: set[str] = set()
+        for batch_id in sorted(candidate_batch_ids):
+            header = self._ops.execute_fetchone(
+                select(
+                    aggregation_results_table,
+                    batches_table.c.aggregation_node_id,
+                    batches_table.c.aggregation_state_id.label("batch_state_id"),
+                    batches_table.c.expansion_group_id,
+                    batches_table.c.status.label("batch_status"),
+                    batches_table.c.retry_of_batch_id,
+                    node_states_table.c.status.label("node_status"),
+                    node_states_table.c.output_hash.label("node_output_hash"),
+                )
+                .select_from(
+                    aggregation_results_table.join(
+                        batches_table,
+                        and_(
+                            aggregation_results_table.c.batch_id == batches_table.c.batch_id,
+                            aggregation_results_table.c.run_id == batches_table.c.run_id,
+                        ),
+                    ).join(
+                        node_states_table,
+                        and_(
+                            aggregation_results_table.c.aggregation_state_id == node_states_table.c.state_id,
+                            aggregation_results_table.c.run_id == node_states_table.c.run_id,
+                        ),
+                    )
+                )
+                .where(aggregation_results_table.c.batch_id == batch_id)
+                .where(aggregation_results_table.c.run_id == run_id)
+            )
+            if header is None:
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} is missing its batch or node state")
+            if header.expansion_group_id is not None:
+                raise AuditIntegrityError(
+                    f"Aggregation result receipt {batch_id!r} already has expansion claim {header.expansion_group_id!r} "
+                    "but still has BLOCKED members"
+                )
+            try:
+                output_mode = OutputMode(str(header.output_mode))
+            except ValueError as exc:
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has unknown output mode") from exc
+            shape_parent_valid = (
+                (
+                    output_mode is OutputMode.TRANSFORM
+                    and header.output_shape in {"single", "multi"}
+                    and header.expansion_parent_token_id is not None
+                )
+                or (output_mode is OutputMode.TRANSFORM and header.output_shape == "empty" and header.expansion_parent_token_id is None)
+                or (
+                    output_mode is OutputMode.PASSTHROUGH
+                    and header.output_shape in {"empty", "multi"}
+                    and header.expansion_parent_token_id is None
+                )
+            )
+            if (
+                header.aggregation_node_id != aggregation_node_id
+                or header.batch_state_id != header.aggregation_state_id
+                or header.batch_status != BatchStatus.COMPLETED.value
+                or header.node_status != NodeStateStatus.COMPLETED.value
+                or not shape_parent_valid
+                or header.output_hash != header.node_output_hash
+                or type(header.output_hash) is not str
+            ):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent completion identity")
+
+            member_rows = self._ops.execute_fetchall(
+                select(batch_members_table.c.token_id, batch_members_table.c.ordinal)
+                .where(batch_members_table.c.batch_id == batch_id)
+                .where(batch_members_table.c.run_id == run_id)
+                .order_by(batch_members_table.c.ordinal)
+            )
+            member_ids = tuple(str(row.token_id) for row in member_rows)
+            if not member_ids or tuple(int(row.ordinal) for row in member_rows) != tuple(range(len(member_rows))):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has invalid batch membership")
+            if not frozenset(member_ids).issubset(blocked_set) or claimed_member_ids.intersection(member_ids):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} lacks an exact non-overlapping BLOCKED member set")
+
+            disposition_rows = self._ops.execute_fetchall(
+                select(aggregation_result_members_table)
+                .where(aggregation_result_members_table.c.batch_id == batch_id)
+                .where(aggregation_result_members_table.c.run_id == run_id)
+                .order_by(aggregation_result_members_table.c.ordinal)
+            )
+            if (
+                tuple(int(row.ordinal) for row in disposition_rows) != tuple(range(len(member_ids)))
+                or tuple(str(row.token_id) for row in disposition_rows) != member_ids
+            ):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent ordered member actions")
+            members: list[AggregationResultMember] = []
+            for ordinal, row in enumerate(disposition_rows):
+                try:
+                    action = AggregationMemberAction(str(row.action))
+                except ValueError as exc:
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has unknown member action") from exc
+                if action is AggregationMemberAction.QUARANTINE:
+                    if row.error_hash != sha256(f"quarantined_in_batch:{batch_id}:{ordinal}".encode()).hexdigest()[:16]:
+                        raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has divergent quarantine action")
+                elif row.error_hash is not None:
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has error_hash on a non-quarantine action")
+                members.append(
+                    AggregationResultMember(
+                        member_ref=TokenRef(token_id=str(row.token_id), run_id=run_id),
+                        action=action,
+                        error_hash=row.error_hash,
+                    )
+                )
+            actions = tuple(member.action for member in members)
+            if output_mode is OutputMode.TRANSFORM and header.output_shape != "empty":
+                if any(action not in {AggregationMemberAction.CONSUME_BATCH, AggregationMemberAction.QUARANTINE} for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal transform member actions")
+                first_consumed = next(
+                    (member.member_ref.token_id for member in members if member.action is AggregationMemberAction.CONSUME_BATCH),
+                    None,
+                )
+                if first_consumed is None or header.expansion_parent_token_id != first_consumed:
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has a divergent expansion parent")
+            elif output_mode is OutputMode.TRANSFORM:
+                if any(action not in {AggregationMemberAction.DROP_FILTERED, AggregationMemberAction.QUARANTINE} for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal empty transform member actions")
+            elif header.output_shape == "multi":
+                if any(action is not AggregationMemberAction.CONTINUE_PASSTHROUGH for action in actions):
+                    raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal passthrough member actions")
+            elif any(action is not AggregationMemberAction.DROP_FILTERED for action in actions):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has illegal empty passthrough member actions")
+            terminal_member_ids: list[str] = []
+            for i in range(0, len(member_ids), _TOKEN_ID_CHUNK_SIZE):
+                chunk = member_ids[i : i + _TOKEN_ID_CHUNK_SIZE]
+                terminal_rows = self._ops.execute_fetchall(
+                    select(token_outcomes_table.c.token_id)
+                    .where(token_outcomes_table.c.run_id == run_id)
+                    .where(token_outcomes_table.c.token_id.in_(chunk))
+                    .where(token_outcomes_table.c.completed == 1)
+                )
+                terminal_member_ids.extend(str(row.token_id) for row in terminal_rows)
+            if terminal_member_ids:
+                raise AuditIntegrityError(
+                    f"Aggregation result receipt {batch_id!r} has members with terminal outcomes: {sorted(terminal_member_ids)!r}"
+                )
+            # A receipt committed by a resumed flush completes a RETRY batch;
+            # its members' live BUFFERED acceptances keep the original
+            # batch_id (immutable acceptance history), so the liveness proof
+            # binds against the durable retry lineage.
+            lineage_batch_ids = frozenset(
+                batch_retry_lineage_ids(
+                    self._ops.execute_fetchone,
+                    batch_id=batch_id,
+                    run_id=run_id,
+                    aggregation_node_id=aggregation_node_id,
+                    retry_of_batch_id=(str(header.retry_of_batch_id) if header.retry_of_batch_id is not None else None),
+                )
+            )
+            for member_id in member_ids:
+                live = self.list_live_buffered_outcomes(TokenRef(token_id=member_id, run_id=run_id))
+                if len(live) != 1 or live[0].batch_id not in lineage_batch_ids:
+                    raise AuditIntegrityError(
+                        f"Aggregation result receipt {batch_id!r} lacks one live BUFFERED outcome per member within the batch retry lineage"
+                    )
+
+            output_rows = self._ops.execute_fetchall(
+                select(aggregation_result_outputs_table)
+                .where(aggregation_result_outputs_table.c.batch_id == batch_id)
+                .where(aggregation_result_outputs_table.c.run_id == run_id)
+                .order_by(aggregation_result_outputs_table.c.ordinal)
+            )
+            output_refs = tuple(str(row.token_data_ref) for row in output_rows)
+            if (
+                tuple(int(row.ordinal) for row in output_rows) != tuple(range(len(output_rows)))
+                or (header.output_shape == "empty" and len(output_refs) != 0)
+                or (header.output_shape == "single" and len(output_refs) != 1)
+                or (header.output_shape == "multi" and len(output_refs) == 0)
+                or (output_mode is OutputMode.PASSTHROUGH and header.output_shape == "multi" and len(output_refs) != len(member_ids))
+                or any(len(ref) != 64 or any(character not in "0123456789abcdef" for character in ref) for ref in output_refs)
+            ):
+                raise AuditIntegrityError(f"Aggregation result receipt {batch_id!r} has invalid ordered output references")
+            receipts.append(
+                CommittedAggregationOutputReceipt(
+                    batch_id=batch_id,
+                    aggregation_node_id=aggregation_node_id,
+                    aggregation_state_id=str(header.aggregation_state_id),
+                    output_mode=output_mode.value,
+                    output_shape=str(header.output_shape),
+                    output_hash=str(header.output_hash),
+                    output_refs=output_refs,
+                    member_token_ids=member_ids,
+                    members=tuple(members),
+                    expansion_parent_token_id=(
+                        str(header.expansion_parent_token_id) if header.expansion_parent_token_id is not None else None
+                    ),
+                )
+            )
+            claimed_member_ids.update(member_ids)
+        return tuple(receipts)
 
     def find_released_node_state_token_ids(
         self,

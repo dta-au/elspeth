@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalProvider
 
 ProviderFactory = Callable[..., "RetrievalProvider"]
+RetrievalProviderName = Literal["azure_search", "chroma"]
 
 # Registry entry: (config class, provider class or factory callable)
 _ProviderEntry = tuple[type[Any], Callable[..., Any]]
@@ -82,7 +83,7 @@ class RAGRetrievalConfig(TransformDataConfig):
         default=None,
         description="Optional regular expression used to extract the retrieval query from query_field.",
     )
-    provider: str = Field(description="Retrieval provider name registered in the RAG provider catalog.")
+    provider: RetrievalProviderName = Field(description="Retrieval provider name registered in the RAG provider catalog.")
     provider_config: dict[str, Any] = Field(description="Provider-specific retrieval configuration passed to the selected provider.")
     top_k: int = Field(default=5, ge=1, le=100, description="Maximum number of matching documents to return for each query.")
     min_score: float = Field(default=0.0, ge=0.0, le=1.0, description="Minimum relevance score required for a retrieved document.")

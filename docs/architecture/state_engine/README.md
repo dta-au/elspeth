@@ -8,22 +8,22 @@ current verdict, and historical assessments.
 
 | Field | Current value |
 | --- | --- |
-| Assessment | [2026-07-18 18:20 AEST](assessments/2026-07-18-1820/README.md) |
-| Code baseline | `release/0.7.1` at `3c782ac3c7efb0550495be38f75800eddffa639a` |
-| Catalog | `elspeth-state-engine-v1`, schema 1, 68 legs, 10 dimensions |
+| Assessment | [2026-08-12 04:25 AEST](assessments/2026-08-12-0425/README.md) |
+| Code baseline | `codex/state-engine-completion-plan` at `9f78d2b2ae58cd93d8fafc51bf77c3fef65ed5ba` |
+| Catalog | `elspeth-state-engine-v2`, schema 1, 73 legs, explicit semantic cases and required execution profiles |
 | Verdict | **Not complete** |
-| Strongest evidence | TS-02 source-completion atomicity and strict legacy-image recovery; strict fencing; pending-sink admission; TS-07–TS-10 disposition images; barrier atomicity; built-in sink-effect recovery |
-| Primary gaps | Long plugin/effect calls beyond leases; child-enqueue/parent-disposition seam; aggregation continuation; RC-04/RC-07 repository predicates; source exclusion breadth; production follower and read-model matrices |
+| Current observations | 113 reporter-bound Task 5 checks pass on SQLite single-process; four exact cells are promoted while PostgreSQL 16 AWS and follower cells remain unknown |
+| Primary gaps | Independent-process recovery, complete read-model/refusal truth tables, barrier families, external sink ambiguity, `ABANDONED`, first-party plugin lifecycles, and complete PostgreSQL semantics |
 
-The July 2026 implementation is materially stronger than the 2026-07-15
-snapshot. The six concrete hard defects recorded there and the named
-TS-02/source-completion seam are fixed at the current baseline. The engine
-still fails the completion bar because mandatory crash/restart, concurrency,
-plugin-boundary, read-model, and maintenance cells remain unresolved. Closing
-one seam does not close the repository-wide atomicity or restart hard gates.
+This assessment extends the full pinning parent without inheriting historical
+passes. All 73 v2 legs remain `unknown`: each retains at least one mandatory
+cell without current reporter-bound evidence. The v2 contract adds `ABANDONED`, row
+union, RM-14, F-14, current first-party plugin inventory, and PostgreSQL 16 as
+a required first-class backend for the maintained AWS single-leader Landscape
+profile. Multi-replica scheduling remains outside that claim.
 
-Do not reuse the historical `3 Confirmed / 15 Gap` count. The v1 catalog closes
-68 legs across ten dimensions, so that older denominator is not comparable.
+Do not reuse either historical denominator. The v1 68-leg result and the older
+18-leg seed answer different contracts.
 
 ## Authority and precedence
 
@@ -33,7 +33,7 @@ Use this order when documents disagree:
 2. [Completeness criteria](completeness-criteria.md) define the claim bar.
 3. [Current architecture](architecture.md) describes the maintained model and
    known durable seams.
-4. The [v1 proof catalog](proof-catalog/v1/catalog.json) defines the finite leg,
+4. The [v2 proof catalog](proof-catalog/v2/catalog.json) defines the finite leg,
    dimension, case, and hard-gate universe.
 5. The current dated `assessment.json` binds evidence and findings to one code
    baseline.
@@ -72,7 +72,8 @@ docs/architecture/state_engine/
 ├── assessment-framework.md
 ├── proof-catalog/
 │   ├── README.md
-│   └── v1/catalog.json
+│   ├── v1/catalog.json         # frozen historical contract
+│   └── v2/catalog.json         # current contract
 ├── templates/
 │   ├── assessment-readme.md
 │   ├── verification-run.md
@@ -113,6 +114,8 @@ code.
 
 | Date | Baseline | Mode | Verdict | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-08-12 | `9f78d2b2a` | Task 5 SQLite delta assessment | Not complete | Promotes four reporter-bound SQLite single-process cells for queue rollback, TS-02 entry, and F-11 guard refusal; required PostgreSQL 16 AWS and follower cells remain unknown. |
+| 2026-08-12 | `af79b3404` | Full v2 pinning assessment | Not complete | Pins 73 current legs, PostgreSQL 16 AWS single-leader support, fresh structural/tracker context, focused current observations, and live cohort ownership without inheriting v1 passes. |
 | 2026-07-18 | `3c782ac3c` | Full contract refresh and source-ingress evidence | Not complete | Adds the exact source `COMPLETED` witness to TS-02/PB-01, records strict pre-fix reconciliation, and attaches 13 fresh focused checks without promoting the broader legs or hard gates. |
 | 2026-07-18 | `422415009` | Full framework reset and conservative evidence import | Not complete | Introduces the 68-leg v1 catalog, explicit coordination state, sink-effect architecture, reproducibility contract, and reviewed authority model. |
 | 2026-07-15 | `0dcd61ac` | Seed assessment | Not complete | Historical 18-leg Wave 1 result; useful evidence, obsolete denominator and blocker list. |

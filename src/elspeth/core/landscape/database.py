@@ -485,6 +485,11 @@ _REQUIRED_COLUMNS += tuple(
     (table_name, column.name) for table_name in _EPOCH_27_REQUIRED_TABLES for column in metadata.tables[table_name].columns
 )
 
+_EPOCH_32_REQUIRED_TABLES = ("aggregation_results", "aggregation_result_outputs", "aggregation_result_members")
+_REQUIRED_COLUMNS += tuple(
+    (table_name, column.name) for table_name in _EPOCH_32_REQUIRED_TABLES for column in metadata.tables[table_name].columns
+)
+
 # Required foreign keys for audit integrity (Tier 1 trust).
 # Format: (table_name, column_name, referenced_table)
 # Use this only for exact single-column contracts. Run-scoped contracts belong in
@@ -504,6 +509,7 @@ _REQUIRED_FOREIGN_KEYS: tuple[tuple[str, str, str], ...] = (
     ("sink_effect_export_snapshots", "snapshot_id", "audit_export_snapshots"),
     ("sink_effect_attempts", "effect_id", "sink_effects"),
     ("coalesce_effects", "run_id", "runs"),
+    ("aggregation_results", "run_id", "runs"),
 )
 
 # Required composite foreign keys for run-scoped audit integrity.
@@ -530,6 +536,37 @@ _REQUIRED_COMPOSITE_FOREIGN_KEYS: tuple[tuple[str, tuple[str, ...], str, tuple[s
     ("batches", ("retry_of_batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("batch_members", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
     ("batch_members", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
+    ("aggregation_results", ("batch_id", "run_id"), "batches", ("batch_id", "run_id")),
+    (
+        "aggregation_results",
+        ("aggregation_state_id", "run_id"),
+        "node_states",
+        ("state_id", "run_id"),
+    ),
+    (
+        "aggregation_results",
+        ("expansion_parent_token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ),
+    (
+        "aggregation_result_outputs",
+        ("batch_id", "run_id"),
+        "aggregation_results",
+        ("batch_id", "run_id"),
+    ),
+    (
+        "aggregation_result_members",
+        ("batch_id", "run_id"),
+        "aggregation_results",
+        ("batch_id", "run_id"),
+    ),
+    (
+        "aggregation_result_members",
+        ("token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ),
     ("token_work_items", ("token_id", "run_id"), "tokens", ("token_id", "run_id")),
     ("token_work_items", ("row_id", "run_id"), "rows", ("row_id", "run_id")),
     ("token_work_items", ("node_id", "run_id"), "nodes", ("node_id", "run_id")),
@@ -596,6 +633,7 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("run_attributions", "ck_run_attributions_auth_provider_type"),
     ("run_web_plugin_policy", "ck_run_web_plugin_policy_schema_version"),
     ("run_sources", "ck_run_sources_lifecycle_state"),
+    ("token_work_items", "ck_token_work_items_status"),
     ("token_work_items", "ck_token_work_items_lease_owner_required_when_leased"),
     ("scheduler_events", "ck_scheduler_events_event_type"),
     ("scheduler_events", "ck_scheduler_events_from_status"),
@@ -656,6 +694,15 @@ _REQUIRED_CHECK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("coalesce_effects", "ck_coalesce_effects_effect_hash_hex"),
     ("coalesce_effects", "ck_coalesce_effects_payload_ref_hex"),
     ("coalesce_effect_members", "ck_coalesce_effect_members_ordinal"),
+    ("aggregation_results", "ck_aggregation_results_output_mode"),
+    ("aggregation_results", "ck_aggregation_results_output_shape"),
+    ("aggregation_results", "ck_aggregation_results_mode_shape_parent"),
+    ("aggregation_results", "ck_aggregation_results_output_hash_hex"),
+    ("aggregation_result_outputs", "ck_aggregation_result_outputs_ordinal"),
+    ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex"),
+    ("aggregation_result_members", "ck_aggregation_result_members_ordinal"),
+    ("aggregation_result_members", "ck_aggregation_result_members_action"),
+    ("aggregation_result_members", "ck_aggregation_result_members_error_hash_hex"),
 )
 
 # Required indexes (including partial unique indexes) for audit integrity.
@@ -695,6 +742,8 @@ _REQUIRED_INDEXES: tuple[tuple[str, str], ...] = (
     ("audit_export_snapshots", "uq_audit_export_snapshots_registry_key"),
     ("audit_export_snapshots", "ix_audit_export_snapshots_registry_key_hash"),
     ("audit_export_snapshot_chunks", "uq_audit_export_snapshot_chunks_terminal"),
+    ("aggregation_results", "ix_aggregation_results_run"),
+    ("aggregation_result_outputs", "ix_aggregation_result_outputs_ref"),
 )
 
 _REQUIRED_TRIGGERS: tuple[str, ...] = (

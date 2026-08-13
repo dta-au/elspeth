@@ -1,0 +1,457 @@
+{
+  "items": [
+    {
+      "issue_id": "elspeth-97d0c15eb6",
+      "title": "Operator: sign current trust-tier judgments and regenerate the release fingerprint baseline",
+      "status": "open",
+      "priority": 0,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-f9c41e6ad9"
+      ]
+    },
+    {
+      "issue_id": "elspeth-1e3ad83d89",
+      "title": "Guided-full inline custody violates the originating-message foreign key before atomic staging",
+      "status": "verifying",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-282f392fae"
+      ]
+    },
+    {
+      "issue_id": "elspeth-64c319bf4d",
+      "title": "Prepare release/0.7.2 version surfaces and release gates",
+      "status": "in_progress",
+      "priority": 1,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-618b5100b8"
+      ]
+    },
+    {
+      "issue_id": "elspeth-3bbf9a9731",
+      "title": "Deliver Azure Container Apps Bicep bundle and live provider acceptance",
+      "status": "open",
+      "priority": 1,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-b5d7aa5655"
+      ]
+    },
+    {
+      "issue_id": "elspeth-a5b07ac072",
+      "title": "Complete deployment profiles, documentation, CI gates, and release/0.7.2 merge",
+      "status": "open",
+      "priority": 1,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-2ff97dbc70",
+        "elspeth-3bbf9a9731",
+        "elspeth-beaf1585a9"
+      ]
+    },
+    {
+      "issue_id": "elspeth-618b5100b8",
+      "title": "Verify post-operator trust-tier baseline and release gates",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-97d0c15eb6"
+      ]
+    },
+    {
+      "issue_id": "elspeth-779b292abe",
+      "title": "Run non-authoritative preview and resolve every BLOCK or disagreement",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-aa05ff4999"
+      ]
+    },
+    {
+      "issue_id": "elspeth-9c0a326976",
+      "title": "Operator handoff and release closeout",
+      "status": "pending",
+      "priority": 1,
+      "type": "phase",
+      "blocked_by": [
+        "elspeth-779b292abe"
+      ]
+    },
+    {
+      "issue_id": "elspeth-aa05ff4999",
+      "title": "Re-stage drift and delete only proven stale entries",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-48d85719b8",
+        "elspeth-68a21ba1ff",
+        "elspeth-775de124fa"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f9c41e6ad9",
+      "title": "Publish the final key-free operator handoff",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-779b292abe"
+      ]
+    },
+    {
+      "issue_id": "elspeth-2784531888",
+      "title": "Preserve durable Composer tool changes in the transcript after Stop",
+      "status": "confirmed",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-f5e6723133"
+      ]
+    },
+    {
+      "issue_id": "elspeth-9f7d336e1c",
+      "title": "Cold install: release/0.7.2 Terraform package cannot boot any published image",
+      "status": "fixing",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-97d0c15eb6"
+      ]
+    },
+    {
+      "issue_id": "elspeth-16e3b93084",
+      "title": "Rerun source-free AWS cold-install qualification and publish the handoff",
+      "status": "open",
+      "priority": 1,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-9f7d336e1c"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f76973159c",
+      "title": "Gateway Phase 5 \u2014 final verification and merge",
+      "status": "open",
+      "priority": 1,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-bd130706dc"
+      ]
+    },
+    {
+      "issue_id": "elspeth-fcef029996",
+      "title": "D2: advisor repair loop is structurally unsatisfiable - exhaustion is deterministic, not intermittent",
+      "status": "verifying",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-955438d517"
+      ]
+    },
+    {
+      "issue_id": "elspeth-d28777dd0e",
+      "title": "Composer mode:fixed emit pin widens reductive emit sets - spurious locked_input_extras/sink_locked_extras block valid pipelines",
+      "status": "verifying",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-9a8367078f"
+      ]
+    },
+    {
+      "issue_id": "elspeth-d6eeb3a71d",
+      "title": "Declaring a transform's own output field in schema.fields makes it required on input \u2014 21 of 24 transforms, not just value_transform",
+      "status": "verifying",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-3790106260",
+        "elspeth-f605f0a94e"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f1def53d38",
+      "title": "Model PEP 695 and PEP 696 annotation scopes in masquerade inventory",
+      "status": "triage",
+      "priority": 1,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-682e0c6581"
+      ]
+    },
+    {
+      "issue_id": "elspeth-67be892457",
+      "title": "Close lifecycle abandonment follower and plugin contracts",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-61350c4744",
+        "elspeth-6f6bbbec00",
+        "elspeth-af65f78095"
+      ]
+    },
+    {
+      "issue_id": "elspeth-cc0b256aca",
+      "title": "Close aggregation coalesce and row-union contracts",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-af65f78095"
+      ]
+    },
+    {
+      "issue_id": "elspeth-d262ace360",
+      "title": "Close queue source transform and gate contracts",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-2e66723070",
+        "elspeth-9cd07962c7",
+        "elspeth-af65f78095",
+        "elspeth-c0d4a28e11"
+      ]
+    },
+    {
+      "issue_id": "elspeth-eefd990b46",
+      "title": "Close lease coordination process and read-model contracts",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-2aba594afb",
+        "elspeth-9a52eb80f9",
+        "elspeth-af65f78095"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f227dd8d2f",
+      "title": "Close sink-effect publication and repair contracts",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-af65f78095"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f89d82e925",
+      "title": "Run the final full assessment and install maintained gates",
+      "status": "pending",
+      "priority": 1,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-61350c4744",
+        "elspeth-67be892457",
+        "elspeth-cc0b256aca",
+        "elspeth-d262ace360",
+        "elspeth-eefd990b46",
+        "elspeth-f227dd8d2f"
+      ]
+    },
+    {
+      "issue_id": "elspeth-b50bd1b8f0",
+      "title": "Epic-close verification \u2014 walk acceptance criteria, certify each met, close elspeth-8843308cfe",
+      "status": "open",
+      "priority": 2,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-797cac825e",
+        "elspeth-b79958739e"
+      ]
+    },
+    {
+      "issue_id": "elspeth-28291aff4c",
+      "title": "[core bugscan P2 design] Full-topology hashing belongs behind a DAG or checkpoint boundary, not in the canonical JSON serializer.",
+      "status": "open",
+      "priority": 2,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-69c957ed96",
+        "elspeth-f321e3ff21"
+      ]
+    },
+    {
+      "issue_id": "elspeth-cfcaa3a02c",
+      "title": "[core bugscan P2 security] Leader-fenced checkpoint writes do not bind the supplied `run_id` to `CoordinationToken.run_id`.",
+      "status": "confirmed",
+      "priority": 2,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-9ae60d87ab"
+      ]
+    },
+    {
+      "issue_id": "elspeth-cdf38d9e17",
+      "title": "[core bugscan P2 smell] Expression language semantics are spread across separate validator, evaluator, and static classifier implementations.",
+      "status": "open",
+      "priority": 2,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-2f93076878"
+      ]
+    },
+    {
+      "issue_id": "elspeth-ef29ef6ba4",
+      "title": "[DAG completeness] Complete the maintained production-path scenario matrix",
+      "status": "in_progress",
+      "priority": 2,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-cb1053fe46"
+      ]
+    },
+    {
+      "issue_id": "elspeth-24e7b2735c",
+      "title": "Consolidate AWS acceptance and deployment boundary policy",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-02cd60d8cd"
+      ]
+    },
+    {
+      "issue_id": "elspeth-2553714de8",
+      "title": "Migrate Composer boundaries and declarative policy",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-02cd60d8cd"
+      ]
+    },
+    {
+      "issue_id": "elspeth-36535414b3",
+      "title": "Migrate web runtime boundaries without blanket route rules",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-02cd60d8cd"
+      ]
+    },
+    {
+      "issue_id": "elspeth-48d85719b8",
+      "title": "Reconcile contracts, core, engine, and telemetry residuals",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-a10a97e9a6"
+      ]
+    },
+    {
+      "issue_id": "elspeth-68a21ba1ff",
+      "title": "Reconcile plugin residuals",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-b3a2cef736"
+      ]
+    },
+    {
+      "issue_id": "elspeth-775de124fa",
+      "title": "Reconcile web and Composer residuals",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-24e7b2735c",
+        "elspeth-2553714de8",
+        "elspeth-36535414b3"
+      ]
+    },
+    {
+      "issue_id": "elspeth-a10a97e9a6",
+      "title": "Migrate contracts, core, and engine trust boundaries",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-02cd60d8cd"
+      ]
+    },
+    {
+      "issue_id": "elspeth-b3a2cef736",
+      "title": "Migrate plugin trust boundaries after ownership fixes",
+      "status": "pending",
+      "priority": 2,
+      "type": "step",
+      "blocked_by": [
+        "elspeth-02cd60d8cd"
+      ]
+    },
+    {
+      "issue_id": "elspeth-f5a9021d2d",
+      "title": "D4: exhausted advisor branch reports 'Runtime preflight failed' on a build whose preflight passed",
+      "status": "verifying",
+      "priority": 2,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-4b3ac84038"
+      ]
+    },
+    {
+      "issue_id": "elspeth-8d5bf01861",
+      "title": "Freeform planner cannot surface a question when requested data is absent from the session",
+      "status": "triage",
+      "priority": 2,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-b1e85829e9"
+      ]
+    },
+    {
+      "issue_id": "elspeth-6522571f78",
+      "title": "CI enforcement \u2014 AST checker for logging policy violations",
+      "status": "deferred",
+      "priority": 3,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-5055bcbe78",
+        "elspeth-b1a122c62c"
+      ]
+    },
+    {
+      "issue_id": "elspeth-dd1a652e0c",
+      "title": "Prepared span attributes are unavailable to creation-time sampling",
+      "status": "confirmed",
+      "priority": 3,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-3ad3fb9e79"
+      ]
+    },
+    {
+      "issue_id": "elspeth-42ae5b798a",
+      "title": "[core bugscan P3 efficiency] `elspeth.core` is eager: importing the package root imports canonical, checkpoint, config, DAG, expression, logging, and payload-store modules up front.",
+      "status": "open",
+      "priority": 3,
+      "type": "task",
+      "blocked_by": [
+        "elspeth-66dd8ae2f0"
+      ]
+    },
+    {
+      "issue_id": "elspeth-c23830feda",
+      "title": "Expression grammar has no regex-extraction primitive; pattern-extract intents still force llm nodes",
+      "status": "triage",
+      "priority": 3,
+      "type": "bug",
+      "blocked_by": [
+        "elspeth-38dffd9bec"
+      ]
+    }
+  ],
+  "has_more": false
+}

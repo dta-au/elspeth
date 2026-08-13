@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import freeze_fields, require_int
 
 
@@ -82,6 +83,16 @@ class BranchLossSpec:
     token_id: str
     reason: str
     recorded_by: str
+
+
+@dataclass(frozen=True)
+class BarrierTerminalOutcomeSpec:
+    """One token terminal written atomically with barrier completion."""
+
+    token_id: str
+    outcome: TerminalOutcome
+    path: TerminalPath
+    error_hash: str | None = None
 
 
 def _validate_scheduler_enum(value: object, enum_type: type[StrEnum], field_name: str, *, optional: bool = False) -> None:

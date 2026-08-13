@@ -31,6 +31,7 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.scheduler import (
     BarrierEmission,
+    BarrierTerminalOutcomeSpec,
     BatchMembershipSpec,
     BlockedPendingSinkHandoff,
     BranchLossSpec,
@@ -692,6 +693,7 @@ class TokenSchedulerRepository:
         coordination_token: CoordinationToken,
         pending_sink_lease_owner: str | None = None,
         branch_losses: Sequence[BranchLossSpec] = (),
+        terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec] = (),
     ) -> int:
         """Complete a barrier atomically (see :meth:`BarrierJournalRepository.complete_barrier`)."""
         return self.barriers.complete_barrier(
@@ -708,6 +710,7 @@ class TokenSchedulerRepository:
             coordination_token=coordination_token,
             pending_sink_lease_owner=pending_sink_lease_owner,
             branch_losses=branch_losses,
+            terminal_outcomes=terminal_outcomes,
         )
 
     def mark_blocked_barrier_pending_sink_many(
@@ -844,9 +847,19 @@ class TokenSchedulerRepository:
         """Count how many of the given work item IDs are in FAILED status."""
         return self.reads.count_failed_in_set(run_id=run_id, work_item_ids=work_item_ids)
 
-    def has_peer_owned_work(self, *, run_id: str, caller_owner: str) -> bool:
+    def has_peer_owned_work(
+        self,
+        *,
+        run_id: str,
+        caller_owner: str,
+        work_item_ids: Sequence[str] | None = None,
+    ) -> bool:
         """Return True if any non-terminal row is owned by a DIFFERENT worker."""
-        return self.reads.has_peer_owned_work(run_id=run_id, caller_owner=caller_owner)
+        return self.reads.has_peer_owned_work(
+            run_id=run_id,
+            caller_owner=caller_owner,
+            work_item_ids=work_item_ids,
+        )
 
     def count_active_work(self, *, run_id: str) -> int:
         """Count non-terminal scheduler work for a run."""

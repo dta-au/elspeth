@@ -21,6 +21,8 @@ from elspeth.contracts.payload_store import PayloadStore
 from elspeth.core.landscape.model_loaders import validate_run_lifecycle_row
 from elspeth.core.landscape.reproducibility import update_grade_after_purge
 from elspeth.core.landscape.schema import (
+    aggregation_result_outputs_table,
+    aggregation_results_table,
     calls_table,
     node_states_table,
     operations_table,
@@ -111,6 +113,7 @@ class PurgeManager:
         call_op_join: FromClause,
         routing_join: FromClause,
         token_join: FromClause,
+        aggregation_output_join: FromClause,
     ) -> CompoundSelect[Any]:
         """Build a UNION of all payload ref sub-queries for a given run condition.
 
@@ -163,6 +166,10 @@ class PurgeManager:
             select(tokens_table.c.token_data_ref)
             .select_from(token_join)
             .where(and_(run_condition, tokens_table.c.token_data_ref.isnot(None))),
+            # 10. Pre-expansion aggregation output receipts
+            select(aggregation_result_outputs_table.c.token_data_ref)
+            .select_from(aggregation_output_join)
+            .where(and_(run_condition, aggregation_result_outputs_table.c.token_data_ref.isnot(None))),
         )
 
     def find_expired_payload_refs(
@@ -233,6 +240,10 @@ class PurgeManager:
             runs_table, node_states_table.c.run_id == runs_table.c.run_id
         )
         token_join = tokens_table.join(runs_table, tokens_table.c.run_id == runs_table.c.run_id)
+        aggregation_output_join = aggregation_result_outputs_table.join(
+            aggregation_results_table,
+            aggregation_result_outputs_table.c.batch_id == aggregation_results_table.c.batch_id,
+        ).join(runs_table, aggregation_results_table.c.run_id == runs_table.c.run_id)
 
         expired_refs_query = self._build_ref_union_query(
             run_expired_condition,
@@ -242,6 +253,7 @@ class PurgeManager:
             call_op_join=call_op_join,
             routing_join=routing_join,
             token_join=token_join,
+            aggregation_output_join=aggregation_output_join,
         )
         active_refs_query = self._build_ref_union_query(
             run_active_condition,
@@ -251,6 +263,7 @@ class PurgeManager:
             call_op_join=call_op_join,
             routing_join=routing_join,
             token_join=token_join,
+            aggregation_output_join=aggregation_output_join,
         )
 
         # === Execute both queries and compute set difference ===
@@ -348,6 +361,17 @@ class PurgeManager:
 
         # 6. From tokens.token_data_ref (expand/coalesce per-token row data)
         token_runs_query = select(tokens_table.c.run_id).distinct().where(tokens_table.c.token_data_ref.in_(refs_chunk))
+        aggregation_output_runs_query = (
+            select(aggregation_results_table.c.run_id)
+            .distinct()
+            .select_from(
+                aggregation_result_outputs_table.join(
+                    aggregation_results_table,
+                    aggregation_result_outputs_table.c.batch_id == aggregation_results_table.c.batch_id,
+                )
+            )
+            .where(aggregation_result_outputs_table.c.token_data_ref.in_(refs_chunk))
+        )
 
         # Union all run_id queries
         all_runs_query = union(
@@ -360,6 +384,7 @@ class PurgeManager:
             call_op_response_runs_query,
             routing_runs_query,
             token_runs_query,
+            aggregation_output_runs_query,
         )
 
         with self._db.connection() as conn:

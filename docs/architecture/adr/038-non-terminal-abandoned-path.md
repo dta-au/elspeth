@@ -87,7 +87,7 @@ increments and `forbidden_in_processing_results=True`, so an ABANDONED
 record reaching the accumulator or the resume re-derivation crashes
 loudly rather than counting as anything.
 
-### 2. The producer is run finalization, inside the fenced terminal transaction
+### 2. Run finalization atomically closes token and effect-operation debt
 
 The single writer of `(NULL, ABANDONED)` is `complete_run`
 (`core/landscape/run_lifecycle_repository.py`) — the §D run-finalization
@@ -104,6 +104,21 @@ the terminal conditional UPDATE succeeds, when:
 
 then every token of the run with no `completed=1` outcome row and no
 existing `(NULL, ABANDONED)` row receives one `(NULL, ABANDONED)` record.
+The same already-computed non-resumability decision also fails every
+effect-linked `operations` row still in `open`. The operation transition is
+`open → failed` with the run-finalization timestamp, a non-negative elapsed
+duration, and the fixed audit-safe message `run finalized as non-resumable
+before sink effect completed`. It does not expose plugin errors, payloads,
+targets, or credentials. `completed`, `failed`, and `pending` operations are
+immutable, and effect-less legacy/source operations are outside this sweep.
+
+The two sweeps are independent: zero undecided tokens does not suppress the
+operation sweep, and zero open effect operations does not suppress token
+abandonment. `RunLifecycleRepository` computes the structural
+non-resumability predicate once, then composes both repository primitives in
+the terminal transaction. `OperationRepository`'s primitive accepts the
+caller's connection and never opens or commits its own transaction. Any
+failure in either sweep rolls back the terminal stamp and the other sweep.
 Idempotency has two layers: the terminal UPDATE's already-terminal refusal
 is the single-winner gate on every ordinary path, and the WHERE exclusion
 makes the sweep a no-op on the one documented re-finalize path
@@ -177,9 +192,15 @@ racing into a decided∧abandoned contradiction. SQLite's single-writer
 transaction gives the same guarantee and ignores `FOR UPDATE` — which
 also means the SQLite test suite cannot exercise this mitigation: the
 PostgreSQL claim currently rests on the FK lock-ordering argument alone,
-and a PG-lane (`ELSPETH_TEST_POSTGRES_URL`) race test is owed alongside
-the multi-replica integration work (`elspeth-4d6c0dd0f5`), the first
-deployment shape where the race becomes reachable.
+and therefore cannot establish the PostgreSQL protocol. PostgreSQL 16 race
+tests now pin both winners with independent connections: finalization first
+causes the late decided writer to refuse the already-ABANDONED token, while a
+decided writer first causes finalization to re-read after its token-lock wait
+and omit ABANDONED. The finalizer deliberately uses two statements under READ
+COMMITTED (lock all run tokens, then classify from a fresh snapshot); combining
+`NOT EXISTS` and `FOR UPDATE` in one statement retained a pre-wait snapshot and
+was proven unsafe. Local PostgreSQL is implementation support, not evidence of
+the AWS deployment boundary.
 
 ### 4. Accounting: `abandoned` tokens and `closure='abandoned'`
 
@@ -262,8 +283,9 @@ duplicate-terminal-outcomes raise.
 
 ### Negative
 
-- `complete_run`'s terminal transaction grows a SELECT and up to N
-  INSERTs on the fenced FAILED/INTERRUPTED arm — one recorder call per
+- `complete_run`'s terminal transaction grows token-lock/classification reads,
+  an effect-operation lock/update pass, and up to N token INSERTs on the
+  fenced FAILED/INTERRUPTED arm — one recorder call per
   undecided token, so N is unbounded in principle (a very large buffered
   run holds the write lock for N round-trips, and a mid-sweep failure
   rolls back the stamp, leaving the run RUNNING-stale). Accepted for now:
@@ -353,13 +375,16 @@ Surface, in dependency order (parity-swept against every consumer of
 5. `engine/orchestrator/run_status.py` — resume re-derivation raises
    `AuditIntegrityError` on `(None, ABANDONED)` (a resume is running over
    a run the audit says can never resume).
-6. `core/landscape/run_lifecycle_repository.py` — the sweep inside
-   `_complete_run_in`, gated on FAILED/INTERRUPTED + the three-arm
-   predicate; writes go through the same persisted-field validation as
-   `record_token_outcome` (identical Tier-1 checks, same connection).
-7. `web/execution/accounting.py` — abandoned split, closure value,
+6. `core/landscape/run_lifecycle_repository.py` — both sweeps inside
+   `_complete_run_in`, gated on FAILED/INTERRUPTED + one evaluation of the
+   three-arm predicate; token writes go through the same persisted-field
+   validation as `record_token_outcome` (identical Tier-1 checks, same
+   connection).
+7. `core/landscape/execution/operations.py` — caller-owned primitive for
+   `open` effect-linked operation failure; no independent transaction.
+8. `web/execution/accounting.py` — abandoned split, closure value,
    decided∧abandoned raise; frontend type union updated in lockstep.
-8. Tests — contracts pair tests; repository sweep tests (fires /
+9. Tests — contracts pair tests; repository sweep tests (fires /
    resumable-no-op / idempotent / SUCCESS-never); the two pinned
    aggregation tests updated (count case now abandoned + `closure='abandoned'`,
    EOF case byte-identical assertions); module docstring scope boundary

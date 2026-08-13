@@ -650,6 +650,48 @@ jobs:
   # ===========================================================================
   # Stage 3c: Dependency and License Audit
   # ===========================================================================
+  state-engine-validation:
+    name: State-engine catalog and selector validation
+    runs-on: ubuntu-24.04
+    needs: [static-analysis]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+          prune-cache: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libsqlcipher-dev
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Validate frozen v2 catalog
+        run: uv run python scripts/state_engine_assessment.py validate-catalog docs/architecture/state_engine/proof-catalog/v2/catalog.json
+
+      - name: Validate current v3 catalog
+        run: uv run python scripts/state_engine_assessment.py validate-catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json
+
+      - name: Validate plugin lifecycle matrix inventory
+        run: uv run python scripts/state_engine_plugin_matrix.py check tests/golden/state_engine/plugin_lifecycle_matrix.json
+
+      - name: Validate v3 evidence selector manifest
+        run: |
+          uv run python scripts/state_engine_assessment.py validate-selectors \
+            docs/architecture/state_engine/proof-catalog/v3/evidence_selectors.json \
+            --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json
+
+      - name: Validate state-engine documentation links
+        run: uv run python scripts/state_engine_assessment.py check-links
+
   supply-chain-audit:
     name: Dependency and License Audit
     runs-on: ${{ fromJSON((github.event_name != 'pull_request') && '["self-hosted","Linux","X64","nyx-ci","trusted"]' || '"ubuntu-24.04"') }}
@@ -877,6 +919,7 @@ jobs:
       - static-analysis
       - test
       - testcontainer
+      - state-engine-validation
       - supply-chain-audit
       - e2e-frontend
       - frontend-unit
@@ -894,6 +937,10 @@ jobs:
           fi
           if [[ "${{ needs.testcontainer.result }}" != "success" ]]; then
             echo "Testcontainer (PostgreSQL contention proofs) job failed"
+            exit 1
+          fi
+          if [[ "${{ needs.state-engine-validation.result }}" != "success" ]]; then
+            echo "State-engine catalog and selector validation job failed"
             exit 1
           fi
           if [[ "${{ needs.supply-chain-audit.result }}" != "success" ]]; then

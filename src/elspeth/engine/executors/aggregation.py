@@ -1,7 +1,7 @@
 """AggregationExecutor - manages batch lifecycle with audit recording."""
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -21,6 +21,7 @@ from elspeth.contracts.barrier_scalars import AggregationNodeScalars
 from elspeth.contracts.enums import (
     BatchStatus,
     NodeStateStatus,
+    OutputMode,
     TriggerType,
 )
 from elspeth.contracts.errors import (
@@ -36,6 +37,7 @@ from elspeth.contracts.types import NodeID, StepResolver
 from elspeth.core.canonical import stable_hash
 from elspeth.core.config import AggregationSettings
 from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.engine.aggregation_result import aggregation_result_members, validated_quarantined_indices
 from elspeth.engine.clock import DEFAULT_CLOCK
 from elspeth.engine.executors.state_guard import NodeStateGuard
 from elspeth.engine.journal_restore import AggregationJournalRestorer
@@ -515,6 +517,7 @@ class AggregationExecutor:
     def _complete_successful_flush(
         self,
         *,
+        node_id: NodeID,
         node: _AggregationNodeState,
         transform: BatchTransformProtocol,
         result: TransformResult,
@@ -523,34 +526,73 @@ class AggregationExecutor:
         batch_id: str,
         trigger_type: TriggerType,
         window: _FlushWindow,
+        buffered_tokens: Sequence[TokenInfo],
     ) -> None:
         """Record successful node-state and batch completion."""
         self._validate_success_outputs(transform, result)
 
-        output_data: dict[str, Any] | list[dict[str, Any]]
-        if result.row is not None:
-            output_data = result.row.to_dict()
-        elif result.rows is not None:
-            output_data = [row.to_dict() for row in result.rows]
-        else:
+        if result.row is None and result.rows is None:
             raise PluginContractViolation(
                 f"Aggregation transform '{transform.name}' returned success status but "
                 f"neither row nor rows contains data. Batch-aware transforms must return "
                 f"output via TransformResult.success(row) or TransformResult.success_multi(rows)."
             )
 
-        guard.complete(
-            NodeStateStatus.COMPLETED,
-            output_data=output_data,
+        output_rows = (result.row,) if result.row is not None else tuple(result.rows or ())
+        quarantined_indices = validated_quarantined_indices(
+            result,
+            buffered_token_count=len(buffered_tokens),
+            aggregation_name=node.settings.name,
+        )
+        if node.settings.output_mode is OutputMode.TRANSFORM:
+            if node.settings.expected_output_count is not None and len(output_rows) != node.settings.expected_output_count:
+                raise PluginContractViolation(
+                    f"Aggregation {node.settings.name!r} produced {len(output_rows)} output row(s), "
+                    f"but expected_output_count={node.settings.expected_output_count}."
+                )
+            non_quarantined_tokens = tuple(token for index, token in enumerate(buffered_tokens) if index not in quarantined_indices)
+            if output_rows and not non_quarantined_tokens:
+                raise OrchestrationInvariantError(
+                    f"Aggregation {node.settings.name!r} emitted output but all buffered tokens were quarantined"
+                )
+            expansion_parent_token_id = non_quarantined_tokens[0].token_id if output_rows else None
+        else:
+            if quarantined_indices:
+                raise OrchestrationInvariantError("passthrough aggregation cannot declare quarantined_indices")
+            if result.rows is None:
+                raise OrchestrationInvariantError(
+                    f"Passthrough mode requires multi-row result, but transform {transform.name!r} returned single row. "
+                    "Use TransformResult.success_multi() for passthrough."
+                )
+            if output_rows and len(output_rows) != len(buffered_tokens):
+                raise OrchestrationInvariantError(
+                    f"Passthrough mode requires same number of output rows as input rows. Transform {transform.name!r} "
+                    f"returned {len(output_rows)} rows but received {len(buffered_tokens)} input rows."
+                )
+            expansion_parent_token_id = None
+        if result.output_hash is None:
+            raise OrchestrationInvariantError("successful aggregation result lacks output_hash")
+        guard.complete_aggregation_result(
+            batch_id=batch_id,
+            run_id=self._run_id,
+            aggregation_node_id=str(node_id),
+            trigger_type=trigger_type,
+            output_mode=node.settings.output_mode,
+            output_rows=output_rows,
+            output_shape="empty" if not output_rows else ("multi" if result.rows is not None else "single"),
+            output_hash=result.output_hash,
+            members=aggregation_result_members(
+                buffered_tokens,
+                run_id=self._run_id,
+                batch_id=batch_id,
+                output_mode=node.settings.output_mode,
+                output_is_empty=not output_rows,
+                quarantined_indices=quarantined_indices,
+            ),
+            expansion_parent_token_id=expansion_parent_token_id,
             duration_ms=duration_ms,
             success_reason=result.success_reason,
             context_after=window.flush_context(batch_id=batch_id, trigger_type=trigger_type),
-        )
-        self._execution.complete_batch(
-            batch_id=batch_id,
-            status=BatchStatus.COMPLETED,
-            trigger_type=trigger_type,
-            state_id=guard.state_id,
         )
         node.completed_flush_count += 1
 
@@ -619,6 +661,8 @@ class AggregationExecutor:
         transform: BatchTransformProtocol,
         ctx: PluginContext,
         trigger_type: TriggerType,
+        *,
+        validate_success: Callable[[TransformResult, Sequence[TokenInfo], str], None] | None = None,
     ) -> tuple[TransformResult, list[TokenInfo], str]:
         """Execute a batch flush with full audit recording.
 
@@ -718,7 +762,10 @@ class AggregationExecutor:
 
                 # Complete node state and batch
                 if result.status == "success":
+                    if validate_success is not None:
+                        validate_success(result, snapshot.buffered_tokens, batch_id)
                     self._complete_successful_flush(
+                        node_id=node_id,
                         node=node,
                         transform=transform,
                         result=result,
@@ -727,6 +774,7 @@ class AggregationExecutor:
                         batch_id=batch_id,
                         trigger_type=trigger_type,
                         window=window,
+                        buffered_tokens=snapshot.buffered_tokens,
                     )
                     batch_finalized = True
                 else:

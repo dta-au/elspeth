@@ -44,7 +44,7 @@ from elspeth.core.landscape.schema import (
     tokens_table,
 )
 
-__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded"]
+__all__ = ["TokenOutcomeRepository", "record_buffered_outcome_guarded", "record_terminal_outcome_guarded"]
 
 # IN-clause chunk size for token-id lock queries — stays under SQLite's
 # default 999 bound-parameter ceiling (the node_states.py convention) and
@@ -198,6 +198,33 @@ class TokenOutcomeRepository:
             raise AuditIntegrityError(
                 f"ADR-019 I1c violation for token {ref.token_id}: artifact_id={artifact_id!r} "
                 "changed its producing node_state during outcome validation."
+            )
+
+    @staticmethod
+    def _refuse_abandonment_contradiction(
+        ref: TokenRef,
+        *,
+        path: TerminalPath,
+        conn: Connection,
+    ) -> None:
+        """Refuse either half of decided-plus-abandoned after the token lock."""
+        if path is TerminalPath.ABANDONED:
+            contradiction = token_outcomes_table.c.completed == 1
+            description = "a completed terminal outcome"
+        else:
+            contradiction = token_outcomes_table.c.path == TerminalPath.ABANDONED.value
+            description = "an ABANDONED outcome"
+        existing = conn.execute(
+            select(token_outcomes_table.c.outcome_id)
+            .where(token_outcomes_table.c.run_id == ref.run_id)
+            .where(token_outcomes_table.c.token_id == ref.token_id)
+            .where(contradiction)
+            .limit(1)
+        ).first()
+        if existing is not None:
+            raise AuditIntegrityError(
+                f"Cannot record {path.value!r} for token {ref.token_id!r}: {description} already exists; "
+                "decided-plus-abandoned history is forbidden (ADR-038)"
             )
 
     @staticmethod
@@ -481,6 +508,7 @@ class TokenOutcomeRepository:
             if not dependencies_prelocked:
                 self.lock_token_outcome_dependencies((ref,), conn=active_conn)
             self._ownership.validate_token_run_ownership(ref, conn=active_conn)
+            self._refuse_abandonment_contradiction(ref, path=path, conn=active_conn)
             self._validate_cross_table_invariants(
                 ref,
                 outcome,
@@ -724,4 +752,48 @@ def record_buffered_outcome_guarded(
         ) from exc
     if result.rowcount == 0:
         raise LandscapeRecordError(f"record_buffered_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
+    return outcome_id
+
+
+def record_terminal_outcome_guarded(
+    conn: Connection,
+    *,
+    run_id: str,
+    token_id: str,
+    outcome: TerminalOutcome,
+    path: TerminalPath,
+    recorded_at: datetime,
+    error_hash: str | None = None,
+) -> str:
+    """Record one terminal outcome inside a caller-owned fenced transaction."""
+    TokenOutcomeRepository._validate_outcome_fields(
+        outcome,
+        path,
+        sink_name=None,
+        batch_id=None,
+        fork_group_id=None,
+        join_group_id=None,
+        expand_group_id=None,
+        error_hash=error_hash,
+    )
+    outcome_id = f"out_{generate_id()[:12]}"
+    try:
+        result = conn.execute(
+            token_outcomes_table.insert().values(
+                outcome_id=outcome_id,
+                run_id=run_id,
+                token_id=token_id,
+                outcome=outcome.value,
+                path=path.value,
+                completed=1,
+                recorded_at=recorded_at,
+                error_hash=error_hash,
+            )
+        )
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(
+            f"record_terminal_outcome_guarded failed for token_id={token_id!r} — database rejected audit write: {type(exc).__name__}"
+        ) from exc
+    if result.rowcount == 0:
+        raise LandscapeRecordError(f"record_terminal_outcome_guarded: zero rows affected for token_id={token_id!r} — audit write failed")
     return outcome_id

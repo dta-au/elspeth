@@ -1600,7 +1600,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
             .values(
                 pending_sink_name="default",
                 pending_outcome="success",
-                pending_path="continue",
+                pending_path="default_flow",
                 lease_expires_at=now + timedelta(seconds=30),  # expired by sweep_time
             )
         )

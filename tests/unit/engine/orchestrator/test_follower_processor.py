@@ -1289,6 +1289,35 @@ class TestFollowerHeartbeatLifecycle:
             follower.run(ctx=_ctx())
         assert heartbeat.stop_called
 
+    def test_unexpected_drain_failure_stops_heartbeat_then_departs(self) -> None:
+        """Exceptional traversal teardown must not leave an ACTIVE worker."""
+        lifecycle_events: list[str] = []
+        coord_repo = _StubRunCoordRepo(lifecycle_events=lifecycle_events)
+        heartbeat = _StubHeartbeat(lifecycle_events=lifecycle_events)
+
+        class _ExplodingDrain:
+            def drain_follower_ready_work(self, ctx: Any, *, before_claim: Any = None) -> list[Any]:
+                del ctx, before_claim
+                raise RuntimeError("unexpected traversal failure")
+
+        follower = FollowerProcessor(
+            processor=_ExplodingDrain(),  # type: ignore[arg-type]
+            token=CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0),
+            run_coordination=coord_repo,  # type: ignore[arg-type]
+            factory=_StubFactory(running=True),  # type: ignore[arg-type]
+            now_fn=lambda: NOW,
+            wait_fn=lambda _: None,
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(RuntimeError, match="unexpected traversal failure"),
+        ):
+            follower.run(ctx=_ctx())
+
+        assert heartbeat.stop_final_beats == [True]
+        assert lifecycle_events == ["heartbeat_stop", "worker_depart"]
+
 
 # ---------------------------------------------------------------------------
 # Tests: finalize-departure clean exit (§B.1 / §D flip discrimination)

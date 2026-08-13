@@ -17,7 +17,9 @@ The state engine comprises four coupled durable mechanisms:
 The engine holds no scheduler write transaction across source, transform, or
 sink plugin I/O. That design keeps database transactions bounded but creates
 cross-transaction seams that require durable continuation authority and fresh-
-process restart proof.
+process restart proof. The maintained store profiles are SQLite WAL for the
+single-host shapes and PostgreSQL 16 for the AWS single-leader Landscape
+shape. PostgreSQL does not imply multi-replica scheduling support.
 
 ## Token scheduler
 
@@ -64,6 +66,17 @@ fields define these subtypes:
 A queue-only hold remains dormant until reachability and release authority are
 positively established.
 
+`ABANDONED` is a permanent undecided token fate, not a scheduler work status
+or a completed terminal token outcome. TS-19 writes `(NULL, ABANDONED)` for
+non-resumable pending tokens atomically with fenced terminal run finalization;
+using the same one-time non-resumability decision, it also changes every
+effect-linked operation still `open` to `failed` with bounded categorical
+evidence. Both sweeps share the terminal transaction and neither depends on
+the other finding a candidate. The run is terminal while the token's
+`TerminalPath.ABANDONED` remains non-terminal (`completed=False`). RM-14 and
+F-14 govern how accounting, resume, and illegal re-entry interpret that
+two-axis state.
+
 ### Transition families
 
 | IDs | Responsibility |
@@ -75,9 +88,10 @@ positively established.
 | TS-15–TS-18 | Barrier consume, sink handoff, and atomic continuation emission |
 | AUX-01–AUX-07 | Heartbeat, lease loss, adoption, branch-loss cursor, membership, and leader fencing |
 | RC-01–RC-07 | Leader seat and worker-registry lifecycle |
+| TS-19 | Fenced run finalization for non-resumable pending tokens and open effect-linked operations |
 
 The exact stable leg list and required cases live in the
-[v1 catalog](proof-catalog/v1/catalog.json).
+[v2 catalog](proof-catalog/v2/catalog.json).
 
 ### Write ownership
 
@@ -173,12 +187,19 @@ and may atomically emit:
 
 Coalesce now materializes deterministic effect identity, parent membership,
 merged token identity, and terminal parent evidence before marking the effect
-complete. Repository atomicity is strong; the full production process-death
-restart discriminator remains mandatory evidence.
+complete. Restore recognizes a completed effect whose exact parents are still
+BLOCKED and publishes the persisted merged token through one strict
+`complete_barrier` call; it does not classify those parents as mere late
+arrivals or execute the merge again. Repository atomicity is strong; the full
+deployment-profile process-death matrix remains mandatory evidence.
 
-Aggregation transform-mode continuation differs: a successful barrier consume
-can commit before non-sink child scheduling. The TS-15-to-child-TS-00 seam
-therefore remains a live architecture/proof gap.
+Aggregation transform mode similarly binds a completed batch/node result to a
+claimed expansion group and self-contained ordered child payloads. If those
+terminal parents remain BLOCKED with no child continuation, restore verifies
+the completed output hash and publishes READY/PENDING_SINK children together
+with exact parent consumption. The transform is never replayed to reconstruct
+that committed result. Images before the expansion receipt exists remain
+non-reconstructable and fail closed.
 
 ## Sink-effect state machine
 
@@ -206,6 +227,16 @@ The durable model includes:
 - ordered effect members and per-member evidence;
 - effect attempts and external-call intent/result;
 - artifact and token-outcome finalization in one Landscape transaction.
+
+Reservation also creates exactly one deterministic `sink_write` operation
+linked to the effect. While that effect is unfinished, `status = open` means
+unfinished and resumable; it is not failure evidence. The effect's current
+lease owner and generation are the sole publication-custody authority, so a
+recovering worker reuses the same effect and operation after a fenced takeover.
+Atomic effect finalization completes that operation. Task 10 owns the distinct
+fenced transition from a non-resumable open operation to `failed`, together
+with the corresponding prohibition on resume; recoverable effect handling must
+not perform that terminal transition.
 
 `RESERVED` has two durable subtypes. An unclaimed reservation has no active
 preparation owner. A preparation-claimed reservation persists owner,
@@ -266,7 +297,9 @@ flowchart LR
 | PB-06 | Sink effect | Reserve, claim preparation, inspect, plan, lease, reconcile/commit, and finalize. |
 | PB-07 | Post-sink repair | TS-14 closes durable scheduler debt without external I/O. |
 | PB-08 | Follower | Claims and row-level traversal; leader retains barrier and sink authority. |
-| PB-09 | Lifecycle | Fresh/resume/follower start and normal/exceptional teardown ordering. |
+| PB-09 | Plugin lifecycle | Every current first-party source, transform, and sink is covered across its applicable lifecycle/profile cases. |
+| PB-10 | Row union | Durable branch membership converges exactly once across arrival, loss, timeout, release, late arrival, and recovery. |
+| PB-11 | PostgreSQL 16 | DB-server time, row-lock ordering, transaction isolation, schema admission/migration, and ambiguous connection loss are proved on a real PostgreSQL 16 service for the AWS single-leader profile. |
 
 ## Read-model authority
 
@@ -288,6 +321,7 @@ flush, resume, relinquish, evict, or complete:
 | RM-11 | Barrier-backed BLOCKED count for completion and resume preflight |
 | RM-12 | Barrier-backed BLOCKED listing for journal restoration |
 | RM-13 | Pending barrier-adoption listing for leader intake |
+| RM-14 | Accounting and resume distinguish decided, resumable pending, abandoned, and contradictory decided-plus-abandoned tokens |
 
 Each truth table must cover positive and negative status/subtype arms, run and
 owner scoping, exact expiry equality, deduplication, and ordering. Scattered
@@ -305,7 +339,7 @@ list; that catalog list remains the machine authority.
 | Pre-fix TS-02 row/token/initial-claim image without source state | Resume drain and plugin traversal | Closed compatibility seam: before plugin execution, `SourceCompletionReconciler` requires a root `LEASED` work item at attempt 1/step 1, exactly one matching current-work-item `ENQUEUE` and `CLAIM_READY`, matching row/token/ingest/payload hashes, and no conflicting source state. It inserts one exact source `COMPLETED` witness; repeat repair is idempotent and every ambiguity fails closed. Current TS-02 ingress no longer creates this image. |
 | TS-00 child enqueue | Parent disposition | P1 crash seam; `elspeth-7cdc4da434` |
 | Plugin call begins under scheduler lease | Next heartbeat/disposition | P1 long-call characterization; `elspeth-51a4b5c771` |
-| TS-15 aggregation consume | Non-sink child TS-00 scheduling | Durable continuation authority incomplete |
+| Completed aggregation/coalesce result receipt | TS-15 consume plus TS-17/TS-18 successor publication | Restore derives the exact child/merged token from the durable receipt and completes the barrier without plugin/merge replay; deployment-profile process proof remains required |
 | Plugin return or visible side effect | Terminal node-state audit | Ordinary transform process-death proof incomplete |
 | Before/after sink-effect reservation | Preparation claim and target inspection | Deterministic reservation and generation-fenced preparation ownership must be reusable after restart |
 | Preparation claim / target inspection | Immutable plan CAS | Death or takeover must not bind a plan from a stale preparation generation |
@@ -314,6 +348,7 @@ list; that catalog list remains the machine authority.
 | Returned response | Atomic effect/member/artifact/outcome finalization | Restart must reuse the exact result or reconcile without another publication |
 | Effect finalization | Coordinator response/reuse | A repeated caller must observe the finalized winner without committing again |
 | Sink effect finalization/outcome | TS-11/TS-12/TS-13 scheduler callback | TS-14 repair exists; integrated callback-loss proof remains mandatory |
+| Open effect-linked operation | Non-resumable FAILED/INTERRUPTED finalization | TS-19 atomically fails the operation with the run stamp and token-abandonment sweep; resumable interruption preserves it for retry |
 
 The sink-effect coordinator also holds a generation-fenced lease while calling
 external reconcile/commit. A heartbeat API exists, but current production-path
@@ -323,11 +358,16 @@ demonstrates the outcome.
 
 ## Forbidden paths
 
-`F-01` through `F-13` cover illegal final-state jumps, foreign barrier release,
+`F-01` through `F-14` cover illegal final-state jumps, foreign barrier release,
 wrong-owner dispositions, missing release keys, absent membership, unsafe
 recovery, partial sink batches, non-exhaustive barrier completion, stale leader
 mutation, source-boundary queue entry, deleted `WAITING`, and dormant queue-only
-release.
+release. `F-14` additionally forbids an `ABANDONED` token from re-entering
+processing or coexisting with a decided terminal outcome.
+
+The same TS-19 boundary forbids an effect-linked operation from remaining
+`open` after fenced non-resumable finalization; already terminal and `pending`
+operation history is never rewritten.
 
 Forbidden paths require positive refusal and zero-mutation evidence. Absence of
 a located caller is not proof of unreachability when static analysis reports

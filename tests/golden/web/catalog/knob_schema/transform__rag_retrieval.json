@@ -56,7 +56,11 @@
       },
       {
         "description": "Retrieval provider name registered in the RAG provider catalog.",
-        "kind": "text",
+        "enum": [
+          "azure_search",
+          "chroma"
+        ],
+        "kind": "enum",
         "label": "Provider",
         "name": "provider",
         "nullable": false,

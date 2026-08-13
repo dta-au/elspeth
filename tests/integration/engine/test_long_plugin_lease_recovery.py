@@ -18,6 +18,7 @@ import queue
 import traceback
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from multiprocessing.process import BaseProcess
 from pathlib import Path
 from typing import Any, Literal
 
@@ -58,11 +59,13 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
 )
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.plugins import CollectSink
+from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
 _LEASE_SECONDS = 2
 _HEARTBEAT_SECONDS = 1
 _STALL_BUDGET_SECONDS = 1
 _PROCESS_TIMEOUT_SECONDS = 30.0
+_PROCESS_CLEANUP_JOIN_SECONDS = 2.0
 
 
 class _SharedFileClock:
@@ -259,6 +262,8 @@ class _ScenarioResult:
     scheduler_events: tuple[dict[str, Any], ...]
     coordination_events: tuple[dict[str, Any], ...]
     plugin_trace: tuple[dict[str, Any], ...]
+    before_old_worker_release: StateEngineImage
+    after_old_worker_completion: StateEngineImage
 
 
 def _queue_result(result_queue: Any) -> dict[str, Any]:
@@ -270,11 +275,23 @@ def _queue_result(result_queue: Any) -> dict[str, Any]:
     return result
 
 
-def _join_process(process: multiprocessing.Process, *, label: str) -> None:
+def _stop_process_bounded(process: BaseProcess, *, label: str) -> None:
+    """Terminate then kill a stuck child without an unbounded join."""
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(_PROCESS_CLEANUP_JOIN_SECONDS)
+    if process.is_alive():
+        process.kill()
+        process.join(_PROCESS_CLEANUP_JOIN_SECONDS)
+    if process.is_alive():  # pragma: no cover - operating-system process failure
+        raise AssertionError(f"could not clean up {label} through the bounded terminate/kill ladder")
+
+
+def _join_process(process: BaseProcess, *, label: str) -> None:
     process.join(_PROCESS_TIMEOUT_SECONDS)
     if process.is_alive():  # pragma: no cover - timeout is a harness failure with explicit diagnostics
-        process.terminate()
-        process.join()
+        _stop_process_bounded(process, label=label)
         raise AssertionError(f"{label} did not terminate after its bounded release")
     assert process.exitcode == 0, f"{label} exited with code {process.exitcode}"
 
@@ -387,17 +404,15 @@ def _run_stall_scenario(tmp_path: Path, *, late_outcome: Literal["success", "fai
         replacement_result = _queue_result(replacement_results)
         assert replacement_result == {"drained": 1, "ok": True}
 
+        before_old_worker_release = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
         old_release.set()
         _join_process(old_process, label="old worker")
         old_result = _queue_result(old_results)
+        after_old_worker_completion = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
     finally:
         old_release.set()
-        if old_process.is_alive():
-            old_process.terminate()
-            old_process.join()
-        if replacement_process.is_alive():
-            replacement_process.terminate()
-            replacement_process.join()
+        _stop_process_bounded(old_process, label="old worker")
+        _stop_process_bounded(replacement_process, label="replacement worker")
 
     with crashed.db.engine.connect() as conn:
         final_item = dict(
@@ -434,11 +449,23 @@ def _run_stall_scenario(tmp_path: Path, *, late_outcome: Literal["success", "fai
         scheduler_events=scheduler_events,
         coordination_events=coordination_events,
         plugin_trace=plugin_trace,
+        before_old_worker_release=before_old_worker_release,
+        after_old_worker_completion=after_old_worker_completion,
     )
 
 
 def _assert_recovered_loser_contract(result: _ScenarioResult) -> None:
     """Assert the exact durable winner/loser image shared by both outcomes."""
+
+    result.before_old_worker_release.diff(result.after_old_worker_completion).assert_only(
+        {"scheduler_events": set(scheduler_events_table.c.keys())}
+    )
+    before_events = result.before_old_worker_release.tables["scheduler_events"]
+    after_events = result.after_old_worker_completion.tables["scheduler_events"]
+    assert len(after_events) == len(before_events) + 1
+    appended_events = tuple(event for event in after_events if event not in before_events)
+    assert len(appended_events) == 1
+    assert appended_events[0]["event_type"] == SchedulerEventType.LEASE_LOST.value
 
     assert result.old_worker == {"drained": 0, "ok": True}
     assert result.replacement_worker == {"drained": 1, "ok": True}

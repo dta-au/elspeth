@@ -46,7 +46,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileResult,
 )
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
-from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
+from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSink
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, validate_headers_value
 from elspeth.plugins.infrastructure.display_headers import (
@@ -155,6 +155,11 @@ class AzureBlobSinkConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "sink"
 
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
+
     # Auth Option 1: Connection string
     connection_string: str | None = Field(
         default=None,
@@ -254,7 +259,8 @@ class AzureBlobSinkConfig(DataPluginConfig):
         """
         # Create AzureAuthConfig to validate auth fields
         # This will raise ValueError with descriptive messages if invalid
-        AzureAuthConfig(
+        auth = AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -263,6 +269,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
             client_id=self.client_id,
             client_secret=self.client_secret,
         )
+        object.__setattr__(self, "auth_mode", auth.auth_method)
         return self
 
     def get_auth_config(self) -> AzureAuthConfig:
@@ -272,6 +279,7 @@ class AzureBlobSinkConfig(DataPluginConfig):
             AzureAuthConfig instance with the auth fields from this config.
         """
         return AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -349,7 +357,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4110c8bcefdca79f"
+    source_file_hash: str | None = "sha256:d06b95f20832ba08"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP

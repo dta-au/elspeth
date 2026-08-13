@@ -1,4 +1,4 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 30)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 32)."""
 
 from __future__ import annotations
 
@@ -9,9 +9,18 @@ from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex
 
 from elspeth.contracts.scheduler import SchedulerEventType
-from elspeth.core.landscape.database import _REQUIRED_COLUMNS, _REQUIRED_COMPOSITE_FOREIGN_KEYS, _REQUIRED_INDEXES, LandscapeDB
+from elspeth.core.landscape.database import (
+    _REQUIRED_CHECK_CONSTRAINTS,
+    _REQUIRED_COLUMNS,
+    _REQUIRED_COMPOSITE_FOREIGN_KEYS,
+    _REQUIRED_INDEXES,
+    LandscapeDB,
+)
 from elspeth.core.landscape.schema import (
     SQLITE_SCHEMA_EPOCH,
+    aggregation_result_members_table,
+    aggregation_result_outputs_table,
+    aggregation_results_table,
     artifacts_table,
     batches_table,
     checkpoints_table,
@@ -27,8 +36,44 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 30
+def test_epoch_is_thirty_two() -> None:
+    assert SQLITE_SCHEMA_EPOCH == 32
+
+
+def test_epoch_32_requires_normalized_aggregation_result_receipts() -> None:
+    required_columns = set(_REQUIRED_COLUMNS)
+    required_foreign_keys = set(_REQUIRED_COMPOSITE_FOREIGN_KEYS)
+    required_checks = set(_REQUIRED_CHECK_CONSTRAINTS)
+    required_indexes = set(_REQUIRED_INDEXES)
+
+    for table in (aggregation_results_table, aggregation_result_outputs_table, aggregation_result_members_table):
+        assert table.name in metadata.tables
+        for column in table.columns:
+            assert (table.name, column.name) in required_columns
+
+    assert (
+        "aggregation_results",
+        ("batch_id", "run_id"),
+        "batches",
+        ("batch_id", "run_id"),
+    ) in required_foreign_keys
+    assert (
+        "aggregation_results",
+        ("aggregation_state_id", "run_id"),
+        "node_states",
+        ("state_id", "run_id"),
+    ) in required_foreign_keys
+    assert (
+        "aggregation_result_members",
+        ("token_id", "run_id"),
+        "tokens",
+        ("token_id", "run_id"),
+    ) in required_foreign_keys
+    assert ("aggregation_results", "ck_aggregation_results_output_hash_hex") in required_checks
+    assert ("aggregation_results", "ck_aggregation_results_mode_shape_parent") in required_checks
+    assert ("aggregation_result_outputs", "ck_aggregation_result_outputs_ref_hex") in required_checks
+    assert ("aggregation_result_members", "ck_aggregation_result_members_action") in required_checks
+    assert ("aggregation_results", "ix_aggregation_results_run") in required_indexes
 
 
 def test_epoch_30_requires_row_union_name() -> None:

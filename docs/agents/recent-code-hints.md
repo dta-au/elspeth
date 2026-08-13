@@ -8,6 +8,51 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-12 — a live-evidence artifact cannot authenticate its own upload
+  digest**: the final GitHub artifact/archive digest exists only after upload,
+  so embedding it in `manifest.json` is circular and self-declared hashes are
+  not producer authentication. Ingestion selects the artifact through the
+  read-only Actions API, downloads that API record's archive, verifies the
+  API-reported digest over the downloaded bytes, safely admits the exact five
+  regular members, and byte-compares them with the supplied directory. Reject
+  duplicate/traversal/extra/encrypted/oversized or compression-bomb members.
+  GitHub's archive endpoint redirects to a different origin: strip the bearer
+  token on every cross-origin redirect, never forward it to the signed blob
+  host.
+
+- **2026-08-12 — PB-09 plugin variants are a three-way exact-set contract**:
+  `scripts/state_engine_plugin_matrix.py check` derives the closed variant set
+  from production-owned Pydantic discriminators and registries, constructs
+  every variant through real config validation, and compares the mechanical
+  discovery projection with
+  `tests/golden/state_engine/plugin_lifecycle_matrix.json`. The discovery suite
+  separately pins live plugin keys, golden variants, and v3 PB-09
+  `(plugin_key, variant_id)` pairs. Adding a plugin or a supported auth/provider
+  mode requires updating the reviewed golden fields and v3 PB-09 cases together;
+  `render-skeleton` deliberately exits nonzero while any new reviewed field is
+  `UNCLASSIFIED`. The golden is reviewed evidence, never variant authority.
+
+- **2026-08-12 — follower teardown has one exit seam and partial startup is
+  tracked explicitly**: `FollowerProcessor.run()` stops its heartbeat before
+  departing the single-use worker on every exit, including unexpected
+  traversal exceptions. Do not add a new exception arm that departs early or
+  bypasses the common `finally`; exact-once departure and stop-before-depart
+  ordering are pinned. CLI follower startup records a transform or sink only
+  after its `on_start()` returns. Pass those exact started subsets to
+  `cleanup_plugins`; never call `on_complete()` or `close()` on the plugin
+  whose startup raised, or on later plugins that were never started.
+
+- **2026-08-12 — Python 3.14 annotation closures expose class namespaces to
+  Runtime-VAL**: PEP 649 `__annotate__` functions close over `__classdict__`
+  and use `LOAD_FROM_DICT_OR_GLOBALS`; never normalize that whole dictionary,
+  because it contains unrelated interpreter state such as `_abc_impl`.
+  Normalize only the exact names read by supported bytecode shapes, including
+  whether each binding resolves from class, module globals, or builtins, and
+  fail closed on any unrecognized dictionary use. Slot member descriptors bind
+  by exact declaring `module:qualname` plus descriptor name. Python 3.14 also
+  emits `slice` objects as code constants, so preserve all three normalized
+  bounds rather than falling back to repr or narrowing supported Python.
+
 ## Whole-tree gates: a green scoped run proves NOTHING
 
 These gates assert over the ENTIRE tree with exact expected sets. Your change
@@ -169,6 +214,20 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-13 — aggregation members' live BUFFERED acceptances keep the
+  ORIGINAL batch_id across crash-retry**: `handle_incomplete_batches` retries a
+  dead EXECUTING/FAILED batch on a NEW batch linked through the durable
+  `batches.retry_of_batch_id` chain and copies `batch_members`, but the
+  acceptance-time BUFFERED `token_outcomes` rows are immutable history and
+  still name the original batch. Any consumer proving "this member is
+  buffered into this batch" — the `complete_aggregation_result` receipt
+  writer and the restore receipt validators — must bind against the whole
+  retry lineage (`core/landscape/batch_lineage.batch_retry_lineage_ids`),
+  never `token_outcomes.batch_id == batch_id` alone; the strict form bricks
+  every resumed EOF/flush-fault recovery. Do not "fix" this by writing a
+  second live BUFFERED row at restore: duplicate live acceptances are
+  refused as corruption by `_derive_restored_batch_id`.
+
 - **2026-08-12 — planner calls and semantic attempts are paired, not counted
   positionally**: a physical provider transport failure has no semantic
   attempt. Every response-bearing planner call (`success` or
@@ -194,6 +253,60 @@ sequentially per worktree.
   Freeform and guided-full keep the canonical identity contract. Reviewed
   guided initial/correction requests select an authority-derived delta, while
   prose amend/replace remains full-document authoring.
+
+- **2026-08-12 — PostgreSQL token-lock classification needs a fresh statement
+  after a lock wait**: do not combine `NOT EXISTS(token_outcomes)` and
+  `SELECT ... FOR UPDATE` when deciding token fate under READ COMMITTED. The
+  predicate can retain the statement's pre-wait snapshot after a competing
+  outcome writer commits. Lock token rows first in stable order, then classify
+  outcomes in a second statement. Every later outcome writer must re-check
+  for an existing `ABANDONED` row after acquiring the same token lock. SQLite
+  cannot prove this protocol because `FOR UPDATE` is inert there; retain the
+  independent PostgreSQL race tests for both lock winners.
+
+- **2026-08-12 — every successful aggregation completion owns an epoch-32
+  result receipt**: validate the plugin output and declaration contract before
+  completing anything, then commit the node, batch, ordered payload refs, and
+  exact member actions in one transaction. PostgreSQL writers lock member
+  tokens first, then node state, then batch. Transform results use a consumed
+  member as the expansion parent; passthrough results carry one output per
+  member and retain the original token identities; empty results carry no
+  output refs. Restore must load and purely validate every candidate receipt
+  before it mutates any candidate. For empty results, terminal member outcomes,
+  branch losses, and BLOCKED-to-TERMINAL scheduler transitions share one barrier
+  transaction. Do not notify or fire a downstream coalesce/row_union from the
+  empty-routing plan: replay the durable loss ledger only after that transaction
+  commits, otherwise a failed aggregation commit can strand a consumed sibling
+  barrier or lose its merged output. Payload retention and affected-run
+  accounting must include the receipt refs.
+
+- **2026-08-12 — completed barrier effects are continuations, not late
+  arrivals**: aggregation expansion receipts and completed coalesce-effect
+  receipts can exist while their exact input scheduler rows are still
+  `BLOCKED` (process death before `complete_barrier`). Restore must validate
+  the durable receipt and publish its READY/PENDING_SINK successor in the same
+  strict barrier completion that consumes those inputs. Never replay the
+  committed plugin/merge, and never let completed-key reconciliation discard
+  the persisted result as if every blocked parent were a late arrival.
+
+- **2026-08-12 — a long-running transform must re-prove scheduler ownership
+  before terminal audit writes**: `TransformExecutor` calls the processor's
+  rate-limited active-claim heartbeat immediately after plugin return or
+  exception and before node-state completion, transform-error/routing writes,
+  contract evolution, or result visibility. If recovery or eviction has moved
+  authority, `NodeStateGuard.abandon_open_state()` leaves that stale attempt
+  OPEN (the honest hard-kill image) and the ownership-loss exception must
+  propagate immediately; do not auto-fail, complete, or otherwise mutate the
+  stale attempt. The scheduler drain then clears any in-memory staged branch
+  losses and records only the canonical lease-loss evidence.
+- **2026-08-12 — sink-redrive recovery is admitted by the complete durable
+  bundle, not by `pending_sink_name` alone**: a `LEASED` row with any
+  sink-redrive field set is sink-shaped debt and must satisfy
+  `pending_sink_bundle_clause()` before it can return to `PENDING_SINK`.
+  Repeat the same subtype/bundle predicate inside the recovery CAS; the
+  diagnostic SELECT is not the safety boundary. A partial or concurrently
+  corrupted bundle fails closed and the whole recovery transaction rolls back
+  without rotating attempts, changing owners, or appending events.
 
 - **2026-08-11 — the AWS IAM policy templates and the deploy README's floor
   commit are both pinned; editing either without its sibling update is red**:

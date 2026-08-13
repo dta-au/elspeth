@@ -1,6 +1,7 @@
 """TransformExecutor - wraps transform.process() with audit recording."""
 
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
@@ -33,6 +34,8 @@ from elspeth.contracts.errors import (
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
+    RunWorkerEvictedError,
+    SchedulerLeaseLostError,
     ZeroEmissionSuccessContractViolation,
 )
 from elspeth.contracts.plugin_context import PluginContext, plugin_context_scope
@@ -149,10 +152,11 @@ class TransformExecutor:
     4. Record node state completion
     5. Emit OpenTelemetry span
 
-    Node state terminality is guaranteed by NodeStateGuard: if any
+    Node state terminality is controlled by NodeStateGuard: if any
     post-processing step (output hashing, contract evolution) raises
     before the state is explicitly completed, the guard auto-completes
-    it as FAILED.  This prevents orphan OPEN states in the audit trail.
+    it as FAILED. The narrow scheduler ownership-loss path preserves the
+    stale attempt OPEN because a replacement generation owns terminal audit.
 
     Example:
         executor = TransformExecutor(execution, span_factory, step_resolver, data_flow=data_flow)
@@ -171,6 +175,7 @@ class TransformExecutor:
         data_flow: DataFlowRepository,
         max_workers: int | None = None,
         error_edge_ids: dict[NodeID, str] | None = None,
+        before_terminal_audit: Callable[[], None] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -190,6 +195,7 @@ class TransformExecutor:
         self._step_resolver = step_resolver
         self._max_workers = max_workers
         self._error_edge_ids = error_edge_ids or {}
+        self._before_terminal_audit = before_terminal_audit
         # Adapter storage keyed by node_id — one SharedBatchAdapter per
         # row-pipelined batch transform, owned by the executor (not monkey-patched
         # onto the transform instance).
@@ -198,6 +204,16 @@ class TransformExecutor:
         # at module scope in engine.executors.pass_through (ADR-009 §Clause 2).
         # Both this executor and the processor's batch-flush cross-check share
         # the same instrument without needing constructor plumbing.
+
+    def _verify_ownership_before_terminal_audit(self, guard: NodeStateGuard) -> None:
+        """Fence terminal audit writes after a potentially long plugin call."""
+        if self._before_terminal_audit is None:
+            return
+        try:
+            self._before_terminal_audit()
+        except (SchedulerLeaseLostError, RunWorkerEvictedError):
+            guard.abandon_open_state()
+            raise
 
     def _record_terminal_contract_failure(
         self,
@@ -777,9 +793,11 @@ class TransformExecutor:
                         )
                         duration_ms = (time.perf_counter() - start) * 1000
                     except contract_errors.TIER_1_ERRORS:
+                        self._verify_ownership_before_terminal_audit(guard)
                         raise  # Tier 1 errors must crash — never record as row FAILED
                     except Exception as e:
                         duration_ms = (time.perf_counter() - start) * 1000
+                        self._verify_ownership_before_terminal_audit(guard)
                         # Record failure
                         error = ExecutionError(
                             exception=str(e),
@@ -806,6 +824,8 @@ class TransformExecutor:
                                 raise RuntimeError(f"Failed to evict timed-out submission for token {token.token_id}") from evict_err
 
                         raise
+
+                self._verify_ownership_before_terminal_audit(guard)
 
                 # -- Post-processing (GUARDED by NodeStateGuard) --
                 # If any of the following steps raise before guard.complete() is

@@ -23,6 +23,12 @@ repos:
       - id: check-toml
       - id: check-added-large-files
         args: ['--maxkb=1000']
+        # The v3 proof catalog and evidence selector manifest legitimately
+        # carry all 73 legs / 7,010 required-cell assignments; their integrity
+        # is guarded by their own validators (catalog validate +
+        # validate-selectors CLI + architecture tests + the CI
+        # state-engine-validation job), not by size.
+        exclude: '^docs/architecture/state_engine/proof-catalog/v3/(catalog|evidence_selectors)\.json$'
       - id: check-merge-conflict
       - id: debug-statements
 

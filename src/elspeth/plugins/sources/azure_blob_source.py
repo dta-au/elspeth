@@ -28,7 +28,7 @@ from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
-from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig
+from elspeth.plugins.infrastructure.azure_auth import AzureAuthConfig, AzureAuthMethod
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.config_base import DataPluginConfig, declared_source_schema_field_names
 from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
@@ -170,6 +170,11 @@ class AzureBlobSourceConfig(DataPluginConfig):
 
     _plugin_component_type: ClassVar[str | None] = "source"
 
+    auth_mode: AzureAuthMethod | None = Field(
+        default=None,
+        description="Explicit Azure authentication mode; inferred from legacy credential fields when omitted.",
+    )
+
     # Auth Option 1: Connection string
     connection_string: str | None = Field(
         default=None,
@@ -249,7 +254,8 @@ class AzureBlobSourceConfig(DataPluginConfig):
         """
         # Create AzureAuthConfig to validate auth fields
         # This will raise ValueError with descriptive messages if invalid
-        AzureAuthConfig(
+        auth = AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -258,6 +264,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
             client_id=self.client_id,
             client_secret=self.client_secret,
         )
+        object.__setattr__(self, "auth_mode", auth.auth_method)
         return self
 
     @model_validator(mode="after")
@@ -327,6 +334,7 @@ class AzureBlobSourceConfig(DataPluginConfig):
             AzureAuthConfig instance with the auth fields from this config.
         """
         return AzureAuthConfig(
+            auth_mode=self.auth_mode,
             connection_string=self.connection_string,
             sas_token=self.sas_token,
             use_managed_identity=self.use_managed_identity,
@@ -399,7 +407,7 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b84f5611f4b4ab1f"
+    source_file_hash: str | None = "sha256:6e51cc15eee15032"
     config_model = AzureBlobSourceConfig
 
     usage_when_to_use: str = (

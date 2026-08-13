@@ -1,8 +1,9 @@
 """Tests for dynamic plugin discovery."""
 
+import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast, get_args
 
 import pytest
 
@@ -11,8 +12,13 @@ from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransf
 from elspeth.plugins.infrastructure.discovery import (
     PLUGIN_SCAN_CONFIG,
     _canonical_module_name,
+    discover_all_plugins,
     discover_plugins_in_directory,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+PLUGIN_MATRIX_PATH = REPOSITORY_ROOT / "tests/golden/state_engine/plugin_lifecycle_matrix.json"
+V3_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
 
 
 class TestDiscoverPlugins:
@@ -272,6 +278,58 @@ class TestDiscoverAllPlugins:
         assert len(discovered["sinks"]) == EXPECTED_SINK_COUNT, (
             f"Sink count: expected {EXPECTED_SINK_COUNT}, got {len(discovered['sinks'])}. "
             f"Found: {[cls.name for cls in discovered['sinks']]}"  # type: ignore[attr-defined]
+        )
+
+    def test_live_golden_and_v3_pb09_plugin_and_variant_sets_are_exact(self) -> None:
+        from elspeth.plugins.infrastructure.azure_auth import AzureAuthMethod
+        from elspeth.plugins.infrastructure.clients.dataverse import DataverseAuthConfig
+        from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchAuthMode
+        from elspeth.plugins.infrastructure.clients.retrieval.connection import ChromaConnectionMode, ChromaSearchMode
+        from elspeth.plugins.sources.llm.source import LLMSource
+        from elspeth.plugins.transforms.aws.textract_config_shared import AuthMode as TextractAuthMode
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        discovered = discover_all_plugins()
+        live_keys = {f"{kind.removesuffix('s')}:{cast(Any, plugin).name}" for kind, plugins in discovered.items() for plugin in plugins}
+        matrix = json.loads(PLUGIN_MATRIX_PATH.read_text(encoding="utf-8"))
+        golden_keys = {entry["plugin_key"] for entry in matrix["plugins"]}
+        catalog = json.loads(V3_CATALOG_PATH.read_text(encoding="utf-8"))
+        pb09 = next(leg for leg in catalog["legs"] if leg["id"] == "PB-09")
+        catalog_keys = {case["plugin_key"] for case in pb09["required_cases"]}
+
+        assert len(live_keys) == 51
+        assert live_keys == golden_keys == catalog_keys
+
+        dataverse_modes = get_args(DataverseAuthConfig.model_fields["method"].annotation)
+        variant_map = {
+            "source:azure_blob": set(get_args(AzureAuthMethod)),
+            "source:dataverse": set(dataverse_modes),
+            "source:llm": set(LLMSource.discriminated_variants()[1]),
+            "transform:aws_textract_document_analysis": set(get_args(TextractAuthMode)),
+            "transform:aws_textract_inline_analysis": set(get_args(TextractAuthMode)),
+            "transform:llm": set(LLMTransform.discriminated_variants()[1]),
+            "transform:rag_retrieval": {
+                *(f"azure-search-{mode.replace('_', '-')}" for mode in get_args(AzureSearchAuthMode)),
+                *(f"chroma-{mode}" for mode in get_args(ChromaSearchMode)),
+            },
+            "sink:azure_blob": set(get_args(AzureAuthMethod)),
+            "sink:chroma_sink": set(get_args(ChromaConnectionMode)),
+            "sink:dataverse": set(dataverse_modes),
+        }
+        expected_pairs = {(plugin_key, variant) for plugin_key in live_keys for variant in variant_map.get(plugin_key, {"default"})}
+        golden_pairs = {(entry["plugin_key"], variant) for entry in matrix["plugins"] for variant in entry["variants"]}
+        catalog_pairs = {(case["plugin_key"], case["variant_id"]) for case in pb09["required_cases"]}
+
+        assert len(expected_pairs) == 72
+        assert expected_pairs == golden_pairs == catalog_pairs
+        assert {case["case_id"] for case in pb09["required_cases"]} == {
+            plugin_key if variant == "default" else f"{plugin_key}@{variant}" for plugin_key, variant in expected_pairs
+        }
+        assert all(
+            cell["status"] == "required" and cell["reason"] is None
+            for case in pb09["required_cases"]
+            for profile in case["cell_applicability"].values()
+            for cell in profile.values()
         )
 
     def test_source_scan_includes_nested_llm_directory(self) -> None:

@@ -572,6 +572,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         SinkEffectExecutionSeam.BEFORE_EFFECT,
         SinkEffectExecutionSeam.AFTER_EFFECT_BEFORE_RETURN,
         SinkEffectExecutionSeam.AFTER_RETURN_BEFORE_FINALIZE,
+        SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE,
     ),
 )
 def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
@@ -619,6 +620,21 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
                 fault_hook=fail_once,
             )
 
+        factory = RecorderFactory(db)
+        (effect_before,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        (operation_before,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run("run-export") if operation.sink_effect_id is not None
+        )
+        assert operation_before.sink_effect_id == effect_before.effect_id
+        if seam is SinkEffectExecutionSeam.AFTER_FINALIZE_BEFORE_RESPONSE:
+            assert effect_before.state is SinkEffectState.FINALIZED
+            assert operation_before.status == "completed"
+            assert operation_before.completed_at is not None
+        else:
+            assert effect_before.state is SinkEffectState.IN_FLIGHT
+            assert operation_before.status == "open"
+            assert operation_before.completed_at is None
+
         result = execute_audit_export_effect(
             factory=RecorderFactory(db),
             snapshot=snapshot,
@@ -631,6 +647,18 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
         assert target.publication_count == 1
         assert result.artifact.sink_effect_id == target.effect_id
         assert result.state_ids == () and result.outcome_ids == ()
+        factory = RecorderFactory(db)
+        (effect_after,) = factory.execution.sink_effects.get_effects_for_run("run-export")
+        (operation_after,) = tuple(
+            operation for operation in factory.execution.get_operations_for_run("run-export") if operation.sink_effect_id is not None
+        )
+        assert effect_after.state is SinkEffectState.FINALIZED
+        assert effect_after.effect_id == effect_before.effect_id
+        assert effect_after.artifact_id == effect_before.artifact_id
+        assert operation_after.operation_id == operation_before.operation_id
+        assert operation_after.sink_effect_id == effect_after.effect_id
+        assert operation_after.status == "completed"
+        assert operation_after.completed_at is not None
     finally:
         db.close()
 

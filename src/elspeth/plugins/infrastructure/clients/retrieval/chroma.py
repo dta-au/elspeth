@@ -33,6 +33,7 @@ from elspeth.contracts.probes import CollectionReadinessResult
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError
 from elspeth.plugins.infrastructure.clients.retrieval.connection import (
     ChromaConnectionConfig,
+    ChromaSearchMode,
     _validated_chroma_http_client_args,
 )
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
@@ -47,7 +48,7 @@ class ChromaSearchProviderConfig(BaseModel):
     model_config = {"extra": "forbid", "frozen": True}
 
     collection: str
-    mode: Literal["ephemeral", "persistent", "client"] = "ephemeral"
+    mode: ChromaSearchMode = "ephemeral"
 
     persist_directory: str | None = None
 
