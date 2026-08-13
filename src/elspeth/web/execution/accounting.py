@@ -398,74 +398,79 @@ def load_run_accounting_map_from_db(
             ):
                 discarded[run_id] += value
 
-        # Per-token decision census. The outer join admits completed rows AND
-        # ADR-038 (NULL, ABANDONED) rows; the conditional counts split them so
-        # one pass classifies every emitted token as decided / abandoned /
-        # unexplained.
-        outcomes_by_emitted_token = (
+        # Per-token decision census, grouped over token_outcomes ALONE. The
+        # admitted set is completed rows plus ADR-038 (NULL, ABANDONED) rows;
+        # the conditional counts split them so one pass classifies every
+        # ACCOUNTED token as decided / abandoned / contradictory, and tokens
+        # with no decision at all are the arithmetic remainder against
+        # ``emitted_tokens``.
+        #
+        # Subtraction rather than an anti-join is what makes this linear:
+        # token_outcomes carries a composite FK (token_id, run_id) → tokens
+        # under a mandatory ``PRAGMA foreign_keys=1``, so every outcome row's
+        # token IS an emitted token and the accounted set cannot exceed the
+        # emitted set. The guard below re-derives that rather than assuming it.
+        #
+        # The previous form joined ``tokens`` to ``token_outcomes`` per token
+        # and executed the result FOUR times. token_outcomes indexes run_id and
+        # token_id separately but not the pair, and an audit database carries no
+        # ANALYZE statistics, so SQLite resolved the inner loop through
+        # ix_token_outcomes_run_id and rescanned every outcome for every token:
+        # 618s to project one 60k-token run (elspeth-c675c8c2d9).
+        decided_by_token = (
             select(
-                tokens_table.c.run_id.label("run_id"),
-                tokens_table.c.token_id.label("token_id"),
+                token_outcomes_table.c.run_id.label("run_id"),
                 func.count(case((token_outcomes_table.c.completed == 1, 1))).label("completed_count"),
                 func.count(case((token_outcomes_table.c.path == TerminalPath.ABANDONED.value, 1))).label("abandoned_count"),
             )
-            .select_from(
-                tokens_table.outerjoin(
-                    token_outcomes_table,
-                    and_(
-                        token_outcomes_table.c.run_id == tokens_table.c.run_id,
-                        token_outcomes_table.c.token_id == tokens_table.c.token_id,
-                        or_(
-                            token_outcomes_table.c.completed == 1,
-                            token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
-                        ),
-                    ),
+            .where(token_outcomes_table.c.run_id.in_(present_run_ids))
+            .where(
+                or_(
+                    token_outcomes_table.c.completed == 1,
+                    token_outcomes_table.c.path == TerminalPath.ABANDONED.value,
                 )
             )
-            .where(tokens_table.c.run_id.in_(present_run_ids))
-            .group_by(tokens_table.c.run_id, tokens_table.c.token_id)
+            .group_by(token_outcomes_table.c.run_id, token_outcomes_table.c.token_id)
             .subquery()
         )
 
-        missing_stmt = (
-            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(outcomes_by_emitted_token.c.completed_count == 0)
-            .where(outcomes_by_emitted_token.c.abandoned_count == 0)
-            .group_by(outcomes_by_emitted_token.c.run_id)
-        )
-        for run_id, count in conn.execute(missing_stmt):
-            missing_terminal_outcomes[str(run_id)] = int(count)
+        census_stmt = select(
+            decided_by_token.c.run_id,
+            func.count().label("accounted"),
+            func.count(case((decided_by_token.c.completed_count > 1, 1))).label("duplicated"),
+            func.count(case((and_(decided_by_token.c.completed_count == 0, decided_by_token.c.abandoned_count > 0), 1))).label("abandoned"),
+            func.count(case((and_(decided_by_token.c.completed_count > 0, decided_by_token.c.abandoned_count > 0), 1))).label(
+                "contradictory"
+            ),
+        ).group_by(decided_by_token.c.run_id)
 
-        abandoned_stmt = (
-            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(outcomes_by_emitted_token.c.completed_count == 0)
-            .where(outcomes_by_emitted_token.c.abandoned_count > 0)
-            .group_by(outcomes_by_emitted_token.c.run_id)
-        )
-        for run_id, count in conn.execute(abandoned_stmt):
-            abandoned_tokens[str(run_id)] = int(count)
+        accounted_tokens = _zero_counts(present_run_ids)
+        for census in conn.execute(census_stmt):
+            # _mapping, not attribute access: Row.count is the tuple method,
+            # and every labelled aggregate rides the same Row protocol.
+            run_id = str(census._mapping["run_id"])
+            accounted_tokens[run_id] = int(census._mapping["accounted"])
+            duplicate_terminal_outcomes[run_id] = int(census._mapping["duplicated"])
+            abandoned_tokens[run_id] = int(census._mapping["abandoned"])
+            # ADR-038 contradiction guard: a token both decided AND abandoned
+            # means the audit trail simultaneously claims a lifecycle answer
+            # exists and that nothing would ever produce one.
+            contradictory = int(census._mapping["contradictory"])
+            if contradictory > 0:
+                violations_by_run[run_id].append(
+                    f"{contradictory} token(s) both terminally decided and marked ABANDONED — audit contradiction (ADR-038)"
+                )
 
-        duplicate_stmt = (
-            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(outcomes_by_emitted_token.c.completed_count > 1)
-            .group_by(outcomes_by_emitted_token.c.run_id)
-        )
-        for run_id, count in conn.execute(duplicate_stmt):
-            duplicate_terminal_outcomes[str(run_id)] = int(count)
-
-        # ADR-038 contradiction guard: a token both decided AND abandoned
-        # means the audit trail simultaneously claims a lifecycle answer
-        # exists and that nothing would ever produce one.
-        contradiction_stmt = (
-            select(outcomes_by_emitted_token.c.run_id, func.count().label("count"))
-            .where(outcomes_by_emitted_token.c.completed_count > 0)
-            .where(outcomes_by_emitted_token.c.abandoned_count > 0)
-            .group_by(outcomes_by_emitted_token.c.run_id)
-        )
-        for run_id, count in conn.execute(contradiction_stmt):
-            violations_by_run[str(run_id)].append(
-                f"{int(count)} token(s) both terminally decided and marked ABANDONED — audit contradiction (ADR-038)"
-            )
+        for run_id in present_run_ids:
+            accounted = accounted_tokens[run_id]
+            emitted = emitted_tokens[run_id]
+            if accounted > emitted:
+                # Only reachable if the composite FK was not enforced when the
+                # store was written. Name it as the integrity failure it is
+                # instead of deriving a negative pending count from it.
+                violations_by_run[run_id].append(f"{accounted} decided or abandoned token(s) exceed the {emitted} token(s) the run emitted")
+                continue
+            missing_terminal_outcomes[run_id] = emitted - accounted
 
     accounting: dict[str, RunAccounting] = {}
     corrupt: dict[str, RunAccountingCorruption] = {}

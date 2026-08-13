@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS
@@ -939,3 +940,80 @@ def test_sqlite_blocks_duplicate_completed_terminal_outcomes() -> None:
             )
     finally:
         db.close()
+
+
+def _count_sqlite_vm_steps(db: LandscapeDB, run_id: str) -> int:
+    """Return SQLite virtual-machine steps spent projecting one run's accounting.
+
+    A wall-clock budget would be flaky under parallel workers; VM steps are a
+    deterministic cost proxy, and the assertion below reads a RATIO of two
+    scales rather than an absolute, so it does not pin a SQLite version's
+    instruction counts.
+    """
+    steps = 0
+
+    def _tick() -> int:
+        nonlocal steps
+        steps += 1
+        return 0
+
+    def _attach(dbapi_connection: object, _record: object, _proxy: object) -> None:
+        # pysqlite connection; the progress handler is the only cost meter
+        # SQLite exposes without a compile-time status API.
+        assert isinstance(dbapi_connection, sqlite3.Connection)
+        dbapi_connection.set_progress_handler(_tick, 100)
+
+    event.listen(db.engine, "checkout", _attach)
+    try:
+        load_run_accounting_map_from_db(db, (run_id,))
+    finally:
+        event.remove(db.engine, "checkout", _attach)
+    return steps
+
+
+def _seed_decided_run(db: LandscapeDB, *, run_id: str, token_count: int) -> None:
+    _setup_run_with_row(db, run_id=run_id)
+    token_ids = [f"token-{index}" for index in range(token_count)]
+    _insert_tokens(db, run_id=run_id, row_id="row-1", token_ids=token_ids)
+    _insert_completed_outcomes(
+        db,
+        run_id=run_id,
+        token_ids=token_ids,
+        outcome=TerminalOutcome.SUCCESS,
+        path=TerminalPath.DEFAULT_FLOW,
+    )
+
+
+def test_accounting_cost_grows_with_token_count_not_its_square() -> None:
+    """Pin the census as linear in a run's size, not quadratic (elspeth-c675c8c2d9).
+
+    The defect: the per-token census joined ``tokens`` to ``token_outcomes`` on
+    (run_id, token_id) with no index covering the pair, so SQLite resolved the
+    inner loop through ``ix_token_outcomes_run_id`` and re-scanned every outcome
+    for every token — then paid it four times over. A 60k-row run took 618s.
+
+    Scaling BOTH sides by 8 multiplies quadratic work by ~64 and linear work by
+    ~8, so the ratio discriminates the two implementations regardless of how the
+    census is written.
+    """
+    small_db = LandscapeDB.in_memory()
+    large_db = LandscapeDB.in_memory()
+    try:
+        _seed_decided_run(small_db, run_id="run-small", token_count=150)
+        _seed_decided_run(large_db, run_id="run-large", token_count=1200)
+
+        small_steps = _count_sqlite_vm_steps(small_db, "run-small")
+        large_steps = _count_sqlite_vm_steps(large_db, "run-large")
+
+        # Cost must not be bought with wrong answers: both runs are fully
+        # decided, so accounting must be present and closed.
+        for db, run_id, token_count in ((small_db, "run-small", 150), (large_db, "run-large", 1200)):
+            accounting = load_run_accounting_map_from_db(db, (run_id,)).accounting[run_id]
+            assert accounting.integrity.closure == "closed"
+            assert accounting.tokens.emitted == token_count
+
+        growth = large_steps / max(small_steps, 1)
+        assert growth < 20, f"census cost grew {growth:.1f}x for an 8x larger run ({small_steps} -> {large_steps} steps) — quadratic"
+    finally:
+        small_db.close()
+        large_db.close()

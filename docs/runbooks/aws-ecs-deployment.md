@@ -1538,7 +1538,7 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 47, Landscape epoch 32 and `run_web_plugin_policy` presence,
+session epoch 47, Landscape epoch 33 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
@@ -3187,7 +3187,7 @@ Retain only allowlisted checks, classes, counts, and hashes.
 ### 7. Prove rollback refusal without crossing the schema stop
 
 The current upgrade record proves the opposite of rollback authorization. Once
-the candidate has recreated Landscape at epoch 32, the 0.7.0 image must
+the candidate has recreated Landscape at epoch 33, the 0.7.0 image must
 never be deployed against that database. Scenario B therefore exercises a
 fail-closed rollback refusal and forward recovery: revalidate and persist the
 sanitized compatibility receipt, prove the candidate task remains the active

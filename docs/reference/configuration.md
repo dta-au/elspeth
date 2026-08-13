@@ -1842,7 +1842,7 @@ Concurrent drains for one path are serialized across processes.
 | `dump_to_jsonl_include_payloads` | bool | `false` | Include request/response bodies in journal |
 | `dump_to_jsonl_payload_base_path` | string | (from payload_store) | Payload store path for inlining |
 
-### Landscape schema epoch 32
+### Landscape schema epoch 33
 
 Landscape epoch 26 added durable sink-effect streams, effects, ordered members,
 attempts, and sealed audit-export snapshots. Epoch 27 adds durable coalesce

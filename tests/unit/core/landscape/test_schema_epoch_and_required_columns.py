@@ -1,10 +1,10 @@
-"""Schema epoch + required-shape + provenance-write guards (epoch 32)."""
+"""Schema epoch + required-shape + provenance-write guards (epoch 33)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.schema import CreateIndex
 
@@ -36,8 +36,33 @@ from elspeth.core.landscape.schema import (
 from tests.fixtures.landscape import make_recorder_with_run
 
 
-def test_epoch_is_thirty_two() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 32
+def test_epoch_is_thirty_three() -> None:
+    assert SQLITE_SCHEMA_EPOCH == 33
+
+
+def test_epoch_33_resolves_run_scoped_per_token_outcome_reads_by_index_order() -> None:
+    """Pin the PLAN, not the index's existence (elspeth-c675c8c2d9).
+
+    ``ix_token_outcomes_run_token`` exists to make a run-scoped per-token read
+    resolvable by one index covering both equality columns. Asserting the index
+    is declared would pass even if SQLite kept choosing ``run_id`` alone, which
+    is exactly the choice that cost 618s on a 60k-token run — so this reads the
+    query plan instead. Streaming in (run_id, token_id) order also removes the
+    grouping sort, which is the absence the second assertion pins.
+    """
+    db = LandscapeDB.in_memory()
+    try:
+        with db.read_only_connection() as conn:
+            plan = "\n".join(
+                str(row)
+                for row in conn.execute(
+                    text("EXPLAIN QUERY PLAN SELECT run_id, token_id FROM token_outcomes WHERE run_id = 'run-1' GROUP BY run_id, token_id")
+                )
+            )
+        assert "ix_token_outcomes_run_token" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    finally:
+        db.close()
 
 
 def test_epoch_32_requires_normalized_aggregation_result_receipts() -> None:

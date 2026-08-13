@@ -169,9 +169,12 @@ hashes, durable batch-expansion claims, and the transaction-owned sidecar
 journal outbox. Epoch 30 adds `token_work_items.row_union_name` so a recovered
 scheduler can attribute a blocked work item to its declared row_union barrier.
 Epoch 31 closes `token_work_items.status` over the public scheduler status enum.
+Epoch 33 adds a composite (run_id, token_id) index to `token_outcomes` so a
+run-scoped per-token read resolves through one index instead of choosing
+between two single-column candidates the planner cannot separate.
 
 ELSPETH is pre-1.0. An older Landscape database is archived or exported as
-required and recreated at epoch 32; startup and read-only inspection do not
+required and recreated at epoch 33; startup and read-only inspection do not
 transform a predecessor store in place.
 
 ### Multi-source ingestion (ADR-025)

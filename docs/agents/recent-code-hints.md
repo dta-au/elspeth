@@ -214,6 +214,37 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
+- **2026-08-14 — adding ANY index to the Landscape metadata is a
+  delete-and-recreate boundary, and the epoch bump has a docs/website tail**:
+  `_validate_schema` compares the FULL metadata shape, not just
+  `_REQUIRED_INDEXES`, so a new `Index(...)` in
+  `core/landscape/schema.py` makes every existing `audit.db` refuse to open
+  with "Landscape database schema is outdated" — a `create_all` on an existing
+  table does NOT add it, so there is no self-heal. Bump `SQLITE_SCHEMA_EPOCH`
+  with an epoch-history entry, and expect the pins to fan out well past
+  `src/`: three test assertions
+  (`test_schema_epoch_and_required_columns`, `test_token_ownership_run_scope`,
+  guided `test_schema9_epoch`), `CHANGELOG.md`, `website/get-started.html`
+  ("29 → NN", pinned by `test_release_site_contract`),
+  `docs/guides/sharing-pipelines.md` (pinned by
+  `test_release_version_surfaces`), and `docs/product/current-state.md`.
+- **2026-08-14 — a two-column equality join needs a two-column index, or
+  SQLite guesses wrong**: an audit database has no `sqlite_stat1` (nothing runs
+  `ANALYZE`), so when a join offers `run_id=?` AND `token_id=?` and each column
+  has its OWN single-column index, SQLite's fixed selectivity guess cannot tell
+  that one matches an entire run and the other matches a handful. It picked
+  `run_id` and turned the run-accounting census into a nested scan: 618s to
+  project one 60k-token run through `GET /api/sessions/{id}/runs`
+  (elspeth-c675c8c2d9). Two lessons: prefer deriving a per-token census from
+  the SMALL table and subtracting against a count (`token_outcomes` carries a
+  composite FK to `tokens`, so "no decision recorded" is arithmetic, not an
+  anti-join), and remember a SQLAlchemy `.subquery()` referenced by N separate
+  `conn.execute()` calls is executed N times — this one was paid four times
+  over. Cost regressions here are testable without wall-clock flake: a SQLite
+  progress handler attached on the engine's `checkout` event counts VM steps,
+  and asserting a RATIO across two data scales discriminates linear from
+  quadratic (see `test_accounting_cost_grows_with_token_count_not_its_square`).
+
 - **2026-08-13 — a live region must PRE-EXIST its content, and that rule is
   not polite-only**: the node must be mounted before the text appears, and
   only the text may change. Inserting a region that already carries its text

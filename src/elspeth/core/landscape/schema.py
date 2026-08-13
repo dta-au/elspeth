@@ -308,7 +308,13 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        transform outputs, continue passthrough rows with their original
 #        token identities, or finish empty members without replaying the
 #        plugin after node/batch completion.
-SQLITE_SCHEMA_EPOCH = 32
+#   33 → token_outcomes carries a composite (run_id, token_id) access path.
+#        Run-scoped per-token reads previously had to choose between two
+#        single-column indexes with no statistics to separate them, and the
+#        accounting census picked the wrong one. This is a pre-1.0
+#        delete-and-recreate boundary: the index is physical schema, so a store
+#        written at epoch 32 lacks it and is not migrated.
+SQLITE_SCHEMA_EPOCH = 33
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -674,6 +680,26 @@ Index(
     unique=True,
     sqlite_where=(token_outcomes_table.c.completed == 1),
     postgresql_where=(token_outcomes_table.c.completed == 1),
+)
+
+# Run-scoped per-token access path (epoch 33, elspeth-c675c8c2d9). run_id and
+# token_id are each indexed above, and that was precisely the trap: a
+# (run_id, token_id) equality pair offered two single-column candidates, and an
+# audit database carries no ANALYZE statistics, so SQLite's fixed selectivity
+# guess could not tell that run_id matches an entire run's outcomes while
+# token_id matches at most a handful. It chose run_id, and the accounting
+# census degraded to a nested scan — 618s to project one 60k-token run.
+#
+# The census no longer joins per token, so this index is not what rescues that
+# endpoint; the read model's own shape is. What it buys is ordering: the census
+# groups by (run_id, token_id), and with this index those rows arrive in group
+# order, so the grouping streams instead of sorting every outcome row through a
+# temp B-tree. It also removes the two-candidate ambiguity for any future
+# run-scoped per-token read, which is the defect class that produced the hang.
+Index(
+    "ix_token_outcomes_run_token",
+    token_outcomes_table.c.run_id,
+    token_outcomes_table.c.token_id,
 )
 
 token_work_items_table = Table(
