@@ -1017,3 +1017,59 @@ def test_accounting_cost_grows_with_token_count_not_its_square() -> None:
     finally:
         small_db.close()
         large_db.close()
+
+
+def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> None:
+    """Partition invariant: no present run may fall through both maps.
+
+    ``load_run_accounting_from_db`` subscripts ``batch.accounting[run_id]``
+    bare after checking ``corrupt``, on the execution service's run-completion
+    path — a run in neither map is a KeyError there, which is worse than the
+    500 a corrupt run produces. The zero-outcome run is the case that made this
+    worth pinning: the census reads token_outcomes alone (elspeth-c675c8c2d9),
+    so such a run produces NO census row at all and its pending count comes
+    entirely from the emitted-count subtraction.
+    """
+    db = LandscapeDB.in_memory()
+    try:
+        _setup_run_with_row(db, run_id="run-decided", row_id="row-decided")
+        _insert_tokens(db, run_id="run-decided", row_id="row-decided", token_ids=["token-decided"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-decided",
+            token_ids=["token-decided"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
+
+        # Tokens emitted, not one outcome recorded — the shape the 60k run left
+        # behind for 48,077 of its tokens.
+        _setup_run_with_row(db, run_id="run-silent", row_id="row-silent")
+        _insert_tokens(db, run_id="run-silent", row_id="row-silent", token_ids=["token-a", "token-b", "token-c"])
+
+        _setup_run_with_row(db, run_id="run-corrupt", row_id="row-corrupt")
+        _insert_tokens(db, run_id="run-corrupt", row_id="row-corrupt", token_ids=["token-corrupt"])
+        _insert_outcome(
+            db,
+            run_id="run-corrupt",
+            token_id="token-corrupt",
+            outcome=None,
+            path=TerminalPath.DEFAULT_FLOW,
+            completed=1,
+        )
+
+        present = ("run-decided", "run-silent", "run-corrupt")
+        batch = load_run_accounting_map_from_db(db, present)
+
+        assert set(batch.accounting) | set(batch.corrupt) == set(present)
+        assert not set(batch.accounting) & set(batch.corrupt)
+
+        silent = batch.accounting["run-silent"]
+        assert silent.tokens.emitted == 3
+        assert silent.tokens.pending == 3
+        assert silent.tokens.terminal == 0
+        assert silent.tokens.abandoned == 0
+        assert silent.integrity.closure == "open"
+        assert silent.integrity.missing_terminal_outcomes == 3
+    finally:
+        db.close()
