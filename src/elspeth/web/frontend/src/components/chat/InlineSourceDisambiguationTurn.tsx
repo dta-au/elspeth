@@ -47,6 +47,8 @@
 
 import { useEffect, useRef } from "react";
 
+import { plural } from "@/utils/plural";
+
 /**
  * Action surface for this widget.
  *
@@ -137,7 +139,7 @@ export function InlineSourceDisambiguationTurn({
   return (
     <section
       role="region"
-      aria-label={`Confirm row count interpretation (${rowCount} rows)`}
+      aria-label={`Confirm row count interpretation (${plural(rowCount, "row")})`}
       data-testid="inline-source-disambiguation-turn"
       className="inline-source-disambiguation-turn"
     >
@@ -184,7 +186,7 @@ export function InlineSourceDisambiguationTurn({
           className="btn btn-primary inline-source-disambiguation-turn-confirm"
           onClick={() => onConfirmMultiRow(proposalId)}
         >
-          {`Yes — ${rowCount} ${rowCount === 1 ? "row" : "rows"}`}
+          {`Yes — ${plural(rowCount, "row")}`}
         </button>
         <button
           type="button"

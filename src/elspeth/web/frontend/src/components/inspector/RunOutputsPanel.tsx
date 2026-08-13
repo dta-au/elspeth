@@ -29,6 +29,7 @@ import {
   type PreviewTableModel,
 } from "@/components/ui";
 import { absoluteTime } from "@/utils/time";
+import { plural } from "@/utils/plural";
 import type {
   ApiError,
   RunOutputArtifact,
@@ -555,7 +556,8 @@ function ArtifactPreviewView({
           style={{ marginTop: 4, color: "var(--color-text-muted)", fontSize: 11 }}
         >
           Preview truncated
-          {preview.row_count_preview != null && ` to ${preview.row_count_preview} rows`}
+          {preview.row_count_preview != null &&
+            ` to ${plural(preview.row_count_preview, "row")}`}
           {" — "}
           <button type="button" className="link-button" onClick={onDownload}>
             download for full file

@@ -208,6 +208,25 @@ describe("RunOutputsPanel", () => {
   // togglePreview path a manual click uses — exactly once — while
   // multi-artifact manifests keep the original opt-in behaviour.
 
+  // row_count_preview === 1 is reachable and is the only count that exposes a
+  // hardcoded plural: the backend sets it to len(lines) when the LINE cap was
+  // not hit but the BYTE cap truncated the read, so one very long first line
+  // yields truncated=true with exactly one row.
+  it("says 'to 1 row' in the truncation footer, not 'to 1 rows'", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+      csvPreview({ truncated: true, row_count_preview: 1 }),
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    const footer = await screen.findByText(/preview truncated/i);
+    expect(footer.textContent).toContain("to 1 row");
+    expect(footer.textContent).not.toContain("to 1 rows");
+  });
+
   it("auto-expands the single previewable artifact, fetching its preview once, and shows the truncation footer", async () => {
     (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
       manifest([fileArtifact()]),
