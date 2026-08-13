@@ -219,11 +219,23 @@ sequentially per worktree.
   only the text may change. Inserting a region that already carries its text
   is the form with documented AT failures — for ASSERTIVE regions as much as
   polite ones, so do not "fix" a `role="alert"` by making it conditional on
-  reliability grounds. Test the MECHANISM, not the symptom: re-querying by
-  test id passes even when React REPLACED the node, so hold the element and
-  assert `expect(after).toBe(before)` across the transition
-  (`RunOutcomeNotice.test.tsx`; `AcknowledgementLiveRegion` still has this gap
-  — elspeth-b46cd07678).
+  reliability grounds. Test the MECHANISM, not the symptom — and note these
+  are TWO defect classes with different tells, both of which were live here:
+  (a) **node-replacement blindness**: re-querying by test id passes even when
+  React REPLACED the node, so hold the element and assert
+  `expect(after).toBe(before)` across the transition. INVISIBLE without a
+  mutation test (`RunOutcomeNotice.test.tsx`, `AcknowledgementStack.test.tsx`).
+  (b) **never performed the transition**: the body mounts with the end state
+  already seeded, so the scenario the title names never happens. VISIBLE BY
+  READING — a test whose title names a transition and whose body has a single
+  `render()` is not exercising one. This is the worse class: node identity is
+  the mechanism, the transition is the EVENT, and a test missing the event
+  never reaches the mechanism at all. It was live in `ProgressView.test.tsx`,
+  the declared M07 announcement authority (fixed da146cd67); suite-wide sweep
+  is elspeth-3f40c9aba2.
+  **`key={...}` is the cheapest guard-check there is**: force a remount, and if
+  the identity assertion does NOT redden it is miswritten. That is what turns
+  an existence pin into a truth pin.
 - **2026-08-13 — pick live-region politeness by CONSISTENCY WITH THE DECLARED
   AUTHORITY, not by how bad the news is**: `ProgressView` announces all five
   terminal run statuses — `failed` and `cancelled` included — through ONE
