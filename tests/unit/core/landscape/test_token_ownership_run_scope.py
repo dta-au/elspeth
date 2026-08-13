@@ -32,7 +32,7 @@ def _forge_token_run(*, setup, token_id: str, forged_run_id: str) -> None:
 
 
 def test_current_epoch_preserves_token_row_run_ownership_for_sqlite_and_postgres() -> None:
-    assert SQLITE_SCHEMA_EPOCH == 31
+    assert SQLITE_SCHEMA_EPOCH == 32
     assert (
         "tokens",
         ("row_id", "run_id"),

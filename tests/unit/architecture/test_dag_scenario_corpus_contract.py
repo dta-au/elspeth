@@ -525,7 +525,13 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8ab
 # Rotated again for elspeth-3875f3b381: one summary row-union recovery
 # declaration reuses the pinned two-variant fixture; all 48 prior declarations
 # are unchanged.
-EXPECTED_CASE_REGISTRY_SHA256 = "6bf7fea9bea268ce3017f277e7450ca40e3e99320d14aa07c1ad9da71b1bee81"
+# Rotated 2026-08-13 with the aggregation result receipts protocol (142e8e8bf):
+# exactly one manifest field moved — checkpoint-deterministic-resume /
+# reopen-resume's resumed_full_projection_sha256 — after the receipts protocol
+# changed the resumed flush's durable completion writes. The
+# terminal-equivalence oracle passes before the byte pin and the digest
+# reproduced across runs; every other declaration is byte-identical.
+EXPECTED_CASE_REGISTRY_SHA256 = "8b350c932175774d989e34e0a70c0ea8a49e3e52c03e2c543911bb5c3bd8990c"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
