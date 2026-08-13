@@ -1025,10 +1025,10 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
     ``load_run_accounting_from_db`` subscripts ``batch.accounting[run_id]``
     bare after checking ``corrupt``, on the execution service's run-completion
     path — a run in neither map is a KeyError there, which is worse than the
-    500 a corrupt run produces. The zero-outcome run is the case that made this
-    worth pinning: the census reads token_outcomes alone (elspeth-c675c8c2d9),
-    so such a run produces NO census row at all and its pending count comes
-    entirely from the emitted-count subtraction.
+    500 a corrupt run produces. A partially decided run is the case that made
+    this worth pinning: the census reads token_outcomes alone
+    (elspeth-c675c8c2d9), so its pending count depends on subtracting the
+    nonzero accounted count from the emitted-token total.
     """
     db = LandscapeDB.in_memory()
     try:
@@ -1042,10 +1042,17 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
             path=TerminalPath.DEFAULT_FLOW,
         )
 
-        # Tokens emitted, not one outcome recorded — the shape the 60k run left
-        # behind for 48,077 of its tokens.
-        _setup_run_with_row(db, run_id="run-silent", row_id="row-silent")
-        _insert_tokens(db, run_id="run-silent", row_id="row-silent", token_ids=["token-a", "token-b", "token-c"])
+        # Three tokens emitted, one outcome recorded — the mixed shape the 60k
+        # run left behind when 48,077 of its tokens had no outcome.
+        _setup_run_with_row(db, run_id="run-partial", row_id="row-partial")
+        _insert_tokens(db, run_id="run-partial", row_id="row-partial", token_ids=["token-a", "token-b", "token-c"])
+        _insert_completed_outcomes(
+            db,
+            run_id="run-partial",
+            token_ids=["token-a"],
+            outcome=TerminalOutcome.SUCCESS,
+            path=TerminalPath.DEFAULT_FLOW,
+        )
 
         _setup_run_with_row(db, run_id="run-corrupt", row_id="row-corrupt")
         _insert_tokens(db, run_id="run-corrupt", row_id="row-corrupt", token_ids=["token-corrupt"])
@@ -1058,18 +1065,18 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
             completed=1,
         )
 
-        present = ("run-decided", "run-silent", "run-corrupt")
+        present = ("run-decided", "run-partial", "run-corrupt")
         batch = load_run_accounting_map_from_db(db, present)
 
         assert set(batch.accounting) | set(batch.corrupt) == set(present)
         assert not set(batch.accounting) & set(batch.corrupt)
 
-        silent = batch.accounting["run-silent"]
-        assert silent.tokens.emitted == 3
-        assert silent.tokens.pending == 3
-        assert silent.tokens.terminal == 0
-        assert silent.tokens.abandoned == 0
-        assert silent.integrity.closure == "open"
-        assert silent.integrity.missing_terminal_outcomes == 3
+        partial = batch.accounting["run-partial"]
+        assert partial.tokens.emitted == 3
+        assert partial.tokens.pending == 2
+        assert partial.tokens.terminal == 1
+        assert partial.tokens.abandoned == 0
+        assert partial.integrity.closure == "open"
+        assert partial.integrity.missing_terminal_outcomes == 2
     finally:
         db.close()
