@@ -406,8 +406,14 @@ def _function_node(contract: _ArchitectureContract) -> ast.FunctionDef:
                 (
                     "func.count(case((token_outcomes_table.c.completed == 1, 1))).label('completed_count')",
                     "func.count(case((token_outcomes_table.c.path == TerminalPath.ABANDONED.value, 1))).label('abandoned_count')",
-                    "outcomes_by_emitted_token.c.completed_count > 0",
-                    "outcomes_by_emitted_token.c.abandoned_count > 0",
+                    "decided_by_token.c.completed_count > 0",
+                    "decided_by_token.c.abandoned_count > 0",
+                    # The census reads token_outcomes alone, so an undecided
+                    # token is the remainder against the emitted count rather
+                    # than a per-token anti-join (elspeth-c675c8c2d9). That
+                    # subtraction now PRODUCES missing_terminal_outcomes, so it
+                    # is the production decision this seam has to bind.
+                    "missing_terminal_outcomes[run_id] = emitted - accounted",
                     "pending=pending_tokens",
                     "abandoned=abandoned_tokens[run_id]",
                     "closure=closure",
