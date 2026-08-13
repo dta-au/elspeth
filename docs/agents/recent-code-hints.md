@@ -214,18 +214,31 @@ sequentially per worktree.
 
 ## Recent conventions (prune when archived)
 
-- **2026-08-13 — the web frontend has TWO live-region conventions, and mixing
-  them breaks unrelated suites**: POLITE `role="status"` regions are
-  persistent-and-mutate (`AcknowledgementLiveRegion`, `RunOutcomeNotice`) —
-  a polite region inserted WITH its content already present is the documented
-  unreliable pattern, so the node must pre-exist and only its text may change.
-  ASSERTIVE `role="alert"` regions are CONDITIONALLY INSERTED (`AppNoticeCenter`,
-  `ErrorBoundary`, `DefaultModeChangedBanner`): `role="alert"` already carries
-  `aria-live="assertive"` + `aria-atomic="true"` and IS the announce-on-insertion
-  role, so a permanently-mounted empty alert buys nothing — and it makes every
-  singular `getByRole("alert")` in the tree ambiguous (this fired: it broke an
-  unrelated App recovery-panel test). Reserve assertive for what actually
-  interrupts; a background run finishing, even failing, is polite.
+- **2026-08-13 — a live region must PRE-EXIST its content, and that rule is
+  not polite-only**: the node must be mounted before the text appears, and
+  only the text may change. Inserting a region that already carries its text
+  is the form with documented AT failures — for ASSERTIVE regions as much as
+  polite ones, so do not "fix" a `role="alert"` by making it conditional on
+  reliability grounds. Test the MECHANISM, not the symptom: re-querying by
+  test id passes even when React REPLACED the node, so hold the element and
+  assert `expect(after).toBe(before)` across the transition
+  (`RunOutcomeNotice.test.tsx`; `AcknowledgementLiveRegion` still has this gap
+  — elspeth-b46cd07678).
+- **2026-08-13 — pick live-region politeness by CONSISTENCY WITH THE DECLARED
+  AUTHORITY, not by how bad the news is**: `ProgressView` announces all five
+  terminal run statuses — `failed` and `cancelled` included — through ONE
+  polite `role="status"`. A second App-level region escalating those two to
+  assertive made the same event *more* urgent when the operator had looked
+  away than when watching it, and assertive cuts off the current utterance
+  without re-reading it. A finished background run is a WCAG 4.1.3 status
+  message, not an action-forcing alert. A permanently-mounted second assertive
+  node also makes every singular `getByRole("alert")` in the tree ambiguous
+  (this fired: it broke an unrelated App recovery-panel test). If something
+  ever must interrupt, build ONE app-wide announcer owning a single shared
+  assertive node — never a second per-feature region. Also: `components/ui/
+  AlertBanner.tsx` assigns `role="alert"` to strong tones, so borrowing the
+  `.alert-banner` CSS classes is fine but swapping in the COMPONENT silently
+  reintroduces an assertive region.
 
 - **2026-08-13 — prose that names a control must derive WHICH controls exist,
   never assume**: review-card labels vary by interpretation kind

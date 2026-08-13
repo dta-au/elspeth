@@ -21,33 +21,49 @@
 // once, from exactly one region.
 //
 // WHY POLITE FOR EVERY OUTCOME, AND WHY THERE IS NO role="alert" NODE HERE.
-// An earlier revision of this component kept a SECOND permanently-mounted
-// region with role="alert", carrying the failed/cancelled statuses. A design
-// review commended that split; it is nevertheless the wrong shape, and this
-// comment exists so it is not restored from that record. Two reasons:
+// An earlier revision kept a SECOND permanently-mounted region with
+// role="alert" carrying failed/cancelled. A design review commended that
+// split; it is nevertheless the wrong shape, and this comment exists so it is
+// not restored from that record.
 //
-//  1. This codebase has two distinct live-region conventions, and the pair
-//     was mixing them. POLITE regions are persistent-and-mutate
-//     (AcknowledgementLiveRegion, for the reason above). ASSERTIVE
-//     role="alert" regions are CONDITIONALLY INSERTED — every one in the tree
-//     does this (AppNoticeCenter, ErrorBoundary, DefaultModeChangedBanner),
-//     because role="alert" carries implicit aria-live="assertive" plus
-//     aria-atomic="true" and IS the canonical announce-on-insertion role. A
-//     permanently-empty alert node therefore buys nothing it does not already
-//     get from being inserted, while making a singular
-//     getByRole/findByRole("alert") ambiguous for every other app-level
-//     surface — which it demonstrably did.
+// The reason is NOT a mechanical one, and an earlier version of this comment
+// got that wrong: an empty, pre-existing role="alert" whose text later
+// mutates announces perfectly well. The pre-exist rule above is the GENERAL
+// live-region rule, not a polite-only one, and mutation-inside-a-stable-node
+// is the robust form for assertive regions too (insertion is the form with
+// the documented historical AT failures). So reliability does not decide
+// this; the argument below does, which is why the ruling holds regardless.
 //
-//  2. Assertive is reserved for messages needing immediate attention, i.e.
-//     ones that interrupt what the user is doing. A background pipeline run
-//     reaching a terminal state does not block the user even when it fails:
-//     the visible banner persists until dismissed, the Run-tab badge persists
-//     alongside it, and the diagnostics are a click away. Interrupting a
-//     screen-reader user mid-sentence to say so is disproportionate.
+//  1. CONSISTENCY WITH THE DECLARED AUTHORITY. ProgressView — the single
+//     terminal-announcement authority named above — announces ALL FIVE
+//     terminal statuses, failed and cancelled included, through a POLITE
+//     role="status" region, and says so in its own comment. A second region
+//     that escalated those two to assertive made the identical event MORE
+//     urgent when the operator had deliberately looked away than when they
+//     were watching it happen. That inversion is what convicts the split.
+//
+//  2. ASSERTIVE IS FOR WHAT INTERRUPTS. An assertive announcement cuts off
+//     the current utterance mid-word and the interrupted content is not
+//     re-read — so it costs a screen-reader user their place in whatever
+//     they had left the Run tab to read. A finished background run is a
+//     WCAG 4.1.3 status message (which role="status" satisfies), not an
+//     action-forcing alert: nothing is lost by hearing it one utterance
+//     later, because the visible banner persists until dismissed and the
+//     Run-tab badge persists alongside it.
+//
+//  3. Incidentally but not trivially: a permanently-present second assertive
+//     node made singular getByRole/findByRole("alert") ambiguous for every
+//     other app-level surface, which demonstrably broke an unrelated test.
 //
 // The visible banner still carries the outcome TONE (error/warning/success/
 // info), so urgency is expressed where it is free rather than in the live
-// region's politeness setting.
+// region's politeness setting. It borrows the .alert-banner CSS classes but
+// deliberately NOT the <AlertBanner> component, which assigns role="alert"
+// to strong tones and would silently reintroduce exactly what this removed.
+//
+// If a failure must ever genuinely interrupt, the correct build is ONE
+// app-wide live-announcer utility owning a single shared assertive node —
+// never a second per-feature region.
 //
 // Pure executionStore reader: no fetching, no polling, no run emitters
 // (REQUEST_RUN_EVENT stays single-owner per App.tsx doctrine).
@@ -136,8 +152,13 @@ export function RunOutcomeNotice(): JSX.Element {
 
   return (
     <>
+      {/* aria-live/aria-atomic are redundant with role="status" but stated
+          explicitly, matching ProgressView's region — the belt-and-braces
+          form this repo already uses for its announcement authority. */}
       <div
         role="status"
+        aria-live="polite"
+        aria-atomic="true"
         className="visually-hidden"
         data-testid="run-outcome-status-region"
       >

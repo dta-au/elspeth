@@ -40,16 +40,42 @@ describe("RunOutcomeNotice", () => {
 
     const status = statusRegion();
     expect(status).toHaveAttribute("role", "status");
+    expect(status).toHaveAttribute("aria-live", "polite");
+    expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveClass("visually-hidden");
     expect(status).toHaveTextContent("");
-    // Exactly one live region, and no assertive one — a permanently-mounted
-    // empty role="alert" node makes a singular getByRole("alert") ambiguous
-    // for every other app-level surface (it broke App.test's chat-error
-    // query), and buys nothing: role="alert" is the announce-on-INSERTION
-    // role, so the tree's assertive regions are all conditionally inserted.
+    // Exactly one live region, and no assertive one. The reason is NOT that
+    // an empty role="alert" would fail to announce — it announces fine. It
+    // is that ProgressView, the declared terminal-announcement authority,
+    // announces all five terminal statuses POLITELY, so escalating two of
+    // them here would make the same event more urgent when the operator has
+    // looked away than when watching. A permanent second assertive node also
+    // makes a singular getByRole("alert") ambiguous app-wide (it broke
+    // App.test's chat-error query).
     expect(container.querySelectorAll('[role="status"]')).toHaveLength(1);
     expect(assertiveRegions(container)).toHaveLength(0);
     expect(visualBanner()).toBeNull();
+  });
+
+  // Mutation-not-insertion is the whole point of the persistent region, and
+  // re-querying by test id CANNOT see it: the query resolves whether React
+  // mutated the node or replaced it. Hold the element identity across the
+  // transition instead, so a refactor that remounts the region — which would
+  // silently restore the unreliable insert-with-content pattern — fails here.
+  it("MUTATES the same region node across the empty-to-outcome transition", () => {
+    render(<RunOutcomeNotice />);
+    const before = statusRegion();
+
+    act(() => {
+      seedOutcome({ runId: "run-1", status: "completed", sessionId: "sess-1" });
+    });
+    expect(statusRegion()).toBe(before);
+
+    act(() => {
+      useExecutionStore.getState().acknowledgeRunOutcome();
+    });
+    expect(statusRegion()).toBe(before);
+    expect(before).toHaveTextContent("");
   });
 
   it("announces a completed run through the pre-existing polite region and shows the success banner", () => {
