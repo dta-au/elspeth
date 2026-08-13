@@ -41,6 +41,13 @@
 //     that escalated those two to assertive made the identical event MORE
 //     urgent when the operator had deliberately looked away than when they
 //     were watching it happen. That inversion is what convicts the split.
+//     (For anyone auditing this chain later: that evidence is ProgressView's
+//     region ELEMENT and its isTerminal set, read from source. A sweep soon
+//     after found ProgressView's own live-region TESTS defective — they
+//     mounted with the terminal status pre-set and so never drove the
+//     transition — but those tests were never the evidence for this; they
+//     merely failed to GUARD the behaviour, which da146cd67 fixed. The
+//     ruling is unaffected.)
 //
 //  2. ASSERTIVE IS FOR WHAT INTERRUPTS. An assertive announcement cuts off
 //     the current utterance mid-word and the interrupted content is not
