@@ -16,8 +16,15 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
     hooks:
+      # Retained assessment evidence is digest-bound: the junit.xml artifacts
+      # legitimately end in '>' (no trailing newline), and their sha256 values
+      # are recorded in the package's assessment.json, so a file-fixer rewrite
+      # breaks the evidence bindings. The package validators (validate-package /
+      # collect-evidence) are the integrity gate for these files.
       - id: trailing-whitespace
+        exclude: '^docs/architecture/state_engine/assessments/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}/evidence/'
       - id: end-of-file-fixer
+        exclude: '^docs/architecture/state_engine/assessments/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}/evidence/'
       - id: check-yaml
         args: ['--unsafe']
       - id: check-toml
