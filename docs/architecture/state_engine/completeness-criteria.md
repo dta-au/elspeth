@@ -121,7 +121,7 @@ Source inspection, architecture documents, decisions, plans, tracker state,
 and test names support mapping and interpretation. They cannot independently
 make a behavioral case pass.
 
-The v2 catalog makes that boundary executable: `pytest` is the only behavioral
+The v3 catalog makes that boundary executable: `pytest` is the only behavioral
 promotion kind and `documentation` is support-only. A promoting pytest record
 must bind every coverage tuple to retained node IDs, use one
 leg/case/profile proof subject per node, match one catalog execution profile,

@@ -1,0 +1,38 @@
+{
+  "schema_version": 2,
+  "producer": "elspeth-state-engine-profile-reporter-v2",
+  "profile_case_id": "sqlite-wal-web-hosted-leader-plus-same-host-cli-followers",
+  "state_store": "sqlite-wal",
+  "deployment": "web-hosted-leader-plus-same-host-cli-followers",
+  "backend_version": "3.47.1",
+  "backend_probe": {
+    "kind": "sqlite-connection-query",
+    "dialect": "sqlite",
+    "query": "SELECT sqlite_version()"
+  },
+  "deployment_probe": {
+    "kind": "trusted-test-runtime-assertion",
+    "node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_web_hosted_leader_plus_same_host_cli_followers_profile_covers_sink_effect_process_death_matrix"
+  },
+  "probe_node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_web_hosted_leader_plus_same_host_cli_followers_profile_covers_sink_effect_process_death_matrix",
+  "node_ids": [
+    "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_web_hosted_leader_plus_same_host_cli_followers_profile_covers_sink_effect_process_death_matrix",
+    "tests/integration/cli/test_state_engine_lifecycle_profiles.py::test_web_execution_service_leader_and_actual_cli_follower_share_full_runtime_lifecycle",
+    "tests/integration/cli/test_state_engine_lifecycle_profiles.py::test_actual_cli_join_exceptional_traversal_departs_and_cleans_plugins"
+  ],
+  "outcomes": [
+    {
+      "node_id": "tests/e2e/recovery/test_sink_effect_deployment_profiles.py::test_web_hosted_leader_plus_same_host_cli_followers_profile_covers_sink_effect_process_death_matrix",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/integration/cli/test_state_engine_lifecycle_profiles.py::test_web_execution_service_leader_and_actual_cli_follower_share_full_runtime_lifecycle",
+      "outcome": "passed"
+    },
+    {
+      "node_id": "tests/integration/cli/test_state_engine_lifecycle_profiles.py::test_actual_cli_join_exceptional_traversal_departs_and_cleans_plugins",
+      "outcome": "passed"
+    }
+  ],
+  "warnings": []
+}

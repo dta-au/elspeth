@@ -8,6 +8,19 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-15 — a selector lane may contain SEVERAL trusted profile probes**:
+  the state-engine profile reporter accepts repeated observations that agree on
+  every profile-identity field (case, store, deployment, backend version,
+  probe shape) and binds the FIRST probe test as the report's
+  `deployment_probe`; it fail-closes only on disagreement. Do not "fix" a
+  multi-probe lane by deleting probe tests or splitting the lane — the
+  single-observation invariant is about one run claiming two DIFFERENT
+  profiles. Discovered by the first full-lane single-invocation evidence run
+  (Task 12); per-cohort runs never exercised two probes together. Also:
+  evidence venvs must be built on the release interpreter (Python 3.13 —
+  `ci.yaml` maintains 3.12/3.13); a bare `uv venv` picks the newest local
+  Python (3.14) whose annotation semantics fail ~11 suite tests spuriously.
+
 - **2026-08-12 — a live-evidence artifact cannot authenticate its own upload
   digest**: the final GitHub artifact/archive digest exists only after upload,
   so embedding it in `manifest.json` is circular and self-declared hashes are

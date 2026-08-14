@@ -11,7 +11,7 @@ import json
 import re
 import sqlite3
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -184,8 +184,17 @@ class RuntimeProfileReporter:
 
     def _record(self, observation: ProfileObservation) -> None:
         prior = self._state.observation
-        if prior is not None and prior != observation:
-            raise AssertionError("one pytest evidence run cannot report multiple execution profiles")
+        if prior is not None:
+            # A selector lane legitimately contains several trusted probe
+            # tests (deployment-profile probes, process-death matrices, the
+            # follower join/drain suite). The single-observation invariant
+            # protects against one run claiming two DIFFERENT profiles, not
+            # against repeated agreement, so a later probe must match the
+            # first on every profile-identity field; the first probe stays
+            # bound as the report's deployment_probe node.
+            if replace(observation, probe_node_id=prior.probe_node_id) != prior:
+                raise AssertionError("one pytest evidence run cannot report two disagreeing execution profiles")
+            return
         self._state.observation = observation
 
     def observe_sqlite(self, connection: sqlite3.Connection, *, deployment: str) -> None:
