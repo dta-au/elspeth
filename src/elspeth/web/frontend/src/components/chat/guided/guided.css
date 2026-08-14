@@ -222,6 +222,18 @@
   border-bottom: 1px solid var(--color-border);
 }
 
+/* Loading placeholder shown under the stepper while the guided pipeline
+   spins up. House placeholder treatment (muted, centred, padded — the
+   .blob-manager-loading/.blob-manager-empty idiom); previously undefined,
+   so it rendered as full-width left-aligned body prose with UA margins
+   (elspeth-729872658a). */
+.guided-loading-status {
+  margin: 0;
+  padding: var(--space-md);
+  color: var(--color-text-muted);
+  text-align: center;
+}
+
 /* Active guided mode supplies only the common workspace's authoring pane.
    Transcript, acknowledgement cards, current decision, and pending reply
    share one bounded scroller; the composer remains docked beneath it. */

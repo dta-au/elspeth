@@ -205,9 +205,12 @@ export function InlineSourceDisambiguationTurn({
       </div>
 
       {/*
-        Escape action (F-10) is rendered as a link-style button so it
-        reads as a less-emphasised "this is the wrong frame" exit,
-        distinct from the three in-frame disambiguation choices above.
+        Escape action (F-10) is rendered as a link-style button — the
+        shared .link-button recipe — so it reads as a less-emphasised
+        "this is the wrong frame" exit, distinct from the three in-frame
+        disambiguation choices above. (It previously carried only its
+        bespoke token, which no stylesheet defines, so this bare Button
+        rendered as a raw UA-default button — elspeth-729872658a.)
         The accessible name MUST contain the substring "this isn't
         source data" for both the widget test and the ChatPanel
         wiring test to find it; the surrounding wrapper is presentational.
@@ -215,7 +218,7 @@ export function InlineSourceDisambiguationTurn({
       <div className="inline-source-disambiguation-turn-escape">
         <Button
           variant="bare"
-          className="inline-source-disambiguation-turn-not-source"
+          className="link-button inline-source-disambiguation-turn-not-source"
           onClick={() => onNotSourceData(messageId)}
         >
           {"This isn't source data"}

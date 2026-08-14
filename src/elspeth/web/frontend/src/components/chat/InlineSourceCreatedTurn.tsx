@@ -125,9 +125,13 @@ export function InlineSourceCreatedTurn({
 
       {showEdit && (
         <div className="inline-source-created-turn-actions">
+          {/* .link-button carries the visible affordance: this bare Button
+              previously held only its bespoke token, which no stylesheet
+              defines, so it rendered as a raw UA-default button
+              (elspeth-729872658a). */}
           <Button
             variant="bare"
-            className="inline-source-created-turn-edit"
+            className="link-button inline-source-created-turn-edit"
             onClick={() => onEdit(summary)}
           >
             Edit the list

@@ -2946,24 +2946,30 @@ export function ChatPanel({
             One assistant-styled bubble per resolved interpretation. Rendered
             inside the role="log" region so the new bubble is announced to
             AT users on append (aria-live="polite" on the parent). The
-            bubbles use the same chat-message--assistant styling as ordinary
-            assistant turns so the confirmation visually flows with the
-            conversation. These are NOT persisted to sessionStore.messages
-            and do NOT round-trip to the server — see the
-            handleInterpretationResolved comment above for the rationale.
+            bubbles compose the same message-row--assistant +
+            bubble-assistant classes as ordinary assistant turns
+            (MessageBubble.tsx) so the confirmation visually flows with the
+            conversation — the previous chat-message* tokens here were
+            defined by no stylesheet, so these rendered as bare unstyled
+            text (elspeth-729872658a). These are NOT persisted to
+            sessionStore.messages and do NOT round-trip to the server — see
+            the handleInterpretationResolved comment above for the
+            rationale.
           */}
           {resolveConfirmations.map((conf) => (
             <div
               key={conf.id}
-              className="chat-message chat-message--assistant interpretation-review-confirmation"
+              className="message-row message-row--assistant interpretation-review-confirmation"
               data-testid="interpretation-review-confirmation"
               role="status"
             >
-              Got it — using your interpretation of{" "}
-              <em className="interpretation-review-confirmation-user-term">
-                {conf.userTerm}
-              </em>
-              .
+              <div className="bubble bubble-assistant message-bubble-content">
+                Got it — using your interpretation of{" "}
+                <em className="interpretation-review-confirmation-user-term">
+                  {conf.userTerm}
+                </em>
+                .
+              </div>
             </div>
           ))}
           {/*

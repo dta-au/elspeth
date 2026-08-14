@@ -4,13 +4,15 @@
    .message-bubble-content*, .bubble-action-overlay*, .message-edit-*,
    .message-failed-*, .message-retry-btn, .message-pending, .message-tools*,
    .message-sources-created*, .inline-source-created-turn*,
+   .inline-source-disambiguation-turn*,
    .message-group-separator, .tool-call-*, .pending-proposals-banner*,
    .inline-source-fallback-prompt*, .pending-overlay-pill, .spec-pending-proposal,
    .yaml-pending-summary, .runs-pending-proposal, .composing-*,
    .freeform-introduction, .proposal-diff*.
-   Tenants (execution-named but chat-mounted — they render inside the chat
-   panel via inline run results):
-     .inline-run-results*, .run-outputs-panel*, .run-output-artifact*. */
+   Tenants (execution- or composer-named but chat-mounted — they render
+   inside the chat panel via inline run results):
+     .inline-run-results*, .run-outputs-panel*, .run-output-artifact*,
+     .narrative-results*. */
 
 /* ---------------------------------------------------------------------------
    Chat Bubble Base Styles
@@ -348,6 +350,51 @@
 
 .run-outputs-panel-muted {
   color: var(--color-text-muted);
+}
+
+/* NarrativeResults — the narrative-mode XOR sibling of .run-outputs-panel in
+   the same inline-run-results slot, so it mirrors that panel's xs register
+   and heading treatment. The whole component previously had NO stylesheet
+   section (elspeth-729872658a): headings, empty state and lists rendered at
+   UA defaults, including disc bullets with 40px indents in the
+   interpretation overlay. "Overlay" in the class names is the component's
+   data-layering vocabulary (Phase 5b events over the Phase 6B summary), not
+   a positioned surface — these are in-flow sections on purpose. */
+.narrative-results {
+  min-width: 0;
+  display: grid;
+  gap: var(--space-sm);
+  font-size: var(--font-size-xs);
+}
+
+.narrative-results h3,
+.narrative-results h4 {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  line-height: var(--line-height-tight);
+}
+
+.narrative-results-empty,
+.narrative-results-download,
+.narrative-results-interpretations p {
+  margin: 0;
+}
+
+.narrative-results-empty {
+  color: var(--color-text-muted);
+}
+
+.narrative-results-interpretation-overlay,
+.narrative-results-interpretations {
+  display: grid;
+  gap: var(--space-xs);
+}
+
+.narrative-results-interpretation-overlay ul {
+  margin: 0;
+  padding-left: var(--space-lg);
 }
 
 .run-output-artifact-list {
@@ -1457,6 +1504,57 @@
 .inline-source-created-turn {
   display: grid;
   gap: var(--space-sm);
+}
+
+/* InlineSourceDisambiguationTurn — the "confirm row count" decision widget.
+   Unlike its sibling .inline-source-created-turn (which renders inside a
+   message bubble), this section mounts directly in the transcript, so it
+   carries the .ack-card frame recipe to read as a decision card. The whole
+   widget previously had NO stylesheet section (elspeth-729872658a): the
+   card had no surface, the <blockquote> echo of the user's input rendered
+   at the UA's 1em/40px margins, the row <ol> at UA indents, and the three
+   action buttons sat with no gap. */
+.inline-source-disambiguation-turn {
+  display: grid;
+  gap: var(--space-sm);
+  padding: var(--space-sm) var(--space-md);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.inline-source-disambiguation-turn-title {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  line-height: var(--line-height-tight);
+}
+
+.inline-source-disambiguation-turn-explainer {
+  margin: 0;
+}
+
+/* Quote treatment for the echoed user input — the .markdown-body blockquote
+   recipe, with the grid gap supplying the vertical rhythm. */
+.inline-source-disambiguation-turn-input {
+  margin: 0;
+  padding: var(--space-xs) var(--space-md);
+  border-left: 3px solid var(--color-border-strong);
+  color: var(--color-text-secondary);
+}
+
+/* Decimal markers are content here (the parsed row numbering), so the list
+   keeps its counters and only the UA margins/indent are disciplined. */
+.inline-source-disambiguation-turn-rows {
+  margin: 0;
+  padding-left: var(--space-lg);
+}
+
+.inline-source-disambiguation-turn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
 }
 
 .inline-source-created-turn-title,

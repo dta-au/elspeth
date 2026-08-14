@@ -161,6 +161,12 @@ export function AppNoticeCenter({
         <span className="app-notice-primary-message">{primary.content}</span>
         <span className="app-notice-primary-actions">
           {primary.action === undefined ? null : (
+            // NOT a control: primary.action is a caller-supplied node that is
+            // already an interactive, .alert-banner-action-styled Button
+            // (every producer in App.tsx passes one). This span's onClick is
+            // a bubbling shim that closes the notice centre after the inner
+            // action activates — wrapping it in a Button would nest
+            // button-in-button.
             <span
               className="app-notice-primary-action"
               onClick={() =>
@@ -223,6 +229,9 @@ export function AppNoticeCenter({
               >
                 <span className="app-notice-item-message">{notice.content}</span>
                 {notice.action === undefined ? null : (
+                  // Same shape as the primary action's wrapper above: the
+                  // caller-supplied node inside is the styled control; this
+                  // span only closes the popover on activation via bubbling.
                   <span
                     className="app-notice-item-action"
                     onClick={() => close(true)}

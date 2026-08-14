@@ -116,6 +116,20 @@ const H2_STYLE: CSSProperties = {
   fontSize: "var(--font-size-lg)",
 };
 
+/**
+ * Read-only provenance banner ("Shared by X … expires on DATE"). Inline for
+ * the same lift-and-shift reason as MAIN_STYLE above — it previously had
+ * neither a rule nor an inline style, so the page's one provenance
+ * disclosure rendered as ordinary paragraph prose (elspeth-729872658a).
+ * De-emphasised secondary register: it must read as page chrome, not as
+ * part of the shared pipeline's content.
+ */
+const BANNER_STYLE: CSSProperties = {
+  margin: "0 0 var(--space-md)",
+  color: "var(--color-text-secondary)",
+  fontSize: "var(--font-size-sm)",
+};
+
 type LoadState =
   | { kind: "loading" }
   | { kind: "loaded"; response: SharedInspectResponse }
@@ -243,7 +257,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         style={MAIN_STYLE}
       >
         <header>
-          <p className="shared-inspect-banner" role="status">
+          <p className="shared-inspect-banner" role="status" style={BANNER_STYLE}>
             Read-only shared view. Shared by{" "}
             <strong>{response.created_by_user_id}</strong> on{" "}
             <time dateTime={response.created_at}>
