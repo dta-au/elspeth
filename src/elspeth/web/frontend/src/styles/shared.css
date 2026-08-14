@@ -322,10 +322,24 @@
 }
 
 /* .btn-small predates .btn-compact and is retained at its existing call sites.
-   New buttons that need a chrome-row size should compose .btn-compact instead. */
+   New buttons that need a chrome-row size should compose .btn-compact instead.
+
+   It set font-size and padding but NO min-height, so all 14 call sites — each
+   of which composes .btn, whether hand-written or via ui/Button, which emits
+   "btn" for compact={false} — rendered a 12px label inside .btn's 44px box
+   (elspeth-04d8ef4f3b). Binding the compact rung here is the single edit that
+   brings those 14 buttons onto a declared rung. .btn-small is declared AFTER
+   .btn at equal specificity (0,1,0), so it wins the tie by order; keep it
+   below .btn.
+
+   This deliberately trades WCAG 2.5.5 (AAA, 44px) for 2.5.8 (AA, >=24px) at
+   those sites. tokens.css:246-253 already sanctions exactly that trade for
+   chrome-row controls, which is what every .btn-small call site is (catalog
+   cards, YAML/tool-call toolbars, the runs-history drawer, import-YAML rows). */
 .btn-small {
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-sm);
+  min-height: var(--size-control-compact);
 }
 
 /* ---------------------------------------------------------------------------
@@ -353,6 +367,16 @@
   font-family: var(--font-sans);
   font-size: var(--font-size-base);
   line-height: 1.4;
+}
+/* .input alone binds to the 44px control rung (elspeth-39bd9d68b3). With no
+   min-height its height was content-derived — 16px x 1.4 line-height + 8px + 8px
+   padding + 2px border = 40.4px — against the 44px .btn that completes the same
+   form column, so every form shipped a 3.6px mismatch between its fields and its
+   submit (four times over on the register form). Deliberately NOT extended to
+   .textarea (height is rows/content-derived by design) or .select (no consumer;
+   the rule is kept only to mirror the website token sheet as one block). */
+.input {
+  min-height: var(--size-control);
 }
 .input::placeholder,
 .textarea::placeholder {
@@ -494,15 +518,41 @@
   flex-shrink: 0;
 }
 
+/* The header carries a bottom rule like every other overlay header
+   (elspeth-329ca624a8) — this dialog declared `flex-shrink: 0` and nothing
+   else, so the app's most-used dialog had no separation between title and
+   body while .graph-modal-header / .yaml-modal-header / .explain-dialog-header
+   all had one.
+
+   Deliberately NOT the modal-header recipe verbatim: those are edge-to-edge
+   frames whose header owns the padding, whereas .confirm-dialog carries
+   --space-xl on the FRAME. Copying `padding: var(--space-md)` here would
+   double-pad the title and inset its rule 24px from the frame edge. Same
+   contract (a rule under the title), expressed for a padded frame — the
+   padding-bottom sets title-to-rule and the margin-bottom sets rule-to-body,
+   which is why .confirm-dialog-title no longer carries a bottom margin. */
+.confirm-dialog-header {
+  margin-bottom: var(--space-md);
+  padding-bottom: var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
 .confirm-dialog-body {
   min-width: 0;
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* Bracket the bottom of the scroll owner (elspeth-8013e385df). The last body
+     ink row measured y=634 against the button band's border at y=635 — zero
+     intervening rows — because the only vertical air was
+     .confirm-dialog-message's bottom margin, which lives INSIDE the scroller
+     and scrolls away exactly when the user is deciding whether to authorise
+     the run. Padding on the scroll owner survives to the end of the scroll. */
+  padding-bottom: var(--space-md);
 }
 
 .confirm-dialog-title {
-  margin: 0 0 var(--space-sm);
+  margin: 0;
   font-size: var(--font-size-lg);
   font-weight: var(--font-weight-semibold);
   color: var(--color-text);
@@ -515,10 +565,15 @@
   line-height: var(--line-height-normal);
 }
 
+/* The other end of the same bracket (elspeth-8013e385df): a rule over the
+   button band plus air between it and the buttons, so the body never appears
+   to sit on top of the controls that authorise the run. */
 .confirm-dialog-actions {
   display: flex;
   justify-content: flex-end;
   gap: var(--space-sm);
+  padding-top: var(--space-lg);
+  border-top: 1px solid var(--color-border);
 }
 
 .confirm-dialog-btn {
@@ -534,12 +589,27 @@
   flex: 0 0 auto;
 }
 
+/* elspeth-81f714e210. Two separate defects met at this seam:
+
+   (1) The content box was 1px SHORT of the control it holds. 44px row − 1px
+       .alert-banner bottom border − 2x --space-xs (4px) = 35px, against a 36px
+       .alert-banner-action. --space-2xs leaves 39px, so the control fits.
+   (2) The focus ring was clipped, and (1) was NOT its cause. The action is
+       flex-CENTRED, so a symmetric padding-block change does not move it at
+       all: it sits 3.5px..39.5px inside the 43px padding box either way. The
+       ring (36px + 2x(2px offset + 2px width) = 44px of extent) simply cannot
+       fit a 43px padding box, so `overflow: hidden` cut ~0.5px off it at each
+       seam no matter what the padding was. Removing the PAINT clip is what
+       uncuts the ring; the row stays exactly as bounded as before because
+       height/max-height bound the LAYOUT, and every overflow source has its
+       own clip — .app-notice-primary-message carries nowrap + ellipsis +
+       overflow:hidden, and every notice `action` in App.tsx:540-643 is a
+       36px .alert-banner-action, never a 44px .btn. */
 .app-notice-primary.alert-banner {
   height: var(--size-control);
   max-height: var(--size-control);
   gap: var(--space-sm);
-  padding-block: var(--space-xs);
-  overflow: hidden;
+  padding-block: var(--space-2xs);
 }
 
 .app-notice-primary-message {
@@ -752,14 +822,24 @@
   margin-bottom: var(--space-2xs);
 }
 
+/* Pass and fail states occupy the SAME slot, so they must share one indent
+   system (elspeth-d1edd9bef8). The fail state used to add its own padding on
+   top of .validation-banner's — 8px/12px on the title and 0/12px/8px/28px on
+   the list — while the pass state (.validation-banner-content /
+   .validation-banner-checks) inherits the banner padding and adds only the
+   bullet column. Measured from the banner box: the fail title landed 12px
+   right and 8px down of the pass summary, and the two bullet columns landed
+   4px apart (28px vs --space-xl 24px), so toggling validation re-positioned
+   the whole text block. Both states now take their inset from
+   .validation-banner alone and their bullet column from --space-xl; the
+   list's --space-xs top margin matches .validation-banner-content's gap. */
 .validation-banner-fail-title {
-  padding: var(--space-sm) var(--space-md);
   font-weight: var(--font-weight-semibold);
 }
 
 .validation-banner-fail-list {
-  margin: 0;
-  padding: 0 var(--space-md) var(--space-sm) 28px;
+  margin: var(--space-xs) 0 0;
+  padding: 0 0 0 var(--space-xl);
 }
 
 .validation-banner-error-item {

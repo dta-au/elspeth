@@ -86,6 +86,19 @@
     border: 1px solid CanvasText;
   }
 
+  /* elspeth-44dc95153e: without this, completed and upcoming steps render
+     identically for the users with no colour cue — reintroducing the exact
+     defect the --complete class split was written to fix (tutorial.css:659).
+     Filled CanvasText (reached) vs Highlight (current) vs Canvas (upcoming)
+     gives three distinguishable states without colour.
+     Source order mirrors tutorial.css (--complete, then --active): the two
+     classes are mutually exclusive today (HelloWorldTutorial.tsx:386-392 is a
+     ternary), but they carry equal specificity, so if a dot ever gained both
+     the CURRENT step must keep Highlight rather than reading as completed. */
+  .tutorial-progress-dot--complete {
+    background: CanvasText;
+  }
+
   .tutorial-progress-dot--active {
     background: Highlight;
   }

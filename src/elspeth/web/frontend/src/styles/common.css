@@ -289,11 +289,30 @@
   padding: var(--space-sm) 0;
 }
 
-.command-palette-empty {
-  padding: var(--space-xl);
-  text-align: center;
+/* Centred placeholder / empty states (elspeth-4b8e6273bf).
+   .command-palette-empty and .yaml-loading were BYTE-EQUIVALENT recipes in the
+   same file (they differed only in declaration order), and both were a third
+   near-copy of .empty-state (shared.css) at a different padding — so the same
+   visual idiom shipped three definitions at two paddings, and a change to the
+   empty-state treatment had to be made in three places. Collapsed onto one
+   rule carrying .empty-state's recipe verbatim, including its --space-2xl
+   padding: .empty-state is the primitive and has four call sites, so folding
+   the two ad-hoc copies onto ITS value is the smaller blast radius. Kept in
+   common.css rather than moved into shared.css because relocating these
+   selectors would move them earlier in the styles/index.css barrel, past
+   recovery/header/sidebar/audit/tutorial. .yaml-loading is declared here
+   rather than in the YamlView section below for the same reason — this is the
+   earlier of the two original positions, so nothing moves later. */
+.command-palette-empty,
+.yaml-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2xl);
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);
+  text-align: center;
+  line-height: var(--line-height-relaxed);
 }
 
 .command-palette-group {
@@ -407,12 +426,8 @@
 /* ---------------------------------------------------------------------------
    YamlView — extra classes
    --------------------------------------------------------------------------- */
-.yaml-loading {
-  padding: var(--space-xl);
-  color: var(--color-text-muted);
-  font-size: var(--font-size-sm);
-  text-align: center;
-}
+/* .yaml-loading is declared with .command-palette-empty above — see the
+   centred-placeholder note there (elspeth-4b8e6273bf). */
 
 .yaml-toolbar-btn {
   padding: var(--space-xs) var(--space-2-5);
@@ -438,38 +453,80 @@
   z-index: var(--z-dialog);
   display: flex;
   flex-direction: column;
-  background-color: var(--color-surface-paper);
+  /* Dialog surface, matching .yaml-modal and .save-for-review-dialog. This
+     frame wraps <GraphView /> (GraphModal.tsx:64), whose React Flow canvas
+     paints --color-bg via --xy-background-color-default (inspector.css:132) —
+     so the warm --color-surface-paper family met workspace teal at the frame
+     edge with no transition. That is exactly the clash .yaml-modal already
+     migrated off (elspeth-bff8043d33, quoted below), now applied to the frame
+     whose content family made it a defect (elspeth-93afabcde8). Paper modals
+     remain correct where the content is NOT canvas. */
+  background-color: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* 8px is the modal radius; --radius-md 6px is the BUTTON radius, and the two
+     shared modals were the only overlays rounded like buttons while
+     .confirm-dialog and .command-palette sat at --radius-lg
+     (elspeth-03492be50b). */
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
   overflow: hidden;
 }
 
-.graph-modal-header {
+/* One overlay-header recipe for both shared modals (elspeth-329ca624a8). The
+   two rules were byte-identical copies, and .explain-dialog-header
+   (audit.css:288) is a third copy of the same seven declarations — the
+   pathology tokens.css:244 already records one level up for shadows. Grouped
+   in place rather than promoted to a class in shared.css: no TSX applies such
+   a class, so the promoted rule would match nothing, and moving these
+   selectors into shared.css would move them earlier in the barrel. */
+.graph-modal-header,
+.yaml-modal-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--space-md);
   padding: var(--space-md);
   border-bottom: 1px solid var(--color-border);
+  flex-shrink: 0;
 }
 
-.graph-modal-header h2 {
+.graph-modal-header h2,
+.yaml-modal-header h2 {
   margin: 0;
   font-size: var(--font-size-lg);
 }
 
-.graph-modal-close {
-  min-width: 36px;
+/* Both modal close buttons, on the .btn-compact recipe rather than
+   hand-rolled (elspeth-a04049d8c4). They were two byte-identical copies that
+   rounded at --radius-sm (the BADGE radius, where buttons are --radius-md),
+   inherited no font — no bare `button` element rule exists anywhere, so they
+   rendered in the UA default — and carried no transition, so the close
+   affordance snapped where every other control eases. The class NAMES are
+   load-bearing: GraphModal.tsx:11 uses ".graph-modal-close" as its focus-trap
+   initial-focus selector. Composing .btn-compact in the TSX would be the real
+   fix and is out of this lane. */
+.graph-modal-close,
+.yaml-modal-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--size-control-compact);
   min-height: var(--size-control-compact);
+  padding: var(--space-2xs) var(--space-sm);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
   cursor: pointer;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
 }
 
-.graph-modal-close:hover {
+.graph-modal-close:hover,
+.yaml-modal-close:hover {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
 }
@@ -497,40 +554,16 @@
      panes and clashed with the app's cool whites here (elspeth-bff8043d33). */
   background-color: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Modal radius, not the button radius — see .graph-modal
+     (elspeth-03492be50b). */
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
   overflow: hidden;
 }
 
-.yaml-modal-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-md);
-  padding: var(--space-md);
-  border-bottom: 1px solid var(--color-border);
-}
-
-.yaml-modal-header h2 {
-  margin: 0;
-  font-size: var(--font-size-lg);
-}
-
-.yaml-modal-close {
-  min-width: 36px;
-  min-height: var(--size-control-compact);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text);
-  cursor: pointer;
-}
-
-.yaml-modal-close:hover {
-  background-color: var(--color-surface-hover);
-  border-color: var(--color-border-strong);
-}
-
+/* .yaml-modal-header, its h2 and .yaml-modal-close are declared with their
+   .graph-modal-* twins above — see the overlay-header and close-button notes
+   there (elspeth-329ca624a8, elspeth-a04049d8c4). */
 
 .yaml-modal-body {
   flex: 1 1 auto;

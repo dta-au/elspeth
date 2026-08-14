@@ -19,9 +19,18 @@
   --color-surface-nav:        #0a1d2e;
   --color-surface-nav-raised: #13283a;
 
-  /* Inspection family — desaturated warm neutral (right-rail, paper modals).
-     Used by .layout-siderail and modal panels so they read as paper-on-desk
-     against the navy/teal columns instead of a third teal slab. */
+  /* Inspection family — desaturated warm neutral (paper modals, inspection
+     panels) so they read as paper-on-desk against the navy/teal columns
+     instead of a third teal slab. The family separates from the workspace
+     teal by HUE, not lightness: dark bg is r-b = -38 (cool) while
+     --color-surface-inspector is r-b = +4 (warm) at almost the same L*.
+     --color-surface-paper is the live member (audit.css, inspector.css,
+     recovery.css, common.css). --color-surface-inspector currently has NO
+     consumer: its documented consumer .layout-siderail was deleted in
+     bcd834cc5 and the rail that replaced it paints --color-surface
+     (workspace.css:398) — tracked as elspeth-dec069e48f. Keep the token
+     defined and gated so the repaint has a tuned value to land on; do not
+     re-document a consumer that does not exist. */
   --color-surface-inspector: #2a2826;
   --color-surface-paper:     #332f2c;
 
@@ -122,12 +131,6 @@
   --color-info-bg:           rgba(97, 218, 255, 0.10);
   --color-info-border:       rgba(97, 218, 255, 0.25);
 
-  /* Per-node validation indicator borders */
-  --color-node-valid: #63d487;
-  --color-node-warning: #e38444;
-  --color-node-invalid: #e85653;
-  --color-node-unchecked: var(--color-border-strong);
-
   /* ── Interactive / accent ────────────────────────────────────────────────── */
   --color-accent:            #1a7a52;
   --color-focus-ring:        #ffffff;
@@ -157,9 +160,6 @@
   --color-surface-input:     #0f2d35;
   --color-accent-muted:      rgba(20, 176, 174, 0.18);
 
-  /* ── Dimming ─────────────────────────────────────────────────────────────── */
-  --opacity-dimmed: 0.35;
-
   /* ── Scrollbar — teal-tinted ─────────────────────────────────────────────── */
   --color-scrollbar-track:       var(--color-bg);
   --color-scrollbar-thumb:       rgba(143, 200, 200, 0.15);
@@ -173,13 +173,6 @@
      Note: orientation grids sit below WCAG 1.4.11's 3:1 UI-component bar by
      design; pushing higher would visually fight with nodes. */
   --color-canvas-grid:           rgba(170, 220, 220, 0.28);
-
-  /* ── Sizing ──────────────────────────────────────────────────────────────── */
-  --inspector-default-width: 320px;
-  --inspector-min-width:     240px;
-  /* Guided authoring's embedded artifact rail. The common desktop workspace
-     owns its width independently through --authoring-pane-width. */
-  --siderail-width:          320px;
 
   /* ── Typography — Inter for body, system fallback ────────────────────────── */
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -200,7 +193,11 @@
   --font-size-base: 16px;
   --font-size-lg:   18px;
   --font-size-xl:   22px;   /* empty-state heroes, loud headings (was 18px duplicate of --lg) */
-  --font-size-2xl:  32px;   /* display headings */
+  /* Top rung of the scale. No heading uses it: its sole consumer is the
+     decorative .error-boundary-icon glyph (common.css:382). Documented here as
+     what it is rather than as a display-heading role nothing fills
+     (elspeth-0aaa8d5408) — it remains available for a real display heading. */
+  --font-size-2xl:  32px;
 
   --line-height-tight:   1.3;
   --line-height-snug:    1.35;  /* chat bubble body — tighter than normal but readable for multi-line responses */
@@ -271,7 +268,6 @@
   /* ── Transitions ─────────────────────────────────────────────────────────── */
   --transition-fast:   100ms ease;
   --transition-normal: 150ms ease;
-  --transition-slow:   250ms ease;
 
   /* ── Z-index layers ─────────────────────────────────────────────────────── */
   --z-panel-controls:  10;   /* floating panel controls */
@@ -282,7 +278,6 @@
      any future hover-revealed help bubbles that must clear inline chrome
      without competing with modal layers. */
   --z-popover:         50;
-  --z-overlay-backdrop: 99;  /* full-screen overlay backdrop */
   --z-overlay:         100;  /* full-screen overlay panels, dropdowns */
   --z-dialog-backdrop: 200;  /* modal dialog backdrop */
   --z-dialog:          201;  /* modal dialog */
@@ -299,19 +294,48 @@
 /* Light theme — applied via data-theme="light" attribute (set by useTheme hook) */
 [data-theme="light"] {
   /* ── Backgrounds — DTA/AGDS three-family role palette (light) ──────────── */
-  /* Workspace family — light teal (active editing surfaces) */
+  /* Workspace family — light teal (active editing surfaces).
+     elspeth-9e1a4935b0: --color-surface and --color-surface-elevated were
+     BYTE-IDENTICAL #ffffff here, so every elevation step that relies on a
+     lighter surface — the dark theme's primary elevation mechanism — was a
+     no-op in light and elevation fell entirely to the 12%-alpha border.
+     Since white is the ceiling, elevation is made by pulling --color-surface
+     DOWN off it and leaving --color-surface-elevated at #ffffff, which also
+     freezes every "…on elevated" assertion in colorContrast.test.ts at its
+     pre-change value. The resulting ladder mirrors the dark theme's SHAPE:
+     a whisper from ground to panel (dark +0.96 L*, light +1.11) and the
+     real step from panel to raised (dark +6.08 L*, light +1.58 — the white
+     ceiling caps it).
+     --color-bg is FROZEN at #f4f8f9 and must not be darkened here: the
+     chat-bubble link gate (colorContrast.test.ts, "keeps the link token at AA
+     over every chat bubble tint") composites --color-bubble-user over it and
+     measures 4.527:1 against --color-link — 0.027 above the 4.5 floor.
+     #eaf1f3 drops it to 4.264 and reddens the gate. Deepening the ground
+     therefore requires deepening --color-link too, which is a cross-cutting
+     palette decision left for the operator. */
   --color-bg:                #f4f8f9;
-  --color-surface:           #ffffff;
+  --color-surface:           #f8fbfc;
   --color-surface-elevated:  #ffffff;
   --color-surface-hover:     rgba(15, 45, 53, 0.06);
 
-  /* Navigation family — pale navy chrome */
-  --color-surface-nav:        #e8edf3;
-  --color-surface-nav-raised: #dbe3ec;
+  /* Navigation family — pale navy chrome. Deepened and pushed navy-ward so
+     the chrome separates from the teal workspace by a real step: bg → nav is
+     now -4.99 L* (dark theme: -6.57 L*), and nav's r-b is -16 against the
+     workspace ground's -5. */
+  --color-surface-nav:        #e2eaf2;
+  --color-surface-nav-raised: #d5dfec;
 
-  /* Inspection family — warm cream (right-rail, paper modals) */
-  --color-surface-inspector: #faf7f3;
-  --color-surface-paper:     #f0eae3;
+  /* Inspection family — warm cream (paper modals, inspection panels).
+     The old values carried almost no warmth (#faf7f3 is r-b = 7) and sat
+     0.04 L* from the workspace ground, so the family that exists to read as
+     paper-on-desk was indistinguishable from the desk. Both members now
+     separate on HUE the way the dark theme's do — inspector r-b 7 → 24,
+     paper r-b 13 → 25 — at held luminance for paper (92.98 → 92.90 L*),
+     because the semantic banner tints composited over --color-surface-paper
+     are the binding gate there: at 90.3 L* error-on-error-bg falls to
+     4.251:1, below AA. */
+  --color-surface-inspector: #f8f0e0;
+  --color-surface-paper:     #f2ead9;
 
   /* ── Surface variants ──────────────────────────────────────────────────── */
   --color-surface-raised:    #eaf2f3;
@@ -398,12 +422,6 @@
   --color-badge-row-union-border:   rgba(79, 91, 181, 0.4);
   --color-badge-queue-border:       rgba(161, 55, 112, 0.35);
 
-  /* Per-node validation indicator borders */
-  --color-node-valid: #0d8a88;
-  --color-node-warning: #b86830;
-  --color-node-invalid: #c93b38;
-  --color-node-unchecked: var(--color-border-strong);
-
   /* ── Interactive / accent ────────────────────────────────────────────────── */
   --color-accent:            #156048;
   --color-focus-ring:        #0f2d35;
@@ -432,7 +450,16 @@
   --color-canvas-grid:           rgba(15, 45, 53, 0.20);
 
   /* ── Elevation (light) ──────────────────────────────────────────────── */
-  /* Dropdown shadow swaps to a tinted-navy base on light backgrounds —
-     plain black at the same alpha reads too heavy on white/cream surfaces. */
+  /* All three tiers swap to a tinted-navy base on light backgrounds — plain
+     black at the same alpha reads too heavy on white/cream surfaces. Only
+     --shadow-dropdown carried that correction before elspeth-b30aa49831, so
+     every dialog (including .explain-dialog on the cream
+     --color-surface-paper) and every tooltip dropped a pure-black shadow at
+     up to 0.25 alpha, the heaviest tier in the system, on light surfaces.
+     Offsets and blur are byte-identical to the :root tiers so this reads as
+     a tinted-base swap, not a redesign; alphas are scaled by the ratio the
+     shipped dropdown override already set (0.18 → 0.10, ×0.556). */
+  --shadow-popover:  0 4px 12px rgba(15, 45, 53, 0.08);
   --shadow-dropdown: 0 8px 24px rgba(15, 45, 53, 0.10);
+  --shadow-modal:    0 8px 32px rgba(15, 45, 53, 0.14);
 }
