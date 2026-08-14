@@ -147,13 +147,17 @@ export function BlobRow({
     : null;
 
   return (
-    <div>
-      <div
-        className="blob-row blob-row-container"
-        style={{
-          borderBottom: previewOpen ? "none" : "1px solid var(--color-border)",
-        }}
-      >
+    // The row divider is CSS, not an inline style (elspeth-a1a1b62aa9): the
+    // last-row exception — suppressing the border that would otherwise stack
+    // on .chat-input's border-top as a doubled seam — cannot be expressed from
+    // JSX at all, because a row cannot know it is last. The open/closed state
+    // is published as a class so blobs.css can own both cases.
+    <div
+      className={
+        previewOpen ? "blob-row-item blob-row-item--preview-open" : "blob-row-item"
+      }
+    >
+      <div className="blob-row blob-row-container">
         {/* Status indicator: shape icon (non-colour cue) + accessible name. */}
         <span
           className="blob-row-status-dot"

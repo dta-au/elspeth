@@ -86,7 +86,11 @@ export const TURN_7_LEARNING_BULLETS = [
       "From this point on, when the composer drafts a pipeline for you in normal use, glance at the graph and the YAML before clicking Run. If anything looks wrong, amend or reject — the same gestures you just practised.",
   },
   {
-    title: "Ask Elspeth.",
+    // Wordmark, not a name: the tutorial says "Welcome to ELSPETH." two turns
+    // earlier, and this was the only mixed-case rendering of it in the tree
+    // (elspeth-cc67815217). The trailing full stop is part of the literal, as
+    // it is on every sibling bullet title.
+    title: "Ask ELSPETH.",
     // Guided/freeform parity guidance is folded into this existing chat-panel
     // item and shared verbatim with the skip path.
     body:

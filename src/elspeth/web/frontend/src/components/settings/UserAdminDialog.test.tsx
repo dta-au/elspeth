@@ -113,6 +113,54 @@ describe("UserAdminDialog", () => {
     await waitFor(() => expect(deleteAdminUser).toHaveBeenCalledWith("alice"));
   });
 
+  it("holds the delete control's width across the confirm step (elspeth-a0700fefff)", async () => {
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    await screen.findByText("Alice");
+
+    const deleteBtn = screen.getByRole("button", { name: /^delete$/i });
+    const slot = deleteBtn.parentElement as HTMLElement;
+    expect(slot).toHaveClass("user-admin-delete-slot");
+
+    const sizer = slot.querySelector<HTMLElement>(".user-admin-delete-sizer");
+    expect(sizer).not.toBeNull();
+    // Hidden from AT and from the pointer — it exists only to reserve width.
+    expect(sizer).toHaveAttribute("aria-hidden", "true");
+    // It reserves the LONGEST label the control can take, so the cell (which
+    // is right-aligned and nowrap) cannot drag both buttons left out from
+    // under the pointer when "Delete" becomes "Confirm delete".
+    expect(sizer).toHaveTextContent("Confirm delete");
+    // ...at the live control's own metrics, so padding/font/border can never
+    // drift apart from the button it is sizing.
+    for (const cls of deleteBtn.classList) {
+      expect(sizer).toHaveClass(cls);
+    }
+
+    await userEvent.click(deleteBtn);
+    const confirmBtn = screen.getByRole("button", { name: /confirm delete/i });
+    expect(confirmBtn.parentElement).toBe(slot);
+    expect(
+      slot.querySelector<HTMLElement>(".user-admin-delete-sizer"),
+    ).toHaveTextContent("Confirm delete");
+  });
+
+  it("separates the row actions with a styled gap, not a literal text space", async () => {
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    await screen.findByText("Alice");
+
+    const resetBtn = screen.getAllByRole("button", {
+      name: /reset password/i,
+    })[1];
+    const group = resetBtn.parentElement as HTMLElement;
+    expect(group).toHaveClass("user-admin-row-action-group");
+    // The old gap was a literal {" "} text node (~3.4px, less than half the
+    // --space-sm the password row uses). Any bare text node between the
+    // actions means the gap is back to being typography.
+    const textNodes = Array.from(group.childNodes).filter(
+      (node) => node.nodeType === node.TEXT_NODE,
+    );
+    expect(textNodes).toHaveLength(0);
+  });
+
   it("surfaces API failures in an alert region", async () => {
     resetAdminUserPassword.mockRejectedValue(new Error("User not found"));
     render(<UserAdminDialog onClose={onClose} currentUserId="john" />);

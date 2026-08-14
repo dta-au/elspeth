@@ -28,7 +28,7 @@ describe("ShortcutsHelp — four-group structure", () => {
     );
 
     const dialogs = screen.getAllByRole("dialog", {
-      name: "Keyboard Shortcuts",
+      name: "Keyboard shortcuts",
     });
     expect(dialogs).toHaveLength(2);
     const titleIds = dialogs.map((dialog) =>

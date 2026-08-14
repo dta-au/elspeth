@@ -97,6 +97,42 @@ describe("BlobManager categorized folders", () => {
   });
 });
 
+describe("BlobManager upload affordance (elspeth-29eef452a8)", () => {
+  beforeEach(() => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    vi.clearAllMocks();
+  });
+
+  it("names the upload control by its own visible text", () => {
+    setBlobState([]);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+
+    // getByRole computes the ACCESSIBLE name, so finding it by "Upload" and
+    // then matching the rendered text proves the two agree (WCAG 2.5.3 Label
+    // in Name — voice control targets a control by what the user can read).
+    // Before the fix the visible label was "+ Upload" against an accessible
+    // name of "Upload file", which shares no full label with it.
+    const upload = screen.getByRole("button", { name: "Upload" });
+    expect(upload.textContent?.trim()).toBe("Upload");
+    expect(
+      upload,
+      "an aria-label here can only drift from the visible text",
+    ).not.toHaveAttribute("aria-label");
+  });
+
+  it("draws no glyph in the UI text font", () => {
+    // The label led with a typed "+": a glyph rendered at the button's 12px UI
+    // size, matching neither the weight nor the optical size of the stroked
+    // SVGs in the rows directly below it. A real icon may be added later — the
+    // constraint is only that a punctuation character must not stand in for one.
+    setBlobState([]);
+    render(<BlobManager onUseAsInput={vi.fn()} />);
+
+    const upload = screen.getByRole("button", { name: "Upload" });
+    expect(upload.textContent).not.toMatch(/[+*×•▸◦→↑]/);
+  });
+});
+
 describe("BlobManager compose-busy gating (elspeth-3f38ebb1b5)", () => {
   beforeEach(() => {
     useSessionStore.setState({ activeSessionId: "session-1" });

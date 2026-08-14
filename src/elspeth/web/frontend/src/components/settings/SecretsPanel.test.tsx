@@ -43,7 +43,33 @@ describe("SecretsPanel", () => {
   it("renders the dialog with title", () => {
     render(<SecretsPanel onClose={onClose} />);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByText("API Keys & Secrets")).toBeInTheDocument();
+    // Sentence case, matching the two controls that open this panel
+    // (App.tsx's provider-alert action and the ChatInput overflow menu).
+    // The destination must not rename itself on arrival (elspeth-5deeca7f99).
+    expect(
+      screen.getByRole("heading", { name: "API keys & secrets" }),
+    ).toBeInTheDocument();
+  });
+
+  it("gives every inventory row the same trailing action slot", () => {
+    // Rows whose secret is not user-scoped render no delete button. Without a
+    // slot of its own, the scope badge on those rows ran a whole control-width
+    // further right and the badge column zig-zagged (elspeth-ca94961ead).
+    render(<SecretsPanel onClose={onClose} />);
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.querySelectorAll(".secrets-list-action")).toHaveLength(1);
+    }
+    // ...and the slot really is empty on the read-only row, i.e. the fix is
+    // the reserved slot rather than a delete button that should not be there.
+    const serverRow = rows.find((row) =>
+      row.textContent?.includes("SERVER_KEY"),
+    );
+    expect(serverRow).toBeDefined();
+    expect(
+      within(serverRow as HTMLElement).queryByRole("button"),
+    ).toBeNull();
   });
 
   it("shows secret inventory", () => {

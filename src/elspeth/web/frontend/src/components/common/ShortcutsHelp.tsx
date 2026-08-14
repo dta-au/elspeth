@@ -31,6 +31,13 @@ interface ShortcutGroup {
 //
 // SWITCH_TAB_EVENT (Alt+1-4 inspector tabs) was never added to App.tsx after
 // Phase 3 removed the inspector tabs — no deletion needed (probe: no matches).
+//
+// COPY REGISTER (elspeth-3db2ae2f48, elspeth-93897c03d1): action labels are
+// sentence case — first word capitalised, everything after it lower case
+// unless it is an acronym (YAML) or a proper name of a product surface
+// ("Sources / Transforms / Sinks" are catalog tab names). CommandPalette
+// titles the same actions and must agree word-for-word for every chord both
+// surfaces carry; `commandRegister.test.tsx` pins both halves.
 const GROUPS: ShortcutGroup[] = [
   {
     name: "Actions",
@@ -45,7 +52,7 @@ const GROUPS: ShortcutGroup[] = [
     items: [
       { keys: "Ctrl+K", action: "Command palette" },
       { keys: "Ctrl+/", action: "Focus chat input" },
-      { keys: "Ctrl/Cmd+Shift+G", action: "Show Graph" },
+      { keys: "Ctrl/Cmd+Shift+G", action: "Show graph" },
       { keys: "Ctrl/Cmd+Shift+Y", action: "Show YAML" },
       { keys: "Alt+1-3", action: "Switch catalog tab (Sources / Transforms / Sinks)" },
     ],
@@ -105,7 +112,7 @@ export function ShortcutsHelp({ onClose }: ShortcutsHelpProps) {
       >
         <header className="confirm-dialog-header">
           <h2 id={titleId} className="confirm-dialog-title">
-            Keyboard Shortcuts
+            Keyboard shortcuts
           </h2>
         </header>
         <div className="confirm-dialog-body">

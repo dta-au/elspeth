@@ -287,34 +287,55 @@ export function UserAdminDialog({
                     <td>{user.display_name}</td>
                     <td>{user.email ?? "—"}</td>
                     <td className="user-admin-row-actions">
-                      <button
-                        type="button"
-                        className="btn btn-compact"
-                        disabled={busy}
-                        onClick={() => onReset(user.user_id)}
-                      >
-                        Reset password
-                      </button>{" "}
-                      {user.user_id !== currentUserId &&
-                        (confirmingDelete === user.user_id ? (
-                          <button
-                            type="button"
-                            className="btn btn-compact"
-                            disabled={busy}
-                            onClick={() => onDelete(user.user_id)}
-                          >
-                            Confirm delete
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            className="btn btn-compact"
-                            disabled={busy}
-                            onClick={() => setConfirmingDelete(user.user_id)}
-                          >
-                            Delete
-                          </button>
-                        ))}
+                      <div className="user-admin-row-action-group">
+                        <button
+                          type="button"
+                          className="btn btn-compact"
+                          disabled={busy}
+                          onClick={() => onReset(user.user_id)}
+                        >
+                          Reset password
+                        </button>
+                        {user.user_id !== currentUserId && (
+                          // The delete control shares a grid cell with a
+                          // hidden sizer carrying the longest label it can
+                          // take (elspeth-a0700fefff). The cell is
+                          // right-aligned and nowrap, so before this the
+                          // "Delete" → "Confirm delete" swap dragged both
+                          // buttons left out from under the pointer at the
+                          // moment the user was asked to confirm an
+                          // irreversible action.
+                          <span className="user-admin-delete-slot">
+                            <span
+                              aria-hidden="true"
+                              className="btn btn-compact user-admin-delete-sizer"
+                            >
+                              Confirm delete
+                            </span>
+                            {confirmingDelete === user.user_id ? (
+                              <button
+                                type="button"
+                                className="btn btn-compact"
+                                disabled={busy}
+                                onClick={() => onDelete(user.user_id)}
+                              >
+                                Confirm delete
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className="btn btn-compact"
+                                disabled={busy}
+                                onClick={() =>
+                                  setConfirmingDelete(user.user_id)
+                                }
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </span>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -326,38 +347,43 @@ export function UserAdminDialog({
             <legend>Create user</legend>
             <div className="user-admin-create-fields">
               <label className="user-admin-field">
-                <span className="secrets-form-label">Username</span>
+                <span className="field-label">Username</span>
                 <input
                   type="text"
-                  className="secrets-form-input"
+                  className="input"
                   value={newUsername}
                   onChange={(e) => setNewUsername(e.target.value)}
                   autoComplete="off"
                 />
               </label>
               <label className="user-admin-field">
-                <span className="secrets-form-label">Display name</span>
+                <span className="field-label">Display name</span>
                 <input
                   type="text"
-                  className="secrets-form-input"
+                  className="input"
                   value={newDisplayName}
                   onChange={(e) => setNewDisplayName(e.target.value)}
                   autoComplete="off"
                 />
               </label>
               <label className="user-admin-field">
-                <span className="secrets-form-label">Email (optional)</span>
+                <span className="field-label">Email (optional)</span>
                 <input
                   type="email"
-                  className="secrets-form-input"
+                  className="input"
                   value={newEmail}
                   onChange={(e) => setNewEmail(e.target.value)}
                   autoComplete="off"
                 />
               </label>
+              {/* .btn, not .btn-compact: the fields in this row are the shared
+                  .input primitive on the --size-control rung, and the row is
+                  align-items: flex-end, so a 36px button next to a 44px field
+                  shows the height difference as a step at the top edge
+                  (elspeth-2580a7b094). */}
               <button
                 type="button"
-                className="btn btn-compact"
+                className="btn"
                 disabled={createDisabled}
                 onClick={onCreate}
               >

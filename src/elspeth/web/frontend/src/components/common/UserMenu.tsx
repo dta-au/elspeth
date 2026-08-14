@@ -214,9 +214,13 @@ export function UserMenu({
               title={themeLabel}
               className="user-menu-action"
             >
-              <span aria-hidden="true">
-                {resolvedTheme === "dark" ? "\u2600" : "\u263E"}
-              </span>{" "}
+              {/* No leading glyph (elspeth-66257bfab1). U+2600 / U+263E are
+                  decorative pictographs from the system symbol font, not
+                  members of the product icon set, and no other row in this
+                  five-row text menu carries one \u2014 so the theme row read as a
+                  different class of item. The label already says which way the
+                  toggle goes ("Switch to light theme" / "Switch to dark
+                  theme"), so dropping the span loses no meaning. */}
               {themeLabel}
             </button>
           </li>

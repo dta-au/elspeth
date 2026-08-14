@@ -126,12 +126,20 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
         <span className="blob-manager-title">
           Files ({blobs.length})
         </span>
+        {/* Label-only, and its accessible name IS its visible text
+            (elspeth-29eef452a8). The label used to read "+ Upload" against an
+            aria-label of "Upload file": a typed plus sign is a glyph drawn in
+            the 12px UI font, so it matched neither the weight nor the optical
+            size of the stroked SVGs in the rows directly below it, and the
+            accessible name did not contain the visible label, which breaks
+            voice-control targeting by visible text (WCAG 2.5.3). Dropping the
+            redundant aria-label is what keeps the two in step — do not
+            reintroduce one that says something else. */}
         <button
           onClick={() => fileInputRef.current?.click()}
           className="btn blob-manager-upload-btn"
-          aria-label="Upload file"
         >
-          + Upload
+          Upload
         </button>
         <input
           ref={fileInputRef}

@@ -216,7 +216,12 @@ describe("SaveForReviewDialog", () => {
     );
   });
 
-  it("copy button surfaces failure when clipboard API is unavailable", async () => {
+  // elspeth-6eb60a33a9: the failure message must NOT land in the button label.
+  // Both .btn and .btn-compact declare white-space: nowrap, so a sentence-long
+  // label made the button grow and reflowed the URL row under the pointer that
+  // had just clicked it. The button keeps a two-state label and the message
+  // renders in a sibling live region that is mounted BEFORE it has any text.
+  it("copy failure renders beside the button, not inside its label", async () => {
     useShareableReviewStore.setState({
       dialogOpen: true,
       latestResponse: _validResponse,
@@ -226,10 +231,22 @@ describe("SaveForReviewDialog", () => {
     Object.assign(navigator, { clipboard: { writeText } });
 
     render(<SaveForReviewDialog />);
-    fireEvent.click(screen.getByTestId("save-for-review-copy"));
-    await waitFor(() =>
-      expect(screen.getByTestId("save-for-review-copy")).toHaveTextContent(/copy failed/i),
-    );
+    const copyButton = screen.getByTestId("save-for-review-copy");
+    const status = screen.getByTestId("save-for-review-copy-status");
+
+    // The live region pre-exists its content: mounted, addressable, empty.
+    expect(status).toHaveAttribute("role", "status");
+    expect(status).toBeEmptyDOMElement();
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+
+    fireEvent.click(copyButton);
+
+    await waitFor(() => expect(status).toHaveTextContent(/copy failed/i));
+    // Same node, so the region was updated rather than re-inserted.
+    expect(screen.getByTestId("save-for-review-copy-status")).toBe(status);
+    // The label never takes the message, and the button stays retryable.
+    expect(copyButton).toHaveTextContent(/^copy$/i);
+    expect(copyButton).not.toHaveTextContent(/copy failed/i);
   });
 
   it("Close button dispatches close()", () => {

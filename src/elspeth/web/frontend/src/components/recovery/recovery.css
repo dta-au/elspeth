@@ -89,16 +89,52 @@
   justify-content: flex-end;
 }
 
+/* Track order (elspeth-76a6d842f1): the transcript column is the WIDER of the
+   two. The diff is a list of one-line rows; the transcript is prose plus tool
+   payloads, and it is what the reader scrolls. The 280px floor stays with the
+   diff so it cannot be crushed — at the 901px viewport where the two-column
+   branch still applies it resolves to ~344px, clear of that floor. */
 .recovery-panel-body {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.8fr);
+  grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1fr);
   gap: var(--space-lg);
   min-height: 0;
   overflow: auto;
 }
 
-.recovery-panel-transcript-controls {
+/* Three children, two tracks, and only ONE of them placed (elspeth-76a6d842f1):
+   sparse auto-placement gave the diff r1c1, the pinned controls r1c2, then
+   row-bumped the transcript to r2c1 — leaving the whole of r2c2 (a >=280px
+   track, as tall as the transcript) blank. Placing all three closes the hole:
+   the diff owns the left column for the panel's full height, and the transcript
+   sits under its own controls in the right column, which is where its DOM
+   order already put it.
+
+   `span 2` rather than `1 / -1`: this grid declares no grid-template-rows, so
+   the explicit grid has no row lines and `-1` would resolve back to line 1 —
+   a start==end range that silently degrades to a one-row span.
+
+   The filed remediation asked only for `.recovery-transcript { grid-column: 2 }`,
+   which alone would have mirrored the hole rather than closed it — the diff
+   would sit in r1c1 with r2c1 blank — and it read the tracks backwards: column
+   1 was the 1fr one, so the row-bumped transcript was already in the wider of
+   the two. Both halves are answered by placing all three children AND putting
+   the wide track second (see the track order above). */
+.recovery-diff {
+  grid-row: span 2;
+}
+
+.recovery-panel-transcript-controls,
+.recovery-transcript {
   grid-column: 2;
+}
+
+/* Grid items default to a min-content automatic minimum size, so a single
+   unbroken identity string or tool payload would push the section past its
+   track instead of scrolling inside it. */
+.recovery-diff,
+.recovery-transcript {
+  min-width: 0;
 }
 
 .recovery-diff-summary,
@@ -130,6 +166,116 @@
   white-space: pre-wrap;
 }
 
+/* ---------------------------------------------------------------------------
+   Diff kind semantics (elspeth-f59db0669e)
+
+   RecoveryDiff emits a --added / --removed / --changed modifier on every group
+   and every row, and RecoveryTranscript emits its own missing/note/assistant
+   classes; none of them were defined by any stylesheet, so a diff view — the
+   one surface whose whole job is "what changed" — rendered added, removed and
+   changed as three identical grey boxes, and "Missing tool response" read as
+   ordinary prose.
+
+   Colour is the SECOND channel here, never the only one: every row still
+   carries its "Added node" / "Removed edge" / "Changed source" label
+   (RecoveryDiff.tsx:93-101), so the distinction survives greyscale and
+   forced-colors (WCAG 1.4.1).
+
+   Family choice: added = success, removed = error, changed = info. Warning is
+   deliberately NOT spent on an ordinary changed row — it is this panel's
+   degraded-evidence tone (.recovery-panel-reason, .recovery-transcript-missing
+   below), and doubling it up would repeat the palette misuse of
+   elspeth-7161879770.
+   --------------------------------------------------------------------------- */
+.recovery-diff-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+}
+
+/* The kind rule sits under the group header rather than on its text so the
+   heading keeps the body colour that is contrast-checked against every panel
+   surface; a border carries no text-contrast obligation. */
+.recovery-diff-group--added .recovery-diff-group-header {
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--color-success-border);
+}
+
+.recovery-diff-group--changed .recovery-diff-group-header {
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--color-info-border);
+}
+
+.recovery-diff-group--removed .recovery-diff-group-header {
+  padding-bottom: var(--space-xs);
+  border-bottom: 1px solid var(--color-error-border);
+}
+
+/* DiffEntryRow is exported and reused by the chat panel's proposal cards
+   (RecoveryDiff.tsx:11-16), which render rows with no group wrapper — so the
+   kind has to be legible on the ROW, not only on its group. */
+.recovery-diff-row--added {
+  border-color: var(--color-success-border);
+  border-left-color: var(--color-success);
+  border-left-width: 3px;
+  background-color: var(--color-success-bg);
+}
+
+.recovery-diff-row--changed {
+  border-color: var(--color-info-border);
+  border-left-color: var(--color-info);
+  border-left-width: 3px;
+  background-color: var(--color-info-bg);
+}
+
+.recovery-diff-row--removed {
+  border-color: var(--color-error-border);
+  border-left-color: var(--color-error);
+  border-left-width: 3px;
+  background-color: var(--color-error-bg);
+}
+
+.recovery-diff-row-change {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-xs);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.recovery-diff-compact,
+.recovery-transcript-note {
+  margin: var(--space-xs) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+
+/* No background: the panel is on the warm paper family, and tinting this block
+   with a workspace-family surface would mix elevation families for nothing.
+   The border alone separates the recorded assistant turn from the tool list. */
+.recovery-transcript-assistant {
+  padding: var(--space-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+
+/* A hole in the recovered transcript — the one place in this panel where the
+   warning family is the honest answer. Same token trio as
+   .recovery-panel-reason so "evidence is incomplete" reads identically
+   wherever the panel says it. */
+.recovery-transcript-missing {
+  margin: var(--space-xs) 0 0;
+  padding: var(--space-2xs) var(--space-sm);
+  color: var(--color-warning);
+  background-color: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
 @media (max-width: 900px) {
   .recovery-panel {
     inset: 16px;
@@ -139,7 +285,15 @@
     grid-template-columns: 1fr;
   }
 
-  .recovery-panel-transcript-controls {
+  /* Single column: every explicit placement above has to be released, or
+     `grid-column: 2` conjures an implicit second track and `grid-row: span 2`
+     leaves a blank row under the diff. */
+  .recovery-diff {
+    grid-row: auto;
+  }
+
+  .recovery-panel-transcript-controls,
+  .recovery-transcript {
     grid-column: auto;
   }
 }

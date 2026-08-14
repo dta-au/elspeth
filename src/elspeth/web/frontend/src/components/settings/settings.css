@@ -1,5 +1,12 @@
-/* settings.css — Settings panels (secrets management, dev-admin users).
-   Owners: .secrets-*, .user-admin-*. */
+/* settings.css — Settings panels (secrets management, dev-admin users,
+   composer preferences).
+   Owners: .secrets-*, .user-admin-*, .composer-preferences-*.
+
+   .composer-preferences-error is also rendered by
+   components/common/DefaultModeChangedBanner.tsx and by UserAdminDialog, so
+   the rule below is the one error affordance all three share; it is defined
+   here, with the rest of the settings surface, rather than being duplicated
+   per call site (elspeth-b9871d3648). */
 
 /* ---------------------------------------------------------------------------
    Secrets Panel
@@ -28,7 +35,7 @@
   line-height: 1;
   padding: var(--space-2xs) var(--space-xs);
   border-radius: var(--radius-sm);
-  min-width: 44px;
+  min-width: var(--size-control);
   min-height: var(--size-control);
   display: flex;
   align-items: center;
@@ -55,28 +62,47 @@
   color: var(--color-text-secondary);
 }
 
+/* Region boundaries inside the secrets modal (elspeth-035c98081b). The three
+   regions used to be delimited three different ways — a 20px inline literal
+   between the entry form and the inventory, --space-lg before the footnote,
+   and no rule anywhere — so the reader had no repeated cue for "a new region
+   starts here". Every boundary below the header now carries the same
+   treatment the header itself draws: a hairline rule with --space-lg of air
+   on both sides. The general sibling combinator (not `+`) is deliberate — the
+   error banner renders between the two sections whenever a save fails, which
+   would break an adjacent-sibling match. */
+.secrets-panel-section ~ .secrets-panel-section,
+.secrets-panel-body > .secrets-footnote {
+  margin-top: var(--space-lg);
+  padding-top: var(--space-lg);
+  border-top: 1px solid var(--color-border);
+}
+
 .secrets-form-fields {
   display: flex;
   flex-direction: column;
   gap: var(--space-sm);
 }
 
-.secrets-form-label {
-  display: block;
-  margin-bottom: var(--space-xs);
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-}
-
-.secrets-form-input {
-  width: 100%;
-  padding: var(--space-xs) var(--space-sm);
+/* THE settings error affordance — one rule, four call sites: the secret
+   entry form, ComposerPreferencesForm, DefaultModeChangedBanner and
+   UserAdminDialog (elspeth-b9871d3648). Every one of them renders it on a
+   role="alert"/aria-describedby element whose whole purpose is to be
+   noticed. Before this, .composer-preferences-error had three call sites and
+   no rule at all — two shipped as ordinary body text, the third carried a
+   one-off inline style — while the secrets banner carried three inline
+   literals (12px margin, 4px radius, 12px text) of its own. Keep the two
+   names on ONE declaration block: the moment they fork, the same failure
+   renders two ways again. */
+.composer-preferences-error,
+.secrets-form-error {
+  margin: var(--space-sm) 0;
+  padding: var(--space-1-5) var(--space-2-5);
+  border: 1px solid var(--color-error-border);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--color-border);
-  background-color: var(--color-surface-input);
-  color: var(--color-text);
+  background-color: var(--color-error-bg);
+  color: var(--color-error);
   font-size: var(--font-size-sm);
-  box-sizing: border-box;
 }
 
 .secrets-submit-btn {
@@ -95,12 +121,16 @@
   gap: var(--space-xs);
 }
 
+/* Bordered content card, so it takes the card radius (--radius-lg), not the
+   badge radius (--radius-sm) it used to carry — an inner corner sharper than
+   the 8px dialog framing it inverted the concentric relationship
+   (elspeth-38ffb9aff3). */
 .secrets-list-item {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
   padding: var(--space-sm);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   border: 1px solid var(--color-border);
   background-color: var(--color-surface-raised);
 }
@@ -137,6 +167,18 @@
   margin-left: var(--space-xs);
 }
 
+/* Fixed trailing slot for the row action (elspeth-ca94961ead). Server- and
+   org-scoped secrets render no delete button, so without a reserved slot the
+   scope badge ran a whole control-width further right on those rows and the
+   badge column zig-zagged down the list. The slot is exactly the delete
+   button's own width, so deletable and read-only rows share one trailing
+   edge; keep the two bound to --size-control together. */
+.secrets-list-action {
+  flex: 0 0 var(--size-control);
+  display: flex;
+  justify-content: flex-end;
+}
+
 .secrets-delete-btn {
   background: none;
   border: none;
@@ -147,11 +189,23 @@
   line-height: 1;
   border-radius: var(--radius-sm);
   flex-shrink: 0;
-  min-width: 44px;
+  min-width: var(--size-control);
   min-height: var(--size-control);
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+/* The panel's only irreversible action was the one control in this file with
+   no hover state at all, while the harmless close button beside it lightens
+   (elspeth-e977b66dba). Same lighten-the-surface move as
+   .secrets-panel-close:hover, in the destructive tint rather than the neutral
+   one so the confirmation reads as "this is the delete". */
+.secrets-delete-btn:hover {
+  background: var(--color-error-bg);
+  color: var(--color-error);
 }
 
 .secrets-loading,
@@ -161,8 +215,9 @@
   text-align: center;
 }
 
+/* Spacing and the boundary rule come from the region-boundary block above —
+   the footnote is the last of the modal's three regions. */
 .secrets-footnote {
-  margin-top: var(--space-lg);
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
   line-height: var(--line-height-normal);
@@ -217,16 +272,49 @@
   text-align: right;
 }
 
+/* The two row actions used to be held apart by a literal `{" "}` text space
+   (~3.4px), less than half the --space-sm the password row above uses
+   (elspeth-a0700fefff). */
+.user-admin-row-action-group {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Reserve the widest label's width for the delete control. The cell is
+   right-aligned and nowrap, so "Delete" growing into "Confirm delete" used to
+   drag BOTH buttons left, out from under the pointer at the exact moment the
+   user is being asked to confirm a destructive action. Stacking a hidden
+   sizer carrying the longest label in the same grid cell fixes the column at
+   that width, so the confirm step changes the label without moving anything.
+   The sizer carries the button's own .btn/.btn-compact classes rather than a
+   copy of its metrics, so padding/font/border can never drift apart. */
+.user-admin-delete-slot {
+  display: grid;
+  justify-items: end;
+}
+
+.user-admin-delete-slot > * {
+  grid-area: 1 / 1;
+}
+
+.user-admin-delete-sizer {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .user-admin-empty {
   padding: var(--space-md) 0;
   color: var(--color-text-muted);
   text-align: center;
 }
 
+/* Card radius, not badge radius — see .secrets-list-item (elspeth-38ffb9aff3). */
 .user-admin-password-banner {
   border: 1px solid var(--color-success-border);
   background-color: var(--color-success-bg);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   padding: var(--space-sm) var(--space-md);
   margin-bottom: var(--space-md);
 }
@@ -250,10 +338,11 @@
   font-size: var(--font-size-xs);
 }
 
+/* Card radius, not badge radius — see .secrets-list-item (elspeth-38ffb9aff3). */
 .user-admin-create-form {
   margin-top: var(--space-lg);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-lg);
   padding: var(--space-sm) var(--space-md) var(--space-md);
 }
 
@@ -277,3 +366,63 @@
   flex: 1 1 140px;
   min-width: 0;
 }
+
+/* ---------------------------------------------------------------------------
+   Composer preferences panel
+
+   ComposerPreferencesForm shipped with NO classes on its <fieldset> /
+   <legend> / <label> elements at all (elspeth-03f43bdef0), so ELSPETH's
+   primary settings surface rendered Chrome's 2px groove fieldset border and
+   its UA ~5px sibling margins on --color-surface. The rules below follow the
+   two fieldset idioms already shipped in this tree: .guided-chip-fieldset
+   (guided.css) strips the UA chrome, .tutorial-mode-fieldset (tutorial.css)
+   lays the options out on a token grid. The legend matches
+   .user-admin-create-form legend above so the two forms in this dialog family
+   label their groups the same way.
+   --------------------------------------------------------------------------- */
+.composer-preferences-fieldset {
+  display: grid;
+  gap: var(--space-sm);
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+
+/* Group-to-group separation is a whole scale step wider than the gap between
+   the options inside a group, so a group reads as one thing
+   (elspeth-c5efcaf102). This replaces an inline `marginTop: 16` literal. */
+.composer-preferences-fieldset ~ .composer-preferences-fieldset {
+  margin-top: var(--space-lg);
+}
+
+.composer-preferences-legend {
+  padding: 0;
+  margin-bottom: var(--space-sm);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-secondary);
+}
+
+.composer-preferences-option {
+  display: flex;
+  gap: var(--space-sm);
+  align-items: center;
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.composer-preferences-option input {
+  margin: 0;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+
+.composer-preferences-reset {
+  margin-top: var(--space-lg);
+}
+
+/* .composer-preferences-error is declared with .secrets-form-error in the
+   Secrets Panel block above — one affordance, one rule. */

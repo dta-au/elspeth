@@ -502,12 +502,16 @@ export function AuditReadinessPanel({
               Checked {checkedText} · as of v{snapshot.composition_version}
             </p>
             {/* Gate legibility (elspeth-088bf83922 T-2, option (a)): a
-                one-line explanation of the per-row "Blocks Run" / "Advisory"
+                one-line explanation of the per-row "Blocks run" / "Advisory"
                 badges below — legibility only, no gating change. Reuses the
                 freshness paragraph's existing muted-text style rather than
-                introducing a new one. */}
+                introducing a new one.
+                The quoted label must match AuditReadinessRow's literal
+                verbatim, case included (elspeth-1fbb371ac3) — a reader
+                matches this sentence against the badges directly beneath
+                it. */}
             <p className="audit-readiness-freshness">
-              Rows marked "Blocks Run" must be clear before you can run this
+              Rows marked "Blocks run" must be clear before you can run this
               pipeline; the rest are advisory and do not stop a run.
             </p>
           </div>
@@ -540,7 +544,13 @@ export function AuditReadinessPanel({
               onClick={() => setExplainOpen(true)}
               aria-label="Explain what this pipeline will record"
             >
-              Explain →
+              {/* No trailing arrow (elspeth-cc56449892): this button opens a
+                  dialog exactly like its two cluster siblings (Refresh,
+                  Collapse), so a forward glyph on this one alone promised a
+                  navigation the others do not make. If a forward affordance
+                  is ever wanted it belongs on all three and comes from the
+                  SVG Icon primitive, not a text arrow. */}
+              Explain
             </button>
             {!anyActionable && (
               <button

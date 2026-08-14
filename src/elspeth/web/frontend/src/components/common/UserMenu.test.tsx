@@ -60,6 +60,46 @@ describe("UserMenu", () => {
     ).toBeInTheDocument();
   });
 
+  // elspeth-66257bfab1: the theme row used to lead with U+2600 / U+263E, the
+  // only glyph in a five-row text menu, drawn from the system symbol font
+  // rather than the product icon set. The guard is written over the whole
+  // rendered menu, not over one span, so re-introducing a pictograph anywhere
+  // in the menu — or on either theme — reddens it.
+  it("carries no decorative pictograph on any row, in either theme", async () => {
+    for (const startingTheme of ["dark", "light"] as const) {
+      localStorage.setItem("elspeth_theme", startingTheme);
+      const { unmount } = render(
+        <UserMenu
+          onOpenSettings={vi.fn()}
+          onSignOut={vi.fn()}
+          onOpenUserManagement={vi.fn()}
+        />,
+      );
+      await userEvent.click(screen.getByRole("button", { name: /account/i }));
+
+      const list = screen.getByRole("list");
+      // Sanity: the theme row really is showing, so this is not vacuous.
+      expect(
+        screen.getByRole("button", { name: /switch to (light|dark) theme/i }),
+      ).toBeInTheDocument();
+      // Symbol/emoji blocks: Miscellaneous Symbols (U+2600-26FF), Dingbats
+      // (U+2700-27BF), Misc Symbols & Pictographs, Emoticons, Transport,
+      // and Supplemental Symbols & Pictographs.
+      const pictographs =
+        /[☀-➿\u{1F300}-\u{1F5FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}]/u;
+      // textContent includes the text of aria-hidden spans, so a decorative
+      // glyph is caught however it is marked up. Deliberately NOT asserting
+      // "no aria-hidden elements": elspeth-66257bfab1's own second remedy is
+      // an <Icon name="sun"/> from the product icon set, which is aria-hidden
+      // by construction and would be a legitimate future implementation.
+      expect(list.textContent ?? "").not.toMatch(pictographs);
+
+      unmount();
+      localStorage.clear();
+      document.documentElement.removeAttribute("data-theme");
+    }
+  });
+
   it("calls onOpenSettings when Composer preferences is clicked, then closes", async () => {
     const openSettings = vi.fn();
     render(<UserMenu onOpenSettings={openSettings} onSignOut={vi.fn()} />);

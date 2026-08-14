@@ -670,7 +670,7 @@ describe("AuditReadinessPanel", () => {
   // against that real predicate, and that the header carries a one-line
   // explanation — without touching any gating behaviour.
 
-  it("labels validation and llm_interpretations rows 'Blocks Run' and the other four rows 'Advisory' (elspeth-088bf83922 T-2)", async () => {
+  it("labels validation and llm_interpretations rows 'Blocks run' and the other four rows 'Advisory' (elspeth-088bf83922 T-2)", async () => {
     const everyRowActionable: AuditReadinessSnapshot = {
       session_id: SESSION_ID,
       composition_version: 1,
@@ -719,7 +719,7 @@ describe("AuditReadinessPanel", () => {
 
     // Both labels are visible text, present exactly twice each (one per
     // gating/advisory row count) — not colour-only.
-    expect(screen.getAllByText("Blocks Run")).toHaveLength(2);
+    expect(screen.getAllByText("Blocks run")).toHaveLength(2);
     expect(screen.getAllByText("Advisory")).toHaveLength(4);
   });
 
@@ -766,14 +766,49 @@ describe("AuditReadinessPanel", () => {
     expect(validation.closest("li")).toHaveTextContent("Advisory");
   });
 
-  it("explains the 'Blocks Run' / 'Advisory' classification in the expanded header", async () => {
+  it("explains the 'Blocks run' / 'Advisory' classification in the expanded header", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(snapshotWithProvenanceWarning(1), { signal }),
     );
     render(<AuditReadinessPanel />);
     expect(
-      await screen.findByText(/Rows marked "Blocks Run" must be clear/i),
+      await screen.findByText(/Rows marked "Blocks run" must be clear/),
     ).toBeInTheDocument();
+  });
+
+  it("quotes the gate badge in the header using the badge's own literal, case included", async () => {
+    // elspeth-1fbb371ac3. Not two independently-pinned strings: this reads
+    // the quoted label OUT of the rendered header sentence and requires a
+    // badge rendering that exact text to exist on the same screen. It fails
+    // if either side drifts — including a case-only drift, which is what
+    // shipped ("Blocks Run" in the badge, "advisory" in the prose). The
+    // second assertion below pins that the pair is ONE case register, so
+    // "Blocks Run" cannot come back by changing both sides together.
+    //
+    // A blocked snapshot, so at least one row actually renders the gating
+    // badge the header sentence quotes.
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(snapshotWithValidationErrorAndProvenanceWarning(1), {
+          signal,
+        }),
+    );
+    render(<AuditReadinessPanel />);
+
+    const explanation = await screen.findByText(/^Rows marked "/);
+    const quoted = /"([^"]+)"/.exec(explanation.textContent ?? "")?.[1];
+    expect(quoted, "the header must quote a gate label").toBeDefined();
+    expect(screen.getAllByText(quoted!).length).toBeGreaterThan(0);
+
+    // One case register across the binary pair: neither value may carry an
+    // interior capital, so "Blocks Run" (Title Case against a single-word
+    // "Advisory") cannot reappear. Matches the house badge register —
+    // GraphView's "row union", StatusBadge's "completed with failures".
+    for (const label of [quoted!, "Advisory"]) {
+      expect(label.slice(1), `${label} must be sentence case, not Title Case`).toBe(
+        label.slice(1).toLowerCase(),
+      );
+    }
   });
 
   it("refetches when compositionState.version advances", async () => {
@@ -864,7 +899,7 @@ describe("AuditReadinessPanel", () => {
     });
   });
 
-  it("mounts the Explain dialog when Explain → is clicked", async () => {
+  it("mounts the Explain dialog when Explain is clicked", async () => {
     vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
       (_sid, signal) => makeAbortablePromise(allGreenSnapshot(1), { signal }),
     );

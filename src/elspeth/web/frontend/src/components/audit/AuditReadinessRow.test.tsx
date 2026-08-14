@@ -129,7 +129,7 @@ describe("AuditReadinessRow", () => {
 
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
-  // Every row carries a parent-prepared "Blocks Run" / "Advisory" text badge
+  // Every row carries a parent-prepared "Blocks run" / "Advisory" text badge
   // next to its heading. Validation follows backend execution readiness;
   // llm_interpretations remains gating; the other four ids are advisory.
   // The badge is visible text (not aria-hidden) and also
@@ -138,8 +138,8 @@ describe("AuditReadinessRow", () => {
   // classification.
 
   it.each([
-    ["validation", "blocks", "Blocks Run"],
-    ["llm_interpretations", "blocks", "Blocks Run"],
+    ["validation", "blocks", "Blocks run"],
+    ["llm_interpretations", "blocks", "Blocks run"],
     ["plugin_trust", "advisory", "Advisory"],
     ["provenance", "advisory", "Advisory"],
     ["retention", "advisory", "Advisory"],
@@ -168,7 +168,7 @@ describe("AuditReadinessRow", () => {
       </ul>,
     );
     expect(screen.getByText("Provenance")).toBeInTheDocument();
-    expect(screen.getByText("Blocks Run")).toBeInTheDocument();
+    expect(screen.getByText("Blocks run")).toBeInTheDocument();
   });
 
   it("renders the gate badge as visible text (not aria-hidden) for both actionable and static variants", () => {

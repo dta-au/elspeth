@@ -72,9 +72,15 @@ export function ComposerPreferencesForm({
 
   return (
     <>
-      <fieldset disabled={writing} aria-busy={writing}>
-        <legend>Default mode for new sessions</legend>
-        <label>
+      <fieldset
+        disabled={writing}
+        aria-busy={writing}
+        className="composer-preferences-fieldset"
+      >
+        <legend className="composer-preferences-legend">
+          Default mode for new sessions
+        </legend>
+        <label className="composer-preferences-option">
           <input
             type="radio"
             name="composer-default-mode"
@@ -85,7 +91,7 @@ export function ComposerPreferencesForm({
           />
           <span>Guided (recommended)</span>
         </label>
-        <label>
+        <label className="composer-preferences-option">
           <input
             type="radio"
             name="composer-default-mode"
@@ -97,9 +103,9 @@ export function ComposerPreferencesForm({
           <span>Freeform</span>
         </label>
       </fieldset>
-      <fieldset style={{ marginTop: 16 }}>
-        <legend>Theme</legend>
-        <label>
+      <fieldset className="composer-preferences-fieldset">
+        <legend className="composer-preferences-legend">Theme</legend>
+        <label className="composer-preferences-option">
           <input
             type="radio"
             name="composer-theme"
@@ -109,7 +115,7 @@ export function ComposerPreferencesForm({
           />
           <span>System</span>
         </label>
-        <label>
+        <label className="composer-preferences-option">
           <input
             type="radio"
             name="composer-theme"
@@ -119,7 +125,7 @@ export function ComposerPreferencesForm({
           />
           <span>Light</span>
         </label>
-        <label>
+        <label className="composer-preferences-option">
           <input
             type="radio"
             name="composer-theme"
@@ -131,15 +137,7 @@ export function ComposerPreferencesForm({
         </label>
       </fieldset>
       {writeError !== null && (
-        <div
-          role="alert"
-          className="composer-preferences-error"
-          style={{
-            marginTop: 8,
-            color: "var(--color-error)",
-            fontSize: 13,
-          }}
-        >
+        <div role="alert" className="composer-preferences-error">
           {writeError}
         </div>
       )}
@@ -152,10 +150,9 @@ export function ComposerPreferencesForm({
           for a user who never started, it is a harmless no-op PATCH. */}
       <button
         type="button"
-        className="btn btn-compact"
+        className="btn btn-compact composer-preferences-reset"
         disabled={writing}
         onClick={() => void onResetTutorial()}
-        style={{ marginTop: 16 }}
       >
         Reset tutorial
       </button>

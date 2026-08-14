@@ -241,18 +241,30 @@
    the design system, so this selector only carries header-specific concerns
    if any are added later. No declarations here is correct. */
 
+/* Elevation (elspeth-4d38a73632): this was the only floating surface in the
+   app that declared NO box-shadow, so it sat flat on the teal workspace it
+   opens over — the one place a menu needs to say where it ends and the page
+   begins. --shadow-dropdown is the tier whose own token comment names menus,
+   and it is what the user menu below already composes.
+
+   The stacking layer now comes from the z-scale instead of the bare literal
+   100 (--z-overlay IS 100, and its token comment names dropdowns — a
+   value-preserving substitution, not a promotion), the corner matches the
+   --radius-md the other menus use, and the menu clears its trigger by the same
+   --space-xs the user menu does. */
 .header-session-switcher-menu {
   position: absolute;
-  top: 100%;
+  top: calc(100% + var(--space-xs));
   left: 0;
   margin: 0;
   padding: var(--space-xs) 0;
   list-style: none;
   background: var(--color-surface-nav-raised);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-dropdown);
   min-width: 240px;
-  z-index: 100;
+  z-index: var(--z-overlay);
   max-height: 60vh;
   overflow-y: auto;
 }
@@ -363,9 +375,13 @@
 
 .user-menu-list {
   position: absolute;
-  top: calc(100% + 4px);
+  top: calc(100% + var(--space-xs));
   right: 0;
-  z-index: 50;
+  /* Was the bare literal 50. Tokenised to the tier it already sat on rather
+     than promoted: which layer a menu belongs on is a system-wide call that
+     also binds the chat, workspace and inspector menus, and it cannot be
+     settled — or seen — from inside this stylesheet. */
+  z-index: var(--z-popover);
   min-width: 200px;
   margin: 0;
   padding: var(--space-xs) 0;

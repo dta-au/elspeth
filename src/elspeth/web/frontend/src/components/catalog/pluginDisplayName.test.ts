@@ -35,6 +35,19 @@ describe("pluginDisplayName", () => {
     expect(pluginDisplayName("rag_retrieval")).toBe("RAG Retrieval");
   });
 
+  // elspeth-d2de348437: two other title-casers ship in the frontend
+  // (chat/interpretationStepLabel.ts, tutorial/TutorialTurn4Run.tsx) with no
+  // acronym set at all, so "json_explode" renders "Json Explode" and the
+  // tutorial's first table header renders "Url". Routing them here is the
+  // fix; this pins the precondition it depends on — the curated set really
+  // does carry URL and JSON — so the acronyms cannot be dropped from under
+  // that consolidation.
+  it("carries the acronyms the other title-casers need", () => {
+    expect(pluginDisplayName("url")).toBe("URL");
+    expect(pluginDisplayName("url_fetch")).toBe("URL Fetch");
+    expect(pluginDisplayName("json_explode")).toBe("JSON Explode");
+  });
+
   it("is not confused by Object.prototype key names", () => {
     // A plugin hypothetically named "constructor" must humanise, not
     // resolve to Object.prototype.constructor.

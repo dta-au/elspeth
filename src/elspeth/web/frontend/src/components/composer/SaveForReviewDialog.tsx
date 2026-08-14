@@ -195,9 +195,15 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   data-testid="save-for-review-copy"
                   aria-label="Copy share URL to clipboard"
                 >
-                  {copyState === "idle" && "Copy"}
-                  {copyState === "copied" && "Copied!"}
-                  {copyState === "failed" && "Copy failed — select & copy manually"}
+                  {/* The failure message is NOT a third button label
+                      (elspeth-6eb60a33a9). `.btn` and `.btn-compact` both
+                      declare white-space: nowrap, so a full sentence made the
+                      button grow, which reflowed this flex row under the
+                      pointer that had just clicked it — the control moved away
+                      at the moment the user was reacting to the error. The
+                      label stays two states wide and the message renders
+                      below the row, exactly as UserAdminDialog does it. */}
+                  {copyState === "copied" ? "Copied!" : "Copy"}
                 </button>
                 <a
                   href={absoluteShareUrl}
@@ -208,6 +214,24 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   Open in new tab
                 </a>
               </div>
+              {/* Live region for the copy outcome. It is mounted empty and only
+                  its TEXT changes, because a region inserted with its content
+                  already inside it is not reliably announced. role="status"
+                  (polite) rather than role="alert": this dialog already owns an
+                  assertive region for the mint failure above, and the user
+                  triggered this message themselves by clicking Copy — it does
+                  not warrant interrupting whatever is being read. The tone
+                  class is applied with the text so an idle empty span paints
+                  no banner. */}
+              <span
+                role="status"
+                className={copyState === "failed" ? "save-for-review-error" : undefined}
+                data-testid="save-for-review-copy-status"
+              >
+                {copyState === "failed"
+                  ? "Copy failed — select the share URL above and copy it manually."
+                  : ""}
+              </span>
               <p className="save-for-review-tip">
                 The link grants a different authenticated user read-only access
                 to a frozen snapshot of this pipeline. Recipients must have an

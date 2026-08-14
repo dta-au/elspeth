@@ -87,7 +87,7 @@ describe("TutorialTurn7Graduation", () => {
     expect(eventListener).toHaveBeenCalledTimes(1);
     expect(screen.getByText("What you built is AI-generated.")).toBeInTheDocument();
     expect(screen.getByText("Read before you run.")).toBeInTheDocument();
-    expect(screen.getByText("Ask Elspeth.")).toBeInTheDocument();
+    expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(screen.getByText("LLMs are confident even when they're wrong.")).toBeInTheDocument();
     // Guided and freeform differ only in interaction style, not capability.
     expect(
@@ -289,8 +289,8 @@ describe("TutorialTurn7Graduation — skip-variant copy (elspeth-918f4434b3)", (
       screen.getByText(/nothing executes without your say-so/i),
     ).toBeInTheDocument();
     // Shared bullets (no just-ran claims) render on both paths, including
-    // the guided/freeform capability-parity guidance riding "Ask Elspeth.".
-    expect(screen.getByText("Ask Elspeth.")).toBeInTheDocument();
+    // the guided/freeform capability-parity guidance riding "Ask ELSPETH.".
+    expect(screen.getByText("Ask ELSPETH.")).toBeInTheDocument();
     expect(
       screen.getByText(/guided and freeform can build the same pipelines/i),
     ).toBeInTheDocument();

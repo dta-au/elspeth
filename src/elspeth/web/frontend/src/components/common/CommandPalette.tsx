@@ -29,6 +29,17 @@ import {
 
 interface Command {
   id: string;
+  /**
+   * User-visible command name, in the product's sentence-case register
+   * (elspeth-93897c03d1): first word capitalised, everything after it lower
+   * case unless it is an acronym (YAML). Where a command carries a `shortcut`
+   * that `ShortcutsHelp` also documents, the two labels must be the SAME
+   * string — the palette is where users learn a command's name, and the
+   * shortcuts sheet is where they look it up again seconds later.
+   * `commandRegister.test.tsx` pins both halves.
+   *
+   * Session commands are exempt: their title is user data, not product copy.
+   */
   title: string;
   category: "action" | "session" | "navigation";
   shortcut?: string;
@@ -77,7 +88,7 @@ export function CommandPalette({
     // Actions
     cmds.push({
       id: "new-session",
-      title: "New Session",
+      title: "New session",
       category: "action",
       shortcut: "Ctrl+N",
       action: () => {
@@ -88,7 +99,7 @@ export function CommandPalette({
 
     cmds.push({
       id: "validate",
-      title: "Validate Pipeline",
+      title: "Validate pipeline",
       category: "action",
       shortcut: "Ctrl+Shift+V",
       enabled: !!compositionState && !!activeSessionId,
@@ -102,7 +113,7 @@ export function CommandPalette({
 
     cmds.push({
       id: "execute",
-      title: "Execute Pipeline",
+      title: "Execute pipeline",
       category: "action",
       shortcut: "Ctrl+E",
       enabled:
@@ -121,7 +132,7 @@ export function CommandPalette({
 
     cmds.push({
       id: "focus-chat",
-      title: "Focus Chat Input",
+      title: "Focus chat input",
       category: "action",
       shortcut: "Ctrl+/",
       action: () => {
@@ -140,7 +151,7 @@ export function CommandPalette({
     ) {
       cmds.push({
         id: "reenter-guided",
-        title: "Re-enter Guided Mode",
+        title: "Re-enter guided mode",
         category: "action",
         action: () => {
           void reenterGuided();
@@ -151,7 +162,7 @@ export function CommandPalette({
 
     cmds.push({
       id: "show-graph",
-      title: "Show Graph",
+      title: "Show graph",
       category: "navigation",
       shortcut: "Ctrl+Shift+G",
       action: () => {

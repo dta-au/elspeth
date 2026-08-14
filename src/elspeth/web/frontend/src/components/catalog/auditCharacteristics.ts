@@ -130,7 +130,11 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   },
   {
     flag: "external_call",
-    label: "Network call",
+    // Sentence-case like every other label here — the twelve chips render
+    // side by side in one wrapping row, and a lone capital reads as a proper
+    // noun or a more important characteristic (elspeth-cfa3faad35). The two
+    // "I/O" labels and "HMAC-signed" keep their capitals: those are acronyms.
+    label: "network call",
     glyph: "🌐",
     tooltip:
       "Plugin reaches an external system over the network (HTTP, API, " +

@@ -19,10 +19,21 @@
  * actionable buttons render as today.
  *
  * Gate legibility (elspeth-088bf83922 T-2, option (a)): every row also
- * renders a small "Blocks Run" / "Advisory" text badge next to its
+ * renders a small "Blocks run" / "Advisory" text badge next to its
  * heading. Parent panels prepare `blocksRun` from the same backend-readiness
  * helper used by ExecuteButton, so this pure renderer never reconstructs
  * admission from row status or summary text.
+ *
+ * Badge case (elspeth-1fbb371ac3): both values of this binary field are
+ * SENTENCE case, so the pair reads as two states of one field rather than
+ * two vocabularies. That is also the house register for badge text — every
+ * other badge in the tree ships its label lowercase or sentence-cased
+ * (`row union` in GraphView, `chat input` in InlineChatSourceEntry,
+ * `completed with failures` in StatusBadge) and lets CSS supply any
+ * upper-case badge register (shared.css `.status-badge`). Do not restore
+ * "Blocks Run": the panel headers quote this literal in prose
+ * (AuditReadinessPanel / SharedAuditReadinessPanel), so the label has to
+ * read as an ordinary phrase inside a sentence.
  */
 
 import { useReadOnly } from "../../contexts/ReadOnlyContext";
@@ -94,7 +105,7 @@ export function AuditReadinessRow({
   // the badge is a sibling within the same audit-readiness-row-label cell,
   // not appended to the heading string.
   const gateKind = row.blocksRun ? "blocks" : "advisory";
-  const gateLabel = gateKind === "blocks" ? "Blocks Run" : "Advisory";
+  const gateLabel = gateKind === "blocks" ? "Blocks run" : "Advisory";
   const label = (
     <span className="audit-readiness-row-label">
       <span className="audit-readiness-row-label-text">{row.heading}</span>{" "}

@@ -109,6 +109,39 @@ describe("ComposerPreferencesForm", () => {
     const alert = screen.getByRole("alert");
     expect(alert).toBeInTheDocument();
     expect(alert).toHaveTextContent(/503 Service Unavailable/);
+    // The affordance is the shared stylesheet rule, not a one-off inline
+    // style: the same class ships on DefaultModeChangedBanner and
+    // UserAdminDialog, and only this call site used to carry inline colour,
+    // so the same error rendered two different ways (elspeth-b9871d3648).
+    expect(alert).toHaveClass("composer-preferences-error");
+    expect(alert.getAttribute("style")).toBeNull();
+  });
+
+  it("puts real classes on every fieldset, legend and option (elspeth-03f43bdef0)", () => {
+    // With no classes at all these rendered Chrome's 2px groove fieldset
+    // bevel and ~5px UA sibling margins on --color-surface. The stylesheet
+    // side of the fix is pinned in settingsSurface.test.ts; this pins that
+    // the markup actually reaches those rules.
+    const { container } = render(<ComposerPreferencesForm />);
+
+    const groups = screen.getAllByRole("group");
+    expect(groups).toHaveLength(2);
+    for (const group of groups) {
+      expect(group).toHaveClass("composer-preferences-fieldset");
+      expect(group.getAttribute("style")).toBeNull();
+      const legend = group.querySelector("legend");
+      expect(legend).not.toBeNull();
+      expect(legend).toHaveClass("composer-preferences-legend");
+    }
+
+    const radios = screen.getAllByRole("radio");
+    expect(radios).toHaveLength(5);
+    for (const radio of radios) {
+      expect(radio.closest("label")).toHaveClass("composer-preferences-option");
+    }
+
+    // No element in the form falls back to an inline layout literal.
+    expect(container.querySelectorAll("[style]")).toHaveLength(0);
   });
 
   it("shows Reset tutorial after completion and calls resetTutorial", async () => {

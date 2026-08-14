@@ -266,7 +266,7 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
-    fireEvent.click(screen.getByText("Focus Chat Input"));
+    fireEvent.click(screen.getByText("Focus chat input"));
 
     await waitFor(() => {
       expect(onFocusAuthoring).toHaveBeenCalledTimes(1);
@@ -343,7 +343,7 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
-    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+    expect(screen.queryByText("Execute pipeline")).not.toBeInTheDocument();
   });
 
   it("withholds Execute when a malformed validation response omits readiness", () => {
@@ -361,7 +361,7 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
-    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+    expect(screen.queryByText("Execute pipeline")).not.toBeInTheDocument();
   });
 
   it("withholds Execute when the run-admission owner is not mounted", () => {
@@ -378,7 +378,7 @@ describe("CommandPalette guided-mode commands", () => {
       />,
     );
 
-    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+    expect(screen.queryByText("Execute pipeline")).not.toBeInTheDocument();
   });
 
   it("dispatches run intent for an execution-ready pipeline", () => {
@@ -397,7 +397,7 @@ describe("CommandPalette guided-mode commands", () => {
         runAdmissionAvailable
       />,
     );
-    fireEvent.click(screen.getByText("Execute Pipeline"));
+    fireEvent.click(screen.getByText("Execute pipeline"));
 
     expect(onRequestRun).toHaveBeenCalledTimes(1);
     expect(executionStoreState.execute).not.toHaveBeenCalled();
@@ -420,6 +420,6 @@ describe("CommandPalette guided-mode commands", () => {
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
     );
 
-    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+    expect(screen.queryByText("Execute pipeline")).not.toBeInTheDocument();
   });
 });

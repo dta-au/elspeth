@@ -700,3 +700,72 @@ describe("CatalogDrawer — internal plugins", () => {
     });
   });
 });
+
+// elspeth-98757e13ae: the unavailable-components notice used to render in the
+// drawer FRAME, above the only band that can shrink. `.catalog-list` is
+// `flex: 1 1 0%` with `overflow-y: auto` (catalog.css) so its automatic
+// minimum resolves to 0, while the header, search wrapper, chip strip and tab
+// strip all carry `flex-shrink: 0` — an unbounded notice therefore squeezed
+// the plugin list towards nothing and could not scroll itself. These tests
+// pin the DOM containment that fixes it; jsdom has no layout engine, so the
+// squeeze itself is not measurable here.
+describe("CatalogDrawer — unavailable-components notice placement", () => {
+  const FINDING = {
+    component_id: "legacy_sink",
+    plugin_id: "sink:retired",
+    reason_code: "plugin_not_installed",
+    snapshot_fingerprint: "catalog-test-snapshot",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    usePluginCatalogStore.getState().clear();
+    useAuthStore.setState({
+      token: "catalog-test-token",
+      user: {
+        user_id: "alice",
+        username: "alice",
+        display_name: "Alice",
+        email: null,
+        groups: [],
+        dev_admin: false,
+      },
+      isLoading: false,
+    });
+    useSessionStore.setState({
+      compositionState: { plugin_policy_findings: [FINDING] },
+    } as never);
+  });
+
+  it("renders the notice inside the scrollable tabpanel, not the drawer frame", async () => {
+    render(<CatalogDrawer isOpen onClose={() => {}} />);
+    // Present FIRST — the notice is gated on the finding's
+    // snapshot_fingerprint matching the loaded catalog's, so a fixture whose
+    // fingerprint drifted would render nothing and make containment vacuous.
+    const banner = await screen.findByRole("region", {
+      name: "Unavailable saved components",
+    });
+    const panel = screen.getByRole("tabpanel");
+    expect(panel).toContainElement(banner);
+    // And it is the panel's own first child, so it scrolls with the body
+    // rather than competing with it for the drawer's fixed height.
+    expect(banner.parentElement).toBe(panel);
+    expect(panel.firstElementChild).toBe(banner);
+  });
+
+  it("keeps the notice when search or filters empty the plugin list", async () => {
+    render(<CatalogDrawer isOpen onClose={() => {}} />);
+    await screen.findByRole("region", { name: "Unavailable saved components" });
+    await userEvent.type(
+      screen.getByLabelText("Search plugins"),
+      "zzzzznomatch",
+    );
+    await screen.findByText("No plugins available.");
+    // The notice sits OUTSIDE the fetchError -> loading -> empty -> list
+    // ladder, so an empty result set cannot take it away.
+    const banner = screen.getByRole("region", {
+      name: "Unavailable saved components",
+    });
+    expect(screen.getByRole("tabpanel")).toContainElement(banner);
+  });
+});

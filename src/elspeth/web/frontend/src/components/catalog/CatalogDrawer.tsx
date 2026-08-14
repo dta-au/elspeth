@@ -10,10 +10,11 @@
 // - Per-tab filter chips for capability tags and audit characteristics
 // - Tab-based filtering by plugin type with counts
 // - Principal/fingerprint-isolated list and schema caches
-// - Sources tab pins an InlineChatSourceEntry as the first row — a
+// - Sources tab pins an InlineChatSourceEntry as the first plugin row — a
 //   synthetic affordance that is unaffected by filters or search and is
 //   always visible alongside the empty-state message when filters
-//   eliminate every real plugin.
+//   eliminate every real plugin. The unavailable-components notice, when
+//   present, precedes it inside the same scrollable tabpanel.
 //
 // Filter state is **per-tab** (one CatalogFilters record per CatalogTab),
 // so an active capability filter on Sources does NOT silently hide every
@@ -444,57 +445,6 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
           </button>
         </div>
 
-        {policyFindings.length > 0 && (
-          <section
-            role="region"
-            aria-labelledby="catalog-disabled-components-title"
-            className="validation-banner validation-banner-fail"
-          >
-            <div
-              id="catalog-disabled-components-title"
-              className="validation-banner-fail-title"
-            >
-              Unavailable saved components
-            </div>
-            <p>
-              These historical components remain visible, but must be removed
-              or replaced before the pipeline can run.
-            </p>
-            <ul className="validation-banner-fail-list">
-              {policyFindings.map((finding) => (
-                <li
-                  key={`${finding.component_id}:${finding.plugin_id}`}
-                  className="validation-banner-error-item"
-                >
-                  <div>
-                    <strong>{finding.component_id}</strong>{" "}
-                    <code>{finding.plugin_id}</code> —{" "}
-                    {unavailableReasonLabel(finding.reason_code)}
-                  </div>
-                  <div className="import-yaml-actions">
-                    <button
-                      type="button"
-                      className="btn btn-small"
-                      aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
-                      onClick={() => handleRemoveDisabled(finding)}
-                    >
-                      Remove
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn-small"
-                      aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
-                      onClick={() => handleReplaceDisabled(finding)}
-                    >
-                      Replace
-                    </button>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
         {/* Search input */}
         <div className="catalog-search-wrapper">
           <div className="catalog-search-container">
@@ -571,13 +521,74 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
             the fetchError → loading → empty → list conditional ladder so it
             remains visible even when filters eliminate every real plugin.
             The empty-state message applies to the plugin list, not the
-            Sources tab as a whole — the synthetic entry stays usable. */}
+            Sources tab as a whole — the synthetic entry stays usable.
+
+            The unavailable-components notice lives here too, for the same
+            reason and one more (elspeth-98757e13ae): this band is the drawer's
+            only shrinkable one (`.catalog-list` is `flex: 1 1 0%` with
+            `overflow-y: auto`, so its automatic minimum resolves to 0, while
+            the header, search wrapper, chip strip and tab strip all carry
+            `flex-shrink: 0`). Rendered in the drawer FRAME the notice grew
+            without bound and squeezed the list — the content the user came
+            for — towards nothing, and could not scroll itself. Inside the
+            tabpanel it scrolls with the body instead of competing with it. */}
         <div
           id={catalogPanelId(activeTab)}
           role="tabpanel"
           aria-labelledby={catalogTabId(activeTab)}
           className="catalog-list"
         >
+          {policyFindings.length > 0 && (
+            <section
+              role="region"
+              aria-labelledby="catalog-disabled-components-title"
+              className="validation-banner validation-banner-fail"
+            >
+              <div
+                id="catalog-disabled-components-title"
+                className="validation-banner-fail-title"
+              >
+                Unavailable saved components
+              </div>
+              <p>
+                These historical components remain visible, but must be removed
+                or replaced before the pipeline can run.
+              </p>
+              <ul className="validation-banner-fail-list">
+                {policyFindings.map((finding) => (
+                  <li
+                    key={`${finding.component_id}:${finding.plugin_id}`}
+                    className="validation-banner-error-item"
+                  >
+                    <div>
+                      <strong>{finding.component_id}</strong>{" "}
+                      <code>{finding.plugin_id}</code> —{" "}
+                      {unavailableReasonLabel(finding.reason_code)}
+                    </div>
+                    <div className="import-yaml-actions">
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
+                        onClick={() => handleRemoveDisabled(finding)}
+                      >
+                        Remove
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
+                        onClick={() => handleReplaceDisabled(finding)}
+                      >
+                        Replace
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
           {activeTab === "sources" && (
             <InlineChatSourceEntry onCloseDrawer={onClose} />
           )}

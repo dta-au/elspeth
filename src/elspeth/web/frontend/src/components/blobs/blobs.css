@@ -26,12 +26,44 @@
 /* ---------------------------------------------------------------------------
    BlobRow
    --------------------------------------------------------------------------- */
+/* One content edge for the whole panel (elspeth-350d5a8b0e). The inline inset
+   is --space-md, matching .blob-manager-header, .blob-manager-category-header
+   and .blob-row-preview; only then does an expanded preview read as nested
+   under its row instead of indenting away from it. The BLOCK inset stays on
+   the --space-1-5 rung: it sets row height, which the 280px max-height on
+   .blob-manager-container is sized against. */
 .blob-row-container {
   display: flex;
   align-items: center;
   gap: var(--space-sm);
-  padding: var(--space-1-5) var(--space-sm);
+  padding: var(--space-1-5) var(--space-md);
   font-size: var(--font-size-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* Row dividers (elspeth-a1a1b62aa9).
+   These lived as an inline `style` on .blob-row-container, which structurally
+   CANNOT express the last-row exception — so the final row's border landed
+   flush on .chat-input's border-top (chat.css) as a doubled 2px seam, heavier
+   than any divider inside the list.
+
+   The suppression is scoped to the last row of the LAST category, not to
+   `:last-child` alone: BlobManager renders one wrapper per non-empty category
+   (empty ones return null, so `.blob-manager-list > *:last-child` really is
+   the last group), and a bare `.blob-row-item:last-child` would also kill the
+   divider between the last Source row and the OUTPUT FILES band below it —
+   .blob-manager-category-header carries border-bottom and no border-top, so
+   that row would merge into the next band. Trading one doubled seam for two
+   missing dividers is not a fix. */
+.blob-manager-list > *:last-child > .blob-row-item:last-child > .blob-row-container,
+.blob-manager-list > *:last-child > .blob-row-item:last-child > .blob-row-preview {
+  border-bottom: none;
+}
+
+/* An open preview takes over the row's divider so the pair reads as one block;
+   .blob-row-preview carries border-bottom for exactly that reason. */
+.blob-row-item--preview-open > .blob-row-container {
+  border-bottom: none;
 }
 
 .blob-row-status-dot {
@@ -189,7 +221,11 @@
   font-weight: 600;
   color: var(--color-text-muted);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  /* Relative tracking (elspeth-5859905d1f): an absolute 0.5px does not scale
+     with font-size, so the band drifted off the uppercase micro-label idiom
+     the moment type size moved. 0.04em is the value already shared by
+     .guided-current-decision-eyebrow and .bubble-system--stage. */
+  letter-spacing: 0.04em;
   background-color: var(--color-surface-elevated);
   border-bottom: 1px solid var(--color-border);
 }
