@@ -55,10 +55,19 @@ const MINIMAP_NODE_STROKE_COLOR_VAR = "--color-border-strong";
 // Interim UX threshold: avoid MiniMap noise on small graphs until we can
 // promote this to a viewport-overflow heuristic or an explicit user toggle.
 const MINIMAP_NODE_COUNT_THRESHOLD = 8;
-// One options object for BOTH fit-view surfaces: the imperative first-render
-// fit in handleInit and the ReactFlow fitViewOptions prop (Controls button).
-// The imperative call does not read the prop, so sharing the constant is what
-// keeps the two fits from drifting apart.
+// One options object for ALL THREE fit-view surfaces, each of which reads its
+// options from a DIFFERENT place and none of which falls back to another:
+//   1. handleInit's imperative instance.fitView(...) — takes them as an argument;
+//   2. the <ReactFlow fitViewOptions> prop — seeds the store's initial fit;
+//   3. the <Controls fitViewOptions> prop — ControlsComponent calls
+//      fitView(fitViewOptions) with its OWN prop, never the ReactFlow one
+//      (@xyflow/react dist/esm/index.js:4558,4571).
+// Passing this constant to (3) is not optional decoration: fitView(undefined)
+// writes fitViewOptions: undefined into the store, and fitViewport then falls
+// through to `options?.maxZoom ?? maxZoom` = the library default 2 with padding
+// 0.1 (@xyflow/system dist/esm/index.js:439-446). The fit-view button therefore
+// zoomed the canvas IN to 2.0x — doubling every token drawn on it — and left
+// the zoom-in button disabled at maxZoomReached (elspeth-a8074a3a7b).
 const GRAPH_FIT_VIEW_OPTIONS: FitViewOptions = {
   padding: 0.15,
   maxZoom: 1.5,
@@ -256,6 +265,40 @@ const NODE_TYPES: NodeTypes = {
   [PIPELINE_NODE_TYPE]: PipelineGraphNode,
 };
 
+const EDGE_DIRECTION_MARKER_SIZE = 12;
+
+/**
+ * Give EVERY edge its arrowhead.
+ *
+ * Direction is the single most important thing this diagram states, so it is a
+ * property of every connector — not a side effect of lane assignment. markerEnd
+ * used to be written only inside assignParallelEdgeLanes, whose lane pass
+ * short-circuits for any endpoint group holding fewer than 2 edges, so one
+ * branching pipeline rendered directed and undirected connectors side by side
+ * (elspeth-ddae27dff1).
+ *
+ * Applied as ONE pass over the finished edge list rather than at each of the
+ * nine construction sites: two later phases (claimExplicitRowUnionAlias and the
+ * row_union outbound rewrite) restyle an already-built edge from authority, and
+ * a per-site marker would keep the old colour while style.stroke moved. Keying
+ * the marker on the same data.flowType that every site uses to pick
+ * style.stroke makes arrowhead colour and line colour unable to disagree.
+ */
+function withDirectionMarkers(
+  edges: PipelineGraphEdgeModel[],
+): PipelineGraphEdgeModel[] {
+  return edges.map((edge) => ({
+    ...edge,
+    markerEnd: {
+      type: MarkerType.ArrowClosed,
+      color:
+        edge.data.flowType === "error" ? EDGE_COLORS.error : EDGE_COLORS.normal,
+      width: EDGE_DIRECTION_MARKER_SIZE,
+      height: EDGE_DIRECTION_MARKER_SIZE,
+    },
+  }));
+}
+
 function assignParallelEdgeLanes(
   nodes: PipelineGraphNodeModel[],
   edges: PipelineGraphEdgeModel[],
@@ -318,15 +361,6 @@ function assignParallelEdgeLanes(
         ...edge.data,
         laneOffset,
       },
-      markerEnd: {
-        type: MarkerType.ArrowClosed,
-        color:
-          typeof edge.style?.stroke === "string"
-            ? edge.style.stroke
-            : undefined,
-        width: 12,
-        height: 12,
-      },
     };
   });
   const nodesWithHandles = nodes.map((node) => ({
@@ -343,23 +377,75 @@ function assignParallelEdgeLanes(
 type MiniMapNodeKind = keyof typeof BADGE_COLORS;
 type ValidationStatus = "valid" | "warning" | "error";
 
+// The validation dot is a 14px circle. A TEXT glyph inside it cannot be given
+// breathing room, because the product's smallest type token is the 12px floor
+// (--font-size-xs) — which left the old letter `x` / `!` marks 1px of clearance
+// and reading as clipped, in two different registers (a Latin letter beside a
+// typographic exclamation mark) so two members of one icon set looked like two
+// different mistakes. Stroked paths on a shared 12x12 viewBox are not type, so
+// they answer to the 8px mark size below instead: one stroke weight, one
+// optical size, 3px of clearance on every side (elspeth-ac3fff7ef2).
+const VALIDATION_MARK_SIZE = 8;
+
+function ValidationMark({ children }: { children: ReactNode }): JSX.Element {
+  return (
+    <svg
+      width={VALIDATION_MARK_SIZE}
+      height={VALIDATION_MARK_SIZE}
+      viewBox="0 0 12 12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
+  );
+}
+
 const VALIDATION_STATUS_MARKERS: Record<
   ValidationStatus,
-  { ariaLabel: string; glyph: string; fallbackTitle: string }
+  { ariaLabel: string; glyph: ReactNode; fallbackTitle: string }
 > = {
   error: {
     ariaLabel: "Validation: error",
-    glyph: "x",
+    glyph: (
+      <ValidationMark>
+        <path d="M3 3 L9 9" />
+        <path d="M9 3 L3 9" />
+      </ValidationMark>
+    ),
     fallbackTitle: "Has validation errors",
   },
   warning: {
     ariaLabel: "Validation: warning",
-    glyph: "!",
+    glyph: (
+      <ValidationMark>
+        <path d="M6 2 L6 7" />
+        {/* An explicit filled circle, not a zero-length round-capped path:
+            renderers disagree about whether that degenerate case paints. r=1
+            makes a 2-unit dot, the same weight as the stem's stroke. */}
+        <circle cx="6" cy="9.75" r="1" fill="currentColor" stroke="none" />
+      </ValidationMark>
+    ),
     fallbackTitle: "Has warnings",
   },
+  // Deliberately unreachable on the canvas: makeRfNode reads the bare
+  // nodeValidationMap, which attributes nothing to a passing node, so a valid
+  // run draws no marker at all. Activating this arm is a separate, deliberate
+  // change (elspeth-b5b7c5a6ad), so it is carried forward in the same stroked
+  // register as its two live siblings rather than left behind as a `✓` that
+  // would reintroduce the mixed-register defect the day someone wires it up.
   valid: {
     ariaLabel: "Validation: passing",
-    glyph: "✓",
+    glyph: (
+      <ValidationMark>
+        <path d="M2.5 6.5 L5 9 L9.5 3.5" />
+      </ValidationMark>
+    ),
     fallbackTitle: "Valid",
   },
 };
@@ -587,7 +673,12 @@ function NodeConfigPanel({
           onClick={onClose}
           aria-label="Close node configuration"
         >
-          x
+          {/* U+00D7 MULTIPLICATION SIGN, the close glyph the other nine close
+              affordances use and that GraphModal.test.tsx names as the standard
+              ("uses the standard × close glyph (not a lowercase 'x')"). A Latin
+              letter x sits at a different optical weight and cap height
+              (elspeth-51cbcf1664). */}
+          ×
         </button>
       </header>
 
@@ -815,16 +906,34 @@ export function GraphView() {
       const validationMarker = validationStatus
         ? VALIDATION_STATUS_MARKERS[validationStatus]
         : null;
-      // Selection ring takes priority over validation border
-      const borderStyle = isSelected
-        ? "2px solid var(--color-selected-ring)"
+      // State is carried OUTSIDE the box, never in border width. The card is a
+      // fixed NODE_WIDTH x NODE_HEIGHT box, so widening its border 1px -> 2px
+      // shrinks the content box and shifts everything inside it 1px down and
+      // 1px right — badge chips that lined up in a column before validation are
+      // misregistered the instant it completes, and the whole canvas appears to
+      // shiver (elspeth-003794d55c). The border therefore stays 1px in every
+      // state and only changes COLOUR; the extra weight comes from a box-shadow
+      // ring, which paints outside the border box and costs no layout. That is
+      // the idiom the selection state already used for its outer halo, so
+      // selection now uses it for its whole emphasis rather than half of it.
+      // Selection ring takes priority over the validation ring.
+      const ringColor = isSelected
+        ? "var(--color-selected-ring)"
         : validationStatus === "error"
-          ? `2px solid ${VALIDATION_COLORS.invalid}`
+          ? VALIDATION_COLORS.invalid
           : validationStatus === "warning"
-            ? `2px solid ${VALIDATION_COLORS.warning}`
+            ? VALIDATION_COLORS.warning
             : validationStatus === "valid"
-              ? `2px solid ${VALIDATION_COLORS.valid}`
-              : "1px solid var(--color-border-strong)";
+              ? VALIDATION_COLORS.valid
+              : null;
+      const borderStyle = `1px solid ${ringColor ?? "var(--color-border-strong)"}`;
+      // Selection keeps its heavier 3px halo; validation matches the 2px total
+      // weight the old 2px border drew, as 1px border + 1px ring.
+      const ringShadow = isSelected
+        ? "0 0 0 3px var(--color-selected-ring)"
+        : ringColor
+          ? `0 0 0 1px ${ringColor}`
+          : undefined;
 
       return {
         id,
@@ -884,8 +993,8 @@ export function GraphView() {
           width: NODE_WIDTH,
           height: NODE_HEIGHT,
           padding: 0,
-          // Selection box-shadow for extra emphasis
-          boxShadow: isSelected ? "0 0 0 3px var(--color-selected-ring)" : undefined,
+          // The whole selection / validation emphasis (see ringShadow above).
+          boxShadow: ringShadow,
           cursor: "pointer",
         },
       };
@@ -1497,7 +1606,13 @@ export function GraphView() {
       rfEdges.splice(index, 1);
     }
 
-    const parallelGeometry = assignParallelEdgeLanes(rfNodes, rfEdges);
+    // Direction markers last: every construction and rewrite phase above has
+    // settled data.flowType by now, so the arrowhead colour cannot disagree
+    // with the stroke it points along (elspeth-ddae27dff1).
+    const parallelGeometry = assignParallelEdgeLanes(
+      rfNodes,
+      withDirectionMarkers(rfEdges),
+    );
     return layoutGraph(parallelGeometry.nodes, parallelGeometry.edges);
   }, [compositionState, nodeValidationMap, nodeMessageMap, selectedNodeId]);
 
@@ -1687,7 +1802,12 @@ export function GraphView() {
               <Background gap={16} size={1} color="var(--color-canvas-grid)" />
             </ReactFlow>
           </div>
-          <Controls showInteractive={false} />
+          {/* fitViewOptions is read from THIS prop, not from <ReactFlow>'s —
+              see GRAPH_FIT_VIEW_OPTIONS (elspeth-a8074a3a7b). */}
+          <Controls
+            showInteractive={false}
+            fitViewOptions={GRAPH_FIT_VIEW_OPTIONS}
+          />
           {nodes.length > MINIMAP_NODE_COUNT_THRESHOLD && (
             <MiniMap
               bgColor="var(--color-surface)"
@@ -1696,7 +1816,14 @@ export function GraphView() {
               nodeStrokeWidth={3}
               zoomable
               pannable
-              style={{ bottom: 8, right: 8, width: 120, height: 80 }}
+              // width/height only. An inline `bottom`/`right` here does not
+              // REPLACE .react-flow__panel's own 15px margin, it stacks on top
+              // of it — which rested the MiniMap 23px off the canvas floor
+              // while the Controls, the other floating panel on the same
+              // canvas, rested at 15px (elspeth-a7ce6e6a4c). MiniMapComponent
+              // still reads style.width/style.height to scale its viewport
+              // rectangle, so those two stay.
+              style={{ width: 120, height: 80 }}
             />
           )}
         </div>

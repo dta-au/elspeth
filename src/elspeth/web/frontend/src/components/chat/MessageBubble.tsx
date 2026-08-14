@@ -154,7 +154,28 @@ export function MessageBubble({
             copy button below is an absolutely-positioned overlay, so this stays
             the first thing announced. */}
         <span className="sr-only">{authorLabel}</span>
-        {/* Copy button — visible on hover via CSS, always accessible on touch */}
+        {/* Copy button — visible on hover via CSS, always accessible on touch.
+
+            The confirmation is a GLYPH, not the word "Copied!"
+            (elspeth-091695b241). This button is `position: absolute; right: 0`
+            over the message prose with a `min-width` of
+            --size-control-compact (chat.css .bubble-action-overlay), so a
+            label wider than that floor can only grow LEFTWARD, over the
+            prose. The word rendered ~50-56px
+            including padding, so it covered the first line of the text the
+            user had just copied — at full opacity (the inline `opacity: 1`
+            below) for the whole 2000ms confirmation window, which is long
+            enough to read as a rendering glitch rather than a confirmation.
+
+            A single glyph stays well inside that floor, so the control's
+            footprint is identical in both states. Nothing is lost for
+            assistive tech: the button's aria-label already flips to "Copied to
+            clipboard", and an aria-label overrides the element's text content,
+            so the word was never the accessible-name channel. U+2713 is the
+            product's success mark — the vocabulary audit.css documents and
+            AuditReadinessPanel / PipelineValidationSummary render. Dropping
+            the word also retires the "Copied!" vs "Copied" voice mismatch
+            against MarkdownRenderer's code-block copy affordance. */}
         {!isSystem && (
           <button
             onClick={handleCopy}
@@ -164,7 +185,7 @@ export function MessageBubble({
               opacity: copied ? 1 : undefined,
             }}
           >
-            {copied ? "Copied!" : "\u2398"}
+            {copied ? "\u2713" : "\u2398"}
           </button>
         )}
 

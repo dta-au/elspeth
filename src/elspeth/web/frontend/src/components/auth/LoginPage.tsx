@@ -493,7 +493,10 @@ export function LoginPage() {
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          height: "100vh",
+          // Dynamic viewport unit, matching .app-root (header.css:12-17):
+          // 100vh is the static large viewport, so on mobile the browser
+          // chrome overlays the bottom of the box (elspeth-340f5d104c).
+          height: "100dvh",
         }}
       >
         <span className="spinner" aria-hidden="true" />
@@ -515,24 +518,50 @@ export function LoginPage() {
 
   return (
     <div
+      data-testid="login-page"
       style={{
         display: "flex",
-        alignItems: "center",
+        // flex-start, NOT center (elspeth-340f5d104c). A centred flex item
+        // that outgrows its line overflows SYMMETRICALLY, so scrollTop: 0
+        // lands below the card's top edge and the heading stays unreachable.
+        // The card's own `margin: auto` still centres it whenever there IS
+        // free space, and resolves to 0 when there is not — so the card is
+        // centred on a tall viewport and top-anchored on a short one.
+        alignItems: "flex-start",
         justifyContent: "center",
-        height: "100vh",
+        // A BOUNDED height is what makes this element a scroll owner. The
+        // filed remediation asked for `min-height: 100dvh; overflow-y: auto`,
+        // but min-height alone leaves the box content-sized: it simply grows
+        // past the viewport, never overflows itself, and `body { overflow:
+        // hidden }` (base.css:14-19) then clips it with no scrollbar — the
+        // exact shipping state where the submit button was unreachable. The
+        // dynamic unit (not 100vh) keeps mobile browser chrome out of the box.
+        height: "100dvh",
+        overflowY: "auto",
+        padding: "var(--space-lg)",
         backgroundColor: "var(--color-bg)",
       }}
     >
       <div
+        data-testid="login-card"
         style={{
-          width: 360,
-          padding: 32,
+          width: "360px",
+          maxWidth: "100%",
+          margin: "auto",
+          padding: "var(--space-2xl)",
           backgroundColor: "var(--color-surface)",
-          borderRadius: 8,
-          boxShadow: "0 2px 8px rgba(10, 40, 50, 0.4)",
+          // The card's edge is drawn by a BORDER, not by its shadow — the
+          // house rule the bespoke `0 2px 8px rgba(10,40,50,0.4)` recipe
+          // stood in for. That literal was also a fourth shadow outside the
+          // sanctioned three, and being inline it could not be overridden by
+          // [data-theme="light"], so the light card wore a dark teal halo.
+          // --shadow-modal is theme-paired (tokens.css:241 / :464).
+          border: "1px solid var(--color-border)",
+          borderRadius: "var(--radius-lg)",
+          boxShadow: "var(--shadow-modal)",
         }}
       >
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
+        <div style={{ textAlign: "center", marginBottom: "var(--space-xl)" }}>
           {/* The brand mark is the canonical <WordMark> (mono/uppercase/
               tracked). The positioning line below states what ELSPETH is —
               derived from the product's own "auditable outputs" thesis, in the
@@ -653,9 +682,17 @@ export function LoginPage() {
               variant="primary"
               type="submit"
               disabled={isSubmitting}
+              aria-busy={isSubmitting}
               aria-label={isSubmitting ? "Creating account" : "Create account"}
             >
-              {isSubmitting ? "Creating account…" : "Create account"}
+              {isSubmitting ? (
+                <>
+                  <span className="spinner" aria-hidden="true" />
+                  Creating account…
+                </>
+              ) : (
+                "Create account"
+              )}
             </Button>
 
             <p
@@ -719,13 +756,31 @@ export function LoginPage() {
                 aria-describedby={loginError ? LOGIN_ERROR_ID : undefined}
               />
 
+              {/* Progress cue INSIDE the button, matching
+                  AcknowledgementCard.tsx:302-306 and ExecuteButton.tsx:610-618
+                  (elspeth-dcb29d06ba). `.btn:disabled` (0,2,0) outranks
+                  `.btn-primary` (0,1,0), so at the moment of commitment the
+                  primary adopts the disabled wash; without a spinner that
+                  reads as "unavailable" rather than "in flight". The spinner
+                  is aria-hidden and the state is carried programmatically by
+                  aria-busy + the aria-label flip — this screen must not mint a
+                  second live region (the loading branch above owns the only
+                  role="status" here; LoginPage.test.tsx:328-340 pins that). */}
               <Button
                 variant="primary"
                 type="submit"
                 disabled={isSubmitting}
+                aria-busy={isSubmitting}
                 aria-label={isSubmitting ? "Signing in" : "Sign in"}
               >
-                {isSubmitting ? "Signing in…" : "Sign in"}
+                {isSubmitting ? (
+                  <>
+                    <span className="spinner" aria-hidden="true" />
+                    Signing in…
+                  </>
+                ) : (
+                  "Sign in"
+                )}
               </Button>
 
               {registrationAvailable && (

@@ -424,14 +424,25 @@ describe("ComposerWorkspace", () => {
       "utf8",
     );
 
-    expect(css).toContain(
-      '.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {\n' +
-        "  border-color: var(--color-warning, currentcolor);\n}",
-    );
-    expect(css).toContain(
-      '.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) {\n' +
-        "  border-color: var(--color-error, currentcolor);\n}",
-    );
+    // elspeth-7161879770: "busy" and "warning" shared the amber border, so an
+    // in-flight readiness check was indistinguishable from a real warning.
+    // Assert the two tones resolve to DIFFERENT tokens rather than pinning
+    // busy's hue by name — the point of the split is that the three tones stay
+    // mutually distinguishable, wherever the palette moves next.
+    const toneBorder = (tone: string): string => {
+      const rule = new RegExp(
+        `\\.workspace-collapsed-affordance:has\\(\\.workspace-collapsed-status\\[data-tone="${tone}"\\]\\) \\{\\n  border-color: ([^;]+);\\n\\}`,
+      ).exec(css);
+      if (rule === null) {
+        throw new Error(`No collapsed-affordance rule for tone ${tone}`);
+      }
+      return rule[1];
+    };
+
+    const tones = ["busy", "error"].map(toneBorder);
+    expect(new Set(tones).size).toBe(tones.length);
+    expect(toneBorder("busy")).not.toContain("--color-warning");
+    expect(toneBorder("error")).toBe("var(--color-error, currentcolor)");
   });
 
   it.each([

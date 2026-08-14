@@ -606,4 +606,73 @@ describe("PipelineValidationSummary", () => {
     // A clean settings finding carries no raw dump, so no expander appears.
     expect(screen.queryByText("Technical details")).toBeNull();
   });
+  // ── elspeth-8c1d49dcf0: one status-glyph vocabulary ───────────────────────
+  //
+  // audit.css documents the vocabulary — "Row status accents are a 3px
+  // left-edge stripe whose colour reinforces the glyph (✓ ⚠ ✗ —). The glyph
+  // stays the primary status channel" — and AuditReadinessPanel /
+  // SharedAuditReadinessPanel render from it. This surface already agreed on
+  // ✓ and ⚠; the error mark was the outlier (U+2715 MULTIPLICATION X, a
+  // heavier and more geometric mark than U+2717 BALLOT X), so the one status a
+  // user most needs to recognise instantly was drawn at a different weight
+  // here than everywhere else.
+  //
+  // Asserted by CODEPOINT, not by eye: ✕ and ✗ are visually similar enough
+  // that a text comparison written from a screenshot would pass on either.
+  it("draws the error status with the same U+2717 the audit readiness rows use", () => {
+    setValidation({
+      is_valid: false,
+      checks: [],
+      errors: [
+        {
+          component_id: "rater",
+          component_type: "transform",
+          message: "Review the prompt wording",
+          suggestion: null,
+        },
+      ],
+      warnings: [],
+    });
+    const { container } = render(<PipelineValidationSummary />);
+    const glyph = container.querySelector(
+      ".pipeline-validation-summary-glyph",
+    );
+    expect(glyph).not.toBeNull();
+    expect(glyph!.textContent).toBe("\u2717");
+    expect(glyph!.textContent!.codePointAt(0)).toBe(0x2717);
+    // The old freelanced mark must not come back.
+    expect(glyph!.textContent).not.toBe("\u2715");
+    // The glyph is decoration: colour alone must not carry status, but the
+    // mark must not be announced twice either.
+    expect(glyph!.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("keeps the success and warning marks the rest of the product already agrees on", () => {
+    setValidation({ is_valid: true, checks: [], errors: [], warnings: [] });
+    const ok = render(<PipelineValidationSummary />);
+    expect(
+      ok.container.querySelector(".pipeline-validation-summary-glyph")!
+        .textContent!.codePointAt(0),
+    ).toBe(0x2713);
+    ok.unmount();
+
+    setValidation({
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [
+        {
+          component_id: "rater",
+          component_type: "transform",
+          message: "Review the prompt wording",
+          suggestion: null,
+        },
+      ],
+    });
+    const warned = render(<PipelineValidationSummary />);
+    expect(
+      warned.container.querySelector(".pipeline-validation-summary-glyph")!
+        .textContent!.codePointAt(0),
+    ).toBe(0x26a0);
+  });
 });

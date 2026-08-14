@@ -1128,3 +1128,133 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
     );
   });
 });
+
+// ============================================================================
+// ChatInput — placeholder legibility and the overflow glyph.
+// ============================================================================
+
+describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput(props?: { readOnly?: boolean; value?: string }) {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        readOnly={props?.readOnly}
+        value={props?.value}
+        onChange={() => undefined}
+      />,
+    );
+  }
+
+  // A placeholder produces NO scroll overflow — no scrollbar, no ellipsis — so
+  // a placeholder taller than the box is simply cut mid-word with no cue that
+  // anything is missing. Every shipped placeholder here is a full sentence
+  // (the four guided per-step nudges, the empty-state priming line, the
+  // pending-interpretation cue), and two rows clipped them in the 360px
+  // authoring pane. Autosizing cannot rescue this: there is no scrollHeight to
+  // measure when the box is empty. The row count IS the fix, so pin it.
+  it("gives the editable composer three rows, not two", () => {
+    renderInput();
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "3");
+  });
+
+  it("still sizes the read-only tutorial prompt to its content", () => {
+    // The locked worked-example prompt is static and multi-line; it is sized
+    // to the content (capped at 10) rather than to the editable row count.
+    renderInput({ readOnly: true, value: "a\nb\nc\nd\ne" });
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute("rows", "6");
+  });
+
+  it("caps read-only growth at ten rows", () => {
+    renderInput({ readOnly: true, value: Array(40).fill("line").join("\n") });
+    expect(screen.getByLabelText(/message input/i)).toHaveAttribute(
+      "rows",
+      "10",
+    );
+  });
+
+  // The growth ceiling pinned above ("bounds textarea growth against the
+  // desktop dynamic viewport") is NOT dead code and must not be "cleaned up"
+  // on the grounds that nothing autosizes into it: `resize: vertical` is what
+  // reaches it, and the ceiling is what bounds the box the user drags.
+  it("keeps the user-drag affordance the growth ceiling exists to bound", () => {
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rule = css.match(/\.chat-input-textarea\s*\{([^}]*)\}/s)?.[1];
+    expect(rule).toMatch(/resize:\s*vertical/);
+  });
+});
+
+describe("ChatInput overflow glyph (elspeth-b720e0b932)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  function renderInput() {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    return render(
+      <ChatInput
+        onSend={() => undefined}
+        disabled={false}
+        inputRef={inputRef}
+        onToggleBlobManager={() => undefined}
+        onOpenSecrets={() => undefined}
+      />,
+    );
+  }
+
+  // The "…" trigger used to be three ZERO-LENGTH path segments
+  // ("M5 12h.01M12 12h.01M19 12h.01") relying on `stroke-linecap: round` to
+  // become dots. At 20px on a 24-unit viewBox that cap is 1.5px, which cannot
+  // rasterise round and carries roughly an order of magnitude less ink than
+  // the Upload glyph in the identically-sized button beside it — so the
+  // control read as disabled. Explicit filled circles are the fix.
+  it("draws the overflow trigger as filled circles, not zero-length strokes", () => {
+    renderInput();
+    const svg = screen
+      .getByLabelText(/more actions/i)
+      .querySelector("svg.chat-input-icon");
+    expect(svg).not.toBeNull();
+
+    const circles = Array.from(svg!.querySelectorAll("circle"));
+    expect(circles).toHaveLength(3);
+    for (const circle of circles) {
+      // A presentation attribute ON the circle beats the `fill: none` it would
+      // otherwise INHERIT from .chat-input-icon, and currentColor keeps the
+      // glyph tracking --color-text in both themes.
+      expect(circle.getAttribute("fill")).toBe("currentColor");
+      expect(Number(circle.getAttribute("r"))).toBeGreaterThan(0);
+    }
+    // Distinct centres — three dots, not one drawn three times.
+    expect(new Set(circles.map((c) => c.getAttribute("cx"))).size).toBe(3);
+
+    // No stroked path survives on this glyph, so the zero-length-segment
+    // idiom cannot creep back in beside the circles.
+    expect(svg!.querySelector("path")).toBeNull();
+  });
+
+  it("leaves the sibling Upload glyph a stroked path", () => {
+    renderInput();
+    const svg = screen
+      .getByLabelText(/upload file/i)
+      .querySelector("svg.chat-input-icon");
+    expect(svg!.querySelectorAll("path")).toHaveLength(1);
+    expect(svg!.querySelectorAll("circle")).toHaveLength(0);
+  });
+
+  it("keeps the round-cap stroke settings the other glyphs in the family rely on", () => {
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const rule = css.match(/\.chat-input-icon\s*\{([^}]*)\}/s)?.[1];
+    expect(rule).toMatch(/stroke:\s*currentColor/);
+    expect(rule).toMatch(/fill:\s*none/);
+  });
+});

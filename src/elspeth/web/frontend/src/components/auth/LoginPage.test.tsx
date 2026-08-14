@@ -574,3 +574,123 @@ describe("LoginPage", () => {
     });
   });
 });
+
+// ── Login frame + commitment state (elspeth-340f5d104c, elspeth-dcb29d06ba) ──
+//
+// The login screen was built entirely from inline style objects, and two of
+// those declarations were shipping defects rather than idiom complaints:
+//
+//   * `height: 100vh` on the page wrapper with NO overflow. On a short
+//     viewport the centred card was clipped at BOTH ends with no scroll path,
+//     so the submit button was unreachable and the user could not sign in.
+//   * the in-flight primary adopted `.btn:disabled` (which outranks
+//     `.btn-primary` at (0,2,0) vs (0,1,0)) with no progress cue, so "working"
+//     and "unavailable" shared one appearance.
+//
+// These read the resolved style off the element rather than asserting on
+// source text: what is being pinned is what reaches the box.
+describe("login page frame and commitment state", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.history.replaceState(null, "", "/");
+    sessionStorage.clear();
+    localStorage.clear();
+    resetStore(useAuthStore);
+    useAuthStore.setState({ isLoading: false });
+    vi.mocked(api.fetchAuthConfig).mockResolvedValue(localConfig());
+    vi.stubGlobal("fetch", vi.fn());
+  });
+
+  it("gives the page wrapper a bounded height AND an overflow rule, so it owns a scroll", async () => {
+    render(<LoginPage />);
+    const page = await screen.findByTestId("login-page");
+    const style = getComputedStyle(page);
+
+    // Both halves are load-bearing. `overflow-y: auto` on a content-sized box
+    // never produces a scrollbar, and a bounded box without it is simply
+    // clipped by `body { overflow: hidden }` — either alone leaves the submit
+    // button unreachable on a short viewport.
+    expect(style.overflowY).toBe("auto");
+    // Dynamic viewport unit, NOT the static 100vh the box shipped with: 100vh
+    // is the LARGE viewport, which mobile browser chrome overlays.
+    expect(style.height).toBe("100dvh");
+  });
+
+  it("top-anchors the card when it outgrows the viewport and centres it when it fits", async () => {
+    render(<LoginPage />);
+    const page = await screen.findByTestId("login-page");
+    const card = await screen.findByTestId("login-card");
+
+    // A centred flex item that outgrows its line overflows symmetrically, so
+    // scrollTop: 0 lands BELOW the card's top edge. flex-start + auto margins
+    // centre while there is free space and top-anchor once there is not.
+    expect(getComputedStyle(page).alignItems).toBe("flex-start");
+    expect(getComputedStyle(card).margin).toBe("auto");
+  });
+
+  it("draws the card edge with a border and a theme-paired shadow token", async () => {
+    render(<LoginPage />);
+    const cardEl = await screen.findByTestId("login-card");
+    const card = getComputedStyle(cardEl);
+
+    // The bespoke `0 2px 8px rgba(10, 40, 50, 0.4)` was a fourth shadow recipe
+    // outside the sanctioned three, teal-tinted, and — being inline — could not
+    // be overridden by [data-theme="light"], so the light card wore a dark
+    // halo. Borders do the heavy lifting; the shadow is a token that flips.
+    // Read off the element's own declaration for `border`: jsdom's computed
+    // view neither expands nor preserves a shorthand whose value contains
+    // var() (it reports the initial `medium none rgb(0,0,0)`), so the computed
+    // view cannot answer this one. There is no cascade question to resolve
+    // here — an inline declaration always reaches its own element.
+    expect(cardEl.style.border).toBe("1px solid var(--color-border)");
+    expect(card.boxShadow).toBe("var(--shadow-modal)");
+    expect(card.boxShadow).not.toMatch(/rgba?\(/);
+  });
+
+  it.each([
+    ["Sign in", "Signing in…", "Signing in"],
+    ["Create account", "Creating account…", "Creating account"],
+  ])(
+    "renders a progress cue inside the in-flight %s button",
+    async (idleName, busyText, busyName) => {
+      // Never settles: the assertion is about the button's committed state.
+      const inFlight = new Promise<never>(() => {});
+      vi.mocked(api.login).mockReturnValue(inFlight as never);
+      vi.mocked(api.register).mockReturnValue(inFlight as never);
+      vi.mocked(api.fetchAuthConfig).mockResolvedValue(localConfig("open"));
+
+      const user = userEvent.setup();
+      render(<LoginPage />);
+
+      if (idleName === "Create account") {
+        await user.click(
+          await screen.findByRole("button", { name: "Create an account" }),
+        );
+        await user.type(screen.getByLabelText("Username"), "alice");
+        await user.type(screen.getByLabelText("Password"), "correct-horse");
+        await user.type(
+          screen.getByLabelText("Confirm password"),
+          "correct-horse",
+        );
+      } else {
+        await user.type(await screen.findByLabelText("Username"), "alice");
+        await user.type(screen.getByLabelText("Password"), "correct-horse");
+      }
+      await user.click(screen.getByRole("button", { name: idleName }));
+
+      const button = screen.getByRole("button", { name: busyName });
+      expect(button).toHaveAttribute("aria-busy", "true");
+      expect(button).toHaveTextContent(busyText);
+      // The cue lives INSIDE the button, matching AcknowledgementCard and
+      // ExecuteButton — not beside it, where the disabled wash still reads as
+      // "unavailable".
+      const cue = button.querySelector(".spinner");
+      expect(cue).not.toBeNull();
+      // aria-hidden, NOT a second live region: the loading branch owns the
+      // only role="status" on this screen and the state is already carried
+      // programmatically by aria-busy plus the aria-label flip.
+      expect(cue).toHaveAttribute("aria-hidden", "true");
+      expect(screen.queryAllByRole("status")).toHaveLength(0);
+    },
+  );
+});

@@ -867,4 +867,117 @@ describe("RunOutputsPanel", () => {
     createSpy.mockRestore();
     revokeSpy.mockRestore();
   });
+
+  // Every other loading state in the app spins (LoginPage, AuthGuard,
+  // ExecuteButton, PluginCard); static text cannot tell an operator whether the
+  // panel is working or stalled. The spacing around the preview block was also
+  // a raw `6` at five sites, invisible to the token system even though
+  // --space-1-5 IS exactly 6px (elspeth-cda90fbb49).
+  describe("loading affordance and spacing tokens (elspeth-cda90fbb49)", () => {
+    it("spins the shared .spinner while the manifest is loading", async () => {
+      const pending = deferred<RunOutputsResponse>();
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const loading = await screen.findByText(/Loading outputs/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+      // The spinner is decoration; the text is the announcement.
+      expect(container.querySelector(".spinner")).toHaveAttribute(
+        "aria-hidden",
+        "true",
+      );
+      expect(loading).toBeInTheDocument();
+
+      pending.resolve(manifest([]));
+      await waitFor(() =>
+        expect(container.querySelector(".spinner")).toBeNull(),
+      );
+    });
+
+    it("spins the shared .spinner while a preview is in flight", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      const pending = deferred<RunOutputArtifactPreview>();
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+        pending.promise,
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Loading preview/);
+      expect(container.querySelector(".spinner")).not.toBeNull();
+
+      pending.resolve(csvPreview());
+      await waitFor(() =>
+        expect(screen.queryByText(/Loading preview/)).toBeNull(),
+      );
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    // purged / error / binary are TERMINAL outcomes, not work in progress. A
+    // spinner on one of them would claim activity that is not happening — the
+    // filed remediation counted them among "four loading states"; they are not.
+    it("shows no spinner on the terminal purged / error / binary states", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ content_type: "binary", preview_text: "" }),
+      );
+
+      const { container } = render(<RunOutputsPanel runId={RUN_ID} />);
+
+      await screen.findByText(/Binary file/);
+      expect(container.querySelector(".spinner")).toBeNull();
+    });
+
+    it("spaces the preview block with --space-1-5, never a raw 6", async () => {
+      (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+        manifest([fileArtifact()]),
+      );
+      (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockResolvedValue(
+        csvPreview({ truncated: true, row_count_preview: 1 }),
+      );
+
+      render(<RunOutputsPanel runId={RUN_ID} />);
+
+      const footer = await screen.findByText(/download for full file/i);
+      // The preview container and the truncation footer both read from the
+      // spacing scale.
+      const previewBlock = footer.closest("div")?.parentElement as HTMLElement;
+      expect(previewBlock.style.marginTop).toBe("var(--space-1-5)");
+      expect((footer.closest("div") as HTMLElement).style.marginTop).toBe(
+        "var(--space-xs)",
+      );
+    });
+  });
+
+  // R11 (elspeth-fa96173e32) filed RunOutputsPanel.tsx:502 as an ASCII "..."
+  // against BlobRow's U+2026. It is not: this panel is already all-U+2026, and
+  // the only "..." in the file are JS spread operators. Pinned so a later edit
+  // cannot reintroduce the split this panel does not currently have.
+  it("terminates every user-visible loading string with U+2026, never '...'", async () => {
+    (fetchRunOutputs as ReturnType<typeof vi.fn>).mockResolvedValue(
+      manifest([fileArtifact()]),
+    );
+    const pending = deferred<RunOutputArtifactPreview>();
+    (fetchRunOutputPreview as ReturnType<typeof vi.fn>).mockReturnValue(
+      pending.promise,
+    );
+
+    render(<RunOutputsPanel runId={RUN_ID} />);
+
+    // Scoped to the copy, not to the whole rendered subtree: artifact names,
+    // hashes and server error strings are DATA and may legitimately contain
+    // three dots.
+    const loading = await screen.findByText(/Loading preview/);
+    expect(loading.textContent).toContain("Loading preview…");
+    expect(loading.textContent).not.toContain("...");
+
+    pending.resolve(csvPreview());
+  });
 });

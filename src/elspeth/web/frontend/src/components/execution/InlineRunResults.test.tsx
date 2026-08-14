@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -28,6 +31,29 @@ vi.mock("@/components/composer/NarrativeResults", () => ({
 }));
 
 const productionLoadRuns = useExecutionStore.getState().loadRuns;
+
+/** Every class name any stylesheet in the tree declares a rule for.
+ *  Deliberately over-approximating (it scans whole files, not parsed
+ *  selectors), so it can only ever be too permissive — a class it reports as
+ *  defined might be a false positive, but a class it omits is genuinely
+ *  undefined. cwd-relative "src" per the repo idiom: vitest runs from the
+ *  frontend root, and styles/tokenReferences.test.ts reads stylesheets the
+ *  same way. */
+function definedCssClassNames(root = "src"): Set<string> {
+  const found = new Set<string>();
+  for (const entry of readdirSync(root)) {
+    const path = join(root, entry);
+    if (statSync(path).isDirectory()) {
+      for (const name of definedCssClassNames(path)) found.add(name);
+    } else if (entry.endsWith(".css")) {
+      const css = readFileSync(path, "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
+      for (const selector of css.matchAll(/\.(-?[_a-zA-Z][\w-]*)/g)) {
+        found.add(selector[1]);
+      }
+    }
+  }
+  return found;
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -109,7 +135,7 @@ describe("InlineRunResults", () => {
     render(<InlineRunResults showEmptyState />);
 
     await waitFor(() => {
-      expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+      expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
     });
     // Without runAvailable there is no run affordance — the tutorial shell
     // mounts no REQUEST_RUN_EVENT owner, so a button here would dispatch
@@ -178,7 +204,7 @@ describe("InlineRunResults", () => {
           screen.getByText(
             "No runs yet. Once validation passes, use Run pipeline to start one.",
           ),
-        ).toHaveClass("artifact-empty");
+        ).toHaveClass("empty-state");
       });
       // The copy names the control, never a place: there is no "sidebar" in
       // this layout (the run control is in the sticky bottom action bar of
@@ -199,7 +225,7 @@ describe("InlineRunResults", () => {
     render(<InlineRunResults showEmptyState runAvailable={false} />);
 
     await waitFor(() => {
-      expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+      expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
     });
     expect(
       screen.queryByRole("button", { name: "Run pipeline" }),
@@ -213,14 +239,99 @@ describe("InlineRunResults", () => {
     } as never);
 
     render(<InlineRunResults showEmptyState />);
-    expect(screen.getByText("Loading runs…")).toHaveClass("artifact-empty");
+    expect(screen.getByText("Loading runs…")).toHaveClass("empty-state");
     expect(screen.queryByText("No runs yet.")).not.toBeInTheDocument();
 
     await act(async () => {
       history.resolve("loaded");
       await history.promise;
     });
-    expect(screen.getByText("No runs yet.")).toHaveClass("artifact-empty");
+    expect(screen.getByText("No runs yet.")).toHaveClass("empty-state");
+  });
+
+  // elspeth-0ee1973592. `.artifact-empty` shipped at five call sites in this
+  // component while NO stylesheet defined it, so every empty and loading
+  // state in the Run panel rendered as a bare UA paragraph. The assertions
+  // above are existence tests — they pin the class NAME and would have passed
+  // unchanged against the defect. This one reads the CSS corpus from disk
+  // (the styles/tokenReferences.test.ts idiom; vitest runs with `css: false`,
+  // so a computed-style assertion is impossible in jsdom) and requires every
+  // class these states render to be DEFINED somewhere in the barrel.
+  it("renders every empty and loading state through classes the stylesheets define", async () => {
+    const definedClasses = definedCssClassNames();
+    // Guards the parser itself: a regex that matched nothing would make the
+    // assertions below vacuous rather than failing.
+    expect(definedClasses.has("empty-state")).toBe(true);
+
+    function assertClassesDefined(root: Element | null): void {
+      expect(root).not.toBeNull();
+      const elements = [root as Element, ...root!.querySelectorAll("[class]")];
+      const rendered = new Set(
+        elements.flatMap((element) => [...element.classList]),
+      );
+      expect(rendered.size).toBeGreaterThan(0);
+      expect(
+        [...rendered].filter((name) => !definedClasses.has(name)),
+        "classes rendered by an InlineRunResults empty/loading state that no " +
+          "stylesheet defines — render the designed primitive instead of a " +
+          "name only the TSX knows about",
+      ).toEqual([]);
+    }
+
+    // 1. Loading: history request in flight.
+    const pending = deferred<"loaded">();
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockReturnValue(pending.promise),
+    } as never);
+    let view = render(<InlineRunResults showEmptyState />);
+    expect(screen.getByText("Loading runs…")).toBeInTheDocument();
+    assertClassesDefined(view.container.firstElementChild);
+    await act(async () => {
+      pending.resolve("loaded");
+      await pending.promise;
+    });
+    view.unmount();
+
+    // 2. Unavailable: message plus a Retry action.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("unavailable"),
+    } as never);
+    view = render(<InlineRunResults showEmptyState />);
+    await screen.findByText("Run history unavailable.");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 3. Settled with no runs and no run affordance.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+    } as never);
+    view = render(<InlineRunResults showEmptyState />);
+    await screen.findByText("No runs yet.");
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 4. Settled with the inline Run affordance (message plus action).
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      validationResult: makeValidationResult(),
+    } as never);
+    view = render(<InlineRunResults showEmptyState runAvailable />);
+    await screen.findByRole("button", { name: "Run pipeline" });
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
+
+    // 5. Settled with directional copy instead of a dead Run button.
+    useExecutionStore.setState({
+      loadRuns: vi.fn().mockResolvedValue("loaded"),
+      validationResult: null,
+    } as never);
+    view = render(<InlineRunResults showEmptyState runAvailable />);
+    await screen.findByText(
+      "No runs yet. Once validation passes, use Run pipeline to start one.",
+    );
+    assertClassesDefined(view.container.firstElementChild);
+    view.unmount();
   });
 
   it("renders loaded history without flashing the empty state", async () => {

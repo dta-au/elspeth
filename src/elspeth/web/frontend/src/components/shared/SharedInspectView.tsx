@@ -59,7 +59,7 @@
  * * Other / network → "Couldn't load the shared pipeline" with retry.
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 
 import { fetchSharedInspect } from "@/api/shareableReviews";
 import { ReadOnlyProvider } from "@/contexts/ReadOnlyContext";
@@ -71,6 +71,50 @@ import type { ApiError, SharedInspectResponse } from "@/types/api";
 interface SharedInspectViewProps {
   token: string;
 }
+
+/**
+ * Scroll ownership for the shared-inspect page (elspeth-2ff1b0b4ad).
+ *
+ * `.shared-inspect-view` is declared by NO stylesheet, so this `<main>` was an
+ * unstyled flex item inside `.app-root` (`display: flex; flex-direction:
+ * column; height: 100dvh`, header.css:12-17) under `body { overflow: hidden }`
+ * (base.css:14-19). NO element on the page claimed the scroll, so the
+ * readiness rows, the YAML and the "Return to my workspace" link were cut at
+ * the fold with no scrollbar and no wheel response — on the one artifact a
+ * user hands to a reviewer.
+ *
+ * `min-height: 0` is the load-bearing half: a column flex item defaults to
+ * `min-height: auto`, which floors it at its content height and defeats
+ * `overflow-y: auto` outright. With the floor released the item's height is
+ * the (definite) 100dvh line, so the overflow is real and scrolls here.
+ *
+ * These are inline styles rather than the class the ticket asks for because
+ * defining `.shared-inspect-view` needs a new stylesheet registered in
+ * `styles/index.css`, which this lane does not own. The class names are left
+ * on the elements so the CSS extraction is a lift-and-shift.
+ */
+const MAIN_STYLE: CSSProperties = {
+  flex: 1,
+  minHeight: 0,
+  overflowY: "auto",
+  width: "100%",
+  // Measure cap on the house pattern for a full-bleed frame
+  // (.recovery-panel, recovery.css:21-22) — otherwise the YAML and the
+  // readiness rows run the full 1920px.
+  maxWidth: "1080px",
+  marginInline: "auto",
+  padding: "var(--space-xl)",
+};
+
+/** Product type scale for the two bare headings (browser default is 32/24px). */
+const H1_STYLE: CSSProperties = {
+  margin: "0 0 var(--space-md)",
+  fontSize: "var(--font-size-xl)",
+};
+const H2_STYLE: CSSProperties = {
+  margin: "0 0 var(--space-sm)",
+  fontSize: "var(--font-size-lg)",
+};
 
 type LoadState =
   | { kind: "loading" }
@@ -156,6 +200,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         className="shared-inspect-view"
         data-testid="shared-inspect-loading"
         aria-busy="true"
+        style={MAIN_STYLE}
       >
         <p>Loading shared pipeline…</p>
       </main>
@@ -168,8 +213,9 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         role="main"
         className="shared-inspect-view shared-inspect-view--error"
         data-testid="shared-inspect-error"
+        style={MAIN_STYLE}
       >
-        <h1>Shared link unavailable</h1>
+        <h1 style={H1_STYLE}>Shared link unavailable</h1>
         <p role="alert">{state.message}</p>
         <p>
           <a href={_returnToWorkspaceUrl()} data-testid="shared-inspect-return-link">
@@ -194,6 +240,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
         role="main"
         className="shared-inspect-view shared-inspect-view--loaded"
         data-testid="shared-inspect-loaded"
+        style={MAIN_STYLE}
       >
         <header>
           <p className="shared-inspect-banner" role="status">
@@ -208,7 +255,9 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
             </time>
             .
           </p>
-          <h1 data-testid="shared-inspect-pipeline-name">{pipelineName}</h1>
+          <h1 style={H1_STYLE} data-testid="shared-inspect-pipeline-name">
+            {pipelineName}
+          </h1>
           {pipelineDescription !== "" && (
             <p data-testid="shared-inspect-pipeline-description">
               {pipelineDescription}
@@ -220,7 +269,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
           aria-label="Pipeline structure (read-only)"
           data-testid="shared-inspect-graph"
         >
-          <h2>Pipeline structure</h2>
+          <h2 style={H2_STYLE}>Pipeline structure</h2>
           <GraphMiniView compositionStateOverride={response.composition_snapshot} />
         </section>
 
@@ -240,7 +289,7 @@ export function SharedInspectView({ token }: SharedInspectViewProps): JSX.Elemen
           aria-label="Pipeline YAML (read-only)"
           data-testid="shared-inspect-yaml"
         >
-          <h2>Pipeline YAML</h2>
+          <h2 style={H2_STYLE}>Pipeline YAML</h2>
           <YamlDisplay yaml={response.yaml} filename="pipeline.yaml" />
         </section>
 

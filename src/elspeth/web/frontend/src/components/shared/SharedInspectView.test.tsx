@@ -406,3 +406,63 @@ describe("SharedInspectView", () => {
     expect(results).toHaveNoViolations();
   });
 });
+
+// ── Scroll ownership (elspeth-2ff1b0b4ad) ───────────────────────────────────
+//
+// `.shared-inspect-view` is declared by no stylesheet, so this <main> was an
+// unstyled flex item inside `.app-root` (100dvh column) under
+// `body { overflow: hidden }`. No element on the page claimed the scroll, so
+// the readiness rows, the YAML and "Return to my workspace" were cut at the
+// fold with no scrollbar and no wheel response — on the one artifact a user
+// hands to a reviewer.
+describe("SharedInspectView scroll ownership", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    ["loaded", "shared-inspect-loaded"],
+    ["error", "shared-inspect-error"],
+  ])("claims the scroll in the %s state", async (state, testId) => {
+    if (state === "loaded") {
+      vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(_validResponse);
+    } else {
+      vi.spyOn(api, "fetchSharedInspect").mockRejectedValueOnce({
+        status: 401,
+        detail: "revoked",
+      });
+    }
+    render(<SharedInspectView token="abc" />);
+    const main = await screen.findByTestId(testId);
+    const style = getComputedStyle(main);
+
+    // All three declarations are load-bearing together. `flex: 1` claims the
+    // column's spare height, `min-height: 0` releases the flex item's
+    // content-height floor (`min-height: auto` is the default and defeats
+    // overflow outright), and only then does `overflow-y: auto` produce a
+    // scrollbar rather than silent clipping.
+    expect(style.flexGrow).toBe("1");
+    expect(style.minHeight).toBe("0px");
+    expect(style.overflowY).toBe("auto");
+  });
+
+  it("caps the reading measure instead of running the full frame width", async () => {
+    vi.spyOn(api, "fetchSharedInspect").mockResolvedValueOnce(_validResponse);
+    render(<SharedInspectView token="abc" />);
+    const style = getComputedStyle(await screen.findByTestId("shared-inspect-loaded"));
+
+    expect(style.maxWidth).toBe("1080px");
+    expect(style.marginInline).toBe("auto");
+    expect(style.padding).not.toBe("");
+  });
+
+  it("puts the loading state on the same scroll contract as the others", async () => {
+    vi.spyOn(api, "fetchSharedInspect").mockReturnValue(new Promise(() => {}));
+    render(<SharedInspectView token="abc" />);
+    const style = getComputedStyle(
+      await screen.findByTestId("shared-inspect-loading"),
+    );
+    expect(style.overflowY).toBe("auto");
+    expect(style.minHeight).toBe("0px");
+  });
+});

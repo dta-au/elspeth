@@ -185,6 +185,34 @@ interface ChatInputProps {
 
 type ChatInputIconName = "folder" | "upload" | "key" | "more";
 
+/**
+ * Horizontal centres of the overflow ("more") glyph's three dots, in the
+ * 24-unit viewBox. `cy` is the box centre for all three.
+ */
+const MORE_DOT_CENTRES_X = [5, 12, 19] as const;
+
+/**
+ * The overflow glyph is drawn as three FILLED circles, not as three
+ * zero-length path segments relying on `stroke-linecap: round`
+ * (elspeth-b720e0b932).
+ *
+ * The zero-length form ("M5 12h.01M12 12h.01M19 12h.01") is a well-known SVG
+ * trick, but it degrades badly at this size: `.chat-input-icon` renders the
+ * 24-unit box at 20px, so the 1.8-unit stroke lands as a 1.5px cap. Round caps
+ * cannot survive rasterisation at 1.5px — the dots came out as hard squares,
+ * and the whole glyph carried an order of magnitude less ink than the Upload
+ * icon in the identically-sized button beside it, so the control read as
+ * DISABLED when it is not. Users skip a control that looks dead, and every
+ * action behind this menu (file manager, secrets) goes with it.
+ *
+ * Explicit circles rasterise at full colour and are genuinely round at 20px.
+ * `fill="currentColor"` is a presentation attribute ON the circle, so it is a
+ * specified value that beats the `fill: none` the element would otherwise
+ * INHERIT from `.chat-input-icon` (chat.css) — and `currentColor` keeps the
+ * glyph tracking `--color-text` in both themes exactly as the stroked paths
+ * do. The inherited stroke still applies, so the dots keep the same weight
+ * relationship to the sibling glyphs that the rest of this family has.
+ */
 function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
   const path =
     name === "folder"
@@ -193,7 +221,7 @@ function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
         ? "M12 16V4m0 0 4 4m-4-4-4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"
         : name === "key"
           ? "M14.5 9.5a4 4 0 1 0-3.2 3.9L9 15.7V18H6.7L5 19.7 3.3 18l6.3-6.3a4 4 0 0 0 4.9-2.2Zm.5-2h.01"
-          : "M5 12h.01M12 12h.01M19 12h.01";
+          : null;
   return (
     <svg
       aria-hidden="true"
@@ -201,7 +229,13 @@ function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
       viewBox="0 0 24 24"
       focusable="false"
     >
-      <path d={path} />
+      {path === null ? (
+        MORE_DOT_CENTRES_X.map((cx) => (
+          <circle key={cx} cx={cx} cy={12} r={1.4} fill="currentColor" />
+        ))
+      ) : (
+        <path d={path} />
+      )}
     </svg>
   );
 }
@@ -434,10 +468,27 @@ export function ChatInput({
   // Read-only (tutorial locked prompt) content is static and multi-line (the
   // worked-example prompt + the sample URLs). A fixed 2-row box clipped it; size
   // the box to the content (capped) so the whole locked prompt is visible
-  // without an obscure inner scroll. Editable mode keeps the compact 2 rows.
+  // without an obscure inner scroll.
+  //
+  // Editable mode is 3 rows, not 2 (elspeth-244b8ba932). The placeholder is the
+  // instruction telling the user what to type, and a placeholder produces no
+  // scroll overflow — no scrollbar, no ellipsis — so a placeholder longer than
+  // the box is simply cut mid-word with no cue that anything is missing. Every
+  // shipped placeholder here is a full sentence: the four guided per-step
+  // nudges (ChatPanel.GUIDED_CHAT_PLACEHOLDERS), the empty-state data-priming
+  // line, and the pending-interpretation cue. Two rows clipped them in the
+  // 360px authoring pane, which is the SHIPPED DEFAULT pane width at the
+  // 1280px minimum supported viewport — sizing against the wider 1536px+
+  // default would leave the common case still clipped.
+  //
+  // This is a static row count, not autosizing: nothing here measures
+  // scrollHeight, and autosizing would not help anyway because a placeholder
+  // contributes no scroll height to measure. The `max-height: min(28dvh,
+  // 240px)` ceiling in chat.css still does real work — it bounds the box the
+  // user drags with `resize: vertical`.
   const rows = readOnly
     ? Math.min(10, Math.max(3, text.split("\n").length + 1))
-    : 2;
+    : 3;
 
   // Phase 5b Task 8 (extends Phase 5a Task 1) — derive the effective
   // placeholder.  Precedence (highest wins):

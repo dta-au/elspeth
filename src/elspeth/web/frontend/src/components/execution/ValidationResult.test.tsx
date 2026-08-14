@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ValidationResultBanner } from "./ValidationResult";
 import type { ValidationResult } from "@/types/index";
@@ -190,5 +190,110 @@ describe("ValidationResultBanner", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Bad transform");
     expect(screen.getByText(/Choose a supported projection/)).toBeInTheDocument();
+  });
+
+  // elspeth-7bcc3d5233. The suggestion used to be built INTO the navigable
+  // button, so a block <div> sat inside a <button> (invalid flow content), the
+  // button's underline ran across the helper note, and the whole four-line
+  // block was one hit target. These pin the CONTAINMENT that causes those
+  // symptoms — jsdom cannot measure an underline or a list marker, so the
+  // mechanism is what is asserted: the suggestion is a sibling of the button
+  // inside the same <li>, and only the button navigates.
+  it("renders an error suggestion as a sibling of the navigable button, not inside it", async () => {
+    const user = userEvent.setup();
+    const onComponentClick = vi.fn();
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          is_valid: false,
+          summary: "Validation failed",
+          errors: [
+            {
+              component_id: "select_columns",
+              component_type: "transform",
+              message: "Bad transform",
+              suggestion: "Choose a supported projection.",
+            },
+          ],
+        })}
+        componentNames={{ select_columns: "Select columns" }}
+        onComponentClick={onComponentClick}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: /Bad transform/ });
+    const suggestion = screen.getByText(/Choose a supported projection/);
+
+    expect(button).toHaveClass("validation-banner-component-btn--error");
+    expect(button.contains(suggestion)).toBe(false);
+    expect(button.querySelector("div")).toBeNull();
+    expect(suggestion.closest("li")).toBe(button.closest("li"));
+    expect(suggestion).toHaveClass("validation-banner-suggestion");
+
+    await user.click(suggestion);
+    expect(onComponentClick).not.toHaveBeenCalled();
+
+    await user.click(button);
+    expect(onComponentClick).toHaveBeenCalledExactlyOnceWith("select_columns");
+  });
+
+  it("renders a warning suggestion as a sibling of the navigable button, not inside it", async () => {
+    const user = userEvent.setup();
+    const onComponentClick = vi.fn();
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          warnings: [
+            {
+              component_id: "csv_source",
+              component_type: "source",
+              message: "Batch size is small",
+              suggestion: "Consider increasing batch size",
+            },
+          ],
+        })}
+        componentNames={{ csv_source: "CSV source" }}
+        onComponentClick={onComponentClick}
+      />,
+    );
+
+    const button = screen.getByRole("button", { name: /Batch size is small/ });
+    const suggestion = screen.getByText(/Consider increasing batch size/);
+
+    expect(button).toHaveClass("validation-banner-component-btn--warning");
+    expect(button.contains(suggestion)).toBe(false);
+    expect(button.querySelector("div")).toBeNull();
+    expect(suggestion.closest("li")).toBe(button.closest("li"));
+    expect(suggestion).toHaveClass("validation-banner-suggestion");
+
+    await user.click(suggestion);
+    expect(onComponentClick).not.toHaveBeenCalled();
+
+    await user.click(button);
+    expect(onComponentClick).toHaveBeenCalledExactlyOnceWith("csv_source");
+  });
+
+  it("still renders a suggestion when the component is not navigable", () => {
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          is_valid: false,
+          summary: "Validation failed",
+          errors: [
+            {
+              component_id: "unknown_component",
+              component_type: "transform",
+              message: "Bad transform",
+              suggestion: "Choose a supported projection.",
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole("button")).toBeNull();
+    expect(
+      screen.getByText(/Choose a supported projection/),
+    ).toHaveClass("validation-banner-suggestion");
   });
 });

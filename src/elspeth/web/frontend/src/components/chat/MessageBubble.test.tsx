@@ -1,19 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
-import { readFileSync } from "node:fs";
 import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MessageBubble } from "./MessageBubble";
 import type { ChatMessage, CompositionProposal } from "@/types/api";
 
-const chatCss = readFileSync("src/components/chat/chat.css", "utf8");
-
-function extractCssRule(selectorPattern: RegExp, selectorName: string): string {
-  const match = selectorPattern.exec(chatCss);
-  if (!match) {
-    throw new Error(`Could not find ${selectorName} rule in chat.css`);
-  }
-  return match[1];
-}
+// This file no longer reads chat.css. It used to scrape rule bodies with a
+// regex to assert on literal declarations, which pinned values rather than
+// constraints and could only ever see the first matching rule. Stylesheet
+// invariants for these components belong to chatBubbleGutter.test.ts.
 
 function makeMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -137,17 +131,16 @@ describe("MessageBubble", () => {
   });
 
   describe("copy button", () => {
-    it("keeps bubble action buttons visibly discoverable before hover or focus", () => {
-      const actionButtonRule = extractCssRule(
-        /\.bubble-copy-btn,\s*\n\.bubble-edit-btn\s*\{([\s\S]*?)\n\}/,
-        ".bubble-copy-btn/.bubble-edit-btn",
-      );
-
-      expect(actionButtonRule).toContain("opacity: 0.3;");
-      expect(actionButtonRule).not.toContain("opacity: 0;");
-      expect(actionButtonRule).not.toContain("visibility: hidden;");
-    });
-
+    // The overlay's resting legibility and its width floor used to be pinned
+    // here as raw chat.css substrings ("opacity: 0.3;", "min-width: 44px;").
+    // Both pinned the LITERAL rather than the property it was chosen for, so
+    // both locked in the very values elspeth-8174010851 and elspeth-e6db9519d2
+    // file as defects — and the regex read only the first matching rule, so
+    // neither could see the @media (hover: none) branch. They now live in
+    // chatBubbleGutter.test.ts, in the stylesheet's own lane, expressed as the
+    // constraints that have to hold: resting opacity above a legibility floor
+    // across every declared branch, and a width derived from
+    // --size-control-compact rather than a hardcoded 44.
     it("renders a copy button on user messages", () => {
       render(<MessageBubble message={makeMessage()} />);
       expect(screen.getByLabelText("Copy message")).toBeInTheDocument();
@@ -182,8 +175,46 @@ describe("MessageBubble", () => {
       await user.click(screen.getByLabelText("Copy message"));
 
       expect(writeText).toHaveBeenCalledWith("Test copy");
-      expect(screen.getByText("Copied!")).toBeInTheDocument();
+      // The confirmation is announced through the accessible name, which is
+      // where it always lived — aria-label overrides text content.
+      expect(screen.getByLabelText("Copied to clipboard")).toBeInTheDocument();
     });
+
+    // elspeth-091695b241 — the confirmation must not change the control's
+    // FOOTPRINT. `.bubble-action-overlay` is `position: absolute; right: 0`
+    // over the prose with `min-width: 44px`, so any label wider than 44px can
+    // only grow leftward, over the message text the user just copied, for the
+    // full 2000ms window. jsdom has no layout engine, so this pins the
+    // mechanism that keeps the width inside the floor: the visible
+    // confirmation is a single glyph, never a word.
+    it("confirms with a single glyph, never a word that could outgrow the overlay", async () => {
+      const user = userEvent.setup();
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText },
+        writable: true,
+        configurable: true,
+      });
+
+      render(<MessageBubble message={makeMessage({ content: "Test copy" })} />);
+      const button = screen.getByLabelText("Copy message");
+      const idleGlyph = button.textContent ?? "";
+      await user.click(button);
+
+      const confirmed = screen.getByLabelText("Copied to clipboard");
+      const confirmedGlyph = confirmed.textContent ?? "";
+      expect(confirmedGlyph).toBe("✓");
+      // Same visible footprint in both states: one character either way.
+      expect([...confirmedGlyph]).toHaveLength(1);
+      expect([...idleGlyph]).toHaveLength(1);
+      // And explicitly not the old word form, in either voice.
+      expect(confirmed.textContent).not.toMatch(/copied/i);
+    });
+
+    // The overlay's min-width floor is what makes a one-character
+    // confirmation footprint-neutral. That floor is pinned in
+    // chatBubbleGutter.test.ts against --size-control-compact, together with
+    // the gutter arithmetic that keeps the overlay off the prose entirely.
   });
 
   describe("tool call exclusion from copy", () => {

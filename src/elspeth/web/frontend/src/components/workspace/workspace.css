@@ -1,6 +1,29 @@
 .composer-workspace {
   --authoring-pane-width: 360px;
 
+  /* Inspector drawer measure, published alongside --authoring-pane-width so
+     the artifact pane can RESERVE the strip the drawer occupies instead of
+     being sliced by it. Before this, the drawer was an absolutely-positioned
+     overlay with no scrim over live, still-clickable controls: "Focus Graph"
+     vanished and the primary action was cut mid-word at the drawer's left
+     border (elspeth-4e54200207). Deliberately not a grid column — at 1280 a
+     360px authoring pane plus a 512px column leaves 408px, under the 640px
+     ARTIFACT_MIN the pane bounds are built on. */
+  --workspace-inspector-width: 512px;
+
+  /* Action-bar rhythm. ONE pair of values feeds every gap and standoff in the
+     bottom bar — the bar's own gap, the status and overflow group gaps, the
+     completion group's gap, and the collapse control's standoff across the
+     divider — so the short-screen density regime at the end of this file can
+     tighten all of them by overriding just these two. Overriding only the
+     bar's own gap (as it used to) left the group BOUNDARIES at 4px while the
+     gaps INSIDE the groups stayed 8px, inverting the grouping so "Audit" read
+     as bonded to "Save for review" (elspeth-fca731fb28). Both are tokens, so
+     the bar/collapse-control alignment contract no longer depends on the
+     browser root staying at 16px. */
+  --workspace-bar-gap: var(--space-sm);
+  --workspace-bar-inset: var(--space-sm);
+
   position: relative;
   display: grid;
   grid-template-rows: minmax(420px, 1fr);
@@ -38,6 +61,34 @@
   overflow: hidden;
 }
 
+/* The action bar's rule and fill are a child of the ARTIFACT grid column, so
+   the bottom of the application used to be a half-drawn line: left of the pane
+   seam there was no rule and no fill, and "Collapse authoring pane" floated on
+   bare page ground while identical-looking controls 8px to its right sat on a
+   bordered, filled bar — an app with a closed top edge and a half-open bottom
+   one (elspeth-215c989bed). The authoring pane has no wrapper element that
+   could carry a mirrored bar, so the pane paints the band itself: a ::before
+   pinned to its bottom edge, exactly as tall as the collapse control's margin
+   box (standoff + --size-control + standoff), which is how the action bar's
+   own height is built — so the two bands start and end on the same two lines
+   in the density regime as well. The pseudo-element is the pane's FIRST child
+   and .workspace-collapse-control is positioned, so tree order paints the
+   control above the band without needing a negative z-index. */
+.workspace-authoring-pane {
+  position: relative;
+}
+
+.workspace-authoring-pane::before {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: calc(2 * var(--workspace-bar-inset) + var(--size-control));
+  border-top: 1px solid var(--color-border, currentcolor);
+  background: var(--color-surface, Canvas);
+  content: "";
+}
+
 .workspace-authoring-body,
 .workspace-artifact-body {
   flex: 1 1 auto;
@@ -64,7 +115,7 @@
 .artifact-workspace-toolbar {
   display: flex;
   flex: 0 0 auto;
-  gap: 0.5rem;
+  gap: var(--space-sm);
   align-items: center;
   justify-content: space-between;
   /* Shared band-height contract: this toolbar, .chat-panel-header, and the
@@ -80,7 +131,7 @@
 
 .artifact-workspace-toolbar [role="tablist"] {
   display: flex;
-  gap: 0.25rem;
+  gap: var(--space-xs);
 }
 
 .artifact-workspace-toolbar button {
@@ -175,45 +226,90 @@
 
 .workspace-action-bar {
   position: sticky;
-  z-index: 3;
+  z-index: var(--z-panel-controls);
   bottom: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: var(--workspace-bar-gap);
   align-items: center;
-  justify-content: space-between;
-  padding: 0.5rem;
+  /* justify-content: space-between used to sit here and was INERT — the
+     uncapped completion group absorbed every pixel of free space, so there was
+     never any to distribute. Capping that group (elspeth-c6fd722d2f) makes the
+     bar's composition live for the first time, and space-between would have
+     flung the three groups to the ends: at 2560 that is two ~700px voids with
+     the primary actions marooned in the middle. Read what that declaration was
+     for — "a stable three-slot composition that does not change when the
+     middle group is absent" — and an overflow pushed right by an auto margin
+     delivers it better: status and completion stay one cluster, "More actions"
+     holds the right edge, and the status/overflow arrangement is identical
+     whether or not guided mode renders a completion bar. */
+  justify-content: flex-start;
+  padding: var(--workspace-bar-inset) var(--space-sm);
   border-top: 1px solid var(--color-border, currentcolor);
   background: var(--color-surface, Canvas);
 }
 
+/* Completion actions in the horizontal bar. The side rail stacks these three
+   vertically; here they run as a row.
+
+   THE THREE STAY EQUAL-WIDTH — that is a documented contract, stated in
+   CompletionBar.tsx's docstring ("no primary emphasis — all three are
+   co-equal verbs"), in sidebar.css and at ExecuteButton.tsx. So the fix for
+   the unbounded growth (588x44 slabs carrying a ~110px label at 2560, a 4.5x
+   overshoot) CAPS the group and keeps the members equal, rather than dropping
+   to content width: flex: 0 1 auto sizes the group to its content, flex:
+   1 1 0 on the members divides that content evenly between them, and the
+   max-width backstops any future label set (elspeth-c6fd722d2f).
+
+   align-items: center is load-bearing too: .completion-bar carries
+   align-items: stretch for its vertical rail layout, which in this row
+   context stretched each button to the bar's full height — a 98px slab
+   whenever the bar wrapped (elspeth-929fc5d4a7). */
 .workspace-action-bar .completion-bar {
-  flex: 1 1 24rem;
+  flex: 0 1 auto;
   flex-direction: row;
   flex-wrap: wrap;
+  gap: var(--workspace-bar-gap);
+  align-items: center;
+  max-width: 768px; /* the 48rem cap, in this file's px idiom */
   padding: 0;
 }
 
 .workspace-action-bar .completion-bar > * {
-  flex: 1 1 8rem;
+  flex: 1 1 0;
   width: auto;
 }
 
 .workspace-status-controls,
 .workspace-more-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--workspace-bar-gap);
   align-items: center;
 }
 
 .workspace-status-control {
   display: inline-flex;
-  gap: 0.375rem;
+  gap: var(--space-1-5);
   align-items: center;
-  min-height: var(--size-control-compact);
+
+  /* One control register for the whole strip. These chips used to sit at
+     --size-control-compact beside 44px .btn completion buttons, leaving a 4px
+     step at BOTH edges of one 8px-padded row, so the strip read as two bars
+     that failed to align. Promoted rather than demoting the primaries: the
+     collapse control below is pinned to --size-control expressly to register
+     against this row (elspeth-5413e4221e). */
+  min-height: var(--size-control);
 }
 
-.workspace-status-control[data-tone="busy"],
+/* "busy" is not-yet-known; "warning" is known-to-be-wrong. Sharing the amber
+   border made an ordinary in-flight readiness check ("Audit Checking") read as
+   a genuine warning on a screen with nothing wrong with it. --color-info is
+   the hue this app already spends on in-progress (--color-status-running is
+   the same token) (elspeth-7161879770). */
+.workspace-status-control[data-tone="busy"] {
+  border-color: var(--color-info, currentcolor);
+}
+
 .workspace-status-control[data-tone="warning"] {
   border-color: var(--color-warning, currentcolor);
 }
@@ -222,63 +318,92 @@
   border-color: var(--color-error, currentcolor);
 }
 
+/* The overflow holds the bar's right edge; see the composition note on
+   .workspace-action-bar. An auto margin rather than space-between, so the
+   status and completion groups stay one cluster on the left. */
 .workspace-more-actions {
   position: relative;
+  margin-inline-start: auto;
 }
 
+/* Same one-register rule as the status chips above (elspeth-5413e4221e). */
 .workspace-more-actions > button {
-  min-height: var(--size-control-compact);
+  min-height: var(--size-control);
 }
 
 .workspace-more-actions-menu {
   position: absolute;
-  z-index: 5;
+  z-index: var(--z-panel-controls);
   right: 0;
-  bottom: calc(100% + 0.25rem);
+  bottom: calc(100% + var(--space-xs));
   display: grid;
-  gap: 0.25rem;
-  min-width: 12rem;
-  padding: 0.5rem;
+  gap: var(--space-xs);
+  min-width: 192px;
+  padding: var(--space-sm);
   border: 1px solid var(--color-border, currentcolor);
-  border-radius: var(--radius-md, 0.375rem);
+  border-radius: var(--radius-md, 6px);
   background: var(--color-surface, Canvas);
-  box-shadow: 0 0.25rem 1rem rgb(0 0 0 / 20%);
+  box-shadow: var(--shadow-dropdown);
+}
+
+/* Both menu items are side-rail controls borrowed into a popover, and they
+   arrived carrying the rail's full-width geometry (width: calc(100% - 16px)
+   plus 8px side margins). Those margins DOUBLED this menu's 8px inset to 16px
+   and QUINTUPLED its 4px row gap to 20px, and the two items read as different
+   control species — a centred --font-size-base pill above a left-aligned
+   --font-size-sm grid row. Strip the rail geometry and settle both on one
+   species: left-aligned, --font-size-sm, the compact radius. The sibling
+   overflow menu in chat.css already ships the equivalent normalising rule
+   (elspeth-3d87be9d02). Heights are untouched — both items are already
+   --size-control. */
+.workspace-more-actions-menu > * {
+  width: auto;
+  margin: 0;
+  border-radius: var(--radius-sm);
+  justify-content: flex-start;
+  font-size: var(--font-size-sm);
+  text-align: left;
 }
 
 .workspace-collapse-control {
+  position: relative;
   align-self: flex-end;
   flex: 0 0 auto;
 
-  /* Vertical registration with the action bar across the divider: that row
-     is 8px padding + 44px .btn buttons, so this control takes the same 8px
-     standoff and the full --size-control height (overriding .btn-compact's
-     36px floor — workspace.css imports after shared.css) so both rows share
-     one bottom edge and one optical center. */
-  margin: var(--space-sm);
+  /* Vertical registration with the action bar across the divider: both rows
+     take the same --workspace-bar-inset standoff and the full --size-control
+     height (overriding .btn-compact's 36px floor — workspace.css imports
+     after shared.css), so they share one bottom edge and one optical center.
+     Expressed in tokens on both sides of the seam, so the contract no longer
+     depends on the browser root staying at 16px (elspeth-fca731fb28).
+     position: relative keeps this control painted above the band that
+     .workspace-authoring-pane::before draws behind it. */
+  margin: var(--workspace-bar-inset) var(--space-sm);
   min-height: var(--size-control);
 }
 
 .workspace-collapsed-affordance {
   position: absolute;
-  z-index: 3;
-  top: 0.5rem;
-  left: 0.5rem;
+  z-index: var(--z-panel-controls);
+  top: var(--space-sm);
+  left: var(--space-sm);
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-sm);
   align-items: center;
-  max-width: min(26rem, calc(100% - 1rem));
-  padding: 0.5rem;
+  max-width: min(416px, calc(100% - 2 * var(--space-sm)));
+  padding: var(--space-sm);
   border: 1px solid var(--color-border, currentcolor);
-  border-radius: var(--radius-md, 0.375rem);
+  border-radius: var(--radius-md, 6px);
   background: var(--color-surface, Canvas);
 }
 
+/* Same busy/warning split as .workspace-status-control (elspeth-7161879770). */
 .workspace-collapsed-affordance[data-tone="busy"] {
-  border-color: var(--color-warning, currentcolor);
+  border-color: var(--color-info, currentcolor);
 }
 
 .workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {
-  border-color: var(--color-warning, currentcolor);
+  border-color: var(--color-info, currentcolor);
 }
 
 .workspace-collapsed-affordance[data-tone="error"] {
@@ -316,7 +441,7 @@
 
 .workspace-separator-slot {
   position: relative;
-  z-index: 2;
+  z-index: var(--z-panel-controls);
   grid-row: 1;
   grid-column: 1;
   align-self: stretch;
@@ -341,19 +466,67 @@
   touch-action: none;
 }
 
+/* The app's primary seam AND a draggable, keyboard-operable resize control.
+   It used to be a 12%-alpha hairline (--color-border, ~1.1:1 against the
+   surfaces either side, effectively invisible in the light theme) drawn as a
+   border on a ZERO-width box offset by half a pixel, so it also rendered
+   blurred at 1x. Three changes (elspeth-ffb96f0b95):
+
+     - a real 1px box with a background instead of a border on a 0px box,
+       landed on a whole device pixel (left: 50% of the 24px hit area);
+     - --color-input-border, the token tokens.css already justifies for
+       exactly this situation — "the fill ~matches surface, so the border is
+       the sole affordance and must clear WCAG 1.4.11 (3:1)"; this is an
+       interactive control, so 1.4.11 applies to it too;
+     - a resting grip mark plus hover/active states, because a 24px
+       col-resize hit area with no feedback beyond the cursor is the reason
+       the affordance is undiscoverable. Seven rules matched this control
+       before and not one was a state selector. */
 .workspace-separator::before {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: calc(50% - 0.5px);
-  width: 0;
-  border-left: 1px solid var(--color-border, currentcolor);
+  left: 50%;
+  width: 1px;
+  background: var(--color-input-border);
   content: "";
+}
+
+/* Resting grip: a short centred thickening of the seam, so the drag
+   affordance is visible without hovering first. */
+.workspace-separator::after {
+  position: absolute;
+  top: 50%;
+  left: calc(50% - 1px);
+  width: 3px;
+  height: 24px;
+  border-radius: var(--radius-pill);
+  background: var(--color-input-border);
+  content: "";
+  transform: translateY(-50%);
+}
+
+.workspace-separator:hover::before,
+.workspace-separator:active::before {
+  left: calc(50% - 1px);
+  width: 3px;
+  background: var(--color-text-secondary);
+}
+
+.workspace-separator:hover::after,
+.workspace-separator:active::after {
+  background: var(--color-text-secondary);
 }
 
 .workspace-separator[aria-disabled="true"] {
   cursor: default;
   pointer-events: none;
+}
+
+/* A disabled separator is not resizable, so it keeps the seam and drops the
+   grip: the mark is a drag affordance, not a divider. */
+.workspace-separator[aria-disabled="true"]::after {
+  display: none;
 }
 
 .workspace-separator:focus-visible {
@@ -367,9 +540,21 @@
   grid-column: 2;
 }
 
+/* The five raw stacking integers this file used to carry (2/3/3/4/5) were
+   written against a scale whose LOWEST rung is 10, so nothing here could be
+   tuned from tokens.css — and the literal 4 put this slot BELOW
+   .graph-a11y-list's var(--z-panel-controls), which is a live ordering bug:
+   neither .composer-workspace nor .artifact-workspace-panel opens a stacking
+   context, so the a11y list painted straight through the open drawer. All
+   five now sit on --z-panel-controls and their relative order is carried by
+   tree order, which reproduces the previous ordering exactly (separator <
+   action bar, collapsed affordance < action bar, action bar < inspector,
+   menu above its own bar) while lifting the drawer over the a11y list. Every
+   one of them stays below --z-catalog (40) and --z-overlay (100), as before
+   (elspeth-cf4b08e271). */
 .workspace-inspector-slot {
   position: absolute;
-  z-index: 4;
+  z-index: var(--z-panel-controls);
   inset: 0 0 0 var(--authoring-pane-width);
   min-width: 0;
   min-height: 0;
@@ -386,30 +571,53 @@
   left: 0;
 }
 
+/* Reserve the drawer's strip in the artifact pane while it is open, so the
+   toolbar and the sticky action bar lay out inside the UNOCCLUDED region
+   instead of being sliced by an overlay with no scrim. Excluded in narrow
+   mode, where the slot spans the full width and the drawer is the view
+   (elspeth-4e54200207). */
+.composer-workspace:not([data-layout-mode="narrow"]):has(
+    .workspace-inspector:not([hidden])
+  )
+  .workspace-artifact-pane {
+  padding-right: var(--workspace-inspector-width);
+}
+
 .workspace-inspector {
   position: absolute;
   inset: 0 0 0 auto;
   display: flex;
   flex-direction: column;
-  width: min(32rem, 100%);
+  width: min(var(--workspace-inspector-width), 100%);
   min-width: 0;
   min-height: 0;
-  border-left: 1px solid var(--color-border, currentcolor);
+  /* The drawer's only boundary against the canvas, so it takes the same
+     3:1 token as the pane separator rather than the 12%-alpha hairline
+     (elspeth-ffb96f0b95). */
+  border-left: 1px solid var(--color-input-border);
   background: var(--color-surface, Canvas);
 }
 
 .workspace-inspector--overlay {
-  box-shadow: -0.5rem 0 1.5rem rgb(0 0 0 / 24%);
+  box-shadow: -8px 0 24px rgb(0 0 0 / 24%);
 }
 
+/* Both drawer bands were hard-built from 8px padding plus a 36px control
+   (= 53px) instead of reading --size-workspace-band, so when the density
+   regime compressed the artifact toolbar beside them to 45px they stayed at
+   53 and opened an 8px seam offset exactly where vertical space is scarcest.
+   Deriving the height from the token — no vertical padding, content centred —
+   is the same construction .artifact-workspace-toolbar uses, so all of them
+   compress together (elspeth-7bd392c0dc). */
 .workspace-inspector-header,
 .workspace-inspector-tabs {
   display: flex;
   flex: 0 0 auto;
-  gap: 0.5rem;
+  gap: var(--space-sm);
   align-items: center;
   justify-content: space-between;
-  padding: 0.5rem;
+  min-height: var(--size-workspace-band);
+  padding: 0 var(--space-sm);
 }
 
 .workspace-inspector-header {
@@ -425,7 +633,7 @@
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
-  padding: 0.5rem;
+  padding: var(--space-sm);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -448,7 +656,7 @@
   display: flex;
   grid-row: 1;
   grid-column: 1;
-  gap: 0.25rem;
+  gap: var(--space-xs);
 }
 
 .composer-workspace[data-layout-mode="narrow"]
@@ -472,7 +680,7 @@
   .workspace-collapsed-affordance {
   position: static;
   max-width: 100%;
-  margin: 0.5rem;
+  margin: var(--space-sm);
 }
 
 /* Component display rules outrank the user-agent [hidden] rule. Keep this
@@ -509,22 +717,22 @@
      freeform header on every ≤800px-tall viewport. */
   .composer-workspace {
     --size-workspace-band: 45px;
+
+    /* Tighten the WHOLE action-bar rhythm, not just the bar's own outer gap.
+       Overriding only the bar left the group BOUNDARIES at 4px while the gaps
+       INSIDE the status and completion groups stayed at 8px — measured
+       8/4/8/8/4 at 1280x720 and 1536x760 — so the eye bonded "Audit N issues"
+       to "Save for review" and split controls that belong together, at exactly
+       the viewport where the bar is most crowded. Both the bar's padding and
+       the collapse control's standoff across the divider read the inset, so
+       the shared bottom edge holds here too (elspeth-fca731fb28). */
+    --workspace-bar-gap: var(--space-xs);
+    --workspace-bar-inset: var(--space-xs);
   }
 
   .artifact-workspace-toolbar {
-    gap: 0.25rem;
-    padding-inline: 0.5rem;
-  }
-
-  .workspace-action-bar {
-    gap: 0.25rem;
-    padding: 0.25rem 0.5rem;
-  }
-
-  /* Track the action bar's tightened padding so the shared bottom edge
-     holds in the compact regime too. */
-  .workspace-collapse-control {
-    margin: 0.25rem 0.5rem;
+    gap: var(--space-xs);
+    padding-inline: var(--space-sm);
   }
 }
 
@@ -560,31 +768,59 @@
   line-height: var(--line-height-tight);
 }
 
+/* ONE key-column measure for every card in a section. max-content on each
+   card's own dl was evaluated PER CARD, so a Source card (longest key
+   on_validation_failure) and an Outputs card (longest key on_write_failure)
+   started their value columns 37px apart while the eye reads the stack as one
+   table. The measure lives on the section container and both the card and its
+   dl re-enter it via subgrid, so every dd in the section shares one left edge.
+   The h4 and the options block span both tracks; because they span the
+   flexible track they are excluded from sizing the max-content key column,
+   so a wide JSON block cannot inflate it (elspeth-ea3aa19ddc). */
 .pipeline-spec-cards {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
   gap: var(--space-md);
 }
 
 .pipeline-spec-card {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  /* Row spacing inside a card stays margin-driven (h4 / options own it); a
+     subgrid inherits the section's 12px gutters otherwise, which would add a
+     second gap on top of those margins. */
+  gap: 0 var(--space-md);
+  align-content: start;
   background: var(--color-surface-elevated);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   padding: var(--space-md);
 }
 
+.pipeline-spec-card > * {
+  grid-column: 1 / -1;
+}
+
+/* The card's caption is a USER-AUTHORED node id, and PipelineSpecView prints
+   the identical string verbatim in the mono grid four lines below. Uppercasing
+   it in the sans face put one identifier on the card in two contradictory
+   forms, so copying the title yielded the wrong string. Give the caption the
+   identifier treatment the dt beneath it already uses, and keep the bold
+   weight so it still reads as the card's caption (elspeth-e7c7a37a7c). */
 .pipeline-spec-card h4 {
   margin: 0 0 var(--space-sm);
-  color: var(--color-text-secondary);
+  color: var(--color-text);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-bold);
   line-height: var(--line-height-tight);
-  text-transform: uppercase;
 }
 
 .pipeline-spec-card dl {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
   gap: var(--space-xs) var(--space-md);
   margin: 0;
 }
@@ -593,10 +829,14 @@
   display: contents;
 }
 
+/* Key and value sit on ONE row and now share one size, so they share a
+   baseline; the key/value distinction is carried by typeface and colour
+   alone, which is work those two declarations were already doing
+   (elspeth-ea3aa19ddc). */
 .pipeline-spec-card dt {
   color: var(--color-text-secondary);
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  font-size: var(--font-size-sm);
 }
 
 .pipeline-spec-card dd {

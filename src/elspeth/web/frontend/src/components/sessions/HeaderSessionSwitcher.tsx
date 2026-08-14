@@ -336,8 +336,28 @@ export function HeaderSessionSwitcher(): JSX.Element {
             </li>
             {/* Semantic + visual break between the create ACTION and the
                 session ENTRIES, so a session whose title resembles the
-                action can never be conflated with it (elspeth-ef8c18a6cb). */}
-            <li role="separator" className="header-session-switcher-separator" />
+                action can never be conflated with it (elspeth-ef8c18a6cb).
+                Suppressed when there is nothing beneath it: a rule drawn
+                under the last row read as a truncated list, and the panel
+                (action, rule, void) was indistinguishable from a load
+                failure (elspeth-0774112acd). */}
+            {filteredSessions.length > 0 && (
+              <li role="separator" className="header-session-switcher-separator" />
+            )}
+            {/* Zero-length branch. role="none" keeps <ul role="menu"> free of
+                non-menuitem owned children — the same aria-required-children
+                constraint that hoisted the filter strip out of the menu. It
+                is not registered in itemRefs and not counted by itemCount, so
+                it is never a roving-focus stop. .empty-state is the shared
+                empty register (shared.css:475); no new class name is minted
+                here, because an undefined one would ship unstyled. */}
+            {filteredSessions.length === 0 && (
+              <li role="none" className="empty-state">
+                {sessions.length === 0
+                  ? "No sessions yet."
+                  : "No sessions match the current filter."}
+              </li>
+            )}
             {filteredSessions.map((session, idx) => {
               const title = session.title || `Session ${session.id.slice(0, 8)}`;
               const selectIndex = 1 + idx * 3;

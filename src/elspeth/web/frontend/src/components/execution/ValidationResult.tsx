@@ -182,7 +182,10 @@ export function ValidationResultBanner({
                 const isClickable =
                   Boolean(onComponentClick) &&
                   isNavigableComponent(warn.component_id, nodes, componentNames);
-                const content = (
+                // The warning TEXT is what the button navigates from; the
+                // suggestion is a sibling note. See the error list below for
+                // why the two must not share one element (elspeth-7bcc3d5233).
+                const warningText = (
                   <>
                     <strong>
                       [{warn.component_type ?? "unknown"}]{" "}
@@ -193,11 +196,6 @@ export function ValidationResultBanner({
                       )}:
                     </strong>{" "}
                     {warn.message}
-                    {warn.suggestion && (
-                      <div className="validation-banner-suggestion">
-                        Suggestion: {warn.suggestion}
-                      </div>
-                    )}
                   </>
                 );
 
@@ -213,10 +211,15 @@ export function ValidationResultBanner({
                         className="validation-banner-component-btn validation-banner-component-btn--warning"
                         title={`Click to select ${warn.component_id} in the pipeline view`}
                       >
-                        {content}
+                        {warningText}
                       </button>
                     ) : (
-                      content
+                      warningText
+                    )}
+                    {warn.suggestion && (
+                      <div className="validation-banner-suggestion">
+                        Suggestion: {warn.suggestion}
+                      </div>
                     )}
                   </li>
                 );
@@ -241,18 +244,20 @@ export function ValidationResultBanner({
           const isClickable =
             Boolean(onComponentClick) &&
             isNavigableComponent(err.component_id, nodes, componentNames);
-          const content = (
+          // elspeth-7bcc3d5233. The suggestion is a SIBLING of the button,
+          // never its child: a block-level <div> inside a <button> is invalid
+          // (flow content in a button), and it dragged the button's underline
+          // — a deliberate affordance on a real control, shared.css:855-874 —
+          // across the helper note, made a four-line block one hit target, and
+          // pushed the list marker down beside the "Suggestion:" line. The
+          // underline itself stays; only the thing it underlines changes.
+          const errorText = (
             <>
               <strong>
                 [{err.component_type ?? "unknown"}]{" "}
                 {resolveComponentName(err.component_id, nodes, componentNames)}:
               </strong>{" "}
               {err.message}
-              {err.suggestion && (
-                <div className="validation-banner-suggestion">
-                  Suggestion: {err.suggestion}
-                </div>
-              )}
             </>
           );
 
@@ -268,10 +273,15 @@ export function ValidationResultBanner({
                   className="validation-banner-component-btn validation-banner-component-btn--error"
                   title={`Click to select ${err.component_id} in the pipeline view`}
                 >
-                  {content}
+                  {errorText}
                 </button>
               ) : (
-                content
+                errorText
+              )}
+              {err.suggestion && (
+                <div className="validation-banner-suggestion">
+                  Suggestion: {err.suggestion}
+                </div>
               )}
             </li>
           );

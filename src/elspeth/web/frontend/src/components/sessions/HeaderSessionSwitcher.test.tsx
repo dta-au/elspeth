@@ -1,8 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { axe, toHaveNoViolations } from "jest-axe";
 import { HeaderSessionSwitcher } from "./HeaderSessionSwitcher";
 import { useSessionStore } from "@/stores/sessionStore";
+
+expect.extend(toHaveNoViolations);
 
 describe("HeaderSessionSwitcher", () => {
   beforeEach(() => {
@@ -476,5 +479,84 @@ describe("HeaderSessionSwitcher", () => {
     expect(input).toHaveAttribute("aria-invalid", "true");
     expect(input.getAttribute("aria-describedby")).toBe(alert.id);
     expect(alert.id).not.toBe("");
+  });
+});
+
+// ── Zero-match branch (elspeth-0774112acd) ──────────────────────────────────
+//
+// A filter that matched nothing left a 240px panel showing an action, a
+// horizontal rule, and void — indistinguishable from a list that failed to
+// load or a component that broke, with no guidance on what to do next.
+describe("HeaderSessionSwitcher empty results", () => {
+  beforeEach(() => {
+    useSessionStore.setState({
+      sessions: [
+        { id: "s1", title: "Tender review", updated_at: "2026-05-15T00:00:00Z" } as never,
+        { id: "s2", title: "Weather monitor", updated_at: "2026-05-14T00:00:00Z" } as never,
+      ],
+      activeSessionId: "s1",
+    } as never);
+  });
+
+  it("names the miss and drops the dangling rule when a filter matches nothing", async () => {
+    const user = userEvent.setup();
+    render(<HeaderSessionSwitcher />);
+    await user.click(screen.getByRole("button", { name: /tender review/i }));
+    const menu = screen.getByRole("menu");
+    // Precondition: with matches, the rule separates the action from entries.
+    expect(menu.querySelector("[role='separator']")).toBeInTheDocument();
+
+    await user.type(
+      screen.getByRole("textbox", { name: /find a session/i }),
+      "zzz-no-such-session",
+    );
+
+    expect(screen.queryAllByRole("menuitem")).toHaveLength(1); // + New session
+    expect(menu).toHaveTextContent(/no sessions match/i);
+    // A rule with nothing beneath it reads as a truncated list.
+    expect(menu.querySelector("[role='separator']")).toBeNull();
+  });
+
+  it("distinguishes an empty account from a filter miss", async () => {
+    useSessionStore.setState({ sessions: [], activeSessionId: null } as never);
+    const user = userEvent.setup();
+    render(<HeaderSessionSwitcher />);
+    await user.click(screen.getByRole("button", { name: /no session/i }));
+
+    const menu = screen.getByRole("menu");
+    expect(menu).toHaveTextContent(/no sessions yet/i);
+    expect(menu).not.toHaveTextContent(/no sessions match/i);
+  });
+
+  it("keeps the empty state out of the menu's owned children and off the focus ring", async () => {
+    const user = userEvent.setup();
+    const { container } = render(<HeaderSessionSwitcher />);
+    await user.click(screen.getByRole("button", { name: /tender review/i }));
+    await user.type(
+      screen.getByRole("textbox", { name: /find a session/i }),
+      "zzz-no-such-session",
+    );
+
+    const menu = screen.getByRole("menu");
+    // aria-required-children: <ul role="menu"> may own only menuitem-family
+    // children (the same constraint that hoisted the filter strip out of the
+    // menu). The empty-state row is presentational.
+    const roles = Array.from(menu.children).map((el) => el.getAttribute("role"));
+    expect(roles).toEqual(["menuitem", "none"]);
+
+    // It is not a roving-focus stop: ArrowDown from the sole menuitem wraps
+    // back to itself rather than landing on the message. (Focus is in the
+    // filter field after typing — that field stops keydown propagation, so
+    // the menu is driven from a menu item.)
+    const newSession = screen.getByRole("menuitem", { name: /new session/i });
+    newSession.focus();
+    await user.keyboard("{ArrowDown}");
+    expect(newSession).toHaveFocus();
+
+    // The precedent this row follows (.header-session-switcher-row) is a
+    // role="none" li that CONTAINS role="menuitem" children; this one carries
+    // bare text instead, which is a different shape. axe is the authority on
+    // whether a menu container tolerates it — reasoning is not.
+    expect(await axe(container)).toHaveNoViolations();
   });
 });

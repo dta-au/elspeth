@@ -366,6 +366,71 @@ describe("App banner roles", () => {
     expect(root!.getAttribute("role")).toBe("status");
   });
 
+  // ── One name per destination (elspeth-bafd220871) ────────────────────────
+  //
+  // This control carried four names for one destination: visible "⚙ API Keys",
+  // title "Configure API keys", aria-label "Open secrets settings", and the
+  // panel heading it opens. A screen-reader user, a hovering mouse user and a
+  // sighted user each learned a different name, so no two could describe it
+  // the same way.
+  it("gives the secrets shortcut one name, carried by its visible text", async () => {
+    vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+      composer_available: false,
+      composer_model: "gpt-4o",
+      composer_provider: "openai",
+      composer_reason: "No API key configured",
+      composer_missing_keys: ["OPENAI_API_KEY"],
+    } satisfies SystemStatus);
+
+    render(<App />);
+    await screen.findByText(/Service unavailable/i);
+
+    const shortcut = screen.getByRole("button", { name: "API keys & secrets" });
+    // The accessible name IS the visible text — no aria-label carrying a
+    // second wording, no title carrying a third.
+    expect(shortcut).toHaveTextContent("API keys & secrets");
+    expect(shortcut).not.toHaveAttribute("aria-label");
+    expect(shortcut).not.toHaveAttribute("title");
+  });
+
+  // ── One prefix treatment (elspeth-e5c446fab0) ────────────────────────────
+  //
+  // Notices sharing a slot and a frame introduced themselves four different
+  // ways (bold + em dash + capitalised continuation / bold + colon / plain +
+  // colon / none), so the prefix could not be skimmed for category.
+  it.each([
+    ["backend-unavailable", /Backend unavailable/i],
+    ["composer-unavailable", /Service unavailable/i],
+  ])("introduces the %s notice with a bold label and a colon", async (
+    _kind,
+    pattern,
+  ) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    if (pattern.source.includes("Backend")) {
+      vi.spyOn(api, "fetchSystemStatus").mockRejectedValue(new Error("down"));
+    } else {
+      vi.spyOn(api, "fetchSystemStatus").mockResolvedValue({
+        composer_available: false,
+        composer_model: "gpt-4o",
+        composer_provider: "openai",
+        composer_reason: "No API key configured",
+        composer_missing_keys: ["OPENAI_API_KEY"],
+      } satisfies SystemStatus);
+    }
+
+    render(<App />);
+    const label = await screen.findByText(pattern);
+
+    expect(label.tagName).toBe("STRONG");
+    expect(label.textContent?.endsWith(":")).toBe(true);
+    expect(label.closest(".alert-banner")).not.toBeNull();
+    // The continuation is ordinary sentence text, not an em-dash join.
+    // Scoped to what follows the LABEL, not the whole banner: the trailing
+    // copy is partly server-supplied and may legitimately contain a dash.
+    expect(label.nextSibling?.textContent ?? "").not.toMatch(/^\s*[—–-]/);
+    errorSpy.mockRestore();
+  });
+
   // The run-lifecycle fix rests entirely on RunOutcomeNotice being mounted at
   // App level: it is the ONLY completion surface outside the Run panel, whose
   // body unmounts whenever another artifact tab is active. Its own suite and

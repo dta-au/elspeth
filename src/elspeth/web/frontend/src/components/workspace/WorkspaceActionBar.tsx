@@ -30,6 +30,15 @@ interface WorkspaceActionBarProps {
 
 type PendingMenuFocus = "first" | "last" | null;
 
+/* The visible separator and the accessible name are ONE expression of the same
+   two strings (elspeth-a41fd9d32b). Rendering the pair bare made it read as a
+   single Title Case phrase — "Validation Passed" — and the colon lived only in
+   workspaceStatus.ts's `accessibleLabel`, so the visible string was not
+   contained in the programmatic name: a WCAG 2.5.3 Label in Name failure for
+   speech input. Composing the name here from the SAME `kind` and `status.text`
+   that are rendered is what makes the two incapable of drifting apart again;
+   the output string is byte-identical to the old `accessibleLabel`, which the
+   tests/e2e page object locates on (/^Validation: /, composer-page.ts:109). */
 function StatusButton({
   kind,
   status,
@@ -44,10 +53,10 @@ function StatusButton({
       type="button"
       className="btn-compact workspace-status-control"
       data-tone={status.tone}
-      aria-label={status.accessibleLabel}
+      aria-label={`${kind}: ${status.text}`}
       onClick={onClick}
     >
-      <span>{kind}</span>
+      <span>{kind}:</span>
       <span>{status.text}</span>
     </button>
   );

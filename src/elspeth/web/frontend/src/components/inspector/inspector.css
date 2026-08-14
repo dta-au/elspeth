@@ -1,9 +1,11 @@
 /* inspector.css — Version selector, graph view, and React Flow theming.
-   Owners: .version-selector*, :root .react-flow.react-flow (token overrides
-   scoped to the react-flow canvas — kept here NOT in tokens.css because
-   they are selector-scoped, not global; src/components/inspector/GraphView.test.tsx
-   reads this file by path), [data-theme="light"] .react-flow.react-flow,
-   .react-flow__controls-button:focus-visible, .graph-view*, .graph-node*,
+   Owners: .version-selector*, the --xy-* token overrides on
+   `:root .react-flow.react-flow, :root .graph-view-canvas` and their
+   [data-theme="light"] counterpart (kept here NOT in tokens.css because they
+   are selector-scoped, not global; src/components/inspector/GraphView.test.tsx
+   and reactFlowThemeScope.test.tsx read this file by path), the @xyflow
+   element overrides (.react-flow__controls-button, .react-flow__panel,
+   .react-flow__edge-textbg), .graph-view*, .graph-node*,
    .graph-validation-dot, .graph-config* + responsive media query. */
 
 /* ---------------------------------------------------------------------------
@@ -18,7 +20,10 @@
   font-size: var(--font-size-xs);
   font-weight: 600;
   line-height: 20px;
-  border-radius: var(--radius-xl);
+  /* No border-radius override: the trigger composes .btn-compact and takes its
+     --radius-md, like every sibling control in the header row. It was the only
+     --radius-xl (12px) element in the product — a pill among rectangles
+     (elspeth-8c66192e65). */
   display: inline-flex;
   align-items: center;
   gap: var(--space-xs);
@@ -128,7 +133,20 @@
 /* ---------------------------------------------------------------------------
    Graph View
    --------------------------------------------------------------------------- */
-:root .react-flow.react-flow {
+/* React Flow theming, declared on BOTH the flow element and the canvas
+   wrapper. <Controls> and <MiniMap> mount as SIBLINGS of the role="img"
+   diagram (GraphView.tsx, elspeth-37f6f13132), i.e. OUTSIDE .react-flow, and
+   @xyflow declares every --xy-*-default on .react-flow itself. A custom
+   property that never reaches an element is invalid-at-computed-value-time,
+   not an error — so the controls painted transparent with no border and no
+   elevation, and the minimap mask fell to the SVG initial (BLACK).
+   .graph-view-canvas is the common ancestor of the diagram AND both panels,
+   so declaring the block there reaches all three. The .react-flow.react-flow
+   half must STAY: @xyflow's own defaults are declared on that element and
+   would beat a value merely inherited from an ancestor
+   (elspeth-1adf90c933, elspeth-525d335cbc). */
+:root .react-flow.react-flow,
+:root .graph-view-canvas {
   --xy-background-color-default: var(--color-bg);
   --xy-background-pattern-dots-color-default: var(--color-border-strong);
   --xy-background-pattern-lines-color-default: var(--color-border-strong);
@@ -146,7 +164,10 @@
   --xy-minimap-node-stroke-color-default: var(--color-border-strong);
   --xy-edge-stroke-default: var(--color-text-muted);
   --xy-edge-stroke-selected-default: var(--color-focus-ring);
-  --xy-edge-label-background-color-default: var(--color-surface);
+  /* Elevated, not --color-surface: the plate sits on the --color-bg canvas
+     three sRGB units away, so it read as a hole punched through the connector
+     rather than as a label chip (elspeth-f6da810e06). */
+  --xy-edge-label-background-color-default: var(--color-surface-elevated);
   --xy-edge-label-color-default: var(--color-text);
   --xy-handle-background-color-default: var(--color-accent);
   --xy-handle-border-color-default: var(--color-surface);
@@ -155,7 +176,11 @@
   --xy-attribution-background-color-default: transparent;
 }
 
-[data-theme="light"] .react-flow.react-flow {
+/* Same two-selector scope as the base block above — without the
+   .graph-view-canvas half this entire light-theme override was dead, because
+   the only elements it themes (Controls, MiniMap) live outside .react-flow. */
+[data-theme="light"] .react-flow.react-flow,
+[data-theme="light"] .graph-view-canvas {
   --xy-minimap-mask-background-color-default: rgba(15, 45, 53, 0.12);
   --xy-selection-background-color-default: rgba(138, 90, 192, 0.10);
   /* --xy-controls-box-shadow-default needs no override here: --shadow-dropdown
@@ -166,6 +191,41 @@
 .react-flow__controls-button:focus-visible {
   outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
+}
+
+/* @xyflow ships its controls buttons at 26×26 — the smallest interactive
+   control in the product. Lift them to the compact chrome rung. min-* rather
+   than width/height so the vendor's own width/height lose on the used-value
+   rules whatever the stylesheet order turns out to be. */
+:root .react-flow__controls-button {
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
+}
+
+/* Both floating panels (Controls, MiniMap) inset from the canvas edge at
+   @xyflow's raw 15px; put them on the spacing scale instead. Every rule in
+   this group is :root-prefixed because the vendor rules are bare classes —
+   an equal-specificity tie whose winner depends on whether
+   @xyflow/react/dist/style.css (imported by GraphView.tsx) or this file (the
+   styles/index.css barrel) lands later in the bundle. Specificity settles it
+   deterministically; source order would not. */
+:root .react-flow__panel {
+  margin: var(--space-lg);
+}
+
+/* The edge-label plate is opaque — it cuts the connector line — so it has to
+   read as a deliberate chip rather than a gap. The fill does that work
+   (--xy-edge-label-background-color-default above); this rule only softens the
+   corner, which is not expressible from the component side because
+   ParallelLaneEdge does not forward labelBgStyle / labelBgPadding
+   (GraphView.tsx) and would drop them silently. rx AND ry are both set:
+   @xyflow puts ry="2" on the rect as a presentation attribute, and a CSS rx
+   alone would leave elliptical corners. No stroke: a 1px border straddles the
+   rect edge, so it would widen the very gap in the connector this ticket is
+   about — a call for a visual pass, not a blind one (elspeth-f6da810e06). */
+:root .react-flow__edge-textbg {
+  rx: var(--radius-sm);
+  ry: var(--radius-sm);
 }
 
 .graph-view-shell {
@@ -221,7 +281,10 @@
   background-color: var(--color-surface-elevated);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  /* Mini floating panel = the --shadow-popover tier. The raw
+     0 4px 16px rgba(0,0,0,0.3) it carried was heavier than any named tier and
+     never softened in the light theme (elspeth-6c3223c76e). */
+  box-shadow: var(--shadow-popover);
 }
 
 .graph-a11y-list li {
@@ -261,10 +324,17 @@
   background-color: var(--color-accent-muted);
 }
 
+/* The card's box is fixed (NODE_HEIGHT = 80, set inline on .react-flow__node),
+   so without height/justify-content the content sat top-aligned with ~9px
+   above and ~26px below it — and the edge connectors, which attach at the
+   box's vertical midpoint, appeared to leave from empty space rather than from
+   the text (elspeth-c91c7b714e). */
 .graph-node-content {
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: var(--space-xs);
+  height: 100%;
   padding: var(--space-sm) var(--space-md);
 }
 
@@ -274,11 +344,23 @@
   gap: var(--space-xs);
 }
 
+/* Carries the shared .type-badge typographic identity (shared.css) — mono,
+   --font-weight-semibold, 2/8px padding, the tracking — because the node card
+   and the selected-node TypeBadge render the SAME type label side by side, and
+   two typographic identities for one concept read as two different facts
+   (elspeth-2b34488bd6). Kept as its own rule rather than composing .type-badge
+   because the canvas resolves its background/foreground inline per node kind.
+   The base .type-badge carries no border; the borders live on its
+   .type-badge-* variants, so none is added here. */
 .graph-node-badge {
+  font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: 0.5px;
+  line-height: 1.4;
   text-transform: uppercase;
-  padding: var(--space-2xs) var(--space-xs);
+  white-space: nowrap;
+  padding: var(--space-2xs) var(--space-sm);
   border-radius: var(--radius-sm);
 }
 
@@ -344,12 +426,21 @@
   font-size: var(--font-size-xs);
 }
 
+/* Geometry copied from .btn-compact (shared.css) rather than the bespoke
+   32×32 / --radius-sm box this carried: 32px matched neither control rung, and
+   a --radius-sm corner inside a --radius-md panel breaks the concentric
+   relationship with its own container (elspeth-5724ae8378). Composing
+   .btn-compact on the element itself would be better still, but the class list
+   lives in GraphView.tsx. The × glyph it renders is the shared close glyph. */
 .graph-config-close {
   flex: 0 0 auto;
-  min-width: 32px;
-  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--size-control-compact);
+  min-height: var(--size-control-compact);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  border-radius: var(--radius-md);
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   cursor: pointer;

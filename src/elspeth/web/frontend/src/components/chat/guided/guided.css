@@ -160,11 +160,18 @@
   font-weight: var(--font-weight-semibold);
 }
 
+/* Card radius, not button radius (elspeth-cad0862ed7). This is a top-level
+   card in the guided authoring scroller, and its two peers there are both
+   --radius-lg: .ack-stack (chat.css) above it and .guided-completion (below in
+   this file) in the terminal state — as is the .chat-panel frame around all
+   three. --radius-md is the button/inner-block rung this file uses everywhere
+   else, so a 6px decision card read as an oversized button between two 8px
+   cards. */
 .guided-current-decision {
   margin: var(--space-md);
   padding: var(--space-md);
   border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background-color: var(--color-surface);
 }
 
@@ -294,10 +301,28 @@
 
 /* Decorative eyebrow above the decision heading ("Current decision"). The
    prominent thing is now the dynamic build rationale (the <h2> below), so this
-   small uppercase label is aria-hidden and quiet. */
-.guided-current-decision-eyebrow {
+   small uppercase label is aria-hidden and quiet.
+
+   On the 12px/700 uppercase micro-label idiom (elspeth-aa1e0f4a96). Every
+   other uppercase micro-label in the frontend is --font-size-xs at 600/700
+   (catalog, chat, inspector, settings, sidebar, workspace, and the
+   .bubble-system--stage divider below in this very file, which shares the
+   0.04em tracking and can sit ~114px away on the same surface); this was the
+   only 13px/400 one, so the two read as two classes of heading rather than
+   one repeated idiom. Alignment stays LEFT: the stage divider is a centred
+   full-width transcript marker, this is a card label above a left-aligned h2.
+
+   SPECIFICITY (load-bearing): the eyebrow is a <p> inside
+   .guided-current-decision-copy, so the (0,1,1) `.guided-current-decision-copy
+   p` rule below wins over a bare (0,1,0) `.guided-current-decision-eyebrow`
+   on every property it declares — font-size included. Qualifying by the copy
+   wrapper puts this rule at (0,2,0), the same construction the rationale rule
+   below already uses. Do not de-qualify it: a font-size set on the bare class
+   is silently overridden and the fix appears to do nothing. */
+.guided-current-decision-copy .guided-current-decision-eyebrow {
   margin: 0;
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-bold);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   color: var(--color-text-secondary);
@@ -615,7 +640,7 @@
   line-height: 1.45;
   min-height: var(--size-control);
   resize: vertical;
-  transition: border-color 0.1s ease;
+  transition: border-color var(--transition-fast);
 }
 
 .wire-stage__correction-input:focus-visible {
@@ -773,13 +798,25 @@
    (left, with pulse + elapsed readout) and the one-click Explain affordance
    (right). The border-top reads as the card's footer bar, so neither piece
    floats in dead space (operator-reported orphan placement). */
+/* Clearance is balanced about the rule (elspeth-74db8a22e6). The gap ABOVE the
+   hairline is not this rule's margin alone — .guided-turn contributes its own
+   `padding: var(--space-md) 0` bottom, so the old
+   `margin-top: var(--space-md)` + `padding-top: var(--space-sm)` pair rendered
+   24px above / 8px below (measured: last option bottom y=540, hairline y=565,
+   Explain-button top y=574). At 3:1 the rule stopped reading as a separator
+   between two regions and read as an underline glued to "Explain this step".
+   Dropping the margin and putting the inside clearance on the same
+   --space-md the turn's own padding already spends lands the rule on the
+   midpoint: 12px above, 12px below. If the turn widget is absent the 12px
+   above comes from .guided-current-decision-copy's margin-bottom instead, so
+   the balance holds either way — do not reintroduce a margin-top here without
+   subtracting it from the padding. */
 .guided-current-decision-footer {
   display: flex;
   align-items: center;
   justify-content: flex-end;
   gap: var(--space-md);
-  margin-top: var(--space-md);
-  padding-top: var(--space-sm);
+  padding-top: var(--space-md);
   border-top: 1px solid var(--color-border);
 }
 
@@ -905,7 +942,7 @@
   font-family: inherit;
   cursor: pointer;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease, border-color 0.1s ease;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .guided-turn-primary {
@@ -977,10 +1014,18 @@
    was dragged out by its hint to a ragged 280px max. align-items: stretch evens
    item heights so a two-line hint (the dataverse case) no longer staggers the
    row. On a ~358px mobile column only one 180px track fits → one option per row. */
+/* Row gap is larger than the button→hint gap below (elspeth-802d658c79): with
+   both at their old values the hint's 1.4 line-height put it ~6px under the
+   option it describes and ~10px above the next one, i.e. almost equidistant,
+   so a hinted row read as detached from its own button. Row gap
+   --space-md / hint gap --space-2xs makes that ~4px vs ~14px and binds the
+   hint to its option. Column gap stays --space-sm so the multi-column track
+   layout is unchanged. Shared with MultiSelectWithCustomTurn per the chip
+   reuse contract at the top of this file — the change is intended in both. */
 .guided-chip-group {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-  gap: var(--space-sm);
+  gap: var(--space-md) var(--space-sm);
   align-items: stretch;
 }
 
@@ -990,7 +1035,9 @@
 .guided-chip-item {
   display: flex;
   flex-direction: column;
-  gap: var(--space-xs);
+  /* Tighter than .guided-chip-group's row gap on purpose — see the note there
+     (elspeth-802d658c79 binds the hint to the option it describes). */
+  gap: var(--space-2xs);
 }
 
 /* The option button itself. Styled as an accent-OUTLINED option, not a text
@@ -1013,12 +1060,77 @@
   font-family: inherit;
   text-align: left;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease, border-color 0.1s ease;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast), box-shadow var(--transition-fast);
 }
 
-.guided-chip-btn:hover {
-  background-color: var(--color-highlight);
+/* Hover (elspeth-64c97a2d72). Two defects fixed here, both in the house hover
+   contract "lighten the surface AND strengthen the border":
+
+   SURFACE — --color-highlight is TRANSLUCENT (dark rgba(26,122,82,0.14),
+   light rgba(21,96,72,0.12)). Assigning it to `background-color` REPLACED the
+   button's opaque --color-surface-elevated fill, so the tint composited
+   against whatever card sat behind the button instead of over the button:
+   #1a3d47 → (19,58,59) in dark, a 1.06:1 move, and a move in the OPPOSITE
+   direction in light (card #f8fbfc under a #ffffff button). Layering the same
+   token OVER the button's own fill as a background-image makes both themes
+   move toward the accent — dark (26,61,71) → (26,70,73) (1.12:1, lighter),
+   light #ffffff → (222,233,229) (1.24:1, darker). The tint stays the tuned
+   per-theme --color-highlight; only the backdrop it composites against
+   changes.
+
+   BORDER — the old declaration named --color-chip-border, the SAME token the
+   base rule sets: a literal no-op. --color-border-strong (rgba(143,200,200,
+   0.25)) would be weaker, not stronger, and would drop the resting boundary
+   below the 3:1 the base rule's comment pins, and there is no strong variant
+   of the chip token. The boundary is strengthened by DOUBLING it instead: an
+   inset 1px ring in the same token renders the 1px border as a 2px one — the
+   emphasis idiom .guided-workflow-step--current already uses — with no layout
+   shift and no new token.
+
+   Guards inside :where() so this stays at (0,2,0), below
+   .guided-chip-btn[aria-pressed="true"]:hover (0,3,0) — the shared.css:156-163
+   discipline. aria-pressed is guarded too: the pressed rules override colour
+   but not background-image/box-shadow, so an unguarded base hover would paint
+   an accent tint and ring over the filled selected chip. */
+.guided-chip-btn:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])):where(:not([aria-pressed="true"])) {
+  background-image: linear-gradient(
+    var(--color-highlight),
+    var(--color-highlight)
+  );
   border-color: var(--color-chip-border);
+  box-shadow: inset 0 0 0 1px var(--color-chip-border);
+}
+
+/* Disabled (elspeth-bf28ffcdfa). The card's primary control was the one guided
+   button with no disabled visual: author-set colour/background suppress the
+   UA's default greying, so a dead chip rendered identically to a live one,
+   kept cursor: pointer, and still lit on hover. The worst arm is
+   SingleSelectTurn's sourceFileChoiceRequired, which holds the options
+   disabled INDEFINITELY until a file is picked — a persistent live-looking
+   dead control, not a sub-second round trip. Same token set .btn:disabled
+   (shared.css:176-181) documents as AA in both themes: muted text on the page
+   background (dark 6.45:1, light 6.32:1), border held at --color-border-strong
+   so the outline stays distinguishable from the page.
+
+   aria-disabled is covered alongside :disabled for parity with .btn even
+   though both chip call sites currently use the real `disabled` attribute.
+
+   Deliberately NOT applied over the pressed fill: a disabled MultiSelect chip
+   keeps its accent-filled selected visual (below, equal specificity but later
+   in source) so the user can still see WHAT they selected while the response
+   is in flight; it picks up cursor: not-allowed from here and its hover is
+   guarded separately. */
+.guided-chip-btn:disabled,
+.guided-chip-btn[aria-disabled="true"] {
+  background-color: var(--color-bg);
+  /* background-color does not reset background-image: clear the hover tint
+     explicitly so a chip that goes disabled under a stationary pointer cannot
+     keep an accent wash over the dimmed fill. */
+  background-image: none;
+  color: var(--color-text-muted);
+  border-color: var(--color-border-strong);
+  cursor: not-allowed;
 }
 
 .guided-chip-btn:focus-visible {
@@ -1181,7 +1293,7 @@
   font-family: inherit;
   cursor: pointer;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease, border-color 0.1s ease;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .guided-inspect-confirm-btn {
@@ -1273,7 +1385,7 @@
   cursor: pointer;
   min-height: var(--size-control-compact);
   white-space: nowrap;
-  transition: background-color 0.1s ease, color 0.1s ease;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
 }
 
 .guided-inspect-remove-btn:hover {
@@ -1300,7 +1412,7 @@
   font-family: inherit;
   cursor: pointer;
   min-height: var(--size-control);
-  transition: background-color 0.1s ease, border-color 0.1s ease;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .guided-inspect-cancel-btn {
@@ -1349,7 +1461,10 @@
   border-color: var(--color-accent);
 }
 
-.guided-chip-btn[aria-pressed="true"]:hover {
+/* Guards inside :where() (zero specificity) so the pressed hover stays at
+   (0,3,0) above the base chip hover, while a DISABLED selected chip stops
+   lighting up under the pointer (elspeth-bf28ffcdfa). */
+.guided-chip-btn[aria-pressed="true"]:hover:where(:not(:disabled)):where(:not([aria-disabled="true"])) {
   background-color: var(--color-btn-primary-bg-hover);
   border-color: var(--color-btn-primary-bg-hover);
 }
@@ -1404,7 +1519,7 @@
   font-family: inherit;
   font-size: var(--font-size-sm);
   line-height: 1;
-  transition: background-color 0.1s ease, color 0.1s ease;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
 }
 
 .guided-multi-custom-remove-btn:hover {
@@ -1434,7 +1549,7 @@
   font-size: var(--font-size-base);
   font-family: inherit;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease;
+  transition: background-color var(--transition-fast);
 }
 
 .guided-multi-escape-btn {
@@ -1447,7 +1562,7 @@
   font-size: var(--font-size-base);
   font-family: inherit;
   min-height: var(--size-control);
-  transition: background-color 0.1s ease, border-color 0.1s ease;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast);
 }
 
 .guided-multi-escape-btn:hover:not(:disabled) {
@@ -1629,7 +1744,7 @@
   font-size: var(--font-size-base);
   font-family: inherit;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: border-color 0.1s ease;
+  transition: border-color var(--transition-fast);
 }
 
 .guided-schema-input:focus-visible {
@@ -1654,7 +1769,7 @@
   font-family: inherit;
   min-height: var(--size-control);
   cursor: pointer;
-  transition: border-color 0.1s ease;
+  transition: border-color var(--transition-fast);
 }
 
 .guided-schema-select:focus-visible {
@@ -1678,7 +1793,12 @@
   flex-shrink: 0;
 }
 
-/* JSON-fallback textarea */
+/* JSON-fallback textarea.
+   font-family goes through --font-mono (elspeth-8dc37146d0): the hardcoded
+   stack that used to live here was the only one in the frontend, and it omits
+   JetBrains Mono, so the field resolved to a different typeface from the mono
+   label sitting directly above it (and from every other mono surface —
+   guided.css:427/519/759, chat.css, header.css all use this token). */
 .guided-schema-textarea {
   padding: var(--space-sm) var(--space-md);
   background-color: var(--color-surface-elevated);
@@ -1686,9 +1806,9 @@
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-md);
   font-size: var(--font-size-sm);
-  font-family: ui-monospace, "Cascadia Code", "Source Code Pro", Menlo, Consolas, monospace;
+  font-family: var(--font-mono, monospace);
   resize: vertical;
-  transition: border-color 0.1s ease;
+  transition: border-color var(--transition-fast);
 }
 
 .guided-schema-textarea:focus-visible {
@@ -1741,7 +1861,7 @@
   font-family: inherit;
   cursor: pointer;
   margin-top: var(--space-xs);
-  transition: background-color 0.1s ease, color 0.1s ease;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
 }
 
 .guided-schema-advanced-toggle:hover {
@@ -1772,7 +1892,7 @@
   font-size: var(--font-size-base);
   font-family: inherit;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease;
+  transition: background-color var(--transition-fast);
 }
 
 .guided-schema-continue-btn:hover:not(:disabled) {
@@ -2020,7 +2140,7 @@
   font-size: var(--font-size-base);
   font-family: inherit;
   min-height: var(--size-control); /* WCAG 2.5.8 minimum target size */
-  transition: background-color 0.1s ease;
+  transition: background-color var(--transition-fast);
 }
 
 .guided-completion-save-btn:hover {

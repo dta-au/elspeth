@@ -209,7 +209,14 @@ export function HeaderVersionSelector(): JSX.Element | null {
         aria-label={`Composition history (currently v${currentVersion})`}
         onClick={toggle}
         onKeyDown={handleTriggerKeyDown}
-        className="btn version-selector-trigger"
+        // Chrome-row rung, not the 44px canvas rung: this trigger lives in the
+        // 40px .app-header band (--size-header-height), so .btn's
+        // min-height: var(--size-control) overflowed it by 2px at every
+        // viewport taller than 800px — the only regime the header.css compact
+        // override did NOT cover (elspeth-2d29ccf56e). Composes .btn-compact
+        // per the tokens.css:248 rule rather than redeclaring a literal
+        // min-height on .version-selector-trigger.
+        className="btn-compact version-selector-trigger"
       >
         v{currentVersion} <span aria-hidden="true">▾</span>
       </button>

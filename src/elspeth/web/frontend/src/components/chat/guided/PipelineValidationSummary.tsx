@@ -89,7 +89,15 @@ export function PipelineValidationSummary({
   if (errors.length > 0) {
     const first = errors[0];
     tone = "error";
-    glyph = "✕";
+    // U+2717 BALLOT X, not U+2715 MULTIPLICATION X (elspeth-8c1d49dcf0). The
+    // status-glyph vocabulary is documented in audit.css ("Row status accents
+    // are a 3px left-edge stripe whose colour reinforces the glyph (✓ ⚠ ✗ —).
+    // The glyph stays the primary status channel") and is rendered from that
+    // vocabulary by AuditReadinessPanel and SharedAuditReadinessPanel. This
+    // surface already agreed on ✓ and ⚠; the error mark was the one outlier,
+    // so the single status a user most needs to recognise instantly was drawn
+    // at a heavier, more geometric weight here than everywhere else.
+    glyph = "✗";
     const label = errors.length === 1 ? "problem to fix" : "problems to fix";
     const finding = humaniseValidationMessage(first.message, phraseFor, stepLabelFor);
     rawDetail = finding.raw;

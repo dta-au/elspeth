@@ -57,6 +57,11 @@ vi.mock("@xyflow/react", () => ({
             key={n.id}
             data-testid={`node-${n.id}`}
             style={n.style}
+            // jsdom cannot compute a var()-bearing shorthand, and React Flow's
+            // real geometry never runs here, so the node's style OBJECT is the
+            // testable truth about what GraphView hands the library
+            // (elspeth-003794d55c).
+            data-node-style={JSON.stringify(n.style ?? null)}
             onClick={(event) => onNodeClick?.(event, n)}
           >
             {NodeRenderer
@@ -78,6 +83,11 @@ vi.mock("@xyflow/react", () => ({
               data-edge-target={e.target}
               data-source-handle={e.sourceHandle}
               data-target-handle={e.targetHandle}
+              // The edge's OWN markerEnd, before the harness overrides it below
+              // with a synthetic url(#...) so BaseEdge has something to render.
+              // Direction must reach every edge, lane-assigned or not
+              // (elspeth-ddae27dff1).
+              data-marker-end={JSON.stringify(e.markerEnd ?? null)}
             >
               <EdgeRenderer
                 {...e}
@@ -98,6 +108,7 @@ vi.mock("@xyflow/react", () => ({
             data-testid={`edge-${e.id}`}
             data-edge-source={e.source}
             data-edge-target={e.target}
+            data-marker-end={JSON.stringify(e.markerEnd ?? null)}
           >
             {e.label}
           </div>
@@ -140,17 +151,24 @@ vi.mock("@xyflow/react", () => ({
       data-size={size}
     />
   ),
-  Controls: ({ showInteractive }: any) => (
+  Controls: ({ showInteractive, fitViewOptions }: any) => (
     <div
       data-testid="react-flow-controls"
       data-show-interactive={String(showInteractive)}
+      // ControlsComponent calls fitView() with its OWN fitViewOptions prop, not
+      // <ReactFlow>'s, so the two must be asserted separately
+      // (elspeth-a8074a3a7b).
+      data-fit-view-options={fitViewOptions ? JSON.stringify(fitViewOptions) : ""}
     />
   ),
-  MiniMap: ({ nodeColor, nodeStrokeColor, bgColor, nodeStrokeWidth }: any) => (
+  MiniMap: ({ nodeColor, nodeStrokeColor, bgColor, nodeStrokeWidth, style }: any) => (
     <div
       data-testid="minimap"
       data-bg-color={bgColor}
       data-node-stroke-width={nodeStrokeWidth}
+      // Inline insets STACK on .react-flow__panel's own 15px margin rather than
+      // replacing it, so their absence is the assertion (elspeth-a7ce6e6a4c).
+      data-style={JSON.stringify(style ?? null)}
       data-source-color={nodeColor?.({ id: "source" })}
       data-gate-color={nodeColor?.({ id: "quality_gate" })}
       data-sink-color={nodeColor?.({ id: "results" })}
@@ -260,6 +278,10 @@ function makeProposal(
 describe("GraphView", () => {
   beforeEach(() => {
     useSessionStore.setState({ compositionState: null, compositionProposals: [] });
+    // selectedNodeId is store state, not a per-render prop: a test that opens
+    // the NodeConfigPanel leaks its selection into every later test in file
+    // order unless it is reset here.
+    useSessionStore.setState({ selectedNodeId: null } as never);
     useExecutionStore.setState({ validationResult: null } as never);
     document.documentElement.removeAttribute("style");
   });
@@ -487,13 +509,101 @@ describe("GraphView", () => {
       name: /validation: warning/i,
     });
 
-    expect(errorMarker).toHaveTextContent(/\S/);
-    expect(warningMarker).toHaveTextContent(/\S/);
+    // Non-colour-alone (WCAG 1.4.1): each dot carries a SHAPE, and the two
+    // shapes differ. Stroked paths on a shared 12x12 viewBox replaced the old
+    // letter `x` / `!` text glyphs, which mixed registers and left 1px of
+    // clearance inside the 14px circle (elspeth-ac3fff7ef2).
+    const errorMark = errorMarker.querySelector("svg");
+    const warningMark = warningMarker.querySelector("svg");
+    expect(errorMark).not.toBeNull();
+    expect(warningMark).not.toBeNull();
+    const errorPaths = [...errorMarker.querySelectorAll("path")].map((p) =>
+      p.getAttribute("d"),
+    );
+    const warningPaths = [...warningMarker.querySelectorAll("path")].map((p) =>
+      p.getAttribute("d"),
+    );
+    expect(errorPaths.length).toBeGreaterThan(0);
+    expect(warningPaths.length).toBeGreaterThan(0);
+    expect(errorPaths).not.toEqual(warningPaths);
   });
 
+  // The mark is drawn, not typed, so the 12px type floor cannot pin it against
+  // the 14px circle. Both marks must share one geometry: same box, same stroke
+  // weight, same viewBox — an icon set, not two freelanced glyphs.
+  it("draws every validation mark at one size, stroke weight and viewBox", () => {
+    useSessionStore.setState({
+      compositionState: makeState({
+        nodes: [
+          makeNode({ id: "needs_fix", node_type: "transform", plugin: "p" }),
+          makeNode({ id: "needs_review", node_type: "transform", plugin: "p" }),
+        ],
+      }),
+    });
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: false,
+        checks: [],
+        errors: [
+          {
+            component_id: "needs_fix",
+            component_type: "transform",
+            message: "Missing source plugin",
+            suggestion: null,
+          },
+        ],
+        warnings: [
+          {
+            component_id: "needs_review",
+            component_type: "transform",
+            message: "Review optional mapping",
+            suggestion: null,
+          },
+        ],
+      },
+    } as never);
+
+    render(<GraphView />);
+
+    const marks = [
+      screen.getByRole("img", { name: /validation: error/i }),
+      screen.getByRole("img", { name: /validation: warning/i }),
+    ].map((marker) => marker.querySelector("svg")!);
+
+    for (const mark of marks) {
+      expect(mark).not.toBeNull();
+      // 8px inside the 14px .graph-validation-dot circle = 3px of clearance on
+      // every side, where a 12px text glyph left 1px.
+      expect(mark.getAttribute("width")).toBe("8");
+      expect(mark.getAttribute("height")).toBe("8");
+      expect(mark.getAttribute("viewBox")).toBe("0 0 12 12");
+      expect(mark.getAttribute("stroke-width")).toBe("2");
+      expect(mark.getAttribute("stroke")).toBe("currentColor");
+      // The dot's own aria-label is the accessible name; the drawing must not
+      // add a second one.
+      expect(mark.getAttribute("aria-hidden")).toBe("true");
+    }
+  });
+
+  // The bridge from React Flow's --xy-* variables to the Elspeth tokens used
+  // to be asserted here as DECLARATION TEXT: eleven toContain() calls over
+  // inspector.css. Every one of them passed while the controls panel and the
+  // minimap rendered completely unthemed for months, because the block was
+  // scoped to `.react-flow` and both panels mount OUTSIDE it (elspeth-1adf90c933,
+  // elspeth-525d335cbc). A stylesheet read as a string cannot see a scope bug:
+  // the declarations were present and correct, and they reached nothing.
+  // The replacement — reactFlowThemeScope.test.tsx, next to this file — runs
+  // each declaring rule's selector list against the rendered ancestry with
+  // Element.closest(), so it fails when the theme cannot arrive. What is kept
+  // here is only the pairing that is genuinely a text fact: the two variables
+  // whose VALUES are theme-specific literals rather than token references.
   it("bridges React Flow CSS variables to the Elspeth theme tokens", () => {
     const appCss = readFileSync("src/components/inspector/inspector.css", "utf8");
 
+    // Which Elspeth token each React Flow variable maps to. These are value
+    // facts, and they stay — it is the two SELECTOR assertions that used to
+    // sit alongside them (`:root .react-flow.react-flow` and the light block's
+    // selector) that were removed: they pinned a scope that reached nothing.
     expect(appCss).toContain("--xy-background-color-default: var(--color-bg);");
     expect(appCss).toContain("--xy-controls-button-background-color-default: var(--color-surface-elevated);");
     expect(appCss).toContain("--xy-controls-button-background-color-hover-default: var(--color-surface-raised);");
@@ -501,8 +611,9 @@ describe("GraphView", () => {
     expect(appCss).toContain("--xy-minimap-background-color-default: var(--color-surface);");
     expect(appCss).toContain("--xy-minimap-mask-stroke-color-default: var(--color-border-strong);");
     expect(appCss).toContain("--xy-edge-stroke-selected-default: var(--color-focus-ring);");
-    expect(appCss).toContain(":root .react-flow.react-flow");
-    expect(appCss).toMatch(/\[data-theme="light"\]\s+\.react-flow\.react-flow\s*\{[\s\S]*--xy-minimap-mask-background-color-default:\s*rgba\(15, 45, 53, 0\.12\);/);
+    expect(appCss).toMatch(
+      /\[data-theme="light"\][\s\S]*--xy-minimap-mask-background-color-default:\s*rgba\(15, 45, 53, 0\.12\);/,
+    );
     expect(appCss).toContain(".react-flow__controls-button:focus-visible");
     expect(appCss).toContain("outline: 2px solid var(--color-focus-ring);");
   });
@@ -1894,6 +2005,313 @@ describe("GraphView", () => {
       expect(flow.dataset.fitViewOptions).not.toBe("");
       const opts = JSON.parse(flow.dataset.fitViewOptions ?? "{}");
       expect(opts).toEqual({ padding: 0.15, maxZoom: 1.5, minZoom: 0.3 });
+    });
+
+    // The test above pins the <ReactFlow> prop, which the fit-view BUTTON never
+    // reads: ControlsComponent calls fitView(its own fitViewOptions prop)
+    // (@xyflow/react dist/esm/index.js:4558,4571), and fitView(undefined)
+    // writes undefined into the store, so fitViewport falls through to the
+    // library default maxZoom 2 / padding 0.1. That is what zoomed the canvas
+    // to 2.0x on every click and then disabled the zoom-in button
+    // (elspeth-a8074a3a7b). The Controls prop is a SEPARATE surface and needs
+    // its own assertion.
+    it("gives the Controls fit-view button its own copy of the options", () => {
+      render(<GraphView />);
+      const controls = screen.getByTestId("react-flow-controls");
+      expect(controls.dataset.fitViewOptions).not.toBe("");
+      expect(JSON.parse(controls.dataset.fitViewOptions ?? "{}")).toEqual({
+        padding: 0.15,
+        maxZoom: 1.5,
+        minZoom: 0.3,
+      });
+    });
+
+    it("hands both fit-view surfaces the identical options", () => {
+      render(<GraphView />);
+      expect(
+        screen.getByTestId("react-flow-controls").dataset.fitViewOptions,
+      ).toBe(screen.getByTestId("react-flow").dataset.fitViewOptions);
+    });
+  });
+
+  // Node state must never be carried in border WIDTH: the card is a fixed
+  // NODE_WIDTH x NODE_HEIGHT box, so 1px -> 2px reflows its contents 1px down
+  // and 1px right and the canvas appears to shiver the instant validation
+  // completes (elspeth-003794d55c).
+  describe("node state rings cost no layout (elspeth-003794d55c)", () => {
+    const styleOf = (nodeId: string) =>
+      JSON.parse(
+        screen.getByTestId(`node-${nodeId}`).getAttribute("data-node-style") ??
+          "null",
+      );
+
+    const validatedState = () => {
+      useSessionStore.setState({
+        selectedNodeId: null,
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "plain", input: "", on_success: null }),
+            makeNode({ id: "needs_fix", input: "", on_success: null }),
+            makeNode({ id: "needs_review", input: "", on_success: null }),
+          ],
+        }),
+      } as never);
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: false,
+          checks: [],
+          errors: [
+            {
+              component_id: "needs_fix",
+              component_type: "transform",
+              message: "Missing source plugin",
+              suggestion: null,
+            },
+          ],
+          warnings: [
+            {
+              component_id: "needs_review",
+              component_type: "transform",
+              message: "Review optional mapping",
+              suggestion: null,
+            },
+          ],
+        },
+      } as never);
+    };
+
+    it("keeps the border 1px in the unvalidated, error and warning states", () => {
+      validatedState();
+      render(<GraphView />);
+
+      expect(styleOf("plain").border).toBe(
+        "1px solid var(--color-border-strong)",
+      );
+      expect(styleOf("needs_fix").border).toBe("1px solid var(--color-error)");
+      expect(styleOf("needs_review").border).toBe(
+        "1px solid var(--color-warning)",
+      );
+    });
+
+    it("carries the validation emphasis in a box-shadow ring instead", () => {
+      validatedState();
+      render(<GraphView />);
+
+      expect(styleOf("plain").boxShadow).toBeUndefined();
+      expect(styleOf("needs_fix").boxShadow).toBe(
+        "0 0 0 1px var(--color-error)",
+      );
+      expect(styleOf("needs_review").boxShadow).toBe(
+        "0 0 0 1px var(--color-warning)",
+      );
+    });
+
+    it("keeps selection on the same 1px border as every other state", () => {
+      useSessionStore.setState({
+        selectedNodeId: "classify",
+        compositionState: makeState({
+          nodes: [
+            makeNode({ id: "classify", input: "", on_success: null }),
+            makeNode({ id: "other", input: "", on_success: null }),
+          ],
+        }),
+      } as never);
+      render(<GraphView />);
+
+      expect(styleOf("classify").border).toBe(
+        "1px solid var(--color-selected-ring)",
+      );
+      expect(styleOf("classify").boxShadow).toBe(
+        "0 0 0 3px var(--color-selected-ring)",
+      );
+      // The whole point: selecting a node cannot move anything inside it, so
+      // its border is byte-identical in width to its unselected neighbour's.
+      expect(styleOf("classify").border.split(" ")[0]).toBe(
+        styleOf("other").border.split(" ")[0],
+      );
+    });
+  });
+
+  // A lowercase Latin letter standing in for the close glyph reads as text
+  // rather than as an affordance, and sits at a different optical weight and
+  // cap height from the nine other closes in the product. GraphModal.test.tsx
+  // already names the standard (elspeth-51cbcf1664).
+  describe("node config close glyph (elspeth-51cbcf1664)", () => {
+    it("uses the standard × close glyph (not a lowercase 'x')", () => {
+      useSessionStore.setState({
+        selectedNodeId: "classify",
+        compositionState: makeState({
+          nodes: [makeNode({ id: "classify", input: "", on_success: null })],
+        }),
+      } as never);
+      render(<GraphView />);
+
+      const closeBtn = screen.getByRole("button", {
+        name: /close node configuration/i,
+      });
+      expect(closeBtn.textContent?.trim()).toBe("×");
+      expect(closeBtn.textContent).not.toContain("x");
+    });
+  });
+
+  // Direction is the single most important thing this diagram states, so it
+  // belongs to EVERY connector. markerEnd used to be written only inside
+  // assignParallelEdgeLanes, whose lane pass short-circuits for endpoint groups
+  // of fewer than 2 edges — so one branching pipeline drew directed and
+  // undirected connectors side by side (elspeth-ddae27dff1).
+  describe("edge direction markers (elspeth-ddae27dff1)", () => {
+    // a -> b twice (a parallel-lane group) alongside a lone b -> c edge: the
+    // exact mix the lane pass used to split into directed and undirected.
+    const mixedLaneState = () =>
+      makeState({
+        nodes: [
+          makeNode({ id: "a", input: "", on_success: null }),
+          makeNode({ id: "b", input: "", on_success: null }),
+          makeNode({ id: "c", input: "", on_success: null }),
+        ],
+        edges: [
+          makeEdge({
+            id: "e1",
+            from_node: "a",
+            to_node: "b",
+            edge_type: "on_success",
+            label: "one",
+          }),
+          makeEdge({
+            id: "e2",
+            from_node: "a",
+            to_node: "b",
+            edge_type: "on_error",
+            label: "two",
+          }),
+          makeEdge({
+            id: "e3",
+            from_node: "b",
+            to_node: "c",
+            edge_type: "on_success",
+            label: "solo",
+          }),
+        ],
+      });
+
+    const markerOf = (edge: Element) =>
+      JSON.parse(edge.getAttribute("data-marker-end") ?? "null");
+
+    it("gives an arrowhead to the lone edge as well as the lane group", () => {
+      useSessionStore.setState({ compositionState: mixedLaneState() });
+      const { container } = render(<GraphView />);
+
+      const laneEdges = container.querySelectorAll(
+        '[data-edge-source="a"][data-edge-target="b"]',
+      );
+      const loneEdges = container.querySelectorAll(
+        '[data-edge-source="b"][data-edge-target="c"]',
+      );
+      expect(laneEdges).toHaveLength(2);
+      expect(loneEdges).toHaveLength(1);
+
+      for (const edge of [...laneEdges, ...loneEdges]) {
+        expect(markerOf(edge)).toMatchObject({ type: "arrowclosed" });
+      }
+    });
+
+    // Every edge here is INFERRED, and each comes from a different construction
+    // site: source -> transform (conn), transform -> queue (queue-in),
+    // queue -> transform (queue-out), transform -> sink on success and on
+    // error (sink). None of them forms a parallel lane group, so before the fix
+    // not one of them carried an arrowhead.
+    it("leaves no inferred edge undirected, whichever site built it", () => {
+      useSessionStore.setState({
+        compositionState: makeState({
+          sources: {
+            source: { plugin: "text", options: {}, on_success: "raw" },
+          },
+          nodes: [
+            makeNode({ id: "clean", input: "raw", on_success: "queued" }),
+            makeNode({
+              id: "queued",
+              node_type: "queue",
+              input: "",
+              on_success: null,
+            }),
+            makeNode({
+              id: "score",
+              input: "queued",
+              on_success: "results",
+              on_error: "rejects",
+            }),
+          ],
+          outputs: [
+            { name: "results", plugin: "csv", options: {} },
+            { name: "rejects", plugin: "csv", options: {} },
+          ],
+        }),
+      });
+      const { container } = render(<GraphView />);
+
+      const edges = [...container.querySelectorAll("[data-marker-end]")];
+      // conn + queue-in + queue-out + sink(success) + sink(error).
+      expect(edges).toHaveLength(5);
+      for (const edge of edges) {
+        expect(markerOf(edge)).toMatchObject({ type: "arrowclosed" });
+      }
+    });
+
+    it("points the arrowhead in the colour of the line it terminates", () => {
+      useSessionStore.setState({ compositionState: mixedLaneState() });
+      const { container } = render(<GraphView />);
+
+      // e1 (on_success) and e2 (on_error) share endpoints, so they are the same
+      // lane group: the arrowhead colour must still follow each edge's own
+      // flow type, not the group's.
+      const laneMarkerColors = [
+        ...container.querySelectorAll(
+          '[data-edge-source="a"][data-edge-target="b"]',
+        ),
+      ]
+        .map((edge) => markerOf(edge).color)
+        .sort();
+      expect(laneMarkerColors).toEqual(
+        ["var(--color-error)", "var(--color-text-muted)"].sort(),
+      );
+
+      const lone = container.querySelector(
+        '[data-edge-source="b"][data-edge-target="c"]',
+      );
+      expect(markerOf(lone!).color).toBe("var(--color-text-muted)");
+    });
+  });
+
+  // Two floating panels on one canvas must rest on one baseline. An inline
+  // bottom/right on the MiniMap does not replace .react-flow__panel's own 15px
+  // margin, it STACKS on it — which put the MiniMap 23px off the canvas floor
+  // against the Controls' 15px (elspeth-a7ce6e6a4c).
+  describe("floating panel insets (elspeth-a7ce6e6a4c)", () => {
+    beforeEach(() => {
+      const nodes = Array.from({ length: 9 }, (_, i) =>
+        makeNode({ id: `n${i}`, node_type: "transform", plugin: "p" }),
+      );
+      useSessionStore.setState({ compositionState: makeState({ nodes }) });
+    });
+
+    it("gives the MiniMap no inline inset of its own", () => {
+      render(<GraphView />);
+      const style = JSON.parse(
+        screen.getByTestId("minimap").dataset.style ?? "null",
+      );
+      expect(style).not.toBeNull();
+      expect(style).not.toHaveProperty("bottom");
+      expect(style).not.toHaveProperty("right");
+      expect(style).not.toHaveProperty("top");
+      expect(style).not.toHaveProperty("left");
+    });
+
+    it("keeps the MiniMap's own dimensions, which MiniMapComponent scales by", () => {
+      render(<GraphView />);
+      const style = JSON.parse(
+        screen.getByTestId("minimap").dataset.style ?? "null",
+      );
+      expect(style).toEqual({ width: 120, height: 80 });
     });
   });
 

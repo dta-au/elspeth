@@ -234,6 +234,12 @@ vi.mock("@xyflow/react", () => ({
   Background: () => <div data-testid="react-flow-background" />,
   Controls: () => <div data-testid="react-flow-controls" />,
   MiniMap: () => <div data-testid="minimap" />,
+  // GraphView reaches MarkerType at render time (withDirectionMarkers), so it
+  // must be mocked even though this file only exercises the accessible-name
+  // surface. Handle/Position/BaseEdge stay out: they are only touched inside
+  // the NODE_TYPES/EDGE_TYPES components, which the mocked ReactFlow above
+  // never invokes.
+  MarkerType: { ArrowClosed: "arrowclosed" },
 }));
 vi.mock("@xyflow/react/dist/style.css", () => ({}));
 vi.mock("@dagrejs/dagre", () => ({

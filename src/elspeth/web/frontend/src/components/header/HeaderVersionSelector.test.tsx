@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { HeaderVersionSelector } from "./HeaderVersionSelector";
@@ -279,5 +281,57 @@ describe("HeaderVersionSelector", () => {
     expect(
       screen.getByRole("listbox", { name: /composition history/i }),
     ).toBeInTheDocument();
+  });
+});
+
+// ── Header control sizing (elspeth-2d29ccf56e) ──────────────────────────────
+//
+// The trigger composed `.btn`, which binds to the 44px --size-control rung,
+// inside the 40px --size-header-height band: 2px of the button was clipped at
+// the top of the header and the overflow bled into the workspace below, at
+// every viewport taller than 800px. (header.css compacts this exact selector
+// under `@media (min-width: 961px) and (max-height: 800px)` — precisely the
+// regime that did NOT clip.)
+//
+// This is deliberately an arithmetic test against the tokens, not a
+// class-name spelling test: it asks whether the rung the trigger binds to
+// actually fits the band it lives in.
+describe("header version selector control rung", () => {
+  const tokensCss = readFileSync("src/styles/tokens.css", "utf8");
+
+  function tokenPx(name: string): number {
+    const declared = new RegExp(`${name}\\s*:\\s*(\\d+)px`).exec(tokensCss);
+    if (declared === null) {
+      throw new Error(`${name} is not declared as a px value in tokens.css`);
+    }
+    return Number(declared[1]);
+  }
+
+  /** min-height each button base class binds to, from tokens.css. */
+  const rungs: Record<string, number> = {
+    btn: tokenPx("--size-control"),
+    "btn-compact": tokenPx("--size-control-compact"),
+  };
+
+  it("binds the trigger to a rung that fits inside the header band", () => {
+    render(<HeaderVersionSelector />);
+    const trigger = screen.getByRole("button", {
+      name: /composition history/i,
+    });
+
+    const composed = Object.keys(rungs).filter((base) =>
+      trigger.classList.contains(base),
+    );
+    expect(
+      composed,
+      "the trigger must compose exactly one declared button rung — " +
+        "tokens.css:248 forbids redeclaring min-height literally",
+    ).toHaveLength(1);
+
+    // .app-header is `height: var(--size-header-height)` with a 1px bottom
+    // border inside that box (box-sizing: border-box is global), so the
+    // content box is one pixel shorter than the band.
+    const contentBox = tokenPx("--size-header-height") - 1;
+    expect(rungs[composed[0]]).toBeLessThanOrEqual(contentBox);
   });
 });

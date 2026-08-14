@@ -340,33 +340,44 @@ export function InlineRunResults({
         ? initialRunLoad.status
         : "loading";
 
+  // Empty and loading states render the designed `.empty-state` primitive
+  // (styles/shared.css), the same one YamlView and GraphView use. They
+  // previously carried `.artifact-empty`, which NO stylesheet defined, so the
+  // first states a new user meets shipped as bare UA paragraphs one tab away
+  // from the correct treatment (elspeth-0ee1973592). The primitive centres a
+  // SINGLE flex child, so the two message-plus-action states below wrap their
+  // children in one unclassed block — that keeps the action under the message
+  // (inheriting the primitive's text-align) rather than beside it, without
+  // inventing a class or freelancing an inline layout.
   if (!showProgress && !outputRunId && !hasDrawerRuns) {
     if (showEmptyState && currentSessionHistoryStatus === "loading") {
       return (
-        <p className="artifact-empty" role="status" aria-live="polite">
+        <p className="empty-state" role="status" aria-live="polite">
           Loading runs…
         </p>
       );
     }
     if (showEmptyState && currentSessionHistoryStatus === "unavailable") {
       return (
-        <div className="artifact-empty">
-          <p role="status" aria-live="polite">
-            Run history unavailable.
-          </p>
-          <button
-            type="button"
-            className="btn-compact"
-            onClick={() => setHistoryRetrySequence((current) => current + 1)}
-          >
-            Retry
-          </button>
+        <div className="empty-state">
+          <div>
+            <p role="status" aria-live="polite">
+              Run history unavailable.
+            </p>
+            <button
+              type="button"
+              className="btn-compact"
+              onClick={() => setHistoryRetrySequence((current) => current + 1)}
+            >
+              Retry
+            </button>
+          </div>
         </div>
       );
     }
     if (!showEmptyState) return null;
     if (!runAvailable) {
-      return <p className="artifact-empty">No runs yet.</p>;
+      return <p className="empty-state">No runs yet.</p>;
     }
     // Inline run affordance (elspeth-553a6fb81d): route through the
     // REQUEST_RUN_EVENT single policy owner (ExecuteButton's gating
@@ -376,15 +387,17 @@ export function InlineRunResults({
     // inadmissible events, so the button would otherwise be a silent
     // dead control.
     return executionReady ? (
-      <div className="artifact-empty">
-        <p>No runs yet. Run the pipeline to see its results here.</p>
-        <button
-          type="button"
-          className="btn-compact"
-          onClick={() => window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT))}
-        >
-          Run pipeline
-        </button>
+      <div className="empty-state">
+        <div>
+          <p>No runs yet. Run the pipeline to see its results here.</p>
+          <button
+            type="button"
+            className="btn-compact"
+            onClick={() => window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT))}
+          >
+            Run pipeline
+          </button>
+        </div>
       </div>
     ) : (
       // Names the CONTROL, not a place. The run control lives in the sticky
@@ -394,7 +407,7 @@ export function InlineRunResults({
       // cannot find") the verb-vocabulary work exists to excise. Location
       // words rot when the layout moves; "Run pipeline" is the one name that
       // control carries on every surface.
-      <p className="artifact-empty">
+      <p className="empty-state">
         No runs yet. Once validation passes, use Run pipeline to start one.
       </p>
     );

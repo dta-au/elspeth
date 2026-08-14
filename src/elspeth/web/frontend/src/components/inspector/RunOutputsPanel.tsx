@@ -85,6 +85,14 @@ interface PreviewState {
 
 const HASH_DISPLAY_LENGTH = 12;
 
+/**
+ * Gap between an artifact row and the preview block beneath it. Named once and
+ * expressed as the token rather than the raw `6` it was repeated as at five
+ * sites: --space-1-5 IS 6px, so the spacing now moves with the scale instead of
+ * being invisible to it (elspeth-cda90fbb49).
+ */
+const PREVIEW_BLOCK_MARGIN_TOP = "var(--space-1-5)";
+
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
@@ -336,7 +344,12 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
       )}
 
       {!manifest && !error && isLoading && (
-        <div className="run-outputs-panel-muted">Loading outputs…</div>
+        <div className="run-outputs-panel-muted">
+          {/* The shared .spinner, same as LoginPage / AuthGuard / ExecuteButton
+              / PluginCard: static text cannot tell an operator whether the
+              panel is working or stalled (elspeth-cda90fbb49). */}
+          <span className="spinner" aria-hidden="true" /> Loading outputs…
+        </div>
       )}
 
       {manifest && manifest.artifacts.length === 0 && !isLoading && (
@@ -499,19 +512,26 @@ function ArtifactPreviewView({
 }: ArtifactPreviewViewProps) {
   if (!previewState || previewState.status === "loading") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)" }}>Loading preview…</div>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)" }}>
+        {/* The shared .spinner, same as LoginPage / AuthGuard / ExecuteButton /
+            PluginCard. This is the only genuinely IN-FLIGHT state in this
+            view — purged / error / binary below are terminal outcomes, and a
+            spinner on one of those would claim work that is not happening
+            (elspeth-cda90fbb49). */}
+        <span className="spinner" aria-hidden="true" /> Loading preview…
+      </div>
     );
   }
   if (previewState.status === "purged") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)", fontStyle: "italic" }}>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)", fontStyle: "italic" }}>
         File is no longer available on disk (purged or moved between manifest fetch and preview).
       </div>
     );
   }
   if (previewState.status === "error") {
     return (
-      <div role="alert" style={{ marginTop: 6, color: "var(--color-error)" }}>
+      <div role="alert" style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-error)" }}>
         {previewState.error ?? "Preview failed"}
       </div>
     );
@@ -520,13 +540,13 @@ function ArtifactPreviewView({
   if (!preview) return null;
   if (preview.content_type === "binary") {
     return (
-      <div style={{ marginTop: 6, color: "var(--color-text-muted)", fontStyle: "italic" }}>
+      <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP, color: "var(--color-text-muted)", fontStyle: "italic" }}>
         Binary file — no inline preview available. Use the Download button to inspect.
       </div>
     );
   }
   return (
-    <div style={{ marginTop: 6 }}>
+    <div style={{ marginTop: PREVIEW_BLOCK_MARGIN_TOP }}>
       {preview.content_type === "json" ? (
         <StructuredJsonPreview
           text={preview.preview_text}
@@ -553,7 +573,11 @@ function ArtifactPreviewView({
       )}
       {preview.truncated && (
         <div
-          style={{ marginTop: 4, color: "var(--color-text-muted)", fontSize: 11 }}
+          style={{
+            marginTop: "var(--space-xs)",
+            color: "var(--color-text-muted)",
+            fontSize: 11,
+          }}
         >
           Preview truncated
           {preview.row_count_preview != null &&

@@ -544,8 +544,13 @@ function App() {
         kind: "backend-unavailable",
         role: "alert",
         content: (
+          // One prefix treatment across the notice array
+          // (elspeth-e5c446fab0): a bold label plus a colon. This site used a
+          // bold label, an em dash and a capitalised continuation, so the
+          // three labelled notices introduced themselves three different ways
+          // and the prefix could not be skimmed for category.
           <>
-            <strong>Backend unavailable</strong> — Cannot connect to the
+            <strong>Backend unavailable:</strong> Cannot connect to the
             ELSPETH server. Check that the backend is running.
             {lastHealthCheckAt !== null ? (
               <> Last attempt: {lastHealthCheckAt}.</>
@@ -621,21 +626,34 @@ function App() {
         kind: "composer-unavailable",
         role: "status",
         content: (
+          // Same bold-label-plus-colon prefix as the other labelled notices
+          // (elspeth-e5c446fab0); the label was previously unemphasised.
+          // The two UNLABELLED notices in this array — the redirect toast
+          // (arbitrary server-supplied text) and the stale-build sentence —
+          // are deliberately left plain: inventing a label for a whole
+          // sentence would be a copy fabrication, not a prefix convention.
           <>
-            Service unavailable:{" "}
+            <strong>Service unavailable:</strong>{" "}
             {systemStatus.composer_reason ??
               "The composer cannot reach a usable LLM right now."}
           </>
         ),
         action: (
+          // One name for one destination (elspeth-bafd220871). This control
+          // carried four: visible "⚙ API Keys", title "Configure API keys",
+          // aria-label "Open secrets settings", destination "API Keys &
+          // Secrets" — so no two users could describe it the same way. The
+          // redundant `title` is dropped rather than left to carry a third
+          // wording, and the aria-label with it, so the visible text IS the
+          // accessible name. The typed ⚙ is dropped too: components/ui/Icon
+          // has no gear in its IconName union, and a freelanced glyph is the
+          // pattern this pass is removing, not adding to.
           <button
             type="button"
             onClick={openSecrets}
-            aria-label="Open secrets settings"
-            title="Configure API keys"
             className="alert-banner-action"
           >
-            ⚙ API Keys
+            API keys & secrets
           </button>
         ),
       });

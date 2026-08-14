@@ -28,8 +28,12 @@
   user-select: none;
 }
 
+/* One focus colour app-wide (elspeth-eaa8c0dc73). This rule used
+   --color-info, a third ring colour alongside the 33 sites that use
+   --color-focus-ring. The inset offset is kept: the header is clipped by its
+   container, so an outset ring would be cut. */
 .side-rail-suggestion-header:focus-visible {
-  outline: 2px solid var(--color-info);
+  outline: 2px solid var(--color-focus-ring);
   outline-offset: -2px;
 }
 
@@ -149,8 +153,12 @@
   background-color: var(--color-surface-hover);
 }
 
+/* One focus colour app-wide (elspeth-eaa8c0dc73). --color-accent (#1a7a52)
+   on the menu surface (#122f37) computes to 2.65:1 — below the WCAG 1.4.11
+   3:1 non-text floor — while the sibling item in the same two-item popover
+   got the ~14:1 --color-focus-ring. The offset is unchanged. */
 .side-rail-catalog-btn:focus-visible {
-  outline: 2px solid var(--color-accent);
+  outline: 2px solid var(--color-focus-ring);
   outline-offset: 2px;
 }
 
@@ -248,11 +256,20 @@
   justify-content: center;
 }
 
+/* Measure cap (elspeth-51358d56a3). The frame is .yaml-modal
+   (common.css: position: fixed; inset: 32px), so at 1920x1080 the sheet is
+   1856px wide — a three-field paste form got an 1856px monospace textarea and
+   stranded its Cancel/Import pair ~1800px from the field they act on. The
+   house pattern for this exact frame is .recovery-panel (recovery.css:21-22:
+   max-width + margin auto); this applies it to the FORM only, leaving
+   .yaml-modal full-bleed for the genuinely wide YAML viewer. */
 .import-yaml-body {
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
   padding: var(--space-md);
+  max-width: 720px;
+  margin-inline: auto;
   overflow-y: auto;
 }
 
@@ -359,11 +376,16 @@
    shared ConfirmDialog by ExecuteButton. The list names what the run will
    reach (sources, LLM/model, network fetches, sinks), derived from the
    live composition. */
+/* One step down from the dialog's lead copy, not two (elspeth-a422aa467c).
+   .confirm-dialog-message is --font-size-base (16px); this body content sat
+   at --font-size-sm (13px), skipping --font-size-md (15px) entirely, so the
+   egress disclosure — the substance of the authorisation — read as fine
+   print beside the sentence that introduces it. */
 .run-disclosure-summary {
   min-width: 0;
   margin: 0 0 var(--space-md);
   padding-left: var(--space-lg);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--color-text);
   overflow-wrap: anywhere;
 }
@@ -374,12 +396,15 @@
   overflow-wrap: anywhere;
 }
 
+/* Same step as .run-disclosure-summary above (elspeth-a422aa467c) — the
+   opt-out label sits in the same dialog body and must not fall two rungs
+   below the lead copy. */
 .run-disclosure-opt-out {
   display: flex;
   align-items: center;
   gap: var(--space-xs);
   margin-bottom: var(--space-md);
-  font-size: var(--font-size-sm);
+  font-size: var(--font-size-md);
   color: var(--color-text-muted);
   cursor: pointer;
 }
