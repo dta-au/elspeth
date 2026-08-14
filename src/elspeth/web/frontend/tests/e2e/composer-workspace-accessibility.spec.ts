@@ -229,7 +229,7 @@ test.describe("Composer workspace browser accessibility", () => {
       await expect(run).toBeEnabled();
       await run.focus();
       await run.press("Enter");
-      const dialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const dialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(dialog).toBeVisible();
       await expect(
         dialog.getByRole("button", { name: "Run pipeline" }),

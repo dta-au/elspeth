@@ -8,6 +8,7 @@ import {
   useState,
   type SetStateAction,
 } from "react";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import {
@@ -528,8 +529,14 @@ const GUIDED_CHAT_PLACEHOLDERS: Record<GuidedStep, string> = {
   // the current decision card. "Card", not "panel": the copy is shared by
   // both layouts, and the tutorial workspace no longer has a decision panel
   // beside the composer — the decision is a card in the conversation column.
+  // Length budget (Wave D2 measured handoff): a placeholder produces no
+  // scroll overflow, so anything past the 3-row box at the 360px pane is cut
+  // silently. The previous 93-char wording rendered 4 lines with the last
+  // clipped; every fitting sibling placeholder is ≤80 chars, so this stays
+  // ≤80. "Clear" is the stack's own doctrine ("clear it to proceed",
+  // AcknowledgementStack.tsx header).
   step_4_wire:
-    "Resolve any pending acknowledgements, then press Confirm wiring on the current decision card.",
+    "Clear pending acknowledgements, then press Confirm wiring on the decision card.",
 };
 
 interface ChatPanelProps {
@@ -1540,7 +1547,7 @@ export function ChatPanel({
       // Skip the confirmation when user_term is null — this is the case
       // for opt-out and auto-interpretation rows, which do not have a
       // user term to echo. The opt-out flow has its own confirm dialog
-      // ("Stop reviewing interpretations for this session"); a chat-stream
+      // ("Stop reviewing interpretations"); a chat-stream
       // echo would be redundant noise.
       const userTerm = resolvedEvent.user_term;
       if (userTerm === null || userTerm === "") return;
@@ -2498,9 +2505,15 @@ export function ChatPanel({
                 </p>
               )}
               {guidedNextTurn && (
-                <button
-                  type="button"
-                  className="btn btn-compact guided-explain-btn"
+                <Button
+                  compact
+                  // Composes .btn-compact (the shared.css:222 idiom). The
+                  // pre-migration class list carried a redundant `.btn` token;
+                  // every declaration it contributed is overridden by the
+                  // later .btn-compact block at equal specificity (or
+                  // duplicated verbatim in its hover/disabled rules), so
+                  // dropping it is computed-style inert.
+                  className="guided-explain-btn"
                   onClick={() => void sendGuidedChat(GUIDED_EXPLAIN_MESSAGE)}
                   // Bootstrap race: Explain routes sendGuidedChat ->
                   // runComposeWithTimeout, which no-ops until the backend wall
@@ -2524,7 +2537,7 @@ export function ChatPanel({
                   }
                 >
                   Explain this step
-                </button>
+                </Button>
               )}
             </div>
           )}
@@ -2552,13 +2565,14 @@ export function ChatPanel({
                   <li key={index}>{detail}</li>
                 ))}
               </ul>
-              <button
+              <Button
+                variant="bare"
                 onClick={clearError}
                 className="chat-panel-error-dismiss"
                 aria-label="Dismiss error"
               >
                 {"\u00D7"}
-              </button>
+              </Button>
             </div>
           )}
         </section>
@@ -2784,13 +2798,14 @@ export function ChatPanel({
               </ul>
             )}
           </div>
-          <button
+          <Button
+            variant="bare"
             onClick={clearError}
             className="chat-panel-error-dismiss"
             aria-label="Dismiss error"
           >
             {"\u00D7"}
-          </button>
+          </Button>
         </div>
       )}
 
@@ -2982,13 +2997,13 @@ export function ChatPanel({
         {/* Scroll-to-bottom button — sibling of the scrolling element, so it
             floats over the messages instead of scrolling away with them. */}
         {showScrollButton && (
-          <button
+          <Button
             onClick={scrollToBottom}
             aria-label="Scroll to bottom"
-            className="btn scroll-to-bottom-btn"
+            className="scroll-to-bottom-btn"
           >
             {"\u2193"} Jump to latest
-          </button>
+          </Button>
         )}
       </div>
 
@@ -3195,13 +3210,14 @@ function GuidedErrorBanner({
   return (
     <div role="alert" className="chat-panel-error">
       <span>{error}</span>
-      <button
+      <Button
+        variant="bare"
         onClick={onDismiss}
         className="chat-panel-error-dismiss"
         aria-label="Dismiss error"
       >
         {"\u00D7"}
-      </button>
+      </Button>
     </div>
   );
 }

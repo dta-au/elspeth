@@ -348,7 +348,7 @@ describe("CompletionBar", () => {
 
     // The disclosure gates execute(); confirming fires it.
     expect(executeSpy).not.toHaveBeenCalled();
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     fireEvent.click(
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
     );

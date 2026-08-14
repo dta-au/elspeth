@@ -16,6 +16,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { requestValidate } from "@/stores/subscriptions";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { Input } from "@/components/ui";
 import { fuzzyMatch } from "@/utils/fuzzyScore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
@@ -333,9 +334,11 @@ export function CommandPalette({
         aria-label="Command palette"
         onKeyDown={handleKeyDown}
       >
-        {/* Search input */}
+        {/* bare: .command-palette-input is a complete bespoke recipe;
+            .input's chrome would restyle the palette. */}
         <div className="command-palette-input-wrapper">
-          <input
+          <Input
+            bare
             ref={inputRef}
             type="text"
             role="combobox"

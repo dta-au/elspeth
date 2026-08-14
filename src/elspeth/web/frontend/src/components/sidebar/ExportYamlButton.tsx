@@ -1,4 +1,5 @@
 import { useId } from "react";
+import { Button } from "@/components/ui";
 import {
   dispatchArtifactViewIntent,
 } from "@/lib/composer-events";
@@ -39,9 +40,8 @@ export function ExportYamlButton(): JSX.Element | null {
 
   return (
     <>
-      <button
-        type="button"
-        className="btn side-rail-export-yaml-btn"
+      <Button
+        className="side-rail-export-yaml-btn"
         onClick={() => dispatchArtifactViewIntent({
           tab: "yaml",
           focusMode: false,
@@ -54,7 +54,7 @@ export function ExportYamlButton(): JSX.Element | null {
         aria-describedby={!hasContent ? describedById : undefined}
       >
         Export YAML
-      </button>
+      </Button>
       {!hasContent && (
         <span id={describedById} className="sr-only">
           {EXPORT_YAML_EMPTY_PIPELINE_TITLE}

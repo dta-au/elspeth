@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { GraphView } from "@/components/inspector/GraphView";
+import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 
@@ -52,14 +53,14 @@ export function GraphModal(): JSX.Element | null {
       >
         <header className="graph-modal-header">
           <h2 id={titleId}>Pipeline graph</h2>
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="graph-modal-close"
             onClick={() => setIsOpen(false)}
             aria-label="Close graph"
           >
             ×
-          </button>
+          </Button>
         </header>
         <div className="graph-modal-body">
           <GraphView />

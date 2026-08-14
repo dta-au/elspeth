@@ -27,6 +27,7 @@
  * drive a sibling's height again.
  */
 
+import { Button } from "@/components/ui";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -60,9 +61,9 @@ export function CompletionBar(): JSX.Element | null {
       aria-label="Composition completion gestures"
       data-testid="completion-bar"
     >
-      <button
+      <Button
         type="button"
-        className="btn completion-bar-save-for-review"
+        className="completion-bar-save-for-review"
         onClick={() => {
           if (!isCompletionReady || inFlight) return;
           // openAndMark resolves asynchronously and persists outcome in the
@@ -79,7 +80,7 @@ export function CompletionBar(): JSX.Element | null {
         data-testid="completion-bar-save-for-review"
       >
         Save for review
-      </button>
+      </Button>
       <ExecuteButton />
       <ExportYamlButton />
     </div>

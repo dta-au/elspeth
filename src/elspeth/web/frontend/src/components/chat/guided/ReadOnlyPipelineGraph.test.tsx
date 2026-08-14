@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+
 import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
@@ -248,5 +250,27 @@ describe("ReadOnlyPipelineGraph", () => {
         (startY + 3 * controlOneY + 3 * controlTwoY + endY) / 8;
       expect(Number(label!.getAttribute("y"))).toBeCloseTo(cubicMidpointY);
     }
+  });
+
+  it("keeps the card-corner rx fallback attribute in step with the --radius-lg rank", () => {
+    // guided.css .guided-readonly-graph__node reads rx from var(--radius-lg)
+    // (elspeth-37cc8b5310, matching GraphView's editable cards); jsdom does
+    // not compute SVG geometry from CSS, so this pins the AGREEMENT between
+    // the rect's rx presentation-attribute fallback and the token rank the
+    // stylesheet reads — a retune of --radius-lg must reach the fallback too.
+    // cwd-relative read per the tokenReferences.test.ts idiom.
+    const tokens = readFileSync("src/styles/tokens.css", "utf8");
+    const radius = /--radius-lg:\s*(\d+(?:\.\d+)?)px/.exec(tokens);
+    expect(radius, "--radius-lg is not declared in px in tokens.css").not.toBeNull();
+    const { container } = render(
+      <ReadOnlyPipelineGraph
+        ariaLabel="Single source"
+        nodes={[{ id: "source-1", label: "source-1", kind: "source", subtitle: null }]}
+        edges={[]}
+      />,
+    );
+    const card = container.querySelector("rect.guided-readonly-graph__node");
+    expect(card).not.toBeNull();
+    expect(card!.getAttribute("rx")).toBe(radius![1]);
   });
 });

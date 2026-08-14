@@ -82,6 +82,12 @@
 .save-for-review-url-row input[type="text"] {
   flex: 1 1 auto;
   min-width: 0;
+  /* The control now routes through ui/Input, whose `.input` base declares
+     `width: 100%`. With `flex-basis: auto` that width IS the flex base size,
+     so the one-line label/URL/Copy/Open row would wrap into a three-line
+     stack. `width: auto` restores the content-derived base size this row was
+     designed against; the flex-grow above still stretches the field. */
+  width: auto;
   /* Vertical padding raised to --space-sm so the input clears the WCAG 2.5.8
      24×24 minimum target with comfortable margin. */
   padding: var(--space-sm) var(--space-sm);

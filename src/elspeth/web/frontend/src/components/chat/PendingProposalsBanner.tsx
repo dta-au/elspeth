@@ -1,6 +1,7 @@
 import { useState } from "react";
 
 import type { CompositionProposal } from "@/types/api";
+import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 
 interface PendingProposalsBannerProps {
@@ -80,24 +81,22 @@ export function PendingProposalsBanner({
                 )}
               </div>
               <div className="pending-proposals-banner-actions">
-                <button
-                  type="button"
+                <Button
+                  variant="primary"
                   onClick={() => onAccept(proposal.id)}
                   aria-label={`Accept proposal: ${proposal.summary}`}
                   disabled={isBusy}
-                  className="btn btn-primary"
                 >
                   Accept
-                </button>
-                <button
-                  type="button"
+                </Button>
+                <Button
+                  variant="danger"
                   onClick={() => setRejectConfirmId(proposal.id)}
                   aria-label={`Reject proposal: ${proposal.summary}`}
                   disabled={isBusy}
-                  className="btn btn-danger"
                 >
                   Reject
-                </button>
+                </Button>
               </div>
             </li>
           );
@@ -105,7 +104,7 @@ export function PendingProposalsBanner({
       </ul>
       {rejectTarget && (
         <ConfirmDialog
-          title="Reject this proposal?"
+          title="Reject proposal"
           message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
           confirmLabel="Reject proposal"
           cancelLabel="Keep open"

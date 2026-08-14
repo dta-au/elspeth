@@ -145,11 +145,14 @@ describe("the progress row spans the card it reports on (elspeth-0c11a9cf90)", (
 });
 
 describe("the tutorial's link control stays in step with .link-button (elspeth-4603f4a432)", () => {
-  // styles/shared.css documents `.link-button` as having replaced
-  // `.tutorial-link-button`, but six tutorial call sites still name the older
-  // class. Until they are migrated the two must not diverge — before this,
-  // .tutorial-link-button had no :hover rule anywhere (six secondary actions
-  // dead on hover) and no border-radius (a square focus ring).
+  // The six tutorial call sites now route through ui/Button as
+  // `variant="bare" className="tutorial-link-button"` (D3 primitive
+  // migration): bare carries this bespoke link recipe verbatim, because
+  // `.link-button` has no touch-target floor and variant="ghost" is chrome
+  // styling, not a link. The recipe must still not diverge from
+  // `.link-button` — before elspeth-4603f4a432, .tutorial-link-button had no
+  // :hover rule anywhere (six secondary actions dead on hover) and no
+  // border-radius (a square focus ring).
   it("shapes its focus ring like the primitive's", () => {
     expect(declaredValue(".tutorial-link-button", "border-radius")).toBe(
       declaredValue(".link-button", "border-radius"),
@@ -186,33 +189,14 @@ describe("chrome-row controls sit on the compact rung (elspeth-4603f4a432, elspe
     expect(exit).toBeGreaterThanOrEqual(24);
   });
 
-  it("puts the hash copy control on a declared rung instead of below both", () => {
-    // It declared no height at all and rendered ~30px — below --size-control
-    // AND --size-control-compact, i.e. on no rung the system declares.
-    expect(px(declaredValue(".tutorial-hash-copy", "min-height"))).toBe(
-      tokenPx("--size-control-compact"),
-    );
-    expect(declaredValue(".tutorial-hash-copy", "border-radius")).toBe(
-      declaredValue(".btn-compact", "border-radius"),
-    );
-  });
-
-  it("changes the border as well as the fill on hover, over a transition", () => {
-    // The defect: hover swapped the fill only, with no transition, so the
-    // control felt less responsive than every other button in the product.
-    const restBorder = tokenIn(declaredValue(".tutorial-hash-copy", "border"));
-    const hoverBorder = tokenIn(declaredValue(".tutorial-hash-copy:hover", "border-color"));
-    expect(hoverBorder, "hover must move the border, not only the fill").not.toBe(restBorder);
-    expect(declaredValue(".tutorial-hash-copy:hover", "background-color")).not.toBe(
-      declaredValue(".tutorial-hash-copy", "background-color"),
-    );
-    const transition = declaredValue(".tutorial-hash-copy", "transition");
-    for (const property of ["background-color", "border-color"]) {
-      expect(transition, `${property} changes on hover, so it must transition`).toContain(
-        property,
-      );
-    }
-  });
+  // The hash-copy rung, radius, transition and hover pins that used to live
+  // here (elspeth-28bb719b47) are retired, not lost: the call site now
+  // COMPOSES .btn-compact (`<Button compact className="tutorial-hash-copy">`,
+  // elspeth-e7dd7ae371), so those properties come from the primitive itself —
+  // pinned for .btn-compact by styles/buttonCascade.test.ts — and can no
+  // longer be mirrored out of step. The composition is pinned as rendered DOM
+  // in teachingMoments.test.tsx; tutorial.css keeps only the deliberate
+  // divergences (transparent fill, flex row sizing).
 });
 
 describe("boxed notes move one way off the card (elspeth-4da8113ac3)", () => {

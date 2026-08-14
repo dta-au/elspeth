@@ -2,6 +2,7 @@
 import { useEffect, useRef, useCallback, useMemo, useState } from "react";
 import { useBlobStore } from "@/stores/blobStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { Button, Input } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { BlobRow } from "./BlobRow";
 import type { BlobMetadata, BlobCategory } from "@/types/api";
@@ -135,13 +136,13 @@ export function BlobManager({ onUseAsInput }: BlobManagerProps) {
             voice-control targeting by visible text (WCAG 2.5.3). Dropping the
             redundant aria-label is what keeps the two in step — do not
             reintroduce one that says something else. */}
-        <button
+        <Button
           onClick={() => fileInputRef.current?.click()}
-          className="btn blob-manager-upload-btn"
+          className="blob-manager-upload-btn"
         >
           Upload
-        </button>
-        <input
+        </Button>
+        <Input
           ref={fileInputRef}
           type="file"
           onChange={handleUpload}

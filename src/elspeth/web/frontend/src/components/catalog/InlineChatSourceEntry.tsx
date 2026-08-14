@@ -13,6 +13,7 @@
 // ============================================================================
 
 import { useCallback } from "react";
+import { Button } from "@/components/ui";
 import { PREFILL_CHAT_INPUT_EVENT } from "./PluginCard";
 
 const SUGGESTED_PROMPT =
@@ -40,13 +41,12 @@ export function InlineChatSourceEntry({ onCloseDrawer }: InlineChatSourceEntryPr
       <div className="inline-chat-source-entry-desc">
         For a URL, sentence, or single record. Use a real source for recurring batches.
       </div>
-      <button
-        type="button"
-        className="btn btn-small inline-chat-source-entry-try"
+      <Button
+        className="btn-small inline-chat-source-entry-try"
         onClick={handleClick}
       >
         Try it
-      </button>
+      </Button>
     </div>
   );
 }

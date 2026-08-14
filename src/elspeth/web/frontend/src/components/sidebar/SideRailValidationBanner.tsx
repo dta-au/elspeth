@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ValidationResultBanner } from "@/components/execution/ValidationResult";
+import { Button } from "@/components/ui";
 import { useComposer } from "@/hooks/useComposer";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -89,7 +90,8 @@ function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
               <span className="side-rail-suggestion-item-text">
                 <strong>{s.component}:</strong> {s.message}
               </span>
-              <button
+              <Button
+                variant="bare"
                 className="side-rail-suggestion-apply-btn"
                 disabled={applyDisabled}
                 title={
@@ -100,7 +102,7 @@ function SuggestionList({ suggestions }: SuggestionListProps): JSX.Element {
                 onClick={() => handleApply(s)}
               >
                 {isComposing ? "Applying..." : "Apply"}
-              </button>
+              </Button>
             </li>
           ))}
         </ul>

@@ -161,11 +161,59 @@ describe("the app-dialog primitive (elspeth-e6fcd8d703)", () => {
     }
   });
 
+  it("keeps the settings-dialog closures to per-dialog decisions only", () => {
+    // The three settings dialogs (SecretsPanel, UserAdminDialog,
+    // ComposerPreferencesPanel) compose .app-dialog in their TSX; their
+    // closures may decide width and content scale, nothing more.
+    // Re-declaring chrome in a closure forks the primitive the moment a
+    // token moves — the exact pathology their inline style objects had.
+    for (const selector of [".settings-dialog", ".settings-dialog-wide"]) {
+      expect(
+        rulesFor(selector).length,
+        `${selector} must have a rule`,
+      ).toBeGreaterThan(0);
+      for (const property of [
+        "border-radius",
+        "box-shadow",
+        "z-index",
+        "background-color",
+        "max-height",
+        "position",
+      ]) {
+        expect(
+          winningValue(selector, property),
+          `${selector} must leave ${property} to the .app-dialog primitive`,
+        ).toBeNull();
+      }
+    }
+  });
+
+  it("resolves the explain-dialog close onto the shared dialog-close recipe", () => {
+    // .explain-dialog-close cannot be renamed — the class is ExplainDialog's
+    // focus-trap initial-focus selector — so it collapses by grouping:
+    // common.css imports after audit.css, and the group's declarations must
+    // be the ones that win over the older hand-rolled copy (which sat at the
+    // badge radius with no font).
+    for (const property of [
+      "border-radius",
+      "min-width",
+      "min-height",
+      "font-family",
+      "font-size",
+    ]) {
+      expect(
+        winningValue(".explain-dialog-close", property),
+        `.explain-dialog-close must resolve ${property} to the .dialog-close recipe`,
+      ).toBe(winningValue(".dialog-close", property));
+    }
+  });
+
   it("rounds every CSS-authored blocking frame at the modal radius", () => {
     // The review shipped three radii across the seven frames; graph/yaml took
     // the correction under elspeth-03492be50b, explain and save-for-review
-    // under elspeth-e6fcd8d703. The remaining offenders are the three
-    // inline-styled settings dialogs, which no stylesheet can reach.
+    // under elspeth-e6fcd8d703. The remaining offenders WERE the three
+    // inline-styled settings dialogs, which no stylesheet could reach —
+    // they now compose .app-dialog directly.
     for (const selector of [
       ".confirm-dialog",
       ".command-palette",

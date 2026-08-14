@@ -208,7 +208,7 @@ test.describe("composer guided live — the colour test (staging)", () => {
 
       // Credential-egress confirmation: the run leaves the composer and uses
       // stored credentials, so an alertdialog interposes before execution.
-      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const runDialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(runDialog).toBeVisible();
       await runDialog.getByRole("button", { name: "Run pipeline" }).click();
 

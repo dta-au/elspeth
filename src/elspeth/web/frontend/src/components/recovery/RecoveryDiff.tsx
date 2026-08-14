@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Button } from "@/components/ui";
 import type {
   CompositionState,
   EdgeSpec,
@@ -297,8 +298,7 @@ export function RecoveryDiff({
             <div className="recovery-diff-group-header">
               <h4>{group.label}</h4>
               {isLarge ? (
-                <button
-                  className="btn"
+                <Button
                   type="button"
                   onClick={() =>
                     setExpandedGroups((previous) => {
@@ -313,7 +313,7 @@ export function RecoveryDiff({
                   }
                 >
                   {isExpanded ? `Hide ${group.label}` : `Show ${group.label}`}
-                </button>
+                </Button>
               ) : null}
             </div>
             {showRows ? (

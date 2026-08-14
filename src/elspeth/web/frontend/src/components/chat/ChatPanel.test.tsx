@@ -485,7 +485,7 @@ describe("ChatPanel", () => {
     expect(
       screen.getByRole("heading", { name: "How pipelines work" }),
     ).toBeVisible();
-    expect(screen.getByRole("button", { name: "Don’t show this again" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Don't show this again" })).toBeVisible();
     expect(screen.getByTestId("chat-input")).toBeInTheDocument();
     expect(sendMessage).not.toHaveBeenCalled();
   });
@@ -2552,7 +2552,7 @@ describe("ChatPanel mode discriminator", () => {
     render(<ChatPanel />);
 
     expect(screen.getByTestId("chat-input").dataset.placeholder).toBe(
-      "Resolve any pending acknowledgements, then press Confirm wiring on the current decision card.",
+      "Clear pending acknowledgements, then press Confirm wiring on the decision card.",
     );
   });
 

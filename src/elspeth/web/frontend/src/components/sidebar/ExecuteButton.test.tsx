@@ -349,7 +349,7 @@ describe("ExecuteButton", () => {
 
     // Confirm gates execute(): nothing fired yet.
     expect(execute).not.toHaveBeenCalled();
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     // The summary derives from the actual composition.
     expect(dialog).toHaveTextContent("source (csv)");
     expect(dialog).toHaveTextContent(
@@ -384,7 +384,7 @@ describe("ExecuteButton", () => {
 
     expect(execute).not.toHaveBeenCalled();
     expect(
-      screen.getByRole("alertdialog", { name: /run pipeline\?/i }),
+      screen.getByRole("alertdialog", { name: "Run pipeline" }),
     ).toBeInTheDocument();
   });
 
@@ -432,7 +432,7 @@ describe("ExecuteButton", () => {
 
     render(<ExecuteButton />);
     fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     fireEvent.click(
       within(dialog).getByRole("checkbox", { name: /don't ask again/i }),
     );
@@ -502,7 +502,7 @@ describe("ExecuteButton", () => {
     render(<ExecuteButton />);
     fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
 
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     expect(dialog).toHaveTextContent(
       "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
     );
@@ -553,7 +553,7 @@ describe("ExecuteButton", () => {
 
     // First run: tick the opt-out, confirm.
     fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     fireEvent.click(
       within(dialog).getByRole("checkbox", { name: /don't ask again/i }),
     );
@@ -638,7 +638,7 @@ describe("ExecuteButton", () => {
 
     render(<ExecuteButton />);
     fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
-    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    const dialog = screen.getByRole("alertdialog", { name: "Run pipeline" });
     fireEvent.click(
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
     );

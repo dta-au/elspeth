@@ -6,6 +6,7 @@ import type {
   CompositionState,
   InlineSourceSummary,
 } from "@/types/api";
+import { Button } from "@/components/ui";
 import { MarkdownRenderer } from "./MarkdownRenderer";
 import { ToolCallCard } from "./ToolCallCard";
 import { InlineSourceCreatedTurn } from "./InlineSourceCreatedTurn";
@@ -177,7 +178,8 @@ export function MessageBubble({
             the word also retires the "Copied!" vs "Copied" voice mismatch
             against MarkdownRenderer's code-block copy affordance. */}
         {!isSystem && (
-          <button
+          <Button
+            variant="bare"
             onClick={handleCopy}
             aria-label={copied ? "Copied to clipboard" : "Copy message"}
             className="bubble-copy-btn bubble-action-overlay bubble-action-overlay--copy"
@@ -186,7 +188,7 @@ export function MessageBubble({
             }}
           >
             {copied ? "\u2713" : "\u2398"}
-          </button>
+          </Button>
         )}
 
         {isUser && isEditing ? (
@@ -206,19 +208,21 @@ export function MessageBubble({
               className="message-edit-textarea"
             />
             <div className="message-edit-actions">
-              <button
+              <Button
+                variant="bare"
                 onClick={handleEditCancel}
                 className="message-edit-cancel"
               >
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="bare"
                 onClick={handleForkSubmit}
                 disabled={!editContent.trim()}
                 className="message-edit-fork"
               >
                 Fork
-              </button>
+              </Button>
             </div>
           </div>
         ) : (
@@ -245,13 +249,14 @@ export function MessageBubble({
 
         {/* Edit/fork button — user messages only, not pending/failed */}
         {isUser && !isEditing && !message.local_status && onFork && (
-          <button
+          <Button
+            variant="bare"
             onClick={handleEditStart}
             aria-label="Edit and fork from this message"
             className="bubble-edit-btn bubble-action-overlay bubble-action-overlay--edit"
           >
             &#9998;
-          </button>
+          </Button>
         )}
 
         {isUser && message.local_status === "failed" && onRetry && (
@@ -264,7 +269,8 @@ export function MessageBubble({
                 precedent in sessionStore.ts) — so keep the failed text but
                 never render a retry invitation for it. */}
             {message.local_failure_code !== "policy_blocked" && (
-              <button
+              <Button
+                variant="bare"
                 onClick={() => onRetry(message.id)}
                 className="message-retry-btn"
                 // Retry is a compose entry point: the store admission gate
@@ -273,7 +279,7 @@ export function MessageBubble({
                 disabled={isComposing}
               >
                 Retry
-              </button>
+              </Button>
             )}
           </div>
         )}
@@ -287,7 +293,8 @@ export function MessageBubble({
         {/* Tool calls section (assistant messages only) */}
         {message.tool_calls && message.tool_calls.length > 0 && (
           <div className="message-tools">
-            <button
+            <Button
+              variant="bare"
               onClick={() => setToolsExpanded(!toolsExpanded)}
               aria-expanded={showToolCalls}
               aria-label={`Tool calls (${message.tool_calls.length})`}
@@ -295,7 +302,7 @@ export function MessageBubble({
             >
               {showToolCalls ? "\u25BC" : "\u25B6"} Tool calls (
               {message.tool_calls.length})
-            </button>
+            </Button>
             {showToolCalls && (
               <div className="message-tools-list">
                 {message.tool_calls.map((tc, i) => (

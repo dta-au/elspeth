@@ -123,8 +123,10 @@ describe("the destructive row action has a state surface (elspeth-e977b66dba)", 
   it("gives every interactive control in the secrets panel a hover background", () => {
     // The delete "×" was the one control in this file with no :hover at all,
     // while the harmless close button beside it lightened — least feedback
-    // exactly where a mis-click is least recoverable.
-    for (const selector of [".secrets-panel-close", ".secrets-delete-btn"]) {
+    // exactly where a mis-click is least recoverable. The close button is
+    // .dialog-close since the settings dialogs migrated onto the app-dialog
+    // primitive (elspeth-e6fcd8d703).
+    for (const selector of [".dialog-close", ".secrets-delete-btn"]) {
       expect(
         hasRule(`${selector}:hover`),
         `${selector} ships without a hover state`,

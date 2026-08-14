@@ -24,6 +24,7 @@
 
 import { useId, useState } from "react";
 
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 
 interface ModeSwitchButtonProps {
@@ -72,14 +73,14 @@ export function ModeSwitchButton({
   if (disabledReason !== undefined) {
     return (
       <div className="mode-switch-disabled">
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="mode-switch-btn"
           disabled
           aria-describedby={disabledReasonId}
         >
           {label}
-        </button>
+        </Button>
         <span id={disabledReasonId} className="mode-switch-disabled-reason">
           {disabledReason}
         </span>
@@ -99,8 +100,8 @@ export function ModeSwitchButton({
         <span id={confirmDescriptionId} className="mode-switch-confirm-note">
           {confirmNote}
         </span>
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="mode-switch-btn mode-switch-btn--confirm"
           aria-describedby={confirmDescriptionId}
           onClick={() => {
@@ -109,25 +110,25 @@ export function ModeSwitchButton({
           }}
         >
           {confirmLabel}
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
+          variant="bare"
           className="mode-switch-btn"
           onClick={() => setConfirming(false)}
         >
           Cancel
-        </button>
+        </Button>
       </div>
     );
   }
 
   return (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="mode-switch-btn"
       onClick={() => (hasWork ? setConfirming(true) : doSwitch())}
     >
       {label}
-    </button>
+    </Button>
   );
 }

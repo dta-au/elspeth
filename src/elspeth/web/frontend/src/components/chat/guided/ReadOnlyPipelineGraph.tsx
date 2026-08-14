@@ -348,6 +348,12 @@ export function ReadOnlyPipelineGraph({
               data-node-kind={node.kind}
               transform={`translate(${node.x - NODE_WIDTH / 2} ${node.y - NODE_HEIGHT / 2})`}
             >
+              {/* Corner radius: guided.css .guided-readonly-graph__node reads
+                  rx from var(--radius-lg) — the same rank GraphView.tsx's
+                  editable cards read (elspeth-37cc8b5310). The rx="8"
+                  presentation attribute below is the value-identical fallback
+                  (SVG2 CSS geometry wins over it wherever CSS applies); keep
+                  the two in step with the token. */}
               <rect
                 className={`guided-readonly-graph__node guided-readonly-graph__node--${node.kind}`}
                 width={NODE_WIDTH}

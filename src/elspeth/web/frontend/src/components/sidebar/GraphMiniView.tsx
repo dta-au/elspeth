@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import type { CompositionState } from "@/types/index";
@@ -67,8 +68,8 @@ export function GraphMiniView({
   }
 
   return (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="graph-mini"
       onClick={() =>
         window.dispatchEvent(new CustomEvent(OPEN_GRAPH_MODAL_EVENT))
@@ -76,7 +77,7 @@ export function GraphMiniView({
       aria-label="Pipeline graph (click to expand)"
     >
       <MiniSvg state={compositionState} />
-    </button>
+    </Button>
   );
 }
 

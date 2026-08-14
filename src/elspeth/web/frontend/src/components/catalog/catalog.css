@@ -491,6 +491,16 @@
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   font-size: var(--font-size-sm);
+  /* This field routes through ui/Input (D3 primitive census), so .input's
+     base recipe now sits UNDER this one. The drawer's search band is denser
+     than the 44px control rung, so re-assert the field's own geometry over
+     .input's min-height/line-height — value-preserving: content-derived
+     height and single-line metrics, exactly as the field shipped. The
+     primitive's font/placeholder/focus-ring vocabulary is adopted
+     deliberately: those were UA-default chrome here, the defect class the
+     ui primitives exist to retire. */
+  min-height: auto;
+  line-height: normal;
 }
 
 .catalog-search-clear {
@@ -516,6 +526,11 @@
   font-size: var(--font-size-base);
   padding: var(--space-2xs);
   line-height: 1;
+  /* Hover states change colour without a transition elsewhere in this file
+     too (elspeth-616a236fc3 family) — declare the eased pair on the base
+     rule, with the per-selector reduced-motion guard below, chat.css-style. */
+  transition: background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .catalog-search-clear:hover,
@@ -620,6 +635,9 @@
   font-size: var(--font-size-xs);
   font-weight: var(--font-weight-semibold);
   line-height: 1.2;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .filter-chip:hover,
@@ -653,12 +671,26 @@
   cursor: pointer;
   font: inherit;
   font-size: var(--font-size-xs);
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .filter-chip-clear:hover {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
   color: var(--color-text);
+}
+
+/* Mirror chat.css's per-selector reduced-motion guards — the global guard in
+   animations.css is not a universal `*` reset, so every eased control names
+   itself here (elspeth-616a236fc3). */
+@media (prefers-reduced-motion: reduce) {
+  .catalog-search-clear,
+  .filter-chip,
+  .filter-chip-clear {
+    transition: none;
+  }
 }
 
 /* The catalog list's loading, empty and load-failure states occupy ONE slot,

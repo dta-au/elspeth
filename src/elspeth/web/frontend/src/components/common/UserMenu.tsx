@@ -5,6 +5,7 @@ import {
   useState,
   type FocusEvent,
 } from "react";
+import { Button } from "@/components/ui";
 import { useTheme } from "@/hooks/useTheme";
 import { useAuthStore } from "@/stores/authStore";
 import type { UserProfile } from "@/types/index";
@@ -158,9 +159,9 @@ export function UserMenu({
 
   return (
     <div ref={wrapperRef} className="user-menu" onBlur={onWrapperBlur}>
-      <button
+      <Button
         ref={triggerRef}
-        type="button"
+        variant="bare"
         aria-label="account menu"
         aria-haspopup="true"
         aria-expanded={open}
@@ -168,7 +169,7 @@ export function UserMenu({
         className="user-menu-trigger"
       >
         Account
-      </button>
+      </Button>
       {open && (
         <ul className="user-menu-list">
           {user !== null && (
@@ -207,8 +208,8 @@ export function UserMenu({
             </li>
           )}
           <li className="user-menu-item">
-            <button
-              type="button"
+            <Button
+              variant="bare"
               onClick={onThemeToggle}
               aria-label={themeLabel}
               title={themeLabel}
@@ -222,26 +223,26 @@ export function UserMenu({
                   toggle goes ("Switch to light theme" / "Switch to dark
                   theme"), so dropping the span loses no meaning. */}
               {themeLabel}
-            </button>
+            </Button>
           </li>
           <li className="user-menu-item">
-            <button
-              type="button"
+            <Button
+              variant="bare"
               onClick={onSettings}
               className="user-menu-action"
             >
               Composer preferences
-            </button>
+            </Button>
           </li>
           {onOpenUserManagement !== undefined && (
             <li className="user-menu-item">
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 onClick={onUserManagement}
                 className="user-menu-action"
               >
                 User management
-              </button>
+              </Button>
             </li>
           )}
           <li className="user-menu-item">
@@ -259,13 +260,13 @@ export function UserMenu({
             </a>
           </li>
           <li className="user-menu-item">
-            <button
-              type="button"
+            <Button
+              variant="bare"
               onClick={onSignOutClick}
               className="user-menu-action user-menu-action--danger"
             >
               Sign out
-            </button>
+            </Button>
           </li>
         </ul>
       )}

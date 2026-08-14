@@ -38,7 +38,11 @@
   padding: var(--space-xs) var(--space-sm);
   font-size: var(--font-size-xs);
   font-weight: 600;
-  line-height: 20px;
+  /* Was a raw 20px (1.667 at the 12px font). --line-height-relaxed (1.7,
+     20.4px) is the nearest rung; the 0.4px drift is invisible in a
+     flex-centred control whose height is governed by .btn-compact's
+     min-height, and a unitless value tracks any future font-size change. */
+  line-height: var(--line-height-relaxed);
   /* No border-radius override: the trigger composes .btn-compact and takes its
      --radius-md, like every sibling control in the header row. It was the only
      --radius-xl (12px) element in the product — a pill among rectangles

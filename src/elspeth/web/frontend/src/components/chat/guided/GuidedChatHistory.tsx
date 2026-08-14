@@ -34,6 +34,7 @@
 // produced in the same request share a wall-clock second (slice 5
 // guarantee).
 
+import { Button } from "@/components/ui";
 import type { ChatTurn } from "@/types/guided";
 import { MarkdownRenderer } from "../MarkdownRenderer";
 import { GUIDED_STEP_LABELS } from "./stepLabels";
@@ -149,14 +150,14 @@ export function GuidedChatHistory({
             {turn.content}
             {onRetrySyntheticFailure && retryInvited && turn.seq === lastSeq && (
               <div className="message-failed-row">
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="message-retry-btn"
                   onClick={() => onRetrySyntheticFailure(turn)}
                   disabled={retryDisabled}
                 >
                   Retry
-                </button>
+                </Button>
               </div>
             )}
           </div>

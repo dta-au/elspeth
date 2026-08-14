@@ -25,6 +25,7 @@ import {
 } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { Button } from "@/components/ui";
 import { CodeBlock } from "./CodeBlock";
 import { resolvePromptDisplaySegments } from "./promptTemplateDisplay";
 import {
@@ -314,8 +315,8 @@ export function AcknowledgementCard({
           always viewed).  Exactly one control carries the name "View
           prompt" in every state — the duplicate-name trap the old
           morphing-primary design worked around is gone structurally. */}
-      <button
-        type="button"
+      <Button
+        variant="bare"
         className="ack-card-view-toggle"
         aria-expanded={expanded}
         aria-controls={valueRegionId}
@@ -331,7 +332,7 @@ export function AcknowledgementCard({
           : expanded
             ? "Hide"
             : "View"}
-      </button>
+      </Button>
       {expanded &&
         (requiresPromptView && promptDisplay !== null ? (
           <div
@@ -479,10 +480,10 @@ export function AcknowledgementCard({
         {valueDisclosure}
         {chooseMode && (
           <div className="ack-card-actions">
-            <button
+            <Button
               ref={acceptButtonRef}
-              type="button"
-              className="btn btn-primary ack-card-accept-btn"
+              variant="primary"
+              className="ack-card-accept-btn"
               // Single-meaning control (elspeth-3a4a65530f): always the
               // decision-naming accept label; the disclosure semantics live
               // on the separate small View-prompt toggle.
@@ -510,18 +511,17 @@ export function AcknowledgementCard({
                 : requiresPromptView
                   ? ACKNOWLEDGEMENT_APPROVE_LABEL
                   : ACKNOWLEDGEMENT_ACCEPT_LABEL}
-            </button>
+            </Button>
             {showAmend && (
-              <button
+              <Button
                 ref={changeButtonRef}
-                type="button"
-                className="btn ack-card-amend-btn"
+                className="ack-card-amend-btn"
                 aria-label={`Change the interpretation of ${userTerm}`}
                 onClick={handleOpenAmend}
                 disabled={primaryButtonsDisabled}
               >
                 {ACKNOWLEDGEMENT_AMEND_LABEL}
-              </button>
+              </Button>
             )}
           </div>
         )}
@@ -565,22 +565,21 @@ export function AcknowledgementCard({
             </p>
           )}
           <div className="ack-card-amend-actions">
-            <button
-              type="button"
-              className="btn ack-card-cancel-btn"
+            <Button
+              className="ack-card-cancel-btn"
               onClick={handleCancelAmend}
               disabled={resolveInFlight}
             >
               Cancel
-            </button>
-            <button
-              type="button"
-              className="btn btn-primary ack-card-submit-btn"
+            </Button>
+            <Button
+              variant="primary"
+              className="ack-card-submit-btn"
               onClick={() => void handleSubmitAmend()}
               disabled={submitDisabled}
             >
               {resolveInFlight ? spinner : "Submit"}
-            </button>
+            </Button>
           </div>
         </div>
       )}

@@ -22,6 +22,26 @@
    .alert-banner-action margin-left (header.css) and this row's own gap are
    two spacing mechanisms that otherwise stack to a 16px drift.
    --------------------------------------------------------------------------- */
+/* The toast OVERLAYS the application instead of participating in flow —
+   the same elspeth-1c4687ff67 treatment .app-notice-center received
+   (styles/shared.css), and for the same reason: rendered in flow before the
+   header, the strip's arrival displaced the whole viewport by its height and
+   snapped it back on dismiss. The opaque ground is load-bearing: the
+   .alert-banner tone backgrounds are 10-14% alpha tints, and as a fixed
+   overlay the strip paints over the header — a bare tint bleeds that content
+   through as text-on-text. The strip renders after .app-notice-center in
+   App.tsx, so at the shared --z-overlay it paints above the notice bar when
+   both are present; dismissing it uncovers the bar. */
+.run-outcome-notice-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--z-overlay);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-popover);
+}
+
 .run-outcome-notice.alert-banner {
   height: var(--size-control);
   max-height: var(--size-control);

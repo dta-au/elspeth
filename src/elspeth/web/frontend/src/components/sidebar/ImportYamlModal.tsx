@@ -2,6 +2,7 @@ import { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from "r
 import { parseDocument } from "yaml";
 import * as api from "@/api/client";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import {
   OPEN_CATALOG_EVENT,
@@ -15,7 +16,7 @@ import type { ApiError, PluginPolicyFinding } from "@/types/index";
 import { hasCompositionContent } from "@/utils/compositionState";
 import { plural } from "@/utils/plural";
 
-export const IMPORT_YAML_CONFIRM_TITLE = "Replace the current pipeline?";
+export const IMPORT_YAML_CONFIRM_TITLE = "Replace current pipeline";
 export const IMPORT_YAML_CONFIRM_CONFIRM_LABEL = "Replace pipeline";
 export const IMPORT_YAML_CONFIRM_CANCEL_LABEL = "Keep current pipeline";
 
@@ -561,7 +562,7 @@ function ImportYamlSourceBindings({
                   </option>
                 ))}
               </select>
-              <input
+              <Input
                 type="file"
                 className="input"
                 aria-label={`Upload file for source ${candidate.sourceName}`}
@@ -938,8 +939,8 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
       >
         <header className="yaml-modal-header">
           <h2 id={titleId}>Import YAML</h2>
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="yaml-modal-close"
             onClick={onClose}
             disabled={!canClose}
@@ -947,7 +948,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
             aria-label="Close import YAML"
           >
             ×
-          </button>
+          </Button>
         </header>
         <div className="yaml-modal-body">
           {phase !== "success" && (
@@ -984,7 +985,7 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 <label htmlFor={fileInputId} className="field-label">
                   Or choose a .yaml file
                 </label>
-                <input
+                <Input
                   id={fileInputId}
                   type="file"
                   accept=".yaml,.yml,text/yaml,application/x-yaml"
@@ -1012,22 +1013,16 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 }}
               />
               <div className="import-yaml-actions">
-                <button
-                  type="button"
-                  className="btn"
-                  onClick={onClose}
-                  disabled={isSubmitting}
-                >
+                <Button onClick={onClose} disabled={isSubmitting}>
                   Cancel
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-primary"
+                </Button>
+                <Button
+                  variant="primary"
                   disabled={!canSubmitYaml || isSubmitting || hasPendingSourceUpload}
                   onClick={handleSubmitClick}
                 >
                   {isSubmitting ? "Importing…" : "Import"}
-                </button>
+                </Button>
               </div>
               {isSubmitting && (
                 <div role="status" aria-live="polite" className="sr-only">
@@ -1093,22 +1088,20 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                           {unavailableReasonLabel(finding.reason_code)}
                         </div>
                         <div className="import-yaml-actions">
-                          <button
-                            type="button"
-                            className="btn btn-small"
+                          <Button
+                            className="btn-small"
                             aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
                             onClick={() => requestDisabledComponentRemoval(finding)}
                           >
                             Remove
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-small"
+                          </Button>
+                          <Button
+                            className="btn-small"
                             aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${pluginKind(finding.plugin_id)}`}
                             onClick={requestDisabledComponentReplacement}
                           >
                             Replace
-                          </button>
+                          </Button>
                         </div>
                       </li>
                     ))}
@@ -1116,9 +1109,9 @@ export function ImportYamlModal({ onClose }: ImportYamlModalProps): JSX.Element 
                 </section>
               )}
               <div className="import-yaml-actions">
-                <button ref={successCloseRef} type="button" className="btn btn-primary" onClick={onClose}>
+                <Button ref={successCloseRef} variant="primary" onClick={onClose}>
                   Close
-                </button>
+                </Button>
               </div>
             </div>
           )}

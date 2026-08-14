@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
@@ -128,23 +129,18 @@ export function TutorialTurn7Graduation({
         ))}
       </ul>
       <div className="tutorial-actions">
-        <button
-          type="button"
-          className="btn btn-primary"
-          disabled={busy}
-          onClick={() => void onFinish()}
-        >
+        <Button variant="primary" disabled={busy} onClick={() => void onFinish()}>
           {busy ? "Saving..." : TURN_7_PRIMARY_BUTTON}
-        </button>
+        </Button>
         {onBack !== undefined && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="tutorial-link-button"
             disabled={busy}
             onClick={onBack}
           >
             Back
-          </button>
+          </Button>
         )}
       </div>
       <p role="status" className="sr-only">

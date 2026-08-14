@@ -3,6 +3,7 @@ import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useTheme, type Theme } from "@/hooks/useTheme";
+import { Button, Input } from "@/components/ui";
 import type { ComposerMode } from "@/types/api";
 
 /**
@@ -81,7 +82,7 @@ export function ComposerPreferencesForm({
           Default mode for new sessions
         </legend>
         <label className="composer-preferences-option">
-          <input
+          <Input
             type="radio"
             name="composer-default-mode"
             value="guided"
@@ -92,7 +93,7 @@ export function ComposerPreferencesForm({
           <span>Guided (recommended)</span>
         </label>
         <label className="composer-preferences-option">
-          <input
+          <Input
             type="radio"
             name="composer-default-mode"
             value="freeform"
@@ -106,7 +107,7 @@ export function ComposerPreferencesForm({
       <fieldset className="composer-preferences-fieldset">
         <legend className="composer-preferences-legend">Theme</legend>
         <label className="composer-preferences-option">
-          <input
+          <Input
             type="radio"
             name="composer-theme"
             value="system"
@@ -116,7 +117,7 @@ export function ComposerPreferencesForm({
           <span>System</span>
         </label>
         <label className="composer-preferences-option">
-          <input
+          <Input
             type="radio"
             name="composer-theme"
             value="light"
@@ -126,7 +127,7 @@ export function ComposerPreferencesForm({
           <span>Light</span>
         </label>
         <label className="composer-preferences-option">
-          <input
+          <Input
             type="radio"
             name="composer-theme"
             value="dark"
@@ -148,14 +149,14 @@ export function ComposerPreferencesForm({
           "the button disappeared". resetTutorial clears completion AND the
           resume fields server-side, so the next load starts a fresh Welcome;
           for a user who never started, it is a harmless no-op PATCH. */}
-      <button
-        type="button"
-        className="btn btn-compact composer-preferences-reset"
+      <Button
+        compact
+        className="composer-preferences-reset"
         disabled={writing}
         onClick={() => void onResetTutorial()}
       >
         Reset tutorial
-      </button>
+      </Button>
     </>
   );
 }
@@ -196,12 +197,7 @@ export function ComposerPreferencesPanel({
       <div
         role="presentation"
         onClick={onClose}
-        style={{
-          position: "fixed",
-          inset: 0,
-          backgroundColor: "rgba(0,0,0,0.45)",
-          zIndex: 100,
-        }}
+        className="app-dialog-backdrop"
       />
       {/* Modal */}
       <div
@@ -209,45 +205,20 @@ export function ComposerPreferencesPanel({
         role="dialog"
         aria-modal="true"
         aria-labelledby="composer-preferences-title"
-        style={{
-          position: "fixed",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          zIndex: 101,
-          width: 480,
-          maxWidth: "calc(100vw - 32px)",
-          maxHeight: "calc(100vh - 64px)",
-          display: "flex",
-          flexDirection: "column",
-          backgroundColor: "var(--color-surface, #fff)",
-          borderRadius: 8,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
-          border: "1px solid var(--color-border)",
-          fontSize: 13,
-          overflow: "hidden",
-        }}
+        className="app-dialog settings-dialog"
       >
         <div className="secrets-panel-header">
           <h2 id="composer-preferences-title" className="secrets-panel-title">
             Composer preferences
           </h2>
-          <button
-            type="button"
+          <Button
+            variant="bare"
             onClick={onClose}
             aria-label="Close composer preferences panel"
-            className="secrets-panel-close"
-            style={{
-              minWidth: 32,
-              minHeight: 32,
-              padding: 4,
-              fontSize: 18,
-              lineHeight: 1,
-              cursor: "pointer",
-            }}
+            className="dialog-close"
           >
             ×
-          </button>
+          </Button>
         </div>
         <div className="secrets-panel-body">
           <ComposerPreferencesForm

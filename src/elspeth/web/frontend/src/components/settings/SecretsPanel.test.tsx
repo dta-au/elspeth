@@ -100,17 +100,36 @@ describe("SecretsPanel", () => {
 
     render(<SecretsPanel onClose={onClose} />);
 
-    const dialogStyle = screen.getByRole("dialog").getAttribute("style");
+    // The frame is the shared .app-dialog primitive, not an inline style
+    // object (elspeth-e6fcd8d703): a string style could never receive a
+    // theme correction, and the old object pinned the dialog to literal
+    // z-index 101 — the non-modal overlay band.
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("style")).toBeNull();
+    expect(dialog).toHaveClass("app-dialog", "settings-dialog");
+
     const availableStyle = screen.getByRole("img", { name: "Available" }).getAttribute("style");
     const unavailableStyle = screen.getByRole("img", { name: "Unavailable" }).getAttribute("style");
 
-    expect(dialogStyle).toContain("var(--color-surface)");
     expect(availableStyle).toContain("var(--color-success)");
     expect(availableStyle).toContain("var(--color-success-bg)");
     expect(unavailableStyle).toContain("var(--color-text-muted)");
-    expect(`${dialogStyle} ${availableStyle} ${unavailableStyle}`).not.toMatch(
+    expect(`${availableStyle} ${unavailableStyle}`).not.toMatch(
       /#16a34a|#9ca3af|#fff/i,
     );
+  });
+
+  it("mounts the modal chrome on the app-dialog primitive (elspeth-e6fcd8d703)", () => {
+    render(<SecretsPanel onClose={onClose} />);
+
+    // Backdrop and frame both compose the shared classes, so the scrim, the
+    // dialog z-band, the modal radius and the shadow tier all arrive from
+    // the stylesheet — the CSS side is gated in styles/overlayChrome.test.ts;
+    // this pins that the markup actually reaches those rules.
+    expect(screen.getByRole("presentation")).toHaveClass("app-dialog-backdrop");
+    expect(
+      screen.getByRole("button", { name: "Close secrets panel" }),
+    ).toHaveClass("dialog-close");
   });
 
   it("surfaces human-readable reasons for unavailable secrets", () => {

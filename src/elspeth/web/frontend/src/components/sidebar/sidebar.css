@@ -91,11 +91,20 @@
   font-size: var(--font-size-xs);
   padding: var(--space-2xs) var(--space-sm);
   flex-shrink: 0;
+  /* Hover changes the fill, so it eases like every .btn does
+     (elspeth-616a236fc3): same gesture, same 100ms answer. */
+  transition: background-color var(--transition-fast);
   white-space: nowrap;
 }
 
 .side-rail-suggestion-apply-btn:hover:not(:disabled) {
   background-color: var(--color-info-border);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-rail-suggestion-apply-btn {
+    transition: none;
+  }
 }
 
 .side-rail-suggestion-apply-btn:disabled {
@@ -146,11 +155,21 @@
   color: var(--color-text);
   cursor: pointer;
   text-align: left;
+  /* Hover changes fill + border, so both ease at the .btn rung
+     (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
 }
 
 .side-rail-catalog-btn:hover {
   border-color: var(--color-border-strong);
   background-color: var(--color-surface-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .side-rail-catalog-btn {
+    transition: none;
+  }
 }
 
 /* One focus colour app-wide (elspeth-eaa8c0dc73). --color-accent (#1a7a52)
@@ -223,11 +242,21 @@
   background-color: var(--color-surface-elevated);
   color: var(--color-text);
   cursor: pointer;
+  /* Hover changes fill + border, so both ease at the .btn rung
+     (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
 }
 
 .graph-mini:hover {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-mini {
+    transition: none;
+  }
 }
 
 .graph-mini--empty {

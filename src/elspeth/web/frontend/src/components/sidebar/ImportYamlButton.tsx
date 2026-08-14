@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui";
 import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 
@@ -16,15 +17,14 @@ export function ImportYamlButton(): JSX.Element | null {
   if (!activeSessionId) return null;
 
   return (
-    <button
-      type="button"
-      className="btn side-rail-import-yaml-btn"
+    <Button
+      className="side-rail-import-yaml-btn"
       onClick={() =>
         window.dispatchEvent(new CustomEvent(OPEN_IMPORT_YAML_MODAL_EVENT))
       }
       aria-label="Import YAML"
     >
       Import YAML
-    </button>
+    </Button>
   );
 }

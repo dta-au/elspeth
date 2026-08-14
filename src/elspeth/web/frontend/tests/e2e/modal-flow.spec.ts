@@ -104,7 +104,7 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.goto(sessionId);
         await composer.waitForChatReady();
 
-        await page.getByRole("button", { name: "Focus Graph" }).click();
+        await page.getByRole("button", { name: "Focus graph" }).click();
 
         const dialog = page.getByRole("dialog", { name: /pipeline graph/i });
         await expect(dialog).toBeVisible();

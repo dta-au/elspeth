@@ -3,6 +3,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { useSecretsStore } from "@/stores/secretsStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import type { SecretInventoryItem } from "@/types/api";
 
 interface SecretsPanelProps {
@@ -185,12 +186,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
       <div
         role="presentation"
         onClick={onClose}
-        style={{
-          position: "fixed",
-          inset: 0,
-          backgroundColor: "rgba(0,0,0,0.45)",
-          zIndex: 100,
-        }}
+        className="app-dialog-backdrop"
       />
 
       {/* Modal */}
@@ -199,24 +195,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
         role="dialog"
         aria-modal="true"
         aria-label="API keys & secrets"
-        style={{
-          position: "fixed",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          zIndex: 101,
-          width: 480,
-          maxWidth: "calc(100vw - 32px)",
-          maxHeight: "calc(100vh - 64px)",
-          display: "flex",
-          flexDirection: "column",
-          backgroundColor: "var(--color-surface)",
-          borderRadius: 8,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
-          border: "1px solid var(--color-border)",
-          fontSize: 13,
-          overflow: "hidden",
-        }}
+        className="app-dialog settings-dialog"
       >
         {/* Header */}
         <div className="secrets-panel-header">
@@ -226,13 +205,14 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
               destination reads the same way rather than title-casing itself
               on arrival. */}
           <h2 className="secrets-panel-title">API keys &amp; secrets</h2>
-          <button
+          <Button
+            variant="bare"
             onClick={onClose}
             aria-label="Close secrets panel"
-            className="secrets-panel-close"
+            className="dialog-close"
           >
             ×
-          </button>
+          </Button>
         </div>
 
         {/* Scrollable body */}
@@ -254,7 +234,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                   <label htmlFor="secret-name" className="field-label">
                     Name
                   </label>
-                  <input
+                  <Input
                     id="secret-name"
                     type="text"
                     aria-invalid={formErrorTargets.name ? true : undefined}
@@ -266,7 +246,6 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                     placeholder="e.g. OPENAI_API_KEY"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="input"
                   />
                 </div>
                 <div>
@@ -275,7 +254,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                   </label>
                   {/* SECURITY: type="password" — value never displayed in plaintext.
                       No "show" toggle is intentional. */}
-                  <input
+                  <Input
                     id="secret-value"
                     type="password"
                     aria-invalid={formErrorTargets.value ? true : undefined}
@@ -286,16 +265,16 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                     placeholder="Paste your secret value here"
                     value={value}
                     onChange={(e) => setValue(e.target.value)}
-                    className="input"
                   />
                 </div>
-                <button
+                <Button
                   type="submit"
+                  variant="primary"
                   disabled={!name.trim() || !value || isSubmitting}
-                  className="btn btn-primary secrets-submit-btn"
+                  className="secrets-submit-btn"
                 >
                   {isSubmitting ? "Saving…" : "Save secret"}
-                </button>
+                </Button>
               </div>
             </form>
           </section>
@@ -369,14 +348,15 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
                           the badge column zig-zagged down the list. */}
                       <span className="secrets-list-action">
                         {secret.scope === "user" && (
-                          <button
+                          <Button
+                            variant="bare"
                             onClick={() => setPendingDelete(secret.name)}
                             aria-label={`Delete secret ${secret.name}`}
                             title="Delete"
                             className="secrets-delete-btn"
                           >
                             ×
-                          </button>
+                          </Button>
                         )}
                       </span>
                     </li>
@@ -397,7 +377,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
       {/* WCAG 3.3.4: irreversible delete is gated behind a danger confirmation. */}
       {pendingDelete !== null && (
         <ConfirmDialog
-          title="Delete this secret?"
+          title="Delete secret"
           message={`Delete secret "${pendingDelete}"? Pipelines that reference it will fail.`}
           confirmLabel="Delete secret"
           cancelLabel="Cancel"

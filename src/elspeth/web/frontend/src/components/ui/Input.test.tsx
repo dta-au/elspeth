@@ -145,4 +145,38 @@ describe("Input", () => {
       },
     );
   });
+
+  describe("bare suppresses the .input chrome for text-like types", () => {
+    it.each(["text", "number"] as const)(
+      "type=%s with bare carries only the caller's className",
+      (type) => {
+        const { container } = render(
+          <Input bare type={type} className="guided-schema-input" />,
+        );
+        const input = container.querySelector("input");
+        expect(input).toHaveAttribute("type", type);
+        expect(input!.getAttribute("class")).toBe("guided-schema-input");
+      },
+    );
+
+    it("emits no class attribute at all when bare and className is empty", () => {
+      const { container } = render(<Input bare type="text" />);
+      expect(container.querySelector("input")!.getAttribute("class")).toBeNull();
+    });
+
+    it("ignores mono under bare — a bare recipe owns its own font", () => {
+      const { container } = render(
+        <Input bare mono type="text" className="command-palette-input" />,
+      );
+      expect(container.querySelector("input")!.getAttribute("class")).toBe(
+        "command-palette-input",
+      );
+    });
+
+    it("still associates the label and forwards a ref under bare", () => {
+      const ref = createRef<HTMLInputElement>();
+      render(<Input bare ref={ref} type="text" label="Custom" />);
+      expect(screen.getByLabelText("Custom")).toBe(ref.current);
+    });
+  });
 });

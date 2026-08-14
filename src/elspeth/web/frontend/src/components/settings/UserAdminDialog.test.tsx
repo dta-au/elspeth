@@ -48,6 +48,29 @@ describe("UserAdminDialog", () => {
     expect(screen.getByText("alice@example.com")).toBeInTheDocument();
   });
 
+  it("mounts the modal chrome on the app-dialog primitive (elspeth-e6fcd8d703)", async () => {
+    render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
+    await screen.findByText("Alice");
+
+    // The frame was a copy-pasted inline style object at literal z-index 101
+    // (the non-modal overlay band) with a string box-shadow no theme override
+    // could reach. It now composes the shared classes — the CSS side is gated
+    // in styles/overlayChrome.test.ts; this pins that the markup actually
+    // reaches those rules. The width/type-scale closure is the wide settings
+    // variant.
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("style")).toBeNull();
+    expect(dialog).toHaveClass(
+      "app-dialog",
+      "settings-dialog",
+      "settings-dialog-wide",
+    );
+    expect(screen.getByRole("presentation")).toHaveClass("app-dialog-backdrop");
+    expect(
+      screen.getByRole("button", { name: "Close user management dialog" }),
+    ).toHaveClass("dialog-close");
+  });
+
   it("offers no Delete button on the signed-in admin's own row", async () => {
     render(<UserAdminDialog onClose={onClose} currentUserId="john" />);
     await screen.findByText("Alice");

@@ -10,6 +10,7 @@ import {
 
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { InlineRunResults } from "@/components/execution/InlineRunResults";
+import { Button } from "@/components/ui";
 import { GraphView } from "@/components/inspector/GraphView";
 import { YamlView } from "@/components/inspector/YamlView";
 import {
@@ -392,12 +393,12 @@ export function ArtifactWorkspaceSurface({
             const available = availableArtifactTabs.includes(tab);
             const selected = activeArtifactTab === tab;
             return (
-              <button
+              <Button
                 key={tab}
                 ref={(element) => {
                   tabRefs.current[tab] = element;
                 }}
-                type="button"
+                variant="bare"
                 className="artifact-tab"
                 role="tab"
                 id={`artifact-tab-${tab}`}
@@ -424,13 +425,13 @@ export function ArtifactWorkspaceSurface({
                     }
                   />
                 )}
-              </button>
+              </Button>
             );
           })}
         </div>
-        <button type="button" className="btn-compact" onClick={focusGraph}>
-          Focus Graph
-        </button>
+        <Button compact onClick={focusGraph}>
+          Focus graph
+        </Button>
       </div>
       <p
         key={announcement.id}

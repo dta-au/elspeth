@@ -76,6 +76,7 @@ import {
   fetchRunOutputs,
 } from "@/api/client";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
+import { Button } from "@/components/ui";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -351,14 +352,15 @@ export function NarrativeResults({ summaryOverride }: NarrativeResultsProps = {}
 
       {downloadArtifact !== null && (
         <p className="narrative-results-download">
-          <button
+          <Button
+            variant="bare"
             type="button"
             className="link-button"
             data-testid="narrative-results-download-link"
             onClick={() => void handleDownload()}
           >
             Download full output
-          </button>
+          </Button>
         </p>
       )}
 

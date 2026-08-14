@@ -1,7 +1,7 @@
 // src/components/blobs/BlobRow.tsx
 import { useMemo, useState } from "react";
 import { previewBlobContentSnippet } from "@/api/client";
-import { Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
+import { Button, Icon, StructuredJsonPreview, type IconName } from "@/components/ui";
 import type { BlobMetadata } from "@/types/api";
 import {
   describeStructuralSummary,
@@ -197,7 +197,8 @@ export function BlobRow({
         {/* Actions */}
         <div className="blob-row-actions">
           {canPreview && blob.status === "ready" && (
-            <button
+            <Button
+              variant="bare"
               onClick={handleTogglePreview}
               title={previewOpen ? "Hide preview" : "Preview content"}
               aria-label={`${previewOpen ? "Hide" : "Preview"} ${blob.filename}`}
@@ -205,11 +206,12 @@ export function BlobRow({
               className="blob-action-btn"
             >
               <Icon name="eye" />
-            </button>
+            </Button>
           )}
           {blob.status === "ready" && (
             <>
-              <button
+              <Button
+                variant="bare"
                 onClick={() => onUseAsInput(blob)}
                 title="Use as pipeline input"
                 aria-label={`Use ${blob.filename} as input`}
@@ -217,25 +219,31 @@ export function BlobRow({
                 disabled={useAsInputDisabled}
               >
                 <Icon name="play" />
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="bare"
                 onClick={() => onDownload(blob.id)}
                 title="Download"
                 aria-label={`Download ${blob.filename}`}
                 className="blob-action-btn"
               >
                 <Icon name="download" />
-              </button>
+              </Button>
             </>
           )}
-          <button
+          {/* Neutral trigger by recorded decision (elspeth-50fd9b04e0):
+              destructive pattern is neutral trigger + red CONFIRM step. The
+              red step is the variant="danger" ConfirmDialog BlobManager opens
+              for this request — do not repaint this trigger red. */}
+          <Button
+            variant="bare"
             onClick={() => onDelete(blob.id)}
             title="Delete"
             aria-label={`Delete ${blob.filename}`}
             className="blob-action-btn"
           >
             <Icon name="trash" />
-          </button>
+          </Button>
         </div>
       </div>
 

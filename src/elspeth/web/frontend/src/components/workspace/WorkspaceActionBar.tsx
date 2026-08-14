@@ -8,6 +8,7 @@ import {
 import { CompletionBar } from "@/components/composer/CompletionBar";
 import { CatalogButton } from "@/components/sidebar/CatalogButton";
 import { ImportYamlButton } from "@/components/sidebar/ImportYamlButton";
+import { Button } from "@/components/ui";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -49,16 +50,16 @@ function StatusButton({
   onClick: (event: React.MouseEvent<HTMLButtonElement>) => void;
 }): JSX.Element {
   return (
-    <button
-      type="button"
-      className="btn-compact workspace-status-control"
+    <Button
+      compact
+      className="workspace-status-control"
       data-tone={status.tone}
       aria-label={`${kind}: ${status.text}`}
       onClick={onClick}
     >
       <span>{kind}:</span>
       <span>{status.text}</span>
-    </button>
+    </Button>
   );
 }
 
@@ -205,10 +206,9 @@ export function WorkspaceActionBar({
       {capabilities.completion && <CompletionBar />}
       {hasSecondaryActions && (
         <div className="workspace-more-actions">
-          <button
+          <Button
             ref={moreButtonRef}
-            type="button"
-            className="btn-compact"
+            compact
             aria-label="More actions"
             aria-controls="workspace-more-actions-panel"
             aria-expanded={menuOpen}
@@ -216,7 +216,7 @@ export function WorkspaceActionBar({
             onKeyDown={handleMoreKeyDown}
           >
             More actions
-          </button>
+          </Button>
           {menuOpen && (
             <div
               id="workspace-more-actions-panel"

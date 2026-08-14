@@ -26,27 +26,6 @@
   font-weight: 600;
 }
 
-.secrets-panel-close {
-  background: none;
-  border: none;
-  cursor: pointer;
-  color: var(--color-text-muted);
-  font-size: var(--font-size-xl);
-  line-height: 1;
-  padding: var(--space-2xs) var(--space-xs);
-  border-radius: var(--radius-sm);
-  min-width: var(--size-control);
-  min-height: var(--size-control);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.secrets-panel-close:hover {
-  background: var(--color-surface-hover);
-  color: var(--color-text);
-}
-
 .secrets-panel-body {
   flex: 1;
   overflow-y: auto;
@@ -58,7 +37,7 @@
   font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--letter-spacing-caps);
   color: var(--color-text-secondary);
 }
 
@@ -160,7 +139,7 @@
   display: inline-block;
   font-size: var(--font-size-xs);
   font-weight: 600;
-  letter-spacing: 0.05em;
+  letter-spacing: var(--letter-spacing-wide);
   text-transform: uppercase;
   padding: var(--space-2xs) var(--space-xs);
   border-radius: var(--radius-sm);
@@ -200,9 +179,9 @@
 
 /* The panel's only irreversible action was the one control in this file with
    no hover state at all, while the harmless close button beside it lightens
-   (elspeth-e977b66dba). Same lighten-the-surface move as
-   .secrets-panel-close:hover, in the destructive tint rather than the neutral
-   one so the confirmation reads as "this is the delete". */
+   (elspeth-e977b66dba). Same lighten-the-surface move as .dialog-close:hover,
+   in the destructive tint rather than the neutral one so the confirmation
+   reads as "this is the delete". */
 .secrets-delete-btn:hover {
   background: var(--color-error-bg);
   color: var(--color-error);
@@ -244,7 +223,7 @@
   font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: var(--letter-spacing-wide);
   color: var(--color-text-secondary);
   border-bottom: 1px solid var(--color-border);
 }
@@ -350,7 +329,7 @@
   font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--letter-spacing-caps);
   color: var(--color-text-secondary);
   padding: 0 var(--space-2xs);
 }
@@ -401,7 +380,7 @@
   font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: var(--letter-spacing-caps);
   color: var(--color-text-secondary);
 }
 

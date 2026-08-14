@@ -90,6 +90,8 @@
 //   escape hatch is deliberately available even when nothing is chosen.
 
 import { useEffect, useId, useRef, useState } from "react";
+
+import { Button, Input } from "@/components/ui";
 import type {
   GuidedRespondAction,
   MultiSelectWithCustomPayload,
@@ -336,8 +338,8 @@ export function MultiSelectWithCustomTurn({
             const pressed = selection.chosen.has(option.id);
             return (
               <div key={option.id} className="guided-chip-item">
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="guided-chip-btn"
                   aria-pressed={pressed}
                   aria-describedby={hintId}
@@ -345,7 +347,7 @@ export function MultiSelectWithCustomTurn({
                   disabled={disabled}
                 >
                   {option.label}
-                </button>
+                </Button>
                 {option.hint !== null && (
                   <p id={hintId} className="guided-chip-hint">
                     {option.hint}
@@ -361,7 +363,10 @@ export function MultiSelectWithCustomTurn({
         <label htmlFor={customInputId} className="guided-custom-label">
           Custom field
         </label>
-        <input
+        {/* bare: .guided-custom-input is a complete bespoke recipe; .input's
+            chrome would restyle it (see SingleSelectTurn's identical note). */}
+        <Input
+          bare
           ref={customInputRef}
           id={customInputId}
           type="text"
@@ -383,14 +388,14 @@ export function MultiSelectWithCustomTurn({
           }}
           placeholder="Add a field name..."
         />
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-custom-submit-btn"
           onClick={handleAddCustom}
           disabled={disabled || addDisabled}
         >
           Add
-        </button>
+        </Button>
       </div>
 
       {selection.customs.length > 0 && (
@@ -398,7 +403,7 @@ export function MultiSelectWithCustomTurn({
           {selection.customs.map((value) => (
             <li key={value} className="guided-multi-custom-chip">
               <span className="guided-multi-custom-chip-label">{value}</span>
-              <button
+              <Button
                 ref={(el) => {
                   // Keep the ref-Map in sync with mount/unmount lifecycle.
                   // React invokes the callback with `el` on mount and `null`
@@ -410,7 +415,7 @@ export function MultiSelectWithCustomTurn({
                     removeBtnRefs.current.set(value, el);
                   }
                 }}
-                type="button"
+                variant="bare"
                 className="guided-multi-custom-remove-btn"
                 onClick={() => handleRemoveCustom(value)}
                 aria-label={`Remove ${value}`}
@@ -422,7 +427,7 @@ export function MultiSelectWithCustomTurn({
                     exception to the "no aria-label on visible-text controls"
                     rule — there is no useful visible text. */}
                 x
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
@@ -430,23 +435,23 @@ export function MultiSelectWithCustomTurn({
 
       <div className="guided-multi-actions">
         {payload.escape_label !== null && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-multi-escape-btn"
             onClick={handleEscape}
             disabled={disabled}
           >
             {payload.escape_label}
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-multi-continue-btn"
           onClick={handleContinue}
           disabled={disabled || continueDisabled}
         >
           Continue
-        </button>
+        </Button>
       </div>
     </div>
   );

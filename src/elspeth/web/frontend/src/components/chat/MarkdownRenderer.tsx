@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import mermaid from "mermaid";
 import DOMPurify from "dompurify";
 import { Highlight, themes as prismThemes } from "prism-react-renderer";
+import { Button } from "@/components/ui";
 import { useTheme, type ResolvedTheme } from "@/hooks/useTheme";
 
 type MermaidConfig = NonNullable<Parameters<typeof mermaid.initialize>[0]>;
@@ -177,14 +178,14 @@ function FencedCodeBlock({
 
   return (
     <div className="code-block-wrapper">
-      <button
-        type="button"
+      <Button
+        variant="bare"
         className="code-block-copy"
         onClick={handleCopy}
         aria-label={copied ? "Copied" : "Copy code"}
       >
         {copied ? "Copied" : "Copy"}
-      </button>
+      </Button>
       <Highlight code={code} language={language || "text"} theme={prismTheme}>
         {({ className: hClass, style, tokens, getLineProps, getTokenProps }) => (
           <pre className={`code-block ${hClass}`} style={style}>

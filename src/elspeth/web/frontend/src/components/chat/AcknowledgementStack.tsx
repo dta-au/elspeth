@@ -21,6 +21,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CompositionState } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
+import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { AcknowledgementCard } from "./AcknowledgementCard";
 import { supportsAmendment } from "./acknowledgementLabels";
@@ -280,20 +281,20 @@ export function AcknowledgementStack({
               <span className="ack-stack-error-body">{optOutError.body}</span>
             </div>
           )}
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="ack-stack-opt-out-link"
             onClick={() => setShowOptOutConfirm(true)}
             disabled={optOutInFlight}
           >
             Stop reviewing interpretations this session
-          </button>
+          </Button>
         </div>
       )}
 
       {showOptOutConfirm && (
         <ConfirmDialog
-          title="Stop reviewing interpretations for this session?"
+          title="Stop reviewing interpretations"
           message={
             "For the rest of this session, I'll bake interpretations in " +
             "automatically without asking you to review each one.  You can " +

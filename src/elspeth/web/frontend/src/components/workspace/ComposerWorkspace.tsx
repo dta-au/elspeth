@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { hasCompositionContent } from "@/utils/compositionState";
 import {
@@ -277,9 +278,9 @@ export function ComposerWorkspace({
           aria-label={narrow ? "Workspace view" : undefined}
           hidden={!narrow}
         >
-          <button
+          <Button
             ref={composeTabRef}
-            type="button"
+            variant="bare"
             className="artifact-tab"
             role={narrow ? "tab" : undefined}
             id={narrow ? "workspace-compose-tab" : undefined}
@@ -290,10 +291,10 @@ export function ComposerWorkspace({
             onKeyDown={handleViewTabKeyDown}
           >
             Compose
-          </button>
-          <button
+          </Button>
+          <Button
             ref={pipelineTabRef}
-            type="button"
+            variant="bare"
             className="artifact-tab"
             role={narrow ? "tab" : undefined}
             id={narrow ? "workspace-pipeline-tab" : undefined}
@@ -304,7 +305,7 @@ export function ComposerWorkspace({
             onKeyDown={handleViewTabKeyDown}
           >
             Pipeline
-          </button>
+          </Button>
         </div>
 
         <div
@@ -332,15 +333,15 @@ export function ComposerWorkspace({
               <ErrorBoundary label="Authoring pane">{authoring}</ErrorBoundary>
             </div>
             <div className="workspace-authoring-status">{authoringStatus}</div>
-            <button
+            <Button
               ref={collapseControlRef}
-              type="button"
-              className="btn-compact workspace-collapse-control"
+              compact
+              className="workspace-collapse-control"
               aria-label="Collapse authoring pane"
               onClick={collapseAuthoring}
             >
               Collapse authoring pane
-            </button>
+            </Button>
           </section>
           {paneState.authoringCollapsed && (
             <div
@@ -350,16 +351,15 @@ export function ComposerWorkspace({
               <div id="workspace-collapsed-status" role="status">
                 {collapsedStatusContent}
               </div>
-              <button
+              <Button
                 ref={restoreControlRef}
-                type="button"
-                className="btn-compact"
+                compact
                 aria-label="Restore authoring pane"
                 aria-describedby="workspace-collapsed-status"
                 onClick={restoreAuthoring}
               >
                 Restore authoring pane
-              </button>
+              </Button>
             </div>
           )}
         </div>

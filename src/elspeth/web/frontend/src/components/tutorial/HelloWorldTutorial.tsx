@@ -6,6 +6,7 @@ import {
   renameSession,
   sendTutorialAbandonBeacon,
 } from "@/api/client";
+import { Button } from "@/components/ui";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { TutorialTurn1Welcome } from "./TutorialTurn1Welcome";
@@ -403,13 +404,13 @@ export function HelloWorldTutorial({
         {(state.step === "guided" ||
           state.step === "run" ||
           state.step === "audit") && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="tutorial-link-button tutorial-exit-button"
             onClick={onExitTutorial}
           >
             Exit tutorial
-          </button>
+          </Button>
         )}
       </nav>
       {state.step === "welcome" && (

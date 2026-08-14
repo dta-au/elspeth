@@ -5,6 +5,7 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
 import type {
   CompositionState,
@@ -580,15 +581,14 @@ export function ExecuteButton(): JSX.Element | null {
 
   return (
     <>
-      <button
-        type="button"
-        // Plain .btn, never .btn-primary: CompletionBar's contract (its
-        // docstring, per plan 19b §"Scope boundaries") renders Save-for-review
-        // / Run / Export YAML as CO-EQUAL verbs with no primary emphasis. A
-        // conditional btn-primary here singled Run out as the lone filled
-        // accent button whenever the composition was valid, contradicting the
-        // documented design (elspeth-0d37694c8c).
-        className="btn side-rail-execute-btn"
+      <Button
+        // Default (secondary) variant, never variant="primary": CompletionBar's
+        // contract (its docstring, per plan 19b §"Scope boundaries") renders
+        // Save-for-review / Run / Export YAML as CO-EQUAL verbs with no primary
+        // emphasis. A conditional primary here singled Run out as the lone
+        // filled accent button whenever the composition was valid,
+        // contradicting the documented design (elspeth-0d37694c8c).
+        className="side-rail-execute-btn"
         onClick={handleRunClick}
         // Native disabled ONLY for reasons without a button-attached
         // explanation. The interpretation-pending block must stay focusable
@@ -618,7 +618,7 @@ export function ExecuteButton(): JSX.Element | null {
         ) : (
           "Run pipeline"
         )}
-      </button>
+      </Button>
       {/*
         Visually-hidden description for AT users. The `title` attribute on
         the button alone is not reliably announced by all screen readers
@@ -660,7 +660,7 @@ export function ExecuteButton(): JSX.Element | null {
       )}
       {showRunDisclosure && (
         <ConfirmDialog
-          title="Run pipeline?"
+          title="Run pipeline"
           message={
             egressLines.length > 0
               ? "This run leaves the composer and uses your stored credentials:"
@@ -678,7 +678,7 @@ export function ExecuteButton(): JSX.Element | null {
             </ul>
           )}
           <label className="run-disclosure-opt-out">
-            <input
+            <Input
               type="checkbox"
               checked={skipFutureDisclosure}
               onChange={(event) => setSkipFutureDisclosure(event.target.checked)}

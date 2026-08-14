@@ -249,7 +249,11 @@
   background-color: var(--color-surface);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
-  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.35);
+  /* The blocking-overlay elevation tier, not a hand-tuned literal
+     (elspeth-e6fcd8d703): this was the one modal shadow left outside
+     --shadow-modal, so the palette could never receive the light-theme
+     shadow correction the token carries. */
+  box-shadow: var(--shadow-modal);
   z-index: var(--z-palette);
   display: flex;
   flex-direction: column;
@@ -515,8 +519,17 @@
    (elspeth-e6fcd8d703): the same compact-control recipe under the ONE name
    future and migrating dialogs compose, replacing the five divergent close
    treatments the review counted. Grouped here so the primitive's name ships
-   live declarations rather than a dead rule. */
+   live declarations rather than a dead rule. The three settings dialogs
+   compose `.dialog-close` directly in their TSX.
+
+   `.explain-dialog-close` collapses onto the same recipe by grouping, not by
+   rename: its class NAME is ExplainDialog.tsx's focus-trap initial-focus
+   selector (the same load-bearing-name situation as .graph-modal-close). Its
+   old hand-rolled copy in audit.css — badge radius (--radius-sm), no font,
+   the exact defects the graph/yaml close buttons already shed — is deleted,
+   so this group is the recipe's only home. */
 .dialog-close,
+.explain-dialog-close,
 .graph-modal-close,
 .yaml-modal-close {
   display: inline-flex;
@@ -538,6 +551,7 @@
 }
 
 .dialog-close:hover,
+.explain-dialog-close:hover,
 .graph-modal-close:hover,
 .yaml-modal-close:hover {
   background-color: var(--color-surface-hover);

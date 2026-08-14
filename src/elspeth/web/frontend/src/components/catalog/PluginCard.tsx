@@ -25,6 +25,7 @@
 
 import { useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
+import { Button } from "@/components/ui";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
 import { pluginDisplayName } from "./pluginDisplayName";
@@ -195,9 +196,8 @@ export function PluginCard({
 
       <div className="plugin-card-actions">
         {hasDetails && (
-          <button
-            type="button"
-            className="btn btn-small plugin-card-detail-toggle"
+          <Button
+            className="btn-small plugin-card-detail-toggle"
             onClick={() =>
               setDetailsState((current) => ({
                 cardId,
@@ -209,18 +209,17 @@ export function PluginCard({
             aria-label={`Reference details for ${displayName}`}
           >
             Details
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
-          className="btn btn-small plugin-card-disclosure"
+        <Button
+          className="btn-small plugin-card-disclosure"
           onClick={handleDisclosureClick}
           aria-expanded={expanded}
           aria-controls={schemaPanelId}
           aria-label={`Schema for ${displayName}`}
         >
           Schema
-        </button>
+        </Button>
       </div>
 
       {detailsOpen && (
@@ -245,9 +244,9 @@ export function PluginCard({
           {schemaError ? (
             <div className="plugin-card-schema-error">
               <span>Failed to load schema.</span>
-              <button type="button" className="btn btn-small" onClick={handleRetry} aria-label="Retry loading schema">
+              <Button className="btn-small" onClick={handleRetry} aria-label="Retry loading schema">
                 Retry
-              </button>
+              </Button>
             </div>
           ) : schema === null || configSchema === undefined ? (
             <div role="status" aria-live="polite" className="plugin-card-schema-loading">

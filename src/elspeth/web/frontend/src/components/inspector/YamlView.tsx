@@ -20,6 +20,7 @@
 // ============================================================================
 
 import { useState, useEffect, useMemo } from "react";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import * as api from "@/api/client";
 import type { ApiError } from "@/types/index";
@@ -161,30 +162,30 @@ export function YamlView() {
             </span>
           ) : (
             <span className="tool-call-actions">
-              <button
-                type="button"
-                className="btn btn-primary btn-small"
+              <Button
+                variant="primary"
+                className="btn-small"
                 disabled={pendingYamlProposalIsBusy}
                 onClick={() => void acceptProposal(pendingYamlProposal.id)}
                 aria-label={`Accept YAML proposal: ${pendingYamlProposal.summary}`}
               >
                 Accept
-              </button>
-              <button
-                type="button"
-                className="btn btn-danger btn-small"
+              </Button>
+              <Button
+                variant="danger"
+                className="btn-small"
                 disabled={pendingYamlProposalIsBusy}
                 onClick={() => setRejectConfirmId(pendingYamlProposal.id)}
                 aria-label={`Reject YAML proposal: ${pendingYamlProposal.summary}`}
               >
                 Reject
-              </button>
+              </Button>
             </span>
           )}
         </div>
         {rejectConfirmId !== null && (
           <ConfirmDialog
-            title="Reject this YAML proposal?"
+            title="Reject YAML proposal"
             message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
             confirmLabel="Reject proposal"
             cancelLabel="Keep open"

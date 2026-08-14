@@ -107,8 +107,12 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 1.25rem;
-  height: 1.25rem;
+  /* --size-icon-md is the 20px toolbar / step-indicator rank this indicator's
+     old 1.25rem literal was equal to only at the 16px default root
+     (elspeth-7f63055e06: glyph boxes are px-deliberate so icon and label
+     scale together). */
+  width: var(--size-icon-md);
+  height: var(--size-icon-md);
   flex: 0 0 auto;
   border-radius: 50%;
   border: 1px solid var(--color-input-border);
@@ -139,8 +143,14 @@
 }
 
 .guided-workflow-check {
-  width: 0.75rem;
-  height: 0.75rem;
+  /* 12px ≡ the old 0.75rem at the default root, converted to px per the
+     glyph-boxes-are-px rationale on the icon rungs (elspeth-7f63055e06).
+     Deliberately NOT --size-icon-sm (16px): the check sits inside the 20px
+     --size-icon-md ring above, and a 16px glyph would collide with the
+     current-step ring's 2px border. No 12px rung is shipped; minting one
+     belongs to the token owner. */
+  width: 12px;
+  height: 12px;
   fill: none;
   stroke: currentColor;
   stroke-width: 1.8;
@@ -1794,7 +1804,12 @@
   gap: var(--space-sm);
 }
 
-/* Checkbox itself */
+/* Checkbox itself. 18px is a DELIBERATE keep (D3 icon-size adoption pass):
+   this is a native form control (accent-color chrome), not a glyph box, so
+   the icon rungs don't govern it; it is already px (no rem/px mixed-scale
+   defect — elspeth-7f63055e06); and nudging it to the nearest 20px rung
+   would be a visual change with no cross-tree checkbox convention backing
+   it. */
 .guided-schema-checkbox {
   width: 18px;
   height: 18px;
@@ -2279,6 +2294,12 @@
   fill: var(--color-surface-elevated);
   stroke: var(--color-border-strong);
   stroke-width: 1.5;
+  /* Card corner reads the token rank, matching GraphView.tsx's editable
+     cards (elspeth-37cc8b5310: a raw literal is invisible to the radius
+     system, so a card-rank retune could never reach this graph). The SVG2
+     geometry property overrides the rect's rx="8" presentation attribute,
+     which stays in the TSX as the value-identical fallback. */
+  rx: var(--radius-lg);
 }
 
 .guided-readonly-graph__node--source,

@@ -153,7 +153,7 @@ async function assertScenario(
       await expect(invoker).toBeEnabled();
       await invoker.focus();
       await invoker.click();
-      const dialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const dialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(dialog).toBeVisible();
       await expectDialogGeometry(page, dialog);
       await dialog.getByRole("button", { name: "Cancel" }).click();
@@ -633,7 +633,7 @@ test.describe("Composer deterministic workspace geometry", () => {
           composer.artifactTab("Spec"),
           composer.artifactTab("YAML"),
           composer.artifactTab("Run"),
-          page.getByRole("button", { name: "Focus Graph" }),
+          page.getByRole("button", { name: "Focus graph" }),
           composer.validationStatus(),
           composer.auditStatus(),
           composer.moreActions(),

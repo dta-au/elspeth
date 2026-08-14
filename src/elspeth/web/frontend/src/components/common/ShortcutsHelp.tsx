@@ -1,4 +1,5 @@
 import { useId, useRef } from "react";
+import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
 interface ShortcutsHelpProps {
@@ -128,13 +129,9 @@ export function ShortcutsHelp({ onClose }: ShortcutsHelpProps) {
           ))}
         </div>
         <footer className="confirm-dialog-actions">
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn confirm-dialog-btn"
-          >
+          <Button onClick={onClose} className="confirm-dialog-btn">
             Close
-          </button>
+          </Button>
         </footer>
       </div>
     </>

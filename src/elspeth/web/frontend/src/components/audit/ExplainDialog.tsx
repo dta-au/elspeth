@@ -14,6 +14,7 @@
  */
 import { useEffect, useId, useRef } from "react";
 
+import { Button } from "@/components/ui";
 import { useAuditReadinessStore } from "../../stores/auditReadinessStore";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
@@ -95,14 +96,15 @@ export function ExplainDialog({
             <h2 id={titleId} className="explain-dialog-title">
               What this pipeline will record
             </h2>
-            <button
+            <Button
+              variant="bare"
               type="button"
               className="explain-dialog-close"
               onClick={onClose}
               aria-label="Close"
             >
               ×
-            </button>
+            </Button>
           </header>
 
           {isLoading && !explain && (

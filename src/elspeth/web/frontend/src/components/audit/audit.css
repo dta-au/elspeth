@@ -321,20 +321,10 @@
   font-size: var(--font-size-lg);
 }
 
-.explain-dialog-close {
-  min-width: 36px;
-  min-height: var(--size-control-compact);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-  background-color: var(--color-surface-elevated);
-  color: var(--color-text);
-  cursor: pointer;
-  transition: background-color var(--transition-fast);
-}
-
-.explain-dialog-close:hover {
-  background-color: var(--color-surface-hover);
-}
+/* .explain-dialog-close is styled by the shared .dialog-close group in
+   common.css (elspeth-e6fcd8d703). The class stays in the TSX because it is
+   ExplainDialog's focus-trap initial-focus selector; no declarations live
+   here so the recipe has exactly one home. */
 
 .explain-dialog-loading,
 .explain-dialog-error,

@@ -6,6 +6,7 @@
 // ============================================================================
 
 import { useEffect, useState } from "react";
+import { Button, Icon } from "@/components/ui";
 import {
   type RunHistoryLoadOutcome,
   useExecutionStore,
@@ -364,13 +365,12 @@ export function InlineRunResults({
             <p role="status" aria-live="polite">
               Run history unavailable.
             </p>
-            <button
-              type="button"
-              className="btn-compact"
+            <Button
+              compact
               onClick={() => setHistoryRetrySequence((current) => current + 1)}
             >
               Retry
-            </button>
+            </Button>
           </div>
         </div>
       );
@@ -390,13 +390,12 @@ export function InlineRunResults({
       <div className="empty-state">
         <div>
           <p>No runs yet. Run the pipeline to see its results here.</p>
-          <button
-            type="button"
-            className="btn-compact"
+          <Button
+            compact
             onClick={() => window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT))}
           >
             Run pipeline
-          </button>
+          </Button>
         </div>
       </div>
     ) : (
@@ -428,23 +427,26 @@ export function InlineRunResults({
           )}
         </div>
         <div className="inline-run-results-actions">
-          <button
-            type="button"
+          <Button
+            compact
             onClick={() => setIsCollapsed((value) => !value)}
-            className="btn-compact inline-run-results-collapse-btn"
+            className="inline-run-results-collapse-btn"
             aria-label={isCollapsed ? "Show run results" : "Hide run results"}
             title={isCollapsed ? "Show run results" : "Hide run results"}
           >
-            <span aria-hidden="true">{isCollapsed ? "\u25B2" : "\u25BC"}</span>
-          </button>
+            {/* Direction semantics preserved from the text-glyph era: the
+                collapsed toolbar points up (expand reveals above-the-toolbar
+                content), expanded points down. */}
+            <Icon name={isCollapsed ? "chevron-up" : "chevron-down"} />
+          </Button>
           {hasDrawerRuns && (
-            <button
-              type="button"
+            <Button
+              compact
               onClick={() => setShowHistory(true)}
-              className="btn-compact inline-run-results-history-btn"
+              className="inline-run-results-history-btn"
             >
               Runs ({drawerRuns.length})
-            </button>
+            </Button>
           )}
         </div>
       </div>

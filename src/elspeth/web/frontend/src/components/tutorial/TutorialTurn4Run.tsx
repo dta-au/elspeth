@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
-import { AlertBanner } from "@/components/ui";
+import { titleCaseLabel } from "@/components/catalog/pluginDisplayName";
+import { AlertBanner, Button } from "@/components/ui";
 import type { TutorialRunResponse } from "@/types/api";
 import {
   TUTORIAL_RUN_PREAMBLE,
@@ -309,13 +310,7 @@ export function TutorialTurn4Run({
           </div>
           {showCancel && (
             <div className="tutorial-actions">
-              <button
-                type="button"
-                className="btn"
-                onClick={onCancelClick}
-              >
-                Cancel run
-              </button>
+              <Button onClick={onCancelClick}>Cancel run</Button>
             </div>
           )}
         </>
@@ -326,21 +321,17 @@ export function TutorialTurn4Run({
             {error}
           </p>
           <div className="tutorial-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={onRetryClick}
-            >
+            <Button variant="primary" onClick={onRetryClick}>
               Retry
-            </button>
+            </Button>
             {onBack !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="tutorial-link-button"
                 onClick={onBack}
               >
                 Back
-              </button>
+              </Button>
             )}
           </div>
         </>
@@ -360,22 +351,18 @@ export function TutorialTurn4Run({
           )}
           <TutorialResultTable rows={result.rows} />
           <div className="tutorial-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => onCompleted(result)}
-            >
+            <Button variant="primary" onClick={() => onCompleted(result)}>
               {TURN_4_PRIMARY_BUTTON}
-            </button>
+            </Button>
             {onBack !== undefined && (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="tutorial-link-button"
                 onClick={onBack}
                 aria-label="Back to the pipeline build"
               >
                 Back
-              </button>
+              </Button>
             )}
           </div>
         </>
@@ -404,7 +391,7 @@ function TutorialResultTable({ rows }: { rows: RunResultRow[] }): JSX.Element {
         <thead>
           <tr>
             {columns.map((column) => (
-              <th key={column}>{titleCase(column)}</th>
+              <th key={column}>{titleCaseLabel(column)}</th>
             ))}
           </tr>
         </thead>
@@ -448,10 +435,6 @@ function stringifyCell(value: unknown): string {
     return String(value);
   }
   return JSON.stringify(value);
-}
-
-function titleCase(value: string): string {
-  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
 function formatError(err: unknown): string {

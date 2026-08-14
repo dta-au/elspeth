@@ -707,13 +707,16 @@ export function LoginPage() {
               }}
             >
               Already have an account?{" "}
-              <button
+              {/* Inside a <form>: the explicit type="button" is the submit-
+                  hazard decision — this link must never submit the form. */}
+              <Button
+                variant="bare"
                 type="button"
                 className="link-button"
                 onClick={() => switchView("signin")}
               >
                 Sign in
-              </button>
+              </Button>
             </p>
           </form>
         ) : (
@@ -796,13 +799,16 @@ export function LoginPage() {
                   }}
                 >
                   New to ELSPETH?{" "}
-                  <button
+                  {/* Inside a <form>: explicit type="button" — must never
+                      submit the sign-in form. */}
+                  <Button
+                    variant="bare"
                     type="button"
                     className="link-button"
                     onClick={() => switchView("register")}
                   >
                     Create an account
-                  </button>
+                  </Button>
                 </p>
               )}
             </form>

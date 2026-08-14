@@ -78,6 +78,7 @@
 
 import { useRef } from "react";
 
+import { Button } from "@/components/ui";
 import { useExecutionStore } from "@/stores/executionStore";
 import { dispatchArtifactViewIntent } from "@/lib/composer-events";
 import { terminalRunPhrase } from "./runTerminalPhrases";
@@ -175,33 +176,44 @@ export function RunOutcomeNotice(): JSX.Element {
         {message ?? ""}
       </div>
       {lastRunOutcome !== null && message !== null && (
-        <div
-          ref={bannerRef}
-          className={`${toneClassName(lastRunOutcome.status)} run-outcome-notice`}
-          data-run-outcome={lastRunOutcome.status}
-        >
-          <span className="run-outcome-notice-message">{message}</span>
-          <span className="run-outcome-notice-actions">
-            {/* "View run", not "View results": a failed or empty run has no
-                results, and the destination is the Run panel's diagnostics in
-                both of those cases. The label must be true for all five
-                terminal statuses this notice can carry. */}
-            <button
-              type="button"
-              className="alert-banner-action"
-              onClick={handleViewRun}
-            >
-              View run
-            </button>
-            <button
-              type="button"
-              className="alert-banner-action"
-              onClick={handleDismiss}
-              aria-label="Dismiss run outcome notice"
-            >
-              Dismiss
-            </button>
-          </span>
+        /* Fixed-overlay wrapper (elspeth-1c4687ff67 class): rendered in flow
+           before the header, the strip's arrival displaced the entire app by
+           its height and snapped it back on dismiss. The wrapper mirrors
+           .app-notice-center's treatment (styles/shared.css) — fixed at the
+           top of the viewport on --z-overlay with an opaque --color-surface
+           ground beneath the .alert-banner tone tint (a bare 10-14% alpha
+           tint over the header is text-on-text). Only the VISUAL banner moves
+           into the overlay; the polite region above stays the one always-
+           mounted announcement node. */
+        <div className="run-outcome-notice-overlay">
+          <div
+            ref={bannerRef}
+            className={`${toneClassName(lastRunOutcome.status)} run-outcome-notice`}
+            data-run-outcome={lastRunOutcome.status}
+          >
+            <span className="run-outcome-notice-message">{message}</span>
+            <span className="run-outcome-notice-actions">
+              {/* "View run", not "View results": a failed or empty run has no
+                  results, and the destination is the Run panel's diagnostics in
+                  both of those cases. The label must be true for all five
+                  terminal statuses this notice can carry. */}
+              <Button
+                variant="bare"
+                className="alert-banner-action"
+                onClick={handleViewRun}
+              >
+                View run
+              </Button>
+              <Button
+                variant="bare"
+                className="alert-banner-action"
+                onClick={handleDismiss}
+                aria-label="Dismiss run outcome notice"
+              >
+                Dismiss
+              </Button>
+            </span>
+          </div>
         </div>
       )}
     </>

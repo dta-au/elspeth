@@ -2,6 +2,7 @@
 
 import { useEffect, useId, useRef, useState } from "react";
 
+import { Button } from "@/components/ui";
 import type {
   ComposerProgressSnapshot,
   CompositionState,
@@ -350,14 +351,14 @@ export function ComposingIndicator({
             </>
           )}
 
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="composing-details-toggle"
             aria-expanded={detailsOpen}
             onClick={() => setDetailsOpen((open) => !open)}
           >
             {detailsOpen ? "Hide details" : "Show details"}
-          </button>
+          </Button>
 
           {detailsOpen && (
             <div className="composing-details">

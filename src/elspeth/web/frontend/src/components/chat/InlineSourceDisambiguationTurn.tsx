@@ -47,6 +47,8 @@
 
 import { useEffect, useRef } from "react";
 
+import { Button } from "@/components/ui";
+
 import { plural } from "@/utils/plural";
 
 /**
@@ -180,28 +182,26 @@ export function InlineSourceDisambiguationTurn({
           Label "Yes — N rows" is load-bearing — the widget test
           and the ChatPanel wiring test both query by /yes.*N rows/i.
         */}
-        <button
+        <Button
           ref={primaryButtonRef}
-          type="button"
-          className="btn btn-primary inline-source-disambiguation-turn-confirm"
+          variant="primary"
+          className="inline-source-disambiguation-turn-confirm"
           onClick={() => onConfirmMultiRow(proposalId)}
         >
           {`Yes — ${plural(rowCount, "row")}`}
-        </button>
-        <button
-          type="button"
-          className="btn inline-source-disambiguation-turn-single"
+        </Button>
+        <Button
+          className="inline-source-disambiguation-turn-single"
           onClick={() => onTreatAsOneRow(proposalId)}
         >
           {"No — treat as 1 row"}
-        </button>
-        <button
-          type="button"
-          className="btn inline-source-disambiguation-turn-edit"
+        </Button>
+        <Button
+          className="inline-source-disambiguation-turn-edit"
           onClick={() => onEditRows(proposalId)}
         >
           Edit the rows
-        </button>
+        </Button>
       </div>
 
       {/*
@@ -213,13 +213,13 @@ export function InlineSourceDisambiguationTurn({
         wiring test to find it; the surrounding wrapper is presentational.
       */}
       <div className="inline-source-disambiguation-turn-escape">
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="inline-source-disambiguation-turn-not-source"
           onClick={() => onNotSourceData(messageId)}
         >
-          {"This isn’t source data"}
-        </button>
+          {"This isn't source data"}
+        </Button>
       </div>
     </section>
   );

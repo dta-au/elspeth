@@ -241,7 +241,7 @@ test.describe("Composer workspace visual baselines", () => {
     try {
       await expect(composer.runPipeline()).toBeEnabled();
       await composer.runPipeline().click();
-      const dialog = page.getByRole("alertdialog", { name: "Run pipeline?" });
+      const dialog = page.getByRole("alertdialog", { name: "Run pipeline" });
       await expect(dialog).toBeVisible();
       await expectDialogGeometry(page, dialog);
       await expect(page).toHaveScreenshot("tall-dialog-1280x720.png", {

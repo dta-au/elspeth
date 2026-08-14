@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button } from "@/components/ui";
 import {
   deriveVersionLabel,
   describeVersionOperation,
@@ -201,7 +202,8 @@ export function HeaderVersionSelector(): JSX.Element | null {
       className="version-selector header-version-selector"
       onBlur={onContainerBlur}
     >
-      <button
+      <Button
+        compact
         ref={triggerRef}
         aria-haspopup="listbox"
         aria-expanded={isOpen}
@@ -213,13 +215,13 @@ export function HeaderVersionSelector(): JSX.Element | null {
         // 40px .app-header band (--size-header-height), so .btn's
         // min-height: var(--size-control) overflowed it by 2px at every
         // viewport taller than 800px — the only regime the header.css compact
-        // override did NOT cover (elspeth-2d29ccf56e). Composes .btn-compact
-        // per the tokens.css:248 rule rather than redeclaring a literal
-        // min-height on .version-selector-trigger.
-        className="btn-compact version-selector-trigger"
+        // override did NOT cover (elspeth-2d29ccf56e). `compact` composes
+        // .btn-compact per the tokens.css:248 rule rather than redeclaring a
+        // literal min-height on .version-selector-trigger.
+        className="version-selector-trigger"
       >
         v{currentVersion} <span aria-hidden="true">▾</span>
-      </button>
+      </Button>
 
       {isOpen && (
         <div className="version-selector-dropdown">
@@ -309,9 +311,9 @@ export function HeaderVersionSelector(): JSX.Element | null {
             })}
           </ul>
           <div className="version-selector-actions">
-            <button
+            <Button
               type="button"
-              className="btn version-selector-revert-btn"
+              className="version-selector-revert-btn"
               disabled={!canRevertSelected}
               aria-label={
                 canRevertSelected
@@ -327,7 +329,7 @@ export function HeaderVersionSelector(): JSX.Element | null {
               {canRevertSelected
                 ? `Revert to v${selectedVersion.version}`
                 : "Current version selected"}
-            </button>
+            </Button>
           </div>
         </div>
       )}

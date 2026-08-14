@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import * as api from "@/api/client";
+import { Button, Input } from "@/components/ui";
 import type { AdminUserSummary } from "@/types/index";
 
 /**
@@ -20,8 +21,10 @@ import type { AdminUserSummary } from "@/types/index";
  * focused) and the banner is scrolled into view.
  *
  * Modal chrome follows the SecretsPanel convention: backdrop + focus trap
- * + Escape-close + role=dialog, with the shared .secrets-panel-* shell
- * classes and .user-admin-* content classes from settings.css.
+ * + Escape-close + role=dialog, on the shared .app-dialog frame primitive
+ * (with the .settings-dialog closure and .dialog-close affordance), plus
+ * the .secrets-panel-* shell and .user-admin-* content classes from
+ * settings.css.
  */
 
 interface UserAdminDialogProps {
@@ -156,12 +159,7 @@ export function UserAdminDialog({
       <div
         role="presentation"
         onClick={onClose}
-        style={{
-          position: "fixed",
-          inset: 0,
-          backgroundColor: "rgba(0,0,0,0.45)",
-          zIndex: 100,
-        }}
+        className="app-dialog-backdrop"
       />
       {/* Modal */}
       <div
@@ -169,37 +167,20 @@ export function UserAdminDialog({
         role="dialog"
         aria-modal="true"
         aria-labelledby="user-admin-title"
-        style={{
-          position: "fixed",
-          top: "50%",
-          left: "50%",
-          transform: "translate(-50%, -50%)",
-          zIndex: 101,
-          width: 560,
-          maxWidth: "calc(100vw - 32px)",
-          maxHeight: "calc(100vh - 64px)",
-          display: "flex",
-          flexDirection: "column",
-          backgroundColor: "var(--color-surface)",
-          borderRadius: 8,
-          boxShadow: "0 8px 32px rgba(0,0,0,0.25)",
-          border: "1px solid var(--color-border)",
-          fontSize: 13,
-          overflow: "hidden",
-        }}
+        className="app-dialog settings-dialog settings-dialog-wide"
       >
         <div className="secrets-panel-header">
           <h2 id="user-admin-title" className="secrets-panel-title">
             User management
           </h2>
-          <button
-            type="button"
+          <Button
+            variant="bare"
             onClick={onClose}
             aria-label="Close user management dialog"
-            className="secrets-panel-close"
+            className="dialog-close"
           >
             ×
-          </button>
+          </Button>
         </div>
         <div className="secrets-panel-body">
           <p className="user-admin-intro">
@@ -229,20 +210,12 @@ export function UserAdminDialog({
                 >
                   {generated.password}
                 </code>
-                <button
-                  type="button"
-                  className="btn btn-compact"
-                  onClick={onCopyPassword}
-                >
+                <Button compact onClick={onCopyPassword}>
                   {copyState === "copied" ? "Copied" : "Copy"}
-                </button>
-                <button
-                  type="button"
-                  className="btn btn-compact"
-                  onClick={() => setGenerated(null)}
-                >
+                </Button>
+                <Button compact onClick={() => setGenerated(null)}>
                   Dismiss
-                </button>
+                </Button>
                 {copyState === "failed" && (
                   <span role="alert" className="user-admin-copy-failed">
                     Copy failed — select the text manually.
@@ -288,14 +261,13 @@ export function UserAdminDialog({
                     <td>{user.email ?? "—"}</td>
                     <td className="user-admin-row-actions">
                       <div className="user-admin-row-action-group">
-                        <button
-                          type="button"
-                          className="btn btn-compact"
+                        <Button
+                          compact
                           disabled={busy}
                           onClick={() => onReset(user.user_id)}
                         >
                           Reset password
-                        </button>
+                        </Button>
                         {user.user_id !== currentUserId && (
                           // The delete control shares a grid cell with a
                           // hidden sizer carrying the longest label it can
@@ -308,30 +280,28 @@ export function UserAdminDialog({
                           <span className="user-admin-delete-slot">
                             <span
                               aria-hidden="true"
-                              className="btn btn-compact user-admin-delete-sizer"
+                              className="btn-compact user-admin-delete-sizer"
                             >
                               Confirm delete
                             </span>
                             {confirmingDelete === user.user_id ? (
-                              <button
-                                type="button"
-                                className="btn btn-compact"
+                              <Button
+                                compact
                                 disabled={busy}
                                 onClick={() => onDelete(user.user_id)}
                               >
                                 Confirm delete
-                              </button>
+                              </Button>
                             ) : (
-                              <button
-                                type="button"
-                                className="btn btn-compact"
+                              <Button
+                                compact
                                 disabled={busy}
                                 onClick={() =>
                                   setConfirmingDelete(user.user_id)
                                 }
                               >
                                 Delete
-                              </button>
+                              </Button>
                             )}
                           </span>
                         )}
@@ -348,9 +318,8 @@ export function UserAdminDialog({
             <div className="user-admin-create-fields">
               <label className="user-admin-field">
                 <span className="field-label">Username</span>
-                <input
+                <Input
                   type="text"
-                  className="input"
                   value={newUsername}
                   onChange={(e) => setNewUsername(e.target.value)}
                   autoComplete="off"
@@ -358,9 +327,8 @@ export function UserAdminDialog({
               </label>
               <label className="user-admin-field">
                 <span className="field-label">Display name</span>
-                <input
+                <Input
                   type="text"
-                  className="input"
                   value={newDisplayName}
                   onChange={(e) => setNewDisplayName(e.target.value)}
                   autoComplete="off"
@@ -368,27 +336,21 @@ export function UserAdminDialog({
               </label>
               <label className="user-admin-field">
                 <span className="field-label">Email (optional)</span>
-                <input
+                <Input
                   type="email"
-                  className="input"
                   value={newEmail}
                   onChange={(e) => setNewEmail(e.target.value)}
                   autoComplete="off"
                 />
               </label>
-              {/* .btn, not .btn-compact: the fields in this row are the shared
-                  .input primitive on the --size-control rung, and the row is
-                  align-items: flex-end, so a 36px button next to a 44px field
-                  shows the height difference as a step at the top edge
+              {/* Default (non-compact) Button: the fields in this row are the
+                  shared .input primitive on the --size-control rung, and the
+                  row is align-items: flex-end, so a 36px button next to a 44px
+                  field shows the height difference as a step at the top edge
                   (elspeth-2580a7b094). */}
-              <button
-                type="button"
-                className="btn"
-                disabled={createDisabled}
-                onClick={onCreate}
-              >
+              <Button disabled={createDisabled} onClick={onCreate}>
                 Create
-              </button>
+              </Button>
             </div>
           </fieldset>
         </div>

@@ -22,6 +22,7 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { Button, Input } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
@@ -150,9 +151,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
           {!inFlight && error !== null && (
             <div role="alert" className="save-for-review-error" data-testid="save-for-review-error">
               <p>{error}</p>
-              <button
+              <Button
+                compact
                 type="button"
-                className="btn btn-compact"
                 onClick={_onRetry}
                 disabled={!completionReady}
                 aria-disabled={!completionReady || undefined}
@@ -165,7 +166,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
                 data-testid="save-for-review-retry"
               >
                 Try again
-              </button>
+              </Button>
             </div>
           )}
 
@@ -180,7 +181,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
               </p>
               <div className="save-for-review-url-row">
                 <label htmlFor="save-for-review-url">Share URL</label>
-                <input
+                <Input
                   id="save-for-review-url"
                   type="text"
                   readOnly
@@ -188,9 +189,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
                   onFocus={(e) => e.currentTarget.select()}
                   data-testid="save-for-review-url-input"
                 />
-                <button
+                <Button
+                  compact
                   type="button"
-                  className="btn btn-compact"
                   onClick={() => void _onCopy()}
                   data-testid="save-for-review-copy"
                   aria-label="Copy share URL to clipboard"
@@ -204,7 +205,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
                       label stays two states wide and the message renders
                       below the row, exactly as UserAdminDialog does it. */}
                   {copyState === "copied" ? "Copied!" : "Copy"}
-                </button>
+                </Button>
                 <a
                   href={absoluteShareUrl}
                   target="_blank"
@@ -241,14 +242,14 @@ export function SaveForReviewDialog(): JSX.Element | null {
           )}
 
           <footer>
-            <button
+            <Button
               type="button"
-              className="btn save-for-review-close"
+              className="save-for-review-close"
               onClick={close}
               data-testid="save-for-review-close"
             >
               Close
-            </button>
+            </Button>
           </footer>
         </div>
       </section>

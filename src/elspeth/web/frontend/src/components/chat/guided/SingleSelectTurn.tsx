@@ -20,6 +20,8 @@
 // pipeline-proposal turns establish their own structures.
 
 import { useEffect, useId, useState } from "react";
+
+import { Button, Input } from "@/components/ui";
 import type {
   GuidedRespondAction,
   GuidedSourceBlobCandidate,
@@ -222,8 +224,8 @@ export function SingleSelectTurn({
               sourceBlobCompatibleOptionIds.has(option.id);
             return (
               <div key={option.id} className="guided-chip-item">
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="guided-chip-btn"
                   onClick={() => handleOptionClick(option.id)}
                   aria-describedby={hintId}
@@ -234,7 +236,7 @@ export function SingleSelectTurn({
                   }
                 >
                   {option.label}
-                </button>
+                </Button>
                 {option.hint !== null && (
                   <p id={hintId} className="guided-chip-hint">
                     {option.hint}
@@ -251,7 +253,11 @@ export function SingleSelectTurn({
           <label htmlFor={customInputId} className="guided-custom-label">
             Custom
           </label>
-          <input
+          {/* bare: .guided-custom-input is a complete bespoke recipe (flex:1,
+              --color-border-strong, font-family inherit); .input's chrome
+              would restyle it. */}
+          <Input
+            bare
             id={customInputId}
             type="text"
             className="guided-custom-input"
@@ -270,14 +276,14 @@ export function SingleSelectTurn({
             }}
             placeholder="Describe your custom option..."
           />
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-custom-submit-btn"
             onClick={handleCustomSubmit}
             disabled={disabled || !customText.trim()}
           >
             Submit custom
-          </button>
+          </Button>
         </div>
       )}
     </div>

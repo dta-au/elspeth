@@ -13,6 +13,7 @@
 //   - CSS via components/chat/guided/guided.css guided-completion-* classes.
 //   - No auto-focus on mount.
 
+import { Button } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import {
   COMPLETION_OUTCOME_LABELS,
@@ -72,13 +73,13 @@ function CompletionSummaryInner({ isTutorial }: CompletionSummaryInnerProps) {
       </h3>
 
       {!isTutorial && (
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-completion-save-btn"
           onClick={handleExit}
         >
           Open freeform editor
-        </button>
+        </Button>
       )}
     </div>
   );

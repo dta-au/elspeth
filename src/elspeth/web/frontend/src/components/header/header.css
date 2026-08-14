@@ -568,6 +568,20 @@
   padding: var(--space-1-5) var(--space-sm);
 }
 
+/* This field routes through ui/Input (D3 primitive census), whose .input base
+   binds the 44px --size-control rung. Its Save/Cancel siblings in this grid
+   are 36px btn-compact, so the unadjusted primitive left one 44px control in
+   a 36px row of the dense popover. Re-assert the compact rung and its
+   padding/type scale over .input — same dense-context move as
+   .catalog-search-input. The primitive's border/focus-ring/placeholder
+   vocabulary is adopted deliberately: those were UA-default chrome on the
+   dark popover, the defect class the ui primitives exist to retire. */
+.header-session-switcher-rename-input {
+  min-height: var(--size-control-compact);
+  padding: var(--space-2xs) var(--space-sm);
+  font-size: var(--font-size-sm);
+}
+
 /* Rename-failure alert (elspeth-8c7ac37d49): in-flow directly under the
    rename form inside the popover — co-located with the field it describes
    (aria-describedby binds them) — but previously undefined, so it read as

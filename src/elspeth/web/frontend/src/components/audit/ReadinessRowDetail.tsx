@@ -22,6 +22,7 @@
 import { useEffect, useId, useMemo, useRef } from "react";
 
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
+import { Button } from "@/components/ui";
 import { useSessionStore } from "../../stores/sessionStore";
 import type { ReadinessRow, ValidationError } from "../../types/api";
 import { stepLabelForNodeId } from "../chat/interpretationStepLabel";
@@ -129,7 +130,8 @@ export function ReadinessRowDetail({
         <h3 id={labelId} className="readiness-row-detail-title">
           {row.label}
         </h3>
-        <button
+        <Button
+          variant="bare"
           ref={closeBtnRef}
           type="button"
           className="readiness-row-detail-close"
@@ -137,7 +139,7 @@ export function ReadinessRowDetail({
           aria-label="Close detail"
         >
           ×
-        </button>
+        </Button>
       </header>
 
       <p className="readiness-row-detail-summary">{row.summary}</p>
@@ -189,14 +191,14 @@ export function ReadinessRowDetail({
               return (
                 <li key={id}>
                   {resolvable ? (
-                    <button
+                    <Button
                       type="button"
-                      className="btn readiness-row-detail-jump-btn"
+                      className="readiness-row-detail-jump-btn"
                       onClick={() => handleJump(id)}
                       aria-label={`Jump to ${jumpTargetLabel(id)}`}
                     >
                       Jump to {jumpTargetLabel(id)}
-                    </button>
+                    </Button>
                   ) : (
                     // Not a composition node: a source/sink name or YAML
                     // fragment. Show its plain phrase when the gloss resolves

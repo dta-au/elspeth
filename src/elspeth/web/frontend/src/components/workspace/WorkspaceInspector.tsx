@@ -15,6 +15,7 @@ import {
 } from "@/components/chat/guided/GuidedHistory";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { SideRailValidationBanner } from "@/components/sidebar/SideRailValidationBanner";
+import { Button } from "@/components/ui";
 import {
   dispatchArtifactViewIntent,
 } from "@/lib/composer-events";
@@ -200,14 +201,13 @@ export function WorkspaceInspector({
     >
       <header className="workspace-inspector-header">
         <h2 id="workspace-inspector-heading">Inspector</h2>
-        <button
-          type="button"
-          className="btn-compact"
+        <Button
+          compact
           aria-label="Close inspector"
           onClick={closeInspector}
         >
           Close
-        </button>
+        </Button>
       </header>
       <div
         className="workspace-inspector-tabs"
@@ -217,12 +217,12 @@ export function WorkspaceInspector({
         {availableTabs.map((tab) => {
           const selected = tab === activeTab;
           return (
-            <button
+            <Button
               key={tab}
               ref={(element) => {
                 tabRefs.current[tab] = element;
               }}
-              type="button"
+              variant="bare"
               className="artifact-tab"
               role="tab"
               id={`workspace-inspector-tab-${tab}`}
@@ -233,7 +233,7 @@ export function WorkspaceInspector({
               onKeyDown={handleTabKeyDown}
             >
               {INSPECTOR_TAB_LABELS[tab]}
-            </button>
+            </Button>
           );
         })}
       </div>

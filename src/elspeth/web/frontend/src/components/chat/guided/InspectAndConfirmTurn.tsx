@@ -56,6 +56,8 @@
 //   warnings come from SourceInspectionFacts at emit time (advisory only, not stored in intent).
 
 import { useEffect, useId, useRef, useState } from "react";
+
+import { Button, Input } from "@/components/ui";
 import type { GuidedRespondAction, InspectAndConfirmPayload } from "@/types/guided";
 
 interface InspectAndConfirmTurnProps {
@@ -191,7 +193,11 @@ export function InspectAndConfirmTurn({
               >
                 Column {index + 1}
               </label>
-              <input
+              {/* bare: .guided-inspect-editor-input is a complete bespoke
+                  recipe; .input's chrome would restyle it (see
+                  SingleSelectTurn's identical note). */}
+              <Input
+                bare
                 id={columnInputId(index)}
                 ref={index === 0 ? firstEditInputRef : null}
                 type="text"
@@ -200,34 +206,34 @@ export function InspectAndConfirmTurn({
                 disabled={disabled}
                 onChange={(e) => handleRenameColumn(index, e.target.value)}
               />
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="guided-inspect-remove-btn"
                 onClick={() => handleRemoveColumn(index)}
                 disabled={disabled}
               >
                 Remove
-              </button>
+              </Button>
             </li>
           ))}
         </ul>
         <div className="guided-inspect-editor-actions">
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-inspect-cancel-btn"
             onClick={handleCancelEdit}
             disabled={disabled}
           >
             Cancel
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="bare"
             className="guided-inspect-apply-btn"
             onClick={handleApplyEdits}
             disabled={disabled}
           >
             Apply edits
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -285,24 +291,24 @@ export function InspectAndConfirmTurn({
       )}
 
       <div className="guided-inspect-actions">
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-inspect-confirm-btn"
           onClick={handleLooksRight}
           disabled={disabled}
         >
           Looks right
-        </button>
+        </Button>
         {!isTutorial && (
-          <button
+          <Button
             ref={editButtonRef}
-            type="button"
+            variant="bare"
             className="guided-inspect-edit-btn"
             onClick={handleOpenEditor}
             disabled={disabled}
           >
             Edit columns...
-          </button>
+          </Button>
         )}
       </div>
     </div>

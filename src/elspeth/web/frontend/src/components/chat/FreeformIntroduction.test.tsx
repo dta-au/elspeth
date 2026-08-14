@@ -134,7 +134,7 @@ describe("FreeformIntroduction", () => {
     render(<FreeformIntroduction />);
 
     await user.click(
-      screen.getByRole("button", { name: "Don’t show this again" }),
+      screen.getByRole("button", { name: "Don't show this again" }),
     );
 
     expect(dismiss).toHaveBeenCalledOnce();

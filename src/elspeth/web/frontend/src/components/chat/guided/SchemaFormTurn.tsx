@@ -1,4 +1,6 @@
 import { useEffect, useId, useState, type ReactNode } from "react";
+
+import { Button, Input } from "@/components/ui";
 import type { GuidedRespondAction, GuidedSourceBlobCandidate, KnobField, SchemaFormPayload } from "@/types/guided";
 import { TUTORIAL_VALIDATION_FAILURE_CAVEAT } from "@/components/tutorial/copy";
 import { CodeBlock } from "../CodeBlock";
@@ -229,32 +231,32 @@ export function SchemaFormTurn({
         })()}
       <div className="guided-schema-actions">
         {!isTutorial && view === "summary" && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-turn-secondary guided-schema-edit-toggle"
             onClick={() => setView("edit")}
           >
             Edit
-          </button>
+          </Button>
         )}
         {!isTutorial && view === "edit" && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-turn-secondary guided-schema-edit-toggle"
             onClick={() => setView("summary")}
             disabled={visibleFields().some((f) => fieldHasError(f, values[f.name]))}
           >
             Done editing
-          </button>
+          </Button>
         )}
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="guided-turn-primary"
           onClick={handleContinue}
           disabled={disabled || !canSubmit()}
         >
           Continue
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -505,7 +507,11 @@ function KnobFieldRenderer({
       return (
         <div className="guided-schema-field-row">
           <FieldLabel field={field} htmlFor={id} required={required} />
-          <input
+          {/* bare: .guided-schema-input is a complete bespoke recipe
+              (--color-border-strong, font-family inherit); .input's chrome
+              would restyle it. Same applies to the number field below. */}
+          <Input
+            bare
             id={id}
             type="text"
             className="guided-schema-input"
@@ -524,14 +530,14 @@ function KnobFieldRenderer({
             </p>
           )}
           {field.nullable && value !== null && (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="guided-turn-secondary"
               onClick={() => onChange(null)}
               disabled={disabled}
             >
               Clear {field.label}
-            </button>
+            </Button>
           )}
         </div>
       );
@@ -543,7 +549,8 @@ function KnobFieldRenderer({
       return (
         <div className="guided-schema-field-row">
           <FieldLabel field={field} htmlFor={id} required={required} />
-          <input
+          <Input
+            bare
             id={id}
             type="number"
             className={`guided-schema-input${hasError ? " guided-schema-input--error" : ""}`}
@@ -587,7 +594,7 @@ function KnobFieldRenderer({
     case "checkbox":
       return (
         <div className="guided-schema-field-row guided-schema-checkbox-row">
-          <input
+          <Input
             id={id}
             type="checkbox"
             className="guided-schema-checkbox"

@@ -36,6 +36,7 @@
 
 import { useState } from "react";
 import type { InlineSourceSummary, InlineSourceProvenance } from "@/types/api";
+import { Button } from "@/components/ui";
 import { describeRowCount } from "@/utils/contentStructure";
 
 /**
@@ -124,13 +125,13 @@ export function InlineSourceCreatedTurn({
 
       {showEdit && (
         <div className="inline-source-created-turn-actions">
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="inline-source-created-turn-edit"
             onClick={() => onEdit(summary)}
           >
             Edit the list
-          </button>
+          </Button>
         </div>
       )}
 

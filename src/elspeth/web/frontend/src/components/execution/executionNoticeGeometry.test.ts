@@ -92,4 +92,23 @@ describe("run-outcome notice mirrors its app-notice sibling (elspeth-1df26d22ae)
       declaration(".app-notice-primary-actions .alert-banner-action", "margin-left"),
     );
   });
+
+  // Overlay treatment (elspeth-1c4687ff67 class): both app-level strips must
+  // OVERLAY the application rather than participate in flow — a strip in flow
+  // before the header displaces the whole viewport by its height on arrival
+  // and snaps it back on dismiss. Same sibling-mirror discipline as above:
+  // the assertions redden only if the two strips' overlay recipes diverge.
+  describe("overlays the app exactly as .app-notice-center does", () => {
+    const overlay = ".run-outcome-notice-overlay";
+    const sibling = ".app-notice-center";
+
+    it.each(["position", "top", "left", "right", "z-index", "background", "box-shadow"])(
+      "keeps %s equal across the two overlay wrappers",
+      (property) => {
+        const overlayValue = declaration(overlay, property);
+        expect(overlayValue, `${overlay} declares no ${property}`).not.toBeNull();
+        expect(overlayValue).toBe(declaration(sibling, property));
+      },
+    );
+  });
 });

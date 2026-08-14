@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
   type ChangeEvent,
 } from "react";
+import { Button, Icon, Input } from "@/components/ui";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useBlobStore } from "@/stores/blobStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -183,62 +184,13 @@ interface ChatInputProps {
   readOnly?: boolean;
 }
 
-type ChatInputIconName = "folder" | "upload" | "key" | "more";
-
-/**
- * Horizontal centres of the overflow ("more") glyph's three dots, in the
- * 24-unit viewBox. `cy` is the box centre for all three.
- */
-const MORE_DOT_CENTRES_X = [5, 12, 19] as const;
-
-/**
- * The overflow glyph is drawn as three FILLED circles, not as three
- * zero-length path segments relying on `stroke-linecap: round`
- * (elspeth-b720e0b932).
- *
- * The zero-length form ("M5 12h.01M12 12h.01M19 12h.01") is a well-known SVG
- * trick, but it degrades badly at this size: `.chat-input-icon` renders the
- * 24-unit box at 20px, so the 1.8-unit stroke lands as a 1.5px cap. Round caps
- * cannot survive rasterisation at 1.5px — the dots came out as hard squares,
- * and the whole glyph carried an order of magnitude less ink than the Upload
- * icon in the identically-sized button beside it, so the control read as
- * DISABLED when it is not. Users skip a control that looks dead, and every
- * action behind this menu (file manager, secrets) goes with it.
- *
- * Explicit circles rasterise at full colour and are genuinely round at 20px.
- * `fill="currentColor"` is a presentation attribute ON the circle, so it is a
- * specified value that beats the `fill: none` the element would otherwise
- * INHERIT from `.chat-input-icon` (chat.css) — and `currentColor` keeps the
- * glyph tracking `--color-text` in both themes exactly as the stroked paths
- * do. The inherited stroke still applies, so the dots keep the same weight
- * relationship to the sibling glyphs that the rest of this family has.
- */
-function ChatInputIcon({ name }: { name: ChatInputIconName }): JSX.Element {
-  const path =
-    name === "folder"
-      ? "M3 6.5h6l1.5 2H21v9.5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V6.5Zm0 3h18"
-      : name === "upload"
-        ? "M12 16V4m0 0 4 4m-4-4-4 4M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"
-        : name === "key"
-          ? "M14.5 9.5a4 4 0 1 0-3.2 3.9L9 15.7V18H6.7L5 19.7 3.3 18l6.3-6.3a4 4 0 0 0 4.9-2.2Zm.5-2h.01"
-          : null;
-  return (
-    <svg
-      aria-hidden="true"
-      className="chat-input-icon"
-      viewBox="0 0 24 24"
-      focusable="false"
-    >
-      {path === null ? (
-        MORE_DOT_CENTRES_X.map((cx) => (
-          <circle key={cx} cx={cx} cy={12} r={1.4} fill="currentColor" />
-        ))
-      ) : (
-        <path d={path} />
-      )}
-    </svg>
-  );
-}
+// This family's glyphs live in the ui Icon primitive (elspeth-2b88e3ca6d
+// retired the local ChatInputIcon after Icon grew folder/upload/key/more with
+// geometry copied verbatim). `.chat-input-icon` (chat.css) renders them at
+// 20px — CSS width/height beat Icon's 16px attribute defaults, and chat.css
+// imports after the ui stylesheet so it also wins over .ui-icon's 1em. The
+// "more" glyph's filled-circle rasterisation contract (elspeth-b720e0b932)
+// is documented and test-pinned in Icon.tsx/Icon.test.tsx.
 
 export function ChatInput({
   onSend,
@@ -579,17 +531,17 @@ export function ChatInput({
         {/* File upload button — using a visible button that clicks a hidden input */}
         {!readOnly && (
           <>
-            <button
-              type="button"
+            <Button
+              variant="bare"
               onClick={() => fileInputRef.current?.click()}
               disabled={!activeSessionId || uploadDisabled}
               className="chat-input-icon-btn chat-input-upload-btn"
               title="Upload file"
               aria-label="Upload file"
             >
-              <ChatInputIcon name="upload" />
-            </button>
-            <input
+              <Icon name="upload" className="chat-input-icon" />
+            </Button>
+            <Input
               ref={fileInputRef}
               type="file"
               // Mirrors the server's closed storage MIME vocabulary
@@ -621,8 +573,8 @@ export function ChatInput({
               }
             }}
           >
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="chat-input-icon-btn"
               title="More actions"
               aria-label="More actions"
@@ -630,8 +582,8 @@ export function ChatInput({
               aria-expanded={moreOpen}
               onClick={() => setMoreOpen((open) => !open)}
             >
-              <ChatInputIcon name="more" />
-            </button>
+              <Icon name="more" className="chat-input-icon" />
+            </Button>
             {moreOpen && (
               <div
                 id="chat-input-more-panel"
@@ -640,9 +592,9 @@ export function ChatInput({
                 aria-label="More actions"
               >
                 {onToggleBlobManager && (
-                  <button
-                    type="button"
-                    className="btn-compact chat-input-more-item"
+                  <Button
+                    compact
+                    className="chat-input-more-item"
                     aria-label={
                       showBlobManager ? "Hide file manager" : "Show file manager"
                     }
@@ -650,23 +602,23 @@ export function ChatInput({
                       setMoreOpen(false);
                       onToggleBlobManager();
                     }}
+                    iconLeft={<Icon name="folder" className="chat-input-icon" />}
                   >
-                    <ChatInputIcon name="folder" />
                     {showBlobManager ? "Hide file manager" : "Show file manager"}
-                  </button>
+                  </Button>
                 )}
                 {onOpenSecrets && (
-                  <button
-                    type="button"
-                    className="btn-compact chat-input-more-item"
+                  <Button
+                    compact
+                    className="chat-input-more-item"
                     onClick={() => {
                       setMoreOpen(false);
                       onOpenSecrets();
                     }}
+                    iconLeft={<Icon name="key" className="chat-input-icon" />}
                   >
-                    <ChatInputIcon name="key" />
                     API keys & secrets
-                  </button>
+                  </Button>
                 )}
               </div>
             )}
@@ -674,19 +626,19 @@ export function ChatInput({
         )}
 
         {disabled && onCancel && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             onClick={onCancel}
             aria-label="Stop composing"
             className="chat-input-cancel-btn"
           >
             Stop
-          </button>
+          </Button>
         )}
 
         {/* Send button */}
-        <button
-          type="button"
+        <Button
+          variant="bare"
           onClick={handleSend}
           disabled={!canSend}
           aria-label="Send message"
@@ -694,7 +646,7 @@ export function ChatInput({
           className="chat-input-send-btn"
         >
           Send
-        </button>
+        </Button>
 
         {/* Hint is the textarea's aria-describedby target — DO NOT mark it
             aria-hidden, that masks it for some screen readers despite the

@@ -12,6 +12,7 @@
 // ============================================================================
 
 import { useCallback } from "react";
+import { Button } from "@/components/ui";
 import { lookupAuditCharacteristic } from "./auditCharacteristics";
 
 // Trust tier is kind-derived internal metadata (see 16b OD-C rationale):
@@ -96,14 +97,14 @@ export function FilterChipStrip({
         </ChipGroup>
       )}
       {anyActive && (
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="filter-chip-clear"
           onClick={clear}
           aria-label="Clear filters"
         >
           Clear filters
-        </button>
+        </Button>
       )}
     </div>
   );
@@ -120,13 +121,13 @@ function ChipGroup({ label, children }: { label: string; children: React.ReactNo
 
 function Chip({ active, onToggle, label }: { active: boolean; onToggle: () => void; label: string }) {
   return (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className={`filter-chip ${active ? "filter-chip-active" : ""}`}
       aria-pressed={active}
       onClick={onToggle}
     >
       {label}
-    </button>
+    </Button>
   );
 }

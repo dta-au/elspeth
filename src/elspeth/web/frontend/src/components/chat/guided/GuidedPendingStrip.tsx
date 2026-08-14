@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { Button } from "@/components/ui";
 import type { ComposerProgressSnapshot } from "@/types/api";
 import { ElapsedReadout } from "../ComposingIndicator";
 
@@ -114,8 +115,8 @@ export function GuidedPendingStrip({
         </ol>
       )}
       {onStop !== undefined && (
-        <button
-          type="button"
+        <Button
+          variant="bare"
           onClick={onStop}
           aria-label="Stop composing"
           className={`chat-input-cancel-btn guided-pending-strip-stop${
@@ -123,7 +124,7 @@ export function GuidedPendingStrip({
           }`}
         >
           Stop
-        </button>
+        </Button>
       )}
     </div>
   );

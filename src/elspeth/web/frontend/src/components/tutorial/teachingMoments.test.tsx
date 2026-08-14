@@ -105,6 +105,34 @@ describe("tutorial teaching moments — render at the right turn", () => {
     expect(backButton).not.toHaveAccessibleName(/edit prompt/i);
   });
 
+  it("Turn 5 hash-copy control composes .btn-compact (elspeth-e7dd7ae371)", async () => {
+    // The copy control's rung, radius, transition and hover come from the
+    // .btn-compact primitive by COMPOSITION, not by mirrored declarations
+    // (which tutorialShell.test.ts used to pin and could drift). Rendered-DOM
+    // truth: the ui/Button call site must emit both classes — the primitive's
+    // chrome plus the divergence-only bespoke class.
+    vi.mocked(api.getRunAuditSummary).mockResolvedValue({
+      source_data_hash: "abc123",
+      llm_call_count: 1,
+      run_id: "r1",
+      started_at: new Date().toISOString(),
+      plugin_versions: {},
+    } as unknown as Awaited<ReturnType<typeof api.getRunAuditSummary>>);
+    render(
+      <TutorialTurn5AuditStory
+        sessionId="sess-1"
+        runId="run-1"
+        onContinue={noop}
+        onBack={noop}
+      />,
+    );
+    const copyButton = await screen.findByRole("button", {
+      name: "Copy full source data hash",
+    });
+    expect(copyButton).toHaveClass("btn-compact");
+    expect(copyButton).toHaveClass("tutorial-hash-copy");
+  });
+
   it("Turn 4 (run) renders the shield-override caveat with no shield selected", async () => {
     stubRun();
     vi.mocked(api.fetchPluginPolicy).mockResolvedValue(policyWithShield(false));

@@ -45,7 +45,7 @@ import {
 } from "@/utils/compositionState";
 import { plural } from "@/utils/plural";
 import { BADGE_COLORS, BADGE_BACKGROUNDS, EDGE_COLORS, EDGE_LABEL_COLOR, VALIDATION_COLORS } from "@/styles/tokens";
-import { TypeBadge } from "@/components/ui";
+import { Button, TypeBadge } from "@/components/ui";
 import type { CompositionState } from "@/types/index";
 
 const NODE_WIDTH = 260;
@@ -667,8 +667,8 @@ function NodeConfigPanel({
             <p className="graph-config-plugin">{config.plugin}</p>
           )}
         </div>
-        <button
-          type="button"
+        <Button
+          variant="bare"
           className="graph-config-close"
           onClick={onClose}
           aria-label="Close node configuration"
@@ -679,7 +679,7 @@ function NodeConfigPanel({
               letter x sits at a different optical weight and cap height
               (elspeth-51cbcf1664). */}
           ×
-        </button>
+        </Button>
       </header>
 
       <section className="graph-config-section">
@@ -1749,8 +1749,11 @@ export function GraphView() {
         >
           {accessibleNodes.map((node) => (
             <li key={node.id}>
-              <button
-                type="button"
+              {/* variant="bare" with no className: emits no class attribute,
+                  exactly like the raw <button> it replaces — the control is
+                  styled by the .graph-a11y-list descendant rules. */}
+              <Button
+                variant="bare"
                 aria-pressed={selectedNodeId === node.id}
                 onClick={() => {
                   const nextNodeId =
@@ -1762,7 +1765,7 @@ export function GraphView() {
                 }}
               >
                 {node.label}. Activate to inspect.
-              </button>
+              </Button>
             </li>
           ))}
         </ol>

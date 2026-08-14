@@ -1,4 +1,5 @@
 import { useRef, useState } from "react";
+import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 import { RecoveryDiff } from "./RecoveryDiff";
 import { RecoveryTranscript } from "./RecoveryTranscript";
@@ -132,20 +133,19 @@ export function RecoveryPanel({
               Applying the partial draft will replace the current draft.
             </p>
             <div className="recovery-panel-confirm-actions">
-              <button
-                className="btn"
+              <Button
                 type="button"
                 onClick={() => setNeedsConfirmation(false)}
               >
                 Cancel
-              </button>
-              <button
-                className="btn btn-danger"
+              </Button>
+              <Button
+                variant="danger"
                 type="button"
                 onClick={confirmApply}
               >
                 Apply anyway
-              </button>
+              </Button>
             </div>
           </div>
         ) : null}
@@ -156,15 +156,14 @@ export function RecoveryPanel({
             recoveredState={recoveryError.partial_state}
           />
           <div className="recovery-panel-transcript-controls">
-            <button
-              className="btn"
+            <Button
               type="button"
               onClick={() =>
                 setShowTranscriptControls((currentlyShown) => !currentlyShown)
               }
             >
               View raw transcript controls
-            </button>
+            </Button>
             {showTranscriptControls ? (
               <p>
                 Transcript rows are loaded from the audit view with tool rows
@@ -179,20 +178,22 @@ export function RecoveryPanel({
         </div>
 
         <footer className="recovery-panel-actions">
-          <button
-            className="btn btn-danger recovery-panel-discard"
+          <Button
+            variant="danger"
+            className="recovery-panel-discard"
             type="button"
             onClick={onDiscard}
           >
             Discard recovery
-          </button>
-          <button
-            className="btn btn-primary recovery-panel-apply"
+          </Button>
+          <Button
+            variant="primary"
+            className="recovery-panel-apply"
             type="button"
             onClick={requestApply}
           >
             Apply partial draft
-          </button>
+          </Button>
         </footer>
       </div>
     </>

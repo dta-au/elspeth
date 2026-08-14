@@ -1,5 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
 
+import { Button } from "@/components/ui";
+
 import type {
   GuidedEditTarget,
   GuidedProposalReviewState,
@@ -447,8 +449,8 @@ export function ProposePipelineTurn({
       <div className="guided-proposal__controls">
         <div className="guided-proposal__primary-actions">
           {retainedInstruction !== null ? (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="guided-turn-primary"
               disabled={!actionEnabled(retainedInstruction)}
               onClick={() => onSubmit({
@@ -465,11 +467,11 @@ export function ProposePipelineTurn({
               } satisfies GuidedRespondAction)}
             >
               Retry {retainedInstruction.revision_mode} revision
-            </button>
+            </Button>
           ) : null}
           {!(isTutorial && payload.supersedes_draft_hash === null) && (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="guided-turn-primary"
               disabled={!actionEnabled({ kind: "review_wiring" }) || payload.blockers.length > 0}
               onClick={() => onSubmit({
@@ -483,11 +485,11 @@ export function ProposePipelineTurn({
               } satisfies GuidedRespondAction)}
             >
               Review wiring
-            </button>
+            </Button>
           )}
           {!isTutorial && (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="guided-turn-secondary"
               disabled={!actionEnabled({ kind: "reject" })}
               onClick={() => onSubmit({
@@ -501,15 +503,15 @@ export function ProposePipelineTurn({
               } satisfies GuidedRespondAction)}
             >
               Reject proposal
-            </button>
+            </Button>
           )}
         </div>
         {!isTutorial && (
           <fieldset className="guided-proposal__revise" disabled={controlsLocked}>
             <legend>Revise a component</legend>
             {payload.edit_targets.map((target) => (
-              <button
-                type="button"
+              <Button
+                variant="bare"
                 className="guided-turn-secondary"
                 key={`${target.kind}-${target.stable_id}`}
                 disabled={!revisionTargetEnabled(target)}
@@ -535,7 +537,7 @@ export function ProposePipelineTurn({
                 }}
               >
                 Revise {targetLabel(target)}
-              </button>
+              </Button>
             ))}
             {revisionTarget !== null &&
             (revisionTarget.kind === "node" || revisionTarget.kind === "edge") ? (
@@ -554,8 +556,8 @@ export function ProposePipelineTurn({
                   maxLength={4096}
                   onChange={(event) => setRevisionFeedback(event.target.value)}
                 />
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="guided-turn-secondary"
                   disabled={
                     revisionFeedback.trim().length === 0 ||
@@ -581,7 +583,7 @@ export function ProposePipelineTurn({
                   }}
                 >
                   Send revision request
-                </button>
+                </Button>
               </div>
             ) : null}
           </fieldset>

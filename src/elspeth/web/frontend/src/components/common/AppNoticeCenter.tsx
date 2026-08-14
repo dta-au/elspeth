@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { Button } from "@/components/ui";
 
 export type AppNoticeKind =
   | "backend-unavailable"
@@ -175,9 +176,9 @@ export function AppNoticeCenter({
             </span>
           )}
           {additional.length > 0 ? (
-            <button
+            <Button
               ref={invokerRef}
-              type="button"
+              variant="bare"
               className="alert-banner-action app-notice-more"
               aria-expanded={open}
               aria-controls={popoverId}
@@ -187,7 +188,7 @@ export function AppNoticeCenter({
               onClick={() => (open ? close(true) : setOpen(true))}
             >
               {additionalLabel}
-            </button>
+            </Button>
           ) : null}
         </span>
       </div>
@@ -207,13 +208,9 @@ export function AppNoticeCenter({
         >
           <header className="app-notice-popover-header">
             <h2>Notifications</h2>
-            <button
-              type="button"
-              className="btn btn-compact"
-              onClick={() => close(true)}
-            >
+            <Button compact onClick={() => close(true)}>
               Close
-            </button>
+            </Button>
           </header>
           <div className="app-notice-list">
             {orderedNotices.map(({ notice, index }) => (

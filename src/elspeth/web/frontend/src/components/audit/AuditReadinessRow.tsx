@@ -36,6 +36,7 @@
  * read as an ordinary phrase inside a sentence.
  */
 
+import { Button } from "@/components/ui";
 import { useReadOnly } from "../../contexts/ReadOnlyContext";
 import type { ReadinessRowId, ReadinessStatus } from "../../types/api";
 
@@ -125,7 +126,8 @@ export function AuditReadinessRow({
         data-testid={row.testId}
         data-gate={gateKind}
       >
-        <button
+        <Button
+          variant="bare"
           type="button"
           className="audit-readiness-row-btn"
           onClick={() => onSelect(row.id)}
@@ -136,7 +138,7 @@ export function AuditReadinessRow({
           <span className="sr-only">{row.ariaStatusLabel}.</span>
           {label}
           <span className="audit-readiness-row-summary">{row.summaryText}</span>
-        </button>
+        </Button>
       </li>
     );
   }

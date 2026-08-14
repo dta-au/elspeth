@@ -28,6 +28,7 @@ import type {
   ReadinessStatus,
   ValidationResult,
 } from "../../types/api";
+import { Button } from "@/components/ui";
 import { ReadinessRowDetail } from "./ReadinessRowDetail";
 import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
@@ -420,9 +421,9 @@ export function AuditReadinessPanel({
         <div role="alert" className="audit-readiness-error">
           {error}
         </div>
-        <button
+        <Button
           type="button"
-          className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
+          className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
           onClick={() =>
             void loadSnapshot(
               activeSessionId,
@@ -440,7 +441,7 @@ export function AuditReadinessPanel({
           aria-label="Retry audit readiness check"
         >
           Retry
-        </button>
+        </Button>
       </section>
     );
   }
@@ -459,7 +460,8 @@ export function AuditReadinessPanel({
         className="audit-readiness audit-readiness--collapsed"
         aria-busy={isLoading ? "true" : undefined}
       >
-        <button
+        <Button
+          variant="bare"
           type="button"
           className="audit-readiness-summary"
           onClick={() => setUserExpandedInStore(activeSessionId, true)}
@@ -477,7 +479,7 @@ export function AuditReadinessPanel({
           <span className="audit-readiness-summary-meta">
             Checked {checkedText} · as of v{snapshot.composition_version}
           </span>
-        </button>
+        </Button>
       </section>
     );
   }
@@ -516,9 +518,9 @@ export function AuditReadinessPanel({
             </p>
           </div>
           <div className="audit-readiness-actions">
-            <button
+            <Button
               type="button"
-              className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
+              className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
               onClick={() =>
                 void loadSnapshot(
                   activeSessionId,
@@ -537,10 +539,11 @@ export function AuditReadinessPanel({
               aria-label="Refresh audit check now"
             >
               Refresh
-            </button>
-            <button
+            </Button>
+            <Button
+              variant="primary"
               type="button"
-              className="btn btn-primary audit-readiness-action-btn"
+              className="audit-readiness-action-btn"
               onClick={() => setExplainOpen(true)}
               aria-label="Explain what this pipeline will record"
             >
@@ -551,16 +554,16 @@ export function AuditReadinessPanel({
                   is ever wanted it belongs on all three and comes from the
                   SVG Icon primitive, not a text arrow. */}
               Explain
-            </button>
+            </Button>
             {!anyActionable && (
-              <button
+              <Button
                 type="button"
-                className="btn audit-readiness-action-btn audit-readiness-action-btn--ghost"
+                className="audit-readiness-action-btn audit-readiness-action-btn--ghost"
                 onClick={() => setUserExpandedInStore(activeSessionId, false)}
                 aria-label="Collapse audit readiness"
               >
                 Collapse
-              </button>
+              </Button>
             )}
           </div>
         </header>

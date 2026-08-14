@@ -17,6 +17,7 @@
 
 import { useState } from "react";
 
+import { Button, Icon } from "@/components/ui";
 import {
   VALIDATION_ADVISORY_CHECK_NAMES,
   type ValidationResult as ValidationResultType,
@@ -117,14 +118,14 @@ export function ValidationResultBanner({
           role="status"
           className="validation-banner validation-banner-pass validation-banner--collapsed"
         >
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="validation-banner-summary-btn"
             onClick={() => setUserExpanded(true)}
             aria-expanded={false}
             aria-label="Validation passed. Show details."
           >
-            <span aria-hidden="true">{"\u2713"}</span>
+            <Icon name="check" />
             <span className="validation-banner-summary">
               {result.summary ?? "Validation passed"}
             </span>
@@ -133,7 +134,7 @@ export function ValidationResultBanner({
                 {result.checks.length} checks
               </span>
             )}
-          </button>
+          </Button>
         </div>
       );
     }
@@ -144,29 +145,27 @@ export function ValidationResultBanner({
         className="validation-banner validation-banner-pass validation-banner-content"
       >
         <div className="validation-banner-header">
-          <span aria-hidden="true">{"\u2713"}</span>
+          <Icon name="check" />
           <span className="validation-banner-summary">
             {result.summary ?? "Validation passed"}
           </span>
           {!hasForcedGuidance && (
-            <button
-              type="button"
+            <Button
+              variant="bare"
               className="validation-banner-collapse-btn"
               onClick={() => setUserExpanded(false)}
               aria-expanded={true}
               aria-label="Collapse validation details"
             >
               Collapse
-            </button>
+            </Button>
           )}
         </div>
         {result.checks.length > 0 && (
           <ul className="validation-banner-checks">
             {result.checks.map((check, i) => (
               <li key={i} className="validation-banner-check-item">
-                <span aria-hidden="true">
-                  {check.passed ? "\u2713" : "\u2717"}
-                </span>{" "}
+                <Icon name={check.passed ? "check" : "cross"} />{" "}
                 {validationCheckDisplayName(check.name)}: {check.detail}
               </li>
             ))}
@@ -202,7 +201,8 @@ export function ValidationResultBanner({
                 return (
                   <li key={i} className="validation-banner-warn-item">
                     {isClickable ? (
-                      <button
+                      <Button
+                        variant="bare"
                         onClick={() => {
                           if (warn.component_id) {
                             onComponentClick?.(warn.component_id);
@@ -212,7 +212,7 @@ export function ValidationResultBanner({
                         title={`Click to select ${warn.component_id} in the pipeline view`}
                       >
                         {warningText}
-                      </button>
+                      </Button>
                     ) : (
                       warningText
                     )}
@@ -264,7 +264,8 @@ export function ValidationResultBanner({
           return (
             <li key={i} className="validation-banner-error-item">
               {isClickable ? (
-                <button
+                <Button
+                  variant="bare"
                   onClick={() => {
                     if (err.component_id) {
                       onComponentClick?.(err.component_id);
@@ -274,7 +275,7 @@ export function ValidationResultBanner({
                   title={`Click to select ${err.component_id} in the pipeline view`}
                 >
                   {errorText}
-                </button>
+                </Button>
               ) : (
                 errorText
               )}

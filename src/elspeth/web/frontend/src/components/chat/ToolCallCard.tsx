@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 
 import type { CompositionProposal, CompositionState, ToolCall } from "@/types/api";
+import { Button } from "@/components/ui";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { ArgumentFields, buildProposalDiff, ProposalChanges } from "./ProposalDiff";
 import { describeToolCall, toolCallOutcomeLabel } from "./toolCallDescriptions";
@@ -19,14 +20,14 @@ function ToolCallInfo({
 }) {
   return (
     <span className="tool-call-info">
-      <button
-        type="button"
+      <Button
+        variant="bare"
         className="tool-call-info-trigger"
         aria-label={`What does ${toolName} do?`}
         aria-describedby={describedById}
       >
         i
-      </button>
+      </Button>
       <span
         id={describedById}
         role="tooltip"
@@ -171,29 +172,29 @@ export function ToolCallCard({
       )}
       {isPending && !isStale && (
         <div className="tool-call-actions">
-          <button
-            type="button"
+          <Button
+            variant="primary"
             onClick={() => onAccept(proposal.id)}
             aria-label={`Accept proposal: ${proposal.summary}`}
             disabled={isBusy}
-            className="btn btn-primary btn-small"
+            className="btn-small"
           >
             Accept
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="danger"
             onClick={() => setRejectConfirmOpen(true)}
             aria-label={`Reject proposal: ${proposal.summary}`}
             disabled={isBusy}
-            className="btn btn-danger btn-small"
+            className="btn-small"
           >
             Reject
-          </button>
+          </Button>
         </div>
       )}
       {rejectConfirmOpen && proposal && (
         <ConfirmDialog
-          title="Reject this proposal?"
+          title="Reject proposal"
           message="The composer's proposed change will be discarded. You can ask the composer to revise the proposal afterwards."
           confirmLabel="Reject proposal"
           cancelLabel="Keep open"

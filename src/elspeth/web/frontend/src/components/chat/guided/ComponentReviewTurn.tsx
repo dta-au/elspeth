@@ -1,4 +1,6 @@
 import { useId } from "react";
+
+import { Button } from "@/components/ui";
 import type {
   ComponentReviewPayload,
   GuidedComponentAction,
@@ -83,8 +85,8 @@ export function ComponentReviewTurn({
               </div>
               <div className="guided-component-review-item-actions">
                 {allowed.has("edit") && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="bare"
                     className="guided-component-review-btn"
                     onClick={() =>
                       submit({
@@ -95,11 +97,11 @@ export function ComponentReviewTurn({
                     disabled={disabled}
                   >
                     Edit {item.name}
-                  </button>
+                  </Button>
                 )}
                 {allowed.has("remove") && payload.items.length > 1 && (
-                  <button
-                    type="button"
+                  <Button
+                    variant="bare"
                     className="guided-component-review-btn guided-component-review-btn--remove"
                     onClick={() =>
                       submit({
@@ -110,28 +112,28 @@ export function ComponentReviewTurn({
                     disabled={disabled}
                   >
                     Remove {item.name}
-                  </button>
+                  </Button>
                 )}
                 {allowed.has("reorder") && payload.items.length > 1 && (
                   <>
-                    <button
-                      type="button"
+                    <Button
+                      variant="bare"
                       className="guided-component-review-btn"
                       aria-label={`Move ${item.name} up`}
                       onClick={() => move(item.stable_id, -1)}
                       disabled={disabled || currentIndex === 0}
                     >
                       Move up
-                    </button>
-                    <button
-                      type="button"
+                    </Button>
+                    <Button
+                      variant="bare"
                       className="guided-component-review-btn"
                       aria-label={`Move ${item.name} down`}
                       onClick={() => move(item.stable_id, 1)}
                       disabled={disabled || currentIndex === stableIds.length - 1}
                     >
                       Move down
-                    </button>
+                    </Button>
                   </>
                 )}
               </div>
@@ -141,24 +143,24 @@ export function ComponentReviewTurn({
       </ol>
       <div className="guided-component-review-actions">
         {allowed.has("add") && !(isTutorial && payload.component_kind === "source") && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-component-review-btn"
             onClick={() => submit({ action: "add", component_kind: payload.component_kind })}
             disabled={disabled}
           >
             Add {payload.component_kind}
-          </button>
+          </Button>
         )}
         {allowed.has("finish") && (
-          <button
-            type="button"
+          <Button
+            variant="bare"
             className="guided-component-review-btn guided-component-review-btn--finish"
             onClick={() => submit({ action: "finish", component_kind: payload.component_kind })}
             disabled={disabled}
           >
             Finish {plural}
-          </button>
+          </Button>
         )}
       </div>
     </section>

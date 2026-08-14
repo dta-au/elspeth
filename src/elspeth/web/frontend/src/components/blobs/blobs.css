@@ -16,11 +16,24 @@
   align-items: center;
   justify-content: center;
   color: var(--color-text-muted);
+  /* Hover states animate like every other button surface (elspeth-616a236fc3
+     family): the three properties :hover changes, on the shared fast rung. */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast);
 }
 .blob-action-btn:hover {
   background-color: var(--color-surface-hover);
   border-color: var(--color-border-strong);
   color: var(--color-text);
+}
+
+/* Per-selector reduced-motion guard, following the chat.css idiom
+   (chat.css:708-714) rather than a global reset. */
+@media (prefers-reduced-motion: reduce) {
+  .blob-action-btn {
+    transition: none;
+  }
 }
 
 /* ---------------------------------------------------------------------------

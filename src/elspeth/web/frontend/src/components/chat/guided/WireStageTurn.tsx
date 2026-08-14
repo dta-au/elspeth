@@ -1,4 +1,6 @@
 import { useId, useState } from "react";
+
+import { Button } from "@/components/ui";
 import type { GuidedEditTarget, NodeOptionSummary, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
 import { focusAcknowledgementCard } from "../AcknowledgementCard";
 import { stepLabelForPlugin } from "../interpretationStepLabel";
@@ -328,15 +330,15 @@ export function WireStageTurn({
     acknowledgements.length > 0 || blockingValidationIssues.length > 0 || data.blockers.length > 0;
 
   const confirmButton = (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="guided-turn-primary"
       onClick={onConfirm}
       disabled={confirmDisabled || !data.can_confirm || data.blockers.length > 0 || blockingValidationIssues.length > 0}
       aria-describedby={hasBlockers ? blockersId : undefined}
     >
       Confirm wiring
-    </button>
+    </Button>
   );
 
   // Named-blocker panel: renders directly under the (possibly disabled)
@@ -355,13 +357,13 @@ export function WireStageTurn({
           <ul className="wire-stage__blockers-list">
             {acknowledgements.map((blocker) => (
               <li key={blocker.id}>
-                <button
-                  type="button"
+                <Button
+                  variant="bare"
                   className="wire-stage__blocker-link"
                   onClick={() => focusAcknowledgementCard(blocker.id)}
                 >
                   {blocker.label}
-                </button>
+                </Button>
               </li>
             ))}
           </ul>
@@ -388,13 +390,13 @@ export function WireStageTurn({
   ) : null;
 
   const exitButton = (
-    <button
-      type="button"
+    <Button
+      variant="bare"
       className="guided-turn-secondary"
       onClick={() => onExitToFreeform?.()}
     >
       Exit to freeform
-    </button>
+    </Button>
   );
 
   return (
@@ -574,9 +576,12 @@ export function WireStageTurn({
             />
           </div>
           <div className="wire-stage__correction-actions">
-            <button type="submit" className="guided-turn-secondary" disabled={correctionFeedback.trim().length === 0}>
+            {/* Inside the correction <form>: Button defaults to type="button",
+                so the submit role MUST stay explicit — this is the control the
+                form's onSubmit (and any Enter-key submit) fires through. */}
+            <Button variant="bare" type="submit" className="guided-turn-secondary" disabled={correctionFeedback.trim().length === 0}>
               {isFormDirectedCorrection ? "Edit component settings" : "Re-plan wiring"}
-            </button>
+            </Button>
           </div>
         </form>
       ) : null}

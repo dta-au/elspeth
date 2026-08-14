@@ -33,6 +33,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import type { PluginPolicyFinding, PluginSummary } from "@/types/index";
+import { Button, Input } from "@/components/ui";
 import { PluginCard, PREFILL_CHAT_INPUT_EVENT } from "./PluginCard";
 import { FilterChipStrip, type CatalogFilters } from "./FilterChipStrip";
 import { InlineChatSourceEntry } from "./InlineChatSourceEntry";
@@ -440,19 +441,19 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               composer to apply them.
             </span>
           </div>
-          <button
+          <Button
             onClick={onClose}
             aria-label="Close plugin catalog"
-            className="btn catalog-close-btn"
+            className="catalog-close-btn"
           >
             ×
-          </button>
+          </Button>
         </div>
 
         {/* Search input */}
         <div className="catalog-search-wrapper">
           <div className="catalog-search-container">
-            <input
+            <Input
               ref={searchInputRef}
               type="text"
               placeholder="Search plugins... (press /)"
@@ -462,7 +463,8 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               className="catalog-search-input"
             />
             {searchQuery && (
-              <button
+              <Button
+                variant="bare"
                 onClick={() => {
                   setSearchQuery("");
                   searchInputRef.current?.focus();
@@ -471,7 +473,7 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
                 className="catalog-search-clear"
               >
                 ×
-              </button>
+              </Button>
             )}
           </div>
         </div>
@@ -495,8 +497,9 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
             const count = counts[tab];
             const isActive = activeTab === tab;
             return (
-              <button
+              <Button
                 key={tab}
+                variant="bare"
                 role="tab"
                 id={catalogTabId(tab)}
                 aria-controls={catalogPanelId(tab)}
@@ -515,7 +518,7 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
                     {count}
                   </span>
                 )}
-              </button>
+              </Button>
             );
           })}
         </div>
@@ -570,22 +573,20 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
                       {unavailableReasonLabel(finding.reason_code)}
                     </div>
                     <div className="import-yaml-actions">
-                      <button
-                        type="button"
-                        className="btn btn-small"
+                      <Button
+                        className="btn-small"
                         aria-label={`Remove disabled component ${finding.component_id} (${finding.plugin_id})`}
                         onClick={() => handleRemoveDisabled(finding)}
                       >
                         Remove
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-small"
+                      </Button>
+                      <Button
+                        className="btn-small"
                         aria-label={`Replace disabled component ${finding.component_id} (${finding.plugin_id}) with an available ${repairTab(finding.plugin_id).slice(0, -1)}`}
                         onClick={() => handleReplaceDisabled(finding)}
                       >
                         Replace
-                      </button>
+                      </Button>
                     </div>
                   </li>
                 ))}
@@ -606,14 +607,13 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
               className="catalog-status-message catalog-status-message--error"
             >
               <span>Failed to load plugin catalog.</span>
-              <button
-                type="button"
-                className="btn btn-small"
+              <Button
+                className="btn-small"
                 onClick={loadCatalog}
                 aria-label="Retry loading plugin catalog"
               >
                 Retry
-              </button>
+              </Button>
             </div>
           ) : isLoading || isFetching ? (
             <div

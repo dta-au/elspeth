@@ -247,6 +247,25 @@ describe("ComposerPreferencesPanel — modal chrome", () => {
     expect(title).toHaveTextContent(/composer preferences/i);
   });
 
+  it("mounts the modal chrome on the app-dialog primitive (elspeth-e6fcd8d703)", () => {
+    render(<ComposerPreferencesPanel onClose={vi.fn()} />);
+    // The frame was a copy-pasted inline style object at literal z-index 101
+    // (the non-modal overlay band), and the close button carried a one-off
+    // 32×32 inline recipe below both control-size tokens. Both now compose
+    // the shared classes — the CSS side is gated in
+    // styles/overlayChrome.test.ts; this pins that the markup actually
+    // reaches those rules.
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.getAttribute("style")).toBeNull();
+    expect(dialog).toHaveClass("app-dialog", "settings-dialog");
+    expect(screen.getByRole("presentation")).toHaveClass("app-dialog-backdrop");
+    const close = screen.getByRole("button", {
+      name: "Close composer preferences panel",
+    });
+    expect(close).toHaveClass("dialog-close");
+    expect(close.getAttribute("style")).toBeNull();
+  });
+
   it("Escape calls onClose (modal dismissal contract)", async () => {
     const onClose = vi.fn();
     render(<ComposerPreferencesPanel onClose={onClose} />);

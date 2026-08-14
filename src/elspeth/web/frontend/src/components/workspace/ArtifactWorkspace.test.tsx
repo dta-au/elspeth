@@ -375,7 +375,7 @@ describe("ArtifactWorkspace", () => {
     const user = userEvent.setup();
     renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
 
-    await user.click(screen.getByRole("button", { name: "Focus Graph" }));
+    await user.click(screen.getByRole("button", { name: "Focus graph" }));
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
     await act(async () => Promise.resolve());
 
@@ -816,7 +816,7 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    await user.click(screen.getByRole("button", { name: "Focus Graph" }));
+    await user.click(screen.getByRole("button", { name: "Focus graph" }));
 
     await waitFor(() => expect(observations).toHaveLength(1));
     await Promise.resolve();
@@ -841,7 +841,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus Graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
       useSessionStore.setState({ activeSessionId: "session-2" });
     });
 
@@ -856,7 +856,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus Graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
       fireEvent.click(screen.getByRole("tab", { name: "Run" }));
     });
     await act(async () => Promise.resolve());
@@ -879,7 +879,7 @@ describe("ArtifactWorkspace", () => {
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
     act(() => {
-      fireEvent.click(screen.getByRole("button", { name: "Focus Graph" }));
+      fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
       view.unmount();
     });
 
@@ -973,7 +973,7 @@ describe("ArtifactWorkspace", () => {
     };
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, listener);
 
-    fireEvent.click(screen.getByRole("button", { name: "Focus Graph" }));
+    fireEvent.click(screen.getByRole("button", { name: "Focus graph" }));
     fireEvent.click(
       screen.getByRole("button", { name: "Switch speculative session" }),
     );
@@ -1030,7 +1030,7 @@ describe("ArtifactWorkspace", () => {
       "Spec artifact encountered an error",
     );
     expect(screen.getByRole("tablist", { name: "Pipeline artifacts" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Focus Graph" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Focus graph" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Validation status" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Run pipeline" })).toBeEnabled();
 

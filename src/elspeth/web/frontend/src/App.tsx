@@ -13,6 +13,7 @@ import {
   nextStaleBuildStreak,
   ownFrontendBuild,
 } from "./utils/deployBeacon";
+import { Button } from "./components/ui";
 import { AuthGuard } from "./components/common/AuthGuard";
 import { AppHeader } from "./components/common/AppHeader";
 import { GraphModal } from "./components/sidebar/GraphModal";
@@ -558,7 +559,8 @@ function App() {
           </>
         ),
         action: (
-          <button
+          <Button
+            variant="bare"
             type="button"
             onClick={checkHealth}
             disabled={healthChecking}
@@ -568,7 +570,7 @@ function App() {
             className="alert-banner-action"
           >
             {healthChecking ? "Checking…" : "Retry"}
-          </button>
+          </Button>
         ),
       });
     }
@@ -590,14 +592,15 @@ function App() {
         tone: "info",
         content: redirectToast.message,
         action: (
-          <button
+          <Button
+            variant="bare"
             type="button"
             className="alert-banner-action"
             onClick={redirectToast.dismiss}
             aria-label="Dismiss"
           >
             Dismiss
-          </button>
+          </Button>
         ),
       });
     }
@@ -607,13 +610,14 @@ function App() {
         role: "status",
         content: "A new version of ELSPETH is available — refresh to load it.",
         action: (
-          <button
+          <Button
+            variant="bare"
             type="button"
             onClick={() => window.location.reload()}
             className="alert-banner-action"
           >
             Refresh
-          </button>
+          </Button>
         ),
       });
     }
@@ -648,13 +652,14 @@ function App() {
           // accessible name. The typed ⚙ is dropped too: components/ui/Icon
           // has no gear in its IconName union, and a freelanced glyph is the
           // pattern this pass is removing, not adding to.
-          <button
+          <Button
+            variant="bare"
             type="button"
             onClick={openSecrets}
             className="alert-banner-action"
           >
             API keys & secrets
-          </button>
+          </Button>
         ),
       });
     }
@@ -738,20 +743,19 @@ function App() {
                 plugin catalog to see what ELSPETH can work with.
               </p>
               <div className="empty-landing-actions">
-                <button
+                <Button
+                  variant="primary"
                   type="button"
-                  className="btn btn-primary"
                   onClick={() => void createSession()}
                 >
                   + New session
-                </button>
-                <button
+                </Button>
+                <Button
                   type="button"
-                  className="btn"
                   onClick={() => setCatalogOpen(true)}
                 >
                   Browse the catalog
-                </button>
+                </Button>
               </div>
             </section>
           </div>

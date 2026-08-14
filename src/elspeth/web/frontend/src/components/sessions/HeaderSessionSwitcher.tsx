@@ -15,6 +15,7 @@ import {
 } from "react";
 import { useSessionStore } from "@/stores/sessionStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
+import { Button, Input } from "@/components/ui";
 import { relativeTime } from "@/utils/time";
 import type { Session } from "@/types/index";
 
@@ -246,9 +247,9 @@ export function HeaderSessionSwitcher(): JSX.Element {
   return (
     <>
       <div ref={wrapperRef} className="header-session-switcher">
-        <button
+        <Button
           ref={triggerRef}
-          type="button"
+          compact
           aria-haspopup="menu"
           aria-expanded={open}
           aria-controls={MENU_ID}
@@ -267,12 +268,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
               return !v;
             });
           }}
-          className="btn-compact header-session-switcher-trigger"
+          className="header-session-switcher-trigger"
         >
           <span aria-hidden="true">Session:</span>{" "}
           <strong>{triggerLabel}</strong>
           <span aria-hidden="true"> ▾</span>
-        </button>
+        </Button>
         {archiveError !== null && (
           <div role="alert" className="header-session-switcher-archive-error">
             {archiveError}
@@ -308,7 +309,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
               aria-label="Filter sessions"
               className="header-session-switcher-controls"
             >
-              <input
+              <Input
                 type="text"
                 aria-label="Find a session…"
                 value={filterText}
@@ -318,7 +319,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
                 placeholder="Find a session…"
               />
               <label className="header-session-switcher-show-archived">
-                <input
+                <Input
                   type="checkbox"
                   aria-label="Show archived"
                   checked={showArchived}
@@ -386,9 +387,10 @@ export function HeaderSessionSwitcher(): JSX.Element {
                         void saveRename();
                       }}
                     >
-                      <input
+                      <Input
                         ref={renameInputRef}
                         type="text"
+                        className="header-session-switcher-rename-input"
                         value={renameText}
                         onChange={(e) => setRenameText(e.target.value)}
                         onKeyDown={(e) => {
@@ -405,23 +407,23 @@ export function HeaderSessionSwitcher(): JSX.Element {
                         }
                         disabled={renamePending}
                       />
-                      <button
+                      <Button
                         type="submit"
-                        className="btn-compact"
+                        compact
                         aria-label="Save session name"
                         disabled={renamePending || !trimmedRename}
                       >
                         Save
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         type="button"
-                        className="btn-compact"
+                        compact
                         aria-label="Cancel session rename"
                         onClick={cancelRename}
                         disabled={renamePending}
                       >
                         Cancel
-                      </button>
+                      </Button>
                     </form>
                     {renameError !== null && (
                       <div
@@ -437,11 +439,11 @@ export function HeaderSessionSwitcher(): JSX.Element {
               }
               return (
                 <li key={session.id} role="none" className="header-session-switcher-row">
-                  <button
+                  <Button
                     ref={(el) => {
                       itemRefs.current[selectIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === selectIndex ? 0 : -1}
                     aria-current={session.id === activeSessionId ? "page" : undefined}
@@ -468,12 +470,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     >
                       {relativeTime(session.updated_at)}
                     </span>
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     ref={(el) => {
                       itemRefs.current[renameIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === renameIndex ? 0 : -1}
                     aria-label={`Rename ${title}`}
@@ -481,12 +483,12 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     className="header-session-switcher-action"
                   >
                     Rename
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     ref={(el) => {
                       itemRefs.current[archiveIndex] = el;
                     }}
-                    type="button"
+                    variant="bare"
                     role="menuitem"
                     tabIndex={focusIndex === archiveIndex ? 0 : -1}
                     aria-label={`Archive ${title}`}
@@ -494,7 +496,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     className="header-session-switcher-action"
                   >
                     Archive
-                  </button>
+                  </Button>
                 </li>
               );
             })}

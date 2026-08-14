@@ -549,6 +549,28 @@
   padding: var(--space-xl);
 }
 
+/* Per-dialog closures for the three settings dialogs (SecretsPanel,
+   UserAdminDialog, ComposerPreferencesPanel — elspeth-e6fcd8d703). These were
+   the last inline-styled frames: each carried a copy-pasted style object at
+   literal z-index 100/101 (the NON-modal overlay band, so they stacked as if
+   they were not modal), a hardcoded backdrop rgba and a string box-shadow no
+   theme override could ever reach. The chrome — dialog band, scrim, radius,
+   shadow, height cap — is .app-dialog's; only width and the content scale are
+   these dialogs' own decisions, mirroring how .confirm-dialog closes over the
+   primitive above. */
+.settings-dialog {
+  width: 480px;
+  /* The frame sets the settings content scale (the inline recipe's
+     fontSize: 13) — the .secrets-panel-* / .user-admin-* /
+     .composer-preferences-* content is designed against it, where body copy
+     elsewhere sits at --font-size-base. */
+  font-size: var(--font-size-sm);
+}
+
+.settings-dialog-wide {
+  width: 560px;
+}
+
 .confirm-dialog-header,
 .confirm-dialog-actions {
   flex-shrink: 0;

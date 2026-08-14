@@ -1,4 +1,5 @@
 import { useEffect, useId, useRef, type ReactNode } from "react";
+import { Button } from "@/components/ui";
 import { useFocusTrap } from "@/hooks/useFocusTrap";
 
 interface ConfirmDialogProps {
@@ -56,9 +57,6 @@ export function ConfirmDialog({
     return () => document.removeEventListener("keydown", handleKeyDown);
   }, [onCancel]);
 
-  const confirmBtnClass =
-    variant === "danger" ? "btn btn-danger" : "btn btn-primary";
-
   return (
     <>
       <div
@@ -86,20 +84,16 @@ export function ConfirmDialog({
           {children}
         </div>
         <footer className="confirm-dialog-actions">
-          <button
-            type="button"
-            onClick={onCancel}
-            className="btn confirm-dialog-btn"
-          >
+          <Button onClick={onCancel} className="confirm-dialog-btn">
             {cancelLabel}
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant={variant === "danger" ? "danger" : "primary"}
             onClick={onConfirm}
-            className={`${confirmBtnClass} confirm-dialog-btn confirm-dialog-confirm-btn`}
+            className="confirm-dialog-btn confirm-dialog-confirm-btn"
           >
             {confirmLabel}
-          </button>
+          </Button>
         </footer>
       </div>
     </>

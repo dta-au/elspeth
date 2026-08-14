@@ -194,11 +194,14 @@
   align-items: center;
 }
 
-/* Link-styled secondary action. NOTE: styles/shared.css's `.link-button`
-   (shared.css:269-287) supersedes this class; the six tutorial call sites still
-   name this one, so until they are migrated the two must stay in step — the
-   radius and hover cue below are the primitive's, verbatim, and
-   tutorialShell.test.ts pins them to it.
+/* Link-styled secondary action. The six tutorial call sites route through
+   ui/Button as `variant="bare" className="tutorial-link-button"` (D3
+   primitive migration, elspeth-e7dd7ae371): bare carries this bespoke recipe
+   verbatim because `.link-button` (shared.css:269-287) has no touch-target
+   floor and variant="ghost" is chrome-button styling, not a link — either
+   swap would visually regress six first-run controls. The recipe must stay
+   in step with `.link-button` — the radius and hover cue below are the
+   primitive's, verbatim, and tutorialShell.test.ts pins them to it.
 
    Before elspeth-4603f4a432 this class had NO hover rule anywhere, so every
    secondary action in the tutorial was dead on hover while the identical-looking
@@ -608,40 +611,23 @@
 
 /* Compact copy control in the dense audit panel. It does not need .btn's 44px
    (WCAG 2.5.5 AAA) hit area — tokens.css:242-249 sanctions the smaller
-   --size-control-compact rung (2.5.8, AA) for exactly this kind of chrome row —
-   but it does need to BE on that rung: before elspeth-28bb719b47 it declared no
-   height at all and rendered ~30px, below BOTH control tokens, at badge radius,
-   with a hover that swapped the fill but not the border and no transition, so it
-   read as less substantial than every other button in the product.
+   --size-control-compact rung (2.5.8, AA) for exactly this kind of chrome row.
 
-   Geometry, radius, transition and hover treatment are .btn-compact's
-   (shared.css:188-215); `background-color: transparent` is the one deliberate
-   divergence, because this control sits ON --color-surface-elevated and would
-   otherwise vanish into its own panel. Pinned by tutorialShell.test.ts.
-   (It still does not COMPOSE .btn-compact — that needs the
-   TutorialTurn5AuditStory call site; tracked under elspeth-e7dd7ae371.) */
+   COMPOSES .btn-compact (elspeth-e7dd7ae371, closing the caveat previously
+   recorded here): the TutorialTurn5AuditStory call site renders
+   `<Button compact className="tutorial-hash-copy">`, so geometry, radius,
+   font, transition and hover treatment come from .btn-compact
+   (shared.css:196-233) directly instead of being mirrored declaration by
+   declaration. This rule keeps only the deliberate divergences:
+   `background-color: transparent`, because the control sits ON
+   --color-surface-elevated and would otherwise vanish into its own panel
+   (tutorial.css loads after shared.css, so it wins the equal-specificity tie;
+   .btn-compact's :hover fill still applies at (0,2,0)); and `flex: 0 0 auto`,
+   which is row layout, not chrome. Composition is pinned by
+   teachingMoments.test.tsx. */
 .tutorial-hash-copy {
   flex: 0 0 auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-height: var(--size-control-compact);
   background-color: transparent;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  color: var(--color-text);
-  cursor: pointer;
-  font: inherit;
-  font-size: var(--font-size-sm);
-  padding: var(--space-xs) var(--space-sm);
-  transition: background-color var(--transition-fast),
-    border-color var(--transition-fast);
-  white-space: nowrap;
-}
-
-.tutorial-hash-copy:hover {
-  background-color: var(--color-surface-hover);
-  border-color: var(--color-border-strong);
 }
 
 .tutorial-cancelled-note {

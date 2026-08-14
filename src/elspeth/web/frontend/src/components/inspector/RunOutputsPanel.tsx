@@ -24,6 +24,7 @@ import {
   fetchRunOutputs,
 } from "@/api/client";
 import {
+  Button,
   PreviewTable,
   StructuredJsonPreview,
   type PreviewTableModel,
@@ -327,14 +328,13 @@ export function RunOutputsPanel({ runId }: RunOutputsPanelProps) {
     >
       <div className="run-outputs-panel-header">
         <span className="run-outputs-panel-title">Outputs</span>
-        <button
-          type="button"
-          className="btn-compact"
+        <Button
+          compact
           onClick={() => void loadManifest(runId)}
           disabled={isLoading}
         >
           {isLoading ? "Loading…" : "Refresh"}
-        </button>
+        </Button>
       </div>
 
       {error && (
@@ -480,21 +480,19 @@ function ArtifactActions({ artifact, expanded, onTogglePreview, onDownload }: Ar
   }
   return (
     <span className="run-output-artifact-actions">
-      <button
-        type="button"
-        className="btn-compact"
+      <Button
+        compact
         onClick={onTogglePreview}
         aria-expanded={expanded}
       >
         {expanded ? "Hide preview" : "Preview"}
-      </button>
-      <button
-        type="button"
-        className="btn-compact"
+      </Button>
+      <Button
+        compact
         onClick={onDownload}
       >
         Download
-      </button>
+      </Button>
     </span>
   );
 }
@@ -583,9 +581,9 @@ function ArtifactPreviewView({
           {preview.row_count_preview != null &&
             ` to ${plural(preview.row_count_preview, "row")}`}
           {" — "}
-          <button type="button" className="link-button" onClick={onDownload}>
+          <Button variant="bare" className="link-button" onClick={onDownload}>
             download for full file
-          </button>
+          </Button>
           {" "}({formatBytes(preview.total_size_bytes)} total).
         </div>
       )}

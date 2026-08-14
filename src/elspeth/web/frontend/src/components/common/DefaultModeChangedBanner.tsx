@@ -1,4 +1,5 @@
 import { useCallback } from "react";
+import { Button } from "@/components/ui";
 import { usePreferencesStore } from "@/stores/preferencesStore";
 import { useSessionStore } from "@/stores/sessionStore";
 
@@ -100,14 +101,14 @@ export function DefaultModeChangedBanner(): JSX.Element | null {
           {writeError}
         </p>
       ) : null}
-      <button
-        type="button"
+      <Button
+        variant="bare"
         onClick={onDismiss}
         disabled={writing}
         className="banner-dismiss-btn"
       >
         Got it
-      </button>
+      </Button>
     </div>
   );
 }
