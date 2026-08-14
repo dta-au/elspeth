@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
-CURRENT_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
-V3_CANDIDATE_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
+CURRENT_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v3/catalog.json"
+FROZEN_V2_CATALOG_PATH = REPOSITORY_ROOT / "docs/architecture/state_engine/proof-catalog/v2/catalog.json"
 ADR_041_PATH = REPOSITORY_ROOT / "docs/architecture/adr/041-state-engine-supported-profiles.md"
 ADR_030_PATH = REPOSITORY_ROOT / "docs/architecture/adr/030-multi-worker-deployment-shape.md"
 ADR_INDEX_PATH = REPOSITORY_ROOT / "docs/architecture/adr/README.md"
@@ -17,11 +17,14 @@ def _normalized_text(path: Path) -> str:
 
 
 def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() -> None:
+    """The maintained-current catalog is v3; a silent fallback to v2 fails here."""
+
     assert ADR_041_PATH.is_file(), "ADR-041 must define the supported state-engine profiles"
-    assert CURRENT_CATALOG_PATH.is_file(), "the maintained-current v2 proof catalog must pin the supported profiles"
+    assert CURRENT_CATALOG_PATH.is_file(), "the maintained-current v3 proof catalog must pin the supported profiles"
 
     catalog = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
-    assert catalog["catalog_id"] == "elspeth-state-engine-v2"
+    assert catalog["catalog_id"] == "elspeth-state-engine-v3"
+    assert catalog["schema_version"] == 2
 
     execution_profiles = catalog["execution_profiles"]
     state_store_profiles = execution_profiles["state_store"]
@@ -86,15 +89,22 @@ def test_supported_state_engine_profiles_are_pinned_across_catalog_and_docs() ->
     assert "[041](041-state-engine-supported-profiles.md)" in adr_index
 
 
-def test_v3_candidate_preserves_supported_profiles_for_task12_pointer_switch() -> None:
-    current = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
-    candidate = json.loads(V3_CANDIDATE_CATALOG_PATH.read_text(encoding="utf-8"))
+def test_frozen_v2_catalog_remains_valid_historical_input() -> None:
+    """The frozen v2 package stays byte-present with the exact supported profiles.
 
-    assert current["catalog_id"] == "elspeth-state-engine-v2"
-    assert candidate["catalog_id"] == "elspeth-state-engine-v3"
-    assert candidate["schema_version"] == 2
-    assert candidate["execution_profiles"] == current["execution_profiles"]
-    assert {profile["id"] for profile in candidate["execution_profiles"]["state_store"]} == {
+    v2 is immutable history: it can never again become the maintained-current
+    catalog (the maintained-current assertion above names v3), but the frozen
+    package must keep resolving so historical v2 assessments stay valid.
+    """
+
+    assert FROZEN_V2_CATALOG_PATH.is_file(), "the frozen v2 proof catalog must remain in the tree"
+    frozen = json.loads(FROZEN_V2_CATALOG_PATH.read_text(encoding="utf-8"))
+    current = json.loads(CURRENT_CATALOG_PATH.read_text(encoding="utf-8"))
+
+    assert frozen["catalog_id"] == "elspeth-state-engine-v2"
+    assert current["catalog_id"] == "elspeth-state-engine-v3"
+    assert frozen["execution_profiles"] == current["execution_profiles"]
+    assert {profile["id"] for profile in frozen["execution_profiles"]["state_store"]} == {
         "sqlite-wal",
         "postgresql-16",
     }
