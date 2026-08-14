@@ -29,6 +29,33 @@ export async function boxHeight(locator: Locator): Promise<number> {
   return (await locator.boundingBox())?.height ?? 0;
 }
 
+/**
+ * Width of the artifact region a user can actually see (elspeth-750f92e132).
+ *
+ * The inspector is an absolutely-positioned drawer pinned to the pane's right
+ * edge, so while it is open the pane's own bounding box overstates the usable
+ * region — the old contract measured 920px where the visible strip was 408px,
+ * which is how a P1 that sliced the primary button in half shipped under a
+ * green gate. Subtract the horizontal overlap of a VISIBLE inspector from the
+ * pane's box; with no inspector open this equals boxWidth(artifactRegion()),
+ * so inspector-free specs are unchanged.
+ */
+export async function unoccludedArtifactWidth(composer: ComposerPage): Promise<number> {
+  const pane = await composer.artifactRegion().boundingBox();
+  if (pane === null) return 0;
+  const inspector = composer.page.locator(".workspace-inspector");
+  if ((await inspector.count()) === 0 || !(await inspector.first().isVisible())) {
+    return pane.width;
+  }
+  const drawer = await inspector.first().boundingBox();
+  if (drawer === null) return pane.width;
+  const overlap = Math.max(
+    0,
+    Math.min(pane.x + pane.width, drawer.x + drawer.width) - Math.max(pane.x, drawer.x),
+  );
+  return pane.width - overlap;
+}
+
 export async function expectDesktopWorkspaceGeometry(
   page: Page,
   composer: ComposerPage,
@@ -39,7 +66,13 @@ export async function expectDesktopWorkspaceGeometry(
   await expect(composer.activeArtifactPanel()).toBeVisible();
   await expect.poll(() => boxWidth(composer.authoringPane())).toBeGreaterThanOrEqual(360);
   await expect.poll(() => boxWidth(composer.authoringPane())).toBeLessThanOrEqual(640);
-  await expect.poll(() => boxWidth(composer.artifactRegion())).toBeGreaterThanOrEqual(640);
+  // The floor is asserted against the UNOCCLUDED width, not the pane's own
+  // box — with the inspector drawer open the two differ by the drawer's full
+  // width, and the pane-box form certified a 408px strip as 920px
+  // (elspeth-750f92e132). Callers exercising an inspector-open state at a
+  // viewport that cannot afford 360 + drawer + 640 are expected to fail here:
+  // that failure is the contract working, not flake.
+  await expect.poll(() => unoccludedArtifactWidth(composer)).toBeGreaterThanOrEqual(640);
   await expect.poll(() => boxHeight(composer.activeArtifactPanel())).toBeGreaterThanOrEqual(420);
   expect(page.viewportSize()).not.toBeNull();
 }
@@ -273,13 +306,13 @@ export async function expectResizeGeometry(
   await page.mouse.move(viewportWidth, startY, { steps: 8 });
   await page.mouse.up();
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedMaximum);
-  await expect.poll(() => boxWidth(composer.artifactRegion())).toBeGreaterThanOrEqual(640);
+  await expect.poll(() => unoccludedArtifactWidth(composer)).toBeGreaterThanOrEqual(640);
   await separator.focus();
   await separator.press("Home");
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(360);
   await separator.press("End");
   await expect.poll(() => boxWidth(composer.authoringPane())).toBe(expectedMaximum);
-  await expect.poll(() => boxWidth(composer.artifactRegion())).toBeGreaterThanOrEqual(640);
+  await expect.poll(() => unoccludedArtifactWidth(composer)).toBeGreaterThanOrEqual(640);
   await expect(separator).toHaveAttribute("aria-valuemin", "360");
   await expect(separator).toHaveAttribute("aria-valuemax", String(expectedMaximum));
 }
