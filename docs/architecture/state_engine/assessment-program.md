@@ -10,7 +10,7 @@ validator; do not copy its rules into a dated package or another document.
 1. Read this page, the [criteria](completeness-criteria.md), the
    [architecture](architecture.md), and the
    [proof catalog](proof-catalog/README.md).
-2. Initialize a full v2 package, or materialize an allowed delta from its
+2. Initialize a full v3 package, or materialize an allowed delta from its
    parent.
 3. Capture the exact baseline and environment before executing evidence.
 4. Execute exact command vectors and retain honest limitations.
@@ -27,15 +27,16 @@ Use local Canberra time in `YYYY-MM-DD-HHMM` form:
 STATE_ASSESSMENT_ID="$(TZ=Australia/Canberra date '+%Y-%m-%d-%H%M')"
 STATE_ASSESSMENT_DIR="docs/architecture/state_engine/assessments/${STATE_ASSESSMENT_ID}"
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
-  init-full --catalog docs/architecture/state_engine/proof-catalog/v2/catalog.json \
+  init-full --catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json \
   "${STATE_ASSESSMENT_ID}" "${STATE_ASSESSMENT_DIR}"
 ```
 
 `--catalog` is mandatory and repository-relative. There is deliberately no
-implicit current-catalog fallback. Keep v2 in this command until the first
-full v3 publication switches the maintained pointers atomically.
+implicit current-catalog fallback. The first full v3 publication
+(2026-08-15-0537) switched the maintained pointers to v3; v1 and v2 remain
+frozen historical inputs addressed explicitly by path.
 
-The initializer creates a fully materialized 73-leg v2 manifest plus readable
+The initializer creates a fully materialized 73-leg v3 manifest plus readable
 README, evidence, and review templates. It refuses any pre-existing destination
 (including a symlink) and stages the files in a sibling directory. It then
 claims the destination with an atomic no-replace `mkdir`, moves the staged files
@@ -50,7 +51,7 @@ fully materialized manifest, never a sparse patch. It names
 "..."}`, declares each changed proof cell in `changed_tuples`, and declares
 changed gates in `changed_gate_ids`.
 
-A v2 changed tuple contains `leg_id`, `dimension_id`, `case_id`, and
+A changed tuple contains `leg_id`, `dimension_id`, `case_id`, and
 `profile_case`. Copy the parent, change the assessment/baseline identity, and
 rerun or remove evidence for every affected cell. The validator compares
 normalized cell status plus referenced evidence content and gate records to the
@@ -59,7 +60,7 @@ global engine complete.
 
 ## 2. Capture Git identity
 
-New v2 assessments use an explicit baseline provenance mode. Use `current` for
+New assessments use an explicit baseline provenance mode. Use `current` for
 the Task 3 assessment and ordinary new assessments: repository root, origin,
 branch, commit, and tree must all match the validating checkout, and the
 non-document worktree must be clean. Use `historical` only for retained-object
@@ -142,13 +143,13 @@ truncated session-context screen is orientation, not canonical evidence.
 
 ## 5. Validate catalog identity
 
-The current catalog is `proof-catalog/v2/catalog.json`. Validate its complete
+The current catalog is `proof-catalog/v3/catalog.json`. Validate its complete
 contract and record its digest:
 
 ```bash
 PYTHONPATH="$PWD/src" .venv/bin/python scripts/state_engine_assessment.py \
-  validate-catalog docs/architecture/state_engine/proof-catalog/v2/catalog.json
-sha256sum docs/architecture/state_engine/proof-catalog/v2/catalog.json
+  validate-catalog docs/architecture/state_engine/proof-catalog/v3/catalog.json
+sha256sum docs/architecture/state_engine/proof-catalog/v3/catalog.json
 ```
 
 This operation rejects duplicate JSON keys; wrong leg, dimension, gate, or
@@ -157,8 +158,8 @@ enum drift; and a first-party plugin inventory that differs from live
 discovery. Normal `json.load` alone is insufficient because it silently
 overwrites duplicate keys.
 
-The v2 applicability axis is explicit. Evidence coverage and overrides name an
-exact `(leg_id, dimension_id, case_id, profile_case)` cell. A passing SQLite
+The v3 applicability axis is explicit per cell. Evidence coverage and overrides
+name an exact `(leg_id, dimension_id, case_id, profile_case)` cell. A passing SQLite
 cell does not promote the corresponding PostgreSQL cell, or vice versa.
 
 ## 6. Execute evidence
@@ -203,6 +204,23 @@ sha256sum \
 
 Record the exit code even when the command fails. Do not hide skips, xfails,
 warnings, service absence, or nondeterministic timing.
+
+Rerunning a published record's evidence: rewrite the output-transport
+arguments (`--junitxml`, `--state-engine-profile-report`) to throwaway paths
+outside the repository before replaying any recorded argv — the recorded paths
+ARE the retained evidence, and a verbatim replay overwrites what it is
+verifying. File permissions do not protect you here: git records plain file
+modes, so a fresh clone's evidence files are writable regardless of how the
+capture worktree shipped them. Honor any reproduction preconditions the
+package's `evidence.md` declares (quiet-host load bars for
+contention-sensitive process probes, interpreter version, safe environment),
+and compare a rerun to the retained `profile.json` by node identities and
+outcomes — the JUnit carries timestamps and hostnames and will never
+byte-match. Know the reporter's silent fail-closed signature: a rerun that
+prints "N passed" but exits 1 with empty stderr and no profile report means
+the reporter's session gate fired (no probe observation, the probe node was
+not in your selection, or an outcome/node mismatch), not that the tree
+regressed.
 
 ## 7. Attach evidence to proof cells
 
@@ -358,10 +376,16 @@ this path only when an assessment has a v1 manifest and recorded hashes:
 6. Compare deterministic artifacts by hash and logs/JUnit by declared semantic
    fields. Write a divergence report without modifying the original assessment
    or retained artifacts.
+7. Rewrite the output-transport arguments (`--junitxml`,
+   `--state-engine-profile-report`) to throwaway paths outside the repository
+   before replaying any recorded argv: the recorded paths are the retained
+   evidence, and a verbatim replay overwrites what it is verifying. Honor any
+   reproduction preconditions the package declares (for example, a quiet-host
+   load bar for contention-sensitive process probes).
 
-The current v2 catalog intentionally fails live-inventory validation against an
-older v1 checkout, and the v1 catalog may fail live-inventory validation against
-current source. Validate historical identity in the package-bearing checkout;
+The current v3 catalog intentionally fails live-inventory validation against an
+older checkout, and the frozen v1/v2 catalogs may fail live-inventory validation
+against current source. Validate historical identity in the package-bearing checkout;
 execute historical behavior in the detached baseline worktree.
 
 ### Legacy best-effort reconstruction

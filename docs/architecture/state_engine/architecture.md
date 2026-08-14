@@ -91,7 +91,7 @@ two-axis state.
 | TS-19 | Fenced run finalization for non-resumable pending tokens and open effect-linked operations |
 
 The exact stable leg list and required cases live in the
-[v2 catalog](proof-catalog/v2/catalog.json).
+[v3 catalog](proof-catalog/v3/catalog.json).
 
 ### Write ownership
 
