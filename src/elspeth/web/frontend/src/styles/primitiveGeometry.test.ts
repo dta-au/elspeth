@@ -232,13 +232,17 @@ describe("indeterminate progress stripe (elspeth-14523219ee, elspeth-58903688f2)
     expect(period).toBeLessThanOrEqual(trackHeight * 2);
   });
 
-  it("declares the track height that actually ships, so import order cannot decide it", () => {
+  it("declares the track height in exactly one place, so import order cannot decide it", () => {
     // ProgressView.tsx renders className="progress-bar progress-bar-outer";
     // .progress-bar-outer (execution.css) is a later barrel import at equal
-    // specificity, so it shipped. Both must now agree.
-    expect(px(winningValue(".progress-bar", "height"))).toBe(
-      px(winningValue(".progress-bar-outer", "height")),
-    );
+    // specificity, so when both declared a height the shipped value was
+    // decided by import order alone (elspeth-58903688f2). .progress-bar owns
+    // the height; .progress-bar-outer must not re-declare it.
+    expect(px(winningValue(".progress-bar", "height"))).toBe(8);
+    expect(
+      winningValue(".progress-bar-outer", "height"),
+      ".progress-bar-outer must not re-declare the track height .progress-bar owns",
+    ).toBeNull();
   });
 });
 

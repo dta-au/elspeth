@@ -10,12 +10,15 @@
 /* Real centered-overlay modal, consistent with .graph-modal / .confirm-dialog
    (which it previously only impersonated via role="dialog"). The backdrop
    dims the page and closes the dialog on click; the dialog floats above it on
-   the shared --z-dialog stack. The literal rgba black backdrop/shadow values
-   mirror those modals verbatim — there is no backdrop/shadow design token. */
+   the shared --z-dialog stack. The backdrop and shadow now come from the
+   design tokens this file's header once (correctly) complained did not exist:
+   --color-scrim is the single page-dimming veil behind every blocking
+   overlay, and --shadow-modal the blocking-dialog elevation tier
+   (elspeth-e6fcd8d703). */
 .save-for-review-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
@@ -31,7 +34,9 @@
   overflow: auto;
   padding: var(--space-lg);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Modal radius, not the button radius — the same correction .graph-modal /
+     .yaml-modal already took (elspeth-03492be50b, elspeth-e6fcd8d703). */
+  border-radius: var(--radius-lg);
   background: var(--color-surface-elevated);
   box-shadow: var(--shadow-modal);
 }

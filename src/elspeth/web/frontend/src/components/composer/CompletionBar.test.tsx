@@ -128,7 +128,7 @@ describe("CompletionBar", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("renders three co-equal buttons when a session is active and validation passes", () => {
+  it("renders three co-equal buttons as DIRECT children of the group (elspeth-929fc5d4a7)", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
@@ -137,10 +137,20 @@ describe("CompletionBar", () => {
       execute: vi.fn(),
     });
     render(<CompletionBar />);
-    expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-save-for-review")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-run-pipeline")).toBeInTheDocument();
-    expect(screen.getByTestId("completion-bar-export-yaml")).toBeInTheDocument();
+    const bar = screen.getByTestId("completion-bar");
+    const buttons = within(bar).getAllByRole("button");
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Save for review",
+      "Run pipeline",
+      "Export YAML",
+    ]);
+    // Structural symmetry contract: a wrapper <div> around any verb makes
+    // flexbox treat the three asymmetrically (the bare sibling stretches to
+    // the tallest wrapper — the 98px slab). All three must be direct flex
+    // children so the equal-width/height rules reach the buttons themselves.
+    for (const button of buttons) {
+      expect(button.parentElement).toBe(bar);
+    }
   });
 
   it("disables Save for review when validation has not run", () => {
@@ -184,9 +194,7 @@ describe("CompletionBar", () => {
 
     expect(screen.getByTestId("completion-bar-save-for-review")).toBeDisabled();
     expect(
-      screen
-        .getByTestId("completion-bar-run-pipeline")
-        .querySelector("button"),
+      screen.getByRole("button", { name: "Run pipeline" }),
     ).toBeDisabled();
   });
 
@@ -220,9 +228,9 @@ describe("CompletionBar", () => {
     const save = screen.getByTestId(
       "completion-bar-save-for-review",
     ) as HTMLButtonElement;
-    const run = screen
-      .getByTestId("completion-bar-run-pipeline")
-      .querySelector("button") as HTMLButtonElement;
+    const run = screen.getByRole("button", {
+      name: "Run pipeline",
+    }) as HTMLButtonElement;
 
     expect(save).toBeDisabled();
     expect(save).toHaveAttribute(
@@ -277,9 +285,9 @@ describe("CompletionBar", () => {
     });
     // beforeEach already sets validationResult: null.
     const { unmount } = render(<CompletionBar />);
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButtonNull = exportContainer.querySelector("button") as HTMLButtonElement;
-    expect(exportButtonNull).not.toBeNull();
+    const exportButtonNull = screen.getByRole("button", {
+      name: "Export YAML",
+    }) as HTMLButtonElement;
     expect(exportButtonNull.disabled).toBe(false);
     expect(exportButtonNull.getAttribute("aria-disabled")).toBeNull();
     unmount();
@@ -293,9 +301,9 @@ describe("CompletionBar", () => {
       execute: vi.fn(),
     });
     render(<CompletionBar />);
-    const exportContainerInvalid = screen.getByTestId("completion-bar-export-yaml");
-    const exportButtonInvalid = exportContainerInvalid.querySelector("button") as HTMLButtonElement;
-    expect(exportButtonInvalid).not.toBeNull();
+    const exportButtonInvalid = screen.getByRole("button", {
+      name: "Export YAML",
+    }) as HTMLButtonElement;
     expect(exportButtonInvalid.disabled).toBe(false);
     expect(exportButtonInvalid.getAttribute("aria-disabled")).toBeNull();
   });
@@ -307,9 +315,9 @@ describe("CompletionBar", () => {
     useSessionStore.setState({ activeSessionId: "sess-1" });
     // beforeEach leaves compositionState null (no pipeline yet).
     render(<CompletionBar />);
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButton = exportContainer.querySelector("button") as HTMLButtonElement;
-    expect(exportButton).not.toBeNull();
+    const exportButton = screen.getByRole("button", {
+      name: "Export YAML",
+    }) as HTMLButtonElement;
     expect(exportButton.disabled).toBe(true);
     expect(exportButton.getAttribute("aria-disabled")).toBe("true");
     expect(exportButton.getAttribute("title")).toMatch(/add pipeline components/i);
@@ -331,9 +339,9 @@ describe("CompletionBar", () => {
     });
 
     render(<CompletionBar />);
-    const runContainer = screen.getByTestId("completion-bar-run-pipeline");
-    const runButton = runContainer.querySelector("button") as HTMLButtonElement;
-    expect(runButton).not.toBeNull();
+    const runButton = screen.getByRole("button", {
+      name: "Run pipeline",
+    }) as HTMLButtonElement;
     expect(runButton.disabled).toBe(false);
 
     fireEvent.click(runButton);
@@ -375,8 +383,9 @@ describe("CompletionBar", () => {
       "true",
     );
 
-    const exportContainer = screen.getByTestId("completion-bar-export-yaml");
-    const exportButton = exportContainer.querySelector("button") as HTMLButtonElement;
+    const exportButton = screen.getByRole("button", {
+      name: "Export YAML",
+    }) as HTMLButtonElement;
     fireEvent.click(exportButton);
 
     await waitFor(() => {

@@ -134,7 +134,7 @@ export function PipelineSpecView(): JSX.Element {
   const compositionState = useSessionStore((state) => state.compositionState);
 
   if (compositionState === null) {
-    return <p className="artifact-empty">No pipeline specification yet.</p>;
+    return <p className="empty-state">No pipeline specification yet.</p>;
   }
 
   const name = compositionState.metadata.name ?? "Untitled pipeline";

@@ -14,6 +14,17 @@
  * co-equal verbs. The "Save for review" button follows the backend-owned
  * completion-readiness axis. This is deliberately stricter than Run: an
  * advisor checkpoint can allow execution while still blocking completion.
+ *
+ * STRUCTURAL SYMMETRY (elspeth-929fc5d4a7): the three verbs render as DIRECT
+ * children of .completion-bar — no wrapper <div>s. The earlier shape (bare
+ * save button beside two wrapped primitives) let flexbox treat the three
+ * asymmetrically: the bare button stretched to the tallest wrapper's height
+ * (a 98px slab when ExecuteButton's block-reason line rode inside the Run
+ * wrapper), and the co-equal verbs shared no baseline. With no wrappers, the
+ * equal-width rules (`.completion-bar > *`, sidebar.css / workspace.css)
+ * reach the buttons themselves, and workspace.css moves ExecuteButton's
+ * reason line onto its own full-width flex line so helper text can never
+ * drive a sibling's height again.
  */
 
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
@@ -69,12 +80,8 @@ export function CompletionBar(): JSX.Element | null {
       >
         Save for review
       </button>
-      <div data-testid="completion-bar-run-pipeline">
-        <ExecuteButton />
-      </div>
-      <div data-testid="completion-bar-export-yaml">
-        <ExportYamlButton />
-      </div>
+      <ExecuteButton />
+      <ExportYamlButton />
     </div>
   );
 }

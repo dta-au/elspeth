@@ -16,6 +16,7 @@ import {
   stepLabelForNodeId,
   stepLabelForPlugin,
 } from "./interpretationStepLabel";
+import { pluginDisplayName } from "@/components/catalog/pluginDisplayName";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 import type { CompositionState, NodeSpec } from "@/types/index";
 
@@ -56,6 +57,24 @@ describe("stepLabelForPlugin", () => {
       "Aws Textract Document Analysis",
     );
   });
+
+  // elspeth-d2de348437: a plugin outside the verb map must carry EXACTLY its
+  // catalog card name — same curated overrides, same acronym set — so one
+  // plugin never has two display names in one session. Derived from the
+  // shared function (the constraint), with one literal anchor so the shared
+  // function itself cannot silently regress.
+  it("matches the catalog display name exactly for plugins outside the verb map", () => {
+    expect(stepLabelForPlugin("json_explode")).toBe(
+      pluginDisplayName("json_explode"),
+    );
+    expect(stepLabelForPlugin("json_explode")).toBe("JSON Explode");
+    expect(stepLabelForPlugin("azure_blob")).toBe(pluginDisplayName("azure_blob"));
+    expect(stepLabelForPlugin("csv")).toBe(pluginDisplayName("csv"));
+  });
+
+  it("is not confused by Object.prototype key names (verb map is a Map, not a bare object)", () => {
+    expect(stepLabelForPlugin("constructor")).toBe("Constructor");
+  });
 });
 
 describe("humaniseStepLabel — node-name preference (R2-F8b)", () => {
@@ -76,7 +95,9 @@ describe("humaniseStepLabel — node-name preference (R2-F8b)", () => {
 
   it("title-cases a semantically-named id even though it starts with the plugin name (llm_rate_coolness) — accepted behaviour, not a false positive on the plugin-derived check", () => {
     const state = makeCompositionState([makeNode("llm_rate_coolness", "llm")]);
-    expect(humaniseStepLabel(state, "llm_rate_coolness")).toBe("Llm Rate Coolness");
+    // "LLM", not "Llm": author names share the catalog's acronym set
+    // (elspeth-d2de348437).
+    expect(humaniseStepLabel(state, "llm_rate_coolness")).toBe("LLM Rate Coolness");
   });
 
   it("title-cases a user-meaningful node id for a non-llm plugin too", () => {
@@ -116,7 +137,12 @@ describe("stepLabelForNodeId — the shared choke point (R2-F8b)", () => {
 
   it("does not treat a plugin-name PREFIX as plugin-derived (llm_rate_coolness stays a real name)", () => {
     const state = makeCompositionState([makeNode("llm_rate_coolness", "llm")]);
-    expect(stepLabelForNodeId(state, "llm_rate_coolness")).toBe("Llm Rate Coolness");
+    expect(stepLabelForNodeId(state, "llm_rate_coolness")).toBe("LLM Rate Coolness");
+  });
+
+  it("never applies curated plugin display overrides to an author-chosen node name (id 'dataverse' on an llm node stays 'Dataverse', not 'Microsoft Dataverse')", () => {
+    const state = makeCompositionState([makeNode("dataverse", "llm")]);
+    expect(stepLabelForNodeId(state, "dataverse")).toBe("Dataverse");
   });
 
   it("returns null (not the raw id) when the node is absent — callers that must not leak an internal id (validationHumaniser's PipelineValidationSummary / ReadinessRowDetail consumers) depend on this", () => {

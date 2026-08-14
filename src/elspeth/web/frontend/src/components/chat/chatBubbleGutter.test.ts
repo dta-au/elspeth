@@ -266,3 +266,88 @@ describe("one type size across both speakers (elspeth-b6e82c12bb)", () => {
     }
   });
 });
+
+describe("one gutter across the shared band row (elspeth-dfc207f341)", () => {
+  // .chat-panel-header and .artifact-workspace-toolbar are ONE horizontal
+  // band across the pane divider. With --space-lg on the authoring side and
+  // --space-sm on the artifact side, the divider sat off-centre in its own
+  // row: 16px of clearance on its left, 8px on its right, measured at 1280.
+  // Agreement with the toolbar, not a pinned literal — and agreement on what
+  // the two sides RENDER, not on spelling: the toolbar names the gutter
+  // through workspace.css's --artifact-gutter indirection while the header
+  // names the spacing token directly.
+
+  /** Resolve var() chains against every custom-property declaration in the
+   *  barrel (tokens.css :root plus component-scoped properties such as
+   *  --artifact-gutter). Cycles or unknown names throw rather than pass. */
+  function resolveVars(value: string, depth = 0): string {
+    if (depth > 8) throw new Error(`var() chain too deep for: ${value}`);
+    const reference = /var\(\s*(--[\w-]+)\s*\)/.exec(value);
+    if (reference === null) return value.trim();
+    const declaration = new RegExp(
+      `(?:^|[;{\\s])${reference[1]}\\s*:\\s*([^;}]+)`,
+    ).exec(stripComments(appCss));
+    if (declaration === null) {
+      throw new Error(`${reference[1]} is not declared anywhere in the barrel`);
+    }
+    return resolveVars(
+      value.replace(reference[0], declaration[1].trim()),
+      depth + 1,
+    );
+  }
+
+  it("gives both band halves the same rendered inline gutter", () => {
+    const headerInline = declaredValue(".chat-panel-header", "padding").split(
+      /\s+(?![^(]*\))/,
+    )[1];
+    const toolbarInline = declaredValue(
+      ".artifact-workspace-toolbar",
+      "padding",
+    ).split(/\s+(?![^(]*\))/)[1];
+    expect(resolveVars(headerInline)).toBe(resolveVars(toolbarInline));
+  });
+});
+
+describe("one rule per in-bubble seam (elspeth-4dc660d56f)", () => {
+  // The sources-created group is the audit-bearing part of a message. In a
+  // sources-ONLY turn nothing else draws the seam, so the group must carry
+  // the same border-top as its sibling .message-tools — the rule's own
+  // comment promised that parallel for months while the declaration did not
+  // exist, and the group abutted prose with 12px of undifferentiated gap.
+  // When BOTH groups render, MessageBubble.tsx paints the
+  // .message-group-separator ruler between them, and the group's own border
+  // must come OFF or the one seam carries two rules.
+
+  it("gives the sources group the same seam .message-tools draws", () => {
+    // Equality with the sibling, not a pinned literal: if the divider weight
+    // is ever retuned, both groups move together or this fails.
+    expect(declaredValue(".message-sources-created", "border-top")).toBe(
+      declaredValue(".message-tools", "border-top"),
+    );
+  });
+
+  it("keeps the ruler's weight equal to the group seams it substitutes for", () => {
+    expect(declaredValue(".message-group-separator", "border-top")).toBe(
+      declaredValue(".message-tools", "border-top"),
+    );
+  });
+
+  it("strips the group's own border when the ruler owns the seam", () => {
+    // The elspeth-4dc660d56f exclusivity: ruler + border-top in the same
+    // seam is a double rule. The adjacent-sibling rule already zeroes the
+    // margin/padding pair; the border must be zeroed with them.
+    const suppressed = declaredValue(
+      ".message-group-separator + .message-sources-created",
+      "border-top",
+    );
+    expect(px(suppressed)).toBe(0);
+    expect(
+      px(
+        declaredValue(
+          ".message-group-separator + .message-sources-created",
+          "margin-top",
+        ),
+      ),
+    ).toBe(0);
+  });
+});

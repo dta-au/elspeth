@@ -4,13 +4,38 @@
    .progress-counters*,
    .progress-routing-summary, .progress-accounting*, .progress-cancelled-msg,
    .progress-failed-msg, .progress-errors-*, .progress-error-*,
-   .run-outcome-notice*. */
+   .run-outcome-notice*, .runs-history-backdrop, .runs-history-drawer,
+   .runs-history-drawer-header, .runs-history-drawer-body, .runs-history-list,
+   .runs-history-item, .runs-history-item-corruption.
+   (The remaining .runs-history-* row/typography rules are historical tenants
+   of header.css:6; the drawer SURFACE rules live here with the component.) */
 
 /* ---------------------------------------------------------------------------
    RunOutcomeNotice — app-level terminal-run toast (elspeth-3a7b7c7b37).
    Tone backgrounds/borders come from the shared .alert-banner classes
-   (header.css); this block owns only the action-row layout.
+   (header.css); this block owns the strip's geometry and action-row layout.
+
+   elspeth-1df26d22ae: the strip stacks DIRECTLY against .app-notice-primary
+   (one DOM node away) and must not visibly step against it, so it mirrors
+   that sibling's recipe (styles/shared.css): the --size-control height cap,
+   the single-line ellipsised message, and the action-margin reset — the
+   .alert-banner-action margin-left (header.css) and this row's own gap are
+   two spacing mechanisms that otherwise stack to a 16px drift.
    --------------------------------------------------------------------------- */
+.run-outcome-notice.alert-banner {
+  height: var(--size-control);
+  max-height: var(--size-control);
+  gap: var(--space-sm);
+  padding-block: var(--space-2xs);
+}
+
+.run-outcome-notice-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .run-outcome-notice-actions {
   display: inline-flex;
   flex-shrink: 0;
@@ -18,17 +43,119 @@
   align-items: center;
 }
 
+.run-outcome-notice-actions .alert-banner-action {
+  margin-left: 0;
+}
+
+/* ---------------------------------------------------------------------------
+   RunsHistoryDrawer — aria-modal slide-over listing a session's runs
+   (elspeth-61330c82fc). These class names were declared as tenants by
+   header.css:6 but never defined, so the dialog rendered as raw in-flow page
+   content with UA disc bullets. Surface recipe mirrors .catalog-drawer
+   (catalog.css): right-anchored fixed panel over the shared page scrim —
+   blocking overlays consume --color-scrim, never a literal — with
+   --shadow-modal, the blocking-dialog elevation tier.
+   --------------------------------------------------------------------------- */
+.runs-history-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-overlay);
+  background-color: var(--color-scrim);
+}
+
+.runs-history-drawer {
+  position: fixed;
+  inset: 0 0 0 auto;
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  width: min(560px, calc(100% - var(--space-xl)));
+  border-left: 1px solid var(--color-border);
+  background-color: var(--color-surface);
+  box-shadow: var(--shadow-modal);
+}
+
+.runs-history-drawer-header {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-sm);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-sm) var(--space-md);
+  border-bottom: 1px solid var(--color-border);
+}
+
+/* The drawer's single scroll container; the header stays pinned. */
+.runs-history-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: var(--space-sm) var(--space-md);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.runs-history-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.runs-history-item {
+  padding-block: var(--space-sm);
+}
+
+.runs-history-item + .runs-history-item {
+  border-top: 1px solid var(--color-border);
+}
+
+/* Per-run audit-integrity role="alert" (elspeth-d5578ccd98). Without a rule
+   it inherited 16px plain body text beside the 12px tinted StatusBadge, so
+   the most serious message in the row read as the least urgent. Same error
+   affordance family as .run-failure-detail (header.css), one size step above
+   the badge and weighted, so it outranks everything else in its row. */
+.runs-history-item-corruption {
+  padding: var(--space-2xs) var(--space-sm);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-error-bg);
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+}
+
+/* Per-STATE failure provenance inside the diagnostics disclosure — the same
+   error family as .run-failure-detail (header.css), one register quieter
+   because it nests under the per-run detail. Previously rule-less, so the
+   recorded failure read as ordinary diagnostics prose. */
+.run-diagnostics-state-failure {
+  margin-top: var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border-left: 3px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-error-bg);
+  color: var(--color-error);
+}
+
 /* ---------------------------------------------------------------------------
    ProgressView
    --------------------------------------------------------------------------- */
 .progress-container {
-  padding: var(--space-md);
+  /* Inline padding is 0, not --space-md: the only mount is inside
+     .inline-run-results, whose own padding already places the panel's
+     heading and its sibling notices on one left edge — a second inline
+     inset here indented the run counters 12px past the panel's own header
+     (elspeth-a72b7916a1). */
+  padding: var(--space-md) 0;
   font-size: var(--font-size-sm);
 }
 
 .progress-ws-banner {
   padding: var(--space-1-5) var(--space-2-5);
   margin-bottom: var(--space-sm);
+  /* Measure cap (elspeth-d01115c75e): one short sentence otherwise stretches
+     ~1450px across the artifact panel. 74ch matches the chat column's
+     documented reading band (chat.css .message-bubble-content). */
+  max-width: 74ch;
   background-color: var(--color-warning-bg);
   color: var(--color-warning);
   border: 1px solid var(--color-warning-border);
@@ -53,7 +180,10 @@
 }
 
 .progress-bar-outer {
-  height: 8px;
+  /* height is owned by .progress-bar (animations.css) — the only element
+     carrying this class also carries that one, and a second equal-specificity
+     declaration here let import order decide the shipped height
+     (elspeth-58903688f2). primitiveGeometry.test.ts pins single ownership. */
   border-radius: var(--radius-sm);
   margin-bottom: var(--space-md);
 }
@@ -64,11 +194,15 @@
   margin-bottom: var(--space-xs);
 }
 
+/* A real grid, not a label-width-driven flex row: the three counters are the
+   numbers an operator actually watches, and flex columns derived from label
+   width put the values on no shared rhythm (elspeth-a72b7916a1). auto-fit
+   (the .progress-accounting-grid idiom below) keeps the columns equal at
+   every width and reflows rather than overflowing in narrow layouts. */
 .progress-counters {
-  display: flex;
-  gap: var(--space-xl);
-  flex-wrap: wrap;
-  row-gap: var(--space-sm);
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: var(--space-sm) var(--space-lg);
   margin-bottom: var(--space-md);
 }
 
@@ -81,6 +215,9 @@
 .progress-counter-value {
   font-size: var(--font-size-xl);
   font-weight: 700;
+  /* These values tick while the user watches; proportional figures make the
+     numbers jitter sideways on every update (elspeth-a72b7916a1). */
+  font-variant-numeric: tabular-nums;
 }
 
 .progress-routing-summary {
@@ -142,6 +279,9 @@
 .progress-cancelled-msg {
   padding: var(--space-sm) var(--space-md);
   margin-bottom: var(--space-sm);
+  /* Same 74ch measure cap as .progress-ws-banner — the run-status strips in
+     this panel move as one family (elspeth-d01115c75e). */
+  max-width: 74ch;
   background-color: var(--color-warning-bg);
   color: var(--color-warning);
   border-radius: var(--radius-sm);
@@ -152,6 +292,7 @@
 .progress-failed-msg {
   padding: var(--space-sm) var(--space-md);
   margin-bottom: var(--space-sm);
+  max-width: 74ch;
   background-color: var(--color-error-bg);
   color: var(--color-error);
   border-radius: var(--radius-sm);

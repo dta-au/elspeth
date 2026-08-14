@@ -60,7 +60,12 @@ describe("header floating surfaces (elspeth-4d38a73632)", () => {
       '@import "../components/header/header.css";',
     );
     const selectors = floatingRules.flatMap((rule) => rule.selectors);
-    expect(selectors).toContain(".header-session-switcher-menu");
+    // The switcher's floating surface is the POPOVER wrapper, not the menu:
+    // elspeth-8c7ac37d49 moved the filter strip and menu inside one
+    // absolutely-positioned box hung off the trigger, so the header's height
+    // contract holds while the switcher is open. The menu itself is an
+    // in-flow flex child of that popover and owes no elevation of its own.
+    expect(selectors).toContain(".header-session-switcher-popover");
     expect(selectors).toContain(".user-menu-list");
   });
 
@@ -98,7 +103,7 @@ describe("header floating surfaces (elspeth-4d38a73632)", () => {
   // chat, workspace and inspector menus. The scale test above is what holds —
   // the layer must be NAMED, whichever tier it names.
   it("gives both header menus the same corner and trigger offset", () => {
-    const menus = [".header-session-switcher-menu", ".user-menu-list"].map(
+    const menus = [".header-session-switcher-popover", ".user-menu-list"].map(
       (selector) => {
         const rule = floatingRules.find((candidate) =>
           candidate.selectors.includes(selector),

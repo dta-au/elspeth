@@ -5,8 +5,27 @@
    are selector-scoped, not global; src/components/inspector/GraphView.test.tsx
    and reactFlowThemeScope.test.tsx read this file by path), the @xyflow
    element overrides (.react-flow__controls-button, .react-flow__panel,
-   .react-flow__edge-textbg), .graph-view*, .graph-node*,
-   .graph-validation-dot, .graph-config* + responsive media query. */
+   .react-flow__edge-textbg, .react-flow__edge-text), .graph-view*,
+   .graph-node*, .graph-validation-dot, .graph-config* + responsive media
+   query. Tenant: .yaml-view-display (emitted by inspector/YamlDisplay.tsx;
+   the rest of the .yaml-view* family lives in styles/common.css). */
+
+/* Flex-chain link for the YamlDisplay primitive (elspeth-b486ab259c): the
+   class was emitted with no definition anywhere in the barrel, so this
+   in-between box defaulted to a content-height block and common.css's
+   `.yaml-view-content { flex: 1; min-height: 0; overflow: auto }` was inert —
+   the scroll fell through to .artifact-workspace-panel and the Copy/Download
+   toolbar (flex-shrink: 0, i.e. a pinned band by its own declarations)
+   scrolled away with the code it acts on. Restoring the chain makes the
+   content region the scroller and the toolbar a pinned band again. flex: 1
+   engages under YamlView's flex-column .yaml-view; in SharedInspectView's
+   block <section> it is inert and harmless. */
+.yaml-view-display {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
 
 /* ---------------------------------------------------------------------------
    Version Selector (Inspector Panel)
@@ -228,10 +247,50 @@
   ry: var(--radius-sm);
 }
 
+/* The edge label is the only piece of text on the canvas and it carries real
+   information (the edge's outcome condition), but the --xy-* theming block
+   above never sets a size, so @xyflow's unthemed 10px default stood — 2px
+   below the tokens.css type floor ("do not lower --font-size-xs below 12px",
+   elspeth-5836435926 / elspeth-859eae4480). :root-prefixed like every other
+   vendor override in this group so it beats the vendor's bare-class rule on
+   specificity, not bundle order. The label's background rect
+   (.react-flow__edge-textbg) needs no companion change: React Flow sizes it
+   from the text metrics, so it follows the type size. */
+:root .react-flow__edge-text {
+  font-size: var(--font-size-xs);
+}
+
 .graph-view-shell {
   position: relative;
   width: 100%;
   height: 100%;
+}
+
+/* Empty canvas (elspeth-1f4b60a492): composes the shared .empty-state
+   register (shared.css), which centres content within its own box — but the
+   box was content-height, so the one-line message pinned to the top edge of
+   a ~950px void and the first screen inside the product read as unfinished
+   layout. height: 100% stretches the box to the workspace panel (a definite
+   flex height — .artifact-workspace-panel is flex: 1 1 auto; min-height: 0),
+   so the base register's centring actually lands mid-void; column direction
+   stacks the lead line over its guidance. Type treatment mirrors the
+   .empty-landing register (header.css): an --font-size-xl lead in body
+   colour over a muted guidance line. */
+.graph-view-empty {
+  height: 100%;
+  flex-direction: column;
+  gap: var(--space-xs);
+}
+
+.graph-view-empty-title {
+  margin: 0;
+  color: var(--color-text);
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-heading);
+}
+
+.graph-view-empty-hint {
+  margin: 0;
 }
 
 .graph-view-canvas {
@@ -400,8 +459,16 @@
   overflow: auto;
   padding: var(--space-md);
   border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
+  /* --radius-lg, matching the node cards' corner (GraphView.tsx node style):
+     at --radius-md this panel rounded SHARPER than the 8px cards it floats
+     over, inverting the concentric outer-≥-inner relationship
+     (elspeth-37cc8b5310). Both surfaces now read the same token, so a retune
+     of the card rank reaches the panel too. */
+  border-radius: var(--radius-lg);
   background-color: var(--color-surface-paper);
+  /* Raw shadow is DELIBERATE (elspeth-6c3223c76e): covered by the
+     tokens.css "oversized config panels" carve-out — do not map it onto the
+     three shadow tiers. */
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.28);
 }
 
@@ -428,8 +495,10 @@
 
 /* Geometry copied from .btn-compact (shared.css) rather than the bespoke
    32×32 / --radius-sm box this carried: 32px matched neither control rung, and
-   a --radius-sm corner inside a --radius-md panel breaks the concentric
-   relationship with its own container (elspeth-5724ae8378). Composing
+   a --radius-sm corner inside the (now --radius-lg) panel breaks the
+   concentric relationship with its own container (elspeth-5724ae8378) —
+   --radius-md keeps the inner corner softer than --radius-sm while staying
+   inside the panel's larger radius. Composing
    .btn-compact on the element itself would be better still, but the class list
    lives in GraphView.tsx. The × glyph it renders is the shared close glyph. */
 .graph-config-close {

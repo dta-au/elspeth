@@ -191,7 +191,9 @@ describe("Phase 5b.18b.6 — Part A — 5a-then-5b hydration ordering", () => {
     render(<AcknowledgementStack sessionId={SESSION_ID} />);
     // llm_rate_coolness is a user-meaningful node id, so it is title-cased
     // and shown as the author named it; the raw snake_case id must NOT leak.
-    expect(screen.getByText("Llm Rate Coolness step · model")).toBeInTheDocument();
+    // "LLM", not "Llm": author names share the catalog's acronym set
+    // (elspeth-d2de348437).
+    expect(screen.getByText("LLM Rate Coolness step · model")).toBeInTheDocument();
     expect(screen.queryByText(new RegExp(LLM_NODE_ID))).toBeNull();
   });
 });

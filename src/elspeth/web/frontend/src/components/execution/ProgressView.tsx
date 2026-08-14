@@ -15,7 +15,11 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { Button, StatusBadge } from "@/components/ui";
-import { terminalRunAnnouncement } from "./runTerminalPhrases";
+import {
+  RUN_ACCOUNTING_LABELS,
+  RUN_COUNTER_LABELS,
+  terminalRunAnnouncement,
+} from "./runTerminalPhrases";
 import { isTerminalRunStatus, type RunAccounting, type RunProgress } from "@/types/index";
 
 function formattedCount(value: number): string {
@@ -53,17 +57,26 @@ function buildStatusAnnouncement(progress: RunProgress, cancelRequested: boolean
 }
 
 function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }) {
+  // Labels come from the shared run-panel vocabulary (runTerminalPhrases),
+  // not inline literals — one owner holds the sentence-case register
+  // (elspeth-406b503a82).
   const accountingCounters = [
-    ["Tokens Emitted", accounting.tokens.emitted],
-    ["Tokens Terminal", accounting.tokens.terminal],
-    ["Tokens Structural", accounting.tokens.structural],
-    ["Tokens Pending", accounting.tokens.pending],
-    ["Tokens Abandoned", accounting.tokens.abandoned],
-    ["Rows Discarded", accounting.routing.discarded],
+    [RUN_ACCOUNTING_LABELS.tokensEmitted, accounting.tokens.emitted],
+    [RUN_ACCOUNTING_LABELS.tokensTerminal, accounting.tokens.terminal],
+    [RUN_ACCOUNTING_LABELS.tokensStructural, accounting.tokens.structural],
+    [RUN_ACCOUNTING_LABELS.tokensPending, accounting.tokens.pending],
+    [RUN_ACCOUNTING_LABELS.tokensAbandoned, accounting.tokens.abandoned],
+    [RUN_ACCOUNTING_LABELS.rowsDiscarded, accounting.routing.discarded],
   ] as const;
   const integrityWarnings = [
-    ["Missing Terminal", accounting.integrity.missing_terminal_outcomes],
-    ["Duplicate Terminal", accounting.integrity.duplicate_terminal_outcomes],
+    [
+      RUN_ACCOUNTING_LABELS.missingTerminal,
+      accounting.integrity.missing_terminal_outcomes,
+    ],
+    [
+      RUN_ACCOUNTING_LABELS.duplicateTerminal,
+      accounting.integrity.duplicate_terminal_outcomes,
+    ],
   ] as const;
 
   return (
@@ -78,7 +91,9 @@ function ProgressAccountingDetails({ accounting }: { accounting: RunAccounting }
       </dl>
       <div className="progress-accounting-integrity">
         <span className="progress-accounting-integrity-item">
-          <span className="progress-accounting-integrity-label">Audit Closure</span>
+          <span className="progress-accounting-integrity-label">
+            {RUN_ACCOUNTING_LABELS.auditClosure}
+          </span>
           <strong>{accounting.integrity.closure}</strong>
         </span>
         {integrityWarnings.map(([label, value]) =>
@@ -226,11 +241,12 @@ export function ProgressView() {
         </div>
       )}
 
-      {/* Source/token counters -- large and prominent */}
+      {/* Source/token counters -- large and prominent. Labels from the shared
+          run-panel vocabulary (elspeth-406b503a82). */}
       <div className="progress-counters">
         <div>
           <div className="progress-counter-label">
-            Source Rows
+            {RUN_COUNTER_LABELS.sourceRows}
           </div>
           <div className="progress-counter-value">
             {progress.source_rows_processed.toLocaleString()}
@@ -238,7 +254,7 @@ export function ProgressView() {
         </div>
         <div>
           <div className="progress-counter-label">
-            Tokens Succeeded
+            {RUN_COUNTER_LABELS.tokensSucceeded}
           </div>
           <div className="progress-counter-value">
             {progress.tokens_succeeded.toLocaleString()}
@@ -246,7 +262,7 @@ export function ProgressView() {
         </div>
         <div>
           <div className="progress-counter-label">
-            Tokens Failed
+            {RUN_COUNTER_LABELS.tokensFailed}
           </div>
           <div
             className="progress-counter-value"

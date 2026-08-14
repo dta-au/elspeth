@@ -24,6 +24,15 @@
   --workspace-bar-gap: var(--space-sm);
   --workspace-bar-inset: var(--space-sm);
 
+  /* The artifact column's own page gutter (elspeth-87195dda2c). The 360px
+     authoring pane used to supply the application's visual left margin; with
+     the pane collapsed the column crowded the viewport edge on three
+     DIFFERENT insets (toolbar 8px, panel bodies ~8px, action bar 8px — all
+     drifting against each other's borders). ONE property feeds the toolbar,
+     the panel bodies, the action bar, and the collapsed-pane strip, so they
+     share a single left edge whether or not the pane is present. */
+  --artifact-gutter: var(--space-lg);
+
   position: relative;
   display: grid;
   grid-template-rows: minmax(420px, 1fr);
@@ -125,7 +134,7 @@
      the bands drifted apart; see tokens.css). The short-screen density
      regime below shrinks the token, and with it every band at once. */
   min-height: var(--size-workspace-band);
-  padding: 0 var(--space-sm);
+  padding: 0 var(--artifact-gutter);
   border-bottom: 1px solid var(--color-border, currentcolor);
 }
 
@@ -222,6 +231,19 @@
   max-height: none;
   overflow: visible;
   margin: 0;
+  /* In the artifact panel the card runs full-bleed (margin 0 above), so its
+     INTERNAL inset is what places "Run results" and the panel content on the
+     column's shared left edge (elspeth-87195dda2c, elspeth-a72b7916a1). */
+  padding-inline: var(--artifact-gutter);
+}
+
+/* YamlView's explanatory banner inside the artifact panel: one short
+   paragraph otherwise runs the full ~1500px panel width as a single line
+   (elspeth-d01115c75e). Scoped to the workspace panel so the same note in
+   the YAML modal keeps that dialog's own narrower geometry. 74ch is the
+   chat column's documented reading band (chat.css .message-bubble-content). */
+.artifact-workspace-panel .yaml-modal-note {
+  max-width: 74ch;
 }
 
 .workspace-action-bar {
@@ -244,7 +266,10 @@
      holds the right edge, and the status/overflow arrangement is identical
      whether or not guided mode renders a completion bar. */
   justify-content: flex-start;
-  padding: var(--workspace-bar-inset) var(--space-sm);
+  /* Block inset stays the shared --workspace-bar-inset (the collapse-control
+     registration contract, elspeth-fca731fb28); the INLINE inset is the
+     artifact column's shared gutter (elspeth-87195dda2c). */
+  padding: var(--workspace-bar-inset) var(--artifact-gutter);
   border-top: 1px solid var(--color-border, currentcolor);
   background: var(--color-surface, Canvas);
 }
@@ -278,6 +303,19 @@
 .workspace-action-bar .completion-bar > * {
   flex: 1 1 0;
   width: auto;
+}
+
+/* The run-gate reason line is part of ExecuteButton's fragment and, now that
+   CompletionBar renders the three verbs as DIRECT children (no wrapper divs),
+   it is a flex item of this row. Riding inside the Run column was what made
+   that column ~98px and dragged its co-equal siblings with it
+   (elspeth-929fc5d4a7); here it takes its own full-width line BELOW the
+   buttons instead — `order` lifts it past the Export button that follows it
+   in DOM order, so the three verbs stay one unbroken row. The line is not
+   focusable, so visual order and tab order cannot diverge. */
+.workspace-action-bar .completion-bar .side-rail-execute-reason {
+  order: 1;
+  flex: 0 0 100%;
 }
 
 .workspace-status-controls,
@@ -432,6 +470,9 @@
   .workspace-collapsed-affordance {
   position: static;
   max-width: 100%;
+  /* As a full-width strip its content joins the artifact column's shared
+     left edge instead of hugging the viewport (elspeth-87195dda2c). */
+  padding-inline: var(--artifact-gutter);
 }
 
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
@@ -617,11 +658,23 @@
   align-items: center;
   justify-content: space-between;
   min-height: var(--size-workspace-band);
-  padding: 0 var(--space-sm);
+  padding: 0 var(--artifact-gutter);
 }
 
 .workspace-inspector-header {
   border-bottom: 1px solid var(--color-border, currentcolor);
+}
+
+/* The drawer's title had no rule anywhere and base.css carries no heading
+   reset, so it rendered at UA 24px with 19.92px block margins — off the type
+   scale entirely, inflating the header band to 93px against the 45px artifact
+   toolbar one seam away (elspeth-3e23bed130). Same recipe as
+   .graph-modal-header h2 / .yaml-modal-header h2 (common.css): type-scale
+   size, zero margins — band height stays owned by --size-workspace-band. */
+.workspace-inspector-header h2 {
+  margin: 0;
+  font-size: var(--font-size-lg);
+  line-height: var(--line-height-heading);
 }
 
 .workspace-inspector-tabs {
@@ -732,7 +785,6 @@
 
   .artifact-workspace-toolbar {
     gap: var(--space-xs);
-    padding-inline: var(--space-sm);
   }
 }
 
@@ -745,7 +797,9 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-lg);
-  padding: var(--space-md);
+  /* Inline inset joins the artifact column's shared gutter
+     (elspeth-87195dda2c). */
+  padding: var(--space-md) var(--artifact-gutter);
 }
 
 .pipeline-spec-metadata h2 {
@@ -757,6 +811,9 @@
 
 .pipeline-spec-metadata p {
   margin: 0 0 var(--space-sm);
+  /* Pipeline descriptions are user-authored prose; cap the measure at the
+     chat column's reading band (elspeth-d01115c75e). */
+  max-width: 74ch;
   color: var(--color-text-secondary);
   font-size: var(--font-size-sm);
 }
@@ -847,5 +904,11 @@
 
 .pipeline-spec-options {
   margin-top: var(--space-sm);
+  /* Container cap, not a character cap on the code itself: the JSON block
+     stretched its bordered box to ~1450px around ~430px of content
+     (elspeth-d01115c75e). Long lines still scroll horizontally inside —
+     the artifact panel is the one region the scroll-ownership contract
+     permits to scroll horizontally. */
+  max-width: 90ch;
   overflow-x: auto;
 }

@@ -208,7 +208,12 @@ describe("RunsHistoryDrawer", () => {
     render(<RunsHistoryDrawer onClose={vi.fn()} />);
 
     const withFailures = screen.getByText("completed with failures");
-    expect(withFailures).toHaveClass("status-badge", "status-badge-completed");
+    // Not aliased to -completed (elspeth-cd885f4c4d): a partial failure keeps
+    // its own warning-family class rather than the unqualified success tint.
+    expect(withFailures).toHaveClass(
+      "status-badge",
+      "status-badge-completed_with_failures",
+    );
     expect(withFailures).toHaveTextContent("⚠");
 
     const empty = screen.getByText("empty");

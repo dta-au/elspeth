@@ -30,7 +30,6 @@ export function AuditCharacteristicIcon({ flag }: AuditCharacteristicIconProps) 
       className={`audit-icon audit-icon-${meta.tone}`}
       title={meta.tooltip}
     >
-      <span className="audit-icon-glyph" aria-hidden="true">{meta.glyph}</span>
       <span className="audit-icon-label">{meta.label}</span>
     </span>
   );

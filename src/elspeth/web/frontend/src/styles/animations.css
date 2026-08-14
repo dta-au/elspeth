@@ -61,13 +61,13 @@
 .progress-bar {
   width: 100%;
   /* 8px, not 4px: the only element carrying this class also carries
-     .progress-bar-outer (execution.css:56, ProgressView.tsx:189), which
-     declares height: 8px at the same specificity from a LATER barrel import
+     .progress-bar-outer (execution.css, ProgressView.tsx:189), which used to
+     declare height: 8px at the same specificity from a LATER barrel import
      and therefore shipped. The 4px here never rendered and the shipped height
-     was decided by import order alone (elspeth-58903688f2). Declaring the
-     shipped value here makes the height order-independent; execution.css:56 is
-     now a redundant duplicate for the execution lane to delete, and the
-     tutorial's separate 10px track (tutorial.css:402) is still unreconciled. */
+     was decided by import order alone (elspeth-58903688f2). This rule is now
+     the single owner of the track height — execution.css declares none and
+     primitiveGeometry.test.ts pins that — while the tutorial's separate 10px
+     track (tutorial.css:402) is still unreconciled. */
   height: 8px;
   background-color: var(--color-surface-elevated);
   border-radius: var(--radius-sm);
@@ -125,6 +125,19 @@
   border-top-color: transparent;
   border-radius: 50%;
   animation: spin 0.6s linear infinite;
+}
+
+/* Page-scale modifier for full-viewport loading frames (elspeth-b2a677d661).
+   The two boot frames — AuthGuard's auth check and LoginPage's config load —
+   are consecutive full-viewport states, so they must show ONE affordance at
+   ONE size. AuthGuard previously inlined 32px/3px while LoginPage used the
+   bare button-scale .spinner above (14px), so the app appeared to stutter
+   between its first two frames. Compose `spinner spinner-page`; the bare
+   .spinner stays what its comment says it is — a button loading state. */
+.spinner-page {
+  width: 32px;
+  height: 32px;
+  border-width: 3px;
 }
 
 /* ---------------------------------------------------------------------------

@@ -14,20 +14,32 @@
 // the pipeline has more than one node of the same plugin. The raw id is the
 // fallback when the node is absent from the composition entirely.
 //
+// All title-casing routes through catalog/pluginDisplayName.ts — the ONE
+// acronym-aware implementation (elspeth-d2de348437) — so "json_explode" reads
+// "JSON Explode" here exactly as on its catalog card. Do not reintroduce a
+// local titleCase().
+//
 // Presentational only — reads existing store state, never mutates.
 // ============================================================================
 
+import {
+  pluginDisplayName,
+  titleCaseLabel,
+} from "@/components/catalog/pluginDisplayName";
 import type { CompositionState } from "@/types/index";
 
 /**
  * Well-known plugin → step-label map.  Other plugins present in a composition
- * are humanised from the plugin name (see `titleCase`).
+ * take their catalog display name (see `stepLabelForPlugin`). A Map (not a
+ * plain object) so a plugin hypothetically named "constructor" can never
+ * collide with Object.prototype — same discipline as DISPLAY_NAME_OVERRIDES
+ * in catalog/pluginDisplayName.ts.
  */
-const PLUGIN_STEP_LABELS: Record<string, string> = {
-  llm: "Summarise",
-  web_scrape: "Fetch",
-  field_mapper: "Output",
-};
+const PLUGIN_STEP_LABELS: ReadonlyMap<string, string> = new Map([
+  ["llm", "Summarise"],
+  ["web_scrape", "Fetch"],
+  ["field_mapper", "Output"],
+]);
 
 /** Escape a string for literal use inside a RegExp source. */
 function escapeRegExp(value: string): string {
@@ -45,15 +57,6 @@ function isPluginDerivedId(id: string, plugin: string): boolean {
   return new RegExp(`^${escapeRegExp(plugin)}(_\\d+)?$`).test(id);
 }
 
-/** Title-case a snake/space-delimited string ("field_mapper" → "Field Mapper"). */
-function titleCase(value: string): string {
-  return value
-    .split(/[_\s]+/)
-    .filter((part) => part.length > 0)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(" ");
-}
-
 /**
  * Humanised step label for a bare plugin name — the SAME mapping the
  * acknowledgement cards use ("Summarise step · prompt"), exposed for surfaces
@@ -61,9 +64,15 @@ function titleCase(value: string): string {
  * composition node id. Keeping every surface on this one mapping means the
  * wiring list, the problems strip, and the acknowledge cards all name a step
  * identically.
+ *
+ * Plugins outside the verb map take `pluginDisplayName` — the catalog card's
+ * own derivation, curated overrides and acronym set included — so a plugin
+ * never has two display names in one session ("json_explode" reads
+ * "JSON Explode" here exactly as it does on its catalog card;
+ * elspeth-d2de348437).
  */
 export function stepLabelForPlugin(plugin: string): string {
-  return PLUGIN_STEP_LABELS[plugin] ?? titleCase(plugin);
+  return PLUGIN_STEP_LABELS.get(plugin) ?? pluginDisplayName(plugin);
 }
 
 /**
@@ -107,7 +116,10 @@ export function stepLabelForNodeId(
   if (isPluginDerivedId(nodeId, plugin)) {
     return stepLabelForPlugin(plugin);
   }
-  return titleCase(nodeId);
+  // Author-chosen name: acronym-aware casing via the shared title-caser, but
+  // NEVER the curated plugin-name overrides — those are plugin-id vocabulary,
+  // not a rewrite of the author's own words.
+  return titleCaseLabel(nodeId);
 }
 
 /**

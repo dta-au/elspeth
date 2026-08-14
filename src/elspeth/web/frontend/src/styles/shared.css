@@ -120,6 +120,19 @@
   color: var(--color-status-cancelled);
 }
 
+/* completed_with_failures gets its own warning-family tone
+   (elspeth-cd885f4c4d) instead of aliasing to the green completed badge:
+   the progress bar ~20px beneath it, the app toast, and the Run-tab dot
+   (ArtifactWorkspace) all report the status as a warning, and the badge —
+   the most prominent of the four — was the sole surface reporting an
+   unqualified success. Reuses the cancelled/warning pairing already proven
+   on every tint surface in both themes (colorContrast.test.ts); the ⚠ glyph
+   keeps the distinction non-colour-only. */
+.status-badge-completed_with_failures {
+  background-color: rgba(227, 132, 68, 0.15);
+  color: var(--color-status-cancelled);
+}
+
 /* Phase 2.2 (elspeth-0de989c56d): empty is a distinct neutral grey (separate
    from the teal-grey of pending) paired with the empty-set glyph ∅ so an
    operator can tell at a glance that the run produced zero rows. Adds one
@@ -485,22 +498,38 @@
 
 
 /* ---------------------------------------------------------------------------
-   Confirm Dialog (replacement for window.confirm)
-   --------------------------------------------------------------------------- */
+   Dialog primitive + Confirm Dialog (replacement for window.confirm)
+
+   ONE frame, many closures (elspeth-e6fcd8d703): the seven blocking overlays
+   each hand-rolled radius, padding, width, height cap, backdrop and z-index.
+   `.app-dialog` / `.app-dialog-backdrop` are the compose targets for new and
+   migrating dialogs — the frame consumes the dialog band (--z-dialog /
+   --z-dialog-backdrop), the modal radius and shadow tiers, and the single
+   page-dimming veil (--color-scrim); width and frame padding stay per-dialog
+   modifiers. Grouped with `.confirm-dialog`, which (with the ShortcutsHelp
+   dialog that borrows its classes) already ships on exactly these
+   declarations — so the primitive is live from day one, not a dead rule
+   waiting for a consumer. Migrating the remaining frames' TSX class lists
+   onto it is the follow-up this rule exists for. */
+.app-dialog-backdrop,
 .confirm-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-9ae8ee9ac2):
+     this one shipped at rgba(0,0,0,0.45), one of eleven hand-copied scrims
+     across three alphas, so "blocked" dimmed three different amounts
+     depending on which overlay was open. */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
+.app-dialog,
 .confirm-dialog {
   position: fixed;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: var(--z-dialog);
-  width: 400px;
   max-width: calc(100vw - 32px);
   max-height: calc(100dvh - 32px);
   overflow: hidden;
@@ -510,6 +539,13 @@
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
+}
+
+/* Per-dialog closure: only width and frame padding are the confirm dialog's
+   own decisions (the padded-frame contract .confirm-dialog-header documents
+   below). */
+.confirm-dialog {
+  width: 400px;
   padding: var(--space-xl);
 }
 
@@ -581,12 +617,31 @@
   min-height: var(--size-control);
 }
 
-/* The notice center contributes exactly one bounded row to application
-   geometry. Its disclosure floats above the workspace and owns one scroller. */
+/* The notice center OVERLAYS the application instead of participating in
+   flow (elspeth-1c4687ff67). Rendered in flow before the header, a notice's
+   arrival displaced the entire viewport — header, panes, canvas, action
+   bar — by the bar's height and snapped it all back on dismiss: whole-app
+   layout shift on an ordinary state change. Fixed at the top of the
+   viewport, above the header on the z stack (--z-overlay: over page chrome
+   and the catalog drawer, under dialog/palette backdrops), casting the
+   floating-surface shadow onto the header beneath. The fixed position also
+   creates the stacking context inside which the disclosure popover (its own
+   fixed box, --z-popover) paints above the bar. */
 .app-notice-center {
-  position: relative;
-  z-index: var(--z-panel-controls);
-  flex: 0 0 auto;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: var(--z-overlay);
+  /* Opaque ground is load-bearing, not decoration. The content row composes
+     .alert-banner, whose tone backgrounds are 10-14% alpha tints — fine while
+     the bar sat in flow over the app surface, but as a fixed overlay the bar
+     paints over the header (or the run-outcome toast), and a bare tint let
+     that content bleed through at ~88% transparency: text-on-text with
+     uncontrolled contrast. The surface also justifies the shadow — a shadow
+     cast by a transparent element reads as a rendering fault. */
+  background: var(--color-surface);
+  box-shadow: var(--shadow-popover);
 }
 
 /* elspeth-81f714e210. Two separate defects met at this seam:
@@ -610,6 +665,13 @@
   max-height: var(--size-control);
   gap: var(--space-sm);
   padding-block: var(--space-2xs);
+  /* Centre the message + action cluster instead of .alert-banner's
+     space-between (elspeth-1c4687ff67 secondary): on a wide viewport the
+     base recipe parked one sentence at the far left and its action at the
+     far right with ~1600px of empty bar between them. The cluster is
+     content-sized, so centring caps the bar's inner measure without a
+     max-width wrapper; the message keeps its ellipsis clamp for overflow. */
+  justify-content: center;
 }
 
 .app-notice-primary-message {

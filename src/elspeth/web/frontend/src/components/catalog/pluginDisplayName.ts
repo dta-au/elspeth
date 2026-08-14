@@ -68,16 +68,33 @@ function titleCaseWord(word: string): string {
   return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
+/**
+ * Acronym-aware Title Case for a snake/space-delimited label
+ * ("json_explode" → "JSON Explode", "fetch_url" → "Fetch URL").
+ *
+ * THE frontend's single title-casing implementation (elspeth-d2de348437):
+ * `pluginDisplayName`'s humanised fallback builds on it, and non-plugin
+ * labels (author-chosen node ids in chat/interpretationStepLabel.ts,
+ * tutorial result-table column keys) import it directly so acronyms render
+ * identically on every surface. Curated DISPLAY_NAME_OVERRIDES deliberately
+ * do NOT apply here — they are plugin-id vocabulary, and rewriting a user's
+ * own label (a node the author happened to call "dataverse") would put
+ * words in their mouth.
+ */
+export function titleCaseLabel(value: string): string {
+  return value
+    .split(/[_\s]+/)
+    .filter((word) => word.length > 0)
+    .map(titleCaseWord)
+    .join(" ");
+}
+
 /** Human display name for a plugin id. Presentation only — never sent back
  *  to the backend; the raw id remains the wire identifier. */
 export function pluginDisplayName(pluginId: string): string {
   const override = DISPLAY_NAME_OVERRIDES.get(pluginId);
   if (override !== undefined) return override;
-  return pluginId
-    .split(/[_\s]+/)
-    .filter((word) => word.length > 0)
-    .map(titleCaseWord)
-    .join(" ");
+  return titleCaseLabel(pluginId);
 }
 
 /** True for plugins that are internal machinery (badged in the catalog). */

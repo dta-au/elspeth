@@ -220,6 +220,16 @@
   min-height: 0;
   overflow-y: auto;
   padding: var(--space-lg) var(--space-md);
+  /* Marked top boundary (elspeth-3797c79446): content scrolling under the
+     step-indicator band was clipped dead through its letterforms with
+     nothing marking the edge, so a half-sliced decision heading read as a
+     rendering fault rather than as "there is more above". The 12px alpha
+     ramp fades glyphs out as they approach the band instead of guillotining
+     them. Gradient colours here are ALPHA data, not theme colours — the
+     hardcoded-colour rule at the top of this file does not apply. The ramp
+     is shorter than the scroller's 16px top padding, so at scrollTop 0
+     nothing visible is faded. */
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--space-md));
   /* Top-anchored on purpose (elspeth-8fa71e6d15, operator decision D4).
      Guided is a wizard/form, not a chat log: its convention is progress →
      content → next action flowing from the top. The previous chat-style

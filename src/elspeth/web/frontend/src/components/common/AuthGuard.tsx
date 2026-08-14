@@ -80,7 +80,11 @@ export function AuthGuard({ children }: AuthGuardProps) {
           height: "100vh",
         }}
       >
-        <span className="spinner" style={{ width: 32, height: 32, borderWidth: 3 }} />
+        {/* Page-scale spinner (elspeth-b2a677d661): the same
+            .spinner.spinner-page frame LoginPage's config-load state shows
+            next, so the two consecutive boot frames match instead of the
+            affordance shrinking 32px → 14px between them. */}
+        <span className="spinner spinner-page" aria-hidden="true" />
       </div>
     );
   }

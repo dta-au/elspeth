@@ -343,3 +343,33 @@ describe("guided motion and type tokens (elspeth-616a236fc3, elspeth-8dc37146d0)
     );
   });
 });
+
+describe("guided scroller's marked top boundary (elspeth-3797c79446)", () => {
+  // Content scrolling under the step-indicator band used to be clipped dead
+  // through its letterforms — a half-sliced decision heading read as a
+  // rendering fault, not as "there is more above". The scroller masks its
+  // top edge so glyphs fade out as they approach the band.
+
+  it("fades the scroll container's top edge", () => {
+    const mask = valueIn(guidedCss, ".guided-authoring-scroll", "mask-image");
+    expect(mask, "the guided scroller must mask its top edge").not.toBeNull();
+    expect(mask).toMatch(/^linear-gradient\(to bottom,\s*transparent/);
+  });
+
+  it("keeps the fade ramp inside the scroller's own top padding", () => {
+    // AGREEMENT constraint: the ramp must be no longer than the padding
+    // above the first card, or content at scrollTop 0 — with nothing above
+    // it to scroll to — would render partially faded.
+    const mask = valueIn(guidedCss, ".guided-authoring-scroll", "mask-image")!;
+    const ramp = /(?:#000|black)\s+(var\(--[\w-]+\)|\d+(?:\.\d+)?px)\s*\)/.exec(
+      mask,
+    );
+    expect(ramp, `mask ramp length not extractable from: ${mask}`).not.toBeNull();
+    const paddingBlock = valueIn(
+      guidedCss,
+      ".guided-authoring-scroll",
+      "padding",
+    )!.split(/\s+/)[0];
+    expect(tokenPx(ramp![1])).toBeLessThanOrEqual(tokenPx(paddingBlock));
+  });
+});

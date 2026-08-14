@@ -499,7 +499,10 @@ export function LoginPage() {
           height: "100dvh",
         }}
       >
-        <span className="spinner" aria-hidden="true" />
+        {/* Page-scale spinner (elspeth-b2a677d661): matches AuthGuard's boot
+            frame — the bare .spinner is the 14px button-scale affordance and
+            is far too small to anchor a full viewport. */}
+        <span className="spinner spinner-page" aria-hidden="true" />
       </div>
     );
   }

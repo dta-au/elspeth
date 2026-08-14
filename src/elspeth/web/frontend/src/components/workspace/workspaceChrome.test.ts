@@ -113,6 +113,21 @@ describe("workspace inspector drawer (elspeth-4e54200207)", () => {
       declaration(".artifact-workspace-toolbar", "padding"),
     );
   });
+
+  it("keeps the inspector title on the type scale with no UA margins (elspeth-3e23bed130)", () => {
+    // The title was the app's only bare <h2> — UA 24px with 19.92px block
+    // margins, inflating the header band to 93px against the 45px artifact
+    // toolbar one seam away. The band's height must stay owned by
+    // --size-workspace-band, so the title contributes no margins and sits on
+    // the product type scale (the .graph-modal-header h2 recipe, common.css).
+    expect(declaration(".workspace-inspector-header h2", "margin")).toBe("0");
+    expect(declaration(".workspace-inspector-header h2", "font-size")).toBe(
+      "var(--font-size-lg)",
+    );
+    expect(declaration(".workspace-inspector-header h2", "line-height")).toBe(
+      "var(--line-height-heading)",
+    );
+  });
 });
 
 describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
@@ -148,10 +163,13 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
 
   it("takes the bar's padding and the collapse control's standoff from one inset", () => {
     // The two rows meet across the pane divider and must share one bottom edge
-    // and one optical center. Both sides now express the standoff as the same
-    // token, so the contract no longer depends on a 16px browser root.
+    // and one optical center — a BLOCK-axis contract: both sides express the
+    // standoff as --workspace-bar-inset, so it no longer depends on a 16px
+    // browser root. The bar's INLINE inset is the artifact column's shared
+    // --artifact-gutter (elspeth-87195dda2c); the collapse control lives in
+    // the authoring column, which keeps its own --space-sm inline margin.
     expect(declaration(".workspace-action-bar", "padding")).toBe(
-      "var(--workspace-bar-inset) var(--space-sm)",
+      "var(--workspace-bar-inset) var(--artifact-gutter)",
     );
     expect(declaration(".workspace-collapse-control", "margin")).toBe(
       "var(--workspace-bar-inset) var(--space-sm)",
@@ -291,5 +309,52 @@ describe("workspace pane separator (elspeth-ffb96f0b95)", () => {
         "background: var(--color-text-secondary);",
       );
     }
+  });
+});
+
+describe("artifact column gutter (elspeth-87195dda2c)", () => {
+  // With the authoring pane collapsed, the artifact column IS the page, and
+  // its surfaces used to crowd the viewport edge on three different left
+  // margins (strip ~10, tabs ~14, panel content ~8). The fix is one shared
+  // property; these assertions pin that every gutter-bearing inset READS it,
+  // so retuning the gutter moves all of them together and none can drift
+  // back to a private literal.
+  it("defines the gutter once on the workspace root", () => {
+    expect(declaration(".composer-workspace", "--artifact-gutter")).toBe(
+      "var(--space-lg)",
+    );
+  });
+
+  it.each([
+    [".artifact-workspace-toolbar", "padding", "0 var(--artifact-gutter)"],
+    [
+      ".workspace-action-bar",
+      "padding",
+      "var(--workspace-bar-inset) var(--artifact-gutter)",
+    ],
+    [
+      ".artifact-workspace-panel .inline-run-results",
+      "padding-inline",
+      "var(--artifact-gutter)",
+    ],
+    [".pipeline-spec-view", "padding", "var(--space-md) var(--artifact-gutter)"],
+    [
+      '.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) .workspace-collapsed-affordance',
+      "padding-inline",
+      "var(--artifact-gutter)",
+    ],
+  ])("%s takes its inline inset from the gutter", (selector, property, expected) => {
+    expect(declaration(selector, property)).toBe(expected);
+  });
+
+  it("keeps the inspector bands on the same inline inset as the toolbar", () => {
+    // Already pinned pairwise by the band-height test above; restated on the
+    // gutter axis so a band that leaves the gutter is named by THIS failure.
+    expect(
+      declaration(
+        ".workspace-inspector-header, .workspace-inspector-tabs",
+        "padding",
+      ),
+    ).toBe(declaration(".artifact-workspace-toolbar", "padding"));
   });
 });

@@ -989,7 +989,13 @@ export function GraphView() {
         style: {
           backgroundColor: "var(--color-surface-elevated)",
           border: borderStyle,
-          borderRadius: 8,
+          // The card corner reads the token, not a raw 8 (elspeth-37cc8b5310):
+          // the literal was invisible to the radius system, so a retune of the
+          // card rank could never reach the graph. --radius-lg is that rank,
+          // and .graph-config-panel (inspector.css) rounds at the same token
+          // so the panel floating over these cards can never round SHARPER
+          // than they do. Pinned by inspectorPanelContracts.test.ts.
+          borderRadius: "var(--radius-lg)",
           width: NODE_WIDTH,
           height: NODE_HEIGHT,
           padding: 0,
@@ -1688,12 +1694,24 @@ export function GraphView() {
 
   // Empty state — must match the hasContent check above so that a
   // source-to-sink pipeline (zero transform nodes) still renders.
+  //
+  // Centred in the canvas void, not top-pinned (elspeth-1f4b60a492): the
+  // shared .empty-state register centres within its OWN box, but with no
+  // height the box hugged its one line of text at the top edge of a ~950px
+  // panel, reading as an unfinished layout. .graph-view-empty stretches the
+  // box to the panel and stacks the empty-landing treatment (an
+  // --font-size-xl lead + muted guidance — header.css .empty-landing is the
+  // precedent register). Two <p>s, not a heading: this sits inside a
+  // tabpanel, and the message is a state, not a document section. The
+  // explicit {" "} keeps the two sentences one whitespace-normalised string
+  // for text-content assertions.
   if (nodes.length === 0) {
     return (
-      <div
-        className="empty-state"
-      >
-        No pipeline to visualise. Start a conversation to build one.
+      <div className="empty-state graph-view-empty">
+        <p className="graph-view-empty-title">No pipeline to visualise.</p>{" "}
+        <p className="graph-view-empty-hint">
+          Start a conversation to build one.
+        </p>
       </div>
     );
   }

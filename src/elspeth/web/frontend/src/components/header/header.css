@@ -241,31 +241,130 @@
    the design system, so this selector only carries header-specific concerns
    if any are added later. No declarations here is correct. */
 
-/* Elevation (elspeth-4d38a73632): this was the only floating surface in the
-   app that declared NO box-shadow, so it sat flat on the teal workspace it
-   opens over — the one place a menu needs to say where it ends and the page
-   begins. --shadow-dropdown is the tier whose own token comment names menus,
-   and it is what the user menu below already composes.
+/* Floating popover surface (elspeth-8c7ac37d49): one absolutely-positioned
+   box hung off the trigger that carries BOTH the filter-controls strip and
+   the menu. The strip used to render in flow inside the header wrapper, so
+   opening the switcher grew the 41px header to ~60px (clipping 10px above
+   the viewport, spilling 9px below the seam) and widened the wrapper to
+   ~314px, shoving the separator and the model chip right — and the menu,
+   anchored to the grown wrapper, dropped below the STRIP instead of below
+   its trigger. Because the popover is out of flow, the wrapper's in-flow
+   content is the trigger alone and the header's height contract holds.
 
-   The stacking layer now comes from the z-scale instead of the bare literal
-   100 (--z-overlay IS 100, and its token comment names dropdowns — a
-   value-preserving substitution, not a promotion), the corner matches the
-   --radius-md the other menus use, and the menu clears its trigger by the same
-   --space-xs the user menu does. */
-.header-session-switcher-menu {
+   Elevation (elspeth-4d38a73632): --shadow-dropdown is the tier whose own
+   token comment names menus, and it is what the user menu below already
+   composes. The stacking layer comes from the z-scale (--z-overlay IS 100
+   and its token comment names dropdowns), the corner matches the --radius-md
+   the other menus use, and the popover clears its trigger by the same
+   --space-xs the user menu does. overflow:hidden clips the internal menu
+   scroller to the rounded corner. */
+.header-session-switcher-popover {
   position: absolute;
   top: calc(100% + var(--space-xs));
   left: 0;
-  margin: 0;
-  padding: var(--space-xs) 0;
-  list-style: none;
+  display: flex;
+  flex-direction: column;
+  min-width: 280px;
+  max-height: 60vh;
+  overflow: hidden;
   background: var(--color-surface-nav-raised);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-dropdown);
-  min-width: 240px;
   z-index: var(--z-overlay);
-  max-height: 60vh;
+}
+
+/* Filter strip above the menu (elspeth-8c7ac37d49): these three classes were
+   emitted with NO definition anywhere in the barrel, so the filter field and
+   the show-archived checkbox rendered as white UA controls on the dark
+   --color-surface-nav-raised surface. The field takes the .input primitive's
+   vocabulary (input-border, elevated surface, the contrast-gated
+   --color-text-secondary placeholder pair, the app focus-ring idiom) at the
+   compact chrome rung this dense strip sits on. */
+.header-session-switcher-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-shrink: 0;
+  padding: var(--space-xs) var(--space-sm);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.header-session-switcher-filter {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--size-control-compact);
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-input-border);
+  border-radius: var(--radius-sm);
+  background-color: var(--color-surface-elevated);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-sm);
+}
+
+.header-session-switcher-filter::placeholder {
+  /* --color-text-secondary, not -muted: the muted tone is only ~3.84:1 on
+     --color-surface-elevated (shared.css .input::placeholder rationale,
+     gated by colorContrast.test.ts). */
+  color: var(--color-text-secondary);
+}
+
+.header-session-switcher-filter:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+.header-session-switcher-show-archived {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-xs);
+  min-height: var(--size-control-compact);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.header-session-switcher-show-archived input {
+  accent-color: var(--color-accent);
+}
+
+.header-session-switcher-show-archived input:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Archive-failure alert (elspeth-8c7ac37d49): a role="alert" strip that
+   renders while the menu is CLOSED (confirmArchive fires after the menu
+   dismisses), so it floats below the trigger rather than growing the header.
+   Undefined before, it rendered as bare body prose — no error affordance on
+   the one element whose entire job is to be noticed. The tint layers over an
+   opaque surface because --color-error-bg is a 12% wash and this box floats
+   over arbitrary workspace content. */
+.header-session-switcher-archive-error {
+  position: absolute;
+  top: calc(100% + var(--space-xs));
+  left: 0;
+  z-index: var(--z-overlay);
+  min-width: 280px;
+  max-width: 420px;
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-surface);
+  background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
+  color: var(--color-error);
+  font-size: var(--font-size-sm);
+  box-shadow: var(--shadow-dropdown);
+}
+
+.header-session-switcher-menu {
+  margin: 0;
+  padding: var(--space-xs) 0;
+  list-style: none;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -467,6 +566,28 @@
   grid-template-columns: minmax(140px, 1fr) auto auto;
   gap: var(--space-xs);
   padding: var(--space-1-5) var(--space-sm);
+}
+
+/* Rename-failure alert (elspeth-8c7ac37d49): in-flow directly under the
+   rename form inside the popover — co-located with the field it describes
+   (aria-describedby binds them) — but previously undefined, so it read as
+   ordinary menu prose rather than an error. Same affordance family as the
+   archive alert above; --font-size-xs (the 12px floor) in the dense menu. */
+.header-session-switcher-rename-error {
+  margin: var(--space-2xs) var(--space-sm) var(--space-xs);
+  padding: var(--space-xs) var(--space-sm);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-sm);
+  /* Same layered recipe as the archive strip above: the error wash is a
+     low-alpha tint, and this strip sits on the popover's nav-raised surface —
+     a ground the contrast gate's tint matrix does not enumerate. Bare
+     tint-on-nav-raised measured 4.06:1 in the light theme (under AA); riding
+     the tint on background-image over an opaque --color-surface restores the
+     gated error-on-surface pairing in both themes. */
+  background-color: var(--color-surface);
+  background-image: linear-gradient(var(--color-error-bg), var(--color-error-bg));
+  color: var(--color-error);
+  font-size: var(--font-size-xs);
 }
 
 .runs-history-item-summary {

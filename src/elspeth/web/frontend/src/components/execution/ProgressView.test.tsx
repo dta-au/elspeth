@@ -50,11 +50,11 @@ describe("ProgressView", () => {
 
     render(<ProgressView />);
 
-    expect(screen.getByText("Source Rows")).toBeInTheDocument();
+    expect(screen.getByText("Source rows")).toBeInTheDocument();
     expect(screen.getByText("1")).toBeInTheDocument();
-    expect(screen.getByText("Tokens Succeeded")).toBeInTheDocument();
+    expect(screen.getByText("Tokens succeeded")).toBeInTheDocument();
     expect(screen.getByText("9,323")).toBeInTheDocument();
-    expect(screen.getByText("Tokens Failed")).toBeInTheDocument();
+    expect(screen.getByText("Tokens failed")).toBeInTheDocument();
     expect(screen.getByText("2")).toBeInTheDocument();
     expect(screen.getByText("7 routed success")).toBeInTheDocument();
     expect(screen.getByText("2 routed failure")).toBeInTheDocument();
@@ -101,7 +101,12 @@ describe("ProgressView", () => {
     render(<ProgressView />);
 
     const badge = screen.getByText("completed with failures");
-    expect(badge).toHaveClass("status-badge", "status-badge-completed");
+    // Not aliased to -completed (elspeth-cd885f4c4d): a partial failure keeps
+    // its own warning-family class rather than the unqualified success tint.
+    expect(badge).toHaveClass(
+      "status-badge",
+      "status-badge-completed_with_failures",
+    );
     expect(badge).toHaveTextContent("⚠");
   });
 
@@ -162,11 +167,11 @@ describe("ProgressView", () => {
     render(<ProgressView />);
 
     expect(screen.getByLabelText("Run accounting")).toBeInTheDocument();
-    expect(screen.getByText("Tokens Emitted")).toBeInTheDocument();
+    expect(screen.getByText("Tokens emitted")).toBeInTheDocument();
     expect(screen.getAllByText("9,324")).toHaveLength(2);
-    expect(screen.getByText("Tokens Terminal")).toBeInTheDocument();
-    expect(screen.getByText("Tokens Structural")).toBeInTheDocument();
-    expect(screen.getByText("Audit Closure")).toBeInTheDocument();
+    expect(screen.getByText("Tokens terminal")).toBeInTheDocument();
+    expect(screen.getByText("Tokens structural")).toBeInTheDocument();
+    expect(screen.getByText("Audit closure")).toBeInTheDocument();
     expect(screen.getByText("closed")).toBeInTheDocument();
   });
 

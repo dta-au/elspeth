@@ -279,7 +279,18 @@ export function HeaderSessionSwitcher(): JSX.Element {
           </div>
         )}
         {open && (
-          <>
+          /*
+            Floating popover (elspeth-8c7ac37d49): the controls strip used to
+            render IN FLOW inside the header wrapper, growing it to ~60px
+            inside the 41px header (10px clipped above the viewport, 9px
+            spilling below the seam) and shoving the separator + model chip
+            314px right — and the menu, positioned against the wrapper,
+            dropped below the STRIP rather than below its trigger. Strip and
+            menu now share one absolutely-positioned surface hung off the
+            trigger, so the wrapper's in-flow content is the trigger alone
+            and the header keeps its height contract.
+          */
+          <div className="header-session-switcher-popover">
             {/*
               Filter input and show-archived toggle are NOT menu items —
               they control the menu's contents.  They previously sat
@@ -435,7 +446,13 @@ export function HeaderSessionSwitcher(): JSX.Element {
                     tabIndex={focusIndex === selectIndex ? 0 : -1}
                     aria-current={session.id === activeSessionId ? "page" : undefined}
                     onClick={() => onSelect(session.id)}
-                    className="header-session-switcher-item header-session-switcher-item-session"
+                    // Just the styled base class: a `-item-session` discriminator
+                    // token used to ride along here, but nothing defined or
+                    // consumed it — an undefined class name is a dangling
+                    // cross-file reference (elspeth-8c7ac37d49), and
+                    // headerSessionSwitcherChrome.test.ts now fails on any
+                    // emitted class the barrel does not define.
+                    className="header-session-switcher-item"
                     // Explicit name: the visual layout renders title and
                     // last-modified as adjacent spans whose computed accname
                     // would mush together ("First48d ago"); the label keeps
@@ -482,7 +499,7 @@ export function HeaderSessionSwitcher(): JSX.Element {
               );
             })}
             </ul>
-          </>
+          </div>
         )}
       </div>
       {archiveTarget && (

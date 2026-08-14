@@ -3,9 +3,18 @@ import { render, screen } from "@testing-library/react";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
 
 describe("AuditCharacteristicIcon", () => {
-  it("renders the label and glyph for a known flag", () => {
+  it("renders the label for a known flag", () => {
     render(<AuditCharacteristicIcon flag="io_read" />);
     expect(screen.getByText(/reads i\/?o/i)).toBeInTheDocument();
+  });
+
+  it("renders no emoji glyph span — the chip is its text label alone (elspeth-09a1a87051)", () => {
+    // The former glyph column shipped nine emoji into a display:none span; the
+    // span, the CSS rule hiding it, and the metadata column were deleted
+    // TOGETHER so removing any one of them cannot silently re-arm the trap.
+    const { container } = render(<AuditCharacteristicIcon flag="io_read" />);
+    expect(container.querySelector(".audit-icon-glyph")).toBeNull();
+    expect(container.textContent).toBe("reads I/O");
   });
 
   it("uses a positive-tone class for io_read", () => {

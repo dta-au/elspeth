@@ -147,9 +147,21 @@
   --color-accent:            #1a7a52;
   --color-focus-ring:        #ffffff;
   --color-btn-primary-bg:    #16664a;
-  --color-btn-primary-bg-hover: #1a5840;
+  /* Hover retune (elspeth-3b57d9025b): dark-theme hover LIGHTENS — the house
+     hover direction (outlined .btn hover is a 4% white wash). The old values
+     (#1a5840 / #912f2d) darkened, so filled buttons receded on the same
+     gesture that brightens every outlined control. Both retunes are HLS
+     lifts with hue and saturation held exactly. The primary hover must clear
+     BOTH resting fills that share it — .btn-primary (#16664a, L 0.102) and
+     the accent-filled guided/chat buttons (--color-accent #1a7a52, L 0.148)
+     — so it is accent +0.02 L; white text on it is the binding AA pairing at
+     4.79:1 (accent +0.03 lands at 4.50 with zero margin). Danger is base
+     +0.04 L; white text 5.22:1. Light theme is untouched and DARKENS by
+     design — colorContrast.test.ts pins light hover surfaces darker.
+     Gated by styles/tokenContracts.test.ts. */
+  --color-btn-primary-bg-hover: #1c8258;
   --color-btn-danger-bg:     #b23835;
-  --color-btn-danger-bg-hover: #912f2d;
+  --color-btn-danger-bg-hover: #c23d3a;
   --color-link:              #61daff;
   --color-highlight:         rgba(26, 122, 82, 0.14);
   --color-selected-ring:     rgba(26, 122, 82, 0.55);
@@ -211,8 +223,16 @@
      (elspeth-0aaa8d5408) — it remains available for a real display heading. */
   --font-size-2xl:  32px;
 
+  /* elspeth-ec5ba7ba21 added -heading and -prose: the two shipped raw
+     clusters the original four rungs could not serve — 1.2/1.25 (15 sites:
+     titles, card names, eyebrows) and 1.4/1.45 (34 sites: hints, previews,
+     card prose). Remaining raw values snap to existing rungs at adoption
+     (1.55 → -normal); `line-height: 1` stays a per-site glyph-box reset,
+     not a rhythm rung. */
+  --line-height-heading: 1.25;  /* titles, card names, eyebrows — the shipped 1.2/1.25 cluster */
   --line-height-tight:   1.3;
   --line-height-snug:    1.35;  /* chat bubble body — tighter than normal but readable for multi-line responses */
+  --line-height-prose:   1.4;   /* dense-pane prose: hints, previews, card bodies — the shipped 1.4/1.45 cluster */
   --line-height-normal:  1.5;
   --line-height-relaxed: 1.7;
 
@@ -224,6 +244,22 @@
 
   /* ── Brand wordmark tracking — JetBrains Mono, uppercase ─────────────────── */
   --tracking-wordmark: 0.18em;
+
+  /* ── Letter-spacing scale (elspeth-7ac472c22c) ───────────────────────────── */
+  /* Tracking rungs for the "hierarchy below body text is carried by weight,
+     case, and letter-spacing" axis promised at the type floor above. Em-based
+     so tracking scales WITH the text it spaces — the shipped px sites (0.5px,
+     0.3px) drift out of proportion the moment font-size changes. Rungs are
+     the shipped em values verbatim so initial adoption is value-preserving:
+     0.01em ×2 (tutorial), 0.04em ×3 (guided, blobs), 0.05em ×2 (settings),
+     0.06em ×4 (settings, tutorial). The px strays map at the 12px floor:
+     0.5px ≈ 0.042em → -normal; 0.3px (status-badge) sits between rungs, so
+     its adoption picks the nearest rung deliberately. --tracking-wordmark
+     stays separate: brand lockup tracking, not a scale rung. */
+  --letter-spacing-tight:  0.01em;   /* sentence-case emphasis: kickers, subheads */
+  --letter-spacing-normal: 0.04em;   /* default uppercase micro-label / eyebrow tracking */
+  --letter-spacing-wide:   0.05em;   /* mid-emphasis caps: settings section labels */
+  --letter-spacing-caps:   0.06em;   /* loudest caps eyebrows / section headers */
 
   /* ── Spacing ─────────────────────────────────────────────────────────────── */
   --space-2xs: 2px;          /* chip insets, badge padding (covers the 2px axis) */
@@ -252,6 +288,17 @@
   --shadow-dropdown: 0 8px 24px rgba(0, 0, 0, 0.18);   /* menus, the graph-canvas controls panel */
   --shadow-modal:    0 8px 32px rgba(0, 0, 0, 0.25);   /* blocking dialogs (was copy-pasted identically ×7) */
 
+  /* ── Overlay scrim (elspeth-9ae8ee9ac2) ──────────────────────────────────── */
+  /* THE page-dimming veil behind every blocking overlay — dialog backdrops,
+     the catalog drawer, the command palette. One token so "blocked" always
+     dims the page by the same amount: the corpus shipped eleven hand-copied
+     rgba backdrops across three alphas (0.3 / 0.45 / 0.5), which made
+     modality read differently per overlay. Backdrops consume this token,
+     never a literal. Light theme swaps the base to the house ink (#0f2d35)
+     at a lower alpha — plain black at 0.45 reads too heavy over light
+     surfaces — the same tinted-base swap the --shadow-* tiers make. */
+  --color-scrim: rgba(0, 0, 0, 0.45);
+
   /* ── Control heights ─────────────────────────────────────────────────────── */
   /* --size-control is the WCAG 2.5.5 (AAA) 44×44 touch-target floor used by
      .btn for canvas-area primary actions. --size-control-compact is the smaller
@@ -276,6 +323,18 @@
      (~38px, font-metric dependent) and centers inside the band instead of
      defining it. */
   --size-workspace-band:  53px;
+
+  /* ── Icon sizes (elspeth-7f63055e06) ─────────────────────────────────────── */
+  /* Glyph boxes are sized in px DELIBERATELY, matching the px type scale:
+     icons and the labels beside them scale together under browser zoom, and
+     neither tracks a default-text-size change alone. The shipped mix — a rem
+     step indicator vs a px checkbox two rows apart in the guided pane — fell
+     out of relative scale as soon as root font-size moved off 16px. Values
+     are the shipped majority: 16 is the components/ui Icon.tsx primitive
+     viewport; 20 is the toolbar / step-indicator rank (chat.css, header.css,
+     and the guided indicator's 1.25rem ≡ 20px at the default root). */
+  --size-icon-sm: 16px;
+  --size-icon-md: 20px;
 
   /* ── Transitions ─────────────────────────────────────────────────────────── */
   --transition-fast:   100ms ease;
@@ -474,4 +533,7 @@
   --shadow-popover:  0 4px 12px rgba(15, 45, 53, 0.08);
   --shadow-dropdown: 0 8px 24px rgba(15, 45, 53, 0.10);
   --shadow-modal:    0 8px 32px rgba(15, 45, 53, 0.14);
+
+  /* ── Overlay scrim (light) — ink-tinted, lighter veil; see the :root note. */
+  --color-scrim: rgba(15, 45, 53, 0.35);
 }

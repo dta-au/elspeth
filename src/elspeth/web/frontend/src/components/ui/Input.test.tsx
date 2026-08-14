@@ -1,3 +1,4 @@
+import { createRef } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -77,5 +78,71 @@ describe("Input", () => {
     const { container } = render(<Input />);
     expect(container.querySelector("div")).toBeNull();
     expect(container.querySelector("input")).not.toBeNull();
+  });
+
+  it("forwards a ref to the underlying input element (focus management)", () => {
+    const ref = createRef<HTMLInputElement>();
+    render(<Input ref={ref} />);
+    expect(ref.current).toBeInstanceOf(HTMLInputElement);
+    ref.current!.focus();
+    expect(ref.current).toHaveFocus();
+  });
+
+  it("forwards a ref to the control, not the wrapper, when label/hint chrome renders", () => {
+    const ref = createRef<HTMLInputElement>();
+    render(<Input ref={ref} label="Name" hint="as registered" />);
+    expect(ref.current).toBeInstanceOf(HTMLInputElement);
+    expect(ref.current).toBe(screen.getByLabelText("Name"));
+  });
+
+  it("preserves the Input display name through forwardRef", () => {
+    expect(Input.displayName).toBe("Input");
+  });
+
+  describe("non-text types skip the .input text-field class", () => {
+    it.each(["checkbox", "radio", "range", "file", "color"] as const)(
+      "type=%s does not receive .input",
+      (type) => {
+        const { container } = render(<Input type={type} />);
+        const input = container.querySelector("input");
+        expect(input).toHaveAttribute("type", type);
+        expect(input).not.toHaveClass("input");
+      },
+    );
+
+    it("emits no class attribute at all for a non-text type without className", () => {
+      const { container } = render(<Input type="checkbox" />);
+      expect(container.querySelector("input")!.getAttribute("class")).toBeNull();
+    });
+
+    it("still merges the caller's className for non-text types", () => {
+      const { container } = render(
+        <Input type="checkbox" className="toggle" />,
+      );
+      const input = container.querySelector("input");
+      expect(input).toHaveClass("toggle");
+      expect(input).not.toHaveClass("input");
+    });
+
+    it("still associates the label with a non-text control", () => {
+      render(<Input type="checkbox" label="Enable retries" />);
+      const control = screen.getByLabelText("Enable retries");
+      expect(control).toHaveAttribute("type", "checkbox");
+    });
+
+    it("keeps explicit input-mono even on a non-text type (opt-in only)", () => {
+      const { container } = render(<Input type="range" mono />);
+      const input = container.querySelector("input");
+      expect(input).toHaveClass("input-mono");
+      expect(input).not.toHaveClass("input");
+    });
+
+    it.each(["text", "email", "password", "search", "number"] as const)(
+      "text-shaped type=%s still receives .input",
+      (type) => {
+        const { container } = render(<Input type={type} />);
+        expect(container.querySelector("input")).toHaveClass("input");
+      },
+    );
   });
 });

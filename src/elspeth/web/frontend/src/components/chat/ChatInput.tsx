@@ -659,7 +659,6 @@ export function ChatInput({
                   <button
                     type="button"
                     className="btn-compact chat-input-more-item"
-                    aria-label="Open secrets settings"
                     onClick={() => {
                       setMoreOpen(false);
                       onOpenSecrets();
@@ -696,13 +695,20 @@ export function ChatInput({
         >
           Send
         </button>
-      </div>
-      {/* Hint is the textarea's aria-describedby target — DO NOT mark it
-          aria-hidden, that masks it for some screen readers despite the
-          describedby reference. Visible to sighted users, announced after the
-          textarea's label by AT. */}
-      <div id={hintId} className="chat-input-hint">
-        Shift+Enter for new line
+
+        {/* Hint is the textarea's aria-describedby target — DO NOT mark it
+            aria-hidden, that masks it for some screen readers despite the
+            describedby reference. Visible to sighted users, announced after
+            the textarea's label by AT.
+            It renders INSIDE the row as its last flex item
+            (elspeth-1b7227936c): at ordinary pane widths its flex-basis:100%
+            wraps it onto its own full-width line (same visual position as
+            the old sibling arrangement), and under the narrow-pane container
+            query it joins the wrapped Upload/More line to fill what was
+            ~344px of dead gutter beside a lone 44px Upload button. */}
+        <div id={hintId} className="chat-input-hint">
+          Shift+Enter for new line
+        </div>
       </div>
     </div>
   );

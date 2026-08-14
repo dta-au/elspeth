@@ -1709,7 +1709,7 @@ describe("ProgressView", () => {
       },
     } as never);
     const { container } = render(<ProgressView />);
-    screen.getByText("Source Rows");
+    screen.getByText("Source rows");
     expect(await axe(container)).toHaveNoViolations();
   });
 });

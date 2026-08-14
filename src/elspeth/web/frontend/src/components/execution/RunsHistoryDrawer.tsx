@@ -269,6 +269,16 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
   }, [onClose]);
 
   return (
+    <>
+      {/* Page scrim behind the aria-modal drawer (elspeth-61330c82fc). The
+          CatalogDrawer pattern: a sibling backdrop consuming --color-scrim
+          blocks pointer interaction with the "inert" page and closes on
+          click, matching the focus trap's keyboard containment. */}
+      <div
+        data-testid="runs-history-backdrop"
+        className="runs-history-backdrop"
+        onClick={onClose}
+      />
     <div
       ref={drawerRef}
       role="dialog"
@@ -404,6 +414,7 @@ export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerPr
         />
       )}
     </div>
+    </>
   );
 }
 

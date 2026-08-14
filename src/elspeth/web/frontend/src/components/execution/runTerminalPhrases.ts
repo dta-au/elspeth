@@ -73,3 +73,35 @@ export function terminalRunAnnouncement(
     ? `${phrase.stem} — ${totals}.`
     : `${phrase.stem}.`;
 }
+
+// ---------------------------------------------------------------------------
+// Run-panel stat vocabulary (elspeth-406b503a82 / elspeth-a72b7916a1).
+//
+// Same anti-drift shape as the terminal phrases above: ProgressView's counter
+// and accounting labels were inline literals at their render sites, and had
+// drifted into Title Case ("Source Rows") against the product register, which
+// permits capitals beyond the first word only for the ELSPETH wordmark and
+// CSS-uppercased badges. One exported copy holds the case; render sites
+// consume it and cannot re-diverge. Extend THIS module for further run-panel
+// vocabulary rather than starting a parallel strings module.
+// ---------------------------------------------------------------------------
+
+/** The three live counters an operator watches during a run. */
+export const RUN_COUNTER_LABELS = {
+  sourceRows: "Source rows",
+  tokensSucceeded: "Tokens succeeded",
+  tokensFailed: "Tokens failed",
+} as const;
+
+/** Post-run accounting grid + integrity strip labels. */
+export const RUN_ACCOUNTING_LABELS = {
+  tokensEmitted: "Tokens emitted",
+  tokensTerminal: "Tokens terminal",
+  tokensStructural: "Tokens structural",
+  tokensPending: "Tokens pending",
+  tokensAbandoned: "Tokens abandoned",
+  rowsDiscarded: "Rows discarded",
+  auditClosure: "Audit closure",
+  missingTerminal: "Missing terminal",
+  duplicateTerminal: "Duplicate terminal",
+} as const;

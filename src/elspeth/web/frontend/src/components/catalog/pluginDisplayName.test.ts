@@ -4,7 +4,11 @@
 // ============================================================================
 
 import { describe, expect, it } from "vitest";
-import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import {
+  isInternalPlugin,
+  pluginDisplayName,
+  titleCaseLabel,
+} from "./pluginDisplayName";
 
 describe("pluginDisplayName", () => {
   it("uses curated overrides where plain title-casing would mislead", () => {
@@ -35,13 +39,12 @@ describe("pluginDisplayName", () => {
     expect(pluginDisplayName("rag_retrieval")).toBe("RAG Retrieval");
   });
 
-  // elspeth-d2de348437: two other title-casers ship in the frontend
-  // (chat/interpretationStepLabel.ts, tutorial/TutorialTurn4Run.tsx) with no
-  // acronym set at all, so "json_explode" renders "Json Explode" and the
-  // tutorial's first table header renders "Url". Routing them here is the
-  // fix; this pins the precondition it depends on — the curated set really
-  // does carry URL and JSON — so the acronyms cannot be dropped from under
-  // that consolidation.
+  // elspeth-d2de348437: chat/interpretationStepLabel.ts now routes through
+  // this module (its local titleCase is deleted); tutorial/TutorialTurn4Run.tsx
+  // still carries its own acronym-less caser and should consume titleCaseLabel
+  // when its lane lands. This pins the precondition both depend on — the
+  // curated set really does carry URL and JSON — so the acronyms cannot be
+  // dropped from under that consolidation.
   it("carries the acronyms the other title-casers need", () => {
     expect(pluginDisplayName("url")).toBe("URL");
     expect(pluginDisplayName("url_fetch")).toBe("URL Fetch");
@@ -52,6 +55,19 @@ describe("pluginDisplayName", () => {
     // A plugin hypothetically named "constructor" must humanise, not
     // resolve to Object.prototype.constructor.
     expect(pluginDisplayName("constructor")).toBe("Constructor");
+  });
+});
+
+describe("titleCaseLabel", () => {
+  it("upper-cases curated acronyms in free-form labels", () => {
+    expect(titleCaseLabel("url")).toBe("URL");
+    expect(titleCaseLabel("fetch_url")).toBe("Fetch URL");
+    expect(titleCaseLabel("json summary")).toBe("JSON Summary");
+  });
+
+  it("never applies curated plugin overrides — they are plugin-id vocabulary, not label vocabulary", () => {
+    expect(titleCaseLabel("azure_blob")).toBe("Azure Blob");
+    expect(titleCaseLabel("dataverse")).toBe("Dataverse");
   });
 });
 

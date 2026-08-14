@@ -1,5 +1,5 @@
-/* catalog.css — Catalog drawer, plugin cards, shortcuts help, and audit-icon glyph.
-   Owners: .shortcuts-group, .shortcuts-list*, .plugin-card*, .audit-icon*,
+/* catalog.css — Catalog drawer, plugin cards, shortcuts help, and audit icons.
+   Owners: .shortcuts-*, .plugin-card*, .audit-icon*,
    .catalog-backdrop, .catalog-drawer, .catalog-header*, .catalog-close-btn,
    .catalog-search*, .catalog-tab*, .catalog-list, .filter-chip*,
    .catalog-status-message*, .inline-chat-source-entry*.
@@ -12,6 +12,27 @@
    --------------------------------------------------------------------------- */
 .shortcuts-group {
   margin-bottom: var(--space-md);
+}
+
+/* Group headings inside the shortcuts dialog (elspeth-44491d3ea1). The class
+   was applied by ShortcutsHelp.tsx with no rule anywhere, so the four <h3>s
+   fell to the UA default — 18.72px/700 with 18.72px margins, LARGER AND
+   HEAVIER than the dialog's own 18px/600 <h2> title: a measured hierarchy
+   inversion, at a rhythm off the spacing scale. These groups (Actions /
+   Navigation / Reference / Editing) are the same sections the command
+   palette lists, so they take the palette's group-header register
+   (.command-palette-group-header, common.css) — an uppercase xs eyebrow —
+   which sits unambiguously below the dialog title and above the 13px rows.
+   Tracking comes from the letter-spacing scale (the em equivalent of the
+   palette's shipped 0.5px at the 12px floor). */
+.shortcuts-subheading {
+  margin: 0 0 var(--space-sm);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: var(--letter-spacing-normal);
+  line-height: var(--line-height-heading);
+  color: var(--color-text-secondary);
 }
 
 .shortcuts-list {
@@ -164,9 +185,10 @@
   line-height: 1.2;
 }
 
-.audit-icon-glyph {
-  display: none;
-}
+/* .audit-icon-glyph was deleted together with the hidden emoji span and the
+   glyph metadata column (elspeth-09a1a87051): a dead `display: none` over a
+   populated emoji field was a loaded trap — removing only the rule would have
+   shipped nine emoji outside the sanctioned gear/warning/empty-set glyph set. */
 
 .audit-icon-positive {
   color: var(--color-success);
@@ -367,7 +389,12 @@
 .catalog-backdrop {
   position: absolute;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.3);
+  /* The shared scrim token, not a literal (elspeth-9ae8ee9ac2): this backdrop
+     shipped at rgba(0,0,0,0.3) — the drawer is aria-modal and traps focus,
+     yet dimmed the page a third less than every other blocking overlay, so
+     "blocked" was not legible as one state. Backdrops consume --color-scrim,
+     never a literal. */
+  background-color: var(--color-scrim);
   z-index: var(--z-catalog-backdrop);
 }
 

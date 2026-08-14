@@ -952,7 +952,7 @@ describe("ChatInput — tutorial readOnly lock (prepopulated + locked prompt)", 
     expect(
       screen.queryByLabelText(/show file manager|hide file manager/i),
     ).toBeNull();
-    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
   });
 
   it("Send submits the locked value (the learner presses Send, types nothing)", async () => {
@@ -1061,7 +1061,7 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
     expect(
       screen.queryByLabelText(/show file manager|hide file manager/i),
     ).toBeNull();
-    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
   });
 
   it("opens the menu, dispatches each action, and closes on selection", async () => {
@@ -1080,9 +1080,9 @@ describe("ChatInput — rare-action overflow (elspeth-8fa71e6d15)", () => {
     expect(screen.queryByLabelText(/show file manager/i)).toBeNull();
 
     await userEvent.click(trigger);
-    await userEvent.click(screen.getByLabelText(/open secrets settings/i));
+    await userEvent.click(screen.getByRole("button", { name: /API keys & secrets/i }));
     expect(onOpenSecrets).toHaveBeenCalledTimes(1);
-    expect(screen.queryByLabelText(/open secrets settings/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /API keys & secrets/i })).toBeNull();
   });
 
   it("closes on Escape without dispatching", async () => {
@@ -1189,6 +1189,141 @@ describe("ChatInput placeholder legibility (elspeth-244b8ba932)", () => {
     const css = readFileSync("src/components/chat/chat.css", "utf8");
     const rule = css.match(/\.chat-input-textarea\s*\{([^}]*)\}/s)?.[1];
     expect(rule).toMatch(/resize:\s*vertical/);
+  });
+});
+
+describe("ChatInput keyboard hint in the composition row (elspeth-1b7227936c)", () => {
+  beforeEach(() => {
+    resetStore(useSessionStore);
+    resetStore(useBlobStore);
+    resetStore(useInterpretationEventsStore);
+  });
+
+  it("renders the hint as the row's last child, still wired to the textarea", () => {
+    const inputRef = { current: null } as RefObject<HTMLTextAreaElement>;
+    render(
+      <ChatInput onSend={() => undefined} disabled={false} inputRef={inputRef} />,
+    );
+    const textarea = screen.getByLabelText(/message input/i);
+    const hint = screen.getByText(/shift\+enter for new line/i);
+    // The relocation must not sever the description linkage.
+    expect(textarea.getAttribute("aria-describedby")).toBe(hint.id);
+    // Only as a flex CHILD of the row can flex-basis/order place the hint —
+    // its own full-width line at ordinary pane widths, the wrapped Upload
+    // row's dead gutter under the narrow-pane container query. As a row
+    // SIBLING (the old arrangement) both rules are inert.
+    const row = textarea.closest(".chat-input-row");
+    expect(row).not.toBeNull();
+    expect(hint.parentElement).toBe(row);
+    expect(row!.lastElementChild).toBe(hint);
+  });
+
+  it("wraps the hint to a full-width line of its own at ordinary pane widths", () => {
+    // Anchored to the line start: the base rule is unindented, while the
+    // container-query `.chat-input-row .chat-input-hint` rule also ends in
+    // this class name and must not be the one inspected here.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const hintRule = css.match(/\n\.chat-input-hint\s*\{([^}]*)\}/s)?.[1];
+    expect(hintRule).toMatch(/flex-basis:\s*100%/);
+  });
+
+  it("sends the hint onto the wrapped attachment row's own flex line", () => {
+    // The hint fills what was ~344px of dead gutter beside a lone 44px
+    // Upload button, so it must join the SAME order group the attachment
+    // buttons are wrapped with — equality with the buttons' order, not a
+    // pinned number.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toBeDefined();
+    const buttonsOrder = container!.match(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*order:\s*(\d+)/s,
+    )?.[1];
+    const hintRule = container!.match(
+      /\.chat-input-row \.chat-input-hint\s*\{([^}]*)\}/s,
+    )?.[1];
+    expect(hintRule).toBeDefined();
+    expect(hintRule!.match(/order:\s*(\d+)/)?.[1]).toBe(buttonsOrder);
+    // Auto basis + grow is what lets it FILL the gutter instead of forcing
+    // yet another line.
+    expect(hintRule).toMatch(/flex:\s*1 1 auto/);
+  });
+
+  it("pays the wrapped row's inter-line gap exactly once", () => {
+    // The forced .chat-input-row-break is a zero-height flex LINE of its
+    // own, so a plain row-gap is paid on BOTH sides of it — the declared 8px
+    // rendered as 16px. The constraint: inside the container block the row's
+    // row-gap is zero, and every item ordered onto the attachment row
+    // carries ONE base-gap margin — the same token the row's own gap uses.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const container = css.match(
+      /@container \(max-width: 429px\)\s*\{([\s\S]*?)\n\}/,
+    )?.[1];
+    expect(container).toMatch(/\.chat-input-row\s*\{[^}]*row-gap:\s*0/s);
+    const baseGap = css
+      .match(/\.chat-input-row\s*\{[^}]*?[^-]gap:\s*([^;]+);/s)?.[1]
+      ?.trim();
+    expect(baseGap).toBeDefined();
+    const margins = Array.from(
+      container!.matchAll(/margin-top:\s*([^;]+);/g),
+      (m) => m[1].trim(),
+    );
+    // One declaration for the attachment buttons, one for the hint.
+    expect(margins.length).toBeGreaterThanOrEqual(2);
+    for (const margin of margins) {
+      expect(margin, "attachment-row margin must equal the row's own gap").toBe(
+        baseGap,
+      );
+    }
+  });
+
+  it("keeps the ≤760px regime's own gap from stacking with those margins", () => {
+    // The phone regime restores its own row gap (its `gap` shorthand wins
+    // the container block by source order), so the single-paid-gap margins
+    // must come off there or the two mechanisms stack to gap+8.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    const blocks = Array.from(
+      css.matchAll(/@media \(max-width: 760px\)\s*\{([\s\S]*?)\n\}/g),
+      (m) => m[1],
+    );
+    const composerBlock = blocks.find((b) => b.includes(".chat-input-textarea"));
+    expect(composerBlock).toBeDefined();
+    expect(composerBlock).toMatch(
+      /\.chat-input-upload-btn,\s*\.chat-input-more\s*\{[^}]*margin-top:\s*0/s,
+    );
+    expect(composerBlock).toMatch(
+      /\.chat-input-row \.chat-input-hint\s*\{[^}]*margin-top:\s*0/s,
+    );
+  });
+});
+
+describe("chat-input controls consume the motion tokens (elspeth-616a236fc3)", () => {
+  it("eases every input-row control from the shared token, never a raw duration", () => {
+    // The same hover gesture snapped on these three controls while every
+    // .btn eased at 100ms — and a raw literal, even a numerically identical
+    // one, is invisible to any future motion-scale change.
+    const css = readFileSync("src/components/chat/chat.css", "utf8");
+    for (const selector of [
+      ".chat-input-icon-btn",
+      ".chat-input-cancel-btn",
+      ".chat-input-send-btn",
+    ]) {
+      // `\n` anchor: the base rule is unindented; the same class names also
+      // appear indented inside the reduced-motion enumeration, whose
+      // `transition: none` must not satisfy this check.
+      const start = css.indexOf(`\n${selector} {`);
+      expect(start, `${selector} base rule must exist`).toBeGreaterThan(-1);
+      const base = css.slice(start);
+      const rule = base.slice(0, base.indexOf("}"));
+      const transition = rule.match(/transition:([^;]+);/s)?.[1];
+      expect(transition, `${selector} must declare a transition`).toBeDefined();
+      expect(transition).toContain("var(--transition-");
+      expect(
+        /\d+(\.\d+)?m?s\b/.test(transition!),
+        `${selector} transition must not carry a raw duration: ${transition}`,
+      ).toBe(false);
+    }
   });
 });
 

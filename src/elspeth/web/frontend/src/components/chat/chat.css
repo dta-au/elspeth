@@ -517,6 +517,15 @@
 
 .chat-input-row {
   display: flex;
+  /* Wrap is on at EVERY pane width (elspeth-1b7227936c): the keyboard hint is
+     the row's last flex item at flex-basis:100%, so it takes a full-width line
+     of its own below the controls — the same visual position it held as a
+     sibling element — while remaining available to join the wrapped
+     attachment row under the narrow-pane container query below. The control
+     items themselves never wrap without the forced break: their combined
+     min-content width (~402px) fits every pane at or above the 430px
+     threshold where the break is display:none. */
+  flex-wrap: wrap;
   gap: var(--space-sm);
   align-items: flex-end;
 }
@@ -596,6 +605,13 @@
 @container (max-width: 429px) {
   .chat-input-row {
     flex-wrap: wrap;
+    /* The forced break below is a zero-height flex LINE of its own, so a
+       row-gap is paid twice across it — the declared 8px rendered as 16px
+       of inter-line gap (elspeth-1b7227936c). Zero the line gap here and
+       let the wrapped items carry exactly one --space-sm of margin instead,
+       so the gap is paid once. (The ≤760px viewport rule later in this file
+       restores its own gap by source order and resets these margins.) */
+    row-gap: 0;
   }
 
   .chat-input-row-break {
@@ -608,6 +624,22 @@
   .chat-input-upload-btn,
   .chat-input-more {
     order: 2;
+    /* The single paid inter-line gap — see the row-gap note above. */
+    margin-top: var(--space-sm);
+  }
+
+  /* The hint leaves its full-width line and fills the attachment row's
+     gutter (elspeth-1b7227936c): in guided mode Upload has no More sibling,
+     so without the hint the wrapped row was one 44px button and ~344px of
+     nothing. Specificity (0,2,0) on purpose — the base .chat-input-hint
+     rule appears LATER in this file, so an unqualified (0,1,0) rule here
+     would lose its flex override to source order. */
+  .chat-input-row .chat-input-hint {
+    order: 2;
+    flex: 1 1 auto;
+    align-self: center;
+    margin-top: var(--space-sm);
+    padding-block: 0;
   }
 }
 
@@ -674,7 +706,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .chat-input-icon-btn {
+  .chat-input-icon-btn,
+  .chat-input-cancel-btn,
+  .chat-input-send-btn {
     transition: none;
   }
 }
@@ -691,6 +725,10 @@
   font: inherit;
   font-size: var(--font-size-sm);
   font-weight: 600;
+  /* Same 100ms ease as every sibling control in this row and .btn itself
+     (elspeth-616a236fc3): the hover boundary change snapped while the
+     buttons beside it eased, so one gesture gave two answers. */
+  transition: border-color var(--transition-fast);
 }
 
 .chat-input-cancel-btn:hover,
@@ -719,6 +757,9 @@
   font-size: var(--font-size-base);
   min-width: 44px;
   min-height: var(--size-control);
+  /* One motion answer for the whole input row (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    color var(--transition-fast);
 }
 
 .chat-input-send-btn:not(:disabled) {
@@ -734,11 +775,17 @@
 .chat-input-hint {
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
-  /* 8px, not 2px (elspeth-aa32533179). At 2px the hint was the tightest gap
-     in a region whose every other gap is 8 or 16px, so proximity bound
-     "Shift+Enter for new line" to the Upload/More attachment row directly
-     above it rather than to the textarea it describes. */
-  padding: var(--space-sm) 0 var(--space-xs);
+  /* The hint is the row's LAST flex item (elspeth-1b7227936c): at ordinary
+     pane widths flex-basis:100% wraps it onto a full-width line of its own
+     directly below the controls — the same visual position it held as a
+     sibling element — and the row's 8px gap supplies the separation that
+     elspeth-aa32533179 used to buy with padding-top (8px, not 2px: at 2px
+     the hint was the tightest gap in a region whose every other gap is 8 or
+     16px). Under the narrow-pane container query it gives up the full-width
+     basis and joins the wrapped Upload/More line instead, filling what was
+     ~344px of dead gutter beside a lone 44px button. */
+  flex-basis: 100%;
+  padding: 0 0 var(--space-xs);
   text-align: right;
 }
 
@@ -774,6 +821,20 @@
     min-height: var(--size-control);
     padding: var(--space-xs) var(--space-sm);
     overflow-wrap: anywhere;
+  }
+
+  /* This regime restores its own line gap (the `gap` shorthand above wins
+     the narrow-pane container query's row-gap:0 by source order), so the
+     single-paid-gap margins from that block must come off or the two
+     mechanisms would stack to 16px. Same-specificity source-order win for
+     the buttons; the hint reset matches the (0,2,0) qualified rule. */
+  .chat-input-upload-btn,
+  .chat-input-more {
+    margin-top: 0;
+  }
+
+  .chat-input-row .chat-input-hint {
+    margin-top: 0;
   }
 
   .chat-input-hint {
@@ -822,7 +883,15 @@
      via the flex row below — no vertical padding, so the short-screen
      density regime (workspace.css) can compress this band through the token.
      Before the contract this row stayed 53px inside the ≤800px-tall compact
-     regime while the toolbar dropped to 45px. */
+     regime while the toolbar dropped to 45px.
+     The inline gutter is the shared band-row gutter (elspeth-dfc207f341):
+     this band and .artifact-workspace-toolbar are ONE row across the pane
+     divider, and when the toolbar sat at --space-sm the divider had 16px of
+     clearance on its left against 8px on its right — visibly off-centre in
+     its own row. The toolbar now reads --artifact-gutter, which resolves to
+     --space-lg (workspace.css, elspeth-87195dda2c), so the two halves agree
+     at 16px; chatBubbleGutter.test.ts pins the agreement, spelled either
+     way. */
   min-height: var(--size-workspace-band);
   padding: 0 var(--space-lg);
   border-bottom: 1px solid var(--color-border);
@@ -896,8 +965,8 @@
   cursor: pointer;
   min-height: var(--size-control-compact);
   flex-shrink: 0;
-  transition: background-color 0.1s ease, border-color 0.1s ease,
-    color 0.1s ease;
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast), color var(--transition-fast);
 }
 
 .mode-switch-btn:hover {
@@ -1356,16 +1425,17 @@
 /* Sources-created group inside the assistant bubble — parallel to
    .message-tools in its toggle styling (via the shared .message-tools-toggle
    class) so the two groups read as siblings in the bubble.
-   It carries NO border-top of its own: the horizontal ruler
-   (.message-group-separator) is the seam, and MessageBubble.tsx paints it
-   whenever both groups are present. The comment here previously claimed a
-   "same border-top" that this rule has never declared. A sources-ONLY turn
-   therefore still has no seam at all — closing that needs the <hr> to go
-   first (MessageBubble.tsx), tracked as elspeth-4dc660d56f, because adding a
-   border-top here while the ruler still renders would put two rules in one
-   seam. */
+   The seam is now genuinely parallel too (elspeth-4dc660d56f): the same
+   border-top + margin/padding trio as .message-tools, so a sources-ONLY
+   turn — the audit-bearing group naming what the composer drew on — gets a
+   real rule against the prose above it instead of 12px of undifferentiated
+   gap. When BOTH groups render, MessageBubble.tsx paints the
+   .message-group-separator ruler between them, and the adjacent-sibling
+   rule below strips this border (with the margin/padding) so the seam is
+   never double-ruled — one rule per seam in every configuration. */
 .message-sources-created {
-  margin-top: var(--space-1-5);
+  margin-top: var(--space-sm);
+  border-top: 1px solid var(--color-border-strong);
   padding-top: var(--space-1-5);
 }
 
@@ -1476,6 +1546,9 @@
 
 .message-group-separator + .message-sources-created {
   margin-top: 0;
+  /* The ruler owns this seam; the group's own border would double it
+     (the elspeth-4dc660d56f exclusivity). */
+  border-top: 0;
   padding-top: 0;
 }
 
@@ -1574,11 +1647,17 @@
   box-shadow: var(--shadow-popover);
   /* Hidden until the trigger is hovered or focused. visibility +
      opacity transition together so the bubble can fade in but still be
-     pointer-event-inert until visible. */
+     pointer-event-inert until visible.
+     The fade rides the motion scale (elspeth-616a236fc3): 0.12s sat on no
+     rung of the 100/150ms ladder, on the transcript's only popover. The
+     visibility DELAY must numerically match the fade duration but cannot
+     consume the token — var(--transition-fast) expands to `100ms ease`,
+     and a delay cannot take a timing function — so it is a bare 100ms;
+     retune it in step if the token's duration ever moves. */
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 0.12s ease, visibility 0s linear 0.12s;
+  transition: opacity var(--transition-fast), visibility 0s linear 100ms;
 }
 
 /* Hover-bridge: invisible 6px hit-zone that fills the visual gap between
@@ -1616,7 +1695,17 @@
   opacity: 1;
   visibility: visible;
   pointer-events: auto;
-  transition: opacity 0.12s ease, visibility 0s linear 0s;
+  transition: opacity var(--transition-fast), visibility 0s linear 0s;
+}
+
+/* Per-selector guard, mirroring the animations.css convention (its global
+   block is an enumeration, not a `*` reset). Killing the transition also
+   removes the hidden-direction visibility delay, so the bubble simply
+   appears/disappears — the hover-bridge pseudo keeps it reachable. */
+@media (prefers-reduced-motion: reduce) {
+  .tool-call-info-bubble {
+    transition: none;
+  }
 }
 
 .tool-call-card {

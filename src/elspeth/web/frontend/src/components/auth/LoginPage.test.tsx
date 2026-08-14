@@ -338,6 +338,10 @@ describe("LoginPage", () => {
     expect(spinner).toHaveAttribute("aria-hidden", "true");
     expect(spinner).not.toHaveAttribute("role");
     expect(spinner).not.toHaveAttribute("aria-label");
+    // Boot-frame parity (elspeth-b2a677d661): this full-viewport frame and
+    // AuthGuard's must show the SAME page-scale affordance — the bare
+    // button-scale .spinner is 14px and cannot anchor a viewport.
+    expect(spinner).toHaveClass("spinner-page");
   });
 
   it("renders the local-auth form with labelled inputs and a sign-in button", async () => {

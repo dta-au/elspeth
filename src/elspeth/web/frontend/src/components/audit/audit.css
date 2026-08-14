@@ -280,7 +280,8 @@
 .explain-dialog-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-e6fcd8d703). */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
@@ -292,7 +293,9 @@
   flex-direction: column;
   background-color: var(--color-surface-paper);
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
+  /* Modal radius, not the button radius — the same correction .graph-modal /
+     .yaml-modal already took (elspeth-03492be50b, elspeth-e6fcd8d703). */
+  border-radius: var(--radius-lg);
   box-shadow: var(--shadow-modal);
   overflow: hidden;
 }

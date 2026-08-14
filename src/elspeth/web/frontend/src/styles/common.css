@@ -230,7 +230,11 @@
 .command-palette-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.5);
+  /* The single page-dimming veil (elspeth-e6fcd8d703): this backdrop was the
+     0.5-alpha outlier among eleven hand-copied scrims — the palette dimmed
+     the page MORE than every dialog. Backdrops consume --color-scrim, never
+     a literal, so "blocked" reads as one state everywhere. */
+  background-color: var(--color-scrim);
   z-index: var(--z-palette-backdrop);
 }
 
@@ -443,7 +447,8 @@
 .graph-modal-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-e6fcd8d703). */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
@@ -504,7 +509,14 @@
    affordance snapped where every other control eases. The class NAMES are
    load-bearing: GraphModal.tsx:11 uses ".graph-modal-close" as its focus-trap
    initial-focus selector. Composing .btn-compact in the TSX would be the real
-   fix and is out of this lane. */
+   fix and is out of this lane.
+
+   `.dialog-close` is the app-dialog primitive's close affordance
+   (elspeth-e6fcd8d703): the same compact-control recipe under the ONE name
+   future and migrating dialogs compose, replacing the five divergent close
+   treatments the review counted. Grouped here so the primitive's name ships
+   live declarations rather than a dead rule. */
+.dialog-close,
 .graph-modal-close,
 .yaml-modal-close {
   display: inline-flex;
@@ -525,6 +537,7 @@
     border-color var(--transition-fast);
 }
 
+.dialog-close:hover,
 .graph-modal-close:hover,
 .yaml-modal-close:hover {
   background-color: var(--color-surface-hover);
@@ -539,7 +552,8 @@
 .yaml-modal-backdrop {
   position: fixed;
   inset: 0;
-  background-color: rgba(0, 0, 0, 0.45);
+  /* Backdrops consume --color-scrim, never a literal (elspeth-e6fcd8d703). */
+  background-color: var(--color-scrim);
   z-index: var(--z-dialog-backdrop);
 }
 
