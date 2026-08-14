@@ -97,7 +97,10 @@ function secretFormErrorTargets(error: string | null): SecretFormErrorTargets {
 }
 
 /**
- * Secrets settings panel — modal overlay.
+ * API keys & secrets panel — modal overlay. The dialog's accessible name
+ * matches the "API keys & secrets" affordances that open it (App.tsx header
+ * shortcut, ChatInput), so what a screen reader announces on open is the
+ * name the user just activated.
  *
  * Write-only entry form for user-scoped secrets plus an inventory display
  * showing all available secret references (metadata only, never values).
@@ -195,7 +198,7 @@ export function SecretsPanel({ onClose }: SecretsPanelProps) {
         ref={modalRef}
         role="dialog"
         aria-modal="true"
-        aria-label="Secrets settings"
+        aria-label="API keys & secrets"
         style={{
           position: "fixed",
           top: "50%",

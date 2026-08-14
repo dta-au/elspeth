@@ -332,11 +332,11 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(noticeScroll.overflowY).toBe("auto");
       expect(noticeScroll.scrollHeight).toBeGreaterThan(noticeScroll.clientHeight);
       const openSecrets = popover.getByRole("button", {
-        name: "Open secrets settings",
+        name: "API keys & secrets",
       });
       await expect(openSecrets).toBeVisible();
       await openSecrets.click();
-      await expect(page.getByRole("dialog", { name: "Secrets settings" })).toBeVisible();
+      await expect(page.getByRole("dialog", { name: "API keys & secrets" })).toBeVisible();
 
       const workspaceAfter = await composer.workspace().boundingBox();
       expect(workspaceAfter).not.toBeNull();
@@ -696,9 +696,9 @@ test.describe("Composer deterministic workspace geometry", () => {
       const palette = page.getByRole("dialog", { name: "Command palette" });
       await expect(palette).toBeVisible();
       await palette.getByRole("combobox", { name: "Search commands" }).fill(
-        "Show Graph",
+        "Show graph",
       );
-      await palette.getByRole("option", { name: /Show Graph/ }).click();
+      await palette.getByRole("option", { name: /Show graph/ }).click();
 
       await expect(palette).toBeHidden();
       await expect(composer.artifactTab("Graph")).toHaveAttribute(
