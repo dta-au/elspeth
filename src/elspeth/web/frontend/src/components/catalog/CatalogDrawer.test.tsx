@@ -106,7 +106,7 @@ describe("CatalogDrawer", () => {
 
   it("renders nothing when closed", () => {
     render(<CatalogDrawer isOpen={false} onClose={vi.fn()} />);
-    expect(screen.queryByText("Plugin Catalog")).not.toBeInTheDocument();
+    expect(screen.queryByText("Plugin catalog")).not.toBeInTheDocument();
   });
 
   it("fetches catalog on first open", async () => {
@@ -121,7 +121,7 @@ describe("CatalogDrawer", () => {
   it("announces the open drawer as a modal dialog", async () => {
     render(<CatalogDrawer isOpen={true} onClose={vi.fn()} />);
 
-    const dialog = screen.getByRole("dialog", { name: "Plugin Catalog" });
+    const dialog = screen.getByRole("dialog", { name: "Plugin catalog" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     expect(screen.getByText("Reference")).toBeInTheDocument();
     expect(

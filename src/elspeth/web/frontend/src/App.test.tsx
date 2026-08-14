@@ -716,7 +716,7 @@ describe("App banner roles", () => {
     });
 
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("dialog", { name: "Plugin Catalog" })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Plugin catalog" })).toBeInTheDocument();
     window.removeEventListener("open-catalog", onOpenCatalog);
   });
 
@@ -740,7 +740,7 @@ describe("App banner roles", () => {
 
     act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
 
     fireEvent.keyDown(document, {
       key: "P",
@@ -749,7 +749,7 @@ describe("App banner roles", () => {
       shiftKey: true,
     });
     expect(onOpenCatalog).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("dialog", { name: "Plugin Catalog" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Plugin catalog" })).toBeNull();
     window.removeEventListener("open-catalog", onOpenCatalog);
   });
 
@@ -760,7 +760,7 @@ describe("App banner roles", () => {
 
     act(() => window.dispatchEvent(new CustomEvent("open-catalog")));
     expect(
-      screen.getByRole("dialog", { name: "Plugin Catalog" }),
+      screen.getByRole("dialog", { name: "Plugin catalog" }),
     ).toBeInTheDocument();
 
     act(() => {
@@ -779,7 +779,7 @@ describe("App banner roles", () => {
 
     await waitFor(() =>
       expect(
-        screen.queryByRole("dialog", { name: "Plugin Catalog" }),
+        screen.queryByRole("dialog", { name: "Plugin catalog" }),
       ).toBeNull(),
     );
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({

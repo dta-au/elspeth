@@ -428,8 +428,12 @@ export function CatalogDrawer({ isOpen, onClose }: CatalogDrawerProps) {
         <div className="catalog-header">
           <div className="catalog-header-copy">
             <span className="catalog-header-eyebrow">Reference</span>
+            {/* Sentence case, matching CatalogButton's "Plugin catalog" — one
+                surface must not carry two names. This span is the drawer's
+                accessible name via aria-labelledby, so it is also what a
+                screen reader announces on open. */}
             <span id="catalog-drawer-title" className="catalog-header-title">
-              Plugin Catalog
+              Plugin catalog
             </span>
             <span className="catalog-header-subtitle">
               Browse available sources, transforms, and sinks before asking the

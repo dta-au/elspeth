@@ -116,8 +116,20 @@
 
   /* ── Semantic colours — DTA/GOLD dark theme ──────────────────────────────── */
   --color-success:           #63d487;
-  --color-error:             #ef8784;
-  --color-warning:           #e79761;
+  /* Lifted from #ef8784 (+0.016 L in HLS, hue and saturation held exactly).
+     --color-error-bg is a 12% tint, so it LIGHTENS a dark ground and shrinks
+     the text/background gap: on --color-surface-raised the composite is
+     rgb(51,64,72) and the old value measured 4.304:1, under AA. The lift
+     clears every tinted surface (worst 4.547:1 on raised/elevated) and
+     improves the untinted pairings too. colorContrast.test.ts now enumerates
+     raised and elevated, so this cannot silently regress again. */
+  --color-error:             #f08e8b;
+  /* Lifted from #e79761 (+0.032 L, hue and saturation held). Same mechanism as
+     --color-error above, and worse here because --color-warning-bg is a 14%
+     tint rather than 12%: over --color-surface-raised it measured 4.186:1.
+     This one was NOT introduced by the polish pass -- it shipped under AA and
+     was invisible because the gate did not enumerate the surface. */
+  --color-warning:           #e9a06f;
   --color-info:              #61daff;
   --color-state-positive:    #14b0ae;
 

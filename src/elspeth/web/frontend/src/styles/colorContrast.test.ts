@@ -638,9 +638,17 @@ describe("design-review contrast remediation (2026-06-29)", () => {
     // var(--color-X-bg). The tint's real contrast depends on the surface BEHIND
     // it — so gate every such surface, not just --color-bg. (The paper modal
     // was the instance the first remediation pass missed; sign-off caught it.)
+    // The raised/elevated pair was the SECOND instance this enumeration
+    // missed. A tint placed on them measured 4.30:1 while this gate stayed
+    // green, because a surface absent from this list is a defect shape the run
+    // never exercises — the green certified nothing about it. Any new
+    // --color-surface-* that can sit behind a tint belongs here on the day it
+    // is defined.
     const surfaces = [
       "--color-bg",
       "--color-surface",
+      "--color-surface-raised",
+      "--color-surface-elevated",
       "--color-surface-inspector",
       "--color-surface-paper",
     ];

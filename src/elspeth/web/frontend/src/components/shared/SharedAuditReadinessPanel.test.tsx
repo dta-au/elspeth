@@ -166,13 +166,13 @@ describe("SharedAuditReadinessPanel", () => {
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
   // The shared read-only view renders through the same AuditReadinessRow
-  // primitive as the live panel, so it inherits the identical "Blocks Run" /
+  // primitive as the live panel, so it inherits the identical "Blocks run" /
   // "Advisory" classification (validation follows snapshot execution
   // readiness; llm_interpretations gates; the other rows are advisory). It also gets a
   // standalone explanatory line in the header, since a reviewer here has no
   // ExecuteButton in view to infer the distinction from.
 
-  it("labels execution-ready validation and the four informational rows Advisory while llm_interpretations Blocks Run", () => {
+  it("labels execution-ready validation and the four informational rows Advisory while llm_interpretations Blocks run", () => {
     render(<SharedAuditReadinessPanel snapshot={_snapshot} />);
     expect(
       screen.getByTestId("shared-inspect-readiness-row-validation"),
@@ -227,10 +227,29 @@ describe("SharedAuditReadinessPanel", () => {
     expect(screen.queryByRole("button", { name: /validation/i })).not.toBeInTheDocument();
   });
 
-  it("explains the 'Blocks Run' classification in the frozen-snapshot header", () => {
+  it("quotes the gate badge in the frozen-snapshot header using the badge's own literal, case included", () => {
+    // The live panel has this guard (AuditReadinessPanel.test.tsx); this panel
+    // did not, and that gap is how a real case drift shipped: the badge in the
+    // shared AuditReadinessRow primitive moved to "Blocks run" while this
+    // header still read "Blocks Run". The assertion that was here could not
+    // see it, because its regex carried the /i flag — a case-insensitive
+    // check on a case defect passes by construction.
+    //
+    // So do not pin the literal on both sides. Read the quoted label OUT of
+    // the rendered sentence and require a badge rendering that exact text on
+    // the same screen; then either side drifting fails.
     render(<SharedAuditReadinessPanel snapshot={_snapshot} />);
-    expect(
-      screen.getByText(/Rows marked "Blocks Run" had to be clear/i),
-    ).toBeInTheDocument();
+
+    const explanation = screen.getByText(/^Rows marked "/);
+    const quoted = /"([^"]+)"/.exec(explanation.textContent ?? "")?.[1];
+    expect(quoted, "the header must quote a gate label").toBeDefined();
+    expect(screen.getAllByText(quoted!).length).toBeGreaterThan(0);
+
+    // One case register across the binary pair, matching the live panel.
+    for (const label of [quoted!, "Advisory"]) {
+      expect(label.slice(1), `${label} must be sentence case, not Title Case`).toBe(
+        label.slice(1).toLowerCase(),
+      );
+    }
   });
 });
