@@ -163,6 +163,35 @@ async function assertScenario(
   }
 }
 
+/**
+ * The two halves of the workspace's bottom rule. The artifact column draws it
+ * as .workspace-action-bar's border-top; the authoring column has no wrapper
+ * that could carry a mirrored bar, so its pane paints a ::before pinned to its
+ * own bottom edge. A pseudo-element has no box to measure, so its top edge is
+ * derived: the pane's bottom minus its rendered height (elspeth-97db9c22e5).
+ */
+async function workspaceBottomEdges(page: ComposerPage["page"]): Promise<{
+  bandTop: number;
+  barTop: number;
+  barHeight: number;
+} | null> {
+  return page.evaluate(() => {
+    const pane = document.querySelector(".workspace-authoring-pane");
+    const bar = document.querySelector(".workspace-action-bar");
+    if (pane === null || bar === null) return null;
+    const bandHeight = Number.parseFloat(
+      getComputedStyle(pane, "::before").height,
+    );
+    if (!Number.isFinite(bandHeight)) return null;
+    const barBox = bar.getBoundingClientRect();
+    return {
+      bandTop: pane.getBoundingClientRect().bottom - bandHeight,
+      barTop: barBox.top,
+      barHeight: barBox.height,
+    };
+  });
+}
+
 test.describe("Composer deterministic workspace geometry", () => {
   for (const viewport of DESKTOP_VIEWPORTS) {
     for (const scenario of WORKSPACE_SCENARIOS) {
@@ -700,26 +729,65 @@ test.describe("Composer deterministic workspace geometry", () => {
       // vertical position but its own.
       expect(reasonBox!.y).toBeGreaterThanOrEqual(save!.y + save!.height);
 
-      // Both halves of the bottom rule start on one line. The band is a
-      // ::before pinned to the authoring pane's bottom edge, so its top is the
-      // pane's bottom minus its rendered height.
-      const bottomEdges = await page.evaluate(() => {
-        const pane = document.querySelector(".workspace-authoring-pane");
-        const bar = document.querySelector(".workspace-action-bar");
-        if (pane === null || bar === null) return null;
-        const bandHeight = Number.parseFloat(
-          getComputedStyle(pane, "::before").height,
-        );
-        if (!Number.isFinite(bandHeight)) return null;
-        return {
-          bandTop: pane.getBoundingClientRect().bottom - bandHeight,
-          barTop: bar.getBoundingClientRect().top,
-        };
-      });
+      // Both halves of the bottom rule start on one line.
+      const bottomEdges = await workspaceBottomEdges(page);
       expect(bottomEdges).not.toBeNull();
       expect(
         Math.abs(bottomEdges!.bandTop - bottomEdges!.barTop),
       ).toBeLessThanOrEqual(1);
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
+  /* The band is published by a ResizeObserver, so a steady-state check only
+     proves the value was right ONCE. Two things it cannot prove are pinned
+     here, and both are the reason the observer exists rather than a second
+     constant (elspeth-97db9c22e5):
+
+     WRAP — at 1280 the bar wraps its two groups onto separate flex lines and
+     roughly doubles in height. A band repaired by adding one more constant to
+     the token formula would be correct at 1600 and wrong here.
+
+     TRANSITION — the observer has to FIRE when the bar changes, not merely
+     report a height at mount. If it missed the shrink, the band would stay
+     stuck at the taller value and we would have traded one misregistration for
+     its mirror image, visible the moment a pipeline validates and ExecuteButton
+     drops its reason line. Removing the node is how React's unmount reaches the
+     observer: either way the observed slot's content box shrinks. */
+  test("the mirrored bottom band tracks the action bar through a wrap and back", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 720 });
+    const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+      const reason = page.locator(".side-rail-execute-reason");
+      await expect(reason).toBeVisible();
+
+      const wrapped = await workspaceBottomEdges(page);
+      expect(wrapped).not.toBeNull();
+      expect(Math.abs(wrapped!.bandTop - wrapped!.barTop)).toBeLessThanOrEqual(
+        1,
+      );
+
+      await page.evaluate(() => {
+        document.querySelector(".side-rail-execute-reason")?.remove();
+      });
+
+      // Poll rather than wait a fixed beat: the observer callback and the
+      // re-render it triggers are both asynchronous.
+      await expect
+        .poll(async () => (await workspaceBottomEdges(page))?.barHeight ?? 0)
+        .toBeLessThan(wrapped!.barHeight);
+
+      const settled = await workspaceBottomEdges(page);
+      expect(settled).not.toBeNull();
+      expect(Math.abs(settled!.bandTop - settled!.barTop)).toBeLessThanOrEqual(
+        1,
+      );
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }
