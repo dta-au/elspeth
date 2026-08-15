@@ -22,6 +22,7 @@ Dependencies held by this driver:
 
 from __future__ import annotations
 
+import enum
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -66,6 +67,13 @@ from elspeth.engine.spans import SpanFactory
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
     from elspeth.core.events import EventBusProtocol
+
+
+class _SourceRowSentinel(enum.Enum):
+    EXHAUSTED = enum.auto()
+
+
+_SOURCE_ROW_EXHAUSTED = _SourceRowSentinel.EXHAUSTED
 
 
 class SourceIterationDriver:
@@ -453,13 +461,11 @@ class SourceIterationDriver:
             )
 
             try:
-                with self._span_factory.source_span(active_source.name, run_id=run_id):
-                    source_iterator = iter(active_source.load(ctx))
-                    try:
-                        first_row = next(source_iterator)
-                    except StopIteration:
-                        self._events.emit(PhaseCompleted(phase=PipelinePhase.SOURCE, duration_seconds=time.perf_counter() - phase_start))
-                        return
+                source_iterator = iter(active_source.load(ctx))
+                first_row = next(source_iterator, _SOURCE_ROW_EXHAUSTED)
+                if first_row is _SOURCE_ROW_EXHAUSTED:
+                    self._events.emit(PhaseCompleted(phase=PipelinePhase.SOURCE, duration_seconds=time.perf_counter() - phase_start))
+                    return
             except Exception as e:
                 self._ceremony.emit_phase_error(PipelinePhase.SOURCE, e, target=active_source.name)
                 raise
@@ -521,14 +527,17 @@ class SourceIterationDriver:
         last_progress_time = start_time
 
         # source_load operation covers the entire source consumption lifecycle
-        with track_operation(
-            recorder=factory.execution,
-            run_id=run_id,
-            node_id=source_id,
-            operation_type="source_load",
-            ctx=ctx,
-            input_data={"source_plugin": active_source.name},
-        ) as source_op_handle:
+        with (
+            self._span_factory.source_span(active_source.name, run_id=run_id),
+            track_operation(
+                recorder=factory.execution,
+                run_id=run_id,
+                node_id=source_id,
+                operation_type="source_load",
+                ctx=ctx,
+                input_data={"source_plugin": active_source.name},
+            ) as source_op_handle,
+        ):
             # Generator-based sources execute on next() — restore operation_id
             # before each iteration so external calls are attributed to source_load
             source_operation_id = source_op_handle.operation.operation_id

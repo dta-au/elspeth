@@ -28,6 +28,7 @@ import queue
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Sequence
+from time import monotonic, sleep
 from typing import Literal, TypedDict
 
 import structlog
@@ -45,6 +46,8 @@ from elspeth.telemetry.protocols import (
 )
 
 logger = structlog.get_logger(__name__)
+
+_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 class HealthMetrics(TypedDict):
@@ -170,11 +173,13 @@ class TelemetryManager:
         queue_size = int(INTERNAL_DEFAULTS["telemetry"]["queue_size"])
         self._queue: queue.Queue[TelemetryEvent | None] = queue.Queue(maxsize=queue_size)
 
-        # Start export thread (non-daemon to ensure proper cleanup)
+        # The normal close path drains and joins this worker. Daemon mode is a
+        # last-resort process-exit escape if a third-party exporter ignores its
+        # own I/O timeout and never returns.
         self._export_thread = threading.Thread(
             target=self._export_loop,
             name="telemetry-export",
-            daemon=False,
+            daemon=True,
         )
         self._export_thread.start()
         # Wait for thread to be ready (prevents startup race)
@@ -699,22 +704,21 @@ class TelemetryManager:
         #    make space for the sentinel would turn close() into a data-loss
         #    path precisely when a burst fills the queue.
         sentinel_sent = False
-        while self._export_thread.is_alive():
-            try:
-                self._queue.put(None, timeout=0.1)
+        sentinel_deadline = monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+        while self._export_thread.is_alive() and monotonic() < sentinel_deadline:
+            if self._try_enqueue_shutdown_sentinel():
                 sentinel_sent = True
                 break
-            except queue.Full:
-                continue
 
         if not sentinel_sent:
-            logger.error("Export thread stopped before accepting the shutdown sentinel")
+            logger.error("Export thread did not accept the shutdown sentinel before the drain deadline")
 
         # 3. Wait for thread to exit (this implicitly waits for queue drain
         #    because thread processes all events before exiting on sentinel)
-        self._export_thread.join()
+        self._export_thread.join(timeout=_SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
         if self._export_thread.is_alive():
-            logger.error("Export thread did not exit cleanly within timeout")
+            logger.error("Export thread did not exit cleanly within timeout; exporters remain open to avoid a close/export race")
+            return
 
         # 4. Close exporters. Successful infrastructure lifecycle is not
         # duplicated into logs; only telemetry-system failures below are logged.
@@ -744,6 +748,18 @@ class TelemetryManager:
                 )
 
         self._reconcile_deferred_delivery(delivered=delivered_on_close, failed=failed_on_close, dropped=dropped_on_close)
+
+    def _try_enqueue_shutdown_sentinel(self) -> bool:
+        """Make one bounded, non-destructive sentinel insertion attempt."""
+        # close() sets shutdown while holding _lifecycle_lock, so all admitted
+        # producers finish before this method runs and later producers are
+        # rejected. The export worker is therefore the only concurrent queue
+        # actor and can only make capacity more available between these calls.
+        if self._queue.full():
+            sleep(0.01)
+            return False
+        self._queue.put_nowait(None)
+        return True
 
 
 _DELIVERY_METRICS_ABSENT = object()

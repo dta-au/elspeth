@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import threading
 from datetime import UTC, datetime, timedelta
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -49,6 +50,34 @@ class TestTelemetrySpanFactory:
         assert "private payload" not in repr(row_event)
         assert run_event.status is EngineSpanStatus.ERROR
         assert run_event.exception_type == "RuntimeError"
+
+    def test_completion_callback_failure_does_not_mask_active_workload_exception(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        def fail_emit(_event) -> None:
+            raise RuntimeError("telemetry callback failed")
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+
+        with (
+            pytest.raises(ValueError, match="workload failed"),
+            factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
+        ):
+            raise ValueError("workload failed")
+
+    def test_completion_callback_failure_surfaces_after_successful_workload(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        def fail_emit(_event) -> None:
+            raise RuntimeError("telemetry callback failed")
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+
+        with (
+            pytest.raises(RuntimeError, match="telemetry callback failed"),
+            factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
+        ):
+            pass
 
     def test_cross_thread_row_uses_registered_run_root(self) -> None:
         from elspeth.contracts.events import EngineSpanName
@@ -153,6 +182,23 @@ class TestTelemetrySpanFactory:
         assert events[0].exception_type == "RuntimeError"
         assert "private row content" not in repr(events[0])
 
+    def test_bounded_batch_token_ids_report_explicit_truncation_counts(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        token_ids = tuple(f"token-{index}" for index in range(130))
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        with (
+            factory.trace_scope("run-001", datetime.now(UTC)),
+            factory.aggregation_span("batch", token_ids=token_ids, run_id="run-001"),
+        ):
+            pass
+
+        assert len(events[0].attributes["token.ids"]) == 128
+        assert events[0].attributes["token.ids.total_count"] == "130"
+        assert events[0].attributes["token.ids.truncated_count"] == "2"
+
     def test_top_level_telemetry_span_requires_explicit_run_correlation(self) -> None:
         from elspeth.engine.spans import SpanFactory
 
@@ -196,6 +242,28 @@ class TestTelemetrySpanFactory:
                 exception_type=None,
                 attributes={"request.body": "secret"},
             )
+
+    def test_engine_span_event_detaches_from_mapping_proxy_backing_store(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+
+        completed_at = datetime.now(UTC)
+        caller_owned = {"row.id": "row-001", "token.id": "token-001"}
+        event = EngineSpanCompleted(
+            timestamp=completed_at,
+            run_id="run-001",
+            name=EngineSpanName.ROW,
+            started_at=completed_at - timedelta(milliseconds=5),
+            trace_started_at=completed_at - timedelta(seconds=1),
+            span_id="0123456789abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes=MappingProxyType(caller_owned),
+        )
+
+        caller_owned["row.id"] = "changed-through-backing-dict"
+
+        assert event.attributes == {"row.id": "row-001", "token.id": "token-001"}
 
     def test_engine_span_contract_tolerates_cross_host_clock_skew(self) -> None:
         from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus

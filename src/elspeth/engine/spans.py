@@ -16,13 +16,14 @@ import secrets
 import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from sys import exception as active_exception
 from time import perf_counter
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
-from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, _freeze_engine_span_attributes
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, _validate_engine_span_attributes
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span, Tracer
@@ -77,12 +78,12 @@ class _TelemetrySpan:
     def set_attribute(self, key: str, value: Any) -> None:
         candidate = dict(self._attributes)
         candidate.update(_bounded_span_attributes({key: value}))
-        _freeze_engine_span_attributes(self._name, candidate)
+        _validate_engine_span_attributes(self._name, candidate)
         self._attributes.clear()
         self._attributes.update(candidate)
 
     def set_status(self, status: Any) -> None:
-        if not isinstance(status, EngineSpanStatus):
+        if type(status) is not EngineSpanStatus:
             raise TypeError("telemetry-backed engine span status must be EngineSpanStatus")
         self._status = status
 
@@ -131,6 +132,9 @@ def _bounded_span_attributes(attributes: Mapping[str, Any]) -> dict[str, str | t
             bounded[key] = value[:256]
         elif type(value) in (list, tuple) and all(type(item) is str for item in value):
             bounded[key] = tuple(item[:256] for item in value[:128])
+            if key == "token.ids" and len(value) > 128:
+                bounded["token.ids.total_count"] = str(len(value))
+                bounded["token.ids.truncated_count"] = str(len(value) - 128)
         else:
             raise TypeError(f"engine span attribute {key!r} must be a string or string sequence")
     return bounded
@@ -184,17 +188,16 @@ class SpanFactory:
         """Whether tracing is enabled."""
         return self._tracer is not None or self._telemetry_emit is not None
 
-    @staticmethod
-    def mark_error(span: "Span | NoOpSpan | _TelemetrySpan", exception: BaseException) -> None:
+    def mark_error(self, span: "Span | NoOpSpan | _TelemetrySpan", exception: BaseException) -> None:
         """Mark a handled engine failure without recording exception content."""
-        if isinstance(span, _TelemetrySpan):
-            span.record_exception(exception)
+        if self._telemetry_emit is not None:
+            cast(_TelemetrySpan, span).record_exception(exception)
             return
-        if isinstance(span, NoOpSpan):
+        if self._tracer is None:
             return
         from opentelemetry.trace import Status, StatusCode
 
-        span.set_status(Status(StatusCode.ERROR))
+        cast("Span", span).set_status(Status(StatusCode.ERROR))
 
     @contextmanager
     def trace_scope(self, run_id: str, trace_started_at: datetime) -> Iterator[None]:
@@ -208,24 +211,25 @@ class SpanFactory:
             return
         binding = _RunTrace(trace_started_at=_canonical_trace_started_at(trace_started_at), root_span_id=None)
         with self._run_traces_lock:
-            existing = self._run_traces.get(run_id)
-            if existing is not None and existing != binding:
-                raise ValueError(f"run_id {run_id!r} already has different active trace correlation")
-            if existing is None:
+            if run_id not in self._run_traces:
                 self._run_traces[run_id] = binding
                 self._trace_scope_references[run_id] = 1
             else:
-                self._trace_scope_references[run_id] = self._trace_scope_references.get(run_id, 0) + 1
+                if self._run_traces[run_id] != binding:
+                    raise ValueError(f"run_id {run_id!r} already has different active trace correlation")
+                self._trace_scope_references[run_id] += 1
         try:
             yield
         finally:
             with self._run_traces_lock:
-                remaining = self._trace_scope_references.get(run_id, 0) - 1
+                remaining = self._trace_scope_references[run_id] - 1
                 if remaining > 0:
                     self._trace_scope_references[run_id] = remaining
-                elif self._run_traces.get(run_id) == binding:
-                    self._trace_scope_references.pop(run_id, None)
-                    self._run_traces.pop(run_id)
+                else:
+                    if self._run_traces[run_id] != binding:
+                        raise RuntimeError("active trace scope binding changed before final release")
+                    del self._trace_scope_references[run_id]
+                    del self._run_traces[run_id]
 
     @contextmanager
     def _make_span(
@@ -255,7 +259,8 @@ class SpanFactory:
             yield self._NOOP_SPAN
             return
 
-        active_parent = self._active_span.get()
+        active_context = copy_context()
+        active_parent = active_context[self._active_span] if self._active_span in active_context else None
         if active_parent is not None:
             if register_run_root:
                 raise ValueError("run span cannot be nested inside another engine span")
@@ -269,7 +274,7 @@ class SpanFactory:
                 raise ValueError("telemetry-backed top-level engine span requires explicit run_id")
             resolved_run_id = run_id
             with self._run_traces_lock:
-                run_trace = self._run_traces.get(run_id)
+                run_trace = self._run_traces[run_id] if run_id in self._run_traces else None
             if register_run_root:
                 if trace_started_at is None:
                     raise ValueError("run span requires canonical trace_started_at")
@@ -307,20 +312,17 @@ class SpanFactory:
                 span_id=span_id,
             )
         )
-        caught: BaseException | None = None
         try:
             yield telemetry_span
-        except BaseException as exc:
-            caught = exc
-            raise
         finally:
-            self._active_span.reset(token)
-            completed_at = started_at + timedelta(seconds=perf_counter() - started_monotonic)
-            status = EngineSpanStatus.ERROR if caught is not None else telemetry_span._status
-            exception_type = _safe_exception_type(caught) if caught is not None else telemetry_span._exception_type
+            caught = active_exception()
             try:
-                self._telemetry_emit(
-                    EngineSpanCompleted(
+                self._active_span.reset(token)
+                completed_at = started_at + timedelta(seconds=perf_counter() - started_monotonic)
+                status = EngineSpanStatus.ERROR if caught is not None else telemetry_span._status
+                exception_type = _safe_exception_type(caught) if caught is not None else telemetry_span._exception_type
+                try:
+                    completion = EngineSpanCompleted(
                         timestamp=completed_at,
                         run_id=resolved_run_id,
                         name=name,
@@ -332,12 +334,20 @@ class SpanFactory:
                         exception_type=exception_type,
                         attributes=safe_attributes,
                     )
-                )
+                    self._telemetry_emit(completion)
+                finally:
+                    if root_binding is not None:
+                        with self._run_traces_lock:
+                            if self._run_traces[resolved_run_id] != root_binding:
+                                raise RuntimeError("active run span binding changed before final release")
+                            del self._run_traces[resolved_run_id]
             finally:
-                if root_binding is not None:
-                    with self._run_traces_lock:
-                        if self._run_traces.get(resolved_run_id) == root_binding:
-                            self._run_traces.pop(resolved_run_id)
+                # During exception unwinding, the workload failure remains the
+                # authoritative failure even when telemetry delivery also fails.
+                # This outer finally establishes precedence without broadly
+                # catching arbitrary callback errors.
+                if caught is not None:
+                    raise caught
 
     @contextmanager
     def run_span(

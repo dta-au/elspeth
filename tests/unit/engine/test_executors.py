@@ -93,6 +93,7 @@ from elspeth.contracts.errors import (
     TransformErrorReason,
     ZeroEmissionSuccessContractViolation,
 )
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.results import ArtifactDescriptor, GateResult
 from elspeth.contracts.routing import RouteDestination, RoutingAction
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
@@ -650,6 +651,57 @@ class TestTransformExecutor:
         before_terminal_audit.assert_called_once_with()
         factory.execution.begin_node_state.assert_called_once()
         factory.execution.complete_node_state.assert_not_called()
+
+    def test_post_invocation_output_validation_failure_marks_transform_span_error(self) -> None:
+        """The transform span covers validation and terminal audit after process()."""
+        from elspeth.contracts import PluginSchema
+
+        class StrictOutputSchema(PluginSchema):
+            count: int
+
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, spans, _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform()
+        transform.output_schema = StrictOutputSchema
+        transform.process.return_value = TransformResult.success(
+            make_row({"count": "not-an-int"}, contract=_make_contract()),
+            success_reason={"action": "test"},
+        )
+
+        with (
+            spans.trace_scope("run_1", datetime.now(UTC)),
+            pytest.raises(PluginContractViolation, match="output validation failed"),
+        ):
+            executor.execute_transform(transform, _make_token(), make_context(run_id="run_1"))
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.TRANSFORM
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "PluginContractViolation"
+
+    def test_handled_transform_error_result_marks_transform_span_error(self) -> None:
+        """A routed TransformResult.error remains a failed transform operation."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = TransformExecutor(factory.execution, spans, _make_step_resolver(), data_flow=factory.data_flow)
+        transform = _make_transform(on_error="discard")
+        transform.process.return_value = TransformResult.error(reason={"reason": "rejected"})
+
+        with spans.trace_scope("run_1", datetime.now(UTC)):
+            result, _token, error_sink = executor.execute_transform(
+                transform,
+                _make_token(),
+                make_context(run_id="run_1"),
+            )
+
+        assert result.status == "error"
+        assert error_sink == "discard"
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "TransformResultError"
 
     # --- Input validation (centralized) ---
 
@@ -1990,6 +2042,57 @@ class TestGateExecutor:
 
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
 
+    def test_post_evaluation_route_failure_marks_gate_span_error(self) -> None:
+        """The gate span stays open through route admission and guard failure audit."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = GateExecutor(factory.execution, spans, _make_step_resolver())
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="'unknown_label'",
+            routes={"known": "next_conn"},
+        )
+
+        with (
+            spans.trace_scope("run_1", datetime.now(UTC)),
+            pytest.raises(ValueError, match="unknown_label"),
+        ):
+            executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.GATE
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "ValueError"
+
+    def test_handled_gate_expression_error_marks_gate_span_error(self) -> None:
+        """A configured expression-error route remains a failed gate operation."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            spans,
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['missing'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="discard",
+        )
+
+        with spans.trace_scope("run_1", datetime.now(UTC)):
+            outcome = executor.execute_config_gate(config, "cg_1", _make_token(), make_context(run_id="run_1"))
+
+        assert outcome.discarded is True
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "ExpressionEvaluationError"
+
     def test_config_gate_unknown_route_label_error_redacts_row_derived_value(self) -> None:
         """Unknown row-derived route labels must not leak raw values to audit text."""
         from elspeth.contracts.errors import ExecutionError
@@ -2752,11 +2855,13 @@ class TestAggregationExecutor:
         node_id: str = "agg_1",
         count: int = 3,
         clock: MockClock | None = None,
+        span_factory: SpanFactory | None = None,
     ) -> tuple[AggregationExecutor, MagicMock, NodeID]:
         """Create an AggregationExecutor with a single configured node."""
         if factory is None:
             factory = _make_factory()
-        span_factory = _make_span_factory()
+        if span_factory is None:
+            span_factory = _make_span_factory()
         nid = NodeID(node_id)
         settings = AggregationSettings(
             name="test_agg",
@@ -3083,6 +3188,35 @@ class TestAggregationExecutor:
         failed_batches = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.FAILED]
         assert len(failed_batches) == 1
 
+    def test_post_invocation_output_validation_failure_marks_aggregation_span_error(self) -> None:
+        """The aggregation span covers output validation and receipt audit."""
+        from elspeth.contracts import PluginSchema
+
+        class StrictOutputSchema(PluginSchema):
+            count: int
+
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
+        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        transform = _make_aggregation_transform("agg_transform")
+        transform.output_schema = StrictOutputSchema
+        transform.process.return_value = TransformResult.success(
+            make_row({"count": "not-an-int"}, contract=_make_contract()),
+            success_reason={"action": "aggregated"},
+        )
+
+        with (
+            spans.trace_scope("test-run", datetime.now(UTC)),
+            pytest.raises(PluginContractViolation, match="output validation failed"),
+        ):
+            executor.execute_flush(nid, transform, make_context(run_id="test-run"), TriggerType.COUNT)
+
+        assert len(events) == 1
+        assert events[0].name is EngineSpanName.AGGREGATION
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "PluginContractViolation"
+
     def test_execute_flush_error_result_marks_batch_failed(self) -> None:
         """Error result from transform marks batch as FAILED."""
         executor, factory, nid = self._make_agg_executor(count=2)
@@ -3109,6 +3243,28 @@ class TestAggregationExecutor:
         # Verify batch marked failed
         failed_calls = [c for c in factory.execution.complete_batch.call_args_list if c[1].get("status") == BatchStatus.FAILED]
         assert len(failed_calls) == 1
+
+    def test_handled_aggregation_error_result_marks_aggregation_span_error(self) -> None:
+        """A TransformResult.error marks the flush span even though routing returns."""
+        events: list[EngineSpanCompleted] = []
+        spans = SpanFactory(telemetry_emit=events.append)
+        executor, _factory, nid = self._make_agg_executor(count=1, span_factory=spans)
+        executor.buffer_row(nid, _make_token(data={"value": "a"}, token_id="t1"))
+        transform = _make_aggregation_transform("agg_transform")
+        transform.process.return_value = TransformResult.error(reason={"reason": "rejected"})
+
+        with spans.trace_scope("test-run", datetime.now(UTC)):
+            result, _tokens, _batch_id = executor.execute_flush(
+                nid,
+                transform,
+                make_context(run_id="test-run"),
+                TriggerType.COUNT,
+            )
+
+        assert result.status == "error"
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "AggregationResultError"
 
     def test_execute_flush_exception_marks_batch_failed_and_reraises(self) -> None:
         """Exception from transform marks batch as FAILED and re-raises."""
