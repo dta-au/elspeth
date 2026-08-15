@@ -26,10 +26,7 @@ is a working document under the normal delivery posture.
   failure must not replace or rewrite an active workload failure. Exporters
   retain fresh-run trace origin until both `RunFinished` and the enclosing run
   span completion arrive, in either order; joined/resumed runs clear on their
-  sole terminal event. Telemetry shutdown must not hold the lifecycle lock
-  during a blocking queue put or evict a queued event merely to make room for
-  its sentinel, and its wait for an exporter that ignores I/O timeouts must
-  remain bounded.
+  sole terminal event.
 
 - **2026-08-15 — a selector lane may contain SEVERAL trusted profile probes**:
   the state-engine profile reporter accepts repeated observations that agree on
