@@ -451,6 +451,10 @@ _STEP_1_SOURCE_TOOL: dict[str, Any] = {
             # ``resolution`` is deliberately NOT required: it is a constant
             # implied by the tool name, and models omit constant fields.
             # The parser accepts absence and rejects a wrong present value.
+            # ``plugin`` STAYS listed as required (explicitness nudge), but the
+            # parser tolerates its absence when the wizard has a selection
+            # pinned (plugin_hint), defaulting to that server-owned value —
+            # with a hint the equality check makes it a constant field too.
             "required": [
                 "plugin",
                 "filename",
@@ -2145,8 +2149,13 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
     # models omit constant fields, so absence is accepted as its only legal
     # value while a present-but-wrong value stays rejected (mirrors the
     # resolve_sink treatment and the on_validation_failure default below).
+    # ``plugin`` is the same class of constant whenever the wizard has a
+    # selection: the prompt states the selected plugin and the equality check
+    # below rejects any other value, so with a hint the field carries zero
+    # information and models omit it (observed live twice: tutorial step-1,
+    # 2026-08-12 and 2026-08-15, missing exactly ['plugin']). Absence then
+    # defaults to the server-owned hint; without a hint it stays required.
     missing = {
-        "plugin",
         "filename",
         "mime_type",
         "content",
@@ -2155,12 +2164,16 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
         "sample_rows",
         "assistant_message",
     } - set(data.keys())
+    if "plugin" not in data and plugin_hint is None:
+        missing.add("plugin")
     if missing:
         raise GuidedToolArgumentShapeError(f"resolve_source arguments missing required keys: {sorted(missing)}")
     if data.get("resolution", "source") != "source":
         raise GuidedToolArgumentShapeError("resolve_source resolution key must be exactly 'source' when provided")
 
-    plugin = data["plugin"]
+    # Absent (never null) with a wizard hint: the missing-set check above has
+    # already guaranteed plugin_hint is not None on this branch.
+    plugin = data["plugin"] if "plugin" in data else plugin_hint
     if not isinstance(plugin, str) or not plugin:
         raise GuidedToolArgumentShapeError(f"resolve_source plugin must be a non-empty string; got {type(plugin).__name__}")
     if plugin_hint is not None and plugin != plugin_hint:
@@ -3163,7 +3176,44 @@ async def maybe_resolve_step_2_sink_chat(
                     )
                 try:
                     sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
-                except (GuidedToolArgumentShapeError, AssistantScaffoldLeakError):
+                except AssistantScaffoldLeakError:
+                    if pending_deferred is not None:
+                        # Same retention rule for a shape-invalid sink half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=pending_deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
+                    raise
+                except GuidedToolArgumentShapeError as exc:
+                    # Bounded shape self-repair (mirrors the config-invalid
+                    # threading below): a missing/mistyped-key resolve_sink is
+                    # the same model failure class that hit step-1 live (the
+                    # model omits a field the prompt presents as settled state,
+                    # e.g. the revision projection's plugin/schema_mode), so
+                    # thread the shape rejection back as the tool result and
+                    # let the model resend within the same Send. Bounded by
+                    # the shared iteration cap; at exhaustion the pre-repair
+                    # behavior applies (paired retain salvage, else raise).
+                    if _iteration + 1 < iterations:
+                        messages.append(_assistant_tool_calls_message(message, tool_calls))
+                        rejected_sink_call = sink_calls[0] if is_retained_pair else terminal_calls[0]
+                        for tool_call in tool_calls:
+                            if tool_call is rejected_sink_call:
+                                content = (
+                                    f"resolve_sink rejected: the arguments were malformed: {exc} "
+                                    "Resend the complete resolve_sink call with every required key."
+                                )
+                            else:
+                                content = (
+                                    "Not applied: the paired resolve_sink call was rejected. "
+                                    "After correcting it, resend BOTH calls together in one reply."
+                                )
+                            messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
                     if pending_deferred is not None:
                         # Same retention rule for a shape-invalid sink half.
                         status = ComposerLLMCallStatus.SUCCESS

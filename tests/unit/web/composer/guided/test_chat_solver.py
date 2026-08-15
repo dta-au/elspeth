@@ -988,6 +988,112 @@ async def _run_stage_solver(stage: str) -> object:
 
 
 @pytest.mark.asyncio
+async def test_step_1_pair_with_omitted_hinted_plugin_applies_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hinted-plugin default applies inside a pair, not only to solo calls.
+
+    Pre-fix, a paired reply whose resolve_source half omitted the hinted
+    ``plugin`` was salvage-downgraded to a withheld resolution (retain kept,
+    source DISCARDED) even though the source half was legitimately resolvable
+    from the wizard hint. Pins that both halves now apply."""
+
+    async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        source_arguments = {name: value for name, value in _PAIR_SOURCE_ARGUMENTS.items() if name != "plugin"}
+        calls = [
+            SimpleNamespace(id="c_source", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(source_arguments))),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+
+
+@pytest.mark.asyncio
+async def test_step_2_shape_rejected_resolve_sink_is_repaired_within_one_tool_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing-key resolve_sink gets its shape rejection threaded back once.
+
+    Same failure class as the live step-1 tutorial bug (model omits a key the
+    prompt presents as settled state — here the revision projection): instead
+    of terminalizing the Send into the user-facing Retry error, the rejection
+    goes back as the tool result (mirroring the config-invalid threading) and
+    the corrected resend resolves within the same Send."""
+    calls: list[dict[str, Any]] = []
+
+    async def repairing_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            arguments = dict(_PAIR_SINK_ARGUMENTS)
+            arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+            call = SimpleNamespace(id="c_sink_1", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(arguments)))
+        else:
+            call = SimpleNamespace(id="c_sink_2", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS)))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert len(calls) == 2
+    repair_messages = calls[1]["messages"]
+    assert repair_messages[-1]["role"] == "tool"
+    assert repair_messages[-1]["tool_call_id"] == "c_sink_1"
+    assert "resolve_sink rejected" in repair_messages[-1]["content"]
+    assert repair_messages[-2]["role"] == "assistant"
+    assert repair_messages[-2]["tool_calls"][0]["id"] == "c_sink_1"
+
+
+@pytest.mark.asyncio
+async def test_step_2_shape_repair_is_bounded_by_the_iteration_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shape repair consumes loop iterations; at the cap the rejection propagates."""
+    calls: list[dict[str, Any]] = []
+
+    async def always_shape_invalid(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        arguments = dict(_PAIR_SINK_ARGUMENTS)
+        arguments["output"] = {name: value for name, value in _PAIR_SINK_ARGUMENTS["output"].items() if name != "plugin"}
+        call = SimpleNamespace(id=f"c_sink_{len(calls)}", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(arguments)))
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_shape_invalid)
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError):
+        await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Save results as jsonl.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            max_discovery_iters=2,
+            timeout_seconds=30.0,
+        )
+
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
 async def test_malformed_deferred_action_is_repaired_within_one_tool_turn(
     monkeypatch: pytest.MonkeyPatch,
@@ -3621,6 +3727,32 @@ def test_parse_rejects_omitted_content_as_a_missing_key() -> None:
 def test_parse_rejects_null_content_as_a_shape_defect() -> None:
     with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match="content must be a non-empty string"):
         _parse_step_1_source_tool_arguments(_source_tool_args(content=None), plugin_hint="json")
+
+
+def test_parse_defaults_omitted_plugin_to_the_wizard_hint() -> None:
+    """With a wizard selection pinned, an absent ``plugin`` resolves to that hint.
+
+    The prompt tells the model "The current source plugin selected in the
+    wizard is {hint!r}", and the parser rejects any OTHER value — so with a
+    hint the field carries zero information and models omit it as a constant
+    (observed live twice: tutorial step-1, 2026-08-12 and 2026-08-15, missing
+    exactly ['plugin']). Same treatment as the ``resolution`` discriminator:
+    absence defaults to the server-owned value; a present-but-wrong value
+    stays rejected (see the mismatch test below)."""
+    resolution = _parse_step_1_source_tool_arguments(_source_tool_args(plugin=_OMIT_TOOL_ARG), plugin_hint="json")
+    assert resolution.plugin == "json"
+
+
+def test_parse_rejects_omitted_plugin_without_a_wizard_hint() -> None:
+    """No wizard selection -> ``plugin`` is genuinely informative and stays required."""
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match=r"missing required keys: \['plugin'\]"):
+        _parse_step_1_source_tool_arguments(_source_tool_args(plugin=_OMIT_TOOL_ARG), plugin_hint=None)
+
+
+def test_parse_rejects_null_plugin_even_with_a_wizard_hint() -> None:
+    """An explicit ``null`` is a present-but-wrong value, never treated as absence."""
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match="plugin must be a non-empty string"):
+        _parse_step_1_source_tool_arguments(_source_tool_args(plugin=None), plugin_hint="json")
 
 
 def test_parse_defaults_on_validation_failure_to_discard_when_omitted() -> None:
