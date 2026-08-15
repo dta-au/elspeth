@@ -22,15 +22,8 @@ vi.mock("@/components/composer/CompletionBar", () => ({
   CompletionBar: () => <div data-testid="completion-bar">Completion actions</div>,
 }));
 
-vi.mock("@/components/sidebar/CatalogButton", () => ({
-  CatalogButton: () => <button type="button">Plugin catalog</button>,
-}));
-
 function renderActionBar(
-  capabilities: {
-    completion: boolean;
-    catalog: boolean;
-  },
+  capabilities: { completion: boolean },
 ) {
   const openInspector = vi.fn();
   const paneState: WorkspacePaneState = {
@@ -113,7 +106,7 @@ describe("WorkspaceActionBar", () => {
     for (const rule of css.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
       const selector = rule[1].trim();
       if (
-        !/^\.workspace-(status-control|more-actions|collapse-control)\b/.test(
+        !/^\.workspace-(status-control|collapse-control)\b/.test(
           selector,
         )
       ) {
@@ -127,7 +120,6 @@ describe("WorkspaceActionBar", () => {
 
     expect([...barRegisters.keys()].sort()).toEqual([
       ".workspace-collapse-control",
-      ".workspace-more-actions > button",
       ".workspace-status-control",
     ]);
     expect([...new Set(barRegisters.values())]).toEqual([
@@ -143,7 +135,6 @@ describe("WorkspaceActionBar", () => {
     });
     const { openInspector, container } = renderActionBar({
       completion: false,
-      catalog: false,
     });
 
     const actionBar = container.querySelector(".workspace-action-bar");
@@ -233,7 +224,6 @@ describe("WorkspaceActionBar", () => {
       arrange();
       const { container } = renderActionBar({
         completion: false,
-        catalog: false,
       });
 
       const pills = [
@@ -265,7 +255,7 @@ describe("WorkspaceActionBar", () => {
       },
     });
 
-    renderActionBar({ completion: false, catalog: false });
+    renderActionBar({ completion: false });
 
     expect(
       screen.getByRole("button", { name: "Audit: Error" }),
@@ -283,7 +273,6 @@ describe("WorkspaceActionBar", () => {
     } as never);
     const view = renderActionBar({
       completion: false,
-      catalog: false,
     });
     expect(
       screen.getByRole("button", { name: "Validation: Checking" }),
@@ -304,19 +293,22 @@ describe("WorkspaceActionBar", () => {
   });
 
   it.each([
-    ["ordinary freeform", true, true],
-    ["terminal guided", true, true],
-    ["active guided", false, false],
-    ["tutorial", false, false],
+    ["ordinary freeform", true],
+    ["terminal guided", true],
+    ["active guided", false],
+    ["tutorial", false],
   ] as const)(
     "pins the %s capability matrix",
-    (_mode, completion, catalog) => {
-      renderActionBar({ completion, catalog });
+    (_mode, completion) => {
+      renderActionBar({ completion });
 
       expect(screen.queryByTestId("completion-bar") !== null).toBe(completion);
+      // The More-actions popover retired 2026-08-15 (its last item, the
+      // Plugin catalog, moved to the artifact-workspace toolbar); the bar
+      // must never grow it back.
       expect(
-        screen.queryByRole("button", { name: "More actions" }) !== null,
-      ).toBe(catalog);
+        screen.queryByRole("button", { name: "More actions" }),
+      ).toBeNull();
       expect(
         screen.getByRole("button", { name: /Validation:/ }),
       ).toBeInTheDocument();
@@ -326,52 +318,4 @@ describe("WorkspaceActionBar", () => {
     },
   );
 
-  it("renders only individually admitted secondary actions", async () => {
-    const user = userEvent.setup();
-    renderActionBar({ completion: false, catalog: true });
-    await user.click(screen.getByRole("button", { name: "More actions" }));
-
-    expect(
-      screen.getByRole("button", { name: "Plugin catalog" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("group", { name: "More actions" }).querySelectorAll(
-        "button",
-      ),
-    ).toHaveLength(1);
-  });
-
-  it("operates the secondary menu by Arrow, Home, End, and Escape keys", async () => {
-    const user = userEvent.setup();
-    renderActionBar({ completion: false, catalog: true });
-    const more = screen.getByRole("button", { name: "More actions" });
-    expect(more).not.toHaveAttribute("aria-haspopup");
-    expect(more).toHaveAttribute(
-      "aria-controls",
-      "workspace-more-actions-panel",
-    );
-    more.focus();
-
-    await user.keyboard("{ArrowDown}");
-    const catalog = screen.getByRole("button", { name: "Plugin catalog" });
-    expect(more).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("group", { name: "More actions" })).toHaveAttribute(
-      "id",
-      "workspace-more-actions-panel",
-    );
-    expect(catalog).toHaveFocus();
-    // Single-item menu today: Arrow wraps onto the same item and Home/End
-    // both resolve to it, so the roving logic stays exercised end-to-end.
-    await user.keyboard("{ArrowDown}");
-    expect(catalog).toHaveFocus();
-    await user.keyboard("{Home}");
-    expect(catalog).toHaveFocus();
-    await user.keyboard("{End}");
-    expect(catalog).toHaveFocus();
-    await user.keyboard("{Escape}");
-    expect(more).toHaveFocus();
-    expect(
-      screen.queryByRole("button", { name: "Plugin catalog" }),
-    ).not.toBeInTheDocument();
-  });
 });

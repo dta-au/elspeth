@@ -147,6 +147,19 @@
   min-height: var(--size-control-compact);
 }
 
+/* Right cluster: [Plugin catalog][Focus graph] (2026-08-15 UX review; the
+   catalog was promoted here from the retired More-actions popover). Plain
+   flex wrapper with explicit centering — the wrapper-stretch slab bug
+   (elspeth-929fc5d4a7) is why alignment is stated, not inherited. The
+   `.artifact-workspace-toolbar button` register rule above reaches through
+   this wrapper, so both controls stay on the row's 36px register. */
+.artifact-toolbar-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: var(--space-sm);
+  align-items: center;
+}
+
 /* Run-tab outcome/live badge (elspeth-3a7b7c7b37). aria-hidden dot appended
    inside the Run tab button; tones mirror ProgressView's terminal colour
    mapping, "live" is the neutral in-flight pulse.
@@ -318,8 +331,7 @@
   flex: 0 0 100%;
 }
 
-.workspace-status-controls,
-.workspace-more-actions {
+.workspace-status-controls {
   display: flex;
   gap: var(--workspace-bar-gap);
   align-items: center;
@@ -356,52 +368,11 @@
   border-color: var(--color-error, currentcolor);
 }
 
-/* The overflow holds the bar's right edge; see the composition note on
-   .workspace-action-bar. An auto margin rather than space-between, so the
-   status and completion groups stay one cluster on the left. */
-.workspace-more-actions {
-  position: relative;
-  margin-inline-start: auto;
-}
-
-/* Same one-register rule as the status chips above (elspeth-5413e4221e). */
-.workspace-more-actions > button {
-  min-height: var(--size-control);
-}
-
-.workspace-more-actions-menu {
-  position: absolute;
-  z-index: var(--z-panel-controls);
-  right: 0;
-  bottom: calc(100% + var(--space-xs));
-  display: grid;
-  gap: var(--space-xs);
-  min-width: 192px;
-  padding: var(--space-sm);
-  border: 1px solid var(--color-border, currentcolor);
-  border-radius: var(--radius-md, 6px);
-  background: var(--color-surface, Canvas);
-  box-shadow: var(--shadow-dropdown);
-}
-
-/* Both menu items are side-rail controls borrowed into a popover, and they
-   arrived carrying the rail's full-width geometry (width: calc(100% - 16px)
-   plus 8px side margins). Those margins DOUBLED this menu's 8px inset to 16px
-   and QUINTUPLED its 4px row gap to 20px, and the two items read as different
-   control species — a centred --font-size-base pill above a left-aligned
-   --font-size-sm grid row. Strip the rail geometry and settle both on one
-   species: left-aligned, --font-size-sm, the compact radius. The sibling
-   overflow menu in chat.css already ships the equivalent normalising rule
-   (elspeth-3d87be9d02). Heights are untouched — both items are already
-   --size-control. */
-.workspace-more-actions-menu > * {
-  width: auto;
-  margin: 0;
-  border-radius: var(--radius-sm);
-  justify-content: flex-start;
-  font-size: var(--font-size-sm);
-  text-align: left;
-}
+/* The More-actions popover that used to hold the bar's right edge was
+   retired 2026-08-15 (its last item, the Plugin catalog, moved to
+   .artifact-toolbar-actions above); the bar's clusters now sit
+   flex-start with trailing space at wide viewports — deliberate, not
+   unfinished. */
 
 .workspace-collapse-control {
   position: relative;

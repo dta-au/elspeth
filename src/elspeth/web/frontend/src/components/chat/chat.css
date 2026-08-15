@@ -612,9 +612,10 @@
   display: none;
 }
 
-/* Rare-action overflow trigger + menu (elspeth-8fa71e6d15): same idiom as
-   .workspace-more-actions — one persistent trigger, rare actions in a
-   popover, instead of a permanent 44px slot per action. */
+/* Rare-action overflow trigger + menu (elspeth-8fa71e6d15): one persistent
+   trigger, rare actions in a popover, instead of a permanent 44px slot per
+   action. (The workspace bar once used the same idiom; its popover retired
+   2026-08-15 when its last item moved to the artifact toolbar.) */
 .chat-input-more {
   position: relative;
   display: inline-flex;

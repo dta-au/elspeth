@@ -91,14 +91,12 @@ describe("sidebar focus rings (elspeth-eaa8c0dc73)", () => {
   // control in the same two-item popover got the ~14:1 --color-focus-ring.
   // --color-info was a third ring colour again.
   it.each([
-    [".side-rail-catalog-btn:focus-visible", "2px"],
     [".side-rail-suggestion-header:focus-visible", "-2px"],
   ])("%s rings with the focus-ring token", (selector, offset) => {
     expect(winningValue(selector, "outline")).toBe(
       "2px solid var(--color-focus-ring)",
     );
-    // Each rule keeps its own offset: the catalog button rings outside, the
-    // clipped suggestion header rings inside.
+    // The clipped suggestion header rings inside (negative offset).
     expect(winningValue(selector, "outline-offset")).toBe(offset);
   });
 

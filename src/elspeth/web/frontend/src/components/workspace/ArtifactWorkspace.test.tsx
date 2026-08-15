@@ -26,6 +26,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
 import { useHashRouter } from "@/hooks/useHashRouter";
 import {
+  OPEN_CATALOG_EVENT,
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
   dispatchArtifactViewIntent,
@@ -61,6 +62,7 @@ class PassiveResizeObserver implements ResizeObserver {
 interface RenderArtifactWorkspaceOptions {
   inspector?: ReactNode;
   runAvailable?: boolean;
+  catalogAvailable?: boolean;
 }
 
 function renderArtifactWorkspace(
@@ -69,7 +71,12 @@ function renderArtifactWorkspace(
   return render(
     <ComposerWorkspace
       authoring={<button type="button">Author control</button>}
-      artifact={<ArtifactWorkspace runAvailable={options.runAvailable} />}
+      artifact={
+        <ArtifactWorkspace
+          runAvailable={options.runAvailable}
+          catalogAvailable={options.catalogAvailable}
+        />
+      }
       inspector={
         options.inspector ?? <button type="button">Validation status</button>
       }
@@ -1364,5 +1371,58 @@ describe("ArtifactWorkspace", () => {
     );
     act(() => vi.advanceTimersByTime(6000));
     expect(loadRuns).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("toolbar catalog trigger (2026-08-15 UX review)", () => {
+  beforeEach(() => {
+    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: null,
+    } as never);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("mounts Plugin catalog before Focus graph in DOM order when admitted", () => {
+    renderArtifactWorkspace({ catalogAvailable: true });
+
+    const catalog = screen.getByRole("button", { name: "Plugin catalog" });
+    const focusGraph = screen.getByRole("button", { name: "Focus graph" });
+    // WCAG 2.4.3: visual order IS tab order — catalog precedes Focus graph
+    // in the DOM, no CSS `order` on interactive controls. Focus graph keeps
+    // the terminal edge whether or not the catalog renders.
+    expect(
+      catalog.compareDocumentPosition(focusGraph) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(catalog.parentElement).toBe(focusGraph.parentElement);
+  });
+
+  it("omits the catalog trigger by default (tutorial/guided mounts)", () => {
+    renderArtifactWorkspace();
+    expect(
+      screen.queryByRole("button", { name: "Plugin catalog" }),
+    ).toBeNull();
+    // Focus graph is unconditional: it is the only keyboard-operable
+    // GraphModal trigger (palette/Ctrl+Shift+G pass focusMode:false).
+    expect(
+      screen.getByRole("button", { name: "Focus graph" }),
+    ).toBeInTheDocument();
+  });
+
+  it("dispatches OPEN_CATALOG_EVENT from the toolbar trigger", () => {
+    const opened = vi.fn();
+    window.addEventListener(OPEN_CATALOG_EVENT, opened);
+    try {
+      renderArtifactWorkspace({ catalogAvailable: true });
+      fireEvent.click(screen.getByRole("button", { name: "Plugin catalog" }));
+      expect(opened).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(OPEN_CATALOG_EVENT, opened);
+    }
   });
 });

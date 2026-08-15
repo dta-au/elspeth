@@ -18,7 +18,7 @@ interface ScrollCandidate {
 
 export interface WorkspaceControlCapabilities {
   completion: boolean;
-  moreActions: boolean;
+  catalog: boolean;
 }
 
 export async function boxWidth(locator: Locator): Promise<number> {
@@ -135,12 +135,15 @@ export async function expectPrimaryControlsInViewport(
     await expect(control).toHaveCount(capabilities.completion ? 1 : 0);
     if (capabilities.completion) await expectControlReachable(control);
   }
-  await expect(composer.moreActions()).toHaveCount(
-    capabilities.moreActions ? 1 : 0,
+  // The catalog trigger lives in the artifact toolbar beside Focus graph
+  // since the More-actions popover retired (2026-08-15 UX review).
+  await expect(composer.catalogButton()).toHaveCount(
+    capabilities.catalog ? 1 : 0,
   );
-  if (capabilities.moreActions) {
-    await expectControlReachable(composer.moreActions());
+  if (capabilities.catalog) {
+    await expectControlReachable(composer.catalogButton());
   }
+  await expectControlReachable(composer.focusGraph());
 
   await composer.validationStatus().click();
   await expect(composer.inspector()).toBeVisible();

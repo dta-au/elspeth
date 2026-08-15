@@ -138,7 +138,7 @@ describe("workspace action bar rhythm (elspeth-fca731fb28)", () => {
   const gapBearingSelectors = [
     ".workspace-action-bar",
     ".workspace-action-bar .completion-bar",
-    ".workspace-status-controls, .workspace-more-actions",
+    ".workspace-status-controls",
   ];
 
   it.each(gapBearingSelectors)("drives %s's gap from one property", (selector) => {
@@ -196,17 +196,15 @@ describe("workspace completion group (elspeth-c6fd722d2f)", () => {
 
   it("keeps the bar's composition stable when the middle group is absent", () => {
     // Capping the group makes the bar's justify-content live for the first
-    // time. space-between would fling the three groups to the ends — two
-    // ~700px voids at 2560 with the primary actions marooned between them —
-    // and would ALSO change the arrangement depending on whether guided mode
-    // rendered a completion bar. An auto margin on the overflow gives the same
-    // status/overflow arrangement either way.
+    // time. space-between would fling the groups to the ends — two ~700px
+    // voids at 2560 with the primary actions marooned between them — and
+    // would ALSO change the arrangement depending on whether guided mode
+    // rendered a completion bar. flex-start keeps the clusters as one
+    // left-anchored run; since the More-actions popover retired (2026-08-15)
+    // the trailing space at wide viewports is the deliberate composition.
     expect(declaration(".workspace-action-bar", "justify-content")).toBe(
       "flex-start",
     );
-    expect(
-      declaration(".workspace-more-actions", "margin-inline-start"),
-    ).toBe("auto");
   });
 
   it("centers the members instead of stretching them to the bar's height", () => {
