@@ -209,6 +209,82 @@ class TestTelemetrySpanFactory:
         state = BaseException.__dict__["__dict__"].__get__(observed, BaseException)
         assert dict.__getitem__(state, "__notes__") == ["Engine span completion callback also failed with RuntimeError"]
 
+    def test_malformed_notes_state_is_replaced_without_invoking_hostile_hooks(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        class HostileMalformedNotesError(ValueError):
+            def __getattribute__(self, name: str):
+                if name == "__notes__":
+                    raise RuntimeError("private notes get payload")
+                return super().__getattribute__(name)
+
+            def __setattr__(self, name: str, value: object) -> None:
+                if name == "__notes__":
+                    raise RuntimeError("private notes set payload")
+                super().__setattr__(name, value)
+
+        def fail_emit(_event) -> None:
+            raise RuntimeError("private callback payload")
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+        workload_failure = HostileMalformedNotesError("authoritative workload failure")
+        initial_state = BaseException.__dict__["__dict__"].__get__(workload_failure, BaseException)
+        dict.__setitem__(initial_state, "__notes__", "private malformed notes state")
+
+        try:
+            with factory.run_span("run-001", trace_started_at=datetime.now(UTC)):
+                raise workload_failure
+        except BaseException as caught:
+            observed = caught
+
+        same_instance = observed is workload_failure
+        assert same_instance
+        assert BaseException.__str__(observed) == "authoritative workload failure"
+        final_state = BaseException.__dict__["__dict__"].__get__(observed, BaseException)
+        notes = dict.__getitem__(final_state, "__notes__")
+        notes_are_owned_list = type(notes) is list
+        assert notes_are_owned_list
+        assert notes == ["Engine span completion callback also failed with RuntimeError"]
+
+    def test_list_subclass_notes_are_preserved_without_invoking_overrides(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        class HostileNotes(list[str]):
+            def append(self, value: str) -> None:
+                raise RuntimeError(f"private notes append payload: {value}")
+
+            def __iter__(self):
+                raise RuntimeError("private notes iterator payload")
+
+            def __getitem__(self, index):
+                raise RuntimeError(f"private notes index payload: {index}")
+
+            def copy(self):
+                raise RuntimeError("private notes copy payload")
+
+        def fail_emit(_event) -> None:
+            raise RuntimeError("private callback payload")
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+        workload_failure = ValueError("authoritative workload failure")
+        initial_state = BaseException.__dict__["__dict__"].__get__(workload_failure, BaseException)
+        dict.__setitem__(initial_state, "__notes__", HostileNotes(["authoritative detail"]))
+
+        try:
+            with factory.run_span("run-001", trace_started_at=datetime.now(UTC)):
+                raise workload_failure
+        except BaseException as caught:
+            observed = caught
+
+        same_instance = observed is workload_failure
+        assert same_instance
+        assert BaseException.__str__(observed) == "authoritative workload failure"
+        final_state = BaseException.__dict__["__dict__"].__get__(observed, BaseException)
+        notes = dict.__getitem__(final_state, "__notes__")
+        notes_are_owned_list = type(notes) is list
+        assert notes_are_owned_list
+        assert notes == ["authoritative detail", "Engine span completion callback also failed with RuntimeError"]
+
     def test_hostile_exception_metaclass_cannot_replace_or_leak_workload_failure(self) -> None:
         from traceback import format_exception
 

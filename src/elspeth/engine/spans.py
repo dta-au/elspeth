@@ -163,7 +163,14 @@ def _add_safe_exception_note(exception: BaseException, note: str) -> None:
     if dict.__contains__(state, "__notes__"):
         notes: object = dict.__getitem__(state, "__notes__")
         if type(notes) is not list:
-            return
+            notes_class = type(notes)
+            mro_descriptor = type.__dict__["__mro__"]
+            notes_mro = mro_descriptor.__get__(notes_class, type(notes_class))
+            if type(notes_mro) is tuple and any(base is list for base in notes_mro):
+                notes = list.copy(cast(list[Any], notes))
+            else:
+                notes = []
+            dict.__setitem__(state, "__notes__", notes)
     else:
         notes = []
         dict.__setitem__(state, "__notes__", notes)
