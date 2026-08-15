@@ -3807,7 +3807,7 @@ class TestAggregationExecutor:
     def test_restore_from_journal_restores_trigger_fire_offsets(self) -> None:
         """Scalar trigger latches pass through to the TriggerEvaluator and read back."""
         clock = MockClock(start=50.0)
-        executor, _, nid = self._make_agg_executor(node_id="agg-1", count=10, clock=clock)
+        executor, _, nid = self._make_agg_executor(node_id="agg-1", count=1, clock=clock)
 
         executor.restore_from_journal(
             node_id=nid,

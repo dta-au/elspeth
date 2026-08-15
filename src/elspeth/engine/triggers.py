@@ -377,6 +377,23 @@ class TriggerEvaluator:
             raise ValueError(f"count_fire_offset must be non-negative and finite, got {count_fire_offset}")
         if condition_fire_offset is not None and (condition_fire_offset < 0 or not math.isfinite(condition_fire_offset)):
             raise ValueError(f"condition_fire_offset must be non-negative and finite, got {condition_fire_offset}")
+        if batch_count == 0 and (elapsed_age_seconds != 0 or count_fire_offset is not None or condition_fire_offset is not None):
+            raise ValueError("empty batch checkpoint requires zero elapsed_age_seconds and no fire offsets")
+        if count_fire_offset is not None:
+            if count_fire_offset > elapsed_age_seconds:
+                raise ValueError("count_fire_offset cannot exceed elapsed_age_seconds")
+            if self._config.count is None:
+                raise ValueError("count_fire_offset requires a configured count trigger")
+            if batch_count < self._config.count:
+                raise ValueError("count_fire_offset requires batch_count to satisfy configured count")
+        if condition_fire_offset is not None:
+            if condition_fire_offset > elapsed_age_seconds:
+                raise ValueError("condition_fire_offset cannot exceed elapsed_age_seconds")
+            if self._config.condition is None:
+                raise ValueError("condition_fire_offset requires a configured condition trigger")
+        if batch_count == 0:
+            self.reset()
+            return
 
         current_time = self._clock.monotonic()
 

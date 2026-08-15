@@ -630,6 +630,85 @@ class TestAggregationFacadeValidateBeforeMutate:
         assert executor.get_buffer_count(node_id) == 1
         assert executor.get_batch_id(node_id) == "batch-1"
 
+    def test_trigger_rejection_leaves_all_node_and_trigger_state_intact(self) -> None:
+        """A trigger-latch disagreement raises before applying any restored state."""
+        executor, node_id = self._make_executor()
+        executor.restore_from_journal(
+            node_id=node_id,
+            items=[
+                _blocked_item(token_id="t1", row_id="r1", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                _blocked_item(token_id="t2", row_id="r2", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                _blocked_item(token_id="t3", row_id="r3", node_id="agg-1", blocked_at=_JOURNAL_T0),
+            ],
+            member_order=["t1", "t2", "t3"],
+            batch_id="batch-1",
+            accepted_count_total=7,
+            completed_flush_count=2,
+            scalars=AggregationNodeScalars(count_fire_offset=0.0, condition_fire_offset=None),
+            attempt_offsets={"t1": 1, "t2": 2, "t3": 3},
+            resume_checkpoint_id="cp-0",
+            now=_JOURNAL_T0,
+        )
+        assert executor.should_flush(node_id) is True
+
+        node = executor._nodes[node_id]
+        original_settings = node.settings
+        original_trigger = node.trigger
+        original_trigger_config = original_trigger._config
+        original_trigger_clock = original_trigger._clock
+        original_condition_parser = original_trigger._condition_parser
+        original_tokens = tuple(node.tokens)
+        original_batch_id = node.batch_id
+        original_member_count = node.member_count
+        original_accepted_count_total = node.accepted_count_total
+        original_completed_flush_count = node.completed_flush_count
+        original_trigger_state = (
+            original_trigger._batch_count,
+            original_trigger._first_accept_time,
+            original_trigger._last_triggered,
+            original_trigger._count_fire_time,
+            original_trigger._condition_fire_time,
+            tuple(original_trigger._member_accept_times),
+            original_trigger._condition_fire_observed,
+        )
+
+        with pytest.raises(ValueError, match="count_fire_offset requires batch_count to satisfy configured count"):
+            executor.restore_from_journal(
+                node_id=node_id,
+                items=[
+                    _blocked_item(token_id="t4", row_id="r4", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                    _blocked_item(token_id="t5", row_id="r5", node_id="agg-1", blocked_at=_JOURNAL_T0),
+                ],
+                member_order=["t4", "t5"],
+                batch_id="batch-2",
+                accepted_count_total=9,
+                completed_flush_count=4,
+                scalars=AggregationNodeScalars(count_fire_offset=0.0, condition_fire_offset=None),
+                attempt_offsets={"t4": 4, "t5": 5},
+                resume_checkpoint_id="cp-1",
+                now=_JOURNAL_T0,
+            )
+
+        assert node.settings is original_settings
+        assert node.trigger is original_trigger
+        assert original_trigger._config is original_trigger_config
+        assert original_trigger._clock is original_trigger_clock
+        assert original_trigger._condition_parser is original_condition_parser
+        assert tuple(node.tokens) == original_tokens
+        assert node.batch_id == original_batch_id
+        assert node.member_count == original_member_count
+        assert node.accepted_count_total == original_accepted_count_total
+        assert node.completed_flush_count == original_completed_flush_count
+        assert (
+            original_trigger._batch_count,
+            original_trigger._first_accept_time,
+            original_trigger._last_triggered,
+            original_trigger._count_fire_time,
+            original_trigger._condition_fire_time,
+            tuple(original_trigger._member_accept_times),
+            original_trigger._condition_fire_observed,
+        ) == original_trigger_state
+
     def test_facade_wires_buffered_count_not_accepted_total_into_trigger(self) -> None:
         """The trigger's restored batch_count is the BUFFERED row count, never the cumulative accept counter.
 
