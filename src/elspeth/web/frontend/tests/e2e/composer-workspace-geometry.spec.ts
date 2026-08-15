@@ -174,6 +174,7 @@ async function workspaceBottomEdges(page: ComposerPage["page"]): Promise<{
   bandTop: number;
   barTop: number;
   barHeight: number;
+  bandHeight: number;
 } | null> {
   return page.evaluate(() => {
     const pane = document.querySelector(".workspace-authoring-pane");
@@ -188,6 +189,7 @@ async function workspaceBottomEdges(page: ComposerPage["page"]): Promise<{
       bandTop: pane.getBoundingClientRect().bottom - bandHeight,
       barTop: barBox.top,
       barHeight: barBox.height,
+      bandHeight,
     };
   });
 }
@@ -725,9 +727,25 @@ test.describe("Composer deterministic workspace geometry", () => {
       expect(Math.abs(chip!.y - importYaml!.y)).toBeLessThanOrEqual(1);
       expect(Math.abs(chip!.y - run!.y)).toBeLessThanOrEqual(1);
 
-      // The reason line takes its own line BELOW them and drives nobody's
-      // vertical position but its own.
-      expect(reasonBox!.y).toBeGreaterThanOrEqual(save!.y + save!.height);
+      // The reason line sits to Run's LEFT, on the same line, vertically
+      // centred against it (operator decision 2026-08-16). Centre-to-centre,
+      // not top-to-top: the <p> is shorter than the 44px button, so equal tops
+      // would be the wrong assertion and would pass while it looked wrong.
+      const centre = (b: { y: number; height: number }) => b.y + b.height / 2;
+      expect(Math.abs(centre(reasonBox!) - centre(run!))).toBeLessThanOrEqual(1);
+      expect(reasonBox!.x + reasonBox!.width).toBeLessThanOrEqual(run!.x + 1);
+
+      // ...and it must not buy that place by crowding the left cluster. The
+      // `readiness` reason is an arbitrary-length backend string, so this is
+      // the assertion that a long one has to respect.
+      expect(reasonBox!.x).toBeGreaterThanOrEqual(
+        importYaml!.x + importYaml!.width - 1,
+      );
+
+      // With the line inline, the bar is a single control row again.
+      const barBox = await composer.actionBar().boundingBox();
+      expect(barBox).not.toBeNull();
+      expect(barBox!.height).toBeLessThanOrEqual(64);
 
       // Both halves of the bottom rule start on one line.
       const bottomEdges = await workspaceBottomEdges(page);
@@ -750,15 +768,15 @@ test.describe("Composer deterministic workspace geometry", () => {
      the token formula would be correct at 1600 and wrong here.
 
      TRANSITION — the observer has to FIRE when the bar changes, not merely
-     report a height at mount. If it missed the shrink, the band would stay
-     stuck at the taller value and we would have traded one misregistration for
-     its mirror image, visible the moment a pipeline validates and ExecuteButton
-     drops its reason line. Removing the node is how React's unmount reaches the
-     observer: either way the observed slot's content box shrinks. */
+     report a height at mount. If it missed a change the band would stick at the
+     stale value: the same misregistration, in whichever direction the bar last
+     moved. The trigger used here is a viewport resize rather than DOM surgery,
+     because a resize is a real thing users do and it exercises the observer
+     through the same path the browser uses in production. */
   test("the mirrored bottom band tracks the action bar through a wrap and back", async ({
     page,
   }) => {
-    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.setViewportSize({ width: 1600, height: 900 });
     const sessionId = await installWorkspaceScenario(page, "empty-freeform");
     const composer = new ComposerPage(page);
     try {
@@ -767,27 +785,44 @@ test.describe("Composer deterministic workspace geometry", () => {
       const reason = page.locator(".side-rail-execute-reason");
       await expect(reason).toBeVisible();
 
+      const wide = await workspaceBottomEdges(page);
+      expect(wide).not.toBeNull();
+      expect(Math.abs(wide!.bandTop - wide!.barTop)).toBeLessThanOrEqual(1);
+
+      // 1280 wraps the bar's two groups onto separate flex lines, so its height
+      // genuinely changes. Height stays 900 so the short-screen density regime
+      // (min-width: 961px and max-height: 800px) is NOT also toggled — one
+      // variable at a time, or a pass would not say which mechanism worked.
+      //
+      // Poll on the BAND, not on the bar. The bar relayouts synchronously with
+      // the resize, so polling it returns the instant the resize lands, before
+      // the observer callback and its re-render have published the new height —
+      // a race that failed this test at 40px on first write. Waiting for the
+      // band to move is waiting for the exact mechanism under test, and it
+      // still fails (by timeout) if the observer never fires at all.
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await expect
+        .poll(async () => (await workspaceBottomEdges(page))?.bandHeight ?? 0)
+        .toBeGreaterThan(wide!.bandHeight);
+
       const wrapped = await workspaceBottomEdges(page);
       expect(wrapped).not.toBeNull();
+      expect(wrapped!.barHeight).toBeGreaterThan(wide!.barHeight);
       expect(Math.abs(wrapped!.bandTop - wrapped!.barTop)).toBeLessThanOrEqual(
         1,
       );
 
-      await page.evaluate(() => {
-        document.querySelector(".side-rail-execute-reason")?.remove();
-      });
-
-      // Poll rather than wait a fixed beat: the observer callback and the
-      // re-render it triggers are both asynchronous.
+      // ...and back, so a stale value cannot pass by being large enough.
+      await page.setViewportSize({ width: 1600, height: 900 });
       await expect
-        .poll(async () => (await workspaceBottomEdges(page))?.barHeight ?? 0)
-        .toBeLessThan(wrapped!.barHeight);
+        .poll(async () => (await workspaceBottomEdges(page))?.bandHeight ?? 0)
+        .toBeLessThan(wrapped!.bandHeight);
 
-      const settled = await workspaceBottomEdges(page);
-      expect(settled).not.toBeNull();
-      expect(Math.abs(settled!.bandTop - settled!.barTop)).toBeLessThanOrEqual(
-        1,
-      );
+      const restored = await workspaceBottomEdges(page);
+      expect(restored).not.toBeNull();
+      expect(
+        Math.abs(restored!.bandTop - restored!.barTop),
+      ).toBeLessThanOrEqual(1);
     } finally {
       await deleteWorkspaceScenario(page, sessionId);
     }

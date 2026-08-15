@@ -582,6 +582,43 @@ export function ExecuteButton(): JSX.Element | null {
 
   return (
     <>
+      {/* Gate legibility (elspeth-088bf83922 T-2): a visible (not sr-only)
+          one-line reason for whichever gate is currently holding Run back.
+          Deliberately plain text, not a tooltip — tooltips on natively
+          disabled buttons are not reliably reachable by keyboard/AT users
+          (see the WCAG 4.1.2 note below), and this line is meant for every
+          user, not just the interpretation-pending case that already has
+          its own aria-describedby announcement.
+
+          It is emitted BEFORE the button (operator decision, 2026-08-16) so it
+          renders to Run's LEFT and vertically centred against it, rather than
+          on a line of its own underneath. DOM order, not CSS `order`: the two
+          <p> variants are mutually exclusive, so exactly one can precede the
+          button, and workspace.css keys the spacing off that adjacency. Using
+          `order` would have worked visually but the rule against it on
+          interactive controls exists precisely so nobody has to re-derive
+          whether a given lift is the safe kind — moving the markup keeps
+          visual, DOM and tab order identical with nothing to reason about.
+          For AT this reads better too: the reason is announced on the way IN
+          to the button rather than after it (WCAG 1.3.2 meaningful sequence). */}
+      {blockReason && (
+        <p
+          className="side-rail-execute-reason"
+          data-run-block-reason={blockReason}
+        >
+          {blockReasonText}
+        </p>
+      )}
+      {/* Run is enabled, but the audit-readiness panel has a non-green
+          advisory row (plugin trust / provenance / retention / secrets).
+          These rows never gate Run — say so in one line rather than
+          leaving the user to infer it from an amber/red row that did
+          nothing when they ran anyway. */}
+      {!blockReason && advisoryRowsNonGreen && (
+        <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
+          Advisory checks don't block Run.
+        </p>
+      )}
       <Button
         // variant="danger" is a DELIBERATE 2026-08-15 operator decision that
         // supersedes the earlier no-emphasis rule (elspeth-0d37694c8c): Run
@@ -611,7 +648,7 @@ export function ExecuteButton(): JSX.Element | null {
         // interpretations — the other not-runnable states are natively
         // `disabled`, and a `title` on a disabled element is not reliably
         // reachable by keyboard/AT users, so their reason is carried by the
-        // always-visible <p> below instead (elspeth-088bf83922 T-2).
+        // always-visible <p> above instead (elspeth-088bf83922 T-2).
         title={isRunBlocked ? INTERPRETATION_PENDING_RUN_BLOCK_TITLE : undefined}
         aria-describedby={isRunBlocked ? describedById : undefined}
       >
@@ -641,31 +678,6 @@ export function ExecuteButton(): JSX.Element | null {
         <span id={describedById} className="sr-only">
           {INTERPRETATION_PENDING_RUN_BLOCK_TITLE}
         </span>
-      )}
-      {/* Gate legibility (elspeth-088bf83922 T-2): a visible (not sr-only)
-          one-line reason for whichever gate is currently holding Run back.
-          Deliberately plain text, not a tooltip — tooltips on natively
-          disabled buttons are not reliably reachable by keyboard/AT users
-          (see the WCAG 4.1.2 note above), and this line is meant for every
-          user, not just the interpretation-pending case that already has
-          its own aria-describedby announcement. */}
-      {blockReason && (
-        <p
-          className="side-rail-execute-reason"
-          data-run-block-reason={blockReason}
-        >
-          {blockReasonText}
-        </p>
-      )}
-      {/* Run is enabled, but the audit-readiness panel has a non-green
-          advisory row (plugin trust / provenance / retention / secrets).
-          These rows never gate Run — say so in one line rather than
-          leaving the user to infer it from an amber/red row that did
-          nothing when they ran anyway. */}
-      {!blockReason && advisoryRowsNonGreen && (
-        <p className="side-rail-execute-reason side-rail-execute-reason--advisory">
-          Advisory checks don't block Run.
-        </p>
       )}
       {showRunDisclosure && (
         <ConfirmDialog

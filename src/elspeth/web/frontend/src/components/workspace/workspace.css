@@ -333,6 +333,20 @@
   flex-direction: row;
   flex-wrap: wrap;
   gap: var(--workspace-bar-gap);
+  /* flex-end is the WRAPPED-LINE rule, and it is inert on any line an auto
+     margin already governs — auto margins eat free space before
+     justify-content sees it, so on the unwrapped line Save/Import still sit
+     left. It exists for the lines that have no auto margin: once the reason
+     line moved beside Run (2026-08-16) the adjacency rule below hands Run a
+     plain gap instead of its auto margin, which is right while the two share a
+     line and wrong the moment they wrap apart — Run landed at the LEFT edge of
+     the next line, losing the right-edge isolation the 2026-08-15 recut exists
+     to give it (caught by the inspector-open-1280x720 visual baseline, which is
+     the one baseline that renders a gated Run). flex-end restores the right
+     edge on every line, wrapped or not, without a wrapper element — and
+     .completion-bar cannot gain one, since the no-wrapper shape is what
+     elspeth-929fc5d4a7 fixed. */
+  justify-content: flex-end;
   align-items: center;
   padding: 0;
 }
@@ -346,18 +360,62 @@
   margin-inline-start: auto;
 }
 
+/* The left cluster ends here, and saying so with an auto margin is what keeps
+   Save/Import anchored LEFT on whatever line they end up on. Without it,
+   justify-content: flex-end above right-aligns them the moment the group wraps
+   and they no longer share a line with an auto margin — which is a real state
+   (1280 with the inspector open) and contradicts the recut's "Save/Import stay
+   in the left cluster". Auto margins resolve per FLEX LINE, which is exactly
+   why this works where justify-content alone cannot: this one governs the line
+   the left cluster is on, flex-end governs the lines it is not on.
+
+   On the unwrapped line it also does the isolating job on its own — it eats all
+   the free space, so the reason and Run are carried to the right edge together
+   and Run's own auto margin has nothing left to spend. In the ungated state
+   (no reason line) this margin and Run's auto margin split a gap that is
+   contiguous anyway, so Run still lands on the right edge exactly as before. */
+.workspace-action-bar .completion-bar .side-rail-import-yaml-btn {
+  margin-inline-end: auto;
+}
+
 /* The run-gate reason line is part of ExecuteButton's fragment and, now that
    CompletionBar renders the three verbs as DIRECT children (no wrapper divs),
-   it is a flex item of this row. Riding inside the Run column was what made
-   that column ~98px and dragged its siblings with it (elspeth-929fc5d4a7);
-   here it takes its own full-width line BELOW the buttons instead. It
-   follows the Run button in DOM order, so no `order` lift is needed, and
-   text-align: end keeps the reason optically bound to the right-isolated
-   Run button it explains. The line is not focusable, so visual order and
-   tab order cannot diverge. */
+   it is a flex item of this row. Riding INSIDE the Run column was what made
+   that column ~98px and dragged its siblings with it (elspeth-929fc5d4a7).
+   The fix for that gave it its own full-width line BELOW the buttons, which
+   worked but made the bar's height variable, and two consumers had assumed it
+   constant — elspeth-15e8cff7a5 and elspeth-97db9c22e5.
+
+   Operator decision 2026-08-16: the line sits to Run's LEFT, on the same line,
+   vertically centred against it. ExecuteButton emits the <p> BEFORE the button
+   so this is DOM order, not a CSS `order` lift. Three things make it hold:
+
+   `flex: 0 1 auto` lets it shrink rather than shove the buttons, which never
+   shrink (`> *` is flex: 0 0 auto above). `max-width: 44ch` is the load-bearing
+   one: the `readiness` reason is an ARBITRARY-LENGTH backend string
+   (readiness.blockers[0].detail, ExecuteButton.tsx), so without a measure cap a
+   long blocker detail eats the row and pushes Save/Import onto their own line.
+   Capped, it wraps within its own column instead, and because two wrapped lines
+   (36px) are still shorter than the 44px buttons the bar does not grow at all —
+   it only grows past three lines, which is the honest cost of a very long
+   backend message. Measured at 1920/1600/1440: 61px bar for the built-in
+   reasons, 71px for a 150-character one, buttons never displaced.
+
+   The reason carries no auto margin of its own: Import's margin-inline-end
+   (above) is what spends the free space, so the reason and Run ride to the
+   right edge together as a pair, and the adjacency rule below gives Run a plain
+   gap so the space is not split between two competing auto margins. */
 .workspace-action-bar .completion-bar .side-rail-execute-reason {
-  flex: 0 0 100%;
+  flex: 0 1 auto;
+  max-width: 44ch;
   text-align: end;
+}
+
+.workspace-action-bar
+  .completion-bar
+  .side-rail-execute-reason
+  + .side-rail-execute-btn {
+  margin-inline-start: var(--workspace-bar-gap);
 }
 
 .workspace-status-controls {
