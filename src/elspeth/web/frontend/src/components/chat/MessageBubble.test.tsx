@@ -44,6 +44,47 @@ function makeProposal(
 }
 
 describe("MessageBubble", () => {
+  // The edit box always opens over a real message, so it sizes to that
+  // content (floor 4, cap 10) — the ChatInput read-only formula. The browser
+  // default it replaces (rows="2") hid all but the first lines of the very
+  // message being edited.
+  describe("edit-mode textarea sizing", () => {
+    function startEditing(content: string): HTMLElement {
+      render(
+        <MessageBubble
+          message={makeMessage({ content })}
+          isComposing={false}
+          onFork={vi.fn()}
+        />,
+      );
+      fireEvent.click(screen.getByLabelText("Edit and fork from this message"));
+      return screen.getByLabelText("Edit message");
+    }
+
+    it("opens at the four-row floor for a one-line message", () => {
+      expect(startEditing("one line")).toHaveAttribute("rows", "4");
+    });
+
+    it("sizes to the message being edited", () => {
+      expect(startEditing("a\nb\nc\nd\ne")).toHaveAttribute("rows", "6");
+    });
+
+    it("caps growth at ten rows", () => {
+      expect(startEditing(Array(40).fill("line").join("\n"))).toHaveAttribute(
+        "rows",
+        "10",
+      );
+    });
+
+    it("grows as the user adds lines while editing", () => {
+      const textarea = startEditing("a\nb\nc\nd\ne");
+      fireEvent.change(textarea, {
+        target: { value: "a\nb\nc\nd\ne\nf\ng" },
+      });
+      expect(textarea).toHaveAttribute("rows", "8");
+    });
+  });
+
   describe("send-state suppression", () => {
     it("shows Sending... when pending and not composing", () => {
       render(

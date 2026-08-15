@@ -351,3 +351,30 @@ describe("one rule per in-bubble seam (elspeth-4dc660d56f)", () => {
     ).toBe(0);
   });
 });
+
+describe("the edit-mode bubble keeps the reading bubble's geometry", () => {
+  // The bubble is a shrink-to-fit flex item, so a percentage-width child (the
+  // edit textarea's width: 100%) has no definite basis while editing and
+  // collapses to the textarea's intrinsic UA width. The :has() rule pins the
+  // editing bubble to a definite width — but that value and the bubble's
+  // normal max-width cap are ONE choice made in two places: if the reading
+  // cap moves and the editing width doesn't, entering edit mode visibly
+  // resizes the bubble.
+  it("pins the editing bubble to the same cap the reading bubble uses", () => {
+    expect(
+      declaredValue(".message-bubble-content:has(.message-edit-form)", "width"),
+    ).toBe(declaredValue(".message-bubble-content", "max-width"));
+  });
+
+  it("caps edit-textarea growth exactly like the composer input", () => {
+    // Two chat text-entry surfaces, one growth ceiling. If the composer's
+    // ceiling is retuned, the in-transcript editor must move with it or the
+    // two boxes stop feeling like the same control. Compare against the
+    // FIRST declared value: the ≤760px media block redeclares max-height on
+    // the same verbatim selector, so last-wins would fetch the mobile value.
+    expect(declaredValue(".message-edit-textarea", "max-height")).toBe(
+      declaredValues(".chat-input-textarea", "max-height")[0],
+    );
+    expect(declaredValue(".message-edit-textarea", "overflow-y")).toBe("auto");
+  });
+});

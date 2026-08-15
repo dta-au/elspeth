@@ -1350,9 +1350,25 @@
   gap: var(--space-sm);
 }
 
+/* While editing, give the bubble a definite width. The bubble is a
+   shrink-to-fit flex item (no explicit width, only the max-width cap above),
+   and a percentage-width child cannot resolve against a shrink-to-fit parent
+   — the edit textarea fell back to its intrinsic UA width (~20ch), so the
+   whole bubble collapsed far below the width it had as rendered text. Pin
+   the editing bubble to the same cap .message-bubble-content already uses,
+   so the textarea's width: 100% has a real basis. */
+.message-bubble-content:has(.message-edit-form) {
+  width: min(92%, 74ch);
+}
+
 .message-edit-textarea {
   width: 100%;
   min-height: 60px;
+  /* Bound growth the same way .chat-input-textarea does — rows scale with
+     the edited content (capped in JSX), and this caps the box itself for
+     very long messages and user drags via resize: vertical. */
+  max-height: min(28dvh, 240px);
+  overflow-y: auto;
   padding: var(--space-sm);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-sm);

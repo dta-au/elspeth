@@ -205,6 +205,13 @@ export function MessageBubble({
                 }
               }}
               aria-label="Edit message"
+              /* Size to the message being edited (mirrors the ChatInput
+                 read-only formula): the content is always present at mount,
+                 so content-aware rows work here — unlike the composer, where
+                 a placeholder has no scroll height and the count must be
+                 static. Without this the browser default of 2 rows hid all
+                 but the first lines of the message. */
+              rows={Math.min(10, Math.max(4, editContent.split("\n").length + 1))}
               className="message-edit-textarea"
             />
             <div className="message-edit-actions">
