@@ -346,6 +346,10 @@
 
   /* ── Z-index layers ─────────────────────────────────────────────────────── */
   --z-panel-controls:  10;   /* floating panel controls */
+  --z-panel-controls-raised: 11; /* one step above the shared panel-controls
+     rung, for a control that must paint over a sibling on that rung when
+     tree order runs the wrong way (desktop collapsed restore » vs the
+     action bar's opaque background — workspace.css) */
   --z-catalog-backdrop: 38;  /* catalog drawer backdrop */
   --z-catalog:         40;   /* catalog drawer panel */
   /* Tooltip/popover layer — sits above panel-controls (10) and below the

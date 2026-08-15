@@ -526,10 +526,16 @@ describe("ComposerWorkspace", () => {
     // in-flight readiness check was indistinguishable from a real warning.
     // Assert the two tones resolve to DIFFERENT tokens rather than pinning
     // busy's hue by name — the point of the split is that the three tones stay
-    // mutually distinguishable, wherever the palette moves next.
+    // mutually distinguishable, wherever the palette moves next. The rule
+    // pinned here is the production form (:has() reaching the App-owned
+    // status span — the wrapper's own data-tone only exists for the
+    // {text, tone} projection shape) applied to the RESTORE BUTTON's border:
+    // on desktop the collapsed status text is sr-only and the banner box is
+    // stripped, so the button border is the only visible tone signal
+    // (operator decision 2026-08-15).
     const toneBorder = (tone: string): string => {
       const rule = new RegExp(
-        `\\.workspace-collapsed-affordance:has\\(\\.workspace-collapsed-status\\[data-tone="${tone}"\\]\\) \\{\\n  border-color: ([^;]+);\\n\\}`,
+        `\\.workspace-collapsed-affordance:has\\(\\.workspace-collapsed-status\\[data-tone="${tone}"\\]\\) \\.workspace-restore-control \\{\\n  border-color: ([^;]+);\\n\\}`,
       ).exec(css);
       if (rule === null) {
         throw new Error(`No collapsed-affordance rule for tone ${tone}`);
@@ -744,16 +750,32 @@ describe("ComposerWorkspace", () => {
     ).not.toBe(0);
   });
 
-  it("reserves a desktop row for collapsed restore status instead of overlaying artifacts", () => {
+  it("anchors the desktop collapsed restore control to the action bar's bottom-edge band instead of a reserved row", () => {
     const css = readFileSync(
       join(process.cwd(), "src/components/workspace/workspace.css"),
       "utf8",
     );
-    // The auto row is LAST: the restore banner sits at the bottom, the same
-    // region as the expanded pane's collapse control, so the toggle pair
-    // stays spatially stable across states.
-    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto/s);
-    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*position:\s*static/s);
+    // No reserved second grid row (the banner row died with the operator's
+    // 2026-08-15 same-line decision)…
+    expect(css).not.toMatch(
+      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows/s,
+    );
+    // …the affordance bottom-anchors on the SAME inset token the action bar
+    // and the expanded « control register against (elspeth-215c989bed)…
+    expect(css).toMatch(
+      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*bottom:\s*var\(--workspace-bar-inset\)/s,
+    );
+    // …and sits one step above the shared --z-panel-controls rung: tree
+    // order paints the action bar later, so without the raised token its
+    // opaque background covers the button once they share pixels.
+    expect(css).toMatch(
+      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*z-index:\s*var\(--z-panel-controls-raised\)/s,
+    );
+    // …while the bar reserves the button's slot so the first status chip
+    // starts clear of it instead of rendering underneath.
+    expect(css).toMatch(
+      /data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-action-bar\s*\{[^}]*padding-left:\s*calc\(2 \* var\(--space-sm\) \+ var\(--size-control\)\)/s,
+    );
   });
 
   it("publishes the authoritative session reset through one workspace controller", () => {

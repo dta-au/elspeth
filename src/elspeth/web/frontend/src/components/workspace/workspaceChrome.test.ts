@@ -386,11 +386,6 @@ describe("artifact column gutter (elspeth-87195dda2c)", () => {
       "var(--artifact-gutter)",
     ],
     [".pipeline-spec-view", "padding", "var(--space-md) var(--artifact-gutter)"],
-    [
-      '.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) .workspace-collapsed-affordance',
-      "padding-inline",
-      "var(--artifact-gutter)",
-    ],
   ])("%s takes its inline inset from the gutter", (selector, property, expected) => {
     expect(declaration(selector, property)).toBe(expected);
   });

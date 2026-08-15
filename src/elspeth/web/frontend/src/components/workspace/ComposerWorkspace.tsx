@@ -388,7 +388,7 @@ export function ComposerWorkspace({
               <Button
                 ref={restoreControlRef}
                 variant="bare"
-                className="workspace-pane-toggle"
+                className="workspace-pane-toggle workspace-restore-control"
                 title="Restore authoring pane"
                 aria-label="Restore authoring pane"
                 aria-expanded={false}

@@ -532,9 +532,16 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
-  test("collapsed restore status reserves space above the artifact toolbar", async ({
+  test("collapsed restore control shares the action bar's line and stays clickable", async ({
     page,
   }) => {
+    // Operator decision 2026-08-15: no reserved banner row, no visible
+    // "Authoring pane collapsed" text — the » icon joins the action bar's
+    // own line at the bottom-left. The elementFromPoint probe is the
+    // load-bearing assertion: the affordance and the opaque action bar now
+    // occupy the same pixels on a shared z rung, so a stacking regression
+    // paints the bar OVER the button and this probe (not the bounding box)
+    // is what catches it.
     await page.setViewportSize({ width: 1280, height: 720 });
     const sessionId = await installWorkspaceScenario(page, "pending-acknowledgement");
     const composer = new ComposerPage(page);
@@ -543,16 +550,31 @@ test.describe("Composer deterministic workspace geometry", () => {
       await composer.waitForChatReady();
       await composer.collapseAuthoring().click();
       const restore = composer.restoreAuthoring();
-      const toolbar = page.locator(".artifact-workspace-toolbar");
+      const actionBar = page.locator(".workspace-action-bar");
       await expect(restore).toBeVisible();
       await expect(restore).toBeFocused();
-      const [restoreBox, toolbarBox] = await Promise.all([
+      const [restoreBox, barBox] = await Promise.all([
         restore.boundingBox(),
-        toolbar.boundingBox(),
+        actionBar.boundingBox(),
       ]);
       expect(restoreBox).not.toBeNull();
-      expect(toolbarBox).not.toBeNull();
-      expect(restoreBox!.y + restoreBox!.height).toBeLessThanOrEqual(toolbarBox!.y);
+      expect(barBox).not.toBeNull();
+      // Same line: the button's vertical extent overlaps the action bar's.
+      expect(restoreBox!.y).toBeLessThan(barBox!.y + barBox!.height);
+      expect(restoreBox!.y + restoreBox!.height).toBeGreaterThan(barBox!.y);
+      // …but the bar's first chip starts clear of the button (the bar
+      // reserves the slot via padding-left), not underneath it.
+      const validationBox = await composer.validationStatus().boundingBox();
+      expect(validationBox).not.toBeNull();
+      expect(validationBox!.x).toBeGreaterThanOrEqual(
+        restoreBox!.x + restoreBox!.width,
+      );
+      // No visible banner text: the status node stays in the tree for AT
+      // (sr-only), so assert on rendered geometry, not DOM presence.
+      const statusBox = await page
+        .locator("#workspace-collapsed-status")
+        .boundingBox();
+      expect(statusBox === null || statusBox.width <= 1).toBe(true);
       const hit = await page.evaluate(({ x, y }) => {
         const element = document.elementFromPoint(x, y);
         return element?.getAttribute("aria-label") ?? element?.textContent ?? null;

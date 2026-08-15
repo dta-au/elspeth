@@ -479,12 +479,29 @@
   background: var(--color-surface, Canvas);
 }
 
-/* Same busy/warning split as .workspace-status-control (elspeth-7161879770). */
+/* Same busy/warning split as .workspace-status-control (elspeth-7161879770).
+   TWO tone sources, both live, per ComposerWorkspace's collapsedStatus prop
+   contract: a {text, tone} projection stamps data-tone on the affordance
+   wrapper itself, while the production App-owned ReactNode carries its tone
+   on the .workspace-collapsed-status span inside (App.tsx
+   CollapsedAuthoringStatus), reached via :has(). And TWO tone surfaces: the
+   narrow-mode badge's own box border, and the restore button's border for
+   the desktop state, where the box chrome is stripped and the icon button
+   sits alone on the action bar's line — with no visible status text there,
+   the button border IS the tone signal. */
 .workspace-collapsed-affordance[data-tone="busy"] {
   border-color: var(--color-info, currentcolor);
 }
 
 .workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) {
+  border-color: var(--color-info, currentcolor);
+}
+
+.workspace-collapsed-affordance[data-tone="busy"] .workspace-restore-control {
+  border-color: var(--color-info, currentcolor);
+}
+
+.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="busy"]) .workspace-restore-control {
   border-color: var(--color-info, currentcolor);
 }
 
@@ -496,40 +513,70 @@
   border-color: var(--color-error, currentcolor);
 }
 
+.workspace-collapsed-affordance[data-tone="error"] .workspace-restore-control {
+  border-color: var(--color-error, currentcolor);
+}
+
+.workspace-collapsed-affordance:has(.workspace-collapsed-status[data-tone="error"]) .workspace-restore-control {
+  border-color: var(--color-error, currentcolor);
+}
+
 .composer-workspace[data-authoring-collapsed="true"] {
   grid-template-columns: 0 minmax(0, 1fr);
 }
 
-/* The restore banner takes the BOTTOM row: the collapse control it toggles
-   against lives at the bottom of the expanded authoring pane (the
-   elspeth-215c989bed bottom-edge band), so the pair must occupy the same
-   screen region in both states or the toggle teleports between the top and
-   bottom of the viewport on every press. The banner still reserves a real
-   grid row rather than overlaying the canvas — react-flow's Controls panel
-   floats bottom-left of the artifact area by default, so an absolute
-   bottom-left overlay would collide with it. */
-.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) {
-  grid-template-rows: minmax(0, 1fr) auto;
-}
-
-.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
-  .workspace-authoring-slot {
-  grid-row: 2;
-  grid-column: 2;
-}
-
+/* The restore control joins the action bar's own line (operator decision,
+   2026-08-15): no reserved row, no banner box, no visible text — just the »
+   icon at the bottom-left, where the expanded pane's « control sits (the
+   elspeth-215c989bed bottom-edge band), so the toggle pair occupies one
+   spot in both states. It stays the DOM child of .workspace-authoring-slot
+   it always was — the narrow-mode DOM-order test depends on that — only its
+   desktop position changes, from the narrow badge's top-left anchor to a
+   bottom anchor on the bar's inset token. Column 1 is 0-width when
+   collapsed, so column 2's opaque .workspace-action-bar paints at the same
+   pixels; both share --z-panel-controls with tree order putting the bar
+   LATER (the five-way group documented at .workspace-inspector-slot below),
+   which was inert while the two never overlapped. This one pairing is
+   therefore bumped one step so the button stays clickable — the group's
+   other four legs are untouched. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
   .workspace-collapsed-affordance {
-  position: static;
-  max-width: 100%;
-  /* As a full-width strip its content joins the artifact column's shared
-     left edge instead of hugging the viewport (elspeth-87195dda2c). */
-  padding-inline: var(--artifact-gutter);
+  top: auto;
+  bottom: var(--workspace-bar-inset);
+  z-index: var(--z-panel-controls-raised);
+  padding: 0;
+  border: none;
+  background: transparent;
+  max-width: none;
 }
 
+/* Reserve the restore control's slot at the bar's left edge: the » is an
+   absolutely-positioned sibling from the authoring slot painting one rung
+   above the bar, so without this the bar's first chip renders UNDERNEATH
+   it (still hit-testable through the raised button, but visually collided).
+   Reservation = the button's left offset (--space-sm) + its --size-control
+   width + one more --space-sm of breathing room before the first chip. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
-  .workspace-artifact-slot {
-  grid-row: 1;
+  .workspace-action-bar {
+  padding-left: calc(2 * var(--space-sm) + var(--size-control));
+}
+
+/* The status text goes sr-only on desktop (base.css .sr-only recipe): the
+   operator wants no visible label, but the live region must keep announcing
+   unread/busy/error to AT, and the restore button's aria-describedby still
+   points here — clipping keeps the node in the accessibility tree where
+   display:none would remove it. Narrow mode keeps the visible badge text. */
+.composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
+  #workspace-collapsed-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .workspace-separator-slot {
@@ -641,8 +688,12 @@
    context, so the a11y list painted straight through the open drawer. All
    five now sit on --z-panel-controls and their relative order is carried by
    tree order, which reproduces the previous ordering exactly (separator <
-   action bar, collapsed affordance < action bar, action bar < inspector,
-   menu above its own bar) while lifting the drawer over the a11y list. Every
+   action bar, action bar < inspector, menu above its own bar) while lifting
+   the drawer over the a11y list. ONE documented exception: the desktop
+   COLLAPSED affordance is +1 above the group — tree order puts the action
+   bar later, and since the restore icon now sits ON the bar's line
+   (operator decision 2026-08-15, rule near the top of this file), tree
+   order would paint the bar's opaque background over the button. Every
    one of them stays below --z-catalog (40) and --z-overlay (100), as before
    (elspeth-cf4b08e271). */
 .workspace-inspector-slot {
