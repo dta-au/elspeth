@@ -283,6 +283,19 @@ class WebSettings(BaseModel):
     )
     composer_runtime_preflight_timeout_seconds: float = Field(default=5.0, gt=0)
     composer_rate_limit_per_minute: int = Field(..., ge=1)
+    write_rate_limit_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "Per-user per-minute budget for cheap authenticated DB-write "
+            "endpoints (composer-preferences PATCH, shareable-review "
+            "mark-ready/link). Deliberately a SEPARATE bucket from "
+            "composer_rate_limit_per_minute, which is sized for LLM-backed "
+            "calls: the tutorial legitimately writes preference resume "
+            "state in bursts, and sharing one bucket let those bursts "
+            "starve the tutorial-completion write into a 429."
+        ),
+    )
     composer_expose_provider_errors: bool = False
     e2e_state_seed_enabled: bool = False
     composer_advisor_model: str = "anthropic/claude-sonnet-4-6"

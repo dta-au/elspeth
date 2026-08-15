@@ -1404,6 +1404,13 @@ def _create_app(
         limit=settings.composer_rate_limit_per_minute,
     )
 
+    # --- Write rate limiter (per-process in-memory) ---
+    # Cheap authenticated DB writes get their own bucket so tutorial
+    # preference bursts never compete with the LLM-call budget above.
+    app.state.write_rate_limiter = ComposerRateLimiter(
+        limit=settings.write_rate_limit_per_minute,
+    )
+
     # --- Auth rate limiter (per-IP, unauthenticated endpoints) ---
     app.state.auth_rate_limiter = ComposerRateLimiter(
         limit=settings.auth_rate_limit_per_minute,
