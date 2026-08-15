@@ -29,6 +29,7 @@ from sqlalchemy import select
 from elspeth.core.canonical import canonical_json
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
@@ -423,6 +424,25 @@ def test_get_shared_inspect_blob_expired_returns_404(
     assert payload_store.delete(digest_hex), "blob should exist before deletion"
     response = client.get(f"/api/sessions/shared/{token}")
     assert response.status_code == 404
+
+
+def test_review_write_endpoints_use_write_bucket_and_resolve_stays_strict(
+    audit_readiness_client_with_state: tuple[TestClient, UUID],
+) -> None:
+    client, session_id = audit_readiness_client_with_state
+    client.app.state.rate_limiter = ComposerRateLimiter(limit=1)
+    client.app.state.write_rate_limiter = ComposerRateLimiter(limit=100)
+    # Two consecutive write-side calls succeed on a starved strict bucket:
+    r1 = client.post(f"/api/sessions/{session_id}/mark-ready-for-review")
+    assert r1.status_code in (200, 409)
+    r2 = client.get(f"/api/sessions/{session_id}/shareable-link")
+    assert r2.status_code in (200, 409)
+    # get_shared_inspect (token resolve) remains strict: the second
+    # resolve trips the limit=1 strict bucket.
+    token = "not-a-real-token"
+    first = client.get(f"/api/sessions/shared/{token}")
+    second = client.get(f"/api/sessions/shared/{token}")
+    assert 429 in (first.status_code, second.status_code)
 
 
 def test_mark_ready_for_review_audit_write_failure_returns_no_token(

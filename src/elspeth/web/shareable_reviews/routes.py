@@ -28,7 +28,11 @@ from fastapi.responses import JSONResponse
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
+from elspeth.web.middleware.rate_limit import (
+    ComposerRateLimiter,
+    get_rate_limiter,
+    get_write_rate_limiter,
+)
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.shareable_reviews.models import (
     MarkReadyForReviewResponse,
@@ -59,7 +63,8 @@ def create_shareable_reviews_router() -> APIRouter:
         session_id: UUID,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        # Write bucket: cheap DB write / token mint, not an LLM call.
+        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Mint a signed share artifact for the current composition state.
 
@@ -95,7 +100,8 @@ def create_shareable_reviews_router() -> APIRouter:
         session_id: UUID,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        # Write bucket: cheap DB write / token mint, not an LLM call.
+        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Re-mint a fresh token for the current (session, state).
 
@@ -123,6 +129,7 @@ def create_shareable_reviews_router() -> APIRouter:
         token: str,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
+        # Strict bucket: abuse-sensitive token probe stays strict.
         rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Read-only inspect view of a shared composition.
