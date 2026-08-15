@@ -749,7 +749,10 @@ describe("ComposerWorkspace", () => {
       join(process.cwd(), "src/components/workspace/workspace.css"),
       "utf8",
     );
-    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows:\s*auto minmax\(0, 1fr\)/s);
+    // The auto row is LAST: the restore banner sits at the bottom, the same
+    // region as the expanded pane's collapse control, so the toggle pair
+    // stays spatially stable across states.
+    expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto/s);
     expect(css).toMatch(/data-authoring-collapsed="true"\]:not\(\[data-layout-mode="narrow"\]\)\s+\.workspace-collapsed-affordance\s*\{[^}]*position:\s*static/s);
   });
 

@@ -500,13 +500,21 @@
   grid-template-columns: 0 minmax(0, 1fr);
 }
 
+/* The restore banner takes the BOTTOM row: the collapse control it toggles
+   against lives at the bottom of the expanded authoring pane (the
+   elspeth-215c989bed bottom-edge band), so the pair must occupy the same
+   screen region in both states or the toggle teleports between the top and
+   bottom of the viewport on every press. The banner still reserves a real
+   grid row rather than overlaying the canvas — react-flow's Controls panel
+   floats bottom-left of the artifact area by default, so an absolute
+   bottom-left overlay would collide with it. */
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"]) {
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
 }
 
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
   .workspace-authoring-slot {
-  grid-row: 1;
+  grid-row: 2;
   grid-column: 2;
 }
 
@@ -521,7 +529,7 @@
 
 .composer-workspace[data-authoring-collapsed="true"]:not([data-layout-mode="narrow"])
   .workspace-artifact-slot {
-  grid-row: 2;
+  grid-row: 1;
 }
 
 .workspace-separator-slot {
