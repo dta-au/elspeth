@@ -38,10 +38,18 @@
   min-height: var(--size-control-compact);
   margin-left: var(--space-md);
   flex-shrink: 0;
+  /* Exactly the property :hover changes (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast);
 }
 
 .alert-banner-action:hover {
   background: var(--color-surface-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .alert-banner-action {
+    transition: none;
+  }
 }
 
 .alert-banner--info {

@@ -1186,6 +1186,15 @@
   flex: 1;
   overflow-y: auto;
   padding: var(--space-lg) 0;
+  /* Marked bottom boundary (elspeth-1f4b60a492): the "How pipelines work"
+     teaching panel is genuinely taller than the pane, and its text was cut
+     dead mid-word where the composer begins — no fade, no scrollbar cue —
+     so a clipped panel read as broken rather than scrollable. Same alpha
+     ramp as .guided-authoring-scroll's top edge (guided.css), mirrored to
+     the bottom: gradient colours are ALPHA data, not theme colours. The
+     ramp is shorter than this scroller's 24px bottom padding, so when the
+     transcript is scrolled to the end nothing visible is faded. */
+  mask-image: linear-gradient(to bottom, #000 calc(100% - var(--space-md)), transparent);
 }
 
 /* The message list is keyboard-focusable (tabIndex=0 in ChatPanel,

@@ -287,6 +287,10 @@
   --shadow-popover:  0 4px 12px rgba(0, 0, 0, 0.15);   /* tooltips, mini floating panels, the scroll-to-bottom pill */
   --shadow-dropdown: 0 8px 24px rgba(0, 0, 0, 0.18);   /* menus, the graph-canvas controls panel */
   --shadow-modal:    0 8px 32px rgba(0, 0, 0, 0.25);   /* blocking dialogs (was copy-pasted identically ×7) */
+  /* Directional sibling of the tiers above (elspeth-6c3223c76e): the
+     inspector drawer overlays from the right, so its edge casts LEFT —
+     none of the downward tiers can express that offset. */
+  --shadow-drawer-left: -8px 0 24px rgba(0, 0, 0, 0.24);
 
   /* ── Overlay scrim (elspeth-9ae8ee9ac2) ──────────────────────────────────── */
   /* THE page-dimming veil behind every blocking overlay — dialog backdrops,
@@ -533,6 +537,7 @@
   --shadow-popover:  0 4px 12px rgba(15, 45, 53, 0.08);
   --shadow-dropdown: 0 8px 24px rgba(15, 45, 53, 0.10);
   --shadow-modal:    0 8px 32px rgba(15, 45, 53, 0.14);
+  --shadow-drawer-left: -8px 0 24px rgba(15, 45, 53, 0.13);
 
   /* ── Overlay scrim (light) — ink-tinted, lighter veil; see the :root note. */
   --color-scrim: rgba(15, 45, 53, 0.35);

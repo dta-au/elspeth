@@ -792,6 +792,15 @@
   cursor: pointer;
   font: inherit;
   flex: 0 0 auto;
+  /* Exactly the two properties :hover changes (elspeth-616a236fc3). */
+  transition: background-color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .banner-dismiss-btn {
+    transition: none;
+  }
 }
 
 .banner-dismiss-btn:hover,

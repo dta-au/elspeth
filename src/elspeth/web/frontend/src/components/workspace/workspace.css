@@ -640,7 +640,10 @@
 }
 
 .workspace-inspector--overlay {
-  box-shadow: -8px 0 24px rgb(0 0 0 / 24%);
+  /* Left-cast drawer edge on its own directional token
+     (elspeth-6c3223c76e): dark value byte-identical to the old literal;
+     the light theme gets the tinted-navy base the other tiers use. */
+  box-shadow: var(--shadow-drawer-left);
 }
 
 /* Both drawer bands were hard-built from 8px padding plus a 36px control
