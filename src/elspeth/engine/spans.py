@@ -140,7 +140,11 @@ class _TelemetrySpan:
 
 def _safe_exception_type(exception: BaseException) -> str:
     """Return a bounded ASCII class name without rendering exception text."""
-    name = type(exception).__name__
+    name_descriptor = type.__dict__["__name__"]
+    exception_class = type(exception)
+    name = name_descriptor.__get__(exception_class, type(exception_class))
+    if type(name) is not str:
+        return "Exception"
     if not name or len(name) > 128:
         return "Exception"
     if not (name[0].isascii() and (name[0].isalpha() or name[0] == "_")):
@@ -148,6 +152,22 @@ def _safe_exception_type(exception: BaseException) -> str:
     if any(not (character.isascii() and (character.isalnum() or character == "_")) for character in name[1:]):
         return "Exception"
     return name
+
+
+def _add_safe_exception_note(exception: BaseException, note: str) -> None:
+    """Attach a note without dispatching through exception instance hooks."""
+    state_descriptor = BaseException.__dict__["__dict__"]
+    state: object = state_descriptor.__get__(exception, BaseException)
+    if type(state) is not dict:
+        return
+    if dict.__contains__(state, "__notes__"):
+        notes: object = dict.__getitem__(state, "__notes__")
+        if type(notes) is not list:
+            return
+    else:
+        notes = []
+        dict.__setitem__(state, "__notes__", notes)
+    list.append(notes, note)
 
 
 def _canonical_trace_started_at(value: datetime) -> datetime:
@@ -391,7 +411,10 @@ class SpanFactory:
                         self._telemetry_emit(completion)
                     if callback_failure.exception is not None:
                         callback_type = _safe_exception_type(callback_failure.exception)
-                        caught.add_note(f"Engine span completion callback also failed with {callback_type}")
+                        _add_safe_exception_note(
+                            caught,
+                            f"Engine span completion callback also failed with {callback_type}",
+                        )
             finally:
                 if root_binding is not None:
                     with self._run_traces_lock:
