@@ -966,3 +966,56 @@ describe("preferencesStore — tutorial resume state (elspeth-918f4434b3)", () =
     expect(state.tutorialSourceDataHash).toBeNull();
   });
 });
+
+// ── Rate-limit retry (2026-08-16 bucket-split plan, Task 6) ────────────────
+// The tutorial's own stage-persist burst can transiently exhaust the write
+// bucket; the completion save is the one write whose loss has a durable
+// consequence (the tutorial re-shows on next load), so it retries exactly
+// once after a rate-limited 429, waiting out the envelope's retry_after.
+describe("preferencesStore — markTutorialGraduated 429 retry", () => {
+  const completedPayload = {
+    default_mode: "guided" as const,
+    banner_dismissed_at: null,
+    freeform_intro_dismissed_at: null,
+    tutorial_completed_at: "2026-08-16T00:00:00Z",
+    tutorial_stage: null,
+    tutorial_session_id: null,
+    tutorial_run_id: null,
+    tutorial_source_data_hash: null,
+    updated_at: "2026-08-16T00:00:00Z",
+  };
+
+  beforeEach(() => {
+    resetStore(usePreferencesStore);
+    vi.clearAllMocks();
+  });
+
+  it("retries the graduation PATCH once after a rate-limited failure", async () => {
+    vi.useFakeTimers();
+    mockUpdate
+      .mockRejectedValueOnce({ status: 429, error_type: "rate_limited", detail: "…", retry_after: 2 })
+      .mockResolvedValueOnce(completedPayload); // reuse the file's payload fixture
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(promise).resolves.toBe(completedPayload.tutorial_completed_at);
+    expect(mockUpdate).toHaveBeenCalledTimes(2);
+    expect(usePreferencesStore.getState().writeError).toBeNull();
+    vi.useRealTimers();
+  });
+
+  it("gives up after the second rate-limited failure and surfaces the detail", async () => {
+    vi.useFakeTimers();
+    mockUpdate.mockRejectedValue({
+      status: 429, error_type: "rate_limited",
+      detail: "Rate limit exceeded. Try again in 2 seconds.", retry_after: 2,
+    });
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    promise.catch(() => undefined); // assertion happens via store state below
+    await vi.advanceTimersByTimeAsync(2_000);
+    await expect(promise).rejects.toMatchObject({ status: 429 });
+    expect(mockUpdate).toHaveBeenCalledTimes(2); // exactly one retry, no loop
+    expect(usePreferencesStore.getState().writeError).toContain("Rate limit exceeded");
+    expect(usePreferencesStore.getState().writing).toBe(false);
+    vi.useRealTimers();
+  });
+});

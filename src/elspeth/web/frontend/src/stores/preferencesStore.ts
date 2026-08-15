@@ -41,6 +41,7 @@ import type {
   ApiError,
   ComposerMode,
   PersistedTutorialStage,
+  UserComposerPreferencesPayload,
 } from "@/types/api";
 
 // localStorage key for cross-tab banner-dismiss broadcasts. Versioned
@@ -108,6 +109,23 @@ interface PreferencesState {
 function tutorialCompletedFrom(value: string | null): boolean {
   return value !== null;
 }
+
+// Rate-limited ApiError guard (same per-module pattern as
+// RunOutputsPanel.tsx / shareableReviewStore.ts): a thrown ApiError is a
+// plain object, never `instanceof Error`, so discriminate on `status`.
+function isRateLimitedApiError(
+  err: unknown,
+): err is { status: number; detail: string; retry_after?: number } {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { status?: unknown }).status === 429
+  );
+}
+
+// Upper bound on how long the graduation retry will honour a server-supplied
+// retry_after before giving up on the delayed retry strategy entirely.
+const MAX_RETRY_AFTER_WAIT_MS = 30_000;
 
 const INITIAL_STATE = {
   defaultMode: null as ComposerMode | null,
@@ -354,13 +372,30 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
       writing: true,
       writeError: null,
     });
+    const patchBody = {
+      tutorial_completed_at: stamp,
+      ...(options.via !== undefined
+        ? { tutorial_completed_via: options.via }
+        : {}),
+    };
     try {
-      const payload = await updateUserComposerPreferences({
-        tutorial_completed_at: stamp,
-        ...(options.via !== undefined
-          ? { tutorial_completed_via: options.via }
-          : {}),
-      });
+      let payload: UserComposerPreferencesPayload;
+      try {
+        payload = await updateUserComposerPreferences(patchBody);
+      } catch (err) {
+        // One delayed retry for a rate-limited save: the tutorial's own
+        // stage-persist burst can transiently exhaust the write bucket,
+        // and completion is the one write that must not be dropped (it
+        // gates whether the tutorial re-shows on next load). `writing`
+        // stays true across the wait so the graduation card's busy state
+        // ("Saving tutorial completion") stays honest.
+        if (!isRateLimitedApiError(err) || err.retry_after === undefined) {
+          throw err;
+        }
+        const waitMs = Math.min(err.retry_after * 1000, MAX_RETRY_AFTER_WAIT_MS);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        payload = await updateUserComposerPreferences(patchBody);
+      }
       set({
         ...(publishLocally
           ? {
@@ -386,10 +421,15 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         tutorialCompletedAt: previous.tutorialCompletedAt,
         tutorialCompleted: previous.tutorialCompleted,
         writing: false,
+        // Surface the ApiError envelope detail too: a thrown ApiError is a
+        // plain object, not `instanceof Error`, and the bare fallback hid
+        // the actionable "try again in N seconds" message.
         writeError:
           err instanceof Error
             ? `Couldn't save tutorial completion: ${err.message}`
-            : "Couldn't save tutorial completion.",
+            : typeof err === "object" && err !== null && typeof (err as { detail?: unknown }).detail === "string"
+              ? `Couldn't save tutorial completion: ${(err as { detail: string }).detail}`
+              : "Couldn't save tutorial completion.",
       });
       throw err;
     }
