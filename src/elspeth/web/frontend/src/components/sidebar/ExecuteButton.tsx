@@ -524,7 +524,8 @@ export function ExecuteButton(): JSX.Element | null {
   // the Run panel, so a successful launch must bring it on screen. Keyed on
   // execute()'s returned run_id being a real id — the null returns (428
   // fanout guard, 409 conflict, interpretation block, stale-session drop)
-  // must not switch tabs. Same dispatch idiom as ExportYamlButton.
+  // must not switch tabs. Same dispatch idiom as the palette's Export YAML
+  // command.
   const launchRun = useCallback(
     async (sessionId: string): Promise<void> => {
       const runId = await execute(sessionId);
@@ -584,7 +585,7 @@ export function ExecuteButton(): JSX.Element | null {
       <Button
         // Default (secondary) variant, never variant="primary": CompletionBar's
         // contract (its docstring, per plan 19b §"Scope boundaries") renders
-        // Save-for-review / Run / Export YAML as CO-EQUAL verbs with no primary
+        // Save-for-review / Run / Import YAML as CO-EQUAL verbs with no primary
         // emphasis. A conditional primary here singled Run out as the lone
         // filled accent button whenever the composition was valid,
         // contradicting the documented design (elspeth-0d37694c8c).

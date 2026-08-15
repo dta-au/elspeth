@@ -105,7 +105,6 @@ vi.mock("./components/workspace/WorkspaceActionBar", () => ({
   }: {
     capabilities: {
       completion: boolean;
-      importYaml: boolean;
       catalog: boolean;
     };
   }) => {
@@ -114,8 +113,11 @@ vi.mock("./components/workspace/WorkspaceActionBar", () => ({
       <div data-testid="workspace-action-bar-stub">
         <button type="button">Validation Not checked</button>
         <button type="button">Audit Checking</button>
-        {capabilities.completion ? <div data-testid="completion-bar" /> : null}
-        {capabilities.importYaml ? <button type="button">Import YAML</button> : null}
+        {capabilities.completion ? (
+          <div data-testid="completion-bar">
+            <button type="button">Import YAML</button>
+          </div>
+        ) : null}
         {capabilities.catalog ? <button type="button">Catalog (reference)</button> : null}
       </div>
     );
@@ -546,7 +548,6 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: true,
-      importYaml: true,
       catalog: true,
     });
   });
@@ -624,7 +625,6 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: false,
-      importYaml: false,
       catalog: false,
     });
   });
@@ -661,7 +661,6 @@ describe("App banner roles", () => {
     expect(workspaceMountSpy).toHaveBeenCalled();
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: true,
-      importYaml: true,
       catalog: true,
     });
   });
@@ -784,7 +783,6 @@ describe("App banner roles", () => {
     );
     expect(workspaceCapabilitiesSpy).toHaveBeenLastCalledWith({
       completion: false,
-      importYaml: false,
       catalog: false,
     });
   });

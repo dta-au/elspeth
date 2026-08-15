@@ -583,7 +583,7 @@ test.describe("Composer deterministic workspace geometry", () => {
       const actions = [
         composer.saveForReview(),
         composer.runPipeline(),
-        composer.exportYaml(),
+        composer.importYaml(),
       ];
       const [actionBarBox, ...actionBoxes] = await Promise.all([
         actionBar.boundingBox(),

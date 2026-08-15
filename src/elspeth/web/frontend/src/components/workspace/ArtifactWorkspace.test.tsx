@@ -25,10 +25,10 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { makeComposition, makeValidationResult } from "@/test/composerFixtures";
 import { useHashRouter } from "@/hooks/useHashRouter";
-import { ExportYamlButton } from "@/components/sidebar/ExportYamlButton";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   REQUEST_ARTIFACT_VIEW_EVENT,
+  dispatchArtifactViewIntent,
   type RequestArtifactViewDetail,
 } from "@/lib/composer-events";
 import { ComposerWorkspace } from "./ComposerWorkspace";
@@ -344,17 +344,17 @@ describe("ArtifactWorkspace", () => {
       sessions: [{ id: "session-1", title: "Session 1" }],
     } as never);
     window.history.replaceState(null, "", "#/session-1/spec");
-    const user = userEvent.setup();
-    renderArtifactWorkspace({
-      inspector: (
-        <>
-          <HashRouterProbe />
-          <ExportYamlButton />
-        </>
-      ),
-    });
+    renderArtifactWorkspace({ inspector: <HashRouterProbe /> });
 
-    await user.click(screen.getByRole("button", { name: /export yaml/i }));
+    // The palette's Export YAML command and the Ctrl+Shift+Y shortcut both
+    // publish this exact intent; dispatch it directly.
+    act(() =>
+      dispatchArtifactViewIntent({
+        tab: "yaml",
+        focusMode: false,
+        sessionId: "session-1",
+      }),
+    );
     act(() => useSessionStore.setState({ compositionStateLoaded: true }));
     await act(async () => Promise.resolve());
 

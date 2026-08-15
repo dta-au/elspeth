@@ -59,7 +59,7 @@ describe("CompletionSummary -- workspace convergence", () => {
   it("does not duplicate YAML, validation, or run surfaces", () => {
     render(<CompletionSummary terminal={COMPLETED_TERMINAL} />);
     expect(screen.queryByRole("region", { name: "Pipeline YAML" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Export YAML" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Import YAML" })).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Validate pipeline" }),
     ).toBeNull();

@@ -225,11 +225,13 @@ function App() {
   const catalogAvailable = !guidedBuildActive;
   const workspaceActionCapabilities = useMemo(
     () => ({
+      // completion also admits the CompletionBar's Import YAML trigger; in
+      // this mount (shared/tutorial/empty all excluded above) it reduces to
+      // the same !guidedBuildActive fact a separate importYaml flag carried.
       completion: runAdmissionAvailable,
-      importYaml: !guidedBuildActive,
       catalog: catalogAvailable,
     }),
-    [catalogAvailable, guidedBuildActive, runAdmissionAvailable],
+    [catalogAvailable, runAdmissionAvailable],
   );
 
   useEffect(() => {
@@ -427,9 +429,9 @@ function App() {
 
       // Ctrl+Shift+Y / Cmd+Shift+Y: Select the persistent YAML artifact.
       // Gated on composition content — the same hasCompositionContent
-      // predicate ExportYamlButton uses — so the shortcut can't open the
-      // near-empty modal on a pipeline with nothing to export
-      // (elspeth-bff8043d33 residual).
+      // predicate the palette's Export YAML command uses — so the shortcut
+      // can't open the near-empty modal on a pipeline with nothing to
+      // export (elspeth-bff8043d33 residual).
       if (
         e.key.toLowerCase() === "y" &&
         e.shiftKey &&

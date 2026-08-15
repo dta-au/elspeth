@@ -150,7 +150,7 @@ describe("audit surface — coverage snapshot", () => {
 // --- Mocks -----------------------------------------------------------------
 //
 // AppHeader/UserMenu pull useTheme(); CompletionBar renders ExecuteButton +
-// ExportYamlButton which couple to additional stores; YamlView pulls in the
+// ImportYamlButton which couple to additional stores; YamlView pulls in the
 // full YAML rendering pipeline. Stub the heavy/coupled imports so the render
 // produces deterministic DOM for axe without exercising unrelated logic.
 

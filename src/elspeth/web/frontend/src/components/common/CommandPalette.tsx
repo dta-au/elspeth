@@ -184,9 +184,10 @@ export function CommandPalette({
       title: "Export YAML",
       category: "navigation",
       shortcut: "Ctrl+Shift+Y",
-      // Same hasCompositionContent gate ExportYamlButton applies — an empty
-      // pipeline has nothing to export, and this command was a leftover
-      // path into the near-empty modal (elspeth-bff8043d33 residual).
+      // Same hasCompositionContent gate the Ctrl+Shift+Y shortcut applies —
+      // an empty pipeline has nothing to export, and this command was a
+      // leftover path into the near-empty modal (elspeth-bff8043d33
+      // residual).
       enabled: hasCompositionContent(compositionState),
       action: () => {
         const intent = claimWorkspaceViewIntent();

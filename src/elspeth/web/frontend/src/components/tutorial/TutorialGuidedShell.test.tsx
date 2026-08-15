@@ -135,7 +135,7 @@ vi.mock("@/components/workspace/WorkspaceActionBar", () => ({
   WorkspaceActionBar: ({
     capabilities,
   }: {
-    capabilities: { completion: boolean; importYaml: boolean; catalog: boolean };
+    capabilities: { completion: boolean; catalog: boolean };
   }) => (
     <div data-testid="tutorial-workspace-capabilities">
       {JSON.stringify(capabilities)}
@@ -264,7 +264,7 @@ describe("TutorialGuidedShell", () => {
       "true",
     );
     expect(screen.getByTestId("tutorial-workspace-capabilities")).toHaveTextContent(
-      '{"completion":false,"importYaml":false,"catalog":false}',
+      '{"completion":false,"catalog":false}',
     );
     expect(screen.queryByText("Run pipeline")).toBeNull();
     // The Run-tab empty state must stay affordance-free in the tutorial:

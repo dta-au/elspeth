@@ -213,13 +213,11 @@ test.describe("modal flows — Graph, YAML, Catalog", () => {
         await composer.waitForChatReady();
 
         // Export YAML is content-gated. Seed an exportable state above so the
-        // command is available before exercising its narrow-view transition.
+        // command is available before exercising its narrow-view transition;
+        // the enabled YAML artifact tab is the visible fact that the seeded
+        // composition has loaded (the tab is disabled while empty).
         await page.getByRole("tab", { name: "Pipeline", exact: true }).click();
-        const exportYamlBtn = page.getByRole("button", {
-          name: /export yaml/i,
-        });
-        await expect(exportYamlBtn).toBeVisible();
-        await expect(exportYamlBtn).toBeEnabled();
+        await expect(page.getByRole("tab", { name: "YAML" })).toBeEnabled();
         await page.getByRole("tab", { name: "Compose", exact: true }).click();
         await page.keyboard.press("Control+k");
         await page.getByRole("option", { name: "Export YAML" }).click();

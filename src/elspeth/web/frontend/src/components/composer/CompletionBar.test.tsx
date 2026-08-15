@@ -1,12 +1,10 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { type ReactNode } from "react";
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { CompletionBar } from "./CompletionBar";
-import { ArtifactWorkspace } from "@/components/workspace/ArtifactWorkspace";
-import { ComposerWorkspace } from "@/components/workspace/ComposerWorkspace";
+import { OPEN_IMPORT_YAML_MODAL_EVENT } from "@/lib/composer-events";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -20,45 +18,13 @@ import {
 import { resetStore } from "@/test/store-helpers";
 import type { ValidationResult } from "@/types/index";
 
-// The Export-YAML dialog body renders YamlView, which pulls in session state
-// and YAML rendering machinery irrelevant to the assertions in this file.
-// Stub it so the dialog mounts deterministically and AC 7 can assert only the
-// dialog itself (plan 19b:232).
-vi.mock("@/components/inspector/YamlView", () => ({
-  YamlView: () => (
-    <button type="button" data-testid="yaml-view-stub">
-      stub
-    </button>
-  ),
-}));
-
-vi.mock("@xyflow/react", () => ({
-  MarkerType: { ArrowClosed: "arrowclosed" },
-  Position: { Top: "top", Bottom: "bottom" },
-  ReactFlowProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
-  ReactFlow: ({ children }: { children: ReactNode }) => <div>{children}</div>,
-  BaseEdge: () => null,
-  Handle: () => null,
-  Background: () => null,
-  Controls: () => null,
-  MiniMap: () => null,
-}));
-vi.mock("@xyflow/react/dist/style.css", () => ({}));
-
-class PassiveResizeObserver implements ResizeObserver {
-  constructor(_callback: ResizeObserverCallback) {}
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-}
-
 function _validValidation(): ValidationResult {
   return makeValidationResult();
 }
 
-// Minimal composition with content: the Export-YAML button gates on
-// pipeline content (elspeth-bff8043d33), NOT on validation state, so
-// validation-axis tests must hold content constant.
+// Minimal composition with content, so the Import-YAML availability tests
+// can pin both extremes of the content axis (empty is the beforeEach
+// default).
 function _nonEmptyComposition() {
   return makeComposition(1, {
     id: "state-1",
@@ -87,7 +53,6 @@ function _invalidValidation(): ValidationResult {
 
 describe("CompletionBar", () => {
   beforeEach(() => {
-    vi.stubGlobal("ResizeObserver", PassiveResizeObserver);
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
@@ -100,10 +65,6 @@ describe("CompletionBar", () => {
     });
     useShareableReviewStore.getState().reset();
     resetStore(useInterpretationEventsStore);
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
   });
 
   it("keeps the horizontal compact override scoped to the workspace action bar", () => {
@@ -142,7 +103,7 @@ describe("CompletionBar", () => {
     expect(buttons.map((b) => b.textContent)).toEqual([
       "Save for review",
       "Run pipeline",
-      "Export YAML",
+      "Import YAML",
     ]);
     // Structural symmetry contract: a wrapper <div> around any verb makes
     // flexbox treat the three asymmetrically (the bare sibling stretches to
@@ -272,28 +233,30 @@ describe("CompletionBar", () => {
     expect(button.disabled).toBe(true);
   });
 
-  // Plan 19b:229 — AC 4: Export-YAML button is enabled regardless of
-  // VALIDATION state — it is the only completion-bar verb the design doc
-  // (09) marks "Available always — even with warning status". Both extremes
-  // are pinned with a content-bearing pipeline held constant: the button's
-  // only gate is pipeline content (elspeth-bff8043d33), never validation.
-  it("Export-YAML button ignores validation state on a non-empty pipeline (plan 19b:229, AC 4)", () => {
-    // Case 1: no validation run yet (validationResult === null).
+  // Import-YAML is the completion-bar verb with NO gate beyond an active
+  // session: importing into an EMPTY session is its primary use, and an
+  // invalid pipeline may be replaced wholesale, so neither the content axis
+  // nor the validation axis may disable it. Both extremes of each axis are
+  // pinned here.
+  it("Import-YAML button ignores validation and content state", () => {
+    // Case 1: empty pipeline (beforeEach leaves compositionState null), no
+    // validation run yet (validationResult === null).
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    const { unmount } = render(<CompletionBar />);
+    const importButtonEmpty = screen.getByRole("button", {
+      name: "Import YAML",
+    }) as HTMLButtonElement;
+    expect(importButtonEmpty.disabled).toBe(false);
+    expect(importButtonEmpty.getAttribute("aria-disabled")).toBeNull();
+    unmount();
+
+    // Case 2: content-bearing pipeline with an explicit invalid validation —
+    // Save-for-review and Run-pipeline both become disabled, but Import-YAML
+    // must remain enabled.
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
     });
-    // beforeEach already sets validationResult: null.
-    const { unmount } = render(<CompletionBar />);
-    const exportButtonNull = screen.getByRole("button", {
-      name: "Export YAML",
-    }) as HTMLButtonElement;
-    expect(exportButtonNull.disabled).toBe(false);
-    expect(exportButtonNull.getAttribute("aria-disabled")).toBeNull();
-    unmount();
-
-    // Case 2: explicit invalid validation — Save-for-review and Run-pipeline
-    // both become disabled, but Export-YAML must remain enabled.
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
       isExecuting: false,
@@ -301,26 +264,11 @@ describe("CompletionBar", () => {
       execute: vi.fn(),
     });
     render(<CompletionBar />);
-    const exportButtonInvalid = screen.getByRole("button", {
-      name: "Export YAML",
+    const importButtonInvalid = screen.getByRole("button", {
+      name: "Import YAML",
     }) as HTMLButtonElement;
-    expect(exportButtonInvalid.disabled).toBe(false);
-    expect(exportButtonInvalid.getAttribute("aria-disabled")).toBeNull();
-  });
-
-  // elspeth-bff8043d33: on an EMPTY pipeline the three sibling completion
-  // verbs must agree — Export-YAML is disabled with a stated reason instead
-  // of opening a near-empty modal.
-  it("Export-YAML button is disabled with a reason on an empty pipeline", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" });
-    // beforeEach leaves compositionState null (no pipeline yet).
-    render(<CompletionBar />);
-    const exportButton = screen.getByRole("button", {
-      name: "Export YAML",
-    }) as HTMLButtonElement;
-    expect(exportButton.disabled).toBe(true);
-    expect(exportButton.getAttribute("aria-disabled")).toBe("true");
-    expect(exportButton.getAttribute("title")).toMatch(/add pipeline components/i);
+    expect(importButtonInvalid.disabled).toBe(false);
+    expect(importButtonInvalid.getAttribute("aria-disabled")).toBeNull();
   });
 
   // Plan 19b:231 — AC 6: Clicking Run-pipeline calls the existing Execute
@@ -357,7 +305,7 @@ describe("CompletionBar", () => {
     expect(executeSpy).toHaveBeenCalledWith("sess-RUN");
   });
 
-  it("clicking Export-YAML selects and focuses the persistent YAML artifact", async () => {
+  it("clicking Import-YAML dispatches the open-import-modal event", () => {
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
@@ -368,33 +316,16 @@ describe("CompletionBar", () => {
       progress: null,
       execute: vi.fn(),
     });
-
-    render(
-      <ComposerWorkspace
-        authoring={<div>Authoring</div>}
-        artifact={<ArtifactWorkspace />}
-        inspector={<div>Inspector</div>}
-        actionBar={<CompletionBar />}
-      />,
-    );
-
-    expect(screen.getByRole("tab", { name: "Graph" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-
-    const exportButton = screen.getByRole("button", {
-      name: "Export YAML",
-    }) as HTMLButtonElement;
-    fireEvent.click(exportButton);
-
-    await waitFor(() => {
-      expect(screen.getByRole("tab", { name: "YAML" })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      );
-      expect(screen.getByRole("tab", { name: "YAML" })).toHaveFocus();
-    });
-    expect(screen.queryByRole("dialog", { name: /export yaml/i })).toBeNull();
+    const opened = vi.fn();
+    window.addEventListener(OPEN_IMPORT_YAML_MODAL_EVENT, opened);
+    try {
+      render(<CompletionBar />);
+      fireEvent.click(screen.getByRole("button", { name: "Import YAML" }));
+      // The modal itself is mounted at app-root level by ImportYamlModalHost;
+      // this trigger's whole contract is the event.
+      expect(opened).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(OPEN_IMPORT_YAML_MODAL_EVENT, opened);
+    }
   });
 });

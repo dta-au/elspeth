@@ -22,10 +22,6 @@ vi.mock("@/components/composer/CompletionBar", () => ({
   CompletionBar: () => <div data-testid="completion-bar">Completion actions</div>,
 }));
 
-vi.mock("@/components/sidebar/ImportYamlButton", () => ({
-  ImportYamlButton: () => <button type="button">Import YAML</button>,
-}));
-
 vi.mock("@/components/sidebar/CatalogButton", () => ({
   CatalogButton: () => <button type="button">Plugin catalog</button>,
 }));
@@ -33,7 +29,6 @@ vi.mock("@/components/sidebar/CatalogButton", () => ({
 function renderActionBar(
   capabilities: {
     completion: boolean;
-    importYaml: boolean;
     catalog: boolean;
   },
 ) {
@@ -148,7 +143,6 @@ describe("WorkspaceActionBar", () => {
     });
     const { openInspector, container } = renderActionBar({
       completion: false,
-      importYaml: false,
       catalog: false,
     });
 
@@ -239,7 +233,6 @@ describe("WorkspaceActionBar", () => {
       arrange();
       const { container } = renderActionBar({
         completion: false,
-        importYaml: false,
         catalog: false,
       });
 
@@ -272,7 +265,7 @@ describe("WorkspaceActionBar", () => {
       },
     });
 
-    renderActionBar({ completion: false, importYaml: false, catalog: false });
+    renderActionBar({ completion: false, catalog: false });
 
     expect(
       screen.getByRole("button", { name: "Audit: Error" }),
@@ -290,7 +283,6 @@ describe("WorkspaceActionBar", () => {
     } as never);
     const view = renderActionBar({
       completion: false,
-      importYaml: false,
       catalog: false,
     });
     expect(
@@ -312,19 +304,19 @@ describe("WorkspaceActionBar", () => {
   });
 
   it.each([
-    ["ordinary freeform", true, true, true],
-    ["terminal guided", true, true, true],
-    ["active guided", false, false, false],
-    ["tutorial", false, false, false],
+    ["ordinary freeform", true, true],
+    ["terminal guided", true, true],
+    ["active guided", false, false],
+    ["tutorial", false, false],
   ] as const)(
     "pins the %s capability matrix",
-    (_mode, completion, importYaml, catalog) => {
-      renderActionBar({ completion, importYaml, catalog });
+    (_mode, completion, catalog) => {
+      renderActionBar({ completion, catalog });
 
       expect(screen.queryByTestId("completion-bar") !== null).toBe(completion);
       expect(
         screen.queryByRole("button", { name: "More actions" }) !== null,
-      ).toBe(importYaml || catalog);
+      ).toBe(catalog);
       expect(
         screen.getByRole("button", { name: /Validation:/ }),
       ).toBeInTheDocument();
@@ -336,20 +328,22 @@ describe("WorkspaceActionBar", () => {
 
   it("renders only individually admitted secondary actions", async () => {
     const user = userEvent.setup();
-    renderActionBar({ completion: false, importYaml: true, catalog: false });
+    renderActionBar({ completion: false, catalog: true });
     await user.click(screen.getByRole("button", { name: "More actions" }));
 
     expect(
-      screen.getByRole("button", { name: "Import YAML" }),
+      screen.getByRole("button", { name: "Plugin catalog" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Plugin catalog" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("group", { name: "More actions" }).querySelectorAll(
+        "button",
+      ),
+    ).toHaveLength(1);
   });
 
   it("operates the secondary menu by Arrow, Home, End, and Escape keys", async () => {
     const user = userEvent.setup();
-    renderActionBar({ completion: false, importYaml: true, catalog: true });
+    renderActionBar({ completion: false, catalog: true });
     const more = screen.getByRole("button", { name: "More actions" });
     expect(more).not.toHaveAttribute("aria-haspopup");
     expect(more).toHaveAttribute(
@@ -359,24 +353,25 @@ describe("WorkspaceActionBar", () => {
     more.focus();
 
     await user.keyboard("{ArrowDown}");
-    const importYaml = screen.getByRole("button", { name: "Import YAML" });
     const catalog = screen.getByRole("button", { name: "Plugin catalog" });
     expect(more).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("group", { name: "More actions" })).toHaveAttribute(
       "id",
       "workspace-more-actions-panel",
     );
-    expect(importYaml).toHaveFocus();
+    expect(catalog).toHaveFocus();
+    // Single-item menu today: Arrow wraps onto the same item and Home/End
+    // both resolve to it, so the roving logic stays exercised end-to-end.
     await user.keyboard("{ArrowDown}");
     expect(catalog).toHaveFocus();
     await user.keyboard("{Home}");
-    expect(importYaml).toHaveFocus();
+    expect(catalog).toHaveFocus();
     await user.keyboard("{End}");
     expect(catalog).toHaveFocus();
     await user.keyboard("{Escape}");
     expect(more).toHaveFocus();
     expect(
-      screen.queryByRole("button", { name: "Import YAML" }),
+      screen.queryByRole("button", { name: "Plugin catalog" }),
     ).not.toBeInTheDocument();
   });
 });

@@ -125,7 +125,7 @@ export class ComposerPage {
     return this.page.getByRole("button", { name: "Save for review" });
   }
 
-  exportYaml(): Locator {
-    return this.page.getByRole("button", { name: "Export YAML" });
+  importYaml(): Locator {
+    return this.page.getByRole("button", { name: "Import YAML" });
   }
 }

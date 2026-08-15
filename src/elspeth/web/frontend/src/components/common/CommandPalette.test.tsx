@@ -310,8 +310,9 @@ describe("CommandPalette guided-mode commands", () => {
 
   // elspeth-bff8043d33 residual: the palette command was a leftover path
   // into the near-empty Export-YAML modal. Same hasCompositionContent gate
-  // as ExportYamlButton — the command is withheld entirely (disabled
-  // commands are filtered from the palette, matching Validate/Execute).
+  // as the Ctrl+Shift+Y shortcut — the command is withheld entirely
+  // (disabled commands are filtered from the palette, matching
+  // Validate/Execute).
   it("withholds 'Export YAML' when the pipeline is empty", () => {
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,

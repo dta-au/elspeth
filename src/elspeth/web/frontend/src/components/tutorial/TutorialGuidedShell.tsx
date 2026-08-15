@@ -312,7 +312,6 @@ export function TutorialGuidedShell({
           <WorkspaceActionBar
             capabilities={{
               completion: false,
-              importYaml: false,
               catalog: false,
             }}
           />

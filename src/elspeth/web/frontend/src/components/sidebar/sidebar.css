@@ -1,6 +1,6 @@
 /* sidebar.css — Side-rail slots, suggestion buttons, completion bar, graph mini-view.
    Owners: .side-rail-suggestion-*, .side-rail-execute-btn,
-   .side-rail-export-yaml-btn, .side-rail-catalog-btn, .catalog-reference-*,
+   .side-rail-import-yaml-btn, .side-rail-catalog-btn, .catalog-reference-*,
    .completion-bar, .graph-mini*, .side-rail-error-banner.
    (.side-rail-error-banner was sandwiched into the version-selector block
    in App.css; moved here under Path B because it is a sidebar concern.) */
@@ -112,11 +112,9 @@
   cursor: not-allowed;
 }
 
-/* Primary side-rail slot-fill buttons share identical layout. Equivalent to
-   composing .side-rail-slot-fill on each; kept as a comma-grouped selector so
-   the class names remain stable for existing call sites. */
-.side-rail-execute-btn,
-.side-rail-export-yaml-btn {
+/* Primary side-rail slot-fill button layout (the import button below shares
+   it as its own rule). */
+.side-rail-execute-btn {
   width: calc(100% - (2 * var(--space-sm)));
   margin: var(--space-sm);
   justify-content: center;
@@ -204,10 +202,10 @@
   text-transform: uppercase;
 }
 
-/* CompletionBar (TSX: src/components/CompletionBar.tsx) mounts Save-for-review
-   (.btn), ExecuteButton (.btn .side-rail-execute-btn), and ExportYamlButton
-   (.btn .side-rail-export-yaml-btn).
-   The earlier horizontal layout clipped Export-YAML: the side rail is 320px
+/* CompletionBar (TSX: src/components/composer/CompletionBar.tsx) mounts
+   Save-for-review (.btn), ExecuteButton (.btn .side-rail-execute-btn), and
+   ImportYamlButton (.btn .side-rail-import-yaml-btn).
+   The earlier horizontal layout clipped the third verb: the side rail is 320px
    wide (--siderail-width, tokens.css), the three labels need ~436px of min-content
    width at --font-size-base with white-space:nowrap, and the row overflowed
    into .layout-siderail's overflow:hidden region — making the third button
@@ -222,9 +220,12 @@
   align-items: stretch;
 }
 
+/* The two named entries out-specify the buttons' own width/margin rules
+   (which follow later in this file and would otherwise win on source order),
+   so the bar's children stay flush with the group. */
 .completion-bar > *,
 .completion-bar .side-rail-execute-btn,
-.completion-bar .side-rail-export-yaml-btn {
+.completion-bar .side-rail-import-yaml-btn {
   width: 100%;
   margin: 0;
 }
@@ -272,10 +273,10 @@
 }
 
 /* ImportYamlButton / ImportYamlModal (elspeth-24c56585f9 T-1) --------------
-   The button mirrors the full-width rail-body layout shared by
-   .side-rail-execute-btn / .side-rail-export-yaml-btn above (kept as its
-   own rule rather than joining that comma group, per this pass's
-   additive-only constraint on this file). The modal itself reuses
+   The button mirrors the full-width rail-body layout of
+   .side-rail-execute-btn above (kept as its own rule rather than joining
+   that group, per the original pass's additive-only constraint on this
+   file). The modal itself reuses
    .yaml-modal-* (common.css) for its shell and .textarea / .field-label /
    .field-hint / .validation-banner* (shared.css) for its form and outcome
    surfaces -- these rules cover only the layout those primitives don't. */

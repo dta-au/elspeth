@@ -129,7 +129,7 @@ export async function expectPrimaryControlsInViewport(
   const completionControls = [
     composer.saveForReview(),
     composer.runPipeline(),
-    composer.exportYaml(),
+    composer.importYaml(),
   ];
   for (const control of completionControls) {
     await expect(control).toHaveCount(capabilities.completion ? 1 : 0);

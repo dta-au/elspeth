@@ -3592,7 +3592,7 @@ describe("ChatPanel mode discriminator", () => {
     expect(
       screen.getByRole("heading", { name: "Pipeline updated" }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Export YAML" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Import YAML" })).toBeNull();
     expect(screen.queryByTestId("pipeline-validation-summary")).toBeNull();
     // Tutorial completion suppresses the freeform handoff (concern B).
     expect(
@@ -4884,7 +4884,7 @@ assistant_message_kind: "synthetic_failure",
       screen.getByRole("button", { name: "Open freeform editor" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Export YAML" }),
+      screen.queryByRole("button", { name: "Import YAML" }),
     ).toBeNull();
     expect(
       screen.queryByRole("button", { name: "Validate pipeline" }),

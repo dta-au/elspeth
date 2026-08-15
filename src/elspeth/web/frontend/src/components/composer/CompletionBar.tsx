@@ -7,8 +7,11 @@
  *                        signed share URL.
  *   * Run pipeline     → reuses the existing ExecuteButton primitive (which
  *                        carries the Phase 5b interpretation-gating logic).
- *   * Export YAML      → selects the persistent YAML artifact through the
- *                        existing ExportYamlButton primitive.
+ *   * Import YAML      → opens the import modal through the existing
+ *                        ImportYamlButton primitive. (Export lives on the
+ *                        YAML artifact tab's Copy/Download controls and the
+ *                        command palette; a toolbar Export button duplicated
+ *                        them, so the slot carries Import instead.)
  *
  * Per plan 19b §"Scope boundaries": no primary emphasis — all three are
  * co-equal verbs. The "Save for review" button follows the backend-owned
@@ -32,7 +35,7 @@ import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { ExecuteButton } from "@/components/sidebar/ExecuteButton";
-import { ExportYamlButton } from "@/components/sidebar/ExportYamlButton";
+import { ImportYamlButton } from "@/components/sidebar/ImportYamlButton";
 
 const SAVE_FOR_REVIEW_DISABLED_TITLE =
   "Fix validation or completion blockers before sharing for review.";
@@ -82,7 +85,7 @@ export function CompletionBar(): JSX.Element | null {
         Save for review
       </Button>
       <ExecuteButton />
-      <ExportYamlButton />
+      <ImportYamlButton />
     </div>
   );
 }

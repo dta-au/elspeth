@@ -310,7 +310,7 @@
    it is a flex item of this row. Riding inside the Run column was what made
    that column ~98px and dragged its co-equal siblings with it
    (elspeth-929fc5d4a7); here it takes its own full-width line BELOW the
-   buttons instead — `order` lifts it past the Export button that follows it
+   buttons instead — `order` lifts it past the Import button that follows it
    in DOM order, so the three verbs stay one unbroken row. The line is not
    focusable, so visual order and tab order cannot diverge. */
 .workspace-action-bar .completion-bar .side-rail-execute-reason {

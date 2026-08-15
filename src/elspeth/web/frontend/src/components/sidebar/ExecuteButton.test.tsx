@@ -277,7 +277,7 @@ describe("ExecuteButton", () => {
 
   it("stays a co-equal plain .btn (never btn-primary) even when runnable (elspeth-0d37694c8c)", () => {
     // CompletionBar's contract (its docstring, per plan 19b §"Scope
-    // boundaries"): Save-for-review / Run / Export YAML are co-equal verbs
+    // boundaries"): Save-for-review / Run / Import YAML are co-equal verbs
     // with no primary emphasis. A conditional btn-primary previously singled
     // Run out as the lone filled accent button whenever the composition was
     // valid — the common case.

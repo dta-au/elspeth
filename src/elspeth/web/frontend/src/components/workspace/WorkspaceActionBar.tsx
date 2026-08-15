@@ -7,7 +7,6 @@ import {
 
 import { CompletionBar } from "@/components/composer/CompletionBar";
 import { CatalogButton } from "@/components/sidebar/CatalogButton";
-import { ImportYamlButton } from "@/components/sidebar/ImportYamlButton";
 import { Button } from "@/components/ui";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { useExecutionStore } from "@/stores/executionStore";
@@ -20,8 +19,11 @@ import {
 } from "./workspaceStatus";
 
 export interface WorkspaceActionCapabilities {
+  /* `completion` also carries Import YAML: the bar's import trigger rides
+     inside CompletionBar, and everywhere this bar mounts the two
+     availability facts are the same one (!guidedBuildActive — the shared,
+     tutorial, and empty-landing views never render this bar). */
   completion: boolean;
-  importYaml: boolean;
   catalog: boolean;
 }
 
@@ -102,8 +104,7 @@ export function WorkspaceActionBar({
     snapshotsBySession,
     errorBySession: auditErrorsBySession,
   });
-  const hasSecondaryActions =
-    capabilities.importYaml || capabilities.catalog;
+  const hasSecondaryActions = capabilities.catalog;
 
   const menuButtons = (): HTMLButtonElement[] =>
     menuRef.current === null
@@ -231,7 +232,6 @@ export function WorkspaceActionBar({
                 }
               }}
             >
-              {capabilities.importYaml && <ImportYamlButton />}
               {capabilities.catalog && <CatalogButton />}
             </div>
           )}
