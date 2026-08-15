@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from time import monotonic
 from types import MappingProxyType
@@ -1176,15 +1177,14 @@ class TestFlush:
         finally:
             manager.close()
 
-    def test_flush_after_shutdown_skips_queue_join(self) -> None:
+    def test_flush_after_shutdown_is_rejected(self) -> None:
         config = MockTelemetryConfig()
         exporter = TelemetryTestExporter()
         manager = TelemetryManager(config, exporters=[exporter])
         manager.close()
-        # flush() after close should not hang - it skips queue.join()
-        manager.flush()
-        # Exporter flush is still called even after shutdown
-        assert exporter.flush_count == 1
+        with pytest.raises(RuntimeError, match="shutdown"):
+            manager.flush()
+        assert exporter.flush_count == 0
 
     def test_flush_multiple_times_safe(self) -> None:
         config = MockTelemetryConfig()
@@ -1407,6 +1407,327 @@ class TestClose:
         release_export.set()
         manager._export_thread.join(timeout=2.0)
         assert not manager._export_thread.is_alive()
+
+    def test_close_budget_cancels_blocked_enqueue_and_finalizes_after_recovery(self, monkeypatch) -> None:
+        """A saturated BLOCK producer cannot keep close outside its budget.
+
+        The producer is admitted before shutdown, but cannot enter the full
+        queue while the exporter is stalled. Shutdown must cancel that enqueue
+        before placing a sentinel; otherwise the event can land behind the
+        sentinel and remain unprocessed. The shutdown coordinator must retain
+        ownership and finish automatically after exporter recovery.
+        """
+        exporter = TelemetryTestExporter()
+        export_entered = threading.Event()
+        release_export = threading.Event()
+        blocked_put_entered = threading.Event()
+        close_returned = threading.Event()
+        original_export = exporter.export
+
+        def blocking_export(event):
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return original_export(event)
+
+        object.__setattr__(exporter, "export", blocking_export)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        with patch("elspeth.telemetry.manager.INTERNAL_DEFAULTS", _small_queue_defaults()):
+            manager = TelemetryManager(
+                MockTelemetryConfig(backpressure_mode=BackpressureMode.BLOCK),
+                exporters=[exporter],
+            )
+        original_put = manager._queue.put
+
+        def observed_put(item, *args, **kwargs):
+            if item is not None and manager._queue.full():
+                blocked_put_entered.set()
+            return original_put(item, *args, **kwargs)
+
+        monkeypatch.setattr(manager._queue, "put", observed_put)
+        manager.handle_event(_lifecycle_event())
+        assert export_entered.wait(timeout=2.0)
+        for _ in range(manager._queue.maxsize):
+            manager.handle_event(_lifecycle_event())
+
+        producer = threading.Thread(target=manager.handle_event, args=(_lifecycle_event(),))
+        producer.start()
+        assert blocked_put_entered.wait(timeout=2.0)
+
+        def close_manager() -> None:
+            manager.close()
+            close_returned.set()
+
+        closer = threading.Thread(target=close_manager)
+        started_at = monotonic()
+        closer.start()
+        returned_within_budget = close_returned.wait(timeout=0.5)
+        elapsed = monotonic() - started_at
+
+        release_export.set()
+        producer.join(timeout=5.0)
+        closer.join(timeout=5.0)
+        _wait_until(
+            lambda: (
+                len(exporter.events) == manager._queue.maxsize + 1 and not manager._export_thread.is_alive() and exporter.close_count == 1
+            )
+        )
+
+        assert returned_within_budget
+        assert elapsed < 0.5
+        assert not producer.is_alive()
+        assert manager._shutdown_coordinator is not None
+        assert manager._shutdown_coordinator.daemon is True
+        assert not manager._shutdown_coordinator.is_alive()
+        metrics = manager.health_metrics
+        assert metrics["events_attempted"] == manager._queue.maxsize + 2
+        assert metrics["events_delivered"] == manager._queue.maxsize + 1
+        assert metrics["events_dropped"] == 1
+        assert metrics["queue_drops"] == 1
+
+    def test_close_stops_waiting_for_sentinel_when_full_queue_worker_dies(self, monkeypatch) -> None:
+        exporter = TelemetryTestExporter()
+        export_entered = threading.Event()
+        release_export = threading.Event()
+        sentinel_wait_entered = threading.Event()
+
+        def failing_export(_event) -> None:
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            raise ValueError("export loop contract bug")
+
+        object.__setattr__(exporter, "export", failing_export)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        with patch("elspeth.telemetry.manager.INTERNAL_DEFAULTS", _small_queue_defaults()):
+            manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        original_join = manager._export_thread.join
+
+        def observed_join(*args, **kwargs):
+            if kwargs["timeout"] is not None:
+                sentinel_wait_entered.set()
+            return original_join(*args, **kwargs)
+
+        monkeypatch.setattr(manager._export_thread, "join", observed_join)
+        manager.handle_event(_lifecycle_event())
+        assert export_entered.wait(timeout=2.0)
+        for _ in range(manager._queue.maxsize):
+            manager.handle_event(_lifecycle_event())
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            close_result = executor.submit(manager.close)
+            assert sentinel_wait_entered.wait(timeout=2.0)
+            release_export.set()
+            with pytest.raises(ValueError, match="export loop contract bug"):
+                close_result.result(timeout=2.0)
+
+        assert manager._shutdown_coordinator is not None
+        assert not manager._shutdown_coordinator.is_alive()
+        assert not manager._export_thread.is_alive()
+        assert manager._queue.empty()
+        assert manager._queue.unfinished_tasks == 0
+        assert exporter.close_count == 1
+        metrics = manager.health_metrics
+        assert metrics["events_attempted"] == manager._queue.maxsize + 1
+        assert metrics["events_delivered"] == 0
+        assert metrics["events_failed"] == manager._queue.maxsize + 1
+        assert metrics["events_dropped"] == manager._queue.maxsize + 1
+        assert metrics["queue_drops"] == 0
+
+    def test_close_relays_export_loop_programming_error_once(self) -> None:
+        exporter = TelemetryTestExporter()
+
+        def failing_export(_event) -> None:
+            raise ValueError("export loop contract bug")
+
+        object.__setattr__(exporter, "export", failing_export)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        manager._export_thread.join(timeout=2.0)
+        assert not manager._export_thread.is_alive()
+
+        with pytest.raises(ValueError, match="export loop contract bug"):
+            manager.close()
+        manager.close()
+
+        assert exporter.close_count == 1
+
+    def test_programming_error_classifies_unacknowledged_in_flight_event_as_failed(self) -> None:
+        exporter = TelemetryTestExporter()
+
+        def failing_export(_event) -> None:
+            raise ValueError("export loop contract bug")
+
+        object.__setattr__(exporter, "export", failing_export)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        manager._export_thread.join(timeout=2.0)
+
+        with pytest.raises(ValueError, match="export loop contract bug"):
+            manager.close()
+
+        metrics = manager.health_metrics
+        assert metrics["events_attempted"] == 1
+        assert metrics["events_delivered"] == 0
+        assert metrics["events_failed"] == 1
+        assert metrics["events_dropped"] == 1
+        assert metrics["queue_drops"] == 0
+
+    def test_programming_error_preserves_prior_exporter_acknowledgement(self) -> None:
+        acknowledged = TelemetryTestExporter(name="acknowledged")
+        failing = TelemetryTestExporter(name="failing")
+
+        def failing_export(_event) -> None:
+            raise ValueError("later exporter contract bug")
+
+        object.__setattr__(failing, "export", failing_export)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[acknowledged, failing])
+        manager.handle_event(_lifecycle_event())
+        manager._export_thread.join(timeout=2.0)
+
+        with pytest.raises(ValueError, match="later exporter contract bug"):
+            manager.close()
+
+        metrics = manager.health_metrics
+        assert len(acknowledged.events) == 1
+        assert metrics["events_attempted"] == 1
+        assert metrics["events_delivered"] == 1
+        assert metrics["events_emitted"] == 1
+        assert metrics["events_failed"] == 0
+        assert metrics["events_dropped"] == 0
+        assert metrics["queue_drops"] == 0
+
+    def test_flush_rejected_while_timed_out_close_is_still_finalizing(self, monkeypatch) -> None:
+        exporter = TelemetryTestExporter()
+        export_entered = threading.Event()
+        release_export = threading.Event()
+        original_export = exporter.export
+
+        def blocking_export(event):
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return original_export(event)
+
+        object.__setattr__(exporter, "export", blocking_export)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        assert export_entered.wait(timeout=2.0)
+
+        manager.close()
+        with pytest.raises(RuntimeError, match="shutdown"):
+            manager.flush()
+        assert exporter.flush_count == 0
+
+        release_export.set()
+        assert manager._shutdown_coordinator is not None
+        manager._shutdown_coordinator.join(timeout=2.0)
+        assert not manager._shutdown_coordinator.is_alive()
+
+    def test_close_budget_includes_synchronous_exporter_close(self, monkeypatch) -> None:
+        exporter = TelemetryTestExporter()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        close_returned = threading.Event()
+
+        def blocking_close() -> None:
+            close_entered.set()
+            assert release_close.wait(timeout=5.0)
+
+        object.__setattr__(exporter, "close", blocking_close)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+
+        def close_manager() -> None:
+            manager.close()
+            close_returned.set()
+
+        closer = threading.Thread(target=close_manager)
+        started_at = monotonic()
+        closer.start()
+        assert close_entered.wait(timeout=2.0)
+        returned_within_budget = close_returned.wait(timeout=0.5)
+        elapsed = monotonic() - started_at
+
+        release_close.set()
+        closer.join(timeout=5.0)
+
+        assert returned_within_budget
+        assert elapsed < 0.5
+        assert not closer.is_alive()
+        coordinator = manager._shutdown_coordinator
+        assert coordinator is not None
+        assert coordinator.daemon is True
+        _wait_until(lambda: not coordinator.is_alive())
+
+    def test_close_is_idempotent_and_preserves_programming_error(self) -> None:
+        exporter = TelemetryTestExporter()
+        close_count = 0
+
+        def bad_close() -> None:
+            nonlocal close_count
+            close_count += 1
+            raise ValueError("exporter contract bug")
+
+        object.__setattr__(exporter, "close", bad_close)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+
+        with pytest.raises(ValueError, match="exporter contract bug"):
+            manager.close()
+        manager.close()
+
+        assert close_count == 1
+
+    def test_concurrent_close_consumes_programming_error_once(self) -> None:
+        exporter = TelemetryTestExporter()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+
+        def bad_close() -> None:
+            close_entered.set()
+            assert release_close.wait(timeout=5.0)
+            raise ValueError("exporter contract bug")
+
+        object.__setattr__(exporter, "close", bad_close)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = [executor.submit(manager.close) for _ in range(2)]
+            assert close_entered.wait(timeout=2.0)
+            threading.Event().wait(0.05)
+            release_close.set()
+            errors = [result.exception(timeout=2.0) for result in results]
+
+        assert sum(type(error) is ValueError for error in errors) == 1
+        assert errors.count(None) == 1
+        manager.close()
+
+    def test_close_surfaces_worker_error_while_exporter_close_finishes_late(self, monkeypatch) -> None:
+        exporter = TelemetryTestExporter()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+
+        def failing_export(_event) -> None:
+            raise ValueError("export loop contract bug")
+
+        def blocking_close() -> None:
+            close_entered.set()
+            assert release_close.wait(timeout=5.0)
+
+        object.__setattr__(exporter, "export", failing_export)
+        object.__setattr__(exporter, "close", blocking_close)
+        monkeypatch.setattr("elspeth.telemetry.manager._SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+        manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        manager._export_thread.join(timeout=2.0)
+
+        with pytest.raises(ValueError, match="export loop contract bug"):
+            manager.close()
+        assert close_entered.wait(timeout=2.0)
+        assert manager._shutdown_coordinator is not None
+        assert manager._shutdown_coordinator.is_alive()
+
+        release_close.set()
+        manager._shutdown_coordinator.join(timeout=2.0)
+        manager.close()
 
     @pytest.mark.parametrize(
         ("result", "expected_delivered", "expected_failed", "expected_dropped"),

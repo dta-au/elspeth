@@ -88,6 +88,8 @@ class AzureMonitorExporter:
         self._buffer: list[TelemetryEvent] = []
         self._trace_started_at: dict[str, datetime] = {}
         self._fresh_run_ids: set[str] = set()
+        self._fresh_run_finished_ids: set[str] = set()
+        self._fresh_run_span_completed_ids: set[str] = set()
         self._configured: bool = False
 
     @property
@@ -419,13 +421,24 @@ class AzureMonitorExporter:
         self._trace_started_at[run_id] = normalized
 
     def _record_run_finished(self, run_id: str) -> None:
-        """Release trace state after the terminal point event is converted."""
-        self._clear_trace_state(run_id)
-
-    def _record_run_span_completed(self, run_id: str) -> None:
-        """Release standalone/late run spans; fresh runs await RunFinished."""
+        """Record the terminal point; fresh runs await their enclosing span."""
         if run_id not in self._fresh_run_ids:
             self._clear_trace_state(run_id)
+            return
+        if run_id in self._fresh_run_span_completed_ids:
+            self._clear_trace_state(run_id)
+            return
+        self._fresh_run_finished_ids.add(run_id)
+
+    def _record_run_span_completed(self, run_id: str) -> None:
+        """Record the enclosing span; fresh runs await their terminal point."""
+        if run_id not in self._fresh_run_ids:
+            self._clear_trace_state(run_id)
+            return
+        if run_id in self._fresh_run_finished_ids:
+            self._clear_trace_state(run_id)
+            return
+        self._fresh_run_span_completed_ids.add(run_id)
 
     def _clear_trace_state(self, run_id: str) -> None:
         """Remove every registry entry for one terminal run."""
@@ -433,11 +446,17 @@ class AzureMonitorExporter:
             del self._trace_started_at[run_id]
         if run_id in self._fresh_run_ids:
             self._fresh_run_ids.remove(run_id)
+        if run_id in self._fresh_run_finished_ids:
+            self._fresh_run_finished_ids.remove(run_id)
+        if run_id in self._fresh_run_span_completed_ids:
+            self._fresh_run_span_completed_ids.remove(run_id)
 
     def _reset_trace_registry(self) -> None:
         """Discard exporter-local correlation state at a lifecycle boundary."""
         self._trace_started_at.clear()
         self._fresh_run_ids.clear()
+        self._fresh_run_finished_ids.clear()
+        self._fresh_run_span_completed_ids.clear()
 
     @staticmethod
     def _serialize_event_attributes(event: TelemetryEvent) -> dict[str, Any]:

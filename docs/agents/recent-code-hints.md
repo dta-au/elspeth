@@ -19,10 +19,17 @@ is a working document under the normal delivery posture.
   live at the universal scheduler-claim seam so fresh, resumed, and follower
   work share one path, and an operation span stays open through the engine's
   validation, authority, disposition, and terminal audit work — plugin return
-  alone is not success. A telemetry callback failure must not replace an active
-  workload failure. Telemetry shutdown must not evict a queued event merely to
-  make room for its sentinel, and its wait for an exporter that ignores I/O
-  timeouts must remain bounded.
+  alone is not success. Row and aggregation parents are path-dependent: fresh
+  ingestion may inherit source/row context, while late leader-drain, resume,
+  and follower work uses durable run correlation. A handled exception already
+  present in the caller is not a span-body failure, and a telemetry callback
+  failure must not replace or rewrite an active workload failure. Exporters
+  retain fresh-run trace origin until both `RunFinished` and the enclosing run
+  span completion arrive, in either order; joined/resumed runs clear on their
+  sole terminal event. Telemetry shutdown must not hold the lifecycle lock
+  during a blocking queue put or evict a queued event merely to make room for
+  its sentinel, and its wait for an exporter that ignores I/O timeouts must
+  remain bounded.
 
 - **2026-08-15 — a selector lane may contain SEVERAL trusted profile probes**:
   the state-engine profile reporter accepts repeated observations that agree on

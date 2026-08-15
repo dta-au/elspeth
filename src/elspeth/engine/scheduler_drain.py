@@ -76,6 +76,10 @@ SCHEDULER_MAINTENANCE_INTERVAL = 64
 logger = logging.getLogger(__name__)
 
 
+class RowResultError(Exception):
+    """Handled row result whose authoritative disposition is a failure."""
+
+
 class ProcessorMode(enum.Enum):
     """Explicit processor role for the mode-gated drain policy (elspeth-577179bba1).
 
@@ -746,6 +750,8 @@ class SchedulerDrainCoordinator:
                             branch_loss=branch_loss,
                             worker_id=worker_id,
                         )
+                    if sink_bound_result.outcome is TerminalOutcome.FAILURE:
+                        self._spans.mark_error(row_span, RowResultError())
                     result = with_scheduler_pending_sink_handoff(result, claimed.token_id)
                 elif scheduler_result_failed_claimed_token(result, claimed.token_id):
                     failed_now = self._clock.now_utc()
@@ -769,6 +775,7 @@ class SchedulerDrainCoordinator:
                             branch_loss=branch_loss,
                             worker_id=worker_id,
                         )
+                    self._spans.mark_error(row_span, RowResultError())
                 else:
                     terminal_now = self._clock.now_utc()
                     branch_loss = self.take_claim_branch_loss(claimed.token_id)
