@@ -109,6 +109,22 @@ describe("GuidedChatHistory live region", () => {
       screen.getByText("The CSV has price, quantity, and timestamp columns."),
     ).toBeInTheDocument();
   });
+
+  it("replay variant renders a static labelled group, not a nested live log (elspeth-2554bff719)", () => {
+    // The freeform transcript replays a TERMINAL guided session's history
+    // inside its own role=log region; the settled replay must not nest a
+    // second live region there. Rows are unchanged — same bubbles, content.
+    render(<GuidedChatHistory chatHistory={TWO_TURNS} replay />);
+
+    const group = screen.getByRole("group", {
+      name: "Guided build conversation",
+    });
+    expect(group).not.toHaveAttribute("aria-live");
+    expect(screen.queryByRole("log")).not.toBeInTheDocument();
+    expect(group).toHaveTextContent(
+      "The CSV has price, quantity, and timestamp columns.",
+    );
+  });
 });
 
 // ── 3. Freeform bubble idiom ─────────────────────────────────────────────────

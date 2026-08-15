@@ -25,6 +25,8 @@ import {
 } from "@/api/client";
 import { MessageBubble } from "./MessageBubble";
 import { groupIntoTurns, turnRepresentativeMessage, type ChatTurn } from "./turns";
+import { dedupeGuidedUserMessages } from "./guidedReplay";
+import type { ChatTurn as GuidedWireChatTurn } from "@/types/guided";
 import { ComposingIndicator } from "./ComposingIndicator";
 import { AuthorityChip } from "./AuthorityChip";
 import { ChatInput, uploadedBlobPromptSentence } from "./ChatInput";
@@ -615,6 +617,10 @@ function uploadMatchesSourcePlugin(plugin: string, filename: string): boolean {
 
 const CANONICAL_BLOB_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
+// Stable empty for the guided-replay selector: a fresh [] per call would fail
+// zustand's Object.is bail-out and re-render the panel on every store write.
+const EMPTY_GUIDED_REPLAY_HISTORY: GuidedWireChatTurn[] = [];
+
 /**
  * Main chat panel combining the message list, composing indicator, and input.
  *
@@ -627,10 +633,31 @@ export function ChatPanel({
   lockedChatPrompt,
 }: ChatPanelProps) {
   const messages = useSessionStore((s) => s.messages);
+  // Guided replay (elspeth-2554bff719): a TERMINAL guided session's assistant
+  // conversation exists only in guidedSession.chat_history — guided turns
+  // persist zero role='assistant' chat_messages rows — so when the
+  // discriminator below falls through to this freeform body the whole guided
+  // conversation would otherwise vanish. Select the history here (not from
+  // the `guidedSession` selector further down: this feeds the chatTurns memo
+  // above the discriminator hoists) and render it at the top of the message
+  // log. Terminal-gated: a LIVE guided session renders its history on the
+  // guided surface itself, and the transient guidedNextTurn-null fall-through
+  // must not double-render it. The stable EMPTY keeps the selector
+  // referentially settled for zustand's Object.is comparison.
+  const guidedReplayHistory = useSessionStore((s) =>
+    s.guidedSession !== null && s.guidedSession.terminal !== null
+      ? s.guidedSession.chat_history
+      : EMPTY_GUIDED_REPLAY_HISTORY,
+  );
   // Project audit-grade message rows onto user-visible turns. One bubble per
   // turn — see ./turns.ts for the grouping rules. Memoised on the messages
   // reference because the store updates the array on append, not in place.
-  const chatTurns = useMemo(() => groupIntoTurns(messages), [messages]);
+  // The guided-phase user rows duplicated in the replayed history are
+  // filtered out first (consumption dedupe — see guidedReplay.ts).
+  const chatTurns = useMemo(
+    () => groupIntoTurns(dedupeGuidedUserMessages(messages, guidedReplayHistory)),
+    [messages, guidedReplayHistory],
+  );
   // Last complete agent turn id — the inline-source summary attaches to this
   // turn's bubble. null when no complete agent turn exists yet (e.g. fresh
   // session, mid-flight first turn, or session-restore before any chat); the
@@ -2860,7 +2887,19 @@ export function ChatPanel({
           aria-relevant="additions"
           tabIndex={0}
         >
-          {messages.length === 0 ? (
+          {/* Terminal guided session's conversation, replayed above the
+              freeform turns (elspeth-2554bff719): the assistant's guided
+              replies exist ONLY in guidedSession.chat_history, so without
+              this block a graduated tutorial / exited guided build shows a
+              transcript of user turns talking to nobody. Read-only replay —
+              no synthetic-failure Retry — and a static group rather than the
+              component's usual nested live log. The guided-phase user rows
+              in `messages` are deduped out of chatTurns above, so each turn
+              renders exactly once. */}
+          {guidedReplayHistory.length > 0 && (
+            <GuidedChatHistory chatHistory={guidedReplayHistory} replay />
+          )}
+          {messages.length === 0 && guidedReplayHistory.length === 0 ? (
             <FreeformIntroduction />
           ) : (
             // Render one bubble per *turn*, not one per audit row. The compose

@@ -5122,6 +5122,94 @@ assistant_message_kind: "synthetic_failure",
     ).toBeNull();
   });
 
+  it("replays a terminal guided session's conversation in the freeform body, deduping guided-phase user rows (elspeth-2554bff719)", () => {
+    // Guided turns persist zero role='assistant' chat_messages rows: the
+    // assistant conversation lives only in guidedSession.chat_history, while
+    // the user's guided sends land in BOTH stores. Without the replay block
+    // the freeform fall-through shows user turns talking to nobody.
+    const terminal: TerminalState = {
+      kind: "exited_to_freeform",
+      reason: "user_pressed_exit",
+      pipeline_yaml: null,
+    };
+    const guidedPrompt = "Please create a CSV source for this pipeline.";
+    const postGraduationPrompt = "Now rename the sink to results.json.";
+
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [
+        // The guided-phase duplicate of the chat_history user turn…
+        {
+          id: "message-guided-user",
+          session_id: "session-guided",
+          role: "user",
+          content: guidedPrompt,
+          tool_calls: null,
+          created_at: "2026-08-15T05:17:04Z",
+        },
+        // …and an ordinary freeform send after graduation.
+        {
+          id: "message-freeform-user",
+          session_id: "session-guided",
+          role: "user",
+          content: postGraduationPrompt,
+          tool_calls: null,
+          created_at: "2026-08-15T06:30:00Z",
+        },
+      ],
+      guidedSession: {
+        step: "step_1_source",
+        history: [],
+        terminal,
+        chat_history: [
+          {
+            role: "user",
+            content: guidedPrompt,
+            seq: 0,
+            step: "step_1_source",
+            ts_iso: "2026-08-15T05:17:04Z",
+            assistant_message_kind: null,
+            synthetic_failure_reason: null,
+            turn_token: "a".repeat(64),
+          },
+          {
+            role: "assistant",
+            content: "Added a CSV source reading those three pages.",
+            seq: 1,
+            step: "step_1_source",
+            ts_iso: "2026-08-15T05:17:11Z",
+            assistant_message_kind: "assistant",
+            synthetic_failure_reason: null,
+            turn_token: null,
+          },
+        ],
+        chat_turn_seq: 2,
+        profile: null,
+      },
+      guidedNextTurn: null,
+      guidedTerminal: terminal,
+    });
+
+    render(<ChatPanel />);
+
+    // The replayed assistant reply is visible on the freeform surface, in a
+    // STATIC replay group — not the live-log variant the guided surface uses.
+    const replayGroup = screen.getByRole("group", {
+      name: "Guided build conversation",
+    });
+    expect(replayGroup).toHaveTextContent(
+      "Added a CSV source reading those three pages.",
+    );
+    // The guided-phase user row is deduped: its prompt renders exactly once
+    // (the replayed turn), not twice.
+    expect(screen.getAllByText(guidedPrompt)).toHaveLength(1);
+    // Post-graduation freeform sends still render as ordinary bubbles.
+    expect(screen.getByText(postGraduationPrompt)).toBeInTheDocument();
+    // The empty-transcript introduction never renders alongside a replay.
+    expect(screen.queryByText(/describe the pipeline/i)).not.toBeInTheDocument();
+  });
+
   it("keeps 'Switch to guided' enabled (reenterable) when the terminal reason is user_pressed_exit", () => {
     // Reversible operator exit — POST /guided/reenter still honours it
     // (routes/composer/guided.py post_guided_reenter). Disabling here would

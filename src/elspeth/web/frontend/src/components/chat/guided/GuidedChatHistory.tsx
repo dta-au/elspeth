@@ -51,6 +51,15 @@ interface Props {
    */
   onRetrySyntheticFailure?: (turn: ChatTurn) => void;
   retryDisabled?: boolean;
+  /**
+   * Replay rendering (elspeth-2554bff719): the freeform transcript replays a
+   * TERMINAL guided session's conversation inside its own role="log" region.
+   * The replayed history is settled — no new guided turns can arrive — so a
+   * nested live log there would be dishonest semantics and risks
+   * double-announcing in the enclosing region. `replay` swaps the root to a
+   * labelled static group and changes nothing else about the rows.
+   */
+  replay?: boolean;
 }
 
 /**
@@ -77,6 +86,7 @@ export function GuidedChatHistory({
   chatHistory,
   onRetrySyntheticFailure,
   retryDisabled = false,
+  replay = false,
 }: Props): React.ReactElement | null {
   if (chatHistory.length === 0) {
     return null;
@@ -183,6 +193,18 @@ export function GuidedChatHistory({
           {isUser ? turn.content : <MarkdownRenderer content={turn.content} />}
         </div>
       </div>,
+    );
+  }
+
+  if (replay) {
+    return (
+      <div
+        className="guided-chat-bubbles"
+        role="group"
+        aria-label="Guided build conversation"
+      >
+        {rows}
+      </div>
     );
   }
 
