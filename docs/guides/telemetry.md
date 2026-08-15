@@ -259,6 +259,13 @@ do not modify the repository `.venv` ad hoc.
 **Datadog-specific features:**
 - All event fields available as `elspeth.*` tags
 - Native Datadog APM integration
+- Completed engine spans retain their real duration and expose stable
+  `elspeth.trace_id`, `elspeth.span_id`, and `elspeth.parent_span_id`
+  correlation tags. They set `elspeth.hierarchy_mode=correlation_tags` because
+  the public `ddtrace` `Tracer.start_span` API cannot accept the caller-selected
+  current span ID required to reconstruct ELSPETH's post-hoc completion-event
+  hierarchy. Use the OTLP or Azure Monitor exporter when backend-native parent
+  links are required.
 - Works with local Datadog Agent
 
 **Using with Datadog Agent (recommended):**

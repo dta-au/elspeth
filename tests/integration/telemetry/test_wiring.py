@@ -14,11 +14,14 @@ Migrated from tests/integration/test_telemetry_wiring.py
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
-from elspeth.contracts import Determinism
+import pytest
+
+from elspeth.contracts import Determinism, SourceRow
 from elspeth.contracts.enums import RunStatus, TelemetryGranularity
-from elspeth.contracts.events import RunStarted
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, RunStarted
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -96,6 +99,172 @@ class TestOrchestratorWiresTelemetryToContext:
         run_finished = exporter.get_events_of_type("RunFinished")[0]
         assert run_started.run_id == result.run_id
         assert run_finished.run_id == result.run_id
+
+        engine_spans = [event for event in exporter.events if isinstance(event, EngineSpanCompleted)]
+        names = {event.name for event in engine_spans}
+        assert {
+            EngineSpanName.RUN,
+            EngineSpanName.SOURCE,
+            EngineSpanName.ROW,
+            EngineSpanName.TRANSFORM,
+            EngineSpanName.SINK,
+        } <= names
+        assert {event.run_id for event in engine_spans} == {result.run_id}
+        run_span = next(event for event in engine_spans if event.name is EngineSpanName.RUN)
+        source_span = next(event for event in engine_spans if event.name is EngineSpanName.SOURCE)
+        assert all(event.trace_started_at == run_span.trace_started_at for event in engine_spans)
+        assert source_span.parent_span_id == run_span.span_id
+        assert all(event.parent_span_id == source_span.span_id for event in engine_spans if event.name is EngineSpanName.ROW)
+        assert all(event.parent_span_id == run_span.span_id for event in engine_spans if event.name is EngineSpanName.SINK)
+
+    def test_run_span_covers_terminal_audit_and_finalization_failures(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        source = ListSource([{"id": 1}], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+        orchestrator = Orchestrator(landscape_db, telemetry_manager=telemetry_manager)
+
+        def fail_terminal_audit(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("terminal audit failed")
+
+        monkeypatch.setattr(
+            "elspeth.engine.orchestrator.run_lifecycle.derive_terminal_status_from_audit",
+            fail_terminal_audit,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="terminal audit failed"):
+                orchestrator.run(
+                    pipeline_config,
+                    graph=create_test_graph(pipeline_config),
+                    payload_store=payload_store,
+                )
+        finally:
+            telemetry_manager.close()
+
+        run_span = next(event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.RUN)
+        assert run_span.status is EngineSpanStatus.ERROR
+        assert run_span.exception_type == "RuntimeError"
+
+    def test_source_span_covers_post_load_source_audit_failure(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Source completion waits for source-owned validation and audit work."""
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        source = ListSource([{"id": 1}], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+        orchestrator = Orchestrator(landscape_db, telemetry_manager=telemetry_manager)
+
+        def fail_source_audit(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("source audit failed")
+
+        monkeypatch.setattr(
+            "elspeth.engine.orchestrator.source_lifecycle_recorder.SourceLifecycleRecorder.record_field_resolution",
+            fail_source_audit,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="source audit failed"):
+                orchestrator.run(
+                    pipeline_config,
+                    graph=create_test_graph(pipeline_config),
+                    payload_store=payload_store,
+                )
+        finally:
+            telemetry_manager.close()
+
+        source_span = next(
+            event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.SOURCE
+        )
+        assert source_span.status is EngineSpanStatus.ERROR
+        assert source_span.exception_type == "RuntimeError"
+
+    def test_empty_source_still_emits_one_successful_source_span(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+    ) -> None:
+        """An empty iterator is a completed source operation, not no operation."""
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        source = ListSource([], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+        orchestrator = Orchestrator(landscape_db, telemetry_manager=telemetry_manager)
+
+        try:
+            result = orchestrator.run(
+                pipeline_config,
+                graph=create_test_graph(pipeline_config),
+                payload_store=payload_store,
+            )
+        finally:
+            telemetry_manager.close()
+
+        source_spans = [
+            event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.SOURCE
+        ]
+        assert result.status is RunStatus.EMPTY
+        assert len(source_spans) == 1
+        assert source_spans[0].status is EngineSpanStatus.OK
+
+    def test_late_source_iterator_failure_marks_source_span_error(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+    ) -> None:
+        """The source span remains active after the first yielded row."""
+
+        class LateFailureSource(ListSource):
+            def load(self, ctx: Any) -> Iterator[SourceRow]:
+                rows = self.wrap_rows([{"id": 1}])
+                yield next(rows)
+                raise RuntimeError("late source read failed")
+
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(MockTelemetryConfig(), exporters=[exporter])
+        source = LateFailureSource([], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+        orchestrator = Orchestrator(landscape_db, telemetry_manager=telemetry_manager)
+
+        try:
+            with pytest.raises(RuntimeError, match="late source read failed"):
+                orchestrator.run(
+                    pipeline_config,
+                    graph=create_test_graph(pipeline_config),
+                    payload_store=payload_store,
+                )
+        finally:
+            telemetry_manager.close()
+
+        source_spans = [
+            event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.SOURCE
+        ]
+        assert len(source_spans) == 1
+        assert source_spans[0].status is EngineSpanStatus.ERROR
+        assert source_spans[0].exception_type == "RuntimeError"
 
     def test_context_telemetry_emit_is_callable(
         self,

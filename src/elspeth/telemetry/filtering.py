@@ -11,6 +11,8 @@ used by TelemetryManager to decide which events to emit.
 
 from elspeth.contracts.enums import TelemetryGranularity
 from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
     ExternalCallCompleted,
     FieldResolutionApplied,
     GateEvaluated,
@@ -56,6 +58,13 @@ def should_emit(event: TelemetryEvent, granularity: TelemetryGranularity) -> boo
         True
     """
     match event:
+        # Whole-run and source-load spans are lifecycle visibility. Detailed
+        # row/traversal/sink spans follow the existing row granularity policy.
+        case EngineSpanCompleted(name=EngineSpanName.RUN | EngineSpanName.SOURCE):
+            return True
+        case EngineSpanCompleted():
+            return granularity in (TelemetryGranularity.ROWS, TelemetryGranularity.FULL)
+
         # Lifecycle events: always emit at any granularity
         case RunStarted() | RunFinished() | PhaseChanged() | ResourceCleanupFailed():
             return True

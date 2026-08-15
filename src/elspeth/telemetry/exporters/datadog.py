@@ -12,11 +12,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
+from elspeth.telemetry.serialization import derive_trace_id
 
 if TYPE_CHECKING:
     from ddtrace._trace.tracer import Tracer
@@ -247,8 +249,8 @@ class DatadogExporter:
     def _create_span_for_event(self, event: TelemetryEvent) -> None:
         """Create a Datadog span for the given event.
 
-        The span is created and immediately finished since telemetry events
-        represent completed operations (points in time, not durations).
+        Point telemetry is represented as an instant span. Engine span
+        completions retain their original start and completion timestamps.
 
         IMPORTANT: Uses explicit timestamps from event.timestamp rather than
         letting ddtrace auto-timestamp at export time. This ensures spans
@@ -261,12 +263,20 @@ class DatadogExporter:
         if self._tracer is None:
             return
 
-        event_type = type(event).__name__
+        event_class = type(event)
+        if event_class is EngineSpanCompleted:
+            engine_event = cast("EngineSpanCompleted", event)
+            event_type = engine_event.name.value
+            started_at = engine_event.started_at
+        else:
+            engine_event = None
+            event_type = type(event).__name__
+            started_at = event.timestamp
 
         # Convert event timestamp to Unix seconds and nanoseconds
         # ddtrace finish() expects seconds, but start_ns is in nanoseconds
         event_unix_seconds = event.timestamp.timestamp()
-        event_ns = int(event_unix_seconds * 1_000_000_000)
+        event_ns = int(started_at.timestamp() * 1_000_000_000)
 
         # Create span (ddtrace 4.x removed 'start' parameter from start_span)
         span = self._tracer.start_span(
@@ -289,11 +299,34 @@ class DatadogExporter:
             span.set_tag("elspeth.run_id", event.run_id)
             span.set_tag("elspeth.event_type", event_type)
 
-            # Set all event fields as tags
-            self._set_event_tags(span, event)
+            if engine_event is not None:
+                trace_id = derive_trace_id(engine_event.run_id, started_at=engine_event.trace_started_at)
+                # The public ddtrace Tracer.start_span API accepts a parent
+                # Context but always generates the current span ID. ELSPETH's
+                # post-hoc completion events need their caller-selected IDs so
+                # later events can reference them. A child_of Context alone
+                # would therefore create orphaned native links. Preserve the
+                # coherent cross-export hierarchy as explicit correlation tags
+                # without private SDK mutation or provider-specific buffering.
+                span.set_tag("elspeth.trace_id", f"{trace_id:032x}")
+                span.set_tag("elspeth.span_id", engine_event.span_id)
+                if engine_event.parent_span_id is not None:
+                    span.set_tag("elspeth.parent_span_id", engine_event.parent_span_id)
+                span.set_tag("elspeth.hierarchy_mode", "correlation_tags")
+                span.set_tag("elspeth.trace_started_at", engine_event.trace_started_at.isoformat())
+                span.set_tag("elspeth.span_status", engine_event.status.value)
+                for key, value in engine_event.attributes.items():
+                    self._set_tag_value(span, key, value)
+                if engine_event.status is EngineSpanStatus.ERROR:
+                    span.error = 1
+                    if engine_event.exception_type is not None:
+                        span.set_tag("error.type", engine_event.exception_type)
+            else:
+                # Set all event fields as tags
+                self._set_event_tags(span, event)
         finally:
-            # Finish span with explicit timestamp (instant span - start == finish)
-            # This ensures proper cleanup even if tag setting fails
+            # Finish with the event completion timestamp. For point events it
+            # equals start; completed engine spans retain their real duration.
             span.finish(finish_time=event_unix_seconds)
 
     def _set_event_tags(self, span: Any, event: TelemetryEvent) -> None:

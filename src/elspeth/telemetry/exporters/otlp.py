@@ -12,13 +12,13 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from time import time_ns
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit
 
 import structlog
 from opentelemetry.sdk.trace.export import SpanExportResult
 
-from elspeth.contracts.events import RunFinished, RunStarted
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, RunFinished, RunStarted
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.protocols import ExporterDeliveryMetrics
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
@@ -140,6 +140,9 @@ class OTLPExporter:
         self._last_success_unix_nano: int | None = None
         self._lifecycle_failures = 0
         self._trace_started_at: dict[str, datetime] = {}
+        self._fresh_run_ids: set[str] = set()
+        self._fresh_run_finished_ids: set[str] = set()
+        self._fresh_run_span_completed_ids: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -288,6 +291,7 @@ class OTLPExporter:
         self._consecutive_failures = 0
         self._last_success_unix_nano = None
         self._lifecycle_failures = 0
+        self._reset_trace_registry()
 
     def export(self, event: TelemetryEvent) -> bool | None:
         """Export a single telemetry event.
@@ -403,24 +407,28 @@ class OTLPExporter:
         """
         from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
 
+        event_type = type(event)
+        if event_type is EngineSpanCompleted:
+            engine_event = cast("EngineSpanCompleted", event)
+            self._bind_trace_started_at(engine_event.run_id, engine_event.trace_started_at)
+            span = self._engine_event_to_span(engine_event)
+            if engine_event.name is EngineSpanName.RUN:
+                self._record_run_span_completed(engine_event.run_id)
+            return span
+
         # X-Ray interprets the high trace-ID word as the trace-start epoch.
         # Remember the first durable lifecycle timestamp so every later span
         # for the run preserves the same identity.
-        started_at = self._trace_started_at.get(event.run_id)
-        if isinstance(event, RunStarted):
-            if started_at is not None and int(started_at.timestamp()) != int(event.timestamp.timestamp()):
-                raise TelemetryExporterError(self._name, "run trace start changed after binding")
-            started_at = event.timestamp
-        elif started_at is None:
+        if event_type is RunStarted:
+            run_started = cast("RunStarted", event)
+            self._bind_trace_started_at(run_started.run_id, run_started.timestamp)
+            self._fresh_run_ids.add(run_started.run_id)
+        elif event.run_id not in self._trace_started_at:
             # Standalone/custom telemetry may not include RunStarted. Its first
             # observed event still needs a structurally valid trace identity.
-            started_at = event.timestamp
-        if event.run_id not in self._trace_started_at and len(self._trace_started_at) >= _MAX_TRACKED_TRACE_RUNS:
-            raise TelemetryExporterError(self._name, "active trace identity capacity exceeded")
-        self._trace_started_at[event.run_id] = started_at
+            self._bind_trace_started_at(event.run_id, event.timestamp)
+        started_at = self._trace_started_at[event.run_id]
         trace_id = derive_trace_id(event.run_id, started_at=started_at)
-        if isinstance(event, RunFinished):
-            self._trace_started_at.pop(event.run_id, None)
         span_id = generate_span_id()
 
         # Convert timestamp to nanoseconds since epoch
@@ -458,7 +466,100 @@ class OTLPExporter:
             status=status,
         )
 
+        if event_type is RunFinished:
+            run_finished = cast("RunFinished", event)
+            self._record_run_finished(run_finished.run_id)
+
         return span
+
+    def _bind_trace_started_at(self, run_id: str, started_at: datetime) -> None:
+        """Bind or verify one run's durable trace origin."""
+        normalized = started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else started_at.astimezone(UTC)
+        if run_id in self._trace_started_at:
+            existing = self._trace_started_at[run_id]
+            if existing != normalized:
+                raise TelemetryExporterError(self._name, "run trace start changed after binding")
+            return
+        if len(self._trace_started_at) >= _MAX_TRACKED_TRACE_RUNS:
+            raise TelemetryExporterError(self._name, "active trace identity capacity exceeded")
+        self._trace_started_at[run_id] = normalized
+
+    def _record_run_finished(self, run_id: str) -> None:
+        """Record the terminal point; fresh runs await their enclosing span."""
+        if run_id not in self._fresh_run_ids:
+            self._clear_trace_state(run_id)
+            return
+        if run_id in self._fresh_run_span_completed_ids:
+            self._clear_trace_state(run_id)
+            return
+        self._fresh_run_finished_ids.add(run_id)
+
+    def _record_run_span_completed(self, run_id: str) -> None:
+        """Record the enclosing span; fresh runs await their terminal point."""
+        if run_id not in self._fresh_run_ids:
+            self._clear_trace_state(run_id)
+            return
+        if run_id in self._fresh_run_finished_ids:
+            self._clear_trace_state(run_id)
+            return
+        self._fresh_run_span_completed_ids.add(run_id)
+
+    def _clear_trace_state(self, run_id: str) -> None:
+        """Remove every registry entry for one terminal run."""
+        if run_id in self._trace_started_at:
+            del self._trace_started_at[run_id]
+        if run_id in self._fresh_run_ids:
+            self._fresh_run_ids.remove(run_id)
+        if run_id in self._fresh_run_finished_ids:
+            self._fresh_run_finished_ids.remove(run_id)
+        if run_id in self._fresh_run_span_completed_ids:
+            self._fresh_run_span_completed_ids.remove(run_id)
+
+    def _reset_trace_registry(self) -> None:
+        """Discard exporter-local correlation state at a lifecycle boundary."""
+        self._trace_started_at.clear()
+        self._fresh_run_ids.clear()
+        self._fresh_run_finished_ids.clear()
+        self._fresh_run_span_completed_ids.clear()
+
+    def _engine_event_to_span(self, event: EngineSpanCompleted) -> SyntheticReadableSpan:
+        """Reconstruct one completed engine span without opening a new SDK span."""
+        from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
+
+        trace_id = derive_trace_id(event.run_id, started_at=event.trace_started_at)
+        trace_flags = TraceFlags(TraceFlags.SAMPLED)
+        span_context = SpanContext(
+            trace_id=trace_id,
+            span_id=int(event.span_id, 16),
+            is_remote=False,
+            trace_flags=trace_flags,
+        )
+        parent = None
+        if event.parent_span_id is not None:
+            parent = SpanContext(
+                trace_id=trace_id,
+                span_id=int(event.parent_span_id, 16),
+                is_remote=False,
+                trace_flags=trace_flags,
+            )
+
+        attributes: dict[str, Any] = dict(event.attributes)
+        attributes["run_id"] = event.run_id
+        attributes["event_type"] = type(event).__name__
+        if event.exception_type is not None:
+            attributes["exception_type"] = event.exception_type
+
+        return SyntheticReadableSpan(
+            name=event.name.value,
+            context=span_context,
+            parent=parent,
+            attributes=attributes,
+            start_time=int(event.started_at.timestamp() * 1_000_000_000),
+            end_time=int(event.timestamp.timestamp() * 1_000_000_000),
+            kind=SpanKind.INTERNAL,
+            resource=self._resource,
+            status=Status(StatusCode.ERROR if event.status is EngineSpanStatus.ERROR else StatusCode.OK),
+        )
 
     @staticmethod
     def _serialize_event_attributes(event: TelemetryEvent) -> dict[str, Any]:
@@ -503,6 +604,7 @@ class OTLPExporter:
                 )
                 self._lifecycle_failures += 1
             self._span_exporter = None
+        self._reset_trace_registry()
         self._configured = False
 
 

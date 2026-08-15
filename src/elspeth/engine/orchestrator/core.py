@@ -118,7 +118,9 @@ class Orchestrator:
         self._db = db
         self._events = event_bus if event_bus is not None else NullEventBus()
         self._canonical_version = canonical_version
-        self._span_factory = SpanFactory()
+        self._span_factory = SpanFactory(
+            telemetry_emit=telemetry_manager.handle_event if telemetry_manager is not None else None,
+        )
         self._checkpoint_manager = checkpoint_manager
         self._clock = clock if clock is not None else DEFAULT_CLOCK
         self._rate_limit_registry = rate_limit_registry
@@ -152,6 +154,7 @@ class Orchestrator:
             checkpoints=self._checkpoints,
             context_factory=self._context_factory,
             sink_flush=self._sink_flush,
+            span_factory=self._span_factory,
             checkpoint_manager=self._checkpoint_manager,
         )
         self._graph_registration = GraphRegistrationService(

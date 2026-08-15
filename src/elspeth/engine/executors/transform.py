@@ -67,6 +67,10 @@ def _scrub_transform_error_details(error_details: "TransformErrorReason") -> "Tr
     return cast("TransformErrorReason", scrubbed)
 
 
+class TransformResultError(Exception):
+    """Marker for a handled TransformResult.error operation outcome."""
+
+
 def record_transform_error_with_routing(
     *,
     ctx: PluginContext,
@@ -735,18 +739,27 @@ class TransformExecutor:
         # If any unhandled exception occurs before guard.complete() is called
         # (e.g., in output hashing or contract evolution), the guard auto-
         # completes the state as FAILED.
-        with NodeStateGuard(
-            self._execution,
-            token_id=token.token_id,
-            node_id=node_id,
-            run_id=ctx.run_id,
-            step_index=step,
-            input_data=input_dict,
-            # resume_attempt_offset is the generation base (run-1 max+1 for a re-driven token;
-            # 0 for run-1 tokens); `attempt` is the tenacity retry index within this generation.
-            attempt=token.resume_attempt_offset + attempt,
-            resume_checkpoint_id=token.resume_checkpoint_id,
-        ) as guard:
+        with (
+            self._spans.transform_span(
+                transform.name,
+                node_id=node_id,
+                input_hash=input_hash,
+                token_id=token.token_id,
+                run_id=ctx.run_id,
+            ) as transform_span,
+            NodeStateGuard(
+                self._execution,
+                token_id=token.token_id,
+                node_id=node_id,
+                run_id=ctx.run_id,
+                step_index=step,
+                input_data=input_dict,
+                # resume_attempt_offset is the generation base (run-1 max+1 for a re-driven token;
+                # 0 for run-1 tokens); `attempt` is the tenacity retry index within this generation.
+                attempt=token.resume_attempt_offset + attempt,
+                resume_checkpoint_id=token.resume_checkpoint_id,
+            ) as guard,
+        ):
             # --- PREFLIGHT (pre-invocation checks) ---
             # Lifecycle guard, field-collision enforcement, pre-emission
             # declaration-contract dispatch (ADR-010/ADR-013), and input-schema
@@ -770,60 +783,51 @@ class TransformExecutor:
                 contract=token.row_data.contract,
                 token=token,
             ):
-                # Execute with timing and span
-                # Pass token_id for accurate child token attribution in traces
-                # Pass node_id for disambiguation when multiple plugin instances exist
-                with self._spans.transform_span(
-                    transform.name,
-                    node_id=node_id,
-                    input_hash=input_hash,
-                    token_id=token.token_id,
-                ):
-                    start = time.perf_counter()
-                    try:
-                        # Invocation-mode selection (sync process() vs batch-runtime
-                        # accept()+wait) lives in _invoke_transform; timing, FAILED
-                        # completion, and timeout eviction stay here with the guard.
-                        result = self._invoke_transform(
-                            transform=transform,
-                            batch_runtime=batch_runtime,
-                            token=token,
-                            ctx=ctx,
-                            state_id=guard.state_id,
-                        )
-                        duration_ms = (time.perf_counter() - start) * 1000
-                    except contract_errors.TIER_1_ERRORS:
-                        self._verify_ownership_before_terminal_audit(guard)
-                        raise  # Tier 1 errors must crash — never record as row FAILED
-                    except Exception as e:
-                        duration_ms = (time.perf_counter() - start) * 1000
-                        self._verify_ownership_before_terminal_audit(guard)
-                        # Record failure
-                        error = ExecutionError(
-                            exception=str(e),
-                            exception_type=type(e).__name__,
-                        )
-                        guard.complete(
-                            NodeStateStatus.FAILED,
-                            duration_ms=duration_ms,
-                            error=error,
-                        )
+                start = time.perf_counter()
+                try:
+                    # Invocation-mode selection (sync process() vs batch-runtime
+                    # accept()+wait) lives in _invoke_transform; timing, FAILED
+                    # completion, and timeout eviction stay here with the guard.
+                    result = self._invoke_transform(
+                        transform=transform,
+                        batch_runtime=batch_runtime,
+                        token=token,
+                        ctx=ctx,
+                        state_id=guard.state_id,
+                    )
+                    duration_ms = (time.perf_counter() - start) * 1000
+                except contract_errors.TIER_1_ERRORS:
+                    self._verify_ownership_before_terminal_audit(guard)
+                    raise  # Tier 1 errors must crash — never record as row FAILED
+                except Exception as e:
+                    duration_ms = (time.perf_counter() - start) * 1000
+                    self._verify_ownership_before_terminal_audit(guard)
+                    # Record failure
+                    error = ExecutionError(
+                        exception=str(e),
+                        exception_type=type(e).__name__,
+                    )
+                    guard.complete(
+                        NodeStateStatus.FAILED,
+                        duration_ms=duration_ms,
+                        error=error,
+                    )
 
-                        # For TimeoutError on batch transforms, evict the buffer entry
-                        # to prevent FIFO blocking on retry attempts.
-                        #
-                        # The eviction flow:
-                        # 1. First attempt times out at waiter.wait()
-                        # 2. We call evict_submission() to remove buffer entry
-                        # 3. Retry attempt gets new sequence number and can proceed
-                        # 4. Original worker may still complete, but result is discarded
-                        if isinstance(e, TimeoutError) and batch_runtime is not None:
-                            try:
-                                batch_runtime.evict_submission(token.token_id, guard.state_id)
-                            except Exception as evict_err:
-                                raise RuntimeError(f"Failed to evict timed-out submission for token {token.token_id}") from evict_err
+                    # For TimeoutError on batch transforms, evict the buffer entry
+                    # to prevent FIFO blocking on retry attempts.
+                    #
+                    # The eviction flow:
+                    # 1. First attempt times out at waiter.wait()
+                    # 2. We call evict_submission() to remove buffer entry
+                    # 3. Retry attempt gets new sequence number and can proceed
+                    # 4. Original worker may still complete, but result is discarded
+                    if isinstance(e, TimeoutError) and batch_runtime is not None:
+                        try:
+                            batch_runtime.evict_submission(token.token_id, guard.state_id)
+                        except Exception as evict_err:
+                            raise RuntimeError(f"Failed to evict timed-out submission for token {token.token_id}") from evict_err
 
-                        raise
+                    raise
 
                 self._verify_ownership_before_terminal_audit(guard)
 
@@ -892,6 +896,7 @@ class TransformExecutor:
                 else:
                     # Transform returned error status (not exception)
                     # This is a LEGITIMATE processing failure, not a bug
+                    self._spans.mark_error(transform_span, TransformResultError())
 
                     # Handle error routing - on_error is part of TransformProtocol
                     on_error = transform.on_error

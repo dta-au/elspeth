@@ -18,6 +18,9 @@ from elspeth.contracts.enums import (
     TerminalPath,
 )
 from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
+    EngineSpanStatus,
     ExternalCallCompleted,
     FieldResolutionApplied,
     GateEvaluated,
@@ -144,6 +147,22 @@ def _field_resolution_applied() -> FieldResolutionApplied:
     )
 
 
+def _engine_span(name: EngineSpanName) -> EngineSpanCompleted:
+    attributes = {"run.id": _RUN_ID} if name is EngineSpanName.RUN else {}
+    return EngineSpanCompleted(
+        timestamp=_NOW,
+        run_id=_RUN_ID,
+        name=name,
+        started_at=_NOW,
+        trace_started_at=_NOW,
+        span_id="0123456789abcdef",
+        parent_span_id=None,
+        status=EngineSpanStatus.OK,
+        exception_type=None,
+        attributes=attributes,
+    )
+
+
 # =============================================================================
 # Lifecycle Events: Always Emit at Any Granularity
 # =============================================================================
@@ -166,6 +185,15 @@ class TestLifecycleEventsAlwaysEmit:
     def test_phase_changed_emits_at_all_granularities(self, granularity: TelemetryGranularity) -> None:
         assert should_emit(_phase_changed(), granularity) is True
 
+    @pytest.mark.parametrize("name", [EngineSpanName.RUN, EngineSpanName.SOURCE])
+    @pytest.mark.parametrize("granularity", [LIFECYCLE, ROWS, FULL])
+    def test_lifecycle_engine_spans_emit_at_all_granularities(
+        self,
+        name: EngineSpanName,
+        granularity: TelemetryGranularity,
+    ) -> None:
+        assert should_emit(_engine_span(name), granularity) is True
+
 
 # =============================================================================
 # Row Events: Emit at ROWS or FULL Only
@@ -173,6 +201,25 @@ class TestLifecycleEventsAlwaysEmit:
 
 
 class TestRowEventsFilteredByGranularity:
+    @pytest.mark.parametrize(
+        "name",
+        [EngineSpanName.ROW, EngineSpanName.TRANSFORM, EngineSpanName.GATE, EngineSpanName.AGGREGATION, EngineSpanName.SINK],
+    )
+    def test_child_engine_spans_are_suppressed_at_lifecycle(self, name: EngineSpanName) -> None:
+        assert should_emit(_engine_span(name), LIFECYCLE) is False
+
+    @pytest.mark.parametrize(
+        "name",
+        [EngineSpanName.ROW, EngineSpanName.TRANSFORM, EngineSpanName.GATE, EngineSpanName.AGGREGATION, EngineSpanName.SINK],
+    )
+    @pytest.mark.parametrize("granularity", [ROWS, FULL])
+    def test_child_engine_spans_emit_at_row_granularity_and_above(
+        self,
+        name: EngineSpanName,
+        granularity: TelemetryGranularity,
+    ) -> None:
+        assert should_emit(_engine_span(name), granularity) is True
+
     def test_row_created_suppressed_at_lifecycle(self) -> None:
         assert should_emit(_row_created(), LIFECYCLE) is False
 

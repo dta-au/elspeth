@@ -50,6 +50,10 @@ if TYPE_CHECKING:
 slog = structlog.get_logger(__name__)
 
 
+class AggregationResultError(Exception):
+    """Marker for a handled aggregation TransformResult.error outcome."""
+
+
 @dataclass(slots=True)
 class _AggregationNodeState:
     """Per-node aggregation state.
@@ -456,37 +460,26 @@ class AggregationExecutor:
         transform: BatchTransformProtocol,
         pipeline_rows: Sequence[PipelineRow],
         ctx: PluginContext,
-        node_id: NodeID,
-        input_hash: str,
-        batch_id: str,
-        batch_token_ids: tuple[str, ...],
         guard: NodeStateGuard,
     ) -> tuple[TransformResult, float]:
-        """Run the batch transform inside tracing and record direct plugin failures."""
-        with self._spans.aggregation_span(
-            transform.name,
-            node_id=node_id,
-            input_hash=input_hash,
-            batch_id=batch_id,
-            token_ids=batch_token_ids,
-        ):
-            start = time.perf_counter()
-            try:
-                result = transform.process(list(pipeline_rows), ctx)
-                duration_ms = (time.perf_counter() - start) * 1000
-            except contract_errors.TIER_1_ERRORS:
-                raise
-            except Exception as exc:
-                duration_ms = (time.perf_counter() - start) * 1000
-                guard.complete(
-                    NodeStateStatus.FAILED,
-                    duration_ms=duration_ms,
-                    error=ExecutionError(
-                        exception=str(exc),
-                        exception_type=type(exc).__name__,
-                    ),
-                )
-                raise
+        """Run the batch transform and record direct plugin failures."""
+        start = time.perf_counter()
+        try:
+            result = transform.process(list(pipeline_rows), ctx)
+            duration_ms = (time.perf_counter() - start) * 1000
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as exc:
+            duration_ms = (time.perf_counter() - start) * 1000
+            guard.complete(
+                NodeStateStatus.FAILED,
+                duration_ms=duration_ms,
+                error=ExecutionError(
+                    exception=str(exc),
+                    exception_type=type(exc).__name__,
+                ),
+            )
+            raise
         return result, duration_ms
 
     @staticmethod
@@ -713,17 +706,27 @@ class AggregationExecutor:
         # Attempt honors the token's resume offset: a journal-restored flush
         # re-run (the original flush crashed and wrote a FAILED node_state at
         # the prior attempt) must not collide with audited history (F1).
-        with NodeStateGuard(
-            self._execution,
-            token_id=snapshot.representative_token.token_id,
-            node_id=node_id,
-            run_id=ctx.run_id,
-            step_index=step,
-            input_data=batch_input,
-            attempt=snapshot.representative_token.resume_attempt_offset,
-            resume_checkpoint_id=snapshot.representative_token.resume_checkpoint_id,
-        ) as guard:
-            batch_token_ids = tuple(token.token_id for token in snapshot.buffered_tokens)
+        batch_token_ids = tuple(token.token_id for token in snapshot.buffered_tokens)
+        with (
+            self._spans.aggregation_span(
+                transform.name,
+                node_id=node_id,
+                input_hash=input_hash,
+                batch_id=batch_id,
+                token_ids=batch_token_ids,
+                run_id=self._run_id,
+            ) as aggregation_span,
+            NodeStateGuard(
+                self._execution,
+                token_id=snapshot.representative_token.token_id,
+                node_id=node_id,
+                run_id=ctx.run_id,
+                step_index=step,
+                input_data=batch_input,
+                attempt=snapshot.representative_token.resume_attempt_offset,
+                resume_checkpoint_id=snapshot.representative_token.resume_checkpoint_id,
+            ) as guard,
+        ):
             window = self._build_flush_window(
                 node=node,
                 batch_size=len(snapshot.buffered_rows),
@@ -747,10 +750,6 @@ class AggregationExecutor:
                     transform=transform,
                     pipeline_rows=snapshot.pipeline_rows,
                     ctx=ctx,
-                    node_id=node_id,
-                    input_hash=input_hash,
-                    batch_id=batch_id,
-                    batch_token_ids=batch_token_ids,
                     guard=guard,
                 )
                 self._populate_result_audit_fields(
@@ -778,6 +777,7 @@ class AggregationExecutor:
                     )
                     batch_finalized = True
                 else:
+                    self._spans.mark_error(aggregation_span, AggregationResultError())
                     self._complete_error_flush(
                         result=result,
                         guard=guard,
@@ -802,10 +802,10 @@ class AggregationExecutor:
                 self._clear_flush_state(node_id=node_id, node=node, ctx=ctx)
                 raise
 
-        # Success cleanup: save batch_id before reset (needed by caller for CONSUMED_IN_BATCH)
-        flushed_batch_id = batch_id
+            # Success cleanup: save batch_id before reset (needed by caller for CONSUMED_IN_BATCH)
+            flushed_batch_id = batch_id
 
-        self._clear_flush_state(node_id=node_id, node=node, ctx=ctx)
+            self._clear_flush_state(node_id=node_id, node=node, ctx=ctx)
 
         return result, list(snapshot.buffered_tokens), flushed_batch_id
 
