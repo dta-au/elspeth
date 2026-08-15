@@ -123,9 +123,17 @@ function isRateLimitedApiError(
   );
 }
 
-// Upper bound on how long the graduation retry will honour a server-supplied
-// retry_after before giving up on the delayed retry strategy entirely.
-const MAX_RETRY_AFTER_WAIT_MS = 30_000;
+// Longest the graduation retry will sleep on a server-supplied retry_after.
+// This MUST stay below markTutorialGraduated's own 5000ms wait-loop bound:
+// `writing` is held across the sleep, and the whole store assumes that flag
+// covers about one round-trip — the wait loop's double-stamp guard and five
+// sibling actions that `return` while it is true (resetTutorial, the
+// mid-tutorial wedged-resume escape hatch, most of all) both break if a
+// retry can hold it for tens of seconds. A retry_after ABOVE this cap is
+// therefore not slept out: the save fails fast and surfaces the envelope's
+// actionable "try again in N seconds" copy, which beats freezing the
+// tutorial's own escape hatch for half a minute.
+const MAX_RETRY_AFTER_WAIT_MS = 3_000;
 
 const INITIAL_STATE = {
   defaultMode: null as ComposerMode | null,
@@ -392,7 +400,11 @@ export const usePreferencesStore = create<PreferencesState>((set, get) => ({
         if (!isRateLimitedApiError(err) || err.retry_after === undefined) {
           throw err;
         }
-        const waitMs = Math.min(err.retry_after * 1000, MAX_RETRY_AFTER_WAIT_MS);
+        const waitMs = err.retry_after * 1000;
+        if (waitMs > MAX_RETRY_AFTER_WAIT_MS) {
+          // Too long to hold `writing` — fail fast instead of sleeping.
+          throw err;
+        }
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         payload = await updateUserComposerPreferences(patchBody);
       }

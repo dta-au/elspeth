@@ -1018,4 +1018,33 @@ describe("preferencesStore — markTutorialGraduated 429 retry", () => {
     expect(usePreferencesStore.getState().writing).toBe(false);
     vi.useRealTimers();
   });
+
+  // Invariant test, not a behaviour test. The whole store assumes `writing`
+  // is held for about one round-trip: markTutorialGraduated's own wait loop
+  // bounds at 5000ms, and five sibling actions — resetTutorial above all,
+  // the mid-tutorial wedged-resume escape hatch — silently `return` while
+  // it is true. A retry that sleeps out a large server-supplied retry_after
+  // (the live incident reported 26s) would hold the flag far past that
+  // bound: the double-stamp guard would lapse and Reset would go dead
+  // exactly when a struggling user reaches for it. So a retry_after above
+  // the cap does NOT sleep — it fails fast with the actionable detail.
+  // If someone raises MAX_RETRY_AFTER_WAIT_MS past the wait-loop bound,
+  // this test is what should stop them.
+  it("does not retry — or hold the write flag — when retry_after exceeds the cap", async () => {
+    mockUpdate.mockRejectedValue({
+      status: 429,
+      error_type: "rate_limited",
+      detail: "Rate limit exceeded. Try again in 26 seconds.",
+      retry_after: 26,
+    });
+    const promise = usePreferencesStore.getState().markTutorialGraduated();
+    await expect(promise).rejects.toMatchObject({ status: 429 });
+    // Exactly one attempt: no sleep, no second PATCH.
+    expect(mockUpdate).toHaveBeenCalledTimes(1);
+    // Flag released immediately, so resetTutorial et al. stay reachable.
+    expect(usePreferencesStore.getState().writing).toBe(false);
+    expect(usePreferencesStore.getState().writeError).toContain(
+      "Try again in 26 seconds",
+    );
+  });
 });
