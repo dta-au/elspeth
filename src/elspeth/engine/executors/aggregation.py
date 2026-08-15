@@ -469,6 +469,7 @@ class AggregationExecutor:
             input_hash=input_hash,
             batch_id=batch_id,
             token_ids=batch_token_ids,
+            run_id=self._run_id,
         ):
             start = time.perf_counter()
             try:

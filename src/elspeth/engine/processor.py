@@ -714,6 +714,7 @@ class RowProcessor:
             execution=execution,
             barrier_restore_reads=restore_reads,
             clock=self._clock,
+            span_factory=self._spans,
             run_coordination=run_coordination,
             coordination_token=coordination_token,
             scheduler_lease_owner=self._scheduler_lease_owner,
@@ -4066,13 +4067,12 @@ class RowProcessor:
             else []
         )
 
-        with self._spans.row_span(initial_item.token.row_id, initial_item.token.token_id):
-            results = self._drain_scheduler_claims(
-                ctx=ctx,
-                pending_items=pending_items,
-                recover_pending_sinks=False,
-                preclaimed_items=preclaimed_items,
-            )
+        results = self._drain_scheduler_claims(
+            ctx=ctx,
+            pending_items=pending_items,
+            recover_pending_sinks=False,
+            preclaimed_items=preclaimed_items,
+        )
 
         return results
 

@@ -162,6 +162,7 @@ class TelemetryManager:
 
         # Thread coordination
         self._shutdown_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._dropped_lock = threading.Lock()
         self._export_thread_ready = threading.Event()  # Signals thread is running
 
@@ -409,9 +410,18 @@ class TelemetryManager:
         if not should_emit(event, self._config.granularity):
             return
 
+        # Fence the final shutdown check and enqueue as one lifecycle action.
+        # close() takes the same lock before placing its sentinel, so an event
+        # is always entirely before shutdown or rejected after it.
+        with self._lifecycle_lock:
+            if self._shutdown_event.is_set():
+                return
+            self._enqueue_event(event)
+
+    def _enqueue_event(self, event: TelemetryEvent) -> None:
+        """Queue one filtered event while the lifecycle lock is held."""
         self._events_attempted += 1
 
-        # Check thread readiness and liveness
         if not self._export_thread_ready.is_set():
             logger.warning("Export thread not ready, dropping event")
             with self._dropped_lock:
@@ -424,22 +434,21 @@ class TelemetryManager:
             self._disabled = True
             return
 
-        # Queue event based on backpressure mode
         if self._config.backpressure_mode == BackpressureMode.DROP:
             try:
                 self._queue.put_nowait(event)
             except queue.Full:
                 self._drop_oldest_and_enqueue_newest(event)
-        else:  # BLOCK (default)
-            # Timeout prevents permanent deadlock if export thread dies
-            try:
-                self._queue.put(event, timeout=30.0)
-            except queue.Full:
-                # Timeout hit - thread may be dead or stuck
-                logger.error("BLOCK mode put() timed out - export thread may be stuck")
-                with self._dropped_lock:
-                    self._events_dropped += 1
-                    self._queue_drops += 1
+            return
+
+        # Timeout prevents permanent deadlock if export thread dies.
+        try:
+            self._queue.put(event, timeout=30.0)
+        except queue.Full:
+            logger.error("BLOCK mode put() timed out - export thread may be stuck")
+            with self._dropped_lock:
+                self._events_dropped += 1
+                self._queue_drops += 1
 
     def _drop_oldest_and_enqueue_newest(self, event: TelemetryEvent) -> None:
         """DROP mode overflow strategy: evict oldest queued event, keep newest.
@@ -680,40 +689,30 @@ class TelemetryManager:
         don't raise.
         """
         # 1. Signal shutdown - prevents new events from being queued
-        self._shutdown_event.set()
+        with self._lifecycle_lock:
+            self._shutdown_event.set()
 
         # 2. Send sentinel FIRST - thread will process remaining events
         #    then exit when it sees the sentinel.
         #
-        #    CRITICAL: We MUST guarantee sentinel insertion. If queue is full,
-        #    drain items until we can insert. Since shutdown is signaled, no
-        #    new events will be queued, so draining is safe.
+        #    A full queue is allowed to drain naturally. Evicting one event to
+        #    make space for the sentinel would turn close() into a data-loss
+        #    path precisely when a burst fills the queue.
         sentinel_sent = False
-        for _ in range(self._queue.maxsize + 10):  # +10 for safety margin
+        while self._export_thread.is_alive():
             try:
                 self._queue.put(None, timeout=0.1)
                 sentinel_sent = True
                 break
             except queue.Full:
-                # Queue full - drain one item and retry
-                try:
-                    discarded = self._queue.get_nowait()
-                    self._queue.task_done()
-                    if discarded is not None:
-                        logger.debug(
-                            "Discarded event during shutdown drain",
-                            event_type=type(discarded).__name__,
-                        )
-                except queue.Empty:
-                    # Queue became empty between put and get - try put again
-                    pass
+                continue
 
         if not sentinel_sent:
-            logger.error("Failed to send shutdown sentinel after drain attempts - export thread may hang")
+            logger.error("Export thread stopped before accepting the shutdown sentinel")
 
         # 3. Wait for thread to exit (this implicitly waits for queue drain
         #    because thread processes all events before exiting on sentinel)
-        self._export_thread.join(timeout=5.0)
+        self._export_thread.join()
         if self._export_thread.is_alive():
             logger.error("Export thread did not exit cleanly within timeout")
 

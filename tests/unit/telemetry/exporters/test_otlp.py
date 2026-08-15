@@ -10,7 +10,7 @@ Tests cover:
 - Error handling (export failures don't crash pipeline)
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -20,6 +20,9 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 from elspeth.contracts import RawCallPayload, TokenCompleted, TokenUsage
 from elspeth.contracts.enums import CallStatus, CallType, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
+    EngineSpanStatus,
     ExternalCallCompleted,
     RunFinished,
     RunStarted,
@@ -658,6 +661,94 @@ class TestOTLPExporterSpanConversion:
         exported_spans = mock_sdk.export.call_args[0][0]
         expected_trace_id = derive_trace_id("run-123", started_at=started_at)
         assert exported_spans[0].context.trace_id == expected_trace_id
+
+    def test_engine_span_preserves_duration_identity_parent_and_canonical_trace_start(self) -> None:
+        """Completed engine spans retain the hierarchy created in the engine."""
+        exporter, mock_sdk = self._create_configured_exporter()
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        started_at = datetime(2026, 7, 24, 1, 2, 4, 123456, tzinfo=UTC)
+        completed_at = datetime(2026, 7, 24, 1, 2, 5, 654321, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=completed_at,
+            run_id="run-engine-span",
+            name=EngineSpanName.TRANSFORM,
+            started_at=started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id="fedcba0987654321",
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"plugin.name": "field_mapper", "token.ids": ("token-1", "token-2")},
+        )
+
+        exporter.export(event)
+
+        span = mock_sdk.export.call_args[0][0][0]
+        assert span.name == "transform"
+        assert span.start_time == int(started_at.timestamp() * 1_000_000_000)
+        assert span.end_time == int(completed_at.timestamp() * 1_000_000_000)
+        assert span.context.trace_id == derive_trace_id("run-engine-span", started_at=trace_started_at)
+        assert span.context.span_id == int("1234567890abcdef", 16)
+        assert span.parent is not None
+        assert span.parent.trace_id == span.context.trace_id
+        assert span.parent.span_id == int("fedcba0987654321", 16)
+        assert span.attributes["plugin.name"] == "field_mapper"
+        assert span.attributes["token.ids"] == ("token-1", "token-2")
+
+    def test_joined_run_engine_span_binds_following_lifecycle_identity_without_run_started(self) -> None:
+        exporter, mock_sdk = self._create_configured_exporter()
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        exporter.export(
+            EngineSpanCompleted(
+                timestamp=trace_started_at + timedelta(seconds=2),
+                run_id="joined-run",
+                name=EngineSpanName.ROW,
+                started_at=trace_started_at + timedelta(seconds=1),
+                trace_started_at=trace_started_at,
+                span_id="1234567890abcdef",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"row.id": "row-1", "token.id": "token-1"},
+            )
+        )
+        exporter.export(
+            RunFinished(
+                timestamp=trace_started_at + timedelta(seconds=3),
+                run_id="joined-run",
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+
+        exported = [call[0][0][0] for call in mock_sdk.export.call_args_list]
+        assert len(exported) == 2
+        assert exported[0].context.trace_id == exported[1].context.trace_id
+
+    def test_failed_engine_span_sets_error_status_with_safe_exception_type_only(self) -> None:
+        exporter, mock_sdk = self._create_configured_exporter()
+        timestamp = datetime(2026, 7, 24, 1, 2, 5, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=timestamp,
+            run_id="run-engine-span",
+            name=EngineSpanName.SINK,
+            started_at=timestamp,
+            trace_started_at=timestamp,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.ERROR,
+            exception_type="ValueError",
+            attributes={"plugin.name": "csv"},
+        )
+
+        exporter.export(event)
+
+        span = mock_sdk.export.call_args[0][0][0]
+        assert span.status.status_code.name == "ERROR"
+        assert span.status.description is None
+        assert span.attributes["exception_type"] == "ValueError"
+        assert not any("message" in key or "stack" in key for key in span.attributes)
 
     def test_run_finish_reuses_run_start_trace_id(self) -> None:
         """Later lifecycle events retain the durable start epoch and run hash."""

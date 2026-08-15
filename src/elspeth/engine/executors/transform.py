@@ -778,6 +778,7 @@ class TransformExecutor:
                     node_id=node_id,
                     input_hash=input_hash,
                     token_id=token.token_id,
+                    run_id=ctx.run_id,
                 ):
                     start = time.perf_counter()
                     try:

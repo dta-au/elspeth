@@ -22,11 +22,15 @@ import pytest
 from elspeth.contracts import GateEvaluated, TokenCompleted, TokenUsage
 from elspeth.contracts.enums import RoutingMode, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
+    EngineSpanStatus,
     RunFinished,
     RunStarted,
 )
 from elspeth.telemetry.errors import TelemetryExporterError
 from elspeth.telemetry.exporters.datadog import DatadogExporter
+from elspeth.telemetry.serialization import derive_trace_id
 
 # All required fields for a valid Datadog exporter config
 _VALID_CONFIG: dict[str, object] = {
@@ -83,6 +87,7 @@ class _CallRecorder:
 class _FakeDatadogSpan:
     def __init__(self) -> None:
         self.start_ns = 0
+        self.error = 0
         self.set_tag = _CallRecorder()
         self.finish = _CallRecorder()
 
@@ -385,6 +390,63 @@ class TestDatadogExporterSpanCreation:
         assert finish_time == expected_unix_seconds, (
             f"Span finish time should be event timestamp ({expected_unix_seconds}) for instant span. Got: {finish_time}"
         )
+
+    def test_engine_span_uses_real_duration_and_correlation_tags(self) -> None:
+        exporter, mock_tracer, mock_span = self._create_configured_exporter()
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+        started_at = datetime(2026, 7, 24, 1, 2, 4, 123456, tzinfo=UTC)
+        completed_at = datetime(2026, 7, 24, 1, 2, 5, 654321, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=completed_at,
+            run_id="run-engine-span",
+            name=EngineSpanName.TRANSFORM,
+            started_at=started_at,
+            trace_started_at=trace_started_at,
+            span_id="1234567890abcdef",
+            parent_span_id="fedcba0987654321",
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"plugin.name": "field_mapper"},
+        )
+
+        exporter.export(event)
+
+        start_kwargs = mock_tracer.start_span.call_args[1]
+        assert start_kwargs["name"] == "transform"
+        assert start_kwargs["resource"] == "transform"
+        assert "child_of" not in start_kwargs
+        assert mock_span.start_ns == int(started_at.timestamp() * 1_000_000_000)
+        assert mock_span.finish.call_args[1]["finish_time"] == completed_at.timestamp()
+        expected_trace_id = derive_trace_id("run-engine-span", started_at=trace_started_at)
+        mock_span.set_tag.assert_any_call("elspeth.trace_id", f"{expected_trace_id:032x}")
+        mock_span.set_tag.assert_any_call("elspeth.span_id", "1234567890abcdef")
+        mock_span.set_tag.assert_any_call("elspeth.parent_span_id", "fedcba0987654321")
+        mock_span.set_tag.assert_any_call("elspeth.trace_started_at", trace_started_at.isoformat())
+        mock_span.set_tag.assert_any_call("plugin.name", "field_mapper")
+
+    def test_failed_engine_span_sets_error_metadata_without_exception_content(self) -> None:
+        exporter, _mock_tracer, mock_span = self._create_configured_exporter()
+        timestamp = datetime(2026, 7, 24, 1, 2, 5, tzinfo=UTC)
+        event = EngineSpanCompleted(
+            timestamp=timestamp,
+            run_id="run-engine-span",
+            name=EngineSpanName.SINK,
+            started_at=timestamp,
+            trace_started_at=timestamp,
+            span_id="1234567890abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.ERROR,
+            exception_type="ValueError",
+            attributes={},
+        )
+
+        exporter.export(event)
+
+        mock_span.set_tag.assert_any_call("error.type", "ValueError")
+        assert mock_span.error == 1
+        rendered_tags = repr([(call.args, call.kwargs) for call in mock_span.set_tag.call_args_list])
+        assert "error.message" not in rendered_tags
+        assert "error.stack" not in rendered_tags
 
     def test_span_name_is_event_class_name(self) -> None:
         """Span name is the event class name."""

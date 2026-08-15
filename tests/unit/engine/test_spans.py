@@ -3,10 +3,243 @@
 
 from __future__ import annotations
 
+import threading
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+
+import pytest
 
 if TYPE_CHECKING:
     from elspeth.engine.spans import SpanFactory
+
+
+class TestTelemetrySpanFactory:
+    """Engine spans flow through the configured telemetry event fan-out."""
+
+    def test_rejects_competing_tracer_and_telemetry_ownership(self) -> None:
+        from unittest.mock import Mock
+
+        from elspeth.engine.spans import SpanFactory
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            SpanFactory(tracer=Mock(), telemetry_emit=lambda _event: None)
+
+    def test_emits_nested_spans_with_real_timing_and_safe_failure(self) -> None:
+        from elspeth.contracts.events import EngineSpanName, EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        trace_started_at = datetime.now(UTC) - timedelta(seconds=10)
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        with (
+            pytest.raises(RuntimeError, match="private payload"),
+            factory.run_span("run-001", trace_started_at=trace_started_at),
+            factory.row_span("row-001", "token-001", run_id="run-001"),
+        ):
+            raise RuntimeError("private payload")
+
+        assert [event.name for event in events] == [EngineSpanName.ROW, EngineSpanName.RUN]
+        row_event, run_event = events
+        assert row_event.parent_span_id == run_event.span_id
+        assert row_event.trace_started_at == trace_started_at
+        assert row_event.started_at <= row_event.timestamp
+        assert row_event.status is EngineSpanStatus.ERROR
+        assert row_event.exception_type == "RuntimeError"
+        assert "private payload" not in repr(row_event)
+        assert run_event.status is EngineSpanStatus.ERROR
+        assert run_event.exception_type == "RuntimeError"
+
+    def test_cross_thread_row_uses_registered_run_root(self) -> None:
+        from elspeth.contracts.events import EngineSpanName
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        failures: list[BaseException] = []
+        trace_started_at = datetime.now(UTC) - timedelta(seconds=5)
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        def emit_row() -> None:
+            try:
+                with factory.row_span("row-thread", "token-thread", run_id="run-thread"):
+                    pass
+            except BaseException as exc:  # pragma: no cover - surfaced in parent assertion
+                failures.append(exc)
+
+        with factory.run_span("run-thread", trace_started_at=trace_started_at):
+            worker = threading.Thread(target=emit_row)
+            worker.start()
+            worker.join()
+
+        assert failures == []
+        row_event = next(event for event in events if event.name is EngineSpanName.ROW)
+        run_event = next(event for event in events if event.name is EngineSpanName.RUN)
+        assert row_event.parent_span_id == run_event.span_id
+        assert row_event.trace_started_at == trace_started_at
+
+    def test_trace_scope_correlates_follower_root_without_fake_run_span(self) -> None:
+        from elspeth.contracts.events import EngineSpanName
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        trace_started_at = datetime.now(UTC) - timedelta(minutes=2)
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        with (
+            factory.trace_scope("resumed-run", trace_started_at),
+            factory.row_span("row-resume", "token-resume", run_id="resumed-run"),
+        ):
+            pass
+
+        assert len(events) == 1
+        event = events[0]
+        assert event.name is EngineSpanName.ROW
+        assert event.run_id == "resumed-run"
+        assert event.trace_started_at == trace_started_at
+        assert event.parent_span_id is None
+
+    def test_overlapping_trace_scopes_keep_correlation_until_last_exit(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        trace_started_at = datetime.now(UTC) - timedelta(minutes=2)
+        factory = SpanFactory(telemetry_emit=events.append)
+        first = factory.trace_scope("shared-run", trace_started_at)
+        second = factory.trace_scope("shared-run", trace_started_at)
+
+        first.__enter__()
+        second.__enter__()
+        first.__exit__(None, None, None)
+        try:
+            with factory.row_span("row-shared", "token-shared", run_id="shared-run"):
+                pass
+        finally:
+            second.__exit__(None, None, None)
+
+        assert len(events) == 1
+        assert events[0].trace_started_at == trace_started_at
+
+    def test_invalid_facade_attribute_is_rejected_before_event_emission(self) -> None:
+        from elspeth.contracts.events import EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        with (
+            factory.run_span("run-001", trace_started_at=datetime.now(UTC)) as span,
+            pytest.raises(ValueError, match="not allowed"),
+        ):
+            span.set_attribute("request.body", "secret")
+
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.OK
+
+    def test_handled_failure_can_mark_error_without_exception_content(self) -> None:
+        from elspeth.contracts.events import EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events = []
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        with (
+            factory.trace_scope("run-001", datetime.now(UTC)),
+            factory.gate_span("threshold", run_id="run-001") as span,
+        ):
+            factory.mark_error(span, RuntimeError("private row content"))
+
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "RuntimeError"
+        assert "private row content" not in repr(events[0])
+
+    def test_top_level_telemetry_span_requires_explicit_run_correlation(self) -> None:
+        from elspeth.engine.spans import SpanFactory
+
+        factory = SpanFactory(telemetry_emit=lambda _event: None)
+
+        with pytest.raises(ValueError, match="run_id"), factory.row_span("row-001", "token-001"):
+            pass
+
+    def test_engine_span_event_freezes_only_closed_safe_attributes(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+
+        completed_at = datetime.now(UTC)
+        attributes = {"row.id": "row-001", "token.id": "token-001"}
+        event = EngineSpanCompleted(
+            timestamp=completed_at,
+            run_id="run-001",
+            name=EngineSpanName.ROW,
+            started_at=completed_at - timedelta(milliseconds=5),
+            trace_started_at=completed_at - timedelta(seconds=1),
+            span_id="0123456789abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes=attributes,
+        )
+        attributes["row.id"] = "changed"
+        assert event.attributes["row.id"] == "row-001"
+        with pytest.raises(TypeError):
+            event.attributes["row.id"] = "changed"  # type: ignore[index]
+
+        with pytest.raises(ValueError, match="not allowed"):
+            EngineSpanCompleted(
+                timestamp=completed_at,
+                run_id="run-001",
+                name=EngineSpanName.ROW,
+                started_at=completed_at,
+                trace_started_at=completed_at,
+                span_id="fedcba9876543210",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"request.body": "secret"},
+            )
+
+    def test_engine_span_contract_tolerates_cross_host_clock_skew(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+
+        started_at = datetime.now(UTC)
+        event = EngineSpanCompleted(
+            timestamp=started_at + timedelta(milliseconds=5),
+            run_id="run-skewed",
+            name=EngineSpanName.ROW,
+            started_at=started_at,
+            trace_started_at=started_at + timedelta(seconds=1),
+            span_id="0123456789abcdef",
+            parent_span_id=None,
+            status=EngineSpanStatus.OK,
+            exception_type=None,
+            attributes={"row.id": "row-001", "token.id": "token-001"},
+        )
+
+        assert event.trace_started_at > event.started_at
+
+    @pytest.mark.parametrize("field_name", ["span_id", "parent_span_id"])
+    def test_engine_span_contract_rejects_zero_span_identifiers(self, field_name: str) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+
+        timestamp = datetime.now(UTC)
+        values = {
+            "span_id": "0123456789abcdef",
+            "parent_span_id": "fedcba9876543210",
+        }
+        values[field_name] = "0000000000000000"
+
+        with pytest.raises(ValueError, match=field_name):
+            EngineSpanCompleted(
+                timestamp=timestamp,
+                run_id="run-001",
+                name=EngineSpanName.ROW,
+                started_at=timestamp,
+                trace_started_at=timestamp,
+                span_id=values["span_id"],
+                parent_span_id=values["parent_span_id"],
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"row.id": "row-001", "token.id": "token-001"},
+            )
 
 
 class TestSpanFactory:
@@ -147,6 +380,7 @@ class TestGateSpan:
 
     def test_gate_span_with_tracer(self) -> None:
         from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.trace import StatusCode
 
         from elspeth.engine.spans import SpanFactory
 
@@ -156,6 +390,9 @@ class TestGateSpan:
 
         with factory.gate_span("my_gate") as span:
             assert span.is_recording()
+            factory.mark_error(span, RuntimeError("private row content"))
+            assert span.status.status_code is StatusCode.ERROR
+            assert span.events == ()
 
 
 class TestAggregationSpan:

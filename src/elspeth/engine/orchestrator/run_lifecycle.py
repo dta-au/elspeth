@@ -26,8 +26,9 @@ or stub instance methods keep intercepting. Tests that previously patched
 from __future__ import annotations
 
 import json
+import sys
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -457,11 +458,18 @@ class RunLifecycleCoordinator:
 
         run_completed = False
         run_start_time = time.perf_counter()
+        run_span_stack = ExitStack()
         try:
+            run_span_stack.enter_context(
+                self._span_factory.run_span(
+                    run.run_id,
+                    trace_started_at=run.started_at,
+                )
+            )
             # When shutdown_event is provided (testing), skip signal handler
             # installation and use the caller's event directly.
             shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
-            with self._span_factory.run_span(run.run_id), shutdown_ctx as active_event:
+            with shutdown_ctx as active_event:
                 result = execute_run(
                     factory,
                     run.run_id,
@@ -636,4 +644,7 @@ class RunLifecycleCoordinator:
             # path that did not already stop the thread (e.g. an exception
             # raised before any except handler ran release_seat).
             _heartbeat.stop()
-            self._ceremony.safe_flush_telemetry()
+            try:
+                run_span_stack.__exit__(*sys.exc_info())
+            finally:
+                self._ceremony.safe_flush_telemetry()

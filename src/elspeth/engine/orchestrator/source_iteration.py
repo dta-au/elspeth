@@ -453,7 +453,7 @@ class SourceIterationDriver:
             )
 
             try:
-                with self._span_factory.source_span(active_source.name):
+                with self._span_factory.source_span(active_source.name, run_id=run_id):
                     source_iterator = iter(active_source.load(ctx))
                     try:
                         first_row = next(source_iterator)

@@ -10,12 +10,13 @@ to Application Insights for distributed tracing, monitoring, and alerting.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from opentelemetry.sdk.trace.export import SpanExportResult
 
+from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus, RunFinished, RunStarted
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.serialization import (
     SyntheticReadableSpan,
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
     from elspeth.contracts.events import TelemetryEvent
 
 logger = structlog.get_logger(__name__)
+
+_MAX_TRACKED_TRACE_RUNS = 10_000
 
 
 class AzureMonitorExporter:
@@ -83,6 +86,7 @@ class AzureMonitorExporter:
         self._azure_exporter: AzureMonitorTraceExporter | None = None
         self._resource: Any | None = None  # Resource - stored for span creation
         self._buffer: list[TelemetryEvent] = []
+        self._trace_started_at: dict[str, datetime] = {}
         self._configured: bool = False
 
     @property
@@ -304,10 +308,55 @@ class AzureMonitorExporter:
         Returns:
             ReadableSpan-compatible object suitable for Azure Monitor export
         """
-        from opentelemetry.trace import SpanContext, SpanKind, TraceFlags
+        from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
 
-        # Derive IDs using shared serialization functions
-        trace_id = derive_trace_id(event.run_id)
+        if isinstance(event, EngineSpanCompleted):
+            self._bind_trace_started_at(event.run_id, event.trace_started_at)
+            trace_id = derive_trace_id(event.run_id, started_at=event.trace_started_at)
+            span_id = int(event.span_id, 16)
+            trace_flags = TraceFlags(TraceFlags.SAMPLED)
+            parent = None
+            if event.parent_span_id is not None:
+                parent = SpanContext(
+                    trace_id=trace_id,
+                    span_id=int(event.parent_span_id, 16),
+                    is_remote=False,
+                    trace_flags=trace_flags,
+                )
+            attributes: dict[str, Any] = dict(event.attributes)
+            attributes["run_id"] = event.run_id
+            attributes["event_type"] = type(event).__name__
+            if event.exception_type is not None:
+                attributes["exception_type"] = event.exception_type
+            attributes["cloud.provider"] = "azure"
+            attributes["elspeth.exporter"] = "azure_monitor"
+            status = Status(StatusCode.ERROR if event.status is EngineSpanStatus.ERROR else StatusCode.OK)
+            return SyntheticReadableSpan(
+                name=event.name.value,
+                context=SpanContext(
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    is_remote=False,
+                    trace_flags=trace_flags,
+                ),
+                parent=parent,
+                attributes=attributes,
+                start_time=int(event.started_at.timestamp() * 1_000_000_000),
+                end_time=int(event.timestamp.timestamp() * 1_000_000_000),
+                kind=SpanKind.INTERNAL,
+                resource=self._resource,
+                status=status,
+            )
+
+        # Preserve the durable RunStarted trace origin for all lifecycle events
+        # so point telemetry and completed engine spans remain in one trace.
+        started_at = self._trace_started_at.get(event.run_id)
+        if isinstance(event, RunStarted) or started_at is None:
+            self._bind_trace_started_at(event.run_id, event.timestamp)
+            started_at = self._trace_started_at[event.run_id]
+        trace_id = derive_trace_id(event.run_id, started_at=started_at)
+        if isinstance(event, RunFinished):
+            self._trace_started_at.pop(event.run_id, None)
         span_id = generate_span_id()
 
         # Convert timestamp to nanoseconds since epoch
@@ -344,6 +393,18 @@ class AzureMonitorExporter:
         )
 
         return span
+
+    def _bind_trace_started_at(self, run_id: str, started_at: datetime) -> None:
+        """Bind or verify one run's durable trace origin."""
+        normalized = started_at.replace(tzinfo=UTC) if started_at.tzinfo is None else started_at.astimezone(UTC)
+        existing = self._trace_started_at.get(run_id)
+        if existing is not None:
+            if existing != normalized:
+                raise TelemetryExporterError(self._name, "run trace start changed after binding")
+            return
+        if len(self._trace_started_at) >= _MAX_TRACKED_TRACE_RUNS:
+            raise TelemetryExporterError(self._name, "active trace identity capacity exceeded")
+        self._trace_started_at[run_id] = normalized
 
     @staticmethod
     def _serialize_event_attributes(event: TelemetryEvent) -> dict[str, Any]:

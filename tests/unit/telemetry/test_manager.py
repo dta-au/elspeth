@@ -1313,6 +1313,70 @@ class TestClose:
         # All events should have been processed before thread exited
         assert len(exporter.events) == 5
 
+    def test_close_drains_a_saturated_queue_without_discarding_events(self) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+        export_entered = threading.Event()
+        release_export = threading.Event()
+        original_export = exporter.export
+
+        def blocking_export(event):
+            export_entered.set()
+            assert release_export.wait(timeout=5.0)
+            return original_export(event)
+
+        object.__setattr__(exporter, "export", blocking_export)
+        manager = TelemetryManager(config, exporters=[exporter])
+        manager.handle_event(_lifecycle_event())
+        assert export_entered.wait(timeout=2.0)
+        queued_events = manager._queue.maxsize
+        for _ in range(queued_events):
+            manager.handle_event(_lifecycle_event())
+
+        closer = threading.Thread(target=manager.close)
+        closer.start()
+        _wait_until(lambda: manager._shutdown_event.is_set())
+        # Keep the exporter blocked past close()'s first full-queue retry so a
+        # shutdown implementation that evicts an event to make sentinel space
+        # is exercised deterministically.
+        threading.Event().wait(0.25)
+        release_export.set()
+        closer.join(timeout=10.0)
+
+        assert not closer.is_alive()
+        assert len(exporter.events) == queued_events + 1
+
+    def test_close_fences_a_producer_that_passed_the_initial_shutdown_check(self, monkeypatch) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+        manager = TelemetryManager(config, exporters=[exporter])
+        enqueue_entered = threading.Event()
+        release_enqueue = threading.Event()
+        original_put = manager._queue.put
+
+        def blocking_put(item, *args, **kwargs):
+            if item is not None:
+                enqueue_entered.set()
+                assert release_enqueue.wait(timeout=5.0)
+            return original_put(item, *args, **kwargs)
+
+        monkeypatch.setattr(manager._queue, "put", blocking_put)
+        producer = threading.Thread(target=manager.handle_event, args=(_lifecycle_event(),))
+        producer.start()
+        assert enqueue_entered.wait(timeout=2.0)
+
+        closer = threading.Thread(target=manager.close)
+        closer.start()
+        threading.Event().wait(0.25)
+        release_enqueue.set()
+        producer.join(timeout=5.0)
+        closer.join(timeout=5.0)
+
+        assert not producer.is_alive()
+        assert not closer.is_alive()
+        assert len(exporter.events) == 1
+        assert manager._queue.empty()
+
     @pytest.mark.parametrize(
         ("result", "expected_delivered", "expected_failed", "expected_dropped"),
         [

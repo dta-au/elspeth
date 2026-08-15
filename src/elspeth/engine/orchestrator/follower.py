@@ -100,7 +100,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
 )
-from elspeth.contracts.errors import FollowerSeatDeadError, RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
@@ -116,6 +116,7 @@ if TYPE_CHECKING:
     from elspeth.engine.clock import Clock
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
     from elspeth.engine.orchestrator.types import PipelineConfig
+    from elspeth.engine.spans import SpanFactory
 
 __all__ = ["FollowerProcessor", "FollowerWorkSource", "build_follower_processor"]
 
@@ -192,6 +193,12 @@ class FollowerProcessor:
         Injectable ``datetime.now(UTC)`` supplier for tests.
     wait_fn:
         Injectable sleep function ``wait_fn(seconds)`` for tests.
+    span_factory:
+        Shared engine span factory. The production builder supplies the same
+        instance to the inner row processor and this outer trace scope.
+    trace_started_at:
+        Durable ``runs.started_at`` value used for joined-run trace identity.
+        Optional only for direct no-telemetry test construction.
     """
 
     def __init__(
@@ -207,6 +214,8 @@ class FollowerProcessor:
         idle_poll_seconds: float = _IDLE_POLL_SECONDS,
         now_fn: Callable[[], datetime] | None = None,
         wait_fn: Callable[[float], None] | None = None,
+        span_factory: SpanFactory | None = None,
+        trace_started_at: datetime | None = None,
     ) -> None:
         self._processor = processor
         self._token = token
@@ -218,8 +227,11 @@ class FollowerProcessor:
         self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
         self._wait_fn: Callable[[float], None] = wait_fn if wait_fn is not None else time.sleep
         from elspeth.engine.clock import DEFAULT_CLOCK
+        from elspeth.engine.spans import SpanFactory
 
         self._clock = clock if clock is not None else DEFAULT_CLOCK
+        self._span_factory = span_factory if span_factory is not None else SpanFactory()
+        self._trace_started_at = trace_started_at
 
     # ------------------------------------------------------------------
     # Public API
@@ -253,6 +265,20 @@ class FollowerProcessor:
         Any other exception stops the heartbeat, departs the worker, and
         propagates unchanged through the common teardown seam.
         """
+        if self._trace_started_at is None:
+            # Direct test construction predates telemetry-backed spans. The
+            # production builder always supplies the durable run start below.
+            self._run_bound(ctx)
+            return
+
+        # Followers do not fabricate a leader/run parent. The scope binds the
+        # joined run's durable trace identity so follower row spans are honest
+        # roots in the same trace even though they execute in another process.
+        with self._span_factory.trace_scope(self._token.run_id, self._trace_started_at):
+            self._run_bound(ctx)
+
+    def _run_bound(self, ctx: PluginContext) -> None:
+        """Drive the follower while any production trace scope is active."""
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
             token=self._token,
@@ -516,6 +542,12 @@ def build_follower_processor(
     from elspeth.engine.scheduler_drain import ProcessorMode
     from elspeth.engine.spans import SpanFactory
 
+    durable_run = factory.run_lifecycle.get_run(run_id)
+    if durable_run is None:
+        raise AuditIntegrityError(f"Cannot build follower processor: run {run_id!r} not found in Landscape")
+
+    span_factory = SpanFactory(telemetry_emit=telemetry.handle_event) if telemetry is not None else SpanFactory()
+
     # Assign node_id to all plugin instances before building the traversal
     # context.  build_dag_traversal_context (inside build_row_processor)
     # requires transform.node_id to be set on every transform; the leader does
@@ -571,7 +603,7 @@ def build_follower_processor(
         config_gate_id_map=graph.get_config_gate_id_map(),
         coalesce_id_map=graph.get_coalesce_id_map(),
         payload_store=payload_store,
-        span_factory=SpanFactory(),
+        span_factory=span_factory,
         clock=clock,
         max_workers=concurrency_config.max_workers if concurrency_config is not None else None,
         telemetry=telemetry,
@@ -593,4 +625,6 @@ def build_follower_processor(
         run_coordination=factory.run_coordination,
         factory=factory,
         clock=clock,
+        span_factory=span_factory,
+        trace_started_at=durable_run.started_at,
     )

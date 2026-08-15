@@ -27,7 +27,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator.run_context_factory import RunContextFactory
     from elspeth.engine.orchestrator.sink_flush import SinkFlushCoordinator
     from elspeth.engine.orchestrator.types import PipelineConfig, RunResult
+    from elspeth.engine.spans import SpanFactory
 
 
 def setup_resume_context(
@@ -562,6 +563,7 @@ class ResumeCoordinator:
         checkpoints: CheckpointCoordinator,
         context_factory: RunContextFactory,
         sink_flush: SinkFlushCoordinator,
+        span_factory: SpanFactory,
         checkpoint_manager: CheckpointManager | None,
     ) -> None:
         self._db = db
@@ -570,6 +572,7 @@ class ResumeCoordinator:
         self._checkpoints = checkpoints
         self._context_factory = context_factory
         self._sink_flush = sink_flush
+        self._span_factory = span_factory
         self._checkpoint_manager = checkpoint_manager
 
     def reconstruct_resume_state(
@@ -1026,8 +1029,13 @@ class ResumeCoordinator:
         # installation and use the caller's event directly.
         shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
         resume_failure_counter_baseline: ExecutionCounters | None = None
+        trace_stack = ExitStack()
 
         try:
+            durable_run = factory.run_lifecycle.get_run(run_id)
+            if durable_run is None:
+                raise AuditIntegrityError(f"Cannot resume run {run_id!r}: durable run record is missing")
+            trace_stack.enter_context(self._span_factory.trace_scope(run_id, durable_run.started_at))
             incomplete_sources = {
                 state.source_names_by_source[source_node_id]: lifecycle_state
                 for source_node_id, lifecycle_state in state.source_lifecycle_by_source.items()
@@ -1203,7 +1211,10 @@ class ResumeCoordinator:
             # path that did not already stop the thread (e.g. an exception
             # raised before any except handler ran release_seat).
             _heartbeat.stop()
-            self._ceremony.safe_flush_telemetry()
+            try:
+                self._ceremony.safe_flush_telemetry()
+            finally:
+                trace_stack.close()
 
     def process_resumed_rows(
         self,
