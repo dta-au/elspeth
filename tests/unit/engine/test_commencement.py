@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Any
 
 import pytest
+from pydantic import BaseModel, ValidationError
 
 from elspeth.contracts.errors import CommencementGateFailedError, GracefulShutdownError
 from elspeth.core.dependency_config import CommencementGateConfig
@@ -45,6 +46,76 @@ class TestEvaluateCommencementGates:
         }
         with pytest.raises(CommencementGateFailedError, match="ready"):
             evaluate_commencement_gates(gates, context)
+
+    def test_failing_gate_redacts_non_key_string_literals(self) -> None:
+        sensitive_literal = "literal-sensitive-value-9f3a"
+        gates = [
+            CommencementGateConfig(
+                name="literal_check",
+                condition=f"collections['orders']['count'] == '{sensitive_literal}'",
+            )
+        ]
+        context = {
+            "dependency_runs": {},
+            "collections": {"orders": {"count": 0, "reachable": True}},
+        }
+
+        with pytest.raises(CommencementGateFailedError) as exc_info:
+            evaluate_commencement_gates(gates, context)
+
+        error = exc_info.value
+        assert error.condition == "collections['orders']['count'] == '<redacted-string-literal>'"
+        assert sensitive_literal not in str(error)
+
+    @pytest.mark.parametrize(
+        ("condition_template", "expected_condition"),
+        [
+            (
+                "collections[{'public': %r}] is None",
+                "collections[{'public': '<redacted-string-literal>'}] is None",
+            ),
+            (
+                "collections.get({'public': %r}) is None",
+                "collections.get({'public': '<redacted-string-literal>'}) is None",
+            ),
+        ],
+    )
+    def test_composite_lookup_keys_redact_non_key_literals(
+        self,
+        condition_template: str,
+        expected_condition: str,
+    ) -> None:
+        sensitive_literal = "composite-key-sensitive-value-9f3a"
+        gate = CommencementGateConfig(
+            name="composite_key",
+            condition=condition_template % sensitive_literal,
+        )
+
+        with pytest.raises(CommencementGateFailedError) as exc_info:
+            evaluate_commencement_gates([gate], {"dependency_runs": {}, "collections": {}})
+
+        error = exc_info.value
+        assert error.condition == expected_condition
+        assert "'public'" in error.condition
+        assert sensitive_literal not in str(error)
+
+    def test_composite_dict_key_redacts_nested_non_key_literals(self) -> None:
+        sensitive_literal = "composite-dict-key-sensitive-value-9f3a"
+        gate = CommencementGateConfig(
+            name="composite_dict_key",
+            condition=f"collections['orders'] in {{{{'public': '{sensitive_literal}'}}: 1}}",
+        )
+
+        with pytest.raises(CommencementGateFailedError) as exc_info:
+            evaluate_commencement_gates(
+                [gate],
+                {"dependency_runs": {}, "collections": {"orders": "ready"}},
+            )
+
+        error = exc_info.value
+        assert error.condition == ("collections['orders'] in {{'public': '<redacted-string-literal>'}: 1}")
+        assert "'public'" in error.condition
+        assert sensitive_literal not in str(error)
 
     def test_expression_error_raises(self) -> None:
         gates = [
@@ -128,6 +199,30 @@ class TestEvaluateCommencementGates:
         results = evaluate_commencement_gates(gates, context)
         assert len(results) == 2
 
+    def test_passing_gate_redacts_literals_but_preserves_map_keys(self) -> None:
+        sensitive_literal = "literal-sensitive-value-9f3a"
+        gate = CommencementGateConfig(
+            name="literal_check",
+            condition=(
+                "collections.get('orders')['status'] in {'ready': 1} "
+                "and dependency_runs['indexer']['run_id'] == 'run-safe' "
+                f"and dependency_runs['indexer']['run_id'] != '{sensitive_literal}'"
+            ),
+        )
+        context = {
+            "dependency_runs": {"indexer": {"run_id": "run-safe"}},
+            "collections": {"orders": {"status": "ready"}},
+        }
+
+        result = evaluate_commencement_gates([gate], context)[0]
+
+        assert result.condition == (
+            "collections.get('orders')['status'] in {'ready': 1} "
+            "and dependency_runs['indexer']['run_id'] == '<redacted-string-literal>' "
+            "and (dependency_runs['indexer']['run_id'] != '<redacted-string-literal>')"
+        )
+        assert sensitive_literal not in result.condition
+
     def test_second_gate_fails_stops_evaluation(self) -> None:
         gates = [
             CommencementGateConfig(name="g1", condition="collections['a']['count'] > 0"),
@@ -146,13 +241,18 @@ class TestEvaluateCommencementGates:
     def test_env_reference_rejected_at_config_time(self) -> None:
         """``env`` is no longer an allowed name; the config class rejects the
         condition at construction, before any evaluation can be reached."""
-        from elspeth.core.expression_parser import ExpressionSecurityError
+        condition = "env['ENVIRONMENT'] == 'production'"
 
-        with pytest.raises(ExpressionSecurityError, match="env"):
+        with pytest.raises(ValidationError) as exc_info:
             CommencementGateConfig(
                 name="env_check",
-                condition="env['ENVIRONMENT'] == 'production'",
+                condition=condition,
             )
+
+        rendered = str(exc_info.value)
+        assert "unsupported or unsafe syntax" in rendered
+        assert "ENVIRONMENT" not in rendered
+        assert "production" not in rendered
 
     def test_empty_gates_returns_empty(self) -> None:
         results = evaluate_commencement_gates([], {"dependency_runs": {}, "collections": {}})
@@ -300,6 +400,56 @@ class TestCommencementGateTypeEnforcement:
         results = evaluate_commencement_gates(gates, context)
         assert len(results) == 1
         assert results[0].result is True
+
+
+class TestCommencementGateConfigErrorBoundary:
+    def test_security_rejection_is_an_owned_non_disclosing_validation_error(self) -> None:
+        sensitive_literal = "security-rejected-sensitive-value-9f3a"
+        condition = f"{{'public': '{sensitive_literal}'}}['public'] == 'expected'"
+
+        with pytest.raises(ValidationError) as exc_info:
+            CommencementGateConfig(name="unsafe", condition=condition)
+
+        rendered = str(exc_info.value)
+        assert "unsupported or unsafe syntax" in rendered
+        assert sensitive_literal not in rendered
+        assert condition not in rendered
+
+    def test_nested_model_validation_does_not_restore_rejected_condition_input(self) -> None:
+        class GateEnvelope(BaseModel):
+            commencement_gates: list[CommencementGateConfig]
+
+        sensitive_literal = "nestsecret9f3a"
+        condition = f"{{'public': '{sensitive_literal}'}}['public'] == 'expected'"
+
+        with pytest.raises(ValidationError) as exc_info:
+            GateEnvelope(
+                commencement_gates=[
+                    {
+                        "name": "unsafe",
+                        "condition": condition,
+                    }
+                ]
+            )
+
+        rendered = str(exc_info.value)
+        assert "unsupported or unsafe syntax" in rendered
+        assert "<redacted-commencement-gate-condition>" in rendered
+        assert "nestsecret" not in rendered
+        assert sensitive_literal not in rendered
+        assert condition not in rendered
+
+    def test_syntax_rejection_is_an_owned_non_disclosing_validation_error(self) -> None:
+        sensitive_literal = "syntax-rejected-sensitive-value-9f3a"
+        condition = f"collections['orders'] == '{sensitive_literal}"
+
+        with pytest.raises(ValidationError) as exc_info:
+            CommencementGateConfig(name="malformed", condition=condition)
+
+        rendered = str(exc_info.value)
+        assert "invalid syntax" in rendered
+        assert sensitive_literal not in rendered
+        assert condition not in rendered
 
 
 class TestEnvNamespaceRemoved:

@@ -17,36 +17,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, TypedDict
+from typing import Any
 
 from elspeth.contracts.coalesce_enums import CoalescePolicy, MergeStrategy
 from elspeth.contracts.freeze import freeze_fields, require_int
-from elspeth.contracts.hashing import repr_hash, stable_hash
-
-
-class CollisionValueFingerprint(TypedDict):
-    """Audit-safe fingerprint for a colliding branch value."""
-
-    value_hash: str
-    value_type: str
-
-
-def collision_value_fingerprint(value: Any) -> CollisionValueFingerprint:
-    """Return a stable, non-reversible summary for a collided branch value."""
-    try:
-        value_hash = stable_hash(value)
-    except (TypeError, ValueError):
-        value_hash = repr_hash(value)
-    return {"value_hash": value_hash, "value_type": type(value).__name__}
-
-
-def _fingerprint_collision_values(
-    collision_values: Mapping[str, Sequence[tuple[str, Any]]],
-) -> dict[str, tuple[tuple[str, CollisionValueFingerprint], ...]]:
-    return {
-        field: tuple((branch, collision_value_fingerprint(value)) for branch, value in entries)
-        for field, entries in collision_values.items()
-    }
 
 
 def _require_optional_str(value: object, field_name: str) -> None:
@@ -106,47 +80,6 @@ def _require_arrival_order(value: object) -> None:
             raise TypeError(f"arrival_order[{idx}] must be ArrivalOrderEntry, got {type(entry).__name__}: {entry!r}")
 
 
-def _require_union_field_collision_values(value: object) -> None:
-    if value is None:
-        return
-    if not isinstance(value, Mapping):
-        raise TypeError(f"union_field_collision_values must be a mapping, got {type(value).__name__}: {value!r}")
-    for field, entries in value.items():
-        if type(field) is not str:
-            raise TypeError(f"union_field_collision_values key must be str, got {type(field).__name__}: {field!r}")
-        if isinstance(entries, str | bytes | bytearray) or not isinstance(entries, Sequence):
-            raise TypeError(f"union_field_collision_values[{field!r}] must be a sequence, got {type(entries).__name__}: {entries!r}")
-        for idx, entry in enumerate(entries):
-            if isinstance(entry, str | bytes | bytearray) or not isinstance(entry, Sequence):
-                raise TypeError(
-                    f"union_field_collision_values[{field!r}][{idx}] must be a 2-item sequence, got {type(entry).__name__}: {entry!r}"
-                )
-            if len(entry) != 2:
-                raise ValueError(f"union_field_collision_values[{field!r}][{idx}] must have exactly 2 items")
-            branch, fingerprint = entry
-            if type(branch) is not str:
-                raise TypeError(
-                    f"union_field_collision_values[{field!r}][{idx}] branch must be str, got {type(branch).__name__}: {branch!r}"
-                )
-            if not isinstance(fingerprint, Mapping):
-                raise TypeError(
-                    f"union_field_collision_values[{field!r}][{idx}] fingerprint must be a mapping, got "
-                    f"{type(fingerprint).__name__}: {fingerprint!r}"
-                )
-            if set(fingerprint.keys()) != {"value_hash", "value_type"}:
-                raise ValueError(f"union_field_collision_values[{field!r}][{idx}] fingerprint must contain value_hash and value_type only")
-            if type(fingerprint["value_hash"]) is not str:
-                raise TypeError(
-                    f"union_field_collision_values[{field!r}][{idx}] fingerprint.value_hash must be str, got "
-                    f"{type(fingerprint['value_hash']).__name__}: {fingerprint['value_hash']!r}"
-                )
-            if type(fingerprint["value_type"]) is not str:
-                raise TypeError(
-                    f"union_field_collision_values[{field!r}][{idx}] fingerprint.value_type must be str, got "
-                    f"{type(fingerprint['value_type']).__name__}: {fingerprint['value_type']!r}"
-                )
-
-
 @dataclass(frozen=True, slots=True)
 class ArrivalOrderEntry:
     """One branch's arrival timing relative to first arrival."""
@@ -185,10 +118,6 @@ class CoalesceMetadata:
         timeout_seconds: Configured timeout (for timeout-triggered failures).
         union_field_collisions: Field name to contributing branches (union merge).
         union_field_origins: Field name to originating branch (every union merge).
-        union_field_collision_values: Field name to tuple of
-            ``(branch, {value_hash, value_type})`` entries in merge order
-            (populated only when collisions occurred). Raw branch values are
-            never serialized into audit metadata.
     """
 
     policy: CoalescePolicy
@@ -209,7 +138,6 @@ class CoalesceMetadata:
         _require_non_negative_finite_number(self.timeout_seconds, "timeout_seconds")
         _require_string_to_string_sequence_mapping(self.union_field_collisions, "union_field_collisions")
         _require_string_to_string_mapping(self.union_field_origins, "union_field_origins")
-        _require_union_field_collision_values(self.union_field_collision_values)
         _require_string_to_string_sequence_mapping(self.lost_branch_expected_fields, "lost_branch_expected_fields")
         # Freeze all container fields — catches direct construction with raw lists/dicts
         fields_to_freeze = []
@@ -225,8 +153,6 @@ class CoalesceMetadata:
             fields_to_freeze.append("union_field_collisions")
         if self.union_field_origins is not None:
             fields_to_freeze.append("union_field_origins")
-        if self.union_field_collision_values is not None:
-            fields_to_freeze.append("union_field_collision_values")
         if self.lost_branch_expected_fields is not None:
             fields_to_freeze.append("lost_branch_expected_fields")
         if fields_to_freeze:
@@ -255,13 +181,6 @@ class CoalesceMetadata:
 
     # Union merge provenance (populated for every union merge)
     union_field_origins: Mapping[str, str] | None = None
-
-    # Union merge collision value fingerprints (populated only when collisions occurred).
-    # Outer key: field name. Inner tuple entries: (branch_name, fingerprint) in
-    # merge order. The last entry is the winner under last_wins; first under
-    # first_wins. Fingerprints preserve branch/value equality debugging without
-    # persisting raw colliding values into the audit trail.
-    union_field_collision_values: Mapping[str, tuple[tuple[str, CollisionValueFingerprint], ...]] | None = None
 
     # Lost branch expected fields (populated when branches_lost is non-empty).
     # Outer key: branch name. Value: tuple of field names that branch would have
@@ -304,11 +223,6 @@ class CoalesceMetadata:
             result["union_field_collisions"] = {k: list(v) for k, v in self.union_field_collisions.items()}
         if self.union_field_origins is not None:
             result["union_field_origins"] = dict(self.union_field_origins)
-        if self.union_field_collision_values is not None:
-            result["union_field_collision_values"] = {
-                field: [[branch, dict(fingerprint)] for branch, fingerprint in entries]
-                for field, entries in self.union_field_collision_values.items()
-            }
         if self.lost_branch_expected_fields is not None:
             result["lost_branch_expected_fields"] = {k: list(v) for k, v in self.lost_branch_expected_fields.items()}
         return result
@@ -394,19 +308,16 @@ class CoalesceMetadata:
         *,
         field_origins: Mapping[str, str],
         collisions: Mapping[str, Sequence[str]] | None = None,
-        collision_values: Mapping[str, Sequence[tuple[str, Any]]] | None = None,
     ) -> CoalesceMetadata:
         """Layer union-merge provenance onto an existing metadata instance.
 
         ``field_origins`` is always populated for union merges. ``collisions``
-        and ``collision_values`` are populated only when at least one field
-        was produced by more than one branch. ``collision_values`` may contain
-        raw branch values at this internal boundary; they are converted to
-        non-reversible fingerprints before being stored on the metadata object.
+        is populated only when at least one field was produced by more than one
+        branch. Audit metadata deliberately stops at field, branch, and winner
+        identity: it does not derive or persist information from branch values.
         """
         return replace(
             base,
             union_field_origins=dict(field_origins),
             union_field_collisions=({k: tuple(v) for k, v in collisions.items()} if collisions is not None else None),
-            union_field_collision_values=(_fingerprint_collision_values(collision_values) if collision_values is not None else None),
         )

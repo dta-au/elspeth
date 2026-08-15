@@ -172,14 +172,18 @@ elspeth run --settings examples/fork_coalesce/settings_union_fail.yaml --execute
 
 Use this variant when you want the pipeline to reject overlap rather than silently pick a winner — for example, when two enrichment APIs are supposed to return disjoint fields and any overlap indicates a misconfiguration.
 
-Note that `fail` does not distinguish "same value" from "different value" collisions — any duplicate field name is treated as an error. If you only want to fail on divergent values, use `last_wins`/`first_wins` and compare the `union_field_collision_values` record in the audit trail.
+Note that `fail` does not distinguish "same value" from "different value" collisions — any duplicate field name is treated as an error. If your branches intentionally carry shared fields, use `last_wins` or `first_wins`, or rename those fields before the merge.
 
 ### Inspecting the audit trail
 
 All three variants record the full collision provenance on the coalesce `node_states` row via `context_after_json`. The key fields are:
 
 - `union_field_origins` — map of `field_name → selected_branch_name` for `first_wins`/`last_wins`; under `fail`, it records the final resolution candidate even though no merged row is emitted
-- `union_field_collision_values` — map of each collided field to its branch contributions, represented by audit-safe value hashes and types rather than raw values
+- `union_field_collisions` — map of each collided field to its contributing branches in merge order
+
+The audit record intentionally omits collision values, value hashes, and Python
+types. Branch/field/winner provenance remains available without making low-entropy
+values recoverable by enumerating their hashes.
 
 Open the audit database with the Landscape MCP server:
 ```bash
@@ -195,7 +199,7 @@ for (ctx_json,) in db.execute(
 ):
     ctx = json.loads(ctx_json)
     print("origins:", ctx["union_field_origins"])
-    print("collisions:", ctx["union_field_collision_values"])
+    print("collisions:", ctx["union_field_collisions"])
     break
 ```
 

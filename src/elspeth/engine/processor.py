@@ -1995,6 +1995,7 @@ class RowProcessor:
             input_data=token.row_data.to_dict(),
             attempt=token.resume_attempt_offset + attempt,
             resume_checkpoint_id=token.resume_checkpoint_id,
+            auto_fail_phase="retry_pre_attempt_shutdown",
         ) as guard:
             guard.complete(
                 NodeStateStatus.FAILED,

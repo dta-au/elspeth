@@ -884,9 +884,7 @@ def _check_catalog_membership(
                 component_id=component_id,
                 field_name=declaration.field_name,
                 reason=(
-                    f"value {value!r} is not in catalog '{declaration.catalog_id}' "
-                    f"(catalog has {len(catalog)} entries; pick a valid value via the "
-                    "list_models composer tool)"
+                    f"configured value is not in catalog '{declaration.catalog_id}'; pick a valid value via the list_models composer tool"
                 ),
                 component_type=component_type,
             )
@@ -909,8 +907,7 @@ def _check_derived_from_sibling(
         component_id=component_id,
         field_name=declaration.field_name,
         reason=(
-            f"value {field_value!r} must equal sibling "
-            f"'{declaration.sibling_field}' (currently {sibling_value!r})"
+            f"configured value must equal sibling field '{declaration.sibling_field}'"
             + ("; leave the field empty to inherit the sibling value" if declaration.allow_empty_default else "")
         ),
         component_type=component_type,

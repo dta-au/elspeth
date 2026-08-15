@@ -177,11 +177,12 @@ class RunContextFactory:
                 barrier_restore=barrier_restore,
                 coordination_token=coordination_token,
             )
-        except Exception:
+        except Exception as pending_exc:
             cleanup_plugins(
                 config,
                 ctx,
                 include_source=include_source_on_start,
+                pending_exc=pending_exc,
                 started_sources=started_sources,
                 started_transforms=tuple(started_transforms),
                 started_sinks=started_sinks,

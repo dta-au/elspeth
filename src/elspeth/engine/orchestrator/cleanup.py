@@ -15,7 +15,6 @@ operates only on the parameters passed in.
 from __future__ import annotations
 
 import hashlib
-import sys
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from functools import partial
@@ -82,6 +81,7 @@ def cleanup_plugins(
     ctx: PluginContext,
     *,
     include_source: bool = True,
+    pending_exc: BaseException | None,
     started_sources: Mapping[str, SourceProtocol] | None = None,
     started_transforms: Sequence[TransformProtocol] | None = None,
     started_sinks: Mapping[str, SinkProtocol] | None = None,
@@ -111,6 +111,9 @@ def cleanup_plugins(
         ctx: Plugin context
         include_source: If True (default), calls on_complete() and close()
             on the source. Set to False for resume path where source wasn't opened.
+        pending_exc: Base exception that will propagate from the caller's cleanup
+            boundary, if any. Ordinary cleanup failures are logged instead of
+            masking it. Pass None when the boundary is returning normally.
         started_sources: Optional subset of sources whose on_start() completed.
             Defaults to all configured sources for steady-state run cleanup.
         started_transforms: Optional subset of transforms whose on_start()
@@ -125,7 +128,6 @@ def cleanup_plugins(
             failures are logged instead so they never mask it.
     """
     logger = slog
-    pending_exc = sys.exc_info()[1]
     cleanup_errors: list[str] = []
     sources_for_cleanup = started_sources if started_sources is not None else config.sources
     transforms_for_cleanup = started_transforms if started_transforms is not None else config.transforms

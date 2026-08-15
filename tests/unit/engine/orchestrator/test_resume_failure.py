@@ -949,14 +949,16 @@ class TestResumeFinalizesAsFailed:
             coalesce_node_map={},
         )
         graph = MagicMock(spec=ExecutionGraph)
+        preflight_error = RuntimeError("resume runtime preflight exploded")
 
         with (
             patch("elspeth.engine.orchestrator.resume.setup_resume_context", return_value=artifacts),
             patch.object(orch._context_factory, "initialize_run_context", return_value=run_ctx),
             patch(
                 "elspeth.engine.orchestrator.resume.run_transform_runtime_preflights",
-                side_effect=RuntimeError("resume runtime preflight exploded"),
+                side_effect=preflight_error,
             ),
+            patch("elspeth.engine.orchestrator.resume.cleanup_plugins", wraps=cleanup_plugins) as spy_cleanup,
             patch.object(orch._sink_flush, "flush_and_write_sinks") as flush_sinks,
             pytest.raises(RuntimeError, match="resume runtime preflight exploded"),
         ):
@@ -982,6 +984,119 @@ class TestResumeFinalizesAsFailed:
         sink.on_complete.assert_called_once_with(run_ctx.ctx)
         sink.close.assert_called_once_with()
         flush_sinks.assert_not_called()
+        assert spy_cleanup.call_args.kwargs["include_source"] is False
+        assert spy_cleanup.call_args.kwargs["pending_exc"] is preflight_error
+
+    def test_successful_resume_inside_handled_exception_surfaces_cleanup_failure(self) -> None:
+        """The resume finally must not inherit a caller's already-handled exception."""
+        orch = _make_orchestrator(make_landscape_db())
+        source = _specced_source()
+        source.on_success = "default"
+        sink = _specced_sink()
+        sink.close.side_effect = RuntimeError("resume cleanup failed")
+        config = PipelineConfig(
+            sources={"source": source},
+            transforms=(),
+            sinks={"default": sink},
+        )
+        processor = _mock_processor()
+        processor.run_id = "run-resume-clean-boundary"
+        artifacts = SimpleNamespace(
+            source_id_map={"source": NodeID("source")},
+            edge_map={},
+            sink_id_map={"default": NodeID("sink")},
+            source_id=NodeID("source"),
+        )
+        run_ctx = SimpleNamespace(
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+
+        with (
+            patch("elspeth.engine.orchestrator.resume.setup_resume_context", return_value=artifacts),
+            patch.object(orch._context_factory, "initialize_run_context", return_value=run_ctx),
+            patch("elspeth.engine.orchestrator.resume.run_transform_runtime_preflights"),
+            patch("elspeth.engine.orchestrator.resume.run_resume_processing_loop", return_value=False),
+            patch.object(orch._sink_flush, "flush_and_write_sinks"),
+        ):
+            try:
+                raise LookupError("handled by resume caller")
+            except LookupError:
+                with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
+                    orch._resume_coordinator.process_resumed_rows(
+                        MagicMock(spec=RecorderFactory),
+                        "run-resume-clean-boundary",
+                        config,
+                        MagicMock(spec=ExecutionGraph),
+                        unprocessed_rows=(),
+                        barrier_restore=None,
+                        payload_store=MagicMock(spec=PayloadStore),
+                        incomplete_by_row={},
+                        recovery_manager=MagicMock(spec=RecoveryManager),
+                        resume_checkpoint_id="checkpoint-clean-boundary",
+                        schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+                    )
+
+        source.on_complete.assert_not_called()
+        source.close.assert_not_called()
+        sink.on_complete.assert_called_once_with(run_ctx.ctx)
+        sink.close.assert_called_once_with()
+
+    def test_fresh_runtime_preflight_control_flow_failure_passes_exact_pending_exception_to_cleanup(self) -> None:
+        """Fresh preflight cleanup preserves BaseException control flow and passes its identity explicitly."""
+        orch = _make_orchestrator(make_landscape_db())
+        source = _specced_source()
+        source.on_success = "default"
+        sink = _specced_sink()
+        sink.close.side_effect = RuntimeError("cleanup must not replace interrupt")
+        config = PipelineConfig(
+            sources={"source": source},
+            transforms=(),
+            sinks={"default": sink},
+        )
+        processor = _mock_processor()
+        processor.run_id = "run-fresh-preflight-interrupt"
+        artifacts = SimpleNamespace(
+            source_id_map={"source": NodeID("source")},
+            edge_map={},
+            sink_id_map={"default": NodeID("sink")},
+            source_id=NodeID("source"),
+        )
+        run_ctx = SimpleNamespace(
+            processor=processor,
+            ctx=MagicMock(spec=PluginContext),
+            agg_transform_lookup={},
+            coalesce_executor=None,
+            coalesce_node_map={},
+        )
+        preflight_error = KeyboardInterrupt("fresh preflight interrupted")
+
+        with (
+            patch.object(orch, "_register_graph_nodes_and_edges", return_value=artifacts),
+            patch.object(orch._context_factory, "initialize_run_context", return_value=run_ctx),
+            patch(
+                "elspeth.engine.orchestrator.leader_drain.run_transform_runtime_preflights",
+                side_effect=preflight_error,
+            ),
+            patch("elspeth.engine.orchestrator.leader_drain.cleanup_plugins", wraps=cleanup_plugins) as spy_cleanup,
+            pytest.raises(KeyboardInterrupt, match="fresh preflight interrupted") as exc_info,
+        ):
+            orch._execute_run(
+                MagicMock(spec=RecorderFactory),
+                "run-fresh-preflight-interrupt",
+                config,
+                MagicMock(spec=ExecutionGraph),
+                payload_store=MagicMock(spec=PayloadStore),
+            )
+
+        assert exc_info.value is preflight_error
+        assert spy_cleanup.call_count == 1
+        assert spy_cleanup.call_args.kwargs["include_source"] is True
+        assert spy_cleanup.call_args.kwargs["pending_exc"] is preflight_error
+        sink.close.assert_called_once_with()
 
     def test_setup_resume_context_uses_all_source_roots(self) -> None:
         """Multi-source resume must build a full source map instead of calling graph.get_sources()[0]."""
@@ -2094,7 +2209,8 @@ class TestBuildProcessorCallsCleanupOnFailure:
     (DB connections, file handles, thread pools).
 
     Fix: Wrapped _build_processor in try/except that calls
-    _cleanup_plugins(config, ctx, include_source=True) on failure.
+    _cleanup_plugins(config, ctx, include_source=True, pending_exc=build_error)
+    on failure.
     """
 
     def test_cleanup_plugins_runs_full_teardown(self) -> None:
@@ -2113,7 +2229,7 @@ class TestBuildProcessorCallsCleanupOnFailure:
         primary_source = _specced_source(node_id="source-1")
         config.sources = {"primary": primary_source}
 
-        cleanup_plugins(config, ctx)
+        cleanup_plugins(config, ctx, pending_exc=None)
 
         tracked_transform.on_complete.assert_called_once()
         tracked_transform.close.assert_called_once()
@@ -2165,8 +2281,9 @@ class TestBuildProcessorCallsCleanupOnFailure:
         )
 
         # build_processor fails after on_start has been called on all plugins
+        build_error = RuntimeError("processor build failed")
         with (
-            patch.object(orch._processor_factory, "build_processor", side_effect=RuntimeError("processor build failed")),
+            patch.object(orch._processor_factory, "build_processor", side_effect=build_error),
             # cleanup_plugins is now a module function; patch it where
             # run_context_factory.py looks it up (the imported name in that
             # module's namespace), not on the instance.
@@ -2192,6 +2309,7 @@ class TestBuildProcessorCallsCleanupOnFailure:
         assert call_kwargs.kwargs.get("include_source") is True, (
             f"cleanup_plugins must be called with include_source=True when source was started. Got: {call_kwargs}"
         )
+        assert call_kwargs.kwargs.get("pending_exc") is build_error
         # The config passed must be the same config object
         assert call_kwargs.args[0] is config
 
@@ -2437,7 +2555,7 @@ class TestBuildProcessorCallsCleanupOnFailure:
         config.transforms = [transform]
         config.sinks = {"sink": sink}
 
-        cleanup_plugins(config, ctx)
+        cleanup_plugins(config, ctx, pending_exc=None)
 
         assert observed == [
             ("transform", "transform-1"),
@@ -2461,7 +2579,7 @@ class TestBuildProcessorCallsCleanupOnFailure:
         config.sinks = {"sink": sink_without_node_id}
 
         with pytest.raises(OrchestrationInvariantError, match="node_id"):
-            cleanup_plugins(config, ctx, include_source=False)
+            cleanup_plugins(config, ctx, include_source=False, pending_exc=None)
 
 
 class TestCleanupPluginsReRaisesSystemExceptions:
@@ -2527,7 +2645,7 @@ class TestCleanupPluginsReRaisesSystemExceptions:
         config.sources["primary"] = _specced_source(node_id="source-1")
 
         with pytest.raises(FrameworkBugError, match="internal corruption"):
-            cleanup_plugins(config, ctx)
+            cleanup_plugins(config, ctx, pending_exc=None)
 
     def test_audit_integrity_error_propagates_through_cleanup(self) -> None:
         """AuditIntegrityError from sink.close() must propagate, not be swallowed."""
@@ -2546,7 +2664,7 @@ class TestCleanupPluginsReRaisesSystemExceptions:
         config.sources["primary"] = _specced_source(node_id="source-1")
 
         with pytest.raises(AuditIntegrityError, match="audit DB corrupted"):
-            cleanup_plugins(config, ctx)
+            cleanup_plugins(config, ctx, pending_exc=None)
 
     def test_regular_exceptions_still_collected_as_cleanup_errors(self) -> None:
         """Non-system exceptions are still collected and reported as RuntimeError."""
@@ -2564,7 +2682,7 @@ class TestCleanupPluginsReRaisesSystemExceptions:
         config.sources["primary"] = _specced_source(node_id="source-1")
 
         with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
-            cleanup_plugins(config, ctx)
+            cleanup_plugins(config, ctx, pending_exc=None)
 
 
 class TestResumeLoopCoordinationLatch:

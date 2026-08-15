@@ -635,6 +635,60 @@ class TestTelemetrySpanFactory:
 
         assert event.attributes == {"row.id": "row-001", "token.id": "token-001"}
 
+    def test_engine_span_event_rejects_row_content_hash_attributes(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
+
+        completed_at = datetime.now(UTC)
+        for name in (EngineSpanName.TRANSFORM, EngineSpanName.GATE, EngineSpanName.AGGREGATION):
+            with pytest.raises(ValueError, match="not allowed"):
+                EngineSpanCompleted(
+                    timestamp=completed_at,
+                    run_id="run-001",
+                    name=name,
+                    started_at=completed_at,
+                    trace_started_at=completed_at,
+                    span_id="0123456789abcdef",
+                    parent_span_id=None,
+                    status=EngineSpanStatus.OK,
+                    exception_type=None,
+                    attributes={"input.hash": "deterministic-row-fingerprint"},
+                )
+
+    def test_manager_omits_row_content_fingerprint_before_export(self) -> None:
+        """Configured exporters receive an egress-safe event projection."""
+        from typing import get_type_hints
+
+        from elspeth.contracts.enums import TelemetryGranularity
+        from elspeth.contracts.events import RowCreated
+        from elspeth.telemetry import TelemetryManager
+        from elspeth.telemetry.serialization import serialize_event_attributes, serialize_otlp_event_attributes
+        from tests.fixtures.telemetry import MockTelemetryConfig, TelemetryTestExporter
+
+        event = RowCreated(
+            timestamp=datetime.now(UTC),
+            run_id="run-001",
+            row_id="row-001",
+            token_id="token-001",
+            content_hash="deterministic-low-entropy-row-fingerprint",
+        )
+        exporter = TelemetryTestExporter()
+        manager = TelemetryManager(
+            MockTelemetryConfig(granularity=TelemetryGranularity.ROWS),
+            exporters=[exporter],
+        )
+        try:
+            manager.handle_event(event)
+        finally:
+            manager.close()
+
+        exported = exporter.events[0]
+        assert isinstance(exported, RowCreated)
+        assert get_type_hints(RowCreated)["content_hash"] == str | None
+        assert exported.content_hash is None
+        assert "content_hash" not in serialize_event_attributes(exported)
+        assert "content_hash" not in serialize_otlp_event_attributes(exported)
+        assert event.content_hash == "deterministic-low-entropy-row-fingerprint"
+
     def test_engine_span_contract_tolerates_cross_host_clock_skew(self) -> None:
         from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 
@@ -705,7 +759,7 @@ class TestSpanFactory:
 
         factory = SpanFactory()
 
-        with factory.transform_span("my_transform", input_hash="abc123") as span:
+        with factory.transform_span("my_transform") as span:
             assert isinstance(span, NoOpSpan)
 
     def test_with_tracer(self) -> None:
@@ -813,7 +867,7 @@ class TestGateSpan:
         from elspeth.engine.spans import NoOpSpan, SpanFactory
 
         factory = SpanFactory()
-        with factory.gate_span("my_gate", input_hash="xyz789") as span:
+        with factory.gate_span("my_gate") as span:
             assert isinstance(span, NoOpSpan)
 
     def test_gate_span_with_tracer(self) -> None:
@@ -1385,14 +1439,8 @@ class TestNodeIdOnSpans:
         # Also verify batch.id is still present
         assert attrs.get("batch.id") == "batch-001"
 
-    def test_aggregation_span_includes_input_hash(self) -> None:
-        """Aggregation span should include input.hash when provided.
-
-        BUG: P3-2026-02-01-aggregation-flush-span-missing-input-hash
-        Aggregation flushes compute input_hash for audit correlation, but
-        aggregation_span() was created without input_hash parameter when
-        migrating from transform_span(). This breaks trace-to-audit correlation.
-        """
+    def test_aggregation_span_uses_opaque_correlation_without_content_hash(self) -> None:
+        """Batch and token IDs correlate aggregation spans without row hashes."""
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
@@ -1411,16 +1459,13 @@ class TestNodeIdOnSpans:
             node_id="aggregation_batch_stats_abc123",
             batch_id="batch-001",
             token_ids=["token-001", "token-002"],
-            input_hash="sha256:deadbeef1234567890",
         ):
             pass
 
         spans = exporter.get_finished_spans()
         assert len(spans) == 1
         attrs = dict(spans[0].attributes or {})
-        # Core assertion: input.hash must be present for trace-to-audit correlation
-        assert attrs.get("input.hash") == "sha256:deadbeef1234567890"
-        # Verify other attributes still work
+        assert "input.hash" not in attrs
         assert attrs.get("node.id") == "aggregation_batch_stats_abc123"
         assert attrs.get("batch.id") == "batch-001"
         assert attrs.get("token.ids") == ("token-001", "token-002")
@@ -1533,17 +1578,6 @@ class TestTruthinessChecks:
         # After fix: `if node_id is not None:` sets "" → attribute present
         assert "node.id" in attrs
         assert attrs["node.id"] == ""
-
-    def test_transform_span_empty_string_input_hash_sets_attribute(self) -> None:
-        """Empty string input_hash should still set the attribute."""
-        factory, exporter = self._make_factory()
-
-        with factory.transform_span("my_transform", input_hash=""):
-            pass
-
-        spans = exporter.get_finished_spans()
-        attrs = dict(spans[0].attributes or {})
-        assert "input.hash" in attrs
 
     def test_gate_span_empty_string_node_id_sets_attribute(self) -> None:
         """Gate span: empty string node_id should set attribute."""

@@ -5,10 +5,36 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+from pydantic_core import InitErrorDetails, PydanticCustomError
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.core.commencement_gate_expression import validate_commencement_gate_condition
+from elspeth.core.expression_parser import ExpressionSecurityError, ExpressionSyntaxError
+
+_REDACTED_CONDITION_INPUT = "<redacted-commencement-gate-condition>"
+
+
+def _condition_validation_error(*, code: str, message: str) -> ValidationError:
+    """Build an owned Pydantic error whose input cannot reveal source text."""
+    return ValidationError.from_exception_data(
+        title="CommencementGateConfig",
+        line_errors=[
+            InitErrorDetails(
+                type=PydanticCustomError(code, message),
+                loc=(),
+                input=_REDACTED_CONDITION_INPUT,
+            )
+        ],
+    )
 
 
 def _validate_non_blank(value: str, field_name: str) -> str:
@@ -41,7 +67,7 @@ class DependencyConfig(BaseModel):
 class CommencementGateConfig(BaseModel):
     """Declares a go/no-go condition evaluated before the pipeline starts."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
 
     name: str = Field(min_length=1, description="Unique label for this gate")
     condition: str = Field(min_length=1, description="Expression evaluated against pre-flight context")
@@ -60,7 +86,21 @@ class CommencementGateConfig(BaseModel):
         on invalid input — surfaced immediately instead of at gate evaluation time.
         """
         stripped = _validate_non_blank(v, "condition")
-        validate_commencement_gate_condition(stripped)
+        try:
+            validate_commencement_gate_condition(stripped)
+        except ExpressionSyntaxError:
+            raise _condition_validation_error(
+                code="commencement_gate_condition_syntax",
+                message="condition has invalid syntax; provide one valid expression using the supported commencement gate grammar",
+            ) from None
+        except ExpressionSecurityError:
+            raise _condition_validation_error(
+                code="commencement_gate_condition_security",
+                message=(
+                    "condition uses unsupported or unsafe syntax; use only pre-flight lookups, comparisons, boolean operators, "
+                    "literals, and supported safe builtins"
+                ),
+            ) from None
         return stripped
 
 

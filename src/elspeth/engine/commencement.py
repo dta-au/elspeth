@@ -10,6 +10,7 @@ from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.preflight import CommencementGateResult
 from elspeth.core.commencement_gate_expression import (
     COMMENCEMENT_GATE_ALLOWED_NAMES,
+    redact_commencement_gate_condition,
     validate_commencement_gate_condition,
 )
 from elspeth.core.dependency_config import CommencementGateConfig
@@ -82,6 +83,7 @@ def evaluate_commencement_gates(
 
     results: list[CommencementGateResult] = []
     for gate in gates:
+        audited_condition = redact_commencement_gate_condition(gate.condition)
         try:
             parser = ExpressionParser(
                 gate.condition,
@@ -91,7 +93,7 @@ def evaluate_commencement_gates(
             if not isinstance(result, bool):
                 raise CommencementGateFailedError(
                     gate_name=gate.name,
-                    condition=gate.condition,
+                    condition=audited_condition,
                     reason=(
                         # NB: do NOT include {result!r} — for a gate like
                         # dependency_runs['x']['run_id'] the result IS the raw
@@ -121,7 +123,7 @@ def evaluate_commencement_gates(
                 raise
             raise CommencementGateFailedError(
                 gate_name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 reason=f"Expression raised {type(exc).__name__}",
                 context_snapshot=audit_snapshot,
             ) from exc
@@ -129,7 +131,7 @@ def evaluate_commencement_gates(
         if not passed:
             raise CommencementGateFailedError(
                 gate_name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 reason="Condition evaluated to falsy",
                 context_snapshot=audit_snapshot,
             )
@@ -137,7 +139,7 @@ def evaluate_commencement_gates(
         results.append(
             CommencementGateResult(
                 name=gate.name,
-                condition=gate.condition,
+                condition=audited_condition,
                 result=True,
                 context_snapshot=audit_snapshot,
             )

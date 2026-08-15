@@ -700,9 +700,10 @@ class AggregationExecutor:
         step = self._step_resolver(node_id)
 
         # NodeStateGuard guarantees the node state reaches terminal status.
-        # If any post-processing step (output hashing, batch completion) raises
-        # before the state is explicitly completed, the guard auto-completes
-        # it as FAILED.  Batch lifecycle cleanup is handled separately below.
+        # If any guarded flush step (validation, invocation, output hashing, or
+        # batch completion) raises before the state is explicitly completed,
+        # the guard auto-completes it as FAILED. Batch lifecycle cleanup is
+        # handled separately below.
         # Attempt honors the token's resume offset: a journal-restored flush
         # re-run (the original flush crashed and wrote a FAILED node_state at
         # the prior attempt) must not collide with audited history (F1).
@@ -711,7 +712,6 @@ class AggregationExecutor:
             self._spans.aggregation_span(
                 transform.name,
                 node_id=node_id,
-                input_hash=input_hash,
                 batch_id=batch_id,
                 token_ids=batch_token_ids,
                 run_id=self._run_id,
@@ -725,6 +725,7 @@ class AggregationExecutor:
                 input_data=batch_input,
                 attempt=snapshot.representative_token.resume_attempt_offset,
                 resume_checkpoint_id=snapshot.representative_token.resume_checkpoint_id,
+                auto_fail_phase="aggregation_flush",
             ) as guard,
         ):
             window = self._build_flush_window(

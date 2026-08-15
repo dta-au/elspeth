@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, TypedDict
+from typing import Any, TypedDict, cast
 
 import pytest
 
@@ -207,6 +207,25 @@ def test_pre_emission_check_raises_on_missing_declared_input_field() -> None:
     assert tuple(exc_info.value.payload["effective_input_fields"]) == ("account_id",)
 
 
+def test_pre_emission_check_attributes_violation_to_dispatcher_node_id() -> None:
+    contract = DeclaredRequiredFieldsContract()
+    inputs = PreEmissionInputs(
+        plugin=_plugin(node_id="mutated-plugin-node"),
+        node_id="dispatcher-node",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+        input_row=_row(("account_id",)),
+        static_contract=frozenset(),
+        effective_input_fields=frozenset({"account_id"}),
+    )
+
+    with pytest.raises(DeclaredRequiredInputFieldsViolation) as exc_info:
+        contract.pre_emission_check(inputs)
+
+    assert exc_info.value.node_id == "dispatcher-node"
+
+
 def test_pre_emission_check_returns_none_when_declared_fields_present() -> None:
     contract = DeclaredRequiredFieldsContract()
     inputs = PreEmissionInputs(
@@ -229,6 +248,40 @@ def test_pre_emission_check_preserves_orchestration_invariant_on_missing_node_id
     inputs = PreEmissionInputs(
         plugin=plugin,
         node_id="",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+        input_row=_row(("account_id",)),
+        static_contract=frozenset(),
+        effective_input_fields=frozenset({"account_id"}),
+    )
+
+    with pytest.raises(OrchestrationInvariantError):
+        contract.pre_emission_check(inputs)
+
+
+def test_pre_emission_check_rejects_whitespace_only_dispatcher_node_id() -> None:
+    contract = DeclaredRequiredFieldsContract()
+    inputs = PreEmissionInputs(
+        plugin=_plugin(),
+        node_id=" \t",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+        input_row=_row(("account_id",)),
+        static_contract=frozenset(),
+        effective_input_fields=frozenset({"account_id"}),
+    )
+
+    with pytest.raises(OrchestrationInvariantError):
+        contract.pre_emission_check(inputs)
+
+
+def test_pre_emission_check_rejects_truthy_non_string_dispatcher_node_id() -> None:
+    contract = DeclaredRequiredFieldsContract()
+    inputs = PreEmissionInputs(
+        plugin=_plugin(),
+        node_id=cast(str, 7),
         run_id="run-1",
         row_id="row-1",
         token_id="token-1",

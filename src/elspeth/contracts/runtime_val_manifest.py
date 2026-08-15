@@ -114,10 +114,10 @@ def _callable_dependency_key(func: FunctionType) -> str:
 
 
 def _function_builtin_bindings(func: FunctionType) -> dict[str, object]:
-    # typeshed omits FunctionType.__builtins__, but CPython binds this exact
-    # execution namespace when the function is created.  The globals-table
-    # ``__builtins__`` entry may be changed later without changing execution.
-    builtins_value: object = func.__builtins__  # type: ignore[attr-defined]
+    # CPython binds this exact execution namespace when the function is
+    # created.  The globals-table ``__builtins__`` entry may be changed later
+    # without changing execution.
+    builtins_value: object = object.__getattribute__(func, "__builtins__")
     if type(builtins_value) is dict:
         return builtins_value
     if type(builtins_value) is ModuleType:

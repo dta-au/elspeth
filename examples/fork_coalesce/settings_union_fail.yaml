@@ -5,10 +5,10 @@
 # Demonstrates `union_collision_policy: fail` — on ANY field-name
 # collision, the coalesce raises `CoalesceCollisionError`. The orchestrator
 # catches the error, marks the coalesce node FAILED, and persists the full
-# collision record (`union_field_origins`, `union_field_collision_values`)
-# to `node_states.context_after_json` so auditors can see exactly which
-# fields collided, which branches produced the conflicting values, and
-# audit-safe hashes/types for those values.
+# collision record (`union_field_origins`, `union_field_collisions`)
+# to `node_states.context_after_json` so auditors can see which fields
+# collided and which branches contributed, without value-derived hashes
+# or types.
 #
 #   source ─(raw)─> [fork_gate] ─┬─ path_a ─> truncate(20) ─(trunc_a)─┐
 #                                 └─ path_b ─> truncate(50) ─(trunc_b)─┤

@@ -1512,6 +1512,75 @@ class TestListCollisions:
 
         assert results == []
 
+    def test_branch_only_collision_records_remain_queryable_without_value_material(self) -> None:
+        """New collision records expose branches and winner, never value fingerprints."""
+        from sqlalchemy import text
+
+        from elspeth.mcp.analyzers.queries import list_collisions
+
+        setup = make_recorder_with_run(run_id="branch-only")
+        register_test_node(
+            setup.factory.data_flow,
+            "branch-only",
+            "coalesce-node",
+            node_type=NodeType.COALESCE,
+            plugin_name="coalesce:merge",
+        )
+        row = setup.factory.data_flow.create_row(
+            "branch-only",
+            setup.source_node_id,
+            row_index=0,
+            data={"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        token = setup.factory.data_flow.create_token(row.row_id)
+        state = setup.factory.execution.begin_node_state(
+            token.token_id,
+            "coalesce-node",
+            "branch-only",
+            step_index=1,
+            input_data={"x": 1},
+        )
+        context_json = json.dumps(
+            {
+                "union_field_collisions": {"score": ["branch1", "branch2"]},
+                "union_field_origins": {"score": "branch2"},
+            }
+        )
+        with setup.db.write_connection() as conn:
+            conn.execute(
+                text(
+                    """
+                    UPDATE node_states
+                    SET status = :status,
+                        completed_at = datetime('now'),
+                        context_after_json = :context_after
+                    WHERE state_id = :state_id
+                    """
+                ),
+                {
+                    "state_id": state.state_id,
+                    "status": NodeStateStatus.COMPLETED.value,
+                    "context_after": context_json,
+                },
+            )
+
+        results = list_collisions(setup.db, setup.factory, "branch-only")
+
+        assert len(results) == 1
+        [field] = results[0]["collision_fields"]
+        assert field == {
+            "field": "score",
+            "contributing_branches": ["branch1", "branch2"],
+            "winner_branch": "branch2",
+            "winner_value_fingerprint": None,
+            "competing_value_fingerprints": [],
+        }
+        serialized = json.dumps(results, sort_keys=True)
+        assert "value_hash" not in serialized
+        assert "value_type" not in serialized
+
     def test_matches_plain_coalesce_plugin_name(self) -> None:
         """list_collisions must find collisions with plain 'coalesce' plugin_name.
 
@@ -1702,6 +1771,7 @@ class TestListCollisions:
         assert winner_fingerprint is not None
         _assert_value_fingerprint(winner_fingerprint, value_type="int")
         competing = score_field["competing_value_fingerprints"]
+        assert score_field["contributing_branches"] == ["branch1", "branch2"]
         assert [branch for branch, _fingerprint in competing] == ["branch1", "branch2"]
         assert competing[0][1]["value_hash"] != competing[1][1]["value_hash"]
 

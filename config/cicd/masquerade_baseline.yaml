@@ -1403,16 +1403,6 @@ entries:
   justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
     individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
     'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
-- path: tests/unit/engine/test_executors.py
-  qualname: TestAggregationExecutorTerminality.test_output_hash_failure_marks_state_and_batch_failed
-  kind: getattr
-  occurrences: 1
-  probe_shapes:
-  - ebf61f8d22014d0dc8d8801cd7a2c63dadfef6ae19331865db3222859fee5e04
-  classification: unadjudicated
-  justification: Seeded from the elspeth-b9ad1bbee3 gate-creation corpus; not yet
-    individually reviewed. classification=unadjudicated means NOT YET REVIEWED, not
-    'confirmed legitimate' — see the header of this file and docs/architecture/adr/032-validate-by-trust-domain.md.
 - path: tests/unit/engine/test_pass_through_declaration_contract.py
   qualname: test_negative_example_fires_violation
   kind: getattr

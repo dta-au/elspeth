@@ -169,8 +169,8 @@ class LeaderDrainCoordinator:
                 retry_manager=preflight_retry_manager,
                 shutdown_event=shutdown_event,
             )
-        except BaseException:
-            cleanup_plugins(config, run_ctx.ctx, include_source=True)
+        except BaseException as pending_exc:
+            cleanup_plugins(config, run_ctx.ctx, include_source=True, pending_exc=pending_exc)
             raise
 
         loop_ctx = LoopContext(
@@ -184,6 +184,7 @@ class LeaderDrainCoordinator:
             coalesce_node_map=run_ctx.coalesce_node_map,
         )
 
+        cleanup_pending_exc: BaseException | None = None
         try:
             # 3. Source + Process phase. This is sequential multi-source ingest:
             # each declared source is iterated in turn with the active
@@ -389,16 +390,22 @@ class LeaderDrainCoordinator:
                 )
 
             self._events.emit(PhaseCompleted(phase=PipelinePhase.PROCESS, duration_seconds=current_time - loop_result.phase_start))
-        except GracefulShutdownError:
+        except GracefulShutdownError as exc:
+            cleanup_pending_exc = exc
             raise
         except Exception as exc:
-            raise _RunFailedWithPartialResultError(
+            outgoing_exc = _RunFailedWithPartialResultError(
                 original_error=exc,
                 partial_result=loop_ctx.counters.to_run_result(run_id, status=RunStatus.FAILED),
-            ) from exc
+            )
+            cleanup_pending_exc = outgoing_exc
+            raise outgoing_exc from exc
+        except BaseException as exc:
+            cleanup_pending_exc = exc
+            raise
 
         finally:
-            cleanup_plugins(config, run_ctx.ctx, include_source=True)
+            cleanup_plugins(config, run_ctx.ctx, include_source=True, pending_exc=cleanup_pending_exc)
             self._checkpoints.set_active_graph(None)
 
         return loop_ctx.counters.to_run_result(run_id, status=RunStatus.RUNNING)

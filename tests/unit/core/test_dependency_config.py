@@ -111,7 +111,7 @@ class TestCommencementGateConfig:
         # env was removed (elspeth-83261b699c surface); it is a forbidden name now.
         with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'env'"):
             validate_commencement_gate_condition("collections['test']['count'] > 0 and env['READY'] == '1'")
-        with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'row'"):
+        with pytest.raises(ValidationError, match="unsupported or unsafe syntax"):
             CommencementGateConfig(name="bad", condition="row['status'] == 'ready'")
         gate = CommencementGateConfig.model_construct(name="bad", condition="row['status'] == 'ready'")
         with pytest.raises(ExpressionSecurityError, match="Forbidden name: 'row'"):

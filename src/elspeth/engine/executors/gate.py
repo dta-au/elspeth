@@ -304,7 +304,6 @@ class GateExecutor:
             self._spans.gate_span(
                 gate_config.name,
                 node_id=node_id,
-                input_hash=input_hash,
                 token_id=token.token_id,
                 run_id=ctx.run_id,
             ) as gate_span,
@@ -315,6 +314,7 @@ class GateExecutor:
                 run_id=ctx.run_id,
                 step_index=step,
                 input_data=input_dict,
+                auto_fail_phase="gate_evaluation_routing",
             ) as guard,
         ):
             start = time.perf_counter()

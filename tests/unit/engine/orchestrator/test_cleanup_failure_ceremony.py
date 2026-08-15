@@ -99,25 +99,42 @@ def _config_with_sensitive_failing_close_sink() -> PipelineConfig:
 class TestCleanupDoesNotMaskPendingException:
     """Direct cleanup_plugins contract: pending exception wins."""
 
-    def test_cleanup_failure_during_exception_propagation_preserves_original(self) -> None:
+    def test_handled_exception_does_not_suppress_cleanup_failure_when_caller_declares_no_pending_exception(
+        self,
+    ) -> None:
+        """Ambient interpreter state is not cleanup-policy authority."""
         config = _config_with_failing_close_sink()
         ctx = PluginContext(run_id="test", config={}, landscape=None)
 
-        with pytest.raises(ValueError, match="primary run failure"):
+        try:
+            raise ValueError("handled before cleanup")
+        except ValueError:
+            with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
+                cleanup_plugins(config, ctx, include_source=True, pending_exc=None)
+
+    def test_cleanup_failure_during_exception_propagation_preserves_original(self) -> None:
+        config = _config_with_failing_close_sink()
+        ctx = PluginContext(run_id="test", config={}, landscape=None)
+        pending_exc = ValueError("primary run failure")
+
+        with pytest.raises(ValueError, match="primary run failure") as exc_info:
             try:
-                raise ValueError("primary run failure")
+                raise pending_exc
             finally:
-                cleanup_plugins(config, ctx, include_source=True)
+                cleanup_plugins(config, ctx, include_source=True, pending_exc=pending_exc)
+
+        assert exc_info.value is pending_exc
 
     def test_cleanup_failure_during_exception_propagation_is_logged(self) -> None:
         config = _config_with_failing_close_sink()
         ctx = PluginContext(run_id="test", config={}, landscape=None)
+        pending_exc = ValueError("primary run failure")
 
         with structlog.testing.capture_logs() as captured, pytest.raises(ValueError, match="primary run failure"):
             try:
-                raise ValueError("primary run failure")
+                raise pending_exc
             finally:
-                cleanup_plugins(config, ctx, include_source=True)
+                cleanup_plugins(config, ctx, include_source=True, pending_exc=pending_exc)
 
         events = [entry["event"] for entry in captured]
         assert "Plugin cleanup failed during exception propagation; original error preserved" in events
@@ -128,7 +145,21 @@ class TestCleanupDoesNotMaskPendingException:
         ctx = PluginContext(run_id="test", config={}, landscape=None)
 
         with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
-            cleanup_plugins(config, ctx, include_source=True)
+            cleanup_plugins(config, ctx, include_source=True, pending_exc=None)
+
+    def test_cleanup_failure_preserves_pending_control_flow_base_exception(self) -> None:
+        """Ordinary cleanup failures cannot replace KeyboardInterrupt/SystemExit-class flow."""
+        config = _config_with_failing_close_sink()
+        ctx = PluginContext(run_id="test", config={}, landscape=None)
+        pending_exc = KeyboardInterrupt("operator interrupted")
+
+        with pytest.raises(KeyboardInterrupt, match="operator interrupted") as exc_info:
+            try:
+                raise pending_exc
+            finally:
+                cleanup_plugins(config, ctx, include_source=True, pending_exc=pending_exc)
+
+        assert exc_info.value is pending_exc
 
     def test_cleanup_failure_public_surfaces_preserve_benign_error_text(self) -> None:
         """Benign cleanup diagnostics keep a bounded message preview for operators."""
@@ -136,7 +167,7 @@ class TestCleanupDoesNotMaskPendingException:
         ctx = PluginContext(run_id="test", config={}, landscape=None)
 
         with structlog.testing.capture_logs() as captured, pytest.raises(RuntimeError) as exc_info:
-            cleanup_plugins(config, ctx, include_source=True)
+            cleanup_plugins(config, ctx, include_source=True, pending_exc=None)
 
         public_error = str(exc_info.value)
         assert "sink.close(default)" in public_error
@@ -153,7 +184,7 @@ class TestCleanupDoesNotMaskPendingException:
         ctx = PluginContext(run_id="test", config={}, landscape=None)
 
         with structlog.testing.capture_logs() as captured, pytest.raises(RuntimeError) as exc_info:
-            cleanup_plugins(config, ctx, include_source=True)
+            cleanup_plugins(config, ctx, include_source=True, pending_exc=None)
 
         public_error = str(exc_info.value)
         captured_text = repr(captured)
@@ -225,3 +256,36 @@ class TestPartialResultCeremonySurvivesCleanupFailure:
         # Partial-result ceremony: the row ingested before the failure is
         # reported, not the generic ceremony's zeroed counters.
         assert summary.total_rows == 1
+
+    def test_successful_fresh_run_inside_handled_exception_surfaces_cleanup_failure(self) -> None:
+        """The fresh-run finally must not inherit a caller's already-handled exception."""
+        db = LandscapeDB.in_memory()
+        event_bus = RecordingEventBus()
+        source = ListSource([{"value": 1}], name="source", on_success="default")
+        sink = FailingCloseSink("default")
+        source_settings = SourceSettings(plugin=source.name, on_success="default", options={})
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": cast(SourceProtocol, source)},
+            source_settings_map={"primary": source_settings},
+            transforms=[],
+            sinks=cast("dict[str, SinkProtocol]", {"default": sink}),
+            aggregations={},
+            gates=[],
+        )
+        config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[],
+            sinks={"default": as_sink(sink)},
+        )
+        orchestrator = Orchestrator(db, event_bus=event_bus)
+
+        try:
+            raise LookupError("handled by the caller")
+        except LookupError:
+            with pytest.raises(RuntimeError, match="Plugin cleanup failed"):
+                orchestrator.run(
+                    config,
+                    graph=graph,
+                    payload_store=MockPayloadStore(),
+                    shutdown_event=threading.Event(),
+                )

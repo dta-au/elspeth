@@ -270,20 +270,18 @@ _ENGINE_SPAN_ALLOWED_ATTRIBUTES: Mapping[EngineSpanName, frozenset[str]] = Mappi
                 "plugin.name",
                 "plugin.type",
                 "node.id",
-                "input.hash",
                 "token.id",
                 "token.ids",
                 "token.ids.total_count",
                 "token.ids.truncated_count",
             }
         ),
-        EngineSpanName.GATE: frozenset({"plugin.name", "plugin.type", "node.id", "input.hash", "token.id"}),
+        EngineSpanName.GATE: frozenset({"plugin.name", "plugin.type", "node.id", "token.id"}),
         EngineSpanName.AGGREGATION: frozenset(
             {
                 "plugin.name",
                 "plugin.type",
                 "node.id",
-                "input.hash",
                 "batch.id",
                 "token.ids",
                 "token.ids.total_count",
@@ -354,8 +352,9 @@ def _validate_engine_span_attributes(
 class EngineSpanCompleted(TelemetryEvent):
     """One completed engine operation exported through the telemetry fan-out.
 
-    The event carries only a closed set of bounded identifiers and hashes. Raw
-    exception messages and row content never cross this observability boundary.
+    The event carries only a closed set of bounded, opaque identifiers. Raw
+    exception messages, row content, and content-derived hashes never cross
+    this observability boundary.
     """
 
     name: EngineSpanName
@@ -587,15 +586,21 @@ class FieldResolutionApplied(TelemetryEvent):
 class RowCreated(TelemetryEvent):
     """Emitted when a new row enters the pipeline from the source.
 
+    Producers carry the real content hash for in-process audited correlation.
+    Before the event reaches telemetry observers or exporters,
+    ``TelemetryManager`` projects it to an egress-safe event whose
+    ``content_hash`` is ``None``. ``None`` means intentionally omitted; egress
+    must never substitute a shared marker that could be mistaken for a hash.
+
     Attributes:
         row_id: Stable source row identity
         token_id: Token instance for this row in the DAG
-        content_hash: Hash of the row content for deduplication
+        content_hash: Producer-side row hash, or ``None`` in the egress projection
     """
 
     row_id: str
     token_id: str
-    content_hash: str
+    content_hash: str | None
 
 
 # =============================================================================

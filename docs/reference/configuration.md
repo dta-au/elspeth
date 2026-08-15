@@ -1670,14 +1670,19 @@ When `merge: union` is used and two or more branches emit the same field name, `
 |-------|----------|
 | `last_wins` *(default)* | The last branch in declaration order wins. Matches the historical behavior of union merges. |
 | `first_wins` | The first branch in declaration order wins. |
-| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. The full collision record (origin of every field plus each contributing `(branch, value)` pair) is still written to the audit trail on the failed node state. |
+| `fail` | Raise `CoalesceCollisionError` the moment any field collides. No merged row is produced. Field origins and contributing branch names are still written to the failed node state. |
 
 > **Note on `fail`:** Collision detection is **name-based**, not value-based. Two branches that both emit a field called `id` with the *same* value still trigger `fail` — the executor does not compare values to decide whether the overlap is "real." If your branches share trivially-identical fields (like an `id` carried unchanged through both transforms), use `last_wins` or `first_wins` instead, or rename the shared fields out of one branch.
 
 Regardless of the chosen value, every union merge records:
 
 - `union_field_origins` — a mapping from every merged field to the branch that produced the winning value. Always populated so auditors can reconstruct field-level provenance even when no collision occurred.
-- `union_field_collision_values` — a mapping from each colliding field to the ordered list of `(branch, value)` pairs. Populated only when at least one field collided.
+- `union_field_collisions` — a mapping from each colliding field to the ordered list of contributing branches. Populated only when at least one field collided.
+
+Collision audit metadata deliberately does not contain raw values, value hashes, or
+Python value types. This prevents low-entropy branch values from being recovered by
+offline enumeration while preserving the branch, field, and winner provenance needed
+to explain first-wins, last-wins, and failed merges.
 
 `union_collision_policy` is **orthogonal to `policy`**: `policy` governs branch-level arrival (what to do when some branches never arrive), while `union_collision_policy` governs field-level conflict within an already-assembled merge. They are independent axes and can be combined freely.
 

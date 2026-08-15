@@ -7608,6 +7608,39 @@ class TestExecuteTransformWithRetry:
         assert state.status is NodeStateStatus.FAILED
         assert state.node_id == "t1"
         assert state.attempt == 0
+        assert state.error_json is not None
+        assert json.loads(state.error_json)["phase"] == "retry_pre_attempt_shutdown"
+
+    def test_pre_attempt_shutdown_auto_fail_keeps_shutdown_phase(self) -> None:
+        """A failure while building the explicit shutdown error keeps site attribution."""
+        _, factory = _make_factory()
+        transform = _make_mock_transform(node_id="t1", on_error="discard")
+        processor = _make_processor(
+            factory,
+            node_step_map={NodeID("t1"): 1},
+            node_to_plugin={NodeID("t1"): transform},
+        )
+        token = make_token_info(data={"value": 42})
+        _persist_token_for_scheduler(factory, token)
+
+        with (
+            patch("elspeth.engine.processor.scrub_text_for_audit", side_effect=RuntimeError("shutdown audit preparation failed")),
+            pytest.raises(RuntimeError, match="shutdown audit preparation failed"),
+        ):
+            processor._record_pre_attempt_shutdown_state(
+                exc=InterruptedError("shutdown requested before retry attempt"),
+                transform=transform,
+                token=token,
+                attempt=0,
+            )
+
+        states = factory.query.get_node_states_for_token(token.token_id)
+        assert len(states) == 1
+        assert states[0].status is NodeStateStatus.FAILED
+        assert states[0].error_json is not None
+        error = json.loads(states[0].error_json)
+        assert error["type"] == "RuntimeError"
+        assert error["phase"] == "retry_pre_attempt_shutdown"
 
 
 # =============================================================================

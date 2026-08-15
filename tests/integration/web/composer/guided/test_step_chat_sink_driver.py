@@ -68,10 +68,11 @@ def _fake_resolve_sink_response(args: dict) -> SimpleNamespace:
                     content=None,
                     tool_calls=[
                         SimpleNamespace(
+                            id="resolve-sink-call-1",
                             function=SimpleNamespace(
                                 name="resolve_sink",
                                 arguments=json.dumps(args),
-                            )
+                            ),
                         )
                     ],
                 )

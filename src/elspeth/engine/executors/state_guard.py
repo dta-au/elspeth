@@ -44,7 +44,32 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+type NodeStateAutoFailPhase = Literal[
+    "aggregation_flush",
+    "gate_evaluation_routing",
+    "retry_pre_attempt_shutdown",
+    "transform_execution",
+]
+
+_NODE_STATE_AUTO_FAIL_PHASES: frozenset[NodeStateAutoFailPhase] = frozenset(
+    {
+        "aggregation_flush",
+        "gate_evaluation_routing",
+        "retry_pre_attempt_shutdown",
+        "transform_execution",
+    }
+)
 _GUARD_TERMINAL_NODE_STATE_STATUSES = frozenset({NodeStateStatus.COMPLETED, NodeStateStatus.FAILED})
+
+
+def _validate_auto_fail_phase(value: object) -> NodeStateAutoFailPhase:
+    """Validate runtime callers without weakening the constructor's static contract."""
+    if type(value) is not str or value not in _NODE_STATE_AUTO_FAIL_PHASES:
+        raise OrchestrationInvariantError(
+            f"NodeStateGuard auto_fail_phase must be one of {sorted(_NODE_STATE_AUTO_FAIL_PHASES)}; got {value!r}."
+        )
+    return value
+
 
 # Attribute name for the node-state id stamped onto exceptions that cross a
 # NodeStateGuard. Executors scope ctx.state_id per operation (it is restored
@@ -106,13 +131,22 @@ class NodeStateGuard:
 
     Opens a node state in ``__enter__`` and, if the caller has not explicitly
     completed it before an exception triggers ``__exit__``, auto-completes the
-    state as FAILED with the exception details. The sole exception is an
-    explicitly abandoned stale attempt accompanied by ``SchedulerLeaseLostError``
-    or ``RunWorkerEvictedError``; that attempt remains OPEN as crash evidence.
+    state as FAILED with the exception details and the caller-supplied guarded
+    scope. The sole exception is an explicitly abandoned stale attempt
+    accompanied by ``SchedulerLeaseLostError`` or ``RunWorkerEvictedError``;
+    that attempt remains OPEN as crash evidence.
 
     Usage::
 
-        with NodeStateGuard(recorder, token_id=..., node_id=..., ...) as guard:
+        with NodeStateGuard(
+            recorder,
+            token_id=...,
+            node_id=...,
+            run_id=...,
+            step_index=...,
+            input_data=...,
+            auto_fail_phase="transform_execution",
+        ) as guard:
             ctx.state_id = guard.state_id
             # ... processing ...
             guard.complete(NodeStateStatus.COMPLETED, output_data=..., ...)
@@ -126,6 +160,7 @@ class NodeStateGuard:
     __slots__ = (
         "_abandoned",
         "_attempt",
+        "_auto_fail_phase",
         "_completed",
         "_enter_time",
         "_execution",
@@ -150,7 +185,9 @@ class NodeStateGuard:
         input_data: dict[str, Any],  # Row data (Tier 2 pipeline data)
         attempt: int = 0,
         resume_checkpoint_id: str | None = None,
+        auto_fail_phase: NodeStateAutoFailPhase,
     ) -> None:
+        validated_auto_fail_phase = _validate_auto_fail_phase(auto_fail_phase)
         self._execution = execution
         self._token_id = token_id
         self._node_id = node_id
@@ -159,6 +196,7 @@ class NodeStateGuard:
         self._input_data = input_data
         self._attempt = attempt
         self._resume_checkpoint_id = resume_checkpoint_id
+        self._auto_fail_phase = validated_auto_fail_phase
         self._enter_time: float = 0.0
         self._state: NodeStateOpen | None = None
         self._abandoned = False
@@ -258,7 +296,7 @@ class NodeStateGuard:
         exc_error = ExecutionError(
             exception=exc_message,
             exception_type=exc_type.__name__,
-            phase="executor_post_process",
+            phase=self._auto_fail_phase,
             context=context,
         )
         try:

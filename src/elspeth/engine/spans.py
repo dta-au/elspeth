@@ -505,7 +505,6 @@ class SpanFactory:
         transform_name: str,
         *,
         node_id: str | None = None,
-        input_hash: str | None = None,
         token_id: str | None = None,
         token_ids: Sequence[str] | None = None,
         run_id: str | None = None,
@@ -515,7 +514,6 @@ class SpanFactory:
         Args:
             transform_name: Name of the transform plugin
             node_id: Unique node identifier for disambiguation
-            input_hash: Optional input data hash
             token_id: Token identifier for single-row transforms
             token_ids: Token identifiers for batch transforms (aggregation flush)
 
@@ -533,8 +531,6 @@ class SpanFactory:
         attrs: dict[str, Any] = {"plugin.name": transform_name, "plugin.type": "transform"}
         if node_id is not None:
             attrs["node.id"] = node_id
-        if input_hash is not None:
-            attrs["input.hash"] = input_hash
         # Token tracking for accurate child token attribution
         if token_ids is not None:
             attrs["token.ids"] = tuple(token_ids)
@@ -549,7 +545,6 @@ class SpanFactory:
         gate_name: str,
         *,
         node_id: str | None = None,
-        input_hash: str | None = None,
         token_id: str | None = None,
         run_id: str | None = None,
     ) -> Iterator["Span | NoOpSpan | _TelemetrySpan"]:
@@ -558,7 +553,6 @@ class SpanFactory:
         Args:
             gate_name: Name of the gate (from GateSettings)
             node_id: Unique node identifier for disambiguation
-            input_hash: Optional input data hash
             token_id: Token identifier for the token being evaluated
 
         Yields:
@@ -567,8 +561,6 @@ class SpanFactory:
         attrs: dict[str, Any] = {"plugin.name": gate_name, "plugin.type": "gate"}
         if node_id is not None:
             attrs["node.id"] = node_id
-        if input_hash is not None:
-            attrs["input.hash"] = input_hash
         if token_id is not None:
             attrs["token.id"] = token_id
         with self._make_span(EngineSpanName.GATE, attrs, run_id=run_id) as span:
@@ -580,7 +572,6 @@ class SpanFactory:
         aggregation_name: str,
         *,
         node_id: str | None = None,
-        input_hash: str | None = None,
         batch_id: str | None = None,
         token_ids: Sequence[str] | None = None,
         run_id: str | None = None,
@@ -590,7 +581,6 @@ class SpanFactory:
         Args:
             aggregation_name: Name of the aggregation plugin
             node_id: Unique node identifier for disambiguation
-            input_hash: Input data hash for trace-to-audit correlation
             batch_id: Optional batch identifier
             token_ids: Token identifiers in the batch
 
@@ -604,8 +594,6 @@ class SpanFactory:
         attrs: dict[str, Any] = {"plugin.name": aggregation_name, "plugin.type": "aggregation"}
         if node_id is not None:
             attrs["node.id"] = node_id
-        if input_hash is not None:
-            attrs["input.hash"] = input_hash
         if batch_id is not None:
             attrs["batch.id"] = batch_id
         if token_ids is not None:

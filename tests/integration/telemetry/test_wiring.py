@@ -21,7 +21,13 @@ import pytest
 
 from elspeth.contracts import Determinism, SourceRow
 from elspeth.contracts.enums import RunStatus, TelemetryGranularity
-from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, RunStarted
+from elspeth.contracts.events import (
+    EngineSpanCompleted,
+    EngineSpanName,
+    EngineSpanStatus,
+    RunStarted,
+    TransformCompleted,
+)
 from elspeth.core.landscape import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.results import TransformResult
@@ -116,6 +122,44 @@ class TestOrchestratorWiresTelemetryToContext:
         assert source_span.parent_span_id == run_span.span_id
         assert all(event.parent_span_id == source_span.span_id for event in engine_spans if event.name is EngineSpanName.ROW)
         assert all(event.parent_span_id == run_span.span_id for event in engine_spans if event.name is EngineSpanName.SINK)
+
+    def test_engine_spans_do_not_export_row_content_fingerprints(
+        self,
+        landscape_db: LandscapeDB,
+        payload_store: Any,
+    ) -> None:
+        """Opaque audit identifiers are sufficient to correlate engine spans."""
+        exporter = TelemetryTestExporter()
+        telemetry_manager = TelemetryManager(
+            MockTelemetryConfig(granularity=TelemetryGranularity.ROWS),
+            exporters=[exporter],
+        )
+        source = ListSource([{"low_entropy_secret": "0420"}], on_success="output")
+        pipeline_config = PipelineConfig(
+            sources={"primary": as_source(source)},
+            transforms=[as_transform(PassTransform())],
+            sinks={"output": as_sink(CollectSink())},
+        )
+
+        try:
+            result = Orchestrator(landscape_db, telemetry_manager=telemetry_manager).run(
+                pipeline_config,
+                graph=create_test_graph(pipeline_config),
+                payload_store=payload_store,
+            )
+        finally:
+            telemetry_manager.close()
+
+        transform_span = next(
+            event for event in exporter.events if isinstance(event, EngineSpanCompleted) and event.name is EngineSpanName.TRANSFORM
+        )
+        transform_completed = next(event for event in exporter.events if isinstance(event, TransformCompleted))
+        assert result.status is RunStatus.COMPLETED
+        assert "input.hash" not in transform_span.attributes
+        assert transform_completed.input_hash is None
+        assert transform_completed.output_hash is None
+        assert transform_span.attributes["node.id"]
+        assert transform_span.attributes["token.id"]
 
     def test_run_span_covers_terminal_audit_and_finalization_failures(
         self,

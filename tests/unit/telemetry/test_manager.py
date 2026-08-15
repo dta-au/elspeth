@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
 from unittest.mock import create_autospec, patch
@@ -20,6 +21,7 @@ from elspeth.contracts.enums import (
     BackpressureMode,
     CallStatus,
     CallType,
+    NodeStateStatus,
     RunStatus,
     TelemetryGranularity,
 )
@@ -31,6 +33,8 @@ from elspeth.contracts.events import (
     RowCreated,
     RunFinished,
     RunStarted,
+    TelemetryEvent,
+    TransformCompleted,
 )
 from elspeth.telemetry.errors import TelemetryExporterError
 from elspeth.telemetry.exporters.otlp import OTLPExporter
@@ -79,6 +83,31 @@ def _row_event() -> RowCreated:
         token_id="t1",
         content_hash="ch",
     )
+
+
+def _transform_event() -> TransformCompleted:
+    return TransformCompleted(
+        timestamp=_NOW,
+        run_id="run-1",
+        row_id="r1",
+        token_id="t1",
+        node_id="transform-1",
+        plugin_name="test-transform",
+        status=NodeStateStatus.COMPLETED,
+        duration_ms=1.5,
+        input_hash="input-content-fingerprint",
+        output_hash="output-content-fingerprint",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedRowCreated(RowCreated):
+    alternate_content_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class _DerivedTransformCompleted(TransformCompleted):
+    alternate_content_hash: str
 
 
 def _external_call_event() -> ExternalCallCompleted:
@@ -224,7 +253,11 @@ class TestHandleEventBasic:
             _wait_for_processing(manager)
             assert len(exporter.events) == 3
             assert exporter.events[0] is e1
-            assert exporter.events[1] is e2
+            exported_row = exporter.events[1]
+            assert isinstance(exported_row, RowCreated)
+            assert exported_row is not e2
+            assert exported_row.content_hash is None
+            assert e2.content_hash == "ch"
             assert exporter.events[2] is e3
         finally:
             manager.close()
@@ -275,6 +308,80 @@ class TestHandleEventBasic:
             assert failure_log["log_level"] == "error"
             assert "SENSITIVE_OBSERVER_FAILURE" not in repr(logs)
             assert event.run_id not in repr(logs)
+        finally:
+            manager.close()
+
+    def test_observers_and_exporters_receive_hash_free_row_event_projections(self) -> None:
+        config = MockTelemetryConfig(granularity=TelemetryGranularity.ROWS)
+        exporter = TelemetryTestExporter()
+        observed: list[TelemetryEvent] = []
+        row_event = _row_event()
+        transform_event = _transform_event()
+        manager = TelemetryManager(config, exporters=[exporter], event_observers=[observed.append])
+        try:
+            manager.handle_event(row_event)
+            manager.handle_event(transform_event)
+            _wait_for_processing(manager)
+
+            assert len(observed) == 2
+            assert len(exporter.events) == 2
+            observed_row = observed[0]
+            observed_transform = observed[1]
+            assert type(observed_row) is RowCreated
+            assert observed_row.content_hash is None
+            assert type(observed_transform) is TransformCompleted
+            assert observed_transform.input_hash is None
+            assert observed_transform.output_hash is None
+            assert exporter.events[0] is observed_row
+            assert exporter.events[1] is observed_transform
+            assert row_event.content_hash == "ch"
+            assert transform_event.input_hash == "input-content-fingerprint"
+            assert transform_event.output_hash == "output-content-fingerprint"
+        finally:
+            manager.close()
+
+    def test_hash_bearing_subclasses_collapse_to_owned_egress_contracts(self) -> None:
+        config = MockTelemetryConfig(granularity=TelemetryGranularity.ROWS)
+        exporter = TelemetryTestExporter()
+        observed: list[TelemetryEvent] = []
+        row_event = _DerivedRowCreated(
+            timestamp=_NOW,
+            run_id="run-1",
+            row_id="r1",
+            token_id="t1",
+            content_hash="row-content-fingerprint",
+            alternate_content_hash="subclass-row-fingerprint",
+        )
+        transform_event = _DerivedTransformCompleted(
+            timestamp=_NOW,
+            run_id="run-1",
+            row_id="r1",
+            token_id="t1",
+            node_id="transform-1",
+            plugin_name="test-transform",
+            status=NodeStateStatus.COMPLETED,
+            duration_ms=1.5,
+            input_hash="input-content-fingerprint",
+            output_hash="output-content-fingerprint",
+            alternate_content_hash="subclass-transform-fingerprint",
+        )
+        manager = TelemetryManager(config, exporters=[exporter], event_observers=[observed.append])
+        try:
+            manager.handle_event(row_event)
+            manager.handle_event(transform_event)
+            _wait_for_processing(manager)
+
+            projected_row = observed[0]
+            projected_transform = observed[1]
+            assert type(projected_row) is RowCreated
+            assert projected_row.content_hash is None
+            assert not hasattr(projected_row, "alternate_content_hash")
+            assert type(projected_transform) is TransformCompleted
+            assert projected_transform.input_hash is None
+            assert projected_transform.output_hash is None
+            assert not hasattr(projected_transform, "alternate_content_hash")
+            assert exporter.events[0] is projected_row
+            assert exporter.events[1] is projected_transform
         finally:
             manager.close()
 

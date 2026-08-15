@@ -34,6 +34,10 @@ def test_empty_message_without_type_is_stable_but_non_constant() -> None:
     assert re.fullmatch(r"[0-9a-f]{16}", h)
 
 
+def test_empty_message_hash_is_domain_separated_from_ordinary_message() -> None:
+    assert compute_error_hash("", exception_type="ValueError") != compute_error_hash("<no-message:ValueError>")
+
+
 def test_non_empty_message_is_byte_identical_to_inline_hash() -> None:
     """Critical no-regression invariant: every non-empty hash is unchanged, so no
     existing audit hash moves and no fingerprint-baseline reconciliation is needed."""

@@ -531,7 +531,7 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "4bfe774eeb61ef5fb6db5b66568abe8191fa98ff8ab
 # changed the resumed flush's durable completion writes. The
 # terminal-equivalence oracle passes before the byte pin and the digest
 # reproduced across runs; every other declaration is byte-identical.
-EXPECTED_CASE_REGISTRY_SHA256 = "8b350c932175774d989e34e0a70c0ea8a49e3e52c03e2c543911bb5c3bd8990c"
+EXPECTED_CASE_REGISTRY_SHA256 = "8bc80f100ee4ded43251b94a272e99009ff2c928657135abbd2bbf4e234f7ba0"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

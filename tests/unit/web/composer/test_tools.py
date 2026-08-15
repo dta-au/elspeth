@@ -13180,8 +13180,11 @@ class TestPrevalidatePluginOptions:
         assert "api_key" in result
         assert "template" in result
 
-    def test_llm_openrouter_invalid_model_surfaces_list_models_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Composer prevalidation must reject unknown OpenRouter models with a repair hint.
+    def test_llm_openrouter_invalid_model_surfaces_structural_hint_without_raw_value(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Composer prevalidation rejects unknown OpenRouter models without echoing the value.
 
         Catalog membership is now enforced via the value-source walker
         (check_config_value_sources), so patch the catalog at the walker's lookup
@@ -13205,9 +13208,11 @@ class TestPrevalidatePluginOptions:
             },
         )
         assert result is not None
-        assert result.startswith("Invalid options for transform 'llm':")
-        assert "list_models" in result
-        assert "anthropic/claude-3-opus" in result
+        assert result == (
+            "Invalid options for transform 'llm': configured value is not in catalog "
+            "'openrouter'; pick a valid value via the list_models composer tool"
+        )
+        assert "anthropic/claude-3-opus" not in result
 
     def test_unreachable_plugin_type_raises_assertion(self) -> None:
         """Passing an invalid plugin_type triggers the unreachable-branch assertion (not silent bypass)."""

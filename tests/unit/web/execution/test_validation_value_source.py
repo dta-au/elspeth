@@ -35,9 +35,11 @@ from elspeth.web.composer.state import (
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
+    ValidationSummary,
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution.errors import PipelineValidationError
 from elspeth.web.execution.validation import (
     _ALL_CHECKS,
     _CHECK_GRAPH,
@@ -46,6 +48,7 @@ from elspeth.web.execution.validation import (
     validate_pipeline_for_trained_operator,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.sessions.routes import _composer_persisted_validation
 
 
 class TestAllChecksOrdering:
@@ -111,7 +114,56 @@ class TestWalkerL2Direct:
         # Structural attribution — composer UI reads these fields directly.
         assert finding.component_id == "openrouter_node_1"
         assert finding.field_name == "model"
-        assert "anthropic/claude-3.5-sonnet" in finding.reason
+        assert finding.reason == ("configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool")
+
+    def test_catalog_membership_diagnostic_uses_only_structural_context(self) -> None:
+        private_value = "tenant-private-model-alias"
+        _plugin, wired = _build_wired_with_config(
+            config_class=_FakeOpenRouterConfig,
+            config_kwargs={"model": private_value},
+            settings_name="openrouter_node_1",
+        )
+
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openrouter/gpt-4o"}),
+            ),
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([wired])
+
+        finding = exc_info.value.findings[0]
+        expected_reason = "configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool"
+        assert finding.reason == expected_reason
+        assert finding.format() == f"component 'openrouter_node_1' field 'model': {expected_reason}"
+        assert str(exc_info.value) == (
+            f"1 field(s) violated value-source declarations: component 'openrouter_node_1' field 'model': {expected_reason}"
+        )
+        assert private_value not in finding.reason
+        assert private_value not in str(exc_info.value)
+
+    def test_catalog_membership_diagnostic_does_not_call_application_repr(self) -> None:
+        hostile = _HostileRepr()
+        _plugin, wired = _build_wired_with_config(
+            config_class=_FakeOpenRouterConfig,
+            config_kwargs={"model": hostile},
+            settings_name="openrouter_node_1",
+        )
+
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openrouter/gpt-4o"}),
+            ),
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([wired])
+
+        assert hostile.repr_calls == 0
+        assert exc_info.value.findings[0].reason == (
+            "configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool"
+        )
 
     def test_empty_catalog_treated_as_structured_failure(self) -> None:
         _plugin, wired = _build_wired_with_config(
@@ -249,7 +301,7 @@ class TestWalkerL2Direct:
         finding = exc_info.value.findings[0]
         assert finding.component_id == "prod_node_1"
         assert finding.field_name == "model"
-        assert "anthropic/claude-3.5-sonnet" in finding.reason
+        assert finding.reason == ("configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool")
 
     def test_derived_from_sibling_fail_when_diverges(self) -> None:
         _plugin, wired = _build_wired_with_config(
@@ -262,8 +314,46 @@ class TestWalkerL2Direct:
         finding = exc_info.value.findings[0]
         assert finding.component_id == "azure_node_1"
         assert finding.field_name == "model"
-        assert "wrong-deploy" in finding.reason
-        assert "right-deploy" in finding.reason
+        assert finding.reason == (
+            "configured value must equal sibling field 'deployment_name'; leave the field empty to inherit the sibling value"
+        )
+
+    def test_derived_from_sibling_diagnostic_omits_nested_and_non_string_values(self) -> None:
+        private_value = "tenant-private-deployment"
+        configured_value = {"nested": [private_value, 42, True]}
+        sibling_value = [private_value, {"opaque": b"private-bytes"}]
+        _plugin, wired = _build_wired_with_config(
+            config_class=_FakeAzureConfig,
+            config_kwargs={"model": configured_value, "deployment_name": sibling_value},
+            settings_name="azure_node_1",
+        )
+
+        with pytest.raises(ValueSourceValidationError) as exc_info:
+            validate_value_source_compliance([wired])
+
+        finding = exc_info.value.findings[0]
+        expected_reason = "configured value must equal sibling field 'deployment_name'; leave the field empty to inherit the sibling value"
+        assert finding.reason == expected_reason
+        assert private_value not in finding.reason
+        assert private_value not in str(exc_info.value)
+        assert "42" not in finding.reason
+        assert "private-bytes" not in finding.reason
+
+    def test_derived_from_sibling_diagnostic_does_not_call_application_repr(self) -> None:
+        hostile = _HostileRepr()
+        _plugin, wired = _build_wired_with_config(
+            config_class=_FakeAzureConfig,
+            config_kwargs={"model": hostile, "deployment_name": "different"},
+            settings_name="azure_node_1",
+        )
+
+        with pytest.raises(ValueSourceValidationError) as exc_info:
+            validate_value_source_compliance([wired])
+
+        assert hostile.repr_calls == 0
+        assert exc_info.value.findings[0].reason == (
+            "configured value must equal sibling field 'deployment_name'; leave the field empty to inherit the sibling value"
+        )
 
     def test_source_catalog_failure_uses_source_identity_and_component_type(self) -> None:
         plugin = LLMSource(
@@ -385,7 +475,7 @@ class TestWalkerInValidatePipeline:
     boundaries.
     """
 
-    def test_value_source_failure_short_circuits_with_skipped_downstream(self) -> None:
+    def test_value_source_failure_is_structural_across_projection_exception_and_persistence(self) -> None:
         """When ``instantiate_runtime_plugins`` raises ``ValueSourceValidationError``
         (the walker rejected a declared value), validate_pipeline_for_trained_operator reports
         PLUGINS as passed and VALUE_SOURCE as failed, with downstream checks
@@ -394,21 +484,24 @@ class TestWalkerInValidatePipeline:
         truth for value-source compliance under the Option-B refactor.
         """
         yaml_gen = _StaticYamlGenerator()
-
-        # Construct the same exception shape the walker would raise — one
-        # structured finding, attributable to a specific component.
-        finding = ValueSourceFinding(
-            component_id="openrouter_node_1",
-            field_name="model",
-            reason=(
-                "value 'anthropic/claude-3.5-sonnet' is not in catalog 'openrouter' "
-                "(catalog has 1 entries; pick a valid value via the list_models composer tool)"
+        private_value = "tenant-private-model-alias"
+        _plugin, wired = _build_wired_with_config(
+            config_class=_FakeOpenRouterConfig,
+            config_kwargs={"model": private_value},
+            settings_name="openrouter_node_1",
+        )
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openrouter/gpt-4o"}),
             ),
-        )
-        injected_error = ValueSourceValidationError(
-            f"1 field(s) violated value-source declarations: {finding.format()}",
-            findings=(finding,),
-        )
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([wired])
+        injected_error = exc_info.value
+        expected_reason = "configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool"
+        expected_message = f"component 'openrouter_node_1' field 'model': {expected_reason}"
+        expected_exception = f"1 field(s) violated value-source declarations: {expected_message}"
 
         state = _make_state()
         settings = _make_settings()
@@ -431,13 +524,30 @@ class TestWalkerInValidatePipeline:
         # bundle internally before the walker rejected it.
         assert check_by_name[_CHECK_PLUGINS].passed is True
         assert check_by_name[_CHECK_VALUE_SOURCE_COMPLIANCE].passed is False
-        assert "openrouter_node_1" in check_by_name[_CHECK_VALUE_SOURCE_COMPLIANCE].detail
+        assert check_by_name[_CHECK_VALUE_SOURCE_COMPLIANCE].detail == expected_exception
         assert check_by_name[_CHECK_GRAPH].passed is False  # skipped
         # Structured per-component error attribution.
         attributed_errors = [e for e in result.errors if e.component_id == "openrouter_node_1"]
         assert attributed_errors, "expected at least one error attributed to the offending node"
         assert attributed_errors[0].component_type == "transform"
-        assert "anthropic/claude-3.5-sonnet" in attributed_errors[0].message
+        assert attributed_errors[0].message == expected_message
+        response_json = result.model_dump_json()
+        assert private_value not in response_json
+        assert "openrouter_node_1" in response_json
+        assert "catalog 'openrouter'" in response_json
+        assert "list_models" in response_json
+
+        execution_error = PipelineValidationError(errors=tuple(result.errors), readiness=result.readiness)
+        assert str(execution_error) == f"Pipeline failed pre-run validation: {expected_message}"
+        assert private_value not in str(execution_error)
+
+        persisted_is_valid, persisted_errors = _composer_persisted_validation(
+            ValidationSummary(is_valid=True, errors=()),
+            result,
+        )
+        assert persisted_is_valid is False
+        assert persisted_errors == [expected_message]
+        assert private_value not in persisted_errors[0]
 
     def test_value_source_pass_allows_downstream_checks(self) -> None:
         """When ``instantiate_runtime_plugins`` returns a bundle without
@@ -468,7 +578,7 @@ class TestWalkerInValidatePipeline:
             component_id="source:generated_brief",
             component_type="source",
             field_name="model",
-            reason="value 'unknown/model' is not in catalog 'openrouter'",
+            reason=("configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool"),
         )
         injected_error = ValueSourceValidationError(
             f"1 field(s) violated value-source declarations: {finding.format()}",
@@ -539,6 +649,17 @@ class _FakePlugin:
 
 class _PluginWithoutValueSources:
     """Unregistered plugin stand-in for the walker skip path."""
+
+
+class _HostileRepr:
+    """Non-string config value that turns any attempted representation into a failure."""
+
+    def __init__(self) -> None:
+        self.repr_calls = 0
+
+    def __repr__(self) -> str:
+        self.repr_calls += 1
+        raise RuntimeError("application-defined repr must not run during validation diagnostics")
 
 
 @dataclass(frozen=True)
@@ -625,7 +746,7 @@ class _FakeOpenRouterConfig:
 
     VALUE_SOURCES: tuple[_ValueSource, ...] = (_CatalogValueSource(field_name="model", catalog_id="openrouter"),)
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: object) -> None:
         self.model = model
 
 
@@ -647,7 +768,7 @@ class _FakeAzureConfig:
         ),
     )
 
-    def __init__(self, model: str, deployment_name: str) -> None:
+    def __init__(self, model: object, deployment_name: object) -> None:
         self.model = model
         self.deployment_name = deployment_name
 

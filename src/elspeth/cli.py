@@ -3491,6 +3491,7 @@ def join(
         follower_run_entered = False
         started_follower_transforms: list[RowPlugin] = []
         started_follower_sinks: dict[str, SinkProtocol] = {}
+        cleanup_pending_exc: BaseException | None = None
         try:
             _start_follower_plugin_lifecycle(
                 transforms=follower_transforms,
@@ -3505,62 +3506,77 @@ def join(
             follower_run_entered = True
             follower_proc.run(ctx)
         except RunWorkerEvictedError as e:
-            if output_format == "json":
-                import json as json_mod
+            try:
+                if output_format == "json":
+                    import json as json_mod
 
-                typer.echo(
-                    json_mod.dumps(
-                        {
-                            "event": "evicted",
-                            "run_id": run_id,
-                            "worker_id": e.worker_id,
-                            "message": str(e),
-                        }
-                    ),
-                    err=True,
-                )
-            else:
-                typer.echo(f"\nFollower evicted from run {run_id}.", err=True)
-                typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
-            raise typer.Exit(3)  # noqa: B904 — eviction is an interrupted-style exit
-        except FollowerSeatDeadError as e:
-            # Design §B.1 step 5: leader seat died mid-drain. The follower
-            # departed cleanly but the run is incomplete — operator must resume.
-            if output_format == "json":
-                import json as json_mod
-
-                typer.echo(
-                    json_mod.dumps(
-                        {
-                            "event": "seat_dead",
-                            "run_id": run_id,
-                            "worker_id": e.worker_id,
-                            "message": str(e),
-                            "hint": f"elspeth resume {run_id}",
-                        }
-                    ),
-                    err=True,
-                )
-            else:
-                typer.echo(f"\nFollower {e.worker_id} detected no live leader for run {run_id}.", err=True)
-                typer.echo(f"The run is incomplete. Use `elspeth resume {run_id}` to take over.", err=True)
-            raise typer.Exit(2)  # noqa: B904 — seat-dead: run incomplete, resume required
-        except KeyboardInterrupt:
-            if output_format == "json":
-                import json as json_mod
-
-                typer.echo(
-                    json_mod.dumps(
-                        {
-                            "event": "interrupted",
-                            "run_id": run_id,
-                            "worker_id": worker_id,
-                        }
+                    typer.echo(
+                        json_mod.dumps(
+                            {
+                                "event": "evicted",
+                                "run_id": run_id,
+                                "worker_id": e.worker_id,
+                                "message": str(e),
+                            }
+                        ),
+                        err=True,
                     )
-                )
-            else:
-                typer.echo(f"\nFollower {worker_id} interrupted (SIGINT). Departed from run {run_id}.")
-            raise typer.Exit(3)  # noqa: B904 — interrupted
+                else:
+                    typer.echo(f"\nFollower evicted from run {run_id}.", err=True)
+                    typer.echo("Worker identity is single-use. Re-admit under a fresh identity if appropriate.", err=True)
+                raise typer.Exit(3)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except FollowerSeatDeadError as e:
+            try:
+                # Design §B.1 step 5: leader seat died mid-drain. The follower
+                # departed cleanly but the run is incomplete — operator must resume.
+                if output_format == "json":
+                    import json as json_mod
+
+                    typer.echo(
+                        json_mod.dumps(
+                            {
+                                "event": "seat_dead",
+                                "run_id": run_id,
+                                "worker_id": e.worker_id,
+                                "message": str(e),
+                                "hint": f"elspeth resume {run_id}",
+                            }
+                        ),
+                        err=True,
+                    )
+                else:
+                    typer.echo(f"\nFollower {e.worker_id} detected no live leader for run {run_id}.", err=True)
+                    typer.echo(f"The run is incomplete. Use `elspeth resume {run_id}` to take over.", err=True)
+                raise typer.Exit(2)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except KeyboardInterrupt:
+            try:
+                if output_format == "json":
+                    import json as json_mod
+
+                    typer.echo(
+                        json_mod.dumps(
+                            {
+                                "event": "interrupted",
+                                "run_id": run_id,
+                                "worker_id": worker_id,
+                            }
+                        )
+                    )
+                else:
+                    typer.echo(f"\nFollower {worker_id} interrupted (SIGINT). Departed from run {run_id}.")
+                raise typer.Exit(3)
+            except BaseException as pending_exc:
+                cleanup_pending_exc = pending_exc
+                raise
+        except BaseException as pending_exc:
+            cleanup_pending_exc = pending_exc
+            raise
         finally:
             if not follower_run_entered:
                 from datetime import UTC, datetime
@@ -3589,6 +3605,7 @@ def join(
                 pipeline_config,
                 ctx,
                 include_source=False,
+                pending_exc=cleanup_pending_exc,
                 started_transforms=started_follower_transforms,
                 started_sinks=started_follower_sinks,
             )

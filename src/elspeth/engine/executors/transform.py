@@ -743,7 +743,6 @@ class TransformExecutor:
             self._spans.transform_span(
                 transform.name,
                 node_id=node_id,
-                input_hash=input_hash,
                 token_id=token.token_id,
                 run_id=ctx.run_id,
             ) as transform_span,
@@ -758,6 +757,7 @@ class TransformExecutor:
                 # 0 for run-1 tokens); `attempt` is the tenacity retry index within this generation.
                 attempt=token.resume_attempt_offset + attempt,
                 resume_checkpoint_id=token.resume_checkpoint_id,
+                auto_fail_phase="transform_execution",
             ) as guard,
         ):
             # --- PREFLIGHT (pre-invocation checks) ---
@@ -925,7 +925,7 @@ class TransformExecutor:
                     # guard.complete() runs the guard stands down, and a failing
                     # audit write would escape its terminality protection. If a
                     # write raises here, the guard auto-fails the state
-                    # (phase='executor_post_process', carrying the audit-write
+                    # (phase='transform_execution', carrying the audit-write
                     # error rather than result.reason) and the error propagates —
                     # fail-closed, never completed-then-crashed.
                     record_transform_error_with_routing(

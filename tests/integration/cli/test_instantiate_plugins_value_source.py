@@ -115,13 +115,14 @@ class TestInstantiatePluginsValueSourceRegression:
             pytest.raises(ValueSourceValidationError) as exc_info,
         ):
             instantiate_plugins_from_config(config)
-        # Structured attribution — the finding names the field whose
-        # value violates the catalog declaration.
-        offending = [f for f in exc_info.value.findings if f.field_name == "model" and "anthropic/claude-bogus-not-in-catalog" in f.reason]
-        assert offending, (
-            f"expected a finding naming the hallucinated model; got "
-            f"{[(f.component_id, f.field_name, f.reason) for f in exc_info.value.findings]}"
+        # Structured attribution identifies the component, field, and
+        # declaration relationship without echoing the configured value.
+        offending = [f for f in exc_info.value.findings if f.component_id == "enrich" and f.field_name == "model"]
+        assert len(offending) == 1
+        assert offending[0].reason == (
+            "configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool"
         )
+        assert "anthropic/claude-bogus-not-in-catalog" not in offending[0].reason
 
     def test_valid_openrouter_model_passes_instantiation(self, csv_paths: tuple[Path, Path]) -> None:
         """Negative control. When the model is in the patched catalog,

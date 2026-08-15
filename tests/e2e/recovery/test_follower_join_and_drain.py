@@ -1240,6 +1240,7 @@ def _run_real_follower(
     follower._wait_fn = _stop_after_idle
     if before_follower_run is not None:
         before_follower_run(db, token_id, follower_plugins)
+    pending_exc: BaseException | None = None
     try:
         _start_follower_plugin_lifecycle(
             transforms=follower_config.transforms,
@@ -1249,8 +1250,11 @@ def _run_real_follower(
             ctx=ctx,
         )
         follower.run(ctx)
+    except BaseException as exc:
+        pending_exc = exc
+        raise
     finally:
-        cleanup_plugins(follower_config, ctx, include_source=False)
+        cleanup_plugins(follower_config, ctx, include_source=False, pending_exc=pending_exc)
 
     return db, run_id, token_id, follower_plugins, tmp_path / "real-follower-output.jsonl"
 

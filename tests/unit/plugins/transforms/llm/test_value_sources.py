@@ -157,7 +157,8 @@ class TestWalkerBehaviour:
         finding = exc_info.value.findings[0]
         assert finding.component_id == "openrouter_node_1"
         assert finding.field_name == "model"
-        assert "anthropic/claude-3.5-sonnet" in finding.reason
+        assert finding.reason == ("configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool")
+        assert "anthropic/claude-3.5-sonnet" not in finding.reason
 
     def test_openrouter_llm_rejects_hallucinated_model_with_dot_segment_base_url(self) -> None:
         """elspeth-5653909057: dot-segment respellings of the canonical URL are
@@ -195,7 +196,8 @@ class TestWalkerBehaviour:
         finding = exc_info.value.findings[0]
         assert finding.component_id == "openrouter_node_1"
         assert finding.field_name == "model"
-        assert "anthropic/claude-3.5-sonnet" in finding.reason
+        assert finding.reason == ("configured value is not in catalog 'openrouter'; pick a valid value via the list_models composer tool")
+        assert "anthropic/claude-3.5-sonnet" not in finding.reason
 
     def test_bedrock_llm_without_catalog_passes_runtime_walker(self) -> None:
         """Bedrock model access is resolved by AWS, not a local model catalog."""

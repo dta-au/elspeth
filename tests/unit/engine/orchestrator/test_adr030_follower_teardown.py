@@ -8,7 +8,7 @@ hole hiding system-level corruption on the follower path (which had no
 lifecycle at all before the multi-worker change).
 
 The fix routes follower teardown through the canonical ``cleanup_plugins(...,
-include_source=False)`` helper, whose contract is:
+include_source=False, pending_exc=...)`` helper, whose contract is:
 
   - TIER-1 errors PROPAGATE (re-raised before the broad catch, cleanup.py:95-96);
   - non-Tier-1 errors keep best-effort continuation (every OTHER plugin still
@@ -18,7 +18,8 @@ include_source=False)`` helper, whose contract is:
 
 Coverage split (read before editing):
   - ``test_follower_teardown_*`` pin the HELPER contract directly — the exact
-    call ``cli.join`` now makes (``cleanup_plugins(..., include_source=False)``).
+    call ``cli.join`` now makes (``cleanup_plugins(..., include_source=False,
+    pending_exc=...)``).
     They assert WHAT the follower path delegates to. They do NOT, on their own,
     fail under the pre-fix bare ``except Exception: pass`` (they bypass cli.join).
   - ``test_cli_follower_join_wires_canonical_cleanup_not_bare_swallow`` is the
@@ -74,6 +75,15 @@ class _RecoverableOnCompleteTransform(PassTransform):
         raise RuntimeError("follower transform on_complete blew up (recoverable)")
 
 
+class _ControlFlowCloseTransform(PassTransform):
+    """Transform whose close raises outside the ordinary Exception hierarchy."""
+
+    determinism = Determinism.DETERMINISTIC
+
+    def close(self) -> None:
+        raise KeyboardInterrupt("follower cleanup interrupted")
+
+
 class _CloseRecordingSink(CollectSink):
     """Sink that records whether close() ran (to prove best-effort continuation)."""
 
@@ -100,7 +110,7 @@ def test_follower_teardown_propagates_tier1_from_on_complete() -> None:
     config = _follower_config(_Tier1OnCompleteTransform(), sink=_CloseRecordingSink("output"))
 
     with pytest.raises(AuditIntegrityError, match="corrupt journal row"):
-        cleanup_plugins(config, ctx, include_source=False)
+        cleanup_plugins(config, ctx, include_source=False, pending_exc=None)
 
 
 def test_follower_teardown_propagates_tier1_from_close() -> None:
@@ -109,7 +119,31 @@ def test_follower_teardown_propagates_tier1_from_close() -> None:
     config = _follower_config(_Tier1CloseTransform(), sink=_CloseRecordingSink("output"))
 
     with pytest.raises(AuditIntegrityError, match="corrupt journal row"):
-        cleanup_plugins(config, ctx, include_source=False)
+        cleanup_plugins(config, ctx, include_source=False, pending_exc=None)
+
+
+def test_follower_teardown_tier1_supersedes_pending_workload_failure() -> None:
+    """Tier-1 cleanup corruption remains stronger than an active workload failure."""
+    ctx = PluginContext(run_id="run-follower", config={}, landscape=None)
+    config = _follower_config(_Tier1CloseTransform(), sink=_CloseRecordingSink("output"))
+    pending_exc = RuntimeError("follower workload failed")
+
+    with pytest.raises(AuditIntegrityError, match="corrupt journal row"):
+        cleanup_plugins(config, ctx, include_source=False, pending_exc=pending_exc)
+
+
+def test_follower_teardown_control_flow_base_exception_supersedes_pending_workload_failure() -> None:
+    """Non-Exception control flow from cleanup keeps its existing immediate precedence."""
+    ctx = PluginContext(run_id="run-follower", config={}, landscape=None)
+    config = _follower_config(_ControlFlowCloseTransform(), sink=_CloseRecordingSink("output"))
+
+    with pytest.raises(KeyboardInterrupt, match="follower cleanup interrupted"):
+        cleanup_plugins(
+            config,
+            ctx,
+            include_source=False,
+            pending_exc=RuntimeError("follower workload failed"),
+        )
 
 
 def test_follower_teardown_logs_and_continues_on_non_tier1() -> None:
@@ -127,7 +161,7 @@ def test_follower_teardown_logs_and_continues_on_non_tier1() -> None:
     config = _follower_config(bad, sink=sink)
 
     with structlog.testing.capture_logs() as captured, pytest.raises(RuntimeError, match="Plugin cleanup failed"):
-        cleanup_plugins(config, ctx, include_source=False)
+        cleanup_plugins(config, ctx, include_source=False, pending_exc=None)
 
     # Best-effort continuation: the sink still got torn down.
     assert sink.closed is True, "non-Tier-1 transform failure must not block the sink's close()"
@@ -162,7 +196,7 @@ def test_follower_teardown_skips_source_lifecycle() -> None:
         sinks={sink.name: as_sink(sink)},
     )
 
-    cleanup_plugins(config, ctx, include_source=False)
+    cleanup_plugins(config, ctx, include_source=False, pending_exc=None)
 
     assert source.closed is False, "follower teardown must not close the source it never opened"
     assert sink.closed is True, "the sink IS torn down on the follower path"
@@ -188,9 +222,26 @@ def test_cli_follower_join_wires_canonical_cleanup_not_bare_swallow() -> None:
     # An actual call to cleanup_plugins (the canonical helper), include_source=False.
     assert re.search(r"cleanup_plugins\s*\(", src), "follower teardown must CALL the canonical cleanup_plugins(...)"
     assert "include_source=False" in src, "follower teardown must call cleanup_plugins with include_source=False (drain-only worker)"
+    assert "pending_exc=" in src, "follower teardown must pass explicit boundary exception state"
 
     # AST: a cleanup_plugins(...) call must appear inside a try/finally's finalbody.
     tree = ast.parse(textwrap.dedent(src))
+
+    cleanup_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and "cleanup_plugins" in node.func.id)
+            or (isinstance(node.func, ast.Attribute) and "cleanup_plugins" in node.func.attr)
+        )
+    ]
+    assert len(cleanup_calls) == 1
+    pending_keywords = [keyword for keyword in cleanup_calls[0].keywords if keyword.arg == "pending_exc"]
+    assert len(pending_keywords) == 1
+    assert isinstance(pending_keywords[0].value, ast.Name), (
+        "follower teardown must pass locally captured boundary state, not call sys.exception()/sys.exc_info()"
+    )
 
     def _calls_cleanup(nodes: list[ast.stmt]) -> bool:
         for stmt in nodes:

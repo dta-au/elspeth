@@ -130,6 +130,18 @@ B2_COALESCE_FAILURE_AND_COLLISION_CASES = tuple(
     )
 )
 B2_COALESCE_ALL_CASES = B2_COALESCE_POSITIVE_CASES + B2_COALESCE_FAILURE_AND_COLLISION_CASES
+B2_COALESCE_UNION_CASES = tuple(
+    ("fork-coalesce-policies", case_id)
+    for case_id in (
+        "require-all-union",
+        "first-union",
+        "quorum-union-lost-c",
+        "best-effort-union-lost-c",
+        "union-collision-last-wins",
+        "union-collision-first-wins",
+        "union-collision-fail",
+    )
+)
 B2_COMPOSED_COALESCE_CASES = (
     ("sequential-nested-fork-coalesce", "two-sequential-require-all"),
     ("parallel-coalesces", "two-parallel-require-all"),
@@ -2061,6 +2073,18 @@ def test_declared_run_case_uses_complete_production_path(
 ) -> None:
     install_corpus_plugin_manager(monkeypatch)
     evidence = run_scenario_case(scenario, case, tmp_path)
+
+    projection = evidence.runtime.durable_projection
+    if (scenario.id, case.id) in B2_COALESCE_UNION_CASES:
+        assert projection is not None
+    if projection is not None:
+        contexts = [json.loads(state.context_after) for state in projection.node_states if state.context_after is not None]
+        union_contexts = [context for context in contexts if context.get("merge_strategy") == "union"]
+        if (scenario.id, case.id) in B2_COALESCE_UNION_CASES:
+            assert union_contexts
+        assert all("union_field_collision_values" not in context for context in union_contexts)
+        collision_contexts = [context for context in union_contexts if context.get("union_field_collisions")]
+        assert all(context["union_field_origins"] for context in collision_contexts)
 
     _assert_declared_run_evidence(scenario, case, evidence)
 

@@ -118,14 +118,16 @@ class DeclaredRequiredFieldsContract(DeclarationContract):
     @implements_dispatch_site("pre_emission_check")
     def pre_emission_check(self, inputs: PreEmissionInputs) -> None:
         plugin = require_declared_input_fields_plugin(inputs.plugin)
-        transform_node_id = plugin.node_id
-        if transform_node_id is None:
-            raise OrchestrationInvariantError(f"Transform {plugin.name!r} has no node_id set at declared-required-fields check time.")
+        dispatcher_node_id = inputs.node_id
+        if type(dispatcher_node_id) is not str or not dispatcher_node_id.strip():
+            raise OrchestrationInvariantError(
+                f"Transform {plugin.name!r} has no valid dispatcher node_id at declared-required-fields check time."
+            )
         verify_declared_required_fields(
             declared_input_fields=plugin.declared_input_fields,
             effective_input_fields=inputs.effective_input_fields,
             plugin_name=plugin.name,
-            node_id=transform_node_id,
+            node_id=dispatcher_node_id,
             run_id=inputs.run_id,
             row_id=inputs.row_id,
             token_id=inputs.token_id,

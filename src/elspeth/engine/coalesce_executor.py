@@ -242,9 +242,9 @@ def _merge_data(
     if settings.merge == "union":
         # Combine all fields from all branches.
         # On name collision, the last branch in settings.branches wins by default
-        # (union_collision_policy="last_wins"). field_origins and collision_values
-        # are always recorded so auditors can reconstruct lineage and inspect
-        # overwritten values. Policy enforcement happens in build_coalesce_merge().
+        # (union_collision_policy="last_wins"). collision_values stays internal to
+        # first_wins resolution; audit metadata receives only field origins and
+        # contributing branch names. Policy enforcement happens in build_coalesce_merge().
         merged: dict[str, Any] = {}
         field_origins: dict[str, str] = {}
         collisions: dict[str, list[str]] = {}
@@ -403,7 +403,6 @@ def build_coalesce_merge(
             coalesce_metadata,
             field_origins=field_origins,
             collisions=union_collisions if union_collisions else None,
-            collision_values=collision_values if collision_values else None,
         )
 
         if union_collisions:
@@ -1127,8 +1126,8 @@ class CoalesceExecutor:
             )
 
         completed_state_ids: set[str] = set()
-        # Captured so the failure cleanup handler can persist collision provenance
-        # (union_field_origins, redacted union_field_collision_values) to the audit trail
+        # Captured so the failure cleanup handler can persist value-independent
+        # collision provenance (union_field_origins, union_field_collisions) to the audit trail
         # when CoalesceCollisionError is raised under union_collision_policy=fail,
         # or when any other exception happens after metadata was built. Stays None
         # for early failures (e.g., contract merge) where no metadata exists yet.
@@ -1230,7 +1229,7 @@ class CoalesceExecutor:
                 if entry.state_id in completed_state_ids:
                     continue
                 # Pass metadata_for_audit so union_collision_policy=fail's
-                # collision provenance (field_origins + value fingerprints) reaches
+                # collision provenance (field origins + contributing branches) reaches
                 # the Landscape audit trail via context_after. None is acceptable for
                 # early failures (e.g., contract merge) where no metadata exists.
                 self._execution.complete_node_state(

@@ -1294,8 +1294,8 @@ class ResumeCoordinator:
                     retry_manager=preflight_retry_manager,
                     shutdown_event=shutdown_event,
                 )
-            except BaseException:
-                cleanup_plugins(config, run_ctx.ctx, include_source=False)
+            except BaseException as pending_exc:
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=pending_exc)
                 raise
 
             loop_ctx = LoopContext(
@@ -1317,6 +1317,7 @@ class ResumeCoordinator:
                     )
                 source_on_success_by_source[source_id] = source_on_success
 
+            cleanup_pending_exc: BaseException | None = None
             try:
                 # 3. Process loop (resume path)
                 interrupted = run_resume_processing_loop(
@@ -1349,16 +1350,22 @@ class ResumeCoordinator:
                 # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b
                 # postconditions only after resume sink writes finish.
                 factory.data_flow.sweep_deferred_invariants_or_crash(run_id)
-            except GracefulShutdownError:
+            except GracefulShutdownError as exc:
+                cleanup_pending_exc = exc
                 raise
             except Exception as exc:
-                raise _RunFailedWithPartialResultError(
+                outgoing_exc = _RunFailedWithPartialResultError(
                     original_error=exc,
                     partial_result=loop_ctx.counters.to_run_result(run_id, status=RunStatus.FAILED),
-                ) from exc
+                )
+                cleanup_pending_exc = outgoing_exc
+                raise outgoing_exc from exc
+            except BaseException as exc:
+                cleanup_pending_exc = exc
+                raise
 
             finally:
-                cleanup_plugins(config, run_ctx.ctx, include_source=False)
+                cleanup_plugins(config, run_ctx.ctx, include_source=False, pending_exc=cleanup_pending_exc)
 
             return loop_ctx.counters.to_run_result(run_id, status=RunStatus.RUNNING)
         finally:

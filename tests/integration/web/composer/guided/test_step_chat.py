@@ -1394,11 +1394,10 @@ class TestStepChatServerInvariants:
         session_id = _create_session(composer_test_client)
         _seed_persisted_step1(composer_test_client, session_id)
 
-        monkeypatch.setattr(
-            guided_chat_atomic.slog,
-            "error",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("simulated logger failure")),
-        )
+        def _raise_logger_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("simulated logger failure")
+
+        monkeypatch.setattr(guided_chat_atomic, "slog", SimpleNamespace(error=_raise_logger_failure))
 
         with patch(
             _CHAT_SOLVER_ACOMPLETION,

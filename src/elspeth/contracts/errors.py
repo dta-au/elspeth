@@ -1171,12 +1171,12 @@ class CoalesceCollisionError(Exception):
     enforcement. The pipeline author chose to fail-fast on union merge collisions
     rather than allow last_wins/first_wins resolution. The CoalesceMetadata is
     captured BEFORE raising so the orchestrator's failure path can persist
-    collision provenance and value fingerprints to the audit trail without
+    value-independent collision provenance to the audit trail without
     storing the raw colliding branch values.
 
     Attributes:
         metadata: CoalesceMetadata with union_field_origins and
-                  audit-safe union_field_collision_values populated.
+                  union_field_collisions populated without value-derived material.
     """
 
     def __init__(self, message: str, *, metadata: "CoalesceMetadata") -> None:

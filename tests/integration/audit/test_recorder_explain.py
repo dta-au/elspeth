@@ -12,6 +12,7 @@ from sqlalchemy import text
 from elspeth.contracts import Determinism, NodeType, PipelineRow
 from elspeth.contracts.audit import NodeStateCompleted
 from elspeth.contracts.errors import AuditIntegrityError, CoalesceCollisionError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.config import CoalesceSettings, GateSettings
 from elspeth.core.landscape.database import LandscapeDB
@@ -28,15 +29,6 @@ from tests.integration.pipeline.orchestrator.test_branch_transforms import _buil
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
-
-
-def _assert_collision_value_fingerprint(entry: list[Any], branch: str, value_type: str) -> None:
-    assert entry[0] == branch
-    fingerprint = entry[1]
-    assert set(fingerprint) == {"value_hash", "value_type"}
-    assert fingerprint["value_type"] == value_type
-    assert isinstance(fingerprint["value_hash"], str)
-    assert len(fingerprint["value_hash"]) == 64
 
 
 class TestExplainGracefulDegradation:
@@ -427,11 +419,11 @@ class TestExplainGracefulDegradation:
 #
 # These tests exercise the production code path (ExecutionGraph.from_plugin_instances
 # → Orchestrator.run) to verify that union merge field provenance
-# (union_field_origins, union_field_collision_values) is persisted to the
+# (union_field_origins, union_field_collisions) is persisted to the
 # Landscape audit trail via node_states.context_after_json. Covers both the
 # success path (last_wins default policy) and the failure path (fail policy
 # raises CoalesceCollisionError, audit trail still captures the full collision
-# record via the executor's cleanup handler).
+# value-independent collision record via the executor's cleanup handler).
 
 
 class _ScoreATransform(BaseTransform):
@@ -535,7 +527,7 @@ class TestUnionMergeFieldProvenance:
     Covers both concerns raised by CLAUDE.md's attributability standard:
 
     * **Audit trail surface**: the underlying ``node_states.context_after_json``
-      column captures ``union_field_origins`` and ``union_field_collision_values``.
+      column captures ``union_field_origins`` and ``union_field_collisions``.
       Verified via direct SQL — finer-grained than the API contract.
     * **explain() API surface**: ``lineage.explain(run_id, token_id)`` projects
       those fields onto the ``LineageResult.node_states`` tuple so an auditor
@@ -556,8 +548,9 @@ class TestUnionMergeFieldProvenance:
 
           * The underlying ``node_states.context_after_json`` column captures
             ``union_field_origins`` (every merged field -> its branch) and
-            ``union_field_collision_values`` (both branch/value fingerprints for
-            the colliding 'score' field in declared order).
+            ``union_field_collisions`` (the contributing branches for the
+            colliding 'score' field in declared order), without material derived
+            from the raw branch values.
           * Calling ``explain(run_id, token_id=merged_token_id)`` and then
             drilling into each consumed parent token's ``LineageResult`` exposes
             the same provenance via ``NodeState.context_after_json`` — the API
@@ -631,16 +624,17 @@ class TestUnionMergeFieldProvenance:
         # last_wins: 'score' collision resolves to path_b
         assert origins["score"] == "path_b"
 
-        # collision_values records every contributing branch fingerprint in declared order
-        assert "union_field_collision_values" in ctx
-        collision_values = ctx["union_field_collision_values"]
-        assert "score" in collision_values
-        # Each entry is a [branch, value fingerprint] pair; declared order is path_a, path_b
-        score_entries = collision_values["score"]
-        assert len(score_entries) == 2
-        _assert_collision_value_fingerprint(score_entries[0], "path_a", "int")
-        _assert_collision_value_fingerprint(score_entries[1], "path_b", "int")
-        assert score_entries[0][1]["value_hash"] != score_entries[1][1]["value_hash"]
+        # Collision audit provenance must stop at field and branch identity.
+        # Value-derived hashes and types let an audit reader recover low-entropy
+        # values (such as the integer scores in this pipeline) offline.
+        serialized_context = json.dumps(ctx, sort_keys=True)
+        assert stable_hash(99) not in serialized_context
+        assert stable_hash(10) not in serialized_context
+        assert "value_type" not in serialized_context
+        assert "union_field_collision_values" not in ctx
+
+        collisions = ctx["union_field_collisions"]
+        assert collisions["score"] == ["path_a", "path_b"]
 
         # Base merge metadata is still present
         assert ctx["policy"] == "require_all"
@@ -700,15 +694,14 @@ class TestUnionMergeFieldProvenance:
             "auditors cannot reach field provenance through the explain() API."
         )
 
-        # The explain()-surfaced provenance must match the audit trail
-        # (same serialization, same value fingerprints). Spot-check the critical fields.
+        # The explain()-surfaced provenance must match the audit trail. Spot-check
+        # the winning origins and value-independent collision branches.
         assert provenance_via_explain["union_field_origins"]["field_a"] == "path_a"
         assert provenance_via_explain["union_field_origins"]["field_b"] == "path_b"
         assert provenance_via_explain["union_field_origins"]["score"] == "path_b"
-        explain_collisions = provenance_via_explain["union_field_collision_values"]
-        assert "score" in explain_collisions
-        assert len(explain_collisions["score"]) == 2
-        assert {entry[0] for entry in explain_collisions["score"]} == {"path_a", "path_b"}
+        explain_collisions = provenance_via_explain["union_field_collisions"]
+        assert explain_collisions["score"] == ["path_a", "path_b"]
+        assert "union_field_collision_values" not in provenance_via_explain
 
     def test_audit_trail_captures_collision_metadata_on_fail_policy(self, payload_store) -> None:
         """Failure path: union_collision_policy=fail raises but persists metadata.
@@ -779,7 +772,7 @@ class TestUnionMergeFieldProvenance:
 
         # The audit trail must still capture the collision record via the
         # cleanup handler (Task 3 regression guard). Find the FAILED node_state
-        # and assert its context_after_json has the full collision metadata.
+        # and assert its context_after_json has value-independent collision metadata.
         # Note: we use the orchestrator-assigned run_id, which we recover from
         # the database since orchestrator.run raised.
         with db.connection() as conn:
@@ -796,10 +789,12 @@ class TestUnionMergeFieldProvenance:
             f"FAILED state missing union_field_origins — cleanup handler did not propagate metadata_for_audit. Got: {ctx}"
         )
         assert ctx["union_field_origins"]["score"] == "path_b"
-        assert "union_field_collision_values" in ctx
-        score_entries = ctx["union_field_collision_values"]["score"]
-        assert len(score_entries) == 2
-        assert {entry[0] for entry in score_entries} == {"path_a", "path_b"}
+        assert ctx["union_field_collisions"]["score"] == ["path_a", "path_b"]
+        serialized_context = json.dumps(ctx, sort_keys=True)
+        assert stable_hash(99) not in serialized_context
+        assert stable_hash(10) not in serialized_context
+        assert "value_type" not in serialized_context
+        assert "union_field_collision_values" not in ctx
 
     def test_first_wins_collision_policy_surfaces_provenance_via_explain(self, payload_store) -> None:
         """first_wins policy: first branch value wins, audit trail captures collision.
@@ -809,7 +804,8 @@ class TestUnionMergeFieldProvenance:
 
           * The first branch's collision value wins (path_a's score=10)
           * union_field_origins records path_a as the winner for 'score'
-          * union_field_collision_values still captures BOTH branches' values
+          * union_field_collisions captures BOTH contributing branches without
+            hashes or types derived from their values
 
         This is the symmetric counterpart to test_union_merge_surfaces_field_provenance_via_explain
         which covers last_wins (the default).
@@ -874,15 +870,12 @@ class TestUnionMergeFieldProvenance:
         assert origins["field_a"] == "path_a"
         assert origins["field_b"] == "path_b"
 
-        # collision_values still records BOTH branch fingerprints in declared order
-        assert "union_field_collision_values" in ctx
-        collision_values = ctx["union_field_collision_values"]
-        assert "score" in collision_values
-        score_entries = collision_values["score"]
-        assert len(score_entries) == 2
-        _assert_collision_value_fingerprint(score_entries[0], "path_a", "int")
-        _assert_collision_value_fingerprint(score_entries[1], "path_b", "int")
-        assert score_entries[0][1]["value_hash"] != score_entries[1][1]["value_hash"]
+        assert ctx["union_field_collisions"]["score"] == ["path_a", "path_b"]
+        serialized_context = json.dumps(ctx, sort_keys=True)
+        assert stable_hash(99) not in serialized_context
+        assert stable_hash(10) not in serialized_context
+        assert "value_type" not in serialized_context
+        assert "union_field_collision_values" not in ctx
 
         # Base merge metadata
         assert ctx["policy"] == "require_all"

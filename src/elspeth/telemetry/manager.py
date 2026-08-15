@@ -35,7 +35,7 @@ import structlog
 from elspeth.contracts.config import RuntimeTelemetryProtocol
 from elspeth.contracts.config.defaults import INTERNAL_DEFAULTS
 from elspeth.contracts.enums import BackpressureMode
-from elspeth.contracts.events import TelemetryEvent
+from elspeth.contracts.events import RowCreated, TelemetryEvent, TransformCompleted
 from elspeth.telemetry.circuit_breaker import CircuitBreaker
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.filtering import should_emit
@@ -45,6 +45,37 @@ from elspeth.telemetry.protocols import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+def _project_event_for_egress(event: TelemetryEvent) -> TelemetryEvent:
+    """Remove row-derived fingerprints before any telemetry consumer sees them.
+
+    Nominal subclasses are collapsed to the exact owned base contract. This
+    fails closed if a subclass adds hash-bearing metadata: only explicitly
+    copied, bounded base fields can reach observers or exporters.
+    """
+    if isinstance(event, RowCreated):
+        return RowCreated(
+            timestamp=event.timestamp,
+            run_id=event.run_id,
+            row_id=event.row_id,
+            token_id=event.token_id,
+            content_hash=None,
+        )
+    if isinstance(event, TransformCompleted):
+        return TransformCompleted(
+            timestamp=event.timestamp,
+            run_id=event.run_id,
+            row_id=event.row_id,
+            token_id=event.token_id,
+            node_id=event.node_id,
+            plugin_name=event.plugin_name,
+            status=event.status,
+            duration_ms=event.duration_ms,
+            input_hash=None,
+            output_hash=None,
+        )
+    return event
 
 
 class HealthMetrics(TypedDict):
@@ -382,18 +413,20 @@ class TelemetryManager:
         if self._shutdown_event.is_set():
             return
 
+        export_event = _project_event_for_egress(event)
+
         # Operator metrics project bounded facts from already-audited events.
         # This intentionally precedes exporter granularity filtering: the AWS
         # lifecycle policy must not enable content-bearing FULL spans merely to
         # retain aggregate external-call metrics.
         for observer in self._event_observers:
             try:
-                observer(event)
+                observer(export_event)
             except Exception as exc:
                 logger.error(
                     "Telemetry event observer failed",
                     observer_type=type(observer).__name__,
-                    event_type=type(event).__name__,
+                    event_type=type(export_event).__name__,
                     error_type=type(exc).__name__,
                 )
 
@@ -406,7 +439,7 @@ class TelemetryManager:
             return
 
         # Filter by granularity
-        if not should_emit(event, self._config.granularity):
+        if not should_emit(export_event, self._config.granularity):
             return
 
         self._events_attempted += 1
@@ -427,13 +460,13 @@ class TelemetryManager:
         # Queue event based on backpressure mode
         if self._config.backpressure_mode == BackpressureMode.DROP:
             try:
-                self._queue.put_nowait(event)
+                self._queue.put_nowait(export_event)
             except queue.Full:
-                self._drop_oldest_and_enqueue_newest(event)
+                self._drop_oldest_and_enqueue_newest(export_event)
         else:  # BLOCK (default)
             # Timeout prevents permanent deadlock if export thread dies
             try:
-                self._queue.put(event, timeout=30.0)
+                self._queue.put(export_event, timeout=30.0)
             except queue.Full:
                 # Timeout hit - thread may be dead or stuck
                 logger.error("BLOCK mode put() timed out - export thread may be stuck")

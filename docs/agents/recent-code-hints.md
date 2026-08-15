@@ -8,6 +8,50 @@ new whole-tree trap, ADD IT HERE in the same commit. Prune entries once they
 are covered by permanent docs or no longer bite. No sign-off ceremony — this
 is a working document under the normal delivery posture.
 
+- **2026-08-15 — commencement gate conditions have separate execution and
+  audit forms**: only the raw configured expression enters `ExpressionParser`.
+  Every `CommencementGateFailedError`, successful `CommencementGateResult`, and
+  persisted preflight result carries the AST-derived rendering from
+  `redact_commencement_gate_condition`: direct subscript/`.get()` string keys
+  and dict keys stay visible for structural diagnosis, while every other
+  string literal — including values nested inside a composite lookup key —
+  becomes `<redacted-string-literal>`. Config admission catches only the
+  parser's syntax/security rejection types and hides the raw Pydantic input;
+  parser AST diagnostics can contain raw literals. Do not restore the raw
+  condition in a downstream formatter or use heuristic secret-pattern
+  matching; arbitrary literals are the protected class.
+
+- **2026-08-15 — union collision audit provenance stops at field and branch
+  identity**: `_merge_data` must retain raw `collision_values` internally so
+  `first_wins` can restore the configured branch's value, but
+  `build_coalesce_merge` must never pass those values into `CoalesceMetadata`.
+  Stable unsalted hashes and Python type names remain value-derived sensitive
+  material: low-entropy candidates can be recovered offline and correlated
+  across runs. Persist `union_field_collisions` and `union_field_origins`; keep
+  `union_field_collision_values` absent from new `context_after_json` records.
+
+- **2026-08-15 — value-source findings are response and log egress**:
+  catalog-membership and sibling-derivation failures flow into the Composer
+  `/validate` response, exception text, check-detail/log surfaces, model repair
+  prose, and persisted composition-state `validation_errors`. Never render,
+  summarize, hash, measure, or call `repr` on a configured value there: even a
+  short ordinary-looking scalar or a derived length can disclose private
+  configuration. Keep component, field, sibling-field, catalog, and remediation
+  relationships in fixed structural prose so failures remain actionable without
+  becoming an echo channel.
+
+- **2026-08-15 — every `NodeStateGuard` caller names the scope it owns**:
+  `auto_fail_phase` is required, has no default, and is a closed runtime-and-
+  static vocabulary because the guard spans materially different work:
+  transform execution, gate evaluation/routing, aggregation flushes, and
+  pre-attempt shutdown persistence. The value is durably recorded in
+  `ExecutionError.phase` and shown verbatim to operators; a generic, falsey,
+  or misspelled fallback silently creates false attribution. A new guard site
+  therefore requires deliberate vocabulary extension plus caller-path tests.
+  Keep explicit inner failure phases authoritative: once the caller has
+  persisted a terminal state, the guard must stand down rather than overwrite
+  it with an auto-generated failure.
+
 - **2026-08-15 — engine span correlation belongs to the durable run lifecycle**:
   production engine spans are completion events emitted through the existing
   `TelemetryManager`; do not create a second tracer/provider lifecycle beside
@@ -21,7 +65,15 @@ is a working document under the normal delivery posture.
   validation, authority, disposition, and terminal audit work — plugin return
   alone is not success. Row and aggregation parents are path-dependent: fresh
   ingestion may inherit source/row context, while late leader-drain, resume,
-  and follower work uses durable run correlation. A handled exception already
+  and follower work uses durable run correlation. Correlate spans to Landscape
+  through opaque run, node, token, and batch identities; audit-only row-content
+  hashes must not enter engine span attributes. Row-event producers retain real
+  hashes for in-process audit correlation, but `TelemetryManager` projects
+  `RowCreated.content_hash` and `TransformCompleted` hashes to `None` before
+  observers or exporters see them. It reconstructs exact owned base events so
+  a subclass cannot smuggle sibling hash metadata across the boundary; never
+  substitute a shared redaction marker that downstream could treat as a real
+  hash. A handled exception already
   present in the caller is not a span-body failure, and a telemetry callback
   failure must not replace or rewrite an active workload failure. Exporters
   retain fresh-run trace origin until both `RunFinished` and the enclosing run
@@ -74,6 +126,15 @@ is a working document under the normal delivery posture.
   after its `on_start()` returns. Pass those exact started subsets to
   `cleanup_plugins`; never call `on_complete()` or `close()` on the plugin
   whose startup raised, or on later plugins that were never started.
+  `cleanup_plugins` also requires an explicit `pending_exc`: preflight and
+  startup `except` arms pass the bound exception they re-raise, while
+  steady-state and follower scopes initialize a local to `None` and set it
+  only from `except BaseException` around the exact scope whose exception
+  leaves that boundary. A normal return passes `None`, even when the boundary
+  was invoked inside an outer handled `except`. Never derive cleanup policy
+  from `sys.exc_info()` or `sys.exception()` in the helper or a `finally`
+  caller. This explicit input does not change Tier-1 cleanup precedence,
+  lifecycle callback ordering, or exact partial-startup subset cleanup.
 
 - **2026-08-12 — Python 3.14 annotation closures expose class namespaces to
   Runtime-VAL**: PEP 649 `__annotate__` functions close over `__classdict__`

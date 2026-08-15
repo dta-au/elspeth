@@ -190,7 +190,7 @@ class NodeStateRecord(TypedDict, total=False):
 
 
 class CollisionValueFingerprint(TypedDict):
-    """Non-reversible summary of a branch value involved in a coalesce collision."""
+    """Historical summary of a branch value involved in a coalesce collision."""
 
     value_hash: str
     value_type: str
@@ -207,14 +207,17 @@ class CollisionFieldRecord(TypedDict):
     field: str
     """Field name where collision occurred."""
 
+    contributing_branches: list[str]
+    """Branches that supplied the field, in configured merge order."""
+
     winner_branch: str | None
     """Branch whose value was kept (last_wins or first_wins), or None if merge failed."""
 
     winner_value_fingerprint: CollisionValueFingerprint | None
-    """Fingerprint of the value that won, or None if merge failed."""
+    """Historical fingerprint of the winning value; None for current records or failed merges."""
 
     competing_value_fingerprints: list[tuple[str, CollisionValueFingerprint]]
-    """List of (branch_name, value fingerprint) entries in merge order."""
+    """Historical fingerprints in merge order; empty for current branch-only records."""
 
 
 class CollisionRecord(TypedDict):

@@ -152,6 +152,8 @@ tests/unit/telemetry/test_contracts.py::hasattr(config.backpressure_mode, 'value
 tests/unit/telemetry/test_contracts.py::hasattr(config.granularity, 'value')
 tests/unit/telemetry/test_contracts.py::hasattr(event, 'run_id')
 tests/unit/telemetry/test_contracts.py::hasattr(event, 'timestamp')
+tests/unit/telemetry/test_manager.py::not hasattr(projected_row, 'alternate_content_hash')
+tests/unit/telemetry/test_manager.py::not hasattr(projected_transform, 'alternate_content_hash')
 tests/unit/tui/test_lineage_tree.py::not hasattr(parent.children, 'append')
 tests/unit/web/composer/test_compose_loop_carriers.py::not hasattr(exc_info.value, 'response')
 tests/unit/web/composer/test_compose_loop_carriers.py::not hasattr(outcome, 'assistant_message')

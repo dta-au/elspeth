@@ -1250,7 +1250,7 @@ class TestTransformExecutor:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     # --- Exception path ---
 
@@ -2040,7 +2040,8 @@ class TestGateExecutor:
                 ctx,
             )
 
-        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
 
     def test_post_evaluation_route_failure_marks_gate_span_error(self) -> None:
         """The gate span stays open through route admission and guard failure audit."""
@@ -2261,7 +2262,8 @@ class TestGateExecutor:
                 ctx,
             )
 
-        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
 
     def test_config_gate_expression_error_routes_one_row_with_divert_evidence(self) -> None:
         """A configured expression failure returns a per-row failure outcome."""
@@ -2432,7 +2434,8 @@ class TestGateExecutor:
                 token_manager=None,  # Triggers OrchestrationInvariantError in dispatch
             )
 
-        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].phase == "gate_evaluation_routing"
 
     # --- Error routing edge cases (exd audit) ---
 
@@ -4031,6 +4034,51 @@ class TestNodeStateGuard:
     failures left node_states permanently OPEN in the audit trail.
     """
 
+    def test_auto_fail_phase_is_required_at_construction(self) -> None:
+        """Every caller must name its guarded scope; there is no safe fallback."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        with pytest.raises(TypeError, match="auto_fail_phase"):
+            NodeStateGuard(
+                factory.execution,
+                token_id="tok_1",
+                node_id="node_1",
+                run_id="run_1",
+                step_index=1,
+                input_data={"v": 1},
+            )
+
+        factory.execution.begin_node_state.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "invalid_phase",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="whitespace"),
+            pytest.param(17, id="truthy-non-string"),
+            pytest.param("transform_execuion", id="unknown-string"),
+        ],
+    )
+    def test_auto_fail_phase_rejects_values_outside_closed_vocabulary(self, invalid_phase: Any) -> None:
+        """Invalid phase attribution fails before opening or completing audit state."""
+        from elspeth.engine.executors import NodeStateGuard
+
+        factory = _make_factory()
+        with pytest.raises(OrchestrationInvariantError, match="auto_fail_phase"):
+            NodeStateGuard(
+                factory.execution,
+                token_id="tok_1",
+                node_id="node_1",
+                run_id="run_1",
+                step_index=1,
+                input_data={"v": 1},
+                auto_fail_phase=invalid_phase,
+            )
+
+        factory.execution.begin_node_state.assert_not_called()
+        factory.execution.complete_node_state.assert_not_called()
+
     def test_normal_exit_without_complete_crashes_and_records_failed(self) -> None:
         """Clean exit without complete() records FAILED and raises.
 
@@ -4050,6 +4098,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(OrchestrationInvariantError, match="exited without complete"), guard:
             pass  # Don't call complete()
@@ -4074,6 +4123,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="test crash"), guard:
             raise ValueError("test crash")
@@ -4085,7 +4135,7 @@ class TestNodeStateGuard:
         assert kwargs["state_id"] == "state_001"
         assert "test crash" in kwargs["error"].exception
         assert kwargs["error"].exception_type == "ValueError"
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
         assert kwargs["duration_ms"] >= 0
 
     def test_explicit_ownership_abandonment_preserves_open_state(self) -> None:
@@ -4101,6 +4151,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(SchedulerLeaseLostError), guard:
             guard.abandon_open_state()
@@ -4121,6 +4172,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(OrchestrationInvariantError, match="nominal ownership-loss exception"), guard:
             guard.abandon_open_state()
@@ -4147,6 +4199,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError), guard:
             raise ValueError()
@@ -4169,6 +4222,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(RuntimeError), guard:
             raise RuntimeError("   ")
@@ -4198,6 +4252,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(_HostileStr), guard:
             raise _HostileStr("unrenderable")
@@ -4225,6 +4280,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(TypeError, match="abstract"), guard:
@@ -4236,7 +4292,7 @@ class TestNodeStateGuard:
         assert kwargs["state_id"] == "state_001"
         assert kwargs["error"].exception_type == "TypeError"
         assert "abstract" in kwargs["error"].exception
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     def test_explicit_complete_prevents_auto_fail(self) -> None:
         """If caller calls complete() before exception, guard is no-op."""
@@ -4250,6 +4306,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(RuntimeError, match="post-complete crash"), guard:
             guard.complete(NodeStateStatus.COMPLETED, duration_ms=10.0)
@@ -4272,6 +4329,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(OrchestrationInvariantError, match="terminal"), guard:
@@ -4296,6 +4354,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with guard:
             assert guard.state_id == "state_001"
@@ -4314,6 +4373,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(OrchestrationInvariantError, match="before __enter__"):
             _ = guard.state_id
@@ -4339,6 +4399,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # AuditIntegrityError must be raised — DB failure is more critical than original error
         with pytest.raises(AuditIntegrityError, match=r"Cannot record FAILED.*DB is down"), guard:
@@ -4357,6 +4418,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="execution repo bug"), guard:
             raise RuntimeError("original processing error")
@@ -4373,6 +4435,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=2,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
             attempt=3,
         ) as guard:
             guard.complete(NodeStateStatus.COMPLETED, duration_ms=1.0)
@@ -4402,6 +4465,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # Must propagate FrameworkBugError, NOT OrchestrationInvariantError
         with pytest.raises(FrameworkBugError, match="internal inconsistency"), guard:
@@ -4425,6 +4489,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match="corrupt state table"), guard:
             pass
@@ -4450,6 +4515,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match=r"Cannot record FAILED.*DB connection lost"), guard:
             pass
@@ -4467,6 +4533,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError, match="execution repo bug"), guard:
             pass
@@ -4492,6 +4559,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         # FrameworkBugError supersedes the original ValueError
         with pytest.raises(FrameworkBugError, match="broken invariant"), guard:
@@ -4514,6 +4582,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(AuditIntegrityError, match="state table corrupt"), guard:
             raise ValueError("original error, now masked by corruption")
@@ -4550,6 +4619,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(LandscapePostCommitError, match="post-commit validation"), guard:
             guard.complete(NodeStateStatus.COMPLETED, output_data={"v": 1}, duration_ms=0.0)
@@ -4580,6 +4650,7 @@ class TestNodeStateGuard:
             run_id=setup.run_id,
             step_index=1,
             input_data={"name": "test"},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(rfc8785.CanonicalizationError, match="unsupported type"), guard:
@@ -4621,6 +4692,7 @@ class TestNodeStateGuard:
             run_id=setup.run_id,
             step_index=1,
             input_data={"name": "test"},
+            auto_fail_phase="transform_execution",
         )
 
         with pytest.raises(AuditIntegrityError, match="audit evidence serialization failed"), guard:
@@ -4644,6 +4716,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         violation = PassThroughContractViolation(
             transform="t",
@@ -4687,6 +4760,7 @@ class TestNodeStateGuard:
             run_id="run_1",
             step_index=1,
             input_data={"v": 1},
+            auto_fail_phase="transform_execution",
         )
         with pytest.raises(ValueError), guard:
             raise ValueError("just a ValueError")
@@ -4913,7 +4987,7 @@ class TestTransformExecutorTerminality:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert "executor_post_process" in kwargs["error"].phase
+        assert kwargs["error"].phase == "transform_execution"
 
         # ...and the token's fate must be recorded, not just its node state
         # (elspeth-82d4c5146c): a FAILED node_state with no terminal outcome is
@@ -4966,7 +5040,7 @@ class TestTransformExecutorTerminality:
         factory.execution.complete_node_state.assert_called_once()
         kwargs = factory.execution.complete_node_state.call_args[1]
         assert kwargs["status"] == NodeStateStatus.FAILED
-        assert kwargs["error"].phase == "executor_post_process"
+        assert kwargs["error"].phase == "transform_execution"
 
     def test_successful_transform_still_completes_normally(self) -> None:
         """Sanity: guard does not interfere with normal success path."""
@@ -5069,7 +5143,7 @@ class TestAggregationExecutorTerminality:
 
         failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
         assert failed_kwargs["state_id"] == "state_001"
-        assert getattr(failed_kwargs["error"], "phase", None) == "executor_post_process"
+        assert failed_kwargs["error"].phase == "aggregation_flush"
 
         # Batch: FAILED (outer except handler)
         factory.execution.complete_batch.assert_called_once()
