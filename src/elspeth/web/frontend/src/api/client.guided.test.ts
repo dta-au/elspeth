@@ -661,6 +661,69 @@ describe("api/client guided functions", () => {
       await expect(getGuided("sess-invalid-state")).rejects.toThrow(/invalid guided response/i);
     });
 
+    // Regression: the guided planner authors optional per-step `description`
+    // prose (80fa17fed). The strict state decoder initially enumerated only
+    // the pre-existing keys, so the first tutorial re-plan after deploy made
+    // every /guided response undecodable client-side ("received but could not
+    // be read") while the server kept returning 200.
+    it("accepts composer-authored step descriptions on sources, nodes, and outputs", async () => {
+      const state: Record<string, unknown> = {
+        id: "state-1",
+        session_id: "sess-1",
+        version: 1,
+        sources: {
+          source: {
+            plugin: "csv",
+            options: {},
+            on_success: "records",
+            on_validation_failure: "discard",
+            description: "Read the ticket rows.",
+          },
+        },
+        nodes: [{
+          id: "validate",
+          node_type: "transform",
+          plugin: "schema_guard",
+          input: "records",
+          on_success: "valid",
+          on_error: "discard",
+          options: {},
+          description: "Reject rows missing required columns.",
+        }],
+        edges: [{
+          id: "edge-1",
+          from_node: "source",
+          to_node: "validate",
+          edge_type: "on_success",
+          label: null,
+        }],
+        outputs: [{
+          name: "result",
+          plugin: "json",
+          options: {},
+          on_write_failure: "discard",
+          description: "Write validated rows to JSON.",
+        }],
+        metadata: { name: null, description: null },
+        is_valid: true,
+        validation_errors: [],
+        validation_warnings: [],
+        validation_suggestions: [],
+        derived_from_state_id: null,
+        created_at: "2026-07-19T00:00:00Z",
+        composer_meta: null,
+        plugin_policy_findings: [],
+      };
+      const body = makeGetGuidedResponse() as unknown as Record<string, unknown>;
+      body.composition_state = state;
+      fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);
+
+      const decoded = await getGuided("sess-described-state");
+      expect(decoded.composition_state?.sources.source.description).toBe("Read the ticket rows.");
+      expect(decoded.composition_state?.nodes[0].description).toBe("Reject rows missing required columns.");
+      expect(decoded.composition_state?.outputs[0].description).toBe("Write validated rows to JSON.");
+    });
+
     it("propagates AbortSignal to fetch", async () => {
       const controller = new AbortController();
       // Mock fetch to throw an AbortError when called — this simulates the

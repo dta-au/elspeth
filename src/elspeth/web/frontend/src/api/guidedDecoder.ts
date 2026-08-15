@@ -1946,13 +1946,21 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
   const wireSources = state.sources === null ? {} : record(state.sources, `${path}.sources`);
   for (const [name, item] of Object.entries(wireSources)) {
     const sourcePath = `${path}.sources.${name}`;
-    const source = exactRecord(item, sourcePath, ["plugin", "options", "on_success", "on_validation_failure"]);
+    const source = exactRecord(
+      item,
+      sourcePath,
+      ["plugin", "options", "on_success", "on_validation_failure"],
+      ["description"],
+    );
     sources[name] = {
       plugin: stringValue(source.plugin, `${sourcePath}.plugin`),
       options: jsonRecord(source.options, `${sourcePath}.options`),
       on_success: stringValue(source.on_success, `${sourcePath}.on_success`),
       on_validation_failure: stringValue(source.on_validation_failure, `${sourcePath}.on_validation_failure`),
     };
+    if (source.description !== undefined) {
+      sources[name].description = nullableString(source.description, `${sourcePath}.description`);
+    }
   }
 
   const wireNodes = state.nodes === null ? [] : arrayValue(state.nodes, `${path}.nodes`);
@@ -1973,6 +1981,7 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
         "output_mode",
         "expected_output_count",
         "timeout_seconds",
+        "description",
       ],
     );
     const nodeType = stringValue(node.node_type, `${nodePath}.node_type`);
@@ -2027,6 +2036,9 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
           `${nodePath}.timeout_seconds`,
         );
     }
+    if (node.description !== undefined) {
+      decoded.description = nullableString(node.description, `${nodePath}.description`);
+    }
     return decoded;
   });
 
@@ -2048,13 +2060,22 @@ function decodeCompositionState(value: unknown, path: string): CompositionState 
   const wireOutputs = state.outputs === null ? [] : arrayValue(state.outputs, `${path}.outputs`);
   const outputs: CompositionState["outputs"] = wireOutputs.map((item, index) => {
     const outputPath = `${path}.outputs[${index}]`;
-    const output = exactRecord(item, outputPath, ["name", "plugin", "options", "on_write_failure"]);
-    return {
+    const output = exactRecord(
+      item,
+      outputPath,
+      ["name", "plugin", "options", "on_write_failure"],
+      ["description"],
+    );
+    const decodedOutput: CompositionState["outputs"][number] = {
       name: stringValue(output.name, `${outputPath}.name`),
       plugin: stringValue(output.plugin, `${outputPath}.plugin`),
       options: jsonRecord(output.options, `${outputPath}.options`),
       on_write_failure: stringValue(output.on_write_failure, `${outputPath}.on_write_failure`),
     };
+    if (output.description !== undefined) {
+      decodedOutput.description = nullableString(output.description, `${outputPath}.description`);
+    }
+    return decodedOutput;
   });
 
   const metadata = state.metadata === null
