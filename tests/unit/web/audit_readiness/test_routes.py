@@ -12,7 +12,6 @@ from elspeth.web.audit_readiness.routes import create_audit_readiness_router
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.protocol import SessionRecord
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -76,7 +75,6 @@ def _client() -> TestClient:
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _ExplodingReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     # Phase 8 Sub-task 7f. The route reads ``app.state.sessions_telemetry``
     # in the exception path to emit ``composer.audit.fetch_failure_total``.
     # Tests use the fake-counter container so ``observed_value`` can
@@ -152,7 +150,6 @@ def test_snapshot_composition_state_not_found_does_not_emit_fetch_failure() -> N
     )
     app.state.session_service = _SessionService()
     app.state.readiness_service = _NotFoundReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
     app.include_router(create_audit_readiness_router())
     with TestClient(app) as client:
@@ -240,7 +237,6 @@ def _explain_app(session_service: object) -> FastAPI:
     )
     app.state.session_service = session_service
     app.state.readiness_service = _ExplodingReadinessService()
-    app.state.rate_limiter = ComposerRateLimiter(limit=100)
     app.state.sessions_telemetry = build_sessions_telemetry()
     app.include_router(create_audit_readiness_router())
     return app

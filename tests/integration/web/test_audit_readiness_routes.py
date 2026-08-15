@@ -320,9 +320,22 @@ def test_secrets_row_surfaces_disallowed_secret_ref_from_real_validate_pipeline(
     assert "scrape" in rows["secrets"]["component_ids"]
 
 
-def test_audit_readiness_routes_are_rate_limited(
+def test_audit_readiness_reads_do_not_consume_the_composer_rate_limit(
     audit_readiness_client_with_state: tuple[TestClient, UUID],
 ) -> None:
+    """Reads are unguarded — the shared per-user bucket is for writes.
+
+    These GETs previously shared the composer message bucket (added in
+    d1fbdf3fc as a phase-2 review blocker, mirroring sibling routes).
+    In deployment that bucket is sized for LLM-backed compose calls
+    (10/min), and the tutorial's endgame polls audit-readiness enough
+    to starve the tutorial-completion PATCH into a 429. Policy per
+    preferences/routes.py: "Read GET is intentionally unguarded —
+    idempotent, safe to spam, no write amplification."
+
+    limit=1 makes the assertion sharp: if either route consumed or
+    checked the bucket, the second request would 429.
+    """
     client, session_id = audit_readiness_client_with_state
 
     for suffix in ("", "/explain"):
@@ -330,4 +343,4 @@ def test_audit_readiness_routes_are_rate_limited(
         first_response = client.get(f"/api/sessions/{session_id}/audit-readiness{suffix}")
         assert first_response.status_code == 200
         response = client.get(f"/api/sessions/{session_id}/audit-readiness{suffix}")
-        assert response.status_code == 429
+        assert response.status_code == 200
