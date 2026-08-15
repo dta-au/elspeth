@@ -636,6 +636,95 @@ test.describe("Composer deterministic workspace geometry", () => {
     }
   });
 
+  /* elspeth-15e8cff7a5 and elspeth-97db9c22e5, which the row above could not
+     catch for two independent reasons — both worth stating, because either one
+     alone would have been enough to let the bug ship.
+
+     STATE: that test asserts "Validation: Passed" first, so it runs against a
+     VALIDATED pipeline. ExecuteButton renders its block-reason line only when
+     Run is gated, so in that scenario the line does not exist, .completion-bar
+     is a single --size-control row exactly like the status group, and neither
+     defect can arise. The bug lives in the DEFAULT state of an unvalidated
+     pipeline — which is why it was reported as "even blank ones".
+
+     SCOPE: that test compares saveForReview/runPipeline/importYaml against each
+     other. All three are members of the same flex line inside .completion-bar,
+     so they are aligned by construction and the assertion cannot fail. The
+     elements that actually move are the status chips in the OTHER group.
+
+     So this test exercises the gated state and pins the two cross-group facts:
+     the chips share the buttons' top edge, and the two halves of the
+     application's bottom rule — the artifact column's action bar and the
+     authoring column's mirrored band — start on one line. The second is
+     asserted as a RENDERED fact: the band is a fixed-height pseudo-element in a
+     different grid column, so a source-string test of its height cannot observe
+     that the bar it must meet has grown past the formula (elspeth-27dc483116).
+     Nor can a visual snapshot serve here — --update-snapshots rewrites only
+     failing files, and a sub-threshold offset passes silently. */
+  test("a gated Run keeps the status chips and the bottom rule registered with the completion buttons", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1600, height: 900 });
+    const sessionId = await installWorkspaceScenario(page, "empty-freeform");
+    const composer = new ComposerPage(page);
+    try {
+      await composer.goto(sessionId);
+      await composer.waitForChatReady();
+
+      // Asserted, not assumed. Without the reason line in flow the completion
+      // group is the same height as the status group and both invariants hold
+      // trivially, so a green run would be evidence of nothing.
+      const reason = page.locator(".side-rail-execute-reason");
+      await expect(reason).toBeVisible();
+      await expect(composer.validationStatus()).toHaveAccessibleName(
+        "Validation: Not checked",
+      );
+
+      const [chip, save, importYaml, run, reasonBox] = await Promise.all([
+        composer.validationStatus().boundingBox(),
+        composer.saveForReview().boundingBox(),
+        composer.importYaml().boundingBox(),
+        composer.runPipeline().boundingBox(),
+        reason.boundingBox(),
+      ]);
+      for (const box of [chip, save, importYaml, run, reasonBox]) {
+        expect(box).not.toBeNull();
+      }
+
+      // The status chips belong to the bar's first line, with the buttons.
+      expect(Math.abs(chip!.y - save!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(chip!.y - importYaml!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(chip!.y - run!.y)).toBeLessThanOrEqual(1);
+
+      // The reason line takes its own line BELOW them and drives nobody's
+      // vertical position but its own.
+      expect(reasonBox!.y).toBeGreaterThanOrEqual(save!.y + save!.height);
+
+      // Both halves of the bottom rule start on one line. The band is a
+      // ::before pinned to the authoring pane's bottom edge, so its top is the
+      // pane's bottom minus its rendered height.
+      const bottomEdges = await page.evaluate(() => {
+        const pane = document.querySelector(".workspace-authoring-pane");
+        const bar = document.querySelector(".workspace-action-bar");
+        if (pane === null || bar === null) return null;
+        const bandHeight = Number.parseFloat(
+          getComputedStyle(pane, "::before").height,
+        );
+        if (!Number.isFinite(bandHeight)) return null;
+        return {
+          bandTop: pane.getBoundingClientRect().bottom - bandHeight,
+          barTop: bar.getBoundingClientRect().top,
+        };
+      });
+      expect(bottomEdges).not.toBeNull();
+      expect(
+        Math.abs(bottomEdges!.bandTop - bottomEdges!.barTop),
+      ).toBeLessThanOrEqual(1);
+    } finally {
+      await deleteWorkspaceScenario(page, sessionId);
+    }
+  });
+
   for (const width of [1280, 980] as const) {
     test(`workspace navigation/status controls use non-overlapping 36px targets at ${width}px`, async ({
       page,

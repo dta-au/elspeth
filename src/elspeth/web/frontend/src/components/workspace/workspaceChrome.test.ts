@@ -297,8 +297,18 @@ describe("workspace bottom edge (elspeth-215c989bed)", () => {
     // so the bottom of the app was a half-drawn line. The mirrored band must
     // be exactly as tall as the action bar: inset + tallest control + inset.
     const band = ".workspace-authoring-pane::before";
+    /* The band's height is no longer a constant that can be checked against the
+       bar's constant, because the bar is no longer constant: it grows a line
+       whenever .completion-bar carries ExecuteButton's block-reason text, and
+       the band then missed it by 27px (elspeth-97db9c22e5). What a source-string
+       test can still pin is the SHAPE of the agreement — the measured height
+       published by ComposerWorkspace wins, and the token formula survives as the
+       fallback for the paint before the observer fires, so it must still be the
+       bar's ungated height rather than some other value. The equality itself is
+       a rendered fact now and is asserted as one, in
+       composer-workspace-geometry.spec.ts. */
     expect(declaration(band, "height")).toBe(
-      "calc(2 * var(--workspace-bar-inset) + var(--size-control))",
+      "var(--workspace-action-bar-height, calc(2 * var(--workspace-bar-inset) + var(--size-control)))",
     );
     expect(declaration(band, "border-top")).toBe(
       declaration(".workspace-action-bar", "border-top"),

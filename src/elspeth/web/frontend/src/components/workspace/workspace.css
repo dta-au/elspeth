@@ -82,7 +82,19 @@
    own height is built — so the two bands start and end on the same two lines
    in the density regime as well. The pseudo-element is the pane's FIRST child
    and .workspace-collapse-control is positioned, so tree order paints the
-   control above the band without needing a negative z-index. */
+   control above the band without needing a negative z-index.
+
+   That token formula was the band's height outright until elspeth-97db9c22e5.
+   It encodes "the action bar is exactly one --size-control row", which stops
+   being true the moment .completion-bar takes a second line for ExecuteButton's
+   block-reason text: the bar measured 87px against this band's 60px and the
+   bottom of the application was a half-drawn line again — the very defect the
+   band exists to close. CSS cannot read a sibling column's rendered height, so
+   ComposerWorkspace measures the action-bar slot and publishes
+   --workspace-action-bar-height on the workspace root, the same channel that
+   already carries --authoring-pane-width. The formula stays as the fallback
+   because it is the bar's height in the ungated state, so a first paint before
+   the observer fires lands on the right value rather than on zero. */
 .workspace-authoring-pane {
   position: relative;
 }
@@ -92,7 +104,7 @@
   right: 0;
   bottom: 0;
   left: 0;
-  height: calc(2 * var(--workspace-bar-inset) + var(--size-control));
+  height: var(--workspace-action-bar-height, calc(2 * var(--workspace-bar-inset) + var(--size-control)));
   border-top: 1px solid var(--color-border, currentcolor);
   background: var(--color-surface, Canvas);
   content: "";
@@ -266,7 +278,18 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--workspace-bar-gap);
-  align-items: center;
+  /* flex-start, NOT center (elspeth-15e8cff7a5). The bar's two groups are not
+     the same height: .completion-bar carries ExecuteButton's block-reason line
+     as a fourth, full-width flex item (see .side-rail-execute-reason below), so
+     it measures 70px against .workspace-status-controls' 44px whenever Run is
+     gated — which is the DEFAULT state of any unvalidated pipeline, blank ones
+     included. Centering two unequal groups pushed the status chips down by half
+     the difference, (70 - 44) / 2 = 13px, and the row read as two bars that
+     failed to align. Top-alignment registers the chips with the buttons on the
+     bar's first line and leaves the reason line hanging below them, which is
+     where it belongs. In the ungated state both groups are --size-control tall
+     and flex-start and center resolve identically, so this is not a trade. */
+  align-items: flex-start;
   /* justify-content: space-between used to sit here and was INERT — the
      uncapped completion group absorbed every pixel of free space, so there was
      never any to distribute. Capping that group (elspeth-c6fd722d2f) makes the

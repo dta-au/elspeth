@@ -98,12 +98,18 @@ export function ComposerWorkspace({
   const [workspaceWidth, setWorkspaceWidth] = useState(0);
   const [narrowView, setNarrowView] = useState<NarrowView>("compose");
   const [authoringFocusRequest, setAuthoringFocusRequest] = useState(0);
+  /* null = "no measurement", which is NOT the same as 0 and must not be
+     rendered as 0px: the authoring band falls back to its token formula on
+     null, and a 0px band would erase the bottom rule outright. See the
+     observer below (elspeth-97db9c22e5). */
+  const [actionBarHeight, setActionBarHeight] = useState<number | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const composeTabRef = useRef<HTMLButtonElement | null>(null);
   const pipelineTabRef = useRef<HTMLButtonElement | null>(null);
   const authoringSlotRef = useRef<HTMLDivElement | null>(null);
   const separatorSlotRef = useRef<HTMLDivElement | null>(null);
   const artifactSlotRef = useRef<HTMLDivElement | null>(null);
+  const actionBarSlotRef = useRef<HTMLDivElement | null>(null);
   const authoringPaneRef = useRef<HTMLElement | null>(null);
   const artifactPaneRef = useRef<HTMLElement | null>(null);
   const collapseControlRef = useRef<HTMLButtonElement | null>(null);
@@ -139,6 +145,34 @@ export function ComposerWorkspace({
       }
     });
     observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+
+  /* Publish the action bar's RENDERED height so the authoring pane's mirrored
+     bottom band can be exactly as tall (elspeth-97db9c22e5). The band is a
+     ::before in the other grid column, and CSS gives a pseudo-element no way to
+     read a sibling column's height — but the two must agree or the bottom rule
+     of the application is drawn at two heights. The bar is not a fixed row: it
+     grows by a whole line whenever .completion-bar takes one for ExecuteButton's
+     block-reason text, and by more than one when that text wraps, so the
+     token formula the band used to hard-code cannot be repaired by adding a
+     second constant to it. Observing beats recomputing: the slot reports what
+     the browser actually laid out, wrap included.
+
+     The slot is observed rather than the bar itself because the slot is this
+     component's own element and outlives every state in which `actionBar` is
+     null; observing a conditionally-rendered child would need the observer torn
+     down and rebuilt on each mount. An empty slot measures 0, which we report as
+     null so the band keeps its token fallback instead of collapsing. */
+  useLayoutEffect(() => {
+    const slot = actionBarSlotRef.current;
+    if (slot === null) return;
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height;
+      if (height === undefined || !Number.isFinite(height)) return;
+      setActionBarHeight(height > 0 ? height : null);
+    });
+    observer.observe(slot);
     return () => observer.disconnect();
   }, []);
 
@@ -273,6 +307,12 @@ export function ComposerWorkspace({
 
   const rootStyle = {
     "--authoring-pane-width": `${paneState.effectiveAuthoringWidth}px`,
+    /* Omitted, not zeroed, when unmeasured: an absent custom property lets the
+       band's var() fall through to its token formula, whereas "0px" would win
+       and erase the rule. */
+    ...(actionBarHeight === null
+      ? {}
+      : { "--workspace-action-bar-height": `${actionBarHeight}px` }),
   } as CSSProperties;
 
   return (
@@ -449,7 +489,9 @@ export function ComposerWorkspace({
             >
               {artifact}
             </div>
-            <div className="workspace-action-bar-slot">{actionBar}</div>
+            <div ref={actionBarSlotRef} className="workspace-action-bar-slot">
+              {actionBar}
+            </div>
           </section>
         </div>
 
