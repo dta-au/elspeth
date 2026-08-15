@@ -163,7 +163,8 @@ def _add_safe_exception_note(exception: BaseException, note: str) -> None:
     if dict.__contains__(state, "__notes__"):
         notes: object = dict.__getitem__(state, "__notes__")
         if type(notes) is not list:
-            return
+            notes = []
+            dict.__setitem__(state, "__notes__", notes)
     else:
         notes = []
         dict.__setitem__(state, "__notes__", notes)
