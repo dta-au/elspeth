@@ -27,6 +27,9 @@ from elspeth.contracts.events import (
     EngineSpanCompleted,
     EngineSpanName,
     EngineSpanStatus,
+    PhaseAction,
+    PhaseChanged,
+    PipelinePhase,
     RunFinished,
     RunStarted,
 )
@@ -404,7 +407,7 @@ class TestAzureMonitorExporterSpanConversion:
         assert "joined-run" not in configured_exporter._trace_started_at
         assert "joined-run" not in configured_exporter._fresh_run_ids
 
-    def test_run_finished_without_run_span_releases_fresh_trace_registry(
+    def test_run_finished_without_run_span_retains_origin_until_close(
         self,
         configured_exporter: AzureMonitorExporter,
         azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
@@ -424,8 +427,15 @@ class TestAzureMonitorExporterSpanConversion:
 
         exported = azure_monitor_trace_exporter.instance.export_calls[0]
         assert exported[0].context.trace_id == exported[1].context.trace_id
+        assert "run-no-span" in configured_exporter._trace_started_at
+        assert "run-no-span" in configured_exporter._fresh_run_ids
+        assert "run-no-span" in configured_exporter._fresh_run_finished_ids
+
+        configured_exporter.close()
+
         assert "run-no-span" not in configured_exporter._trace_started_at
         assert "run-no-span" not in configured_exporter._fresh_run_ids
+        assert "run-no-span" not in configured_exporter._fresh_run_finished_ids
 
     @pytest.mark.parametrize("terminal_order", ["finish-first", "run-span-first"])
     def test_fresh_run_terminal_pair_keeps_one_trace_then_releases_registry(
@@ -467,6 +477,56 @@ class TestAzureMonitorExporterSpanConversion:
         configured_exporter.flush()
 
         exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len({span.context.trace_id for span in exported}) == 1
+        assert run_id not in configured_exporter._trace_started_at
+        assert run_id not in configured_exporter._fresh_run_ids
+        assert run_id not in configured_exporter._fresh_run_finished_ids
+        assert run_id not in configured_exporter._fresh_run_span_completed_ids
+
+    def test_export_phase_between_run_finished_and_run_span_keeps_durable_trace_origin(
+        self,
+        configured_exporter: AzureMonitorExporter,
+        azure_monitor_trace_exporter: AzureMonitorTraceExporterFactory,
+    ) -> None:
+        run_id = "run-terminal-export-phase"
+        trace_started_at = datetime(2026, 7, 24, 1, 2, 3, tzinfo=UTC)
+
+        configured_exporter.export(RunStarted(timestamp=trace_started_at, run_id=run_id, config_hash="abc", source_plugin="csv"))
+        configured_exporter.export(
+            RunFinished(
+                timestamp=trace_started_at + timedelta(seconds=3),
+                run_id=run_id,
+                status=RunStatus.COMPLETED,
+                row_count=1,
+                duration_ms=3000.0,
+            )
+        )
+        configured_exporter.export(
+            PhaseChanged(
+                timestamp=trace_started_at + timedelta(seconds=4),
+                run_id=run_id,
+                phase=PipelinePhase.EXPORT,
+                action=PhaseAction.EXPORTING,
+            )
+        )
+        configured_exporter.export(
+            EngineSpanCompleted(
+                timestamp=trace_started_at + timedelta(seconds=5),
+                run_id=run_id,
+                name=EngineSpanName.RUN,
+                started_at=trace_started_at,
+                trace_started_at=trace_started_at,
+                span_id="1234567890abcdef",
+                parent_span_id=None,
+                status=EngineSpanStatus.OK,
+                exception_type=None,
+                attributes={"run.id": run_id},
+            )
+        )
+        configured_exporter.flush()
+
+        exported = azure_monitor_trace_exporter.instance.export_calls[0]
+        assert len(exported) == 4
         assert len({span.context.trace_id for span in exported}) == 1
         assert run_id not in configured_exporter._trace_started_at
         assert run_id not in configured_exporter._fresh_run_ids

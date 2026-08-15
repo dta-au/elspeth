@@ -28,7 +28,7 @@ import queue
 import threading
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from time import monotonic, sleep
+from time import monotonic
 from typing import Literal, TypedDict
 
 import structlog
@@ -37,6 +37,7 @@ from elspeth.contracts.config import RuntimeTelemetryProtocol
 from elspeth.contracts.config.defaults import INTERNAL_DEFAULTS
 from elspeth.contracts.enums import BackpressureMode
 from elspeth.contracts.events import TelemetryEvent
+from elspeth.engine._best_effort import best_effort
 from elspeth.telemetry.circuit_breaker import CircuitBreaker
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
 from elspeth.telemetry.filtering import should_emit
@@ -48,6 +49,8 @@ from elspeth.telemetry.protocols import (
 logger = structlog.get_logger(__name__)
 
 _SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 5.0
+_BLOCK_ENQUEUE_TIMEOUT_SECONDS = 30.0
+_BLOCK_ENQUEUE_POLL_SECONDS = 0.01
 
 
 class HealthMetrics(TypedDict):
@@ -166,6 +169,12 @@ class TelemetryManager:
         # Thread coordination
         self._shutdown_event = threading.Event()
         self._lifecycle_lock = threading.Lock()
+        self._lifecycle_condition = threading.Condition(self._lifecycle_lock)
+        self._active_enqueues = 0
+        self._shutdown_coordinator: threading.Thread | None = None
+        self._shutdown_exception: BaseException | None = None
+        self._exception_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._dropped_lock = threading.Lock()
         self._export_thread_ready = threading.Event()  # Signals thread is running
 
@@ -243,61 +252,72 @@ class TelemetryManager:
         failed_counts: list[int] = []
         deferred = 0
 
-        for exporter in self._exporters:
-            breaker = self._circuit_breakers[id(exporter)]
+        dispatch_finished = False
+        try:
+            for exporter in self._exporters:
+                breaker = self._circuit_breakers[id(exporter)]
 
-            # Skip exporters with open circuit breakers
-            if breaker.is_open():
-                skipped += 1
-                logger.debug(
-                    "Skipping exporter due to open circuit breaker",
-                    exporter=exporter.name,
-                    event_type=type(event).__name__,
-                )
-                continue
+                # Skip exporters with open circuit breakers
+                if breaker.is_open():
+                    skipped += 1
+                    logger.debug(
+                        "Skipping exporter due to open circuit breaker",
+                        exporter=exporter.name,
+                        event_type=type(event).__name__,
+                    )
+                    continue
 
-            try:
-                before = _exporter_delivery_metrics(exporter)
-                result = exporter.export(event)
-                after = _exporter_delivery_metrics(exporter)
-                delivered_delta = _metric_delta(before, after, "delivered")
-                failed_delta = _metric_delta(before, after, "failed")
-                if result is False:
+                try:
+                    before = _exporter_delivery_metrics(exporter)
+                    result = exporter.export(event)
+                    after = _exporter_delivery_metrics(exporter)
+                    delivered_delta = _metric_delta(before, after, "delivered")
+                    failed_delta = _metric_delta(before, after, "failed")
+                    if result is False:
+                        breaker.record_failure()
+                        failures += 1
+                        self._exporter_failures[exporter.name] += 1
+                        if failed_delta:
+                            failed_counts.append(failed_delta)
+                        logger.warning(
+                            "Telemetry exporter reported handled failure",
+                            exporter=exporter.name,
+                            event_type=type(event).__name__,
+                            circuit_state=breaker.state.name,
+                        )
+                        continue
+                    if after is not None:
+                        if delivered_delta:
+                            breaker.record_success()
+                            successes += 1
+                            delivered_counts.append(delivered_delta)
+                        else:
+                            deferred += 1
+                    else:
+                        breaker.record_success()
+                        successes += 1
+                        immediate_success = True
+                except TELEMETRY_TRANSPORT_ERRORS as e:
+                    # Transport/IO failure — isolate this exporter, don't crash.
+                    # Any other exception is a programming error and propagates.
                     breaker.record_failure()
                     failures += 1
                     self._exporter_failures[exporter.name] += 1
-                    if failed_delta:
-                        failed_counts.append(failed_delta)
                     logger.warning(
-                        "Telemetry exporter reported handled failure",
+                        "Telemetry exporter failed",
                         exporter=exporter.name,
                         event_type=type(event).__name__,
+                        error_type=type(e).__name__,
                         circuit_state=breaker.state.name,
                     )
-                    continue
-                if after is not None:
-                    if delivered_delta:
-                        breaker.record_success()
-                        successes += 1
-                        delivered_counts.append(delivered_delta)
-                    else:
-                        deferred += 1
-                else:
-                    breaker.record_success()
-                    successes += 1
-                    immediate_success = True
-            except TELEMETRY_TRANSPORT_ERRORS as e:
-                # Transport/IO failure — isolate this exporter, don't crash.
-                # Any other exception is a programming error and propagates.
-                breaker.record_failure()
-                failures += 1
-                self._exporter_failures[exporter.name] += 1
-                logger.warning(
-                    "Telemetry exporter failed",
-                    exporter=exporter.name,
-                    event_type=type(event).__name__,
-                    error_type=type(e).__name__,
-                    circuit_state=breaker.state.name,
+            dispatch_finished = True
+        finally:
+            if not dispatch_finished:
+                self._record_interrupted_dispatch(
+                    successes=successes,
+                    immediate_success=immediate_success,
+                    delivered_counts=delivered_counts,
+                    deferred=deferred,
                 )
 
         # Update metrics based on outcome
@@ -369,6 +389,31 @@ class TelemetryManager:
             # acknowledged delivery yet.  Flush/batch completion resolves it.
             self._pending_deferred_events += 1
 
+    def _record_interrupted_dispatch(
+        self,
+        *,
+        successes: int,
+        immediate_success: bool,
+        delivered_counts: list[int],
+        deferred: int,
+    ) -> None:
+        """Classify an in-flight event when exporter programming code aborts."""
+        if successes:
+            delivered = 1 if immediate_success else max(delivered_counts, default=1)
+            if not immediate_success:
+                delivered = min(delivered, self._pending_deferred_events + 1)
+                self._pending_deferred_events = max(0, self._pending_deferred_events - max(0, delivered - 1))
+            self._events_delivered += delivered
+            self._events_emitted += delivered
+            self._consecutive_total_failures = 0
+            return
+        if deferred:
+            self._pending_deferred_events += 1
+            return
+        self._events_failed += 1
+        with self._dropped_lock:
+            self._events_dropped += 1
+
     def handle_event(self, event: TelemetryEvent) -> None:
         """Queue event for async export.
 
@@ -415,16 +460,25 @@ class TelemetryManager:
         if not should_emit(event, self._config.granularity):
             return
 
-        # Fence the final shutdown check and enqueue as one lifecycle action.
-        # close() takes the same lock before placing its sentinel, so an event
-        # is always entirely before shutdown or rejected after it.
-        with self._lifecycle_lock:
+        # Admit the enqueue while holding the lifecycle lock, then release the
+        # lock before touching the potentially blocking queue. close() rejects
+        # later producers and waits for admitted attempts to finish before it
+        # may place the sentinel, so no event can land behind that sentinel.
+        with self._lifecycle_condition:
             if self._shutdown_event.is_set():
                 return
+            self._active_enqueues += 1
+
+        try:
             self._enqueue_event(event)
+        finally:
+            with self._lifecycle_condition:
+                self._active_enqueues -= 1
+                if self._active_enqueues == 0:
+                    self._lifecycle_condition.notify_all()
 
     def _enqueue_event(self, event: TelemetryEvent) -> None:
-        """Queue one filtered event while the lifecycle lock is held."""
+        """Queue one filtered event admitted by the lifecycle fence."""
         self._events_attempted += 1
 
         if not self._export_thread_ready.is_set():
@@ -446,14 +500,33 @@ class TelemetryManager:
                 self._drop_oldest_and_enqueue_newest(event)
             return
 
-        # Timeout prevents permanent deadlock if export thread dies.
+        # Poll in bounded slices so close() can cancel a blocked admission.
+        # The lifecycle lock is deliberately not held during queue.put().
+        enqueue_deadline = monotonic() + _BLOCK_ENQUEUE_TIMEOUT_SECONDS
+        while not self._shutdown_event.is_set():
+            remaining = enqueue_deadline - monotonic()
+            if remaining <= 0:
+                logger.error("BLOCK mode put() timed out - export thread may be stuck")
+                with self._dropped_lock:
+                    self._events_dropped += 1
+                    self._queue_drops += 1
+                return
+            if self._put_blocking_slice(event, timeout=min(_BLOCK_ENQUEUE_POLL_SECONDS, remaining)):
+                return
+
+        # This event was admitted before close() set shutdown but never entered
+        # the queue. Account for the cancellation as backpressure loss.
+        with self._dropped_lock:
+            self._events_dropped += 1
+            self._queue_drops += 1
+
+    def _put_blocking_slice(self, event: TelemetryEvent, *, timeout: float) -> bool:
+        """Try one bounded BLOCK enqueue slice."""
         try:
-            self._queue.put(event, timeout=30.0)
+            self._queue.put(event, timeout=timeout)
         except queue.Full:
-            logger.error("BLOCK mode put() timed out - export thread may be stuck")
-            with self._dropped_lock:
-                self._events_dropped += 1
-                self._queue_drops += 1
+            return False
+        return True
 
     def _drop_oldest_and_enqueue_newest(self, event: TelemetryEvent) -> None:
         """DROP mode overflow strategy: evict oldest queued event, keep newest.
@@ -628,99 +701,177 @@ class TelemetryManager:
             TelemetryExporterError: If fail_on_total_exporter_failure=True
                 and all exporters failed repeatedly during processing.
         """
-        if not self._shutdown_event.is_set():
+        with self._flush_lock:
+            if self._shutdown_event.is_set():
+                raise RuntimeError("Cannot flush telemetry after shutdown has started")
+
             self._queue.join()  # Wait for all queued events to be processed
 
-        # Re-raise stored exception from background thread (fail_on_total=True)
-        if self._stored_exception is not None:
-            exc = self._stored_exception
-            try:
-                raise exc
-            finally:
-                self._stored_exception = None  # Clear to allow recovery
+            # Re-raise stored exception from background thread.
+            stored_exception = self._take_pending_exception()
+            if stored_exception is not None:
+                raise stored_exception
 
-        delivered_on_flush = 0
-        failed_on_flush = 0
-        dropped_on_flush = 0
-        for exporter in self._exporters:
-            try:
-                before = _exporter_delivery_metrics(exporter)
-                result = exporter.flush()
-                after = _exporter_delivery_metrics(exporter)
-                delivered_delta = _metric_delta(before, after, "delivered")
-                delivered_on_flush = max(delivered_on_flush, delivered_delta)
-                failed_on_flush = max(failed_on_flush, _metric_delta(before, after, "failed"))
-                dropped_on_flush = max(dropped_on_flush, _metric_delta(before, after, "dropped"))
-                if result is False:
-                    breaker = self._circuit_breakers[id(exporter)]
-                    breaker.record_failure()
-                    self._exporter_failures[exporter.name] += 1
+            delivered_on_flush = 0
+            failed_on_flush = 0
+            dropped_on_flush = 0
+            for exporter in self._exporters:
+                try:
+                    before = _exporter_delivery_metrics(exporter)
+                    result = exporter.flush()
+                    after = _exporter_delivery_metrics(exporter)
+                    delivered_delta = _metric_delta(before, after, "delivered")
+                    delivered_on_flush = max(delivered_on_flush, delivered_delta)
+                    failed_on_flush = max(failed_on_flush, _metric_delta(before, after, "failed"))
+                    dropped_on_flush = max(dropped_on_flush, _metric_delta(before, after, "dropped"))
+                    if result is False:
+                        breaker = self._circuit_breakers[id(exporter)]
+                        breaker.record_failure()
+                        self._exporter_failures[exporter.name] += 1
+                        logger.warning(
+                            "Exporter reported handled flush failure",
+                            exporter=exporter.name,
+                            circuit_state=breaker.state.name,
+                        )
+                    elif delivered_delta:
+                        self._circuit_breakers[id(exporter)].record_success()
+                except TELEMETRY_TRANSPORT_ERRORS as e:
+                    # Transport/IO failure — log, don't crash. Other exceptions
+                    # are programming errors and propagate.
                     logger.warning(
-                        "Exporter reported handled flush failure",
+                        "Exporter flush failed",
                         exporter=exporter.name,
-                        circuit_state=breaker.state.name,
+                        error_type=type(e).__name__,
                     )
-                elif delivered_delta:
-                    self._circuit_breakers[id(exporter)].record_success()
-            except TELEMETRY_TRANSPORT_ERRORS as e:
-                # Transport/IO failure — log, don't crash. Other exceptions
-                # are programming errors and propagate.
-                logger.warning(
-                    "Exporter flush failed",
-                    exporter=exporter.name,
-                    error_type=type(e).__name__,
-                )
 
-        self._reconcile_deferred_delivery(delivered=delivered_on_flush, failed=failed_on_flush, dropped=dropped_on_flush)
-        if delivered_on_flush:
-            self._consecutive_total_failures = 0
+            self._reconcile_deferred_delivery(delivered=delivered_on_flush, failed=failed_on_flush, dropped=dropped_on_flush)
+            if delivered_on_flush:
+                self._consecutive_total_failures = 0
 
     def close(self) -> None:
         """Shutdown export thread and close exporters.
 
-        Shutdown Sequence (order is critical to avoid deadlock/data loss):
-        1. Signal shutdown to reject new events
-        2. Send sentinel FIRST (before waiting) - thread processes remaining
-           events then exits when it sees the sentinel
-        3. Wait for thread to exit (implicitly waits for queue drain)
-        4. Close exporters
+        A daemon coordinator owns the ordered shutdown sequence:
+        reject new events, settle already-admitted enqueues, place the sentinel,
+        drain the export worker, and close exporters. The caller waits only the
+        configured budget. If an exporter stalls, the coordinator preserves
+        eventual finalization after recovery without making process exit depend
+        on third-party code returning.
 
         CRITICAL: Do NOT call queue.join() before sending sentinel - this
         creates a race condition where the thread may block on get() after
         join() completes but before sentinel arrives.
 
-        Should be called at pipeline shutdown. Logs final health metrics
-        and releases exporter resources. Close failures are logged but
-        don't raise.
+        Should be called at pipeline shutdown. Transport close failures are
+        logged without raising. Programming failures are relayed when shutdown
+        finishes within the caller budget, or retained for a later close call
+        when finalization first completes in the background.
         """
-        # 1. Signal shutdown - prevents new events from being queued
-        with self._lifecycle_lock:
+        # Start exactly one coordinator. The condition is also the admission
+        # fence, so shutdown becomes visible before the coordinator can observe
+        # the active-enqueue count.
+        with self._lifecycle_condition:
             self._shutdown_event.set()
+            if self._shutdown_coordinator is None:
+                self._shutdown_coordinator = threading.Thread(
+                    target=self._coordinate_shutdown,
+                    name="telemetry-shutdown",
+                    daemon=True,
+                )
+                self._shutdown_coordinator.start()
+            coordinator = self._shutdown_coordinator
 
-        # 2. Send sentinel FIRST - thread will process remaining events
-        #    then exit when it sees the sentinel.
-        #
-        #    A full queue is allowed to drain naturally. Evicting one event to
-        #    make space for the sentinel would turn close() into a data-loss
-        #    path precisely when a burst fills the queue.
-        sentinel_sent = False
-        sentinel_deadline = monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
-        while self._export_thread.is_alive() and monotonic() < sentinel_deadline:
-            if self._try_enqueue_shutdown_sentinel():
-                sentinel_sent = True
-                break
-
-        if not sentinel_sent:
-            logger.error("Export thread did not accept the shutdown sentinel before the drain deadline")
-
-        # 3. Wait for thread to exit (this implicitly waits for queue drain
-        #    because thread processes all events before exiting on sentinel)
-        self._export_thread.join(timeout=_SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
-        if self._export_thread.is_alive():
-            logger.error("Export thread did not exit cleanly within timeout; exporters remain open to avoid a close/export race")
+        coordinator.join(timeout=_SHUTDOWN_DRAIN_TIMEOUT_SECONDS)
+        pending_exception = self._take_pending_exception()
+        if pending_exception is not None:
+            raise pending_exception
+        if coordinator.is_alive():
+            logger.error("Telemetry shutdown did not finish within timeout; finalization will continue in the background")
             return
 
-        # 4. Close exporters. Successful infrastructure lifecycle is not
+    def _coordinate_shutdown(self) -> None:
+        """Finish ordered shutdown outside the caller's bounded wait."""
+        # The relay stores and re-raises programming failures. Suppression is
+        # confined to this daemon-thread boundary; close() re-raises the stored
+        # failure whenever the coordinator completes within the caller budget.
+        with best_effort("Telemetry shutdown coordinator"):
+            self._coordinate_shutdown_with_error_relay()
+
+    def _coordinate_shutdown_with_error_relay(self) -> None:
+        """Run shutdown and retain any failure for the close() caller."""
+        try:
+            # Wait for admitted producers without holding the lifecycle lock.
+            # BLOCK producers poll shutdown and cancel promptly; successful
+            # enqueues complete before the sentinel is inserted.
+            with self._lifecycle_condition:
+                while self._active_enqueues:
+                    self._lifecycle_condition.wait()
+
+            # A full queue drains naturally while the worker is healthy. If the
+            # worker dies on a programming error, stop waiting for capacity and
+            # retire the now-undeliverable queue with explicit failure counts.
+            sentinel_sent = self._enqueue_sentinel_while_worker_alive()
+            if sentinel_sent:
+                self._export_thread.join()
+            if not self._export_thread.is_alive():
+                self._retire_unexportable_queue()
+
+            with self._flush_lock:
+                self._close_exporters()
+        except BaseException as exc:
+            with self._exception_lock:
+                self._shutdown_exception = exc
+            logger.error("Telemetry shutdown coordinator failed", error_type=type(exc).__name__)
+            raise
+
+    def _enqueue_sentinel_while_worker_alive(self) -> bool:
+        """Insert the sentinel without waiting forever after worker death."""
+        while self._export_thread.is_alive():
+            if self._queue.full():
+                self._export_thread.join(timeout=_BLOCK_ENQUEUE_POLL_SECONDS)
+                continue
+            # All producers are settled and the worker is the only other queue
+            # actor, so capacity can only improve after this check.
+            self._queue.put_nowait(None)
+            return True
+        return False
+
+    def _retire_unexportable_queue(self) -> None:
+        """Account queued events left behind by an irrecoverable worker."""
+        abandoned = 0
+        # The worker is dead and all producers settled before the sentinel
+        # phase, so no concurrent queue actor remains.
+        while not self._queue.empty():
+            event = self._queue.get_nowait()
+            try:
+                if event is not None:
+                    abandoned += 1
+            finally:
+                self._queue.task_done()
+
+        if abandoned:
+            self._events_failed += abandoned
+            with self._dropped_lock:
+                self._events_dropped += abandoned
+            logger.error("Telemetry export worker died with queued events", abandoned_events=abandoned)
+
+    def _take_pending_exception(self) -> BaseException | None:
+        """Atomically consume one worker/coordinator failure."""
+        with self._exception_lock:
+            if self._stored_exception is not None:
+                exc = self._stored_exception
+                self._stored_exception = None
+                return exc
+            if self._shutdown_exception is not None:
+                exc = self._shutdown_exception
+                self._shutdown_exception = None
+                return exc
+        return None
+
+    def _close_exporters(self) -> None:
+        """Close exporters after the export worker has terminated."""
+
+        # Successful infrastructure lifecycle is not
         # duplicated into logs; only telemetry-system failures below are logged.
         delivered_on_close = 0
         failed_on_close = 0
@@ -748,18 +899,6 @@ class TelemetryManager:
                 )
 
         self._reconcile_deferred_delivery(delivered=delivered_on_close, failed=failed_on_close, dropped=dropped_on_close)
-
-    def _try_enqueue_shutdown_sentinel(self) -> bool:
-        """Make one bounded, non-destructive sentinel insertion attempt."""
-        # close() sets shutdown while holding _lifecycle_lock, so all admitted
-        # producers finish before this method runs and later producers are
-        # rejected. The export worker is therefore the only concurrent queue
-        # actor and can only make capacity more available between these calls.
-        if self._queue.full():
-            sleep(0.01)
-            return False
-        self._queue.put_nowait(None)
-        return True
 
 
 _DELIVERY_METRICS_ABSENT = object()

@@ -56,6 +56,7 @@ from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import BranchLossSpec, SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
@@ -312,6 +313,17 @@ def _sink_bound_result(token: TokenInfo) -> RowResult:
     )
 
 
+def _error_sink_bound_result(token: TokenInfo) -> RowResult:
+    return RowResult(
+        token=token,
+        final_data=token.row_data,
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.ON_ERROR_ROUTED,
+        sink_name="errors",
+        error=FailureInfo(exception_type="TransformResultError", message="handled transform failure"),
+    )
+
+
 def _dropped_result(token: TokenInfo) -> RowResult:
     """Non-sink terminal result: drives the mark_terminal disposition arm."""
     return RowResult(token=token, final_data=token.row_data, outcome=TerminalOutcome.SUCCESS, path=TerminalPath.FILTER_DROPPED)
@@ -437,6 +449,62 @@ def test_claimed_token_failure_marks_failed_with_fence() -> None:
     assert spy.calls_for("mark_terminal") == []
     status, _owner = _row_status(setup, work_item_id)
     assert status == TokenWorkStatus.FAILED.value
+
+
+def test_error_sink_pending_disposition_marks_row_span_error() -> None:
+    """A handled failure is an ERROR row even when durably routed to an error sink."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def handled_failure(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        return _error_sink_bound_result(kwargs["token"]), []
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(
+            processor,
+            "_process_single_token",
+            new=handled_failure,
+        ),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    status, _owner = _row_status(setup, work_item_id)
+    assert status == TokenWorkStatus.PENDING_SINK.value
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RowResultError"
+
+
+def test_failed_disposition_marks_row_span_error() -> None:
+    """A handled failure is an ERROR row after its ordinary FAILED disposition commits."""
+    events: list[EngineSpanCompleted] = []
+    spans = SpanFactory(telemetry_emit=events.append)
+    processor, spy, setup, clock = _build(lease_owner=LEADER_OWNER, span_factory=spans)
+    work_item_id, _token = _enqueue_ready(setup, spy, clock, sequence=0)
+
+    def handled_failure(**kwargs: Any) -> tuple[RowResult, list[Any]]:
+        return _failed_result(kwargs["token"]), []
+
+    with (
+        spans.trace_scope(setup.run_id, datetime.now(UTC)),
+        patch.object(
+            processor,
+            "_process_single_token",
+            new=handled_failure,
+        ),
+    ):
+        processor._drain_scheduler_claims(ctx=_ctx(setup), pending_items={}, recover_pending_sinks=False)
+
+    status, _owner = _row_status(setup, work_item_id)
+    assert status == TokenWorkStatus.FAILED.value
+    assert len(events) == 1
+    assert events[0].name is EngineSpanName.ROW
+    assert events[0].status is EngineSpanStatus.ERROR
+    assert events[0].exception_type == "RowResultError"
 
 
 def test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced() -> None:

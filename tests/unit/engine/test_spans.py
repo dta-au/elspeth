@@ -65,6 +65,42 @@ class TestTelemetrySpanFactory:
         ):
             raise ValueError("workload failed")
 
+    def test_completion_callback_failure_preserves_workload_exception_chain(self) -> None:
+        from traceback import format_exception
+
+        from elspeth.engine.spans import SpanFactory
+
+        def fail_emit(_event) -> None:
+            raise RuntimeError("private callback payload")
+
+        def raise_workload_failure() -> None:
+            raise ValueError("workload failed")
+
+        def fail_workload_with_implicit_context() -> None:
+            try:
+                raise KeyError("original workload context")
+            except KeyError:
+                raise_workload_failure()
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+
+        try:
+            raise LookupError("handled before span")
+        except LookupError:
+            with (
+                pytest.raises(ValueError, match="workload failed") as raised,
+                factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
+            ):
+                fail_workload_with_implicit_context()
+
+        rendered = "".join(format_exception(raised.value))
+        assert "workload failed" in rendered
+        assert "original workload context" in rendered
+        assert "private callback payload" not in rendered
+        assert type(raised.value.__context__) is KeyError
+        assert raised.value.__suppress_context__ is False
+        assert raised.value.__notes__ == ["Engine span completion callback also failed with RuntimeError"]
+
     def test_completion_callback_failure_surfaces_after_successful_workload(self) -> None:
         from elspeth.engine.spans import SpanFactory
 
@@ -78,6 +114,68 @@ class TestTelemetrySpanFactory:
             factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
         ):
             pass
+
+    def test_successful_span_inside_unrelated_except_block_emits_ok(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events: list[EngineSpanCompleted] = []
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        try:
+            raise ValueError("handled before span")
+        except ValueError:
+            with factory.run_span("run-001", trace_started_at=datetime.now(UTC)):
+                pass
+
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.OK
+        assert events[0].exception_type is None
+
+    def test_workload_failure_inside_unrelated_except_block_records_workload_error(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events: list[EngineSpanCompleted] = []
+        factory = SpanFactory(telemetry_emit=events.append)
+
+        try:
+            raise ValueError("handled before span")
+        except ValueError:
+            with (
+                pytest.raises(RuntimeError, match="span workload failed"),
+                factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
+            ):
+                raise RuntimeError("span workload failed") from None
+
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.ERROR
+        assert events[0].exception_type == "RuntimeError"
+
+    def test_callback_failure_inside_unrelated_except_block_ignores_ambient_error(self) -> None:
+        from elspeth.contracts.events import EngineSpanCompleted, EngineSpanStatus
+        from elspeth.engine.spans import SpanFactory
+
+        events: list[EngineSpanCompleted] = []
+
+        def fail_emit(event: EngineSpanCompleted) -> None:
+            events.append(event)
+            raise RuntimeError("telemetry callback failed")
+
+        factory = SpanFactory(telemetry_emit=fail_emit)
+
+        try:
+            raise ValueError("handled before span")
+        except ValueError:
+            with (
+                pytest.raises(RuntimeError, match="telemetry callback failed"),
+                factory.run_span("run-001", trace_started_at=datetime.now(UTC)),
+            ):
+                pass
+
+        assert len(events) == 1
+        assert events[0].status is EngineSpanStatus.OK
+        assert events[0].exception_type is None
 
     def test_cross_thread_row_uses_registered_run_root(self) -> None:
         from elspeth.contracts.events import EngineSpanName

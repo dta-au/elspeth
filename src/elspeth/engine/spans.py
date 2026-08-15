@@ -3,13 +3,18 @@
 Provides structured span creation for pipeline execution.
 Falls back to no-op mode when neither delivery owner is configured.
 
-Span Hierarchy (span names are static; plugin identity is in attributes):
+Typical fresh-ingestion hierarchy (names are static; plugin identity is in attributes):
     run                          [run.id=<run_id>]
     ├── source                   [plugin.name=<name>]
-    ├── row                      [row.id=<row_id>, token.id=<token_id>]
-    │   ├── transform            [plugin.name=<name>]
-    │   └── sink                 [plugin.name=<name>]
-    └── aggregation              [plugin.name=<name>]
+    │   └── row                  [row.id=<row_id>, token.id=<token_id>]
+    │       ├── transform        [plugin.name=<name>]
+    │       └── gate             [plugin.name=<name>]
+    └── sink                     [plugin.name=<name>]
+
+Row parenting is path-dependent: ingestion rows use the active source span,
+while late leader-drain, resume, and follower rows use durable run correlation.
+Aggregation parenting is path-dependent: it uses the active row or source span
+when invoked there, and durable run correlation on resume or follower paths.
 """
 
 import secrets
@@ -19,9 +24,9 @@ from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from sys import exception as active_exception
 from time import perf_counter
-from typing import TYPE_CHECKING, Any, cast
+from types import TracebackType
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus, _validate_engine_span_attributes
 
@@ -64,6 +69,44 @@ class _RunTrace:
 
     trace_started_at: datetime
     root_span_id: str | None
+
+
+@dataclass(slots=True)
+class _SpanYieldOutcome:
+    """Capture only an exception that crosses this span's yielded body."""
+
+    exception: BaseException | None = None
+
+    def __enter__(self) -> "_SpanYieldOutcome":
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        self.exception = exception
+        return False
+
+
+@dataclass(slots=True)
+class _CompletionCallbackFailure:
+    """Capture and suppress a failure from one completion callback invocation."""
+
+    exception: BaseException | None = None
+
+    def __enter__(self) -> "_CompletionCallbackFailure":
+        return self
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        self.exception = exception
+        return exception is not None
 
 
 class _TelemetrySpan:
@@ -312,42 +355,49 @@ class SpanFactory:
                 span_id=span_id,
             )
         )
+        outcome = _SpanYieldOutcome()
         try:
-            yield telemetry_span
+            with outcome:
+                yield telemetry_span
         finally:
-            caught = active_exception()
+            caught = outcome.exception
+            self._active_span.reset(token)
+            completed_at = started_at + timedelta(seconds=perf_counter() - started_monotonic)
+            status = EngineSpanStatus.ERROR if caught is not None else telemetry_span._status
+            exception_type = _safe_exception_type(caught) if caught is not None else telemetry_span._exception_type
             try:
-                self._active_span.reset(token)
-                completed_at = started_at + timedelta(seconds=perf_counter() - started_monotonic)
-                status = EngineSpanStatus.ERROR if caught is not None else telemetry_span._status
-                exception_type = _safe_exception_type(caught) if caught is not None else telemetry_span._exception_type
-                try:
-                    completion = EngineSpanCompleted(
-                        timestamp=completed_at,
-                        run_id=resolved_run_id,
-                        name=name,
-                        started_at=started_at,
-                        trace_started_at=resolved_trace_started_at,
-                        span_id=span_id,
-                        parent_span_id=parent_span_id,
-                        status=status,
-                        exception_type=exception_type,
-                        attributes=safe_attributes,
-                    )
+                # Construction and correlation cleanup stay outside callback
+                # suppression so invariant failures remain loud.
+                completion = EngineSpanCompleted(
+                    timestamp=completed_at,
+                    run_id=resolved_run_id,
+                    name=name,
+                    started_at=started_at,
+                    trace_started_at=resolved_trace_started_at,
+                    span_id=span_id,
+                    parent_span_id=parent_span_id,
+                    status=status,
+                    exception_type=exception_type,
+                    attributes=safe_attributes,
+                )
+                if caught is None:
                     self._telemetry_emit(completion)
-                finally:
-                    if root_binding is not None:
-                        with self._run_traces_lock:
-                            if self._run_traces[resolved_run_id] != root_binding:
-                                raise RuntimeError("active run span binding changed before final release")
-                            del self._run_traces[resolved_run_id]
+                else:
+                    # Scope suppression to the callback invocation while the
+                    # workload exception is already unwinding. Letting this
+                    # finally finish preserves its original exception chain.
+                    callback_failure = _CompletionCallbackFailure()
+                    with callback_failure:
+                        self._telemetry_emit(completion)
+                    if callback_failure.exception is not None:
+                        callback_type = _safe_exception_type(callback_failure.exception)
+                        caught.add_note(f"Engine span completion callback also failed with {callback_type}")
             finally:
-                # During exception unwinding, the workload failure remains the
-                # authoritative failure even when telemetry delivery also fails.
-                # This outer finally establishes precedence without broadly
-                # catching arbitrary callback errors.
-                if caught is not None:
-                    raise caught
+                if root_binding is not None:
+                    with self._run_traces_lock:
+                        if self._run_traces[resolved_run_id] != root_binding:
+                            raise RuntimeError("active run span binding changed before final release")
+                        del self._run_traces[resolved_run_id]
 
     @contextmanager
     def run_span(
