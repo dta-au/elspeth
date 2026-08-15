@@ -662,7 +662,7 @@ class TestConstructorErrorEdgeMap:
             node_id=str(agg_node),
             schema_config=_DYNAMIC_SCHEMA,
         )
-        now = datetime.now(UTC)
+        now = datetime.now(UTC) - timedelta(seconds=2)
         batch = factory.execution.create_batch(run_id="test-run", aggregation_node_id=str(agg_node))
         tokens: list[TokenInfo] = []
         for ordinal, token_id in enumerate(["t1", "t2"]):
@@ -719,7 +719,7 @@ class TestConstructorErrorEdgeMap:
                     plugin="test-plugin",
                     input="agg_in",
                     on_error="discard",
-                    trigger={"count": 3},
+                    trigger={"count": 2},
                 ),
             },
             barrier_restore=BarrierJournalRestoreContext(
